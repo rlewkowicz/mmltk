@@ -1418,15 +1418,15 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     }
     ~TestPresentationWriter() override { state_->retirements.fetch_add(1U, std::memory_order_acq_rel); }
 
-    void Submit(VisualSourceObservation observation, std::uint64_t selection_generation,
+    void Submit(PresentationSubmittedSource submitted,
                 const VisualSourceReader& reader) override {
         context_.Bind();
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
         const auto submission = state_->submissions.fetch_add(1U, std::memory_order_acq_rel);
         if (submission == 0U) state_->first_submission.set_value();
         if (submission == 2U) state_->third_submission.set_value();
-        selection_generation_ = selection_generation;
-        const auto& frame = observation.frame;
+        submitted_ = submitted;
+        const auto& frame = submitted.observation.frame;
         const auto width = frame.extent.width;
         const auto height = frame.extent.height;
         if (!Contains(active_, width, height)) {
@@ -1440,7 +1440,6 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             }
         }
         const auto& target = Contains(active_, width, height) ? *active_ : *candidate_;
-        last_completed_ = observation;
         reader_ = std::addressof(reader);
         pending_ = PresentationPublication{
             .capability =
@@ -1475,24 +1474,23 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             if (prior == 0U) state_->allocation_retired.set_value();
         }
         state_->RecordPump();
-        if (selection_generation_ != current_selection_generation) {
-            const auto superseded = selection_generation_;
+        if (submitted_.selection_generation != current_selection_generation) {
             pending_.reset();
             return {
                 .progress = PresentationNativeProgress::Superseded,
-                .selection_generation = superseded,
+                .submitted = submitted_,
             };
         }
         if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) return {.capability = capability()};
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
         if (candidate_target && retiring_) return {.capability = capability()};
         auto source = reader_->borrow();
-        if (!visual_product_matches_frame(last_completed_.frame, source)) {
+        if (!visual_product_matches_frame(submitted_.observation.frame, source)) {
             pending_.reset();
             reader_ = nullptr;
             return {
                 .progress = PresentationNativeProgress::Superseded,
-                .selection_generation = selection_generation_,
+                .submitted = submitted_,
                 .capability = capability(),
             };
         }
@@ -1509,10 +1507,9 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         pending_->presentation_revision = state_->presentation_revision.fetch_add(1U, std::memory_order_acq_rel) + 1U;
         auto outcome = PresentationNativeOutcome{
             .progress = PresentationNativeProgress::Published,
-            .selection_generation = selection_generation_,
+            .submitted = submitted_,
             .publication = std::exchange(pending_, std::nullopt).value(),
             .capability = capability(),
-            .source_observation = last_completed_,
         };
         reader_ = nullptr;
         return outcome;
@@ -1558,9 +1555,8 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     mmltk::frameworks::gpu::ImageStream stream_;
     mmltk::frameworks::gpu::ImageProductBuffer backbuffer_;
     std::shared_ptr<TestPresentationWriterState> state_;
-    VisualSourceObservation last_completed_{};
+    PresentationSubmittedSource submitted_{};
     const VisualSourceReader* reader_ = nullptr;
-    std::uint64_t selection_generation_ = 0U;
     std::optional<PresentationPublication> pending_;
     std::optional<Allocation> active_;
     std::optional<Allocation> candidate_;
@@ -2037,6 +2033,7 @@ class PresentationSourceFixture final {
     [[nodiscard]] std::shared_ptr<FakeImageBackend> backend() const noexcept { return backend_; }
     [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
     [[nodiscard]] PresentationSourceIdentity identity() const noexcept { return identity_; }
+    void AdvanceObservation() { snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel); }
     void Advance() {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         const auto borrowed = source_->Borrow();
@@ -5014,6 +5011,33 @@ TEST_CASE("Presentation explicitly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
 
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Presentation carries its submitted observation through metadata changes and reselection") {
+    PresentationSourceFixture source;
+    EventGate events;
+    auto writer = std::make_shared<TestPresentationWriterState>();
+    writer->allow_publication.store(false);
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
+        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
+    source.AdvanceObservation();
+    writer->allow_publication.store(true);
+    writer->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
+    const auto completed = presentation.snapshot();
+    CHECK(completed.completed_source_revision == 1U);
+    CHECK(source.sources().front().observe().snapshot_revision == 2U);
+    static_cast<void>(presentation.Select(source.identity()));
+    writer->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision > completed.presentation_revision; }));
+    CHECK(presentation.snapshot().completed == completed.completed);
+    CHECK(presentation.snapshot().completed_source_revision == 2U);
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);

@@ -29,15 +29,14 @@ namespace raster = mmltk::backend::imaging::raster;
 
 struct NativeAllocation final {
     struct LatestFrame final {
-        VisualSourceObservation source{};
+        PresentationSubmittedSource submitted{};
         std::uint64_t presentation_revision = 0U;
     };
 
     std::unique_ptr<gpu::ExportedImageBuffer> buffer;
     native::WorkspaceSurfaceImportId import_id{};
     std::uint64_t generation = 0U;
-    std::uint64_t selection_generation = 0U;
-    std::uint64_t frame_revision = 0U;
+    PresentationSubmittedSource submitted{};
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     std::size_t pitch = 0U;
@@ -65,15 +64,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (!SettleSourceRead()) std::terminate();
     }
 
-    void Submit(const VisualSourceObservation observation, const std::uint64_t selection_generation,
+    void Submit(const PresentationSubmittedSource submitted,
                 const VisualSourceReader& source) override {
         context_.Bind();
-        if (!observation.valid() || selection_generation == 0U || source.source != observation.frame.source || !source.borrow ||
+        if (!submitted.valid() || source.source != submitted.observation.frame.source || !source.borrow ||
             pending_frame_)
             throw std::invalid_argument("presentation native submission is invalid");
         pending_frame_ = PendingFrame{
-            .source = observation,
-            .selection_generation = selection_generation,
+            .submitted = submitted,
             .reader = std::addressof(source),
         };
         EnsureTargetForPending();
@@ -121,8 +119,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
    private:
     struct PendingFrame final {
-        VisualSourceObservation source{};
-        std::uint64_t selection_generation = 0U;
+        PresentationSubmittedSource submitted{};
         const VisualSourceReader* reader = nullptr;
     };
 
@@ -200,20 +197,19 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                                       .capacity_height = height,
                                       .surface_high = id.high,
                                       .surface_low = id.low,
-                                      .selection_generation = pending_frame_ ? pending_frame_->selection_generation : 0U,
-                                      .frame_revision = pending_frame_ ? pending_frame_->source.frame.revision : 0U,
+                                      .selection_generation = pending_frame_ ? pending_frame_->submitted.selection_generation : 0U,
+                                      .frame_revision = pending_frame_ ? pending_frame_->submitted.observation.frame.revision : 0U,
                                       .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Unavailable),
                                       .outcome = 1U}});
         if (!channel_.admit(id, generation, width, height, pitch, allocation->allocation_size(), std::move(descriptor), frame_edge.get(),
-                            frame_signal.descriptor(), pending_frame_ ? pending_frame_->selection_generation : 0U,
-                            pending_frame_ ? pending_frame_->source.frame.revision : 0U))
+                            frame_signal.descriptor(), pending_frame_ ? pending_frame_->submitted.selection_generation : 0U,
+                            pending_frame_ ? pending_frame_->submitted.observation.frame.revision : 0U))
             throw std::runtime_error("Firefox surface import admission failed");
         candidate_ = std::make_unique<NativeAllocation>(NativeAllocation{
             .buffer = std::move(allocation),
             .import_id = id,
             .generation = generation,
-            .selection_generation = pending_frame_ ? pending_frame_->selection_generation : 0U,
-            .frame_revision = pending_frame_ ? pending_frame_->source.frame.revision : 0U,
+            .submitted = pending_frame_ ? pending_frame_->submitted : PresentationSubmittedSource{},
             .width = width,
             .height = height,
             .pitch = pitch,
@@ -233,16 +229,19 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         };
     }
 
+    [[nodiscard]] static PresentationCapability CapabilityOf(const NativeAllocation& allocation) noexcept {
+        return {
+            .surface_high = allocation.import_id.high,
+            .surface_low = allocation.import_id.low,
+            .extent = {allocation.width, allocation.height},
+            .generation = allocation.generation,
+            .condition = allocation.timeline ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted,
+        };
+    }
+
     [[nodiscard]] PresentationCapability CurrentCapability() const noexcept {
         const NativeAllocation* allocation = candidate_ && channel_.claimable(candidate_->import_id) ? candidate_.get() : active_.get();
-        if (!allocation || !channel_.claimable(allocation->import_id)) return {};
-        return {
-            .surface_high = allocation->import_id.high,
-            .surface_low = allocation->import_id.low,
-            .extent = {allocation->width, allocation->height},
-            .generation = allocation->generation,
-            .condition = allocation->timeline ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted,
-        };
+        return allocation && channel_.claimable(allocation->import_id) ? CapabilityOf(*allocation) : PresentationCapability{};
     }
 
     [[nodiscard]] static bool Contains(const NativeAllocation* allocation, const VisualExtent extent) noexcept {
@@ -275,7 +274,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     void EnsureTargetForPending() {
         if (!pending_frame_) return;
         if (!channel_.connected()) return;
-        const auto extent = pending_frame_->source.frame.extent;
+        const auto extent = pending_frame_->submitted.observation.frame.extent;
         if (Contains(active_.get(), extent) || Contains(candidate_.get(), extent)) return;
         if (candidate_) WithdrawStaleCandidate();
         if (!candidate_) {
@@ -285,7 +284,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             // The undersized candidate must finish its real page claim before
             // the ordinary stale-candidate path can retire it.
             if (pending_supersession_acceptance_ && active_ && !retiring_ &&
-                pending_frame_->source.frame.source.kind == PresentationSourceKind::Upscale) {
+                pending_frame_->submitted.observation.frame.source.kind == PresentationSourceKind::Upscale) {
                 pending_supersession_acceptance_ = false;
                 BeginImport({active_->width, active_->height});
             } else {
@@ -308,8 +307,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                      .capacity_height = candidate_ && candidate_->import_id == outcome.id ? candidate_->height : 0U,
                      .surface_high = outcome.id.high,
                      .surface_low = outcome.id.low,
-                     .selection_generation = candidate_ && candidate_->import_id == outcome.id ? candidate_->selection_generation : 0U,
-                     .frame_revision = candidate_ && candidate_->import_id == outcome.id ? candidate_->frame_revision : 0U,
+                     .selection_generation = candidate_ && candidate_->import_id == outcome.id ? candidate_->submitted.selection_generation : 0U,
+                     .frame_revision = candidate_ && candidate_->import_id == outcome.id ? candidate_->submitted.observation.frame.revision : 0U,
                      .condition = static_cast<std::uint64_t>(outcome.imported ? PresentationCapabilityCondition::Ready
                                                                               : PresentationCapabilityCondition::Unavailable),
                      .outcome = outcome.imported ? 0U : static_cast<std::uint64_t>(outcome.failure)}});
@@ -331,15 +330,16 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
     PresentationNativeOutcome TryIssue(const std::uint64_t current_selection_generation) {
         if (!pending_frame_) return {};
-        if (pending_frame_->selection_generation != current_selection_generation) {
-            const std::uint64_t superseded = pending_frame_->selection_generation;
+        if (pending_frame_->submitted.selection_generation != current_selection_generation) {
+            const auto superseded = pending_frame_->submitted;
             pending_frame_.reset();
             return {
                 .progress = PresentationNativeProgress::Superseded,
-                .selection_generation = superseded,
+                .submitted = superseded,
             };
         }
-        const auto observation = pending_frame_->source;
+        const auto submitted = pending_frame_->submitted;
+        const auto& observation = submitted.observation;
         const auto& frame = observation.frame;
         NativeAllocation* target = nullptr;
         if (!retiring_ && candidate_ && candidate_->timeline && Contains(candidate_.get(), frame.extent))
@@ -348,22 +348,18 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             target = active_.get();
         if (target == nullptr) return {};
         auto stream = reinterpret_cast<cudaStream_t>(stream_.native_handle());
-        const auto previous_selection_generation = target->selection_generation;
-        const auto previous_frame_revision = target->frame_revision;
-        target->selection_generation = pending_frame_->selection_generation;
-        target->frame_revision = frame.revision;
+        const auto previous_submitted = target->submitted;
+        target->submitted = submitted;
         AwaitPriorRelease(stream, *target);
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationSourceBorrowStarted, *target);
         auto source = pending_frame_->reader->borrow();
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationSourceBorrowCompleted, *target, 1U);
         if (!visual_product_matches_frame(frame, source)) {
-            target->selection_generation = previous_selection_generation;
-            target->frame_revision = previous_frame_revision;
-            const auto superseded = pending_frame_->selection_generation;
+            target->submitted = previous_submitted;
             pending_frame_.reset();
             return {
                 .progress = PresentationNativeProgress::Superseded,
-                .selection_generation = superseded,
+                .submitted = submitted,
             };
         }
         stream_.Await(source);
@@ -398,7 +394,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (status != cudaSuccess) throw std::runtime_error("presentation exported backbuffer copy failed");
             presentation_revision = mmltk::common::types::take_monotonic_identity(next_presentation_revision_);
             target->latest = NativeAllocation::LatestFrame{
-                .source = observation,
+                .submitted = submitted,
                 .presentation_revision = presentation_revision,
             };
             ready = OfferLatest(*target, stream);
@@ -424,21 +420,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
         PresentationNativeOutcome outcome{
             .progress = PresentationNativeProgress::Published,
-            .selection_generation = pending_frame_->selection_generation,
+            .submitted = submitted,
             .publication =
                 {
-                    .capability =
-                        {
-                            .surface_high = active_->import_id.high,
-                            .surface_low = active_->import_id.low,
-                            .extent = {active_->width, active_->height},
-                            .generation = active_->generation,
-                            .condition = PresentationCapabilityCondition::Ready,
-                        },
+                    .capability = CapabilityOf(*active_),
                     .timeline_ready = ready,
                     .presentation_revision = presentation_revision,
                 },
-            .source_observation = observation,
         };
         pending_frame_.reset();
         return outcome;
@@ -453,7 +441,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("presentation ready publication failed");
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationReadySyncCompleted, allocation, 1U);
         const auto& latest = *allocation.latest;
-        const auto& frame = latest.source.frame;
+        const auto& frame = latest.submitted.observation.frame;
         native::detail::publish_workspace_frame_signal(allocation.frame_signal.mapping(), ready, transfer_sequence,
                                                        native::WorkspacePresentationLayer::Primary,
                                                        {
@@ -501,8 +489,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                          .capacity_height = allocation.height,
                          .surface_high = allocation.import_id.high,
                          .surface_low = allocation.import_id.low,
-                         .selection_generation = allocation.selection_generation,
-                         .frame_revision = allocation.frame_revision,
+                         .selection_generation = allocation.submitted.selection_generation,
+                         .frame_revision = allocation.submitted.observation.frame.revision,
                          .condition = static_cast<std::uint64_t>(operation == VisualDiagnosticOperation::PresentationRetirement
                                                                      ? PresentationCapabilityCondition::Unavailable
                                                                  : allocation.timeline ? PresentationCapabilityCondition::Ready

@@ -32,7 +32,7 @@ pub(crate) fn observe(snapshot: Option<&ExploreSnapshot>, dark: bool) {
         RENDERER.with(|renderer| {
             let mut renderer = renderer.borrow_mut();
             if let Some(imported) = renderer.as_mut().and_then(|owner| owner.imported.as_mut())
-                && imported.gallery.as_ref().is_some_and(|shown| {
+                && imported.image.gallery.as_ref().is_some_and(|shown| {
                     shown.frame == snapshot.frame
                         && shown.dataset.identity == snapshot.dataset.identity
                         && shown.viewport == snapshot.viewport
@@ -41,7 +41,7 @@ pub(crate) fn observe(snapshot: Option<&ExploreSnapshot>, dark: bool) {
                         && shown.revision != snapshot.revision
                 })
             {
-                imported.gallery = Some(Arc::new(snapshot.clone()));
+                imported.image.gallery = Some(Arc::new(snapshot.clone()));
             }
         });
     }
@@ -73,11 +73,7 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
 
 fn matches(snapshot: &ExploreSnapshot, frame: FrameReady) -> bool {
     snapshot.frame.source.kind == crate::generated::PresentationSourceKind::Explore
-        && snapshot.frame.source.instance != 0
-        && frame.content_session == crate::generated::presentation_source_session(snapshot.frame.source.kind)
-        && snapshot.frame.revision == frame.content_sequence
-        && snapshot.frame.extent.width == frame.content_width
-        && snapshot.frame.extent.height == frame.content_height
+        && frame.matches_content(&snapshot.frame)
         && snapshot.viewport.extent == snapshot.frame.extent
         && snapshot.viewport.columns != 0
         && snapshot.viewport.rowcount != 0
@@ -112,10 +108,10 @@ pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreSnapshot>)> {
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let imported = renderer.as_ref()?.imported.as_ref()?;
-        let frame = imported.captured?;
-        let snapshot = imported.gallery.as_ref()?;
-        (imported.surface.frame == Some(frame) && matches(snapshot, frame))
-            .then(|| (imported.surface, snapshot.clone()))
+        let frame = imported.image.captured?;
+        let snapshot = imported.image.gallery.as_ref()?;
+        (imported.image.surface.frame == Some(frame) && matches(snapshot, frame))
+            .then(|| (imported.image.surface, snapshot.clone()))
     })
 }
 

@@ -15,6 +15,7 @@
 #include <thread>
 #include <utility>
 
+#include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
@@ -153,10 +154,6 @@ class PresentationSystem::Impl final {
         PresentationSourceIdentity source{};
         std::uint64_t generation = 0U;
     };
-    struct InFlight final {
-        VisualSourceObservation source{};
-        std::uint64_t selection_generation = 0U;
-    };
 
     void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
 
@@ -187,8 +184,8 @@ class PresentationSystem::Impl final {
                 const auto found = Find(pending->source);
                 if (found != sources_.end()) {
                     reader = std::addressof(*found);
-                    in_flight_ = InFlight{
-                        .source = {.frame = {.source = pending->source}},
+                    in_flight_ = PresentationSubmittedSource{
+                        .observation = {.frame = {.source = pending->source}},
                         .selection_generation = pending->generation,
                     };
                 }
@@ -197,6 +194,7 @@ class PresentationSystem::Impl final {
         if (expected_process_group) writer_->SetExpectedBrowserProcessGroup(*expected_process_group);
         if (reader) {
             const VisualSourceObservation observation = reader->observe();
+            const PresentationSubmittedSource submitted{observation, pending->generation};
             const auto& frame = observation.frame;
             if (observation.valid() &&
                 (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
@@ -206,17 +204,17 @@ class PresentationSystem::Impl final {
                 std::scoped_lock lock(mutex_);
                 const bool reserved =
                     in_flight_ && in_flight_->selection_generation == pending->generation &&
-                    in_flight_->source.frame.source == pending->source;
+                    in_flight_->observation.frame.source == pending->source;
                 if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
                     pending->generation == selection_generation_ && state_.selected == pending->source) {
-                    in_flight_->source = observation;
+                    in_flight_ = submitted;
                     submit = true;
                 } else if (reserved) {
                     in_flight_.reset();
                     wake_again = pending_.has_value();
                 }
             }
-            if (submit) writer_->Submit(observation, pending->generation, *reader);
+            if (submit) writer_->Submit(submitted, *reader);
         }
         std::uint64_t pump_generation = 0U;
         std::uint64_t pump_frame_revision = 0U;
@@ -224,7 +222,7 @@ class PresentationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             if (stopping_ || stop.stop_requested()) return;
             pump_generation = selection_generation_;
-            if (in_flight_) pump_frame_revision = in_flight_->source.frame.revision;
+            if (in_flight_) pump_frame_revision = in_flight_->observation.frame.revision;
         }
         if (pump_frame_revision != 0U)
             diagnostics_({
@@ -263,9 +261,9 @@ class PresentationSystem::Impl final {
                 case PresentationNativeProgress::Waiting:
                     break;
                 case PresentationNativeProgress::Superseded:
-                    if (in_flight_ && in_flight_->selection_generation == outcome.selection_generation) {
+                    if (in_flight_ && *in_flight_ == outcome.submitted) {
                         if (in_flight_->selection_generation == selection_generation_ &&
-                            state_.selected == in_flight_->source.frame.source)
+                            state_.selected == in_flight_->observation.frame.source)
                             pending_ = Pending{
                                 .source = state_.selected,
                                 .generation = selection_generation_,
@@ -280,12 +278,10 @@ class PresentationSystem::Impl final {
             if (outcome.progress != PresentationNativeProgress::Published) {
                 completed = state_;
             } else {
-                if (!in_flight_ || outcome.selection_generation != in_flight_->selection_generation || !outcome.publication.valid())
+                if (!in_flight_ || outcome.submitted != *in_flight_ || !outcome.publication.valid())
                     throw std::runtime_error("Presentation native publication failed");
-                const auto observation = in_flight_->source;
+                const auto observation = outcome.submitted.observation;
                 const auto& frame = observation.frame;
-                if (outcome.source_observation != observation)
-                    throw std::runtime_error("Presentation native publication changed its source observation");
                 const bool current = in_flight_->selection_generation == selection_generation_ && state_.selected == frame.source;
                 in_flight_.reset();
                 if (current) {
@@ -371,12 +367,7 @@ class PresentationSystem::Impl final {
     }
 
     [[nodiscard]] bool Wake() noexcept {
-        const std::uint64_t wake = 1U;
-        ssize_t written = -1;
-        do {
-            written = ::write(control_fd_.get(), &wake, sizeof(wake));
-        } while (written < 0 && errno == EINTR);
-        return written == static_cast<ssize_t>(sizeof(wake)) || (written < 0 && errno == EAGAIN);
+        return mmltk::common::io::signal_event_fd(control_fd_.get());
     }
 
     void Failed(const std::exception_ptr failure) noexcept {
@@ -431,7 +422,7 @@ class PresentationSystem::Impl final {
     mutable std::mutex mutex_;
     PresentationSnapshot state_;
     std::optional<Pending> pending_;
-    std::optional<InFlight> in_flight_;
+    std::optional<PresentationSubmittedSource> in_flight_;
     std::optional<pid_t> expected_process_group_;
     std::uint64_t selection_generation_ = 0U;
     bool stopping_ = false;

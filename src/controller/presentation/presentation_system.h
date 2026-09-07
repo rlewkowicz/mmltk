@@ -3,6 +3,7 @@
 #include <sys/types.h>
 
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <filesystem>
 #include <memory>
@@ -75,8 +76,16 @@ struct PresentationTargetCapacity final {
 
     [[nodiscard]] constexpr bool contains(const VisualExtent extent) const noexcept {
         const auto row_bytes = static_cast<std::size_t>(extent.width) * 4U;
-        return extent.valid() && width >= extent.width && height >= extent.height && pitch >= row_bytes && height <= bytes / pitch;
+        return extent.valid() && width >= extent.width && height >= extent.height && pitch >= row_bytes && pitch != 0U &&
+               height <= bytes / pitch;
     }
+};
+struct PresentationSubmittedSource final {
+    VisualSourceObservation observation{};
+    std::uint64_t selection_generation = 0U;
+
+    [[nodiscard]] bool valid() const noexcept { return observation.valid() && selection_generation != 0U; }
+    bool operator==(const PresentationSubmittedSource&) const = default;
 };
 enum class PresentationNativeProgress : std::uint8_t {
     Waiting,
@@ -85,10 +94,9 @@ enum class PresentationNativeProgress : std::uint8_t {
 };
 struct PresentationNativeOutcome final {
     PresentationNativeProgress progress = PresentationNativeProgress::Waiting;
-    std::uint64_t selection_generation = 0U;
+    PresentationSubmittedSource submitted{};
     PresentationPublication publication{};
     PresentationCapability capability{};
-    VisualSourceObservation source_observation{};
 };
 enum class PresentationShutdownResult : std::uint8_t {
     Stopped,
@@ -101,7 +109,7 @@ class PresentationNativeWriter {
         bool safe_to_destroy = true;
     };
     virtual ~PresentationNativeWriter() = default;
-    virtual void Submit(VisualSourceObservation, std::uint64_t selection_generation, const VisualSourceReader&) = 0;
+    virtual void Submit(PresentationSubmittedSource, const VisualSourceReader&) = 0;
     [[nodiscard]] virtual PresentationNativeOutcome Pump(std::uint64_t current_selection_generation) = 0;
     [[nodiscard]] virtual int poll_fd() const noexcept = 0;
     [[nodiscard]] virtual bool wants_write() const noexcept = 0;

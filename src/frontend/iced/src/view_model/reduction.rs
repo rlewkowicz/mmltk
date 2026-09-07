@@ -32,8 +32,7 @@ impl ApplicationModel {
         self.explore.reset_transport();
         self.annotation = AnnotationModel::default();
         self.dialog_context = None;
-        self.foreground_visual = None;
-        self.sent_presentation_frame = None;
+        self.presentation_model = presentation::PresentationModel::default();
     }
 
     pub fn install_bootstrap(
@@ -85,7 +84,7 @@ impl ApplicationModel {
                 if context == ApplicationIntentEndpoint::UpscaleStart {
                     if self.explore.requested_upscale == self.explore.sent_upscale {
                         self.explore.requested_upscale = None;
-                        if self.foreground_visual == Some(PresentationSourceKind::Upscale) {
+                        if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
                             self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                         }
                     }
@@ -128,7 +127,7 @@ impl ApplicationModel {
         self.pending.remove(&correlation);
         let refresh = self.presentation_refresh();
         if failed_presentation {
-            self.sent_presentation_frame = None;
+            self.presentation_model.clear_sent();
         }
         refresh
     }
@@ -402,7 +401,7 @@ impl ApplicationModel {
                 } else {
                     self.explore.requested_upscale = None;
                     self.explore.sent_upscale = None;
-                    if self.foreground_visual == Some(PresentationSourceKind::Upscale) {
+                    if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
                         self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                     }
                 }

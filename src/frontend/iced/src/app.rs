@@ -17,7 +17,7 @@ use crate::view_model::{ApplicationIntentEndpoint, ApplicationModel, UiError};
 
 mod annotation;
 mod explore;
-mod presentation;
+pub mod presentation;
 mod settings;
 mod transport;
 mod workflows;
@@ -29,18 +29,11 @@ pub struct App {
     connection: Option<Connection>,
     peer_generation: u64,
     pub model: ApplicationModel,
-    surface: Option<Surface>,
-    presentation_failed: bool,
+    presentation: presentation::Controller,
     workspace: crate::view::router::Router,
     settings: crate::view::settings::Component,
     diagnostics: crate::view::diagnostics::Component,
     integration: crate::integration_control::Controller,
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        self.retire_surface_frame();
-    }
 }
 
 pub fn boot() -> (App, Task<Message>) {
@@ -59,8 +52,7 @@ pub fn boot() -> (App, Task<Message>) {
             connection: None,
             peer_generation: 0,
             model: ApplicationModel::default(),
-            surface: None,
-            presentation_failed: false,
+            presentation: presentation::Controller::default(),
             workspace: crate::view::router::Router::default(),
             settings: crate::view::settings::Component::default(),
             diagnostics: crate::view::diagnostics::Component::default(),
@@ -87,7 +79,9 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     Subscription::batch([
         crate::transport::subscription(app.config.clone()).map(Message::Transport),
         iced::window::events().map(|(_, event)| Message::Window(event)),
-        crate::presentation_surface::subscription().map(Message::Surface),
+        crate::presentation_surface::subscription()
+            .map(presentation::Message::Surface)
+            .map(Message::Presentation),
         app.integration.subscription().map(Message::Integration),
         if app.workspace.active() == crate::generated::FeatureId::Annotate
             && !app.settings.state().open
@@ -101,47 +95,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     ])
 }
 
-fn deferred_presentation_redraw(surface: Surface) -> Task<Message> {
-    let mut first_poll = true;
-    Task::perform(
-        std::future::poll_fn(move |context| {
-            if std::mem::take(&mut first_poll) {
-                context.waker().wake_by_ref();
-                std::task::Poll::Pending
-            } else {
-                std::task::Poll::Ready(())
-            }
-        }),
-        move |()| Message::PresentationRedraw(surface),
-    )
-}
-
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
-    let previous_surface = app.surface;
+    let previous_surface = app.presentation.surface();
     let mut task = Task::none();
     match message {
         Message::Transport(event) => task = app.on_transport(event),
         Message::Window(event) => task = app.on_window(event),
-        Message::Surface(notification) => match notification {
-            crate::presentation_surface::Notification::Native(frame) => {
-                app.present_native_frame(frame)
-            }
-            crate::presentation_surface::Notification::Drawn => {
-                task = iced::window::request_redraw();
-            }
-            crate::presentation_surface::Notification::Completed(frame) => {
-                crate::presentation_surface::promote_completed(frame);
-                task = iced::window::request_redraw();
-            }
-        },
-        Message::PresentationRedraw(surface) => {
-            if app.surface.is_some_and(|current| {
-                crate::presentation_surface::same_allocation(current, surface)
-            }) {
-                crate::presentation_surface::trace_surface("redraw_requested", surface);
-                task = iced::window::request_redraw();
-            }
-        }
+        Message::Presentation(message) => task = app.on_presentation(message),
         Message::ExploreWritable {
             peer_generation,
             result,
@@ -162,19 +122,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
     }
     app.reconcile_surface_frame();
-    let frame = app.surface.and_then(|surface| surface.frame);
-    let presentation_task = match app.surface {
-        Some(surface) if app.surface != previous_surface && surface.frame.is_none() => {
-            crate::presentation_surface::trace_surface("redraw_queued", surface);
-            deferred_presentation_redraw(surface)
-        }
-        _ if app.surface != previous_surface
-            || frame.is_some_and(crate::presentation_surface::gallery::awaiting_display) =>
-        {
-            iced::window::request_redraw()
-        }
-        _ => Task::none(),
-    };
+    let frame = app.presentation.surface().and_then(|surface| surface.frame);
+    let presentation_task = app.presentation.redraw(previous_surface).map(Message::Presentation);
     Task::batch([
         task,
         presentation_task,
@@ -400,7 +349,7 @@ mod route_tests {
 pub fn view(app: &App) -> Element<'_, Message> {
     crate::view::view(
         &app.model,
-        app.surface,
+        app.presentation.surface(),
         &app.diagnostics,
         &app.workspace,
         &app.settings,
@@ -667,7 +616,7 @@ mod tests {
         drop(task);
         install_default_bootstrap(&mut presented);
         presented.connection = Some(closed_connection());
-        presented.surface = Some(Surface {
+        presented.presentation.set_test_surface(Surface {
             high: 1,
             low: 2,
             generation: 3,
@@ -692,7 +641,7 @@ mod tests {
             content_height: 480,
         });
         assert!(presented.connection.is_none());
-        assert!(presented.surface.is_none());
+        assert!(presented.presentation.surface().is_none());
 
         let (mut intent, task) = boot();
         drop(task);

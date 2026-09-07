@@ -1,4 +1,3 @@
-use crate::presentation_surface::Notification;
 use crate::transport::TransportEvent;
 use crate::view::{diagnostics, error_modal, file_dialog, router, settings};
 
@@ -6,8 +5,7 @@ use crate::view::{diagnostics, error_modal, file_dialog, router, settings};
 pub enum Message {
     Transport(TransportEvent),
     Window(iced::window::Event),
-    Surface(Notification),
-    PresentationRedraw(crate::presentation_surface::Surface),
+    Presentation(crate::app::presentation::Message),
     ExploreWritable {
         peer_generation: u64,
         result: Result<(), crate::transport_connection::OutboundSendError>,

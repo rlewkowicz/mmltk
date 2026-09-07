@@ -188,7 +188,7 @@ fn trace_surface_request(_event: &str, _surface: Surface, _requested: Surface, _
 const MAILBOX_SLOTS: u32 = 2;
 const INTEGRATION_REDRAW_PASSES: u8 = 4;
 thread_local! {
-    static DRAWN_DETAIL: std::cell::Cell<Option<(FrameReady, [u32; 4])>> = const { std::cell::Cell::new(None) };
+    static DRAWN_DETAIL: std::cell::Cell<Option<(Surface, [u32; 4])>> = const { std::cell::Cell::new(None) };
     static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; 6]> = const { std::cell::Cell::new([None; 6]) };
     static BORROWS: std::cell::Cell<[Option<FrameReady>; 6]> = const { std::cell::Cell::new([None; 6]) };
 }
@@ -264,7 +264,7 @@ impl Drop for CaptureBorrow {
     }
 }
 
-pub(crate) fn drawn_detail() -> Option<(FrameReady, [u32; 4])> {
+pub(crate) fn drawn_detail() -> Option<(Surface, [u32; 4])> {
     DRAWN_DETAIL.with(std::cell::Cell::get)
 }
 
@@ -272,12 +272,35 @@ pub(crate) fn clear_drawn_detail() {
     DRAWN_DETAIL.with(|drawn| drawn.set(None));
 }
 
-pub(crate) fn record_drawn_detail(frame: FrameReady, crop: [u32; 4]) {
+pub(crate) fn record_drawn_detail(surface: Surface, crop: [u32; 4]) {
+    if surface.frame.is_none() {
+        return;
+    }
     DRAWN_DETAIL.with(|drawn| {
-        if drawn.replace(Some((frame, crop))) != Some((frame, crop)) {
+        if drawn.replace(Some((surface, crop))) != Some((surface, crop)) {
             notify_surface(Notification::Drawn);
         }
     });
+}
+
+pub(crate) fn viewer_copy_matches(
+    model: &crate::view_model::ApplicationModel,
+    source: &crate::generated::VisualFrame,
+) -> bool {
+    drawn_detail().is_some_and(|(surface, crop)| {
+        let Some(frame) = surface.frame else { return false; };
+        let original = model.explore.snapshot.as_ref()
+            .is_some_and(|snapshot| snapshot.detail.showoriginaldimensions);
+        let expected = if original {
+            [source.content.x, source.content.y, source.content.width, source.content.height]
+        } else {
+            [0, 0, source.extent.width, source.extent.height]
+        };
+        model.presentation.as_ref().is_some_and(|snapshot| frame.matches_completed(snapshot))
+            && frame.belongs_to(surface)
+            && frame.matches_content(source)
+            && crop == expected
+    })
 }
 
 pub(crate) fn same_mailbox_slot(left: FrameReady, right: FrameReady) -> bool {
@@ -288,7 +311,8 @@ pub(crate) fn same_mailbox_slot(left: FrameReady, right: FrameReady) -> bool {
 }
 
 pub(crate) fn invalidate_drawn_slot(frame: FrameReady) {
-    if drawn_detail().is_some_and(|(drawn, _)| same_mailbox_slot(drawn, frame) && drawn != frame) {
+    if drawn_detail().and_then(|(surface, _)| surface.frame)
+        .is_some_and(|drawn| same_mailbox_slot(drawn, frame) && drawn != frame) {
         clear_drawn_detail();
     }
 }
@@ -311,6 +335,30 @@ pub struct FrameReady {
 }
 
 impl FrameReady {
+    pub(crate) fn matches_content(self, frame: &crate::generated::VisualFrame) -> bool {
+        frame.source.instance != 0
+            && self.layer == 0
+            && self.slot < MAILBOX_SLOTS
+            && self.content_session == crate::generated::presentation_source_session(frame.source.kind)
+            && self.content_sequence == frame.revision
+            && self.content_width == frame.extent.width
+            && self.content_height == frame.extent.height
+    }
+
+    pub(crate) fn matches_completed(self, snapshot: &crate::generated::PresentationSnapshot) -> bool {
+        // The advertised capability may already be an unpublished replacement.
+        // Allocation, layer, and slot remain those of this physical receipt.
+        self.presentation_revision == snapshot.presentationrevision
+            && self.matches_content(&snapshot.completed)
+    }
+
+    pub(crate) fn belongs_to(self, surface: Surface) -> bool {
+        self.high == surface.high
+            && self.low == surface.low
+            && self.content_width <= surface.width
+            && self.content_height <= surface.height
+    }
+
     fn parse(detail: &str) -> Option<Self> {
         let mut fields = detail.split(':');
         let id = fields.next()?;
@@ -1125,6 +1173,38 @@ pub(crate) fn retire_imports() {
     RENDERER.with(|renderer| *renderer.borrow_mut() = None);
 }
 
+pub(crate) fn completed_content(
+    frame: &crate::generated::VisualFrame,
+    snapshot: &crate::generated::PresentationSnapshot,
+) -> Option<Surface> {
+    RENDERER.with(|renderer| {
+        let renderer = renderer.borrow();
+        let renderer = renderer.as_ref()?;
+        [&renderer.imported, &renderer.pending]
+            .into_iter()
+            .find_map(|imported| {
+                let imported = imported.as_ref()?;
+                imported.image.completed_content(frame, snapshot)
+            })
+    })
+}
+
+pub(crate) fn retained_surface() -> Option<Surface> {
+    RENDERER.with(|renderer| {
+        let renderer = renderer.borrow();
+        let image = &renderer.as_ref()?.imported.as_ref()?.image;
+        image.retained()
+    })
+}
+
+pub(crate) fn retained_detail() -> Option<(Surface, DetailContent)> {
+    RENDERER.with(|renderer| {
+        let renderer = renderer.borrow();
+        let image = &renderer.as_ref()?.imported.as_ref()?.image;
+        Some((image.retained()?, image.detail.clone()?))
+    })
+}
+
 pub(crate) struct Pipeline {
     format: wgpu::TextureFormat,
 }
@@ -1145,19 +1225,65 @@ struct SurfaceRenderer {
 }
 
 struct Imported {
-    surface: Surface,
+    image: ImagePublication,
     _texture: wgpu::Texture,
     geometry: wgpu::Buffer,
     mailbox: Option<MailboxBindings>,
     owned: [OwnedImage; 2],
+    geometry_key: GeometryKey,
+    drawn_revision: AtomicU64,
+    draw_count: AtomicU64,
+}
+
+// CPU facts travel with their receiver-owned pixels, including across an
+// advertised replacement and while a newer capture awaits native metadata.
+struct ImagePublication {
+    surface: Surface,
     owned_index: usize,
     pending_capture: Option<PendingImage>,
     captured: Option<FrameReady>,
     gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
+    detail: Option<DetailContent>,
     placement: Placement,
-    geometry_key: GeometryKey,
-    drawn_revision: AtomicU64,
-    draw_count: AtomicU64,
+}
+
+#[derive(Clone)]
+pub(crate) struct DetailContent {
+    explore: std::sync::Arc<crate::generated::ExploreSnapshot>,
+    upscale: Option<std::sync::Arc<crate::generated::UpscaleSnapshot>>,
+}
+
+impl DetailContent {
+    fn from_model(model: &crate::view_model::ApplicationModel) -> Option<Self> {
+        let frame = model.viewed_explore_frame()?;
+        let explore = model.explore.snapshot.as_ref()?;
+        Some(Self {
+            explore: std::sync::Arc::new(explore.clone()),
+            upscale: model.current_upscale().filter(|upscale| upscale.frame == frame)
+                .map(|upscale| std::sync::Arc::new(upscale.clone())),
+        })
+    }
+
+    pub(crate) fn frame(&self) -> &crate::generated::VisualFrame {
+        self.upscale.as_ref().map_or(&self.explore.frame, |upscale| &upscale.frame)
+    }
+
+    pub(crate) fn scene(&self) -> &crate::generated::AnnotationSceneContent {
+        self.upscale.as_ref().map_or(&self.explore.scene, |upscale| &upscale.scene)
+    }
+
+    pub(crate) fn overlay(&self) -> &crate::generated::ExploreOverlay {
+        &self.explore.overlay
+    }
+
+    fn matches_model(&self, model: &crate::view_model::ApplicationModel) -> bool {
+        model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.revision == self.explore.revision
+        }) && self.upscale.as_ref().map(|snapshot| snapshot.revision)
+            == model.current_upscale()
+                .filter(|snapshot| snapshot.frame == *self.frame())
+                .map(|snapshot| snapshot.revision)
+    }
 }
 
 struct OwnedImage {
@@ -1170,6 +1296,7 @@ struct PendingImage {
     gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
     placement: Placement,
     index: usize,
+    complete: bool,
 }
 
 struct PreparedDraw {
@@ -1192,7 +1319,7 @@ struct MailboxBindings {
 
 impl Drop for Imported {
     fn drop(&mut self) {
-        trace_surface("retired", self.surface);
+        trace_surface("retired", self.image.surface);
         self._texture.destroy();
         for owned in &self.owned {
             owned.texture.destroy();
@@ -1327,15 +1454,15 @@ impl SurfaceRenderer {
         let Some(imported) = self.imported.as_ref() else {
             return;
         };
-        if imported.captured.is_none() || same_allocation(imported.surface, requested) {
+        if imported.image.captured.is_none() || same_allocation(imported.image.surface, requested) {
             return;
         }
         if !self.pending.as_ref().is_some_and(|pending| {
-            same_allocation(pending.surface, requested) && pending.captured.is_none()
+            same_allocation(pending.image.surface, requested) && pending.image.captured.is_none()
         }) {
             return;
         }
-        let completed = imported.surface;
+        let completed = imported.image.surface;
         let probe = (
             (completed.high, completed.low, completed.generation),
             (requested.high, requested.low, requested.generation),
@@ -1368,20 +1495,20 @@ impl SurfaceRenderer {
         let Some(imported) = self
             .imported
             .as_ref()
-            .filter(|value| value.captured.is_some() && value.captured == value.surface.frame)
+            .filter(|value| value.image.captured.is_some() && value.image.captured == value.image.surface.frame)
         else {
             self.draws.remove(control);
             return;
         };
         let requested = self.requested.expect("prepared surface request");
-        if !retained_draw_admitted(imported.surface, requested, placement) {
+        if !retained_draw_admitted(imported.image.surface, requested, placement) {
             self.draws.remove(control);
             return;
         }
         let mut bounds = self.bounds;
         let mut placement = placement;
         if matches!(placement, Placement::GalleryGrid { .. }) {
-            let Some(snapshot) = imported.gallery.as_ref() else {
+            let Some(snapshot) = imported.image.gallery.as_ref() else {
                 self.draws.remove(control);
                 return;
             };
@@ -1390,22 +1517,22 @@ impl SurfaceRenderer {
         }
         let Some(geometry) = placement_geometry(
             bounds,
-            imported.surface.content_extent(),
+            imported.image.surface.content_extent(),
             placement,
             transform,
         ) else {
             trace_image(
                 "owned_draw_rejected",
                 control,
-                imported.surface,
+                imported.image.surface,
                 requested,
-                imported.gallery.as_deref(),
+                imported.image.gallery.as_deref(),
                 Some((bounds, None)),
             );
             self.draws.remove(control);
             return;
         };
-        let key = geometry_key(imported.surface, bounds, placement, transform);
+        let key = geometry_key(imported.image.surface, bounds, placement, transform);
         let draw = self.draws.entry(control).or_insert_with(|| {
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("mmltk widget image geometry"),
@@ -1424,21 +1551,21 @@ impl SurfaceRenderer {
                 )
             });
             PreparedDraw {
-                owned_index: imported.owned_index,
-                surface: imported.surface,
+                owned_index: imported.image.owned_index,
+                surface: imported.image.surface,
                 requested,
                 bounds,
                 geometry,
                 placement,
                 gallery: matches!(placement, Placement::GalleryGrid { .. })
-                    .then(|| imported.gallery.clone())
+                    .then(|| imported.image.gallery.clone())
                     .flatten(),
                 uniform,
                 bindings,
                 key,
             }
         });
-        if !same_allocation(draw.surface, imported.surface) {
+        if !same_allocation(draw.surface, imported.image.surface) {
             draw.bindings = std::array::from_fn(|index| {
                 bind_group(
                     device,
@@ -1453,14 +1580,14 @@ impl SurfaceRenderer {
             write_content_geometry(queue, &draw.uniform, key);
             draw.key = key;
         }
-        draw.owned_index = imported.owned_index;
-        draw.surface = imported.surface;
+        draw.owned_index = imported.image.owned_index;
+        draw.surface = imported.image.surface;
         draw.requested = requested;
         draw.bounds = bounds;
         draw.geometry = geometry;
         draw.placement = placement;
         draw.gallery = matches!(placement, Placement::GalleryGrid { .. })
-            .then(|| imported.gallery.clone())
+            .then(|| imported.image.gallery.clone())
             .flatten();
     }
 
@@ -1483,18 +1610,18 @@ impl SurfaceRenderer {
         if self
             .imported
             .as_ref()
-            .is_some_and(|imported| same_allocation(imported.surface, surface))
+            .is_some_and(|imported| same_allocation(imported.image.surface, surface))
         {
             self.discard_pending();
         }
         let imported_matches = self
             .imported
             .as_ref()
-            .is_some_and(|imported| same_allocation(imported.surface, surface));
+            .is_some_and(|imported| same_allocation(imported.image.surface, surface));
         let pending_matches = self
             .pending
             .as_ref()
-            .is_some_and(|pending| same_allocation(pending.surface, surface));
+            .is_some_and(|pending| same_allocation(pending.image.surface, surface));
         if imported_matches || pending_matches {
             let selected = if imported_matches {
                 self.imported.as_mut()
@@ -1560,16 +1687,19 @@ impl SurfaceRenderer {
             OwnedImage { texture, view }
         });
         let mut imported = Imported {
-            surface,
+            image: ImagePublication {
+                surface,
+                owned_index: 0,
+                pending_capture: None,
+                captured: None,
+                gallery: gallery::matching(surface.frame),
+                detail: None,
+                placement,
+            },
             _texture: texture,
             geometry,
             mailbox: None,
             owned,
-            owned_index: 0,
-            pending_capture: None,
-            captured: None,
-            gallery: gallery::matching(surface.frame),
-            placement,
             geometry_key,
             drawn_revision: AtomicU64::new(0),
             draw_count: AtomicU64::new(0),
@@ -1582,12 +1712,12 @@ impl SurfaceRenderer {
     fn discard_pending(&mut self) {
         if let Some(pending) = self.pending.take() {
             trace_surface(
-                if pending.pending_capture.is_some() {
+                if pending.image.pending_capture.is_some() {
                     "pending_capture_discarded"
                 } else {
                     "pending_discarded"
                 },
-                pending.surface,
+                pending.image.surface,
             );
         }
     }
@@ -1631,7 +1761,7 @@ impl SurfaceRenderer {
         let Some(imported) = self
             .imported
             .as_ref()
-            .filter(|imported| imported.captured == Some(frame))
+            .filter(|imported| imported.image.captured == Some(frame))
         else {
             trace_draw("owned_draw_rejected", control_id, draw, image, clip);
             return;
@@ -1685,7 +1815,7 @@ impl SurfaceRenderer {
             }
         }
         if control_id == crate::view::explore::DETAIL_WORKSPACE_ID {
-            record_drawn_detail(frame, draw.surface.content_region());
+            record_drawn_detail(draw.surface, draw.surface.content_region());
         }
         let prior_draw = imported
             .drawn_revision
@@ -1756,24 +1886,56 @@ fn preserving_color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColo
     }
 }
 
-pub(crate) fn promote_completed(frame: FrameReady) {
+pub(crate) fn complete_capture(frame: FrameReady) {
     trace_frame("completion_received", frame);
+    RENDERER.with(|renderer| {
+        if let Some(renderer) = renderer.borrow_mut().as_mut() {
+            for imported in [&mut renderer.imported, &mut renderer.pending].into_iter().flatten() {
+                imported.image.complete(frame);
+            }
+        }
+    });
+}
+
+pub(crate) fn discard_capture(frame: FrameReady) {
+    RENDERER.with(|renderer| {
+        if let Some(renderer) = renderer.borrow_mut().as_mut() {
+            for imported in [&mut renderer.imported, &mut renderer.pending].into_iter().flatten() {
+                imported.image.discard(frame);
+            }
+        }
+    });
+}
+
+pub(crate) fn reconcile_completed(frame: FrameReady, model: &crate::view_model::ApplicationModel) {
+    if model.completed_presentation_reconciliation().ok()
+        != Some(crate::view_model::PresentationReconciliation::Matching)
+        || model.presentation.as_ref().is_none_or(|snapshot| !frame.matches_completed(snapshot))
+    {
+        return;
+    }
     RENDERER.with(|renderer| {
         let mut renderer = renderer.borrow_mut();
         let Some(renderer) = renderer.as_mut() else {
             return;
         };
+        if let Some(imported) = renderer.imported.as_mut()
+            && imported.image.captured == Some(frame)
+        {
+            imported.image.refresh_detail(model);
+            return;
+        }
         if renderer
             .imported
             .as_mut()
-            .is_some_and(|imported| imported.promote(frame))
+            .is_some_and(|imported| imported.image.promote(frame, model))
         {
             return;
         }
         if renderer
             .pending
             .as_mut()
-            .is_some_and(|pending| pending.promote(frame))
+            .is_some_and(|pending| pending.image.promote(frame, model))
         {
             if renderer.imported.is_some() {
                 trace_surface(
@@ -1782,7 +1944,7 @@ pub(crate) fn promote_completed(frame: FrameReady) {
                         .pending
                         .as_ref()
                         .expect("completed pending image")
-                        .surface,
+                        .image.surface,
                 );
             }
             renderer.imported = renderer.pending.take();
@@ -1790,12 +1952,49 @@ pub(crate) fn promote_completed(frame: FrameReady) {
     });
 }
 
-impl Imported {
-    fn promote(&mut self, frame: FrameReady) -> bool {
-        if !self
+impl ImagePublication {
+    fn refresh_detail(&mut self, model: &crate::view_model::ApplicationModel) {
+        if self.detail.as_ref().is_none_or(|detail| !detail.matches_model(model)) {
+            self.detail = DetailContent::from_model(model);
+        }
+    }
+
+    fn retained(&self) -> Option<Surface> {
+        (self.captured.is_some() && self.captured == self.surface.frame).then_some(self.surface)
+    }
+
+    fn completed_content(
+        &self,
+        frame: &crate::generated::VisualFrame,
+        snapshot: &crate::generated::PresentationSnapshot,
+    ) -> Option<Surface> {
+        self.retained().filter(|surface| surface.frame.is_some_and(|captured| {
+            captured.matches_content(frame) && captured.matches_completed(snapshot)
+        }))
+    }
+
+    fn complete(&mut self, frame: FrameReady) {
+        if let Some(pending) = self.pending_capture.as_mut()
+            && pending.surface.frame == Some(frame)
+        {
+            pending.complete = true;
+        }
+    }
+
+    fn discard(&mut self, frame: FrameReady) {
+        if self.pending_capture.as_ref().is_some_and(|pending| pending.surface.frame == Some(frame)) {
+            self.pending_capture = None;
+        }
+    }
+
+    fn promote(&mut self, frame: FrameReady, model: &crate::view_model::ApplicationModel) -> bool {
+        if model.completed_presentation_reconciliation().ok()
+            != Some(crate::view_model::PresentationReconciliation::Matching)
+            || model.presentation.as_ref().is_none_or(|snapshot| !frame.matches_completed(snapshot))
+            || !self
             .pending_capture
             .as_ref()
-            .is_some_and(|pending| pending.surface.frame == Some(frame))
+            .is_some_and(|pending| pending.complete && pending.surface.frame == Some(frame))
         {
             return false;
         }
@@ -1814,13 +2013,16 @@ impl Imported {
         }
         self.surface = pending.surface;
         self.gallery = pending.gallery;
+        self.detail = DetailContent::from_model(model);
         self.placement = pending.placement;
         self.owned_index = pending.index;
         self.captured = Some(frame);
         trace_surface("owned_capture_promoted", self.surface);
         true
     }
+}
 
+impl Imported {
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -1833,23 +2035,23 @@ impl Imported {
         placement: Placement,
         transform: ViewTransform,
     ) {
-        let retained = self.surface;
-        let retained_gallery = self.gallery.clone();
-        let retained_placement = self.placement;
-        self.gallery = gallery::matching(surface.frame).or_else(|| {
-            (self.captured == surface.frame)
+        let retained = self.image.surface;
+        let retained_gallery = self.image.gallery.clone();
+        let retained_placement = self.image.placement;
+        self.image.gallery = gallery::matching(surface.frame).or_else(|| {
+            (self.image.captured == surface.frame)
                 .then(|| retained_gallery.clone())
                 .flatten()
         });
-        self.placement = placement;
+        self.image.placement = placement;
         refresh_import(self, surface, bounds, placement, transform, queue);
         self.capture(device, queue, pipeline, layout, sampler);
-        if self.captured.is_some()
-            && (self.captured != surface.frame
+        if self.image.captured.is_some()
+            && (self.image.captured != surface.frame
                 || !retained_draw_admitted(retained, surface, placement))
         {
-            self.gallery = retained_gallery;
-            self.placement = retained_placement;
+            self.image.gallery = retained_gallery;
+            self.image.placement = retained_placement;
             refresh_import(self, retained, bounds, retained_placement, transform, queue);
         }
     }
@@ -1862,23 +2064,23 @@ impl Imported {
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
     ) {
-        let Some(frame) = self.surface.frame else {
+        let Some(frame) = self.image.surface.frame else {
             return;
         };
-        if self.captured == Some(frame)
-            || self
+        if self.image.captured == Some(frame)
+            || self.image
                 .pending_capture
                 .as_ref()
                 .is_some_and(|pending| pending.surface.frame == Some(frame))
         {
             return;
         }
-        if matches!(self.placement, Placement::GalleryGrid { .. }) && self.gallery.is_none() {
+        if matches!(self.image.placement, Placement::GalleryGrid { .. }) && self.image.gallery.is_none() {
             trace_image(
                 "capture_rejected",
                 "",
-                self.surface,
-                self.surface,
+                self.image.surface,
+                self.image.surface,
                 None,
                 None,
             );
@@ -1886,8 +2088,8 @@ impl Imported {
         }
         if frame.content_width == 0
             || frame.content_height == 0
-            || frame.content_width > self.surface.width
-            || frame.content_height > self.surface.height
+            || frame.content_width > self.image.surface.width
+            || frame.content_height > self.image.surface.height
         {
             retire_publication(frame);
             return;
@@ -1896,9 +2098,9 @@ impl Imported {
             trace_image(
                 "capture_unavailable",
                 "",
-                self.surface,
-                self.surface,
-                self.gallery.as_deref(),
+                self.image.surface,
+                self.image.surface,
+                self.image.gallery.as_deref(),
                 None,
             );
             return;
@@ -1921,7 +2123,7 @@ impl Imported {
             }
         });
         let binding = mailbox_binding(frame).expect("acquired mailbox binding");
-        let owned_index = 1 - self.owned_index;
+        let owned_index = 1 - self.image.owned_index;
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("mmltk receiver-owned capture"),
         });
@@ -1953,25 +2155,26 @@ impl Imported {
         // Subsequent Iced submissions on this queue see the completed capture.
         // App rejection/replacement cannot return this slot while capture runs.
         // The completion closure owns custody even if this pipeline is dropped.
-        let captured_surface = self.surface;
+        let captured_surface = self.image.surface;
         queue.on_submitted_work_done(move || {
             trace_surface("owned_capture_completed", captured_surface);
             drop(borrow);
             notify_surface(Notification::Completed(frame));
             trace_surface("owned_capture_notified", captured_surface);
         });
-        self.pending_capture = Some(PendingImage {
-            surface: self.surface,
-            gallery: self.gallery.clone(),
-            placement: self.placement,
+        self.image.pending_capture = Some(PendingImage {
+            surface: self.image.surface,
+            gallery: self.image.gallery.clone(),
+            placement: self.image.placement,
             index: owned_index,
+            complete: false,
         });
         trace_image(
             "owned_capture_submitted",
             "",
-            self.surface,
-            self.surface,
-            self.gallery.as_deref(),
+            self.image.surface,
+            self.image.surface,
+            self.image.gallery.as_deref(),
             None,
         );
     }
@@ -1998,7 +2201,7 @@ fn refresh_import(
         write_content_geometry(queue, &imported.geometry, geometry_key);
         imported.geometry_key = geometry_key;
     }
-    imported.surface = surface;
+    imported.image.surface = surface;
 }
 
 fn mailbox_binding(frame: FrameReady) -> Option<usize> {
@@ -2122,8 +2325,7 @@ fn reserve_release(frame: FrameReady) -> bool {
             return true;
         };
         if slot.is_some_and(|prior| {
-            prior.high == frame.high
-                && prior.low == frame.low
+            same_mailbox_slot(prior, frame)
                 && prior.presentation_revision >= frame.presentation_revision
         }) {
             return false;
@@ -2174,6 +2376,11 @@ pub(crate) fn reset_test_releases() {
     RELEASED_FRAMES.with(|released| released.set([None; 6]));
     TEST_RELEASES.with(|released| released.borrow_mut().clear());
     clear_drawn_detail();
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture_borrow(frame: FrameReady) -> impl Drop {
+    CaptureBorrow::acquire(frame).expect("accepted physical publication")
 }
 
 #[cfg(test)]
@@ -2293,6 +2500,324 @@ mod tests {
             presentation_revision,
             content_width,
             content_height,
+        }
+    }
+
+    #[test]
+    fn completion_authorization_matches_all_available_native_identity() {
+        let source = crate::view_model::test_support::visual_frame(
+            crate::generated::PresentationSourceKind::Explore, 7,
+        );
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let snapshot = model.presentation.as_mut().unwrap();
+        snapshot.completed = source.clone();
+        snapshot.presentationrevision = 11;
+        snapshot.capability.surfacehigh = 1;
+        snapshot.capability.surfacelow = 2;
+        let original = frame_ready(
+            crate::generated::presentation_source_session(source.source.kind),
+            source.revision, 11, source.extent.width, source.extent.height,
+        );
+        let surface = surface_for_content_session(original.content_session);
+        assert!(original.matches_completed(snapshot));
+        for field in 0..8 {
+            let mut different = original;
+            match field {
+                0 => different.high += 1,
+                1 => different.low += 1,
+                2 => different.layer += 1,
+                3 => different.slot = MAILBOX_SLOTS,
+                4 => different.content_session += 1,
+                5 => different.content_sequence += 1,
+                6 => different.presentation_revision += 1,
+                _ => different.content_width += 1,
+            }
+            assert!(!different.matches_completed(snapshot) || !different.belongs_to(surface));
+            assert_ne!(different, original);
+        }
+        assert!(!FrameReady { content_height: original.content_height + 1, ..original }
+            .matches_completed(snapshot));
+        let reused = FrameReady { content_sequence: 8, presentation_revision: 12, ..original };
+        assert!(same_mailbox_slot(original, reused));
+        assert_ne!(original, reused);
+        snapshot.capability.surfacelow += 1;
+        snapshot.capability.generation += 1;
+        snapshot.capability.condition = crate::generated::PresentationCapabilityCondition::Admitted;
+        assert!(original.matches_completed(snapshot));
+        assert!(original.belongs_to(surface));
+    }
+
+    #[test]
+    fn captured_predecessor_survives_every_causal_metadata_and_capture_order() {
+        use crate::generated::{ExploreMode, FeatureId, PresentationSourceKind};
+        use crate::view_model::test_support::{annotation_object, bootstrapped, physical_surface, visual_frame};
+
+        for replacement in [false, true] {
+            for domain_position in 0..4 {
+                for control_position in (0..4).filter(|position| *position != domain_position) {
+                    // A physical sample must exist before its receiver copy can
+                    // complete. Cover all twelve orders respecting that edge.
+                    let remaining: Vec<_> = (0..4)
+                        .filter(|position| *position != domain_position && *position != control_position)
+                        .collect();
+                    let physical_position = remaining[0];
+                    let capture_position = remaining[1];
+                    reset_test_releases();
+                    let mut model = bootstrapped();
+                    model.set_foreground_feature(FeatureId::Explore);
+                    let source = visual_frame(PresentationSourceKind::Explore, 1);
+                    let old = frame_ready(1, 1, 5, source.extent.width, source.extent.height);
+                    let mut previous = physical_surface(old);
+                    previous.viewer_identity = Some((9, 0));
+                    let explore = model.explore.snapshot.as_mut().unwrap();
+                    explore.ready = true;
+                    explore.revision = 10;
+                    explore.mode = ExploreMode::Detail;
+                    explore.selectedimage = Some(0);
+                    explore.dataset.identity = 9;
+                    explore.frame = source.clone();
+                    explore.overlay.showlabels = true;
+                    explore.scene.categories = vec![crate::generated::ArtifactClassName { value: "predecessor".into() }];
+                    explore.scene.objects = vec![annotation_object(0)];
+                    let mut next_explore = explore.clone();
+                    next_explore.revision = 20;
+                    next_explore.frame.revision = 2;
+                    next_explore.scene.categories[0].value = "successor".into();
+                    next_explore.scene.objects[0].box_.first.x += 17.0;
+                    let snapshot = model.presentation.as_mut().unwrap();
+                    snapshot.completed = source;
+                    snapshot.completedsourcerevision = 10;
+                    snapshot.presentationrevision = 5;
+                    let mut next = FrameReady { content_sequence: 2, presentation_revision: 6, slot: 1, ..old };
+                    let mut target = previous;
+                    if replacement {
+                        next.low += 1;
+                        target.low = next.low;
+                        target.generation += 1;
+                        target.width *= 2;
+                        target.height *= 2;
+                    }
+                    target.frame = Some(next);
+                    // Capability B is already advertised while completion still
+                    // identifies A/F0. It cannot change the retained image.
+                    snapshot.capability.surfacehigh = target.high;
+                    snapshot.capability.surfacelow = target.low;
+                    snapshot.capability.generation = target.generation;
+                    snapshot.capability.extent.width = target.width;
+                    snapshot.capability.extent.height = target.height;
+                    snapshot.capability.condition = if replacement {
+                        crate::generated::PresentationCapabilityCondition::Admitted
+                    } else {
+                        crate::generated::PresentationCapabilityCondition::Ready
+                    };
+                    let mut next_control = snapshot.clone();
+                    next_control.completed = next_explore.frame.clone();
+                    next_control.completedsourcerevision = 20;
+                    next_control.presentationrevision = 6;
+                    next_control.capability.condition = crate::generated::PresentationCapabilityCondition::Ready;
+                    assert!(accept_publication(old));
+                    drop(CaptureBorrow::acquire(old).unwrap());
+                    let mut image = ImagePublication {
+                        surface: previous,
+                        owned_index: 0,
+                        pending_capture: None,
+                        captured: Some(old),
+                        gallery: None,
+                        detail: DetailContent::from_model(&model),
+                        placement: Placement::Contain,
+                    };
+                    record_drawn_detail(image.surface, image.surface.content_region());
+                    assert!(viewer_copy_matches(&model, image.detail.as_ref().unwrap().frame()));
+                    assert_eq!(image.completed_content(
+                        image.detail.as_ref().unwrap().frame(), model.presentation.as_ref().unwrap(),
+                    ), Some(previous));
+                    assert!(image.completed_content(&next_explore.frame, model.presentation.as_ref().unwrap()).is_none());
+                    let mut copy = None;
+                    let mut replacement_image: Option<ImagePublication> = None;
+                    let mut domain_arrived = false;
+                    let mut control_arrived = false;
+                    let mut capture_completed = false;
+                    for position in 0..4 {
+                        if position == domain_position {
+                            model.explore.snapshot = Some(next_explore.clone());
+                            domain_arrived = true;
+                        } else if position == control_position {
+                            model.presentation = Some(next_control.clone());
+                            control_arrived = true;
+                        } else if position == physical_position {
+                            assert!(accept_publication(next));
+                            copy = CaptureBorrow::acquire(next);
+                            assert!(copy.is_some());
+                            let pending = Some(PendingImage {
+                                surface: target,
+                                gallery: None,
+                                placement: Placement::Contain,
+                                index: 1,
+                                complete: false,
+                            });
+                            if replacement {
+                                replacement_image = Some(ImagePublication {
+                                    surface: target,
+                                    owned_index: 0,
+                                    pending_capture: pending,
+                                    captured: None,
+                                    gallery: None,
+                                    detail: None,
+                                    placement: Placement::Contain,
+                                });
+                            } else {
+                                image.pending_capture = pending;
+                            }
+                        } else {
+                            assert_eq!(position, capture_position);
+                            drop(copy.take());
+                            replacement_image.as_mut().unwrap_or(&mut image).complete(next);
+                            capture_completed = true;
+                        }
+                        if replacement {
+                            if replacement_image.as_mut().is_some_and(|candidate| candidate.promote(next, &model)) {
+                                image = replacement_image.take().unwrap();
+                            }
+                        } else {
+                            let _ = image.promote(next, &model);
+                        }
+                        let promoted = domain_arrived && control_arrived && capture_completed;
+                        assert_eq!(image.surface, if promoted { target } else { previous });
+                        assert_eq!(image.captured, Some(if promoted { next } else { old }));
+                        assert_eq!(image.owned_index, usize::from(promoted));
+                        let meaning = image.detail.as_ref().unwrap();
+                        assert_eq!(meaning.scene().categories[0].value, if promoted { "successor" } else { "predecessor" });
+                        assert_eq!(meaning.scene().objects[0].box_.first.x,
+                            if promoted { next_explore.scene.objects[0].box_.first.x }
+                            else { next_explore.scene.objects[0].box_.first.x - 17.0 });
+                        assert!(meaning.overlay().showlabels);
+                        record_drawn_detail(image.surface, image.surface.content_region());
+                        let authorized = model.viewed_explore_frame()
+                            .is_some_and(|source| viewer_copy_matches(&model, &source));
+                        assert_eq!(authorized, promoted || (!domain_arrived && !control_arrived));
+                        assert_eq!(test_releases(), if capture_completed { vec![old, next] } else { vec![old] });
+                    }
+                    image.complete(next); // A duplicate completion cannot promote or release twice.
+                    assert!(!image.promote(next, &model));
+                    retire_publication(next);
+                    assert_eq!(test_releases(), vec![old, next]);
+                    // Label-only metadata advances no physical frame. Update
+                    // its coherent semantics without recapturing or releasing.
+                    let labels = model.explore.snapshot.as_mut().unwrap();
+                    labels.revision += 1;
+                    labels.overlay.showlabels = false;
+                    assert_eq!(model.completed_presentation_reconciliation().unwrap(),
+                        crate::view_model::PresentationReconciliation::Matching);
+                    image.refresh_detail(&model);
+                    assert!(!image.detail.as_ref().unwrap().overlay().showlabels);
+                    assert_eq!(image.retained(), Some(target));
+                    assert_eq!(test_releases(), vec![old, next]);
+                    let obsolete = FrameReady { content_sequence: 3, presentation_revision: 7, ..next };
+                    assert!(accept_publication(obsolete));
+                    let unsettled = CaptureBorrow::acquire(obsolete).unwrap();
+                    image.pending_capture = Some(PendingImage {
+                        surface: Surface { frame: Some(obsolete), ..target },
+                        gallery: None,
+                        placement: Placement::Contain,
+                        index: 0,
+                        complete: false,
+                    });
+                    let current = model.explore.snapshot.as_mut().unwrap();
+                    current.revision = 40;
+                    current.frame.revision = 4;
+                    let completed = model.presentation.as_mut().unwrap();
+                    completed.completed.revision = 3;
+                    completed.completedsourcerevision = 30;
+                    completed.presentationrevision = 7;
+                    assert_eq!(model.completed_presentation_reconciliation().unwrap(),
+                        crate::view_model::PresentationReconciliation::Superseded);
+                    image.discard(obsolete);
+                    retire_publication(obsolete);
+                    assert_eq!(test_releases(), vec![old, next]); // GPU custody still owns this release.
+                    drop(unsettled);
+                    image.complete(obsolete);
+                    assert!(!image.promote(obsolete, &model));
+                    assert_eq!(image.retained(), Some(target));
+                    assert_eq!(image.detail.as_ref().unwrap().scene().categories[0].value, "successor");
+                    assert_eq!(test_releases(), vec![old, next, obsolete]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn receiver_capture_is_reconciled_after_transport_continuity_recovery() {
+        use crate::generated::{ExploreMode, FeatureId, PresentationSourceKind};
+        use crate::view_model::test_support::{bootstrapped, physical_surface, visual_frame};
+        for matching in [false, true] {
+            for completed_before_disconnect in [false, true] {
+                reset_test_releases();
+                let mut model = bootstrapped();
+                model.set_foreground_feature(FeatureId::Explore);
+                let source = visual_frame(PresentationSourceKind::Explore, 1);
+                let frame = frame_ready(1, 1, 5, source.extent.width, source.extent.height);
+                let surface = physical_surface(frame);
+                let explore = model.explore.snapshot.as_mut().unwrap();
+                explore.ready = true;
+                explore.mode = ExploreMode::Detail;
+                explore.selectedimage = Some(0);
+                explore.revision = 10;
+                explore.frame = source.clone();
+                let control = model.presentation.as_mut().unwrap();
+                control.completed = source;
+                control.completedsourcerevision = 10;
+                control.presentationrevision = 5;
+                let restored_explore = model.explore.snapshot.clone();
+                let restored_control = model.presentation.clone();
+                assert!(accept_publication(frame));
+                let mut borrow = Some(CaptureBorrow::acquire(frame).unwrap());
+                let mut image = ImagePublication {
+                    surface,
+                    owned_index: 0,
+                    captured: None,
+                    pending_capture: Some(PendingImage {
+                        surface, index: 1, gallery: None,
+                        placement: Placement::Contain, complete: false,
+                    }),
+                    gallery: None,
+                    detail: None,
+                    placement: Placement::Contain,
+                };
+                if completed_before_disconnect {
+                    drop(borrow.take());
+                    image.complete(frame);
+                }
+                model.peer_disconnected(crate::view_model::UiError::transport("capture continuity"));
+                assert!(!image.promote(frame, &model));
+                model.peer_connected();
+                if !completed_before_disconnect {
+                    drop(borrow.take());
+                    image.complete(frame);
+                }
+                assert!(!image.promote(frame, &model));
+                assert_eq!(test_releases(), vec![frame]);
+                assert!(image.pending_capture.as_ref().unwrap().complete);
+                model.presentation = restored_control;
+                model.explore.snapshot = restored_explore;
+                model.set_foreground_feature(FeatureId::Explore);
+                if !matching {
+                    let current = model.explore.snapshot.as_mut().unwrap();
+                    current.revision += 1;
+                    current.frame.revision += 1;
+                }
+                assert_eq!(image.promote(frame, &model), matching);
+                if matching {
+                    assert_eq!(image.retained(), Some(surface));
+                    record_drawn_detail(surface, surface.content_region());
+                    assert!(viewer_copy_matches(&model, image.detail.as_ref().unwrap().frame()));
+                } else {
+                    image.discard(frame);
+                    assert!(image.retained().is_none());
+                    assert!(image.pending_capture.is_none());
+                }
+                retire_publication(frame);
+                assert_eq!(test_releases(), vec![frame]);
+            }
         }
     }
 
@@ -2427,7 +2952,7 @@ mod tests {
             ..old
         };
         assert!(accept_publication(current));
-        record_drawn_detail(old, [0, 0, 640, 480]);
+        record_drawn_detail(crate::view_model::test_support::physical_surface(old), [0, 0, 640, 480]);
         invalidate_drawn_slot(current);
         assert!(drawn_detail().is_none());
         assert!(CaptureBorrow::acquire(old).is_none());

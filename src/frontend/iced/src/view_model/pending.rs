@@ -180,7 +180,7 @@ impl ApplicationModel {
                 }
             }
             ApplicationIntentEndpoint::PresentationSelect => {
-                self.sent_presentation_frame = None;
+                self.presentation_model.clear_sent();
             }
             _ => {}
         }

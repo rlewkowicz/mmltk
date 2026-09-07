@@ -20,16 +20,13 @@ fn label_bounds(
 }
 
 #[derive(Clone)]
-pub(crate) enum Source<'a> {
+pub(crate) enum Source {
     Gallery(std::sync::Arc<crate::generated::ExploreSnapshot>),
-    Detail(
-        &'a crate::generated::AnnotationSceneContent,
-        &'a crate::generated::ExploreOverlay,
-    ),
+    Detail(super::DetailContent),
     Hidden,
 }
 
-impl Source<'_> {
+impl Source {
     fn visit(
         &self,
         mut label: impl FnMut(
@@ -59,7 +56,9 @@ impl Source<'_> {
                     }
                 }
             }
-            Self::Detail(scene, overlay) if overlay.showlabels => {
+            Self::Detail(content) if content.overlay().showlabels => {
+                let scene = content.scene();
+                let overlay = content.overlay();
                 for object in &scene.objects {
                     if !object.enabled
                         || !crate::view::explore::dataset::selection_contains(
@@ -91,20 +90,30 @@ impl Source<'_> {
 
 pub(crate) fn view<'a, Message: 'a>(
     program: Program<Message>,
-    source: Source<'a>,
+    source: Source,
 ) -> Element<'a, Message> {
-    let surface = if matches!(&source, Source::Gallery(_)) {
-        super::gallery::displayed().map_or(program.surface, |(surface, _)| surface)
-    } else {
-        program.surface
+    let surface = match &source {
+        Source::Gallery(_) => super::gallery::displayed().map_or(program.surface, |(surface, _)| surface),
+        Source::Detail(_) => super::retained_detail().map_or(program.surface, |(retained, _)| {
+            if program.surface.frame == retained.frame
+                && super::same_allocation(program.surface, retained)
+            {
+                program.surface
+            } else {
+                retained
+            }
+        }),
+        Source::Hidden => program.surface,
     };
     let placement = program.placement;
+    let transform_surface = program.surface;
     Element::new(Labelled {
         child: iced::widget::shader(program)
             .width(Fill)
             .height(Fill)
             .into(),
         surface,
+        transform_surface,
         placement,
         source,
     })
@@ -113,8 +122,9 @@ pub(crate) fn view<'a, Message: 'a>(
 struct Labelled<'a, Message> {
     child: Element<'a, Message>,
     surface: Surface,
+    transform_surface: Surface,
     placement: super::Placement,
-    source: Source<'a>,
+    source: Source,
 }
 
 impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
@@ -200,7 +210,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             bounds,
             self.surface.content_extent(),
             placement,
-            state.transform_for(self.surface),
+            state.transform_for(self.transform_surface),
         ) else {
             return;
         };
@@ -360,7 +370,7 @@ mod tests {
         snapshot.overlay.showboxes = false;
         snapshot.overlay.showlabels = true;
         assert!(snapshot.labels.is_empty());
-        let collect = |source: Source<'_>| {
+        let collect = |source: Source| {
             let mut labels = Vec::new();
             source.visit(|category, bounds, name, color, count, _| {
                 labels.push((
@@ -373,29 +383,38 @@ mod tests {
             });
             labels
         };
+        let detail = |scene: &crate::generated::AnnotationSceneContent, overlay: &crate::generated::ExploreOverlay| {
+            let mut snapshot = crate::view_model::test_support::explore_snapshot();
+            snapshot.scene = scene.clone();
+            snapshot.overlay = overlay.clone();
+            Source::Detail(super::super::DetailContent {
+                explore: std::sync::Arc::new(snapshot),
+                upscale: None,
+            })
+        };
         assert!(collect(Source::Gallery(std::sync::Arc::new(snapshot.clone()))).is_empty());
-        let labels = collect(Source::Detail(&snapshot.scene, &snapshot.overlay));
+        let labels = collect(detail(&snapshot.scene, &snapshot.overlay));
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].2, "人");
         assert_eq!(labels[0].3, snapshot.scene.palette[0]);
         let mut upscale_scene = snapshot.scene.clone();
         upscale_scene.objects[0].box_.first.x = 123.0;
         assert_eq!(
-            collect(Source::Detail(&upscale_scene, &snapshot.overlay))[0]
+            collect(detail(&upscale_scene, &snapshot.overlay))[0]
                 .1
                 .first
                 .x,
             123.0
         );
         snapshot.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::None;
-        assert!(collect(Source::Detail(&snapshot.scene, &snapshot.overlay)).is_empty());
+        assert!(collect(detail(&snapshot.scene, &snapshot.overlay)).is_empty());
         snapshot.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::Subset;
         snapshot.overlay.classselection.classes = vec![0];
         assert_eq!(
-            collect(Source::Detail(&snapshot.scene, &snapshot.overlay)).len(),
+            collect(detail(&snapshot.scene, &snapshot.overlay)).len(),
             1
         );
         snapshot.scene.objects[0].enabled = false;
-        assert!(collect(Source::Detail(&snapshot.scene, &snapshot.overlay)).is_empty());
+        assert!(collect(detail(&snapshot.scene, &snapshot.overlay)).is_empty());
     }
 }

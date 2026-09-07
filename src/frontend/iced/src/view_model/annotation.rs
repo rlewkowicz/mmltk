@@ -44,7 +44,7 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
                 match self.annotation.install_snapshot(value.snapshot) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
-                        if self.foreground_visual
+                        if self.presentation_model.foreground()
                             == Some(crate::generated::PresentationSourceKind::Annotation)
                         {
                             self.set_foreground_visual(Some(

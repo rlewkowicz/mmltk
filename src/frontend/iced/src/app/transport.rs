@@ -8,8 +8,6 @@ impl App {
             return;
         }
         self.connection = None;
-        self.discard_surface();
-        crate::presentation_surface::retire_imports();
         self.model.peer_disconnected(error);
         self.settings.reset_transport();
         self.workspace.reset_transport(&self.model);
@@ -51,9 +49,7 @@ impl App {
                 self.model.peer_connected();
                 self.settings.reset_transport();
                 self.workspace.reset_transport(&self.model);
-                self.discard_surface();
-                crate::presentation_surface::retire_imports();
-                self.presentation_failed = false;
+                self.presentation.reset_failure();
                 if matches!(
                     connection.send_renderer_observation(RendererObservation::Ready),
                     Err(crate::transport_connection::OutboundSendError::Closed)
@@ -80,7 +76,7 @@ impl App {
     }
 
     pub(super) fn install_bootstrap(&mut self, bootstrap: Bootstrap) {
-        self.presentation_failed = false;
+        self.presentation.reset_failure();
         if let Err(error) = self
             .model
             .install_bootstrap(bootstrap.schema_fingerprint, bootstrap.snapshots)
@@ -95,16 +91,9 @@ impl App {
             self.model
                 .set_foreground_feature(authoritative.settingsstate.currentview);
         }
-        if let Err(error) = self.model.completed_presentation_is_obsolete() {
-            self.retire_peer(error);
-            return;
-        }
         self.workspace.bootstrap_components(&self.model);
         self.reconcile_explore_viewport();
-        self.sync_surface();
-        if let Some(frame) = self.model.presentation_recovery_refresh() {
-            self.select_presentation(frame);
-        }
+        self.reconcile_presentation(None, true);
     }
 
     pub(super) fn reduce_reply(&mut self, reply: IntentReply) {
@@ -164,14 +153,7 @@ impl App {
             installed_settings,
             &mut refresh,
         );
-        if let Err(error) = self.model.completed_presentation_is_obsolete() {
-            self.retire_peer(error);
-            return;
-        }
-        self.sync_surface();
-        if let Some(frame) = refresh {
-            self.select_presentation(frame);
-        }
+        self.reconcile_presentation(refresh, false);
     }
 
     pub(super) fn reduce_event(&mut self, event: SystemEvent) {
@@ -199,7 +181,7 @@ impl App {
             .as_ref()
             .is_some_and(|snapshot| self.model.presentation.as_ref() == Some(snapshot))
         {
-            self.presentation_failed = true;
+            self.presentation.failed();
         }
         if install_component_snapshots {
             self.workspace.install_authoritative_components(&self.model);
@@ -214,7 +196,7 @@ impl App {
             let authoritative_route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
             if self.workspace.active() != authoritative_route {
-                self.retire_surface_frame();
+                self.presentation.retire_frame();
             }
             self.workspace.rebase(authoritative_route, &self.model);
             self.model.set_foreground_feature(authoritative_route);
@@ -232,14 +214,7 @@ impl App {
                 self.model.explore_mutation_available(),
             );
         }
-        if let Err(error) = self.model.completed_presentation_is_obsolete() {
-            self.retire_peer(error);
-            return;
-        }
-        if let Some(frame) = refresh {
-            self.select_presentation(frame);
-        }
-        self.sync_surface();
+        self.reconcile_presentation(refresh, false);
     }
 
     pub(super) fn submit_intent(

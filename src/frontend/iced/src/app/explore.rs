@@ -218,7 +218,7 @@ impl App {
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.selectedimage != Some(compiledindex))
                 {
-                    self.retire_surface_frame();
+                    self.presentation.retire_frame();
                 }
                 self.model.set_foreground_feature(FeatureId::Explore);
                 self.model.explore.requested_selection = Some(compiledindex);
@@ -234,7 +234,7 @@ impl App {
                 self.request_explore_navigation(ExploreNavigation::Next);
             }
             crate::view::explore::Outcome::CloseDetailRequested => {
-                self.retire_surface_frame();
+                self.presentation.retire_frame();
                 self.model.set_foreground_feature(FeatureId::Explore);
                 self.model.explore.desired_navigation = None;
                 self.model.explore.desired_close = true;
@@ -462,7 +462,7 @@ impl App {
     }
 
     fn request_explore_navigation(&mut self, direction: ExploreNavigation) {
-        self.retire_surface_frame();
+        self.presentation.retire_frame();
         self.model.set_foreground_feature(FeatureId::Explore);
         self.model.explore.desired_close = false;
         self.model.explore.desired_navigation = Some(direction);

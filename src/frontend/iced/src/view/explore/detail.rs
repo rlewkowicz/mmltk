@@ -72,8 +72,8 @@ pub(super) fn view<'a>(
         if !shown.as_ref().is_some_and(|shown| {
             surface.frame.is_some_and(|frame| {
                 model.presentation.as_ref().is_some_and(|presentation| {
-                    frame.presentation_revision == presentation.presentationrevision
-                }) && frame.content_sequence == shown.revision
+                    frame.matches_completed(presentation)
+                }) && frame.matches_content(shown)
             })
         }) {
             surface.frame = None;
@@ -108,15 +108,11 @@ pub(super) fn view<'a>(
                     placement: crate::presentation_surface::Placement::Contain,
                     control_id: super::DETAIL_WORKSPACE_ID,
                 },
-                if surface.frame.is_some() && snapshot.overlay.showlabels {
-                    let scene = model
-                        .current_upscale()
-                        .filter(|upscale| shown.as_ref() == Some(&upscale.frame))
-                        .map_or(&snapshot.scene, |upscale| &upscale.scene);
-                    crate::presentation_surface::labels::Source::Detail(scene, &snapshot.overlay)
-                } else {
-                    crate::presentation_surface::labels::Source::Hidden
-                },
+                crate::presentation_surface::retained_detail()
+                    .filter(|(retained, _)| retained.viewer_identity == surface.viewer_identity)
+                    .map_or(crate::presentation_surface::labels::Source::Hidden, |(_, content)| {
+                        crate::presentation_surface::labels::Source::Detail(content)
+                    }),
             )
         },
     );

@@ -123,7 +123,7 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
                 match self.install_explore_snapshot(value.snapshot, false) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
-                        if self.foreground_visual == Some(PresentationSourceKind::Explore) {
+                        if self.presentation_model.foreground() == Some(PresentationSourceKind::Explore) {
                             self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                         }
                     }
@@ -203,7 +203,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     Ok(Observation::Installed) => {
                         if self.current_upscale().is_some()
                             && matches!(
-                                self.foreground_visual,
+                                self.presentation_model.foreground(),
                                 Some(
                                     PresentationSourceKind::Explore
                                         | PresentationSourceKind::Upscale
@@ -238,7 +238,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                             })
                         {
                             self.explore.requested_upscale = None;
-                            if self.foreground_visual == Some(PresentationSourceKind::Upscale) {
+                            if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
                                 self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                             }
                         }

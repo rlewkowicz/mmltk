@@ -1,51 +1,135 @@
 use super::*;
 
+#[derive(Debug, Clone, Default)]
+pub(super) struct PresentationModel {
+    foreground: Option<PresentationSourceKind>,
+    sent: Option<VisualFrame>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reconciliation {
+    Matching,
+    MetadataPending,
+    Superseded,
+}
+
+impl PresentationModel {
+    pub(super) fn foreground(&self) -> Option<PresentationSourceKind> {
+        self.foreground
+    }
+
+    pub(super) fn clear_sent(&mut self) {
+        self.sent = None;
+    }
+
+    fn select(&mut self, foreground: Option<PresentationSourceKind>) {
+        if self.foreground != foreground {
+            self.foreground = foreground;
+            self.clear_sent();
+        }
+    }
+
+    fn refresh(&mut self, frame: Option<VisualFrame>, decision: Reconciliation) -> Option<VisualFrame> {
+        let Some(frame) = frame else {
+            self.clear_sent();
+            return None;
+        };
+        if self.sent.as_ref().is_some_and(|sent| sent.source != frame.source) {
+            self.clear_sent();
+        }
+        (decision == Reconciliation::Superseded && self.sent.as_ref() != Some(&frame))
+            .then_some(frame)
+    }
+
+    fn sent(&mut self, frame: VisualFrame) {
+        self.sent = Some(frame);
+    }
+
+    fn reconcile(
+        domain: Option<crate::generated::ApplicationVisualObservation<'_>>,
+        completed: &PresentationSnapshot,
+    ) -> Result<Reconciliation, UiError> {
+        let Some(domain) = domain else {
+            return Ok(Reconciliation::MetadataPending);
+        };
+        if domain.frame == &completed.completed {
+            return Ok(Reconciliation::Matching);
+        }
+        if domain.frame.source != completed.completed.source {
+            return Ok(Reconciliation::Superseded);
+        }
+        match domain.snapshotrevision.cmp(&completed.completedsourcerevision) {
+            std::cmp::Ordering::Less => Ok(Reconciliation::MetadataPending),
+            std::cmp::Ordering::Greater => Ok(Reconciliation::Superseded),
+            std::cmp::Ordering::Equal => Err(UiError::protocol(
+                "one source observation described different completed frames",
+            )),
+        }
+    }
+}
+
 impl ApplicationModel {
+    fn observed_presentation_source(
+        &self,
+        foreground: PresentationSourceKind,
+        completed: &PresentationSnapshot,
+    ) -> PresentationSourceKind {
+        if foreground == PresentationSourceKind::Explore
+            && completed.completed.source.kind == PresentationSourceKind::Upscale
+            && self.explore.requested_upscale.is_some()
+        {
+            PresentationSourceKind::Upscale
+        } else {
+            foreground
+        }
+    }
+
+    fn reconcile_foreground(
+        &self,
+        foreground: PresentationSourceKind,
+        completed: &PresentationSnapshot,
+    ) -> Result<Reconciliation, UiError> {
+        let observed = self.observed_presentation_source(foreground, completed);
+        let decision = PresentationModel::reconcile(self.frame_observation_for(observed), completed)?;
+        // Once the matching Upscale metadata arrives, it can prove a different
+        // method/image is pending. Until then the physical product must wait.
+        if observed != foreground
+            && decision == Reconciliation::Matching
+            && self.current_upscale().is_none()
+        {
+            Ok(Reconciliation::Superseded)
+        } else {
+            Ok(decision)
+        }
+    }
+
     pub(crate) fn completed_presentation_is_obsolete(&self) -> Result<bool, UiError> {
+        self.completed_presentation_reconciliation()
+            .map(|decision| decision == Reconciliation::Superseded)
+    }
+
+    pub(crate) fn completed_presentation_reconciliation(&self) -> Result<Reconciliation, UiError> {
         let Some(presentation) = self.presentation.as_ref() else {
-            return Ok(false);
+            return Ok(Reconciliation::MetadataPending);
         };
         let completed = &presentation.completed;
-        let Some(kind) = self.foreground_visual else {
-            return Ok(true);
+        let Some(kind) = self.presentation_model.foreground() else {
+            return Ok(Reconciliation::Superseded);
         };
-        if kind == PresentationSourceKind::Explore
-            && completed.source.kind == PresentationSourceKind::Upscale
-        {
-            // The native mailbox may beat the matching Upscale snapshot. Keep
-            // that publication while its explicit viewer demand still exists.
-            return Ok(self.explore.requested_upscale.is_none()
-                || self.upscale_snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot.frame.source == completed.source
-                        && snapshot.frame.revision >= completed.revision
-                        && self.current_upscale().is_none()
-                }));
+        if completed.source.kind != self.observed_presentation_source(kind, presentation) {
+            return Ok(Reconciliation::Superseded);
         }
-        if completed.source.kind != kind {
-            return Ok(true);
-        }
-        let Some((current, current_observation)) = self.frame_observation_for(kind) else {
-            return Ok(false);
-        };
-        if completed == current {
-            return Ok((kind == PresentationSourceKind::Upscale && self.current_upscale().is_none())
+        match self.reconcile_foreground(kind, presentation)? {
+            Reconciliation::Matching if
+                (completed.source.kind == PresentationSourceKind::Upscale && self.current_upscale().is_none())
                 || (kind == PresentationSourceKind::Explore
                     && self.explore.requested_selection.is_some_and(|image| {
                         self.explore
                             .snapshot
                             .as_ref()
                             .is_none_or(|snapshot| snapshot.selectedimage != Some(image))
-                    })));
-        }
-        if completed.source != current.source {
-            return Ok(true);
-        }
-        match current_observation.cmp(&presentation.completedsourcerevision) {
-            std::cmp::Ordering::Less => Ok(false),
-            std::cmp::Ordering::Greater => Ok(true),
-            std::cmp::Ordering::Equal => Err(UiError::protocol(
-                "one source observation described different completed frames",
-            )),
+                    })) => Ok(Reconciliation::Superseded),
+            decision => Ok(decision),
         }
     }
 
@@ -81,12 +165,11 @@ impl ApplicationModel {
     pub fn displayed_upscale_kernel(&self) -> Option<crate::generated::UpscaleKernel> {
         let upscale = self.current_upscale()?;
         let shown = self.viewed_explore_frame()?;
-        let (drawn, _) = crate::presentation_surface::drawn_detail()?;
+        let (surface, _) = crate::presentation_surface::drawn_detail()?;
+        let drawn = surface.frame?;
         (shown == upscale.frame
-            && drawn.presentation_revision == self.presentation.as_ref()?.presentationrevision
-            && drawn.content_sequence == shown.revision
-            && drawn.content_width == shown.extent.width
-            && drawn.content_height == shown.extent.height)
+            && drawn.matches_completed(self.presentation.as_ref()?)
+            && drawn.matches_content(&shown))
             .then_some(upscale.kernel)
     }
 
@@ -119,7 +202,7 @@ impl ApplicationModel {
         {
             return None;
         }
-        let expected = match self.foreground_visual? {
+        let expected = match self.presentation_model.foreground()? {
             PresentationSourceKind::Explore => &explore.frame,
             PresentationSourceKind::Upscale => &self.current_upscale()?.frame,
             _ => return None,
@@ -150,14 +233,14 @@ impl ApplicationModel {
             return None;
         }
         self.frame_observation_for(kind)
-            .map(|(frame, _)| frame)
+            .map(|observation| observation.frame)
             .filter(|frame| Self::valid_visual_source(frame).is_some())
     }
 
     fn frame_observation_for(
         &self,
         kind: PresentationSourceKind,
-    ) -> Option<(&VisualFrame, u64)> {
+    ) -> Option<crate::generated::ApplicationVisualObservation<'_>> {
         crate::generated::ApplicationVisualSnapshots {
             explore: self.explore.snapshot.as_ref(),
             annotation: self.annotation.snapshot.as_ref(),
@@ -166,7 +249,6 @@ impl ApplicationModel {
             predict: self.predict_snapshot.as_ref(),
         }
         .observe(kind)
-        .map(|observation| (observation.frame, observation.snapshotrevision))
     }
 
     pub fn source_for(&self, kind: PresentationSourceKind) -> Option<PresentationSourceIdentity> {
@@ -184,10 +266,7 @@ impl ApplicationModel {
     }
 
     pub(crate) fn set_foreground_visual(&mut self, foreground: Option<PresentationSourceKind>) {
-        if self.foreground_visual != foreground {
-            self.foreground_visual = foreground;
-            self.sent_presentation_frame = None;
-        }
+        self.presentation_model.select(foreground);
     }
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
@@ -204,47 +283,36 @@ impl ApplicationModel {
         {
             return None;
         }
-        let Some(foreground) = self.foreground_visual else {
-            self.sent_presentation_frame = None;
-            return None;
+        let foreground = self.presentation_model.foreground();
+        let frame = foreground.and_then(|kind| self.frame_for(kind)).cloned();
+        let decision = if let (Some(presentation), Some(foreground)) = (self.presentation.as_ref(), foreground) {
+            match self.reconcile_foreground(foreground, presentation) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    self.error = Some(error);
+                    return None;
+                }
+            }
+        } else {
+            Reconciliation::Superseded
         };
-        let Some(frame) = self.frame_for(foreground).cloned() else {
-            self.sent_presentation_frame = None;
-            return None;
-        };
-        if self
-            .sent_presentation_frame
-            .as_ref()
-            .is_some_and(|sent| sent.source != frame.source)
-        {
-            self.sent_presentation_frame = None;
-        }
-        let completed = self
-            .presentation
-            .as_ref()
-            .map(|snapshot| &snapshot.completed);
-        if let (Some(presentation), Some((_, observation))) = (
-            self.presentation.as_ref(),
-            self.frame_observation_for(foreground),
-        ) && presentation.completed.source == frame.source
-            && presentation.completed != frame
-            && presentation.completedsourcerevision >= observation
-        {
-            return None;
-        }
-        (completed != Some(&frame) && self.sent_presentation_frame.as_ref() != Some(&frame))
-            .then_some(frame)
+        self.presentation_model.refresh(frame, decision)
     }
 
     pub fn presentation_recovery_refresh(&self) -> Option<VisualFrame> {
-        self.foreground_visual
-            .and_then(|kind| self.frame_for(kind))
-            .cloned()
+        let kind = self.presentation_model.foreground()?;
+        if let Some(snapshot) = self.presentation.as_ref()
+            && self.reconcile_foreground(kind, snapshot).ok()?
+                == Reconciliation::MetadataPending
+        {
+            return None;
+        }
+        self.frame_for(kind).cloned()
     }
 
     pub fn record_presentation_sent(&mut self, frame: VisualFrame) {
-        if self.foreground_visual.and_then(|kind| self.frame_for(kind)) == Some(&frame) {
-            self.sent_presentation_frame = Some(frame);
+        if self.presentation_model.foreground().and_then(|kind| self.frame_for(kind)) == Some(&frame) {
+            self.presentation_model.sent(frame);
         }
     }
 }
@@ -330,11 +398,13 @@ mod tests {
         let presentation = model.presentation.as_mut().unwrap();
         presentation.completed = frame.clone();
         presentation.presentationrevision = 31;
+        presentation.capability.surfacehigh = 1;
+        presentation.capability.surfacelow = 2;
         crate::presentation_surface::clear_drawn_detail();
         model.explore.sent_upscale = Some(request.clone());
         model.request_upscale(request.clone());
         assert_eq!(
-            model.foreground_visual,
+            model.presentation_model.foreground(),
             Some(PresentationSourceKind::Upscale)
         );
         assert_eq!(model.explore.sent_upscale, Some(request.clone()));
@@ -344,14 +414,14 @@ mod tests {
             low: 2,
             layer: 0,
             slot: 0,
-            content_session: 1,
+            content_session: crate::generated::presentation_source_session(frame.source.kind),
             content_sequence: frame.revision,
             presentation_revision: 31,
             content_width: frame.extent.width,
             content_height: frame.extent.height,
         };
         crate::presentation_surface::record_drawn_detail(
-            drawn,
+            physical_surface(drawn),
             [0, 0, frame.extent.width, frame.extent.height],
         );
         assert_eq!(model.displayed_upscale_kernel(), Some(kernel));
@@ -549,6 +619,62 @@ mod tests {
     }
 
     #[test]
+    fn explore_upscale_reconciliation_uses_observation_order_for_cached_products() {
+        let mut model = bootstrapped();
+        let input = select_upscale_source(&mut model, crate::generated::UpscaleKernel::Default);
+        let cached = visual_frame(PresentationSourceKind::Upscale, 3);
+        let newer_pixels = visual_frame(PresentationSourceKind::Upscale, 19);
+        {
+            let upscale = model.upscale_snapshot.as_mut().unwrap();
+            upscale.ready = true;
+            upscale.busy = false;
+            upscale.input = input;
+            upscale.frame = newer_pixels;
+            upscale.revision = 10;
+        }
+        {
+            let presentation = model.presentation.as_mut().unwrap();
+            presentation.completed = cached.clone();
+            presentation.completedsourcerevision = 20;
+        }
+        // The older physical product was selected later than our current metadata.
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+        assert!(model.presentation_refresh().is_none());
+        assert!(model.presentation_recovery_refresh().is_none());
+        model.upscale_snapshot.as_mut().unwrap().revision = 20;
+        assert!(model.completed_presentation_is_obsolete().is_err());
+        assert!(model.presentation_refresh().is_none());
+        assert!(model.presentation_recovery_refresh().is_none());
+        model.upscale_snapshot.as_mut().unwrap().frame = cached.clone();
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+        model.upscale_snapshot.as_mut().unwrap().revision = 21;
+        assert!(!model.completed_presentation_is_obsolete().unwrap());
+        model.upscale_snapshot.as_mut().unwrap().frame.revision = 2;
+        assert!(model.completed_presentation_is_obsolete().unwrap());
+        model.explore.requested_upscale = None;
+        assert!(model.completed_presentation_is_obsolete().unwrap());
+    }
+
+    #[test]
+    fn refresh_and_recovery_share_equal_observation_continuity_checks() {
+        let mut model = bootstrapped();
+        model.set_foreground_feature(FeatureId::Explore);
+        let explore = model.explore.snapshot.as_mut().unwrap();
+        explore.ready = true;
+        explore.revision = 20;
+        explore.frame = visual_frame(PresentationSourceKind::Explore, 3);
+        let completed = model.presentation.as_mut().unwrap();
+        completed.completed = visual_frame(PresentationSourceKind::Explore, 19);
+        completed.completedsourcerevision = 20;
+        assert!(model.presentation_refresh().is_none());
+        assert!(model.completed_presentation_is_obsolete().is_err());
+        assert!(model.presentation_recovery_refresh().is_none());
+        model.explore.snapshot.as_mut().unwrap().revision = 21;
+        assert_eq!(model.presentation_refresh().unwrap().revision, 3);
+        assert_eq!(model.presentation_recovery_refresh().unwrap().revision, 3);
+    }
+
+    #[test]
     fn predict_observation_retains_native_metadata_revision() {
         let mut model = bootstrapped();
         let mut snapshot = model.predict_snapshot.clone().unwrap();
@@ -560,9 +686,9 @@ mod tests {
         model.install_predict_snapshot(snapshot.clone()).unwrap();
         snapshot.revision = 12;
         model.install_predict_snapshot(snapshot.clone()).unwrap();
-        let (frame, revision) = model.frame_observation_for(PresentationSourceKind::Predict).unwrap();
-        assert_eq!(frame, &snapshot.frame);
-        assert_eq!(revision, 12);
+        let observation = model.frame_observation_for(PresentationSourceKind::Predict).unwrap();
+        assert_eq!(observation.frame, &snapshot.frame);
+        assert_eq!(observation.snapshotrevision, 12);
         assert_eq!(model.install_predict_snapshot(snapshot.clone()).unwrap(), super::super::reduction::Observation::Current);
         let mut conflict = snapshot.clone();
         conflict.operation.progress.completed += 1;
@@ -574,7 +700,7 @@ mod tests {
         snapshot.revision = 11;
         snapshot.frame.revision = 5;
         assert_eq!(model.install_predict_snapshot(snapshot).unwrap(), super::super::reduction::Observation::Stale);
-        assert_eq!(model.frame_observation_for(PresentationSourceKind::Predict).unwrap().1, 12);
+        assert_eq!(model.frame_observation_for(PresentationSourceKind::Predict).unwrap().snapshotrevision, 12);
     }
 
     #[test]
@@ -782,7 +908,7 @@ mod tests {
             crate::generated::UpscaleChanged { snapshot: upscale },
         ));
         assert_eq!(
-            model.foreground_visual,
+            model.presentation_model.foreground(),
             Some(PresentationSourceKind::Annotation)
         );
         assert!(model.current_upscale().is_none());

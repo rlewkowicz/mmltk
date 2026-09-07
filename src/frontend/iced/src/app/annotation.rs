@@ -109,7 +109,7 @@ impl App {
         let source = self
             .model
             .viewed_explore_frame()
-            .filter(|source| self.viewer_copy_matches(source));
+            .filter(|source| crate::presentation_surface::viewer_copy_matches(&self.model, source));
         let originalcontent = self
             .model
             .explore
@@ -120,38 +120,6 @@ impl App {
             source,
             originalcontent,
         }))
-    }
-
-    fn viewer_copy_matches(&self, source: &VisualFrame) -> bool {
-        crate::presentation_surface::drawn_detail().is_some_and(|(frame, crop)| {
-            let original = self
-                .model
-                .explore
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.detail.showoriginaldimensions);
-            let expected = if original {
-                [
-                    source.content.x,
-                    source.content.y,
-                    source.content.width,
-                    source.content.height,
-                ]
-            } else {
-                [0, 0, source.extent.width, source.extent.height]
-            };
-            self.model
-                .presentation
-                .as_ref()
-                .is_some_and(|presentation| {
-                    frame.presentation_revision == presentation.presentationrevision
-                })
-                && self
-                    .surface
-                    .is_some_and(|surface| surface.high == frame.high && surface.low == frame.low)
-                && frame.content_sequence == source.revision
-                && crop == expected
-        })
     }
 
     fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>) -> bool {

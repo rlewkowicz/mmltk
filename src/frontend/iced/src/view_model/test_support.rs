@@ -1,6 +1,22 @@
 use super::model_selection::effective_model_selection;
 use super::*;
 
+pub(crate) fn physical_surface(frame: crate::presentation_surface::FrameReady) -> crate::presentation_surface::Surface {
+    crate::presentation_surface::Surface {
+        high: frame.high,
+        low: frame.low,
+        generation: 1,
+        width: frame.content_width,
+        height: frame.content_height,
+        timeline_ready: 0,
+        frame: Some(frame),
+        integration: false,
+        crop: None,
+        viewer_identity: None,
+        fit_revision: 0,
+    }
+}
+
 pub(crate) fn bootstrapped() -> ApplicationModel {
     let mut model = ApplicationModel::default();
     let snapshots = crate::generated::application_snapshot_defaults()

@@ -16,6 +16,7 @@ pub(crate) use reduction::invalid_visual_frame;
 pub use crate::generated::ApplicationIntentEndpoint;
 pub use annotation::AnnotationModel;
 pub use explore::{ExploreModel, ExplorePresentationState};
+pub(crate) use presentation::Reconciliation as PresentationReconciliation;
 pub(crate) use model_selection::{ModelSettingsProjection, model_settings_projection};
 use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
@@ -178,8 +179,7 @@ pub struct ApplicationModel {
     dialog_context: Option<DialogContext>,
     pending: BTreeMap<u64, PendingRequest>,
     next_correlation: u64,
-    foreground_visual: Option<PresentationSourceKind>,
-    sent_presentation_frame: Option<VisualFrame>,
+    presentation_model: presentation::PresentationModel,
 }
 
 #[derive(Debug, Clone)]
@@ -216,8 +216,7 @@ impl Default for ApplicationModel {
             dialog_context: None,
             pending: BTreeMap::new(),
             next_correlation: 1,
-            foreground_visual: None,
-            sent_presentation_frame: None,
+            presentation_model: presentation::PresentationModel::default(),
         }
     }
 }
