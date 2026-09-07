@@ -31,8 +31,12 @@ target_link_libraries(mmltk_controller_annotation_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::controller::visual_runtime
         mmltk::backend::imaging::raster
         stb)
+mmltk_link_declarations(mmltk_controller_annotation_system PUBLIC
+    mmltk::controller::visual_runtime)
+mmltk_register_header_isolation(mmltk_controller_annotation_system)
 
 function(mmltk_add_controller_annotation_tests)
     add_executable(mmltk_controller_annotation_tests EXCLUDE_FROM_ALL)

@@ -40,8 +40,9 @@
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/subsystems/live/live_receiver_copy.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/services/settings_system.h"
@@ -1946,7 +1947,7 @@ class MutableVisualSource final {
         std::scoped_lock lock(mutex_);
         frame_ = visual_frame(identity_, extent, borrowed.plane(0U).revision());
         frame_.clean_revision = frame_.revision;
-        snapshot_revision_ = presentation::detail::advance_monotonic_identity(snapshot_revision_);
+        snapshot_revision_ = mmltk::common::types::advance_monotonic_identity(snapshot_revision_);
     }
     void SetSemantics(const std::uint8_t value) {
         const auto current = frame();
@@ -1954,7 +1955,7 @@ class MutableVisualSource final {
                          [value](const auto, const auto semantic, const auto) { Fill(semantic, value); });
         std::scoped_lock lock(mutex_);
         frame_.revision = runtime_.output().revision();
-        snapshot_revision_ = presentation::detail::advance_monotonic_identity(snapshot_revision_);
+        snapshot_revision_ = mmltk::common::types::advance_monotonic_identity(snapshot_revision_);
     }
     [[nodiscard]] VisualFrame frame() const {
         std::scoped_lock lock(mutex_);
@@ -2099,9 +2100,19 @@ class PresentationFailureProbe final {
 }
 
 TEST_CASE("Presentation monotonic identities fail before wrap") {
-    namespace identity = mmltk::controller::presentation::detail;
+    namespace identity = mmltk::common::types;
     CHECK(identity::advance_monotonic_identity(0U) == 1U);
+    CHECK(identity::advance_monotonic_identity(4U, 2U) == 6U);
+    CHECK_THROWS_AS(identity::advance_monotonic_identity(4U, 0U), std::overflow_error);
     CHECK_THROWS_AS(identity::advance_monotonic_identity(std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
+    std::uint64_t next = 0U;
+    CHECK_THROWS_AS(identity::take_monotonic_identity(next), std::overflow_error);
+    CHECK(next == 0U);
+    next = 3U;
+    CHECK(identity::take_monotonic_identity(next, 0U) == 3U);
+    CHECK(next == 3U);
+    CHECK(identity::take_monotonic_identity(next, 2U) == 3U);
+    CHECK(next == 5U);
     std::uint64_t timeline = std::numeric_limits<std::uint64_t>::max() - 1U;
     CHECK_THROWS_AS(identity::take_monotonic_identity(timeline, 2U), std::overflow_error);
     CHECK(timeline == std::numeric_limits<std::uint64_t>::max() - 1U);

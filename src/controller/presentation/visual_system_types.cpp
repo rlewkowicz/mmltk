@@ -1,5 +1,9 @@
 #include "src/controller/presentation/visual_system_types.h"
 
+#include <utility>
+
+#include "src/frameworks/gpu/image_buffer.h"
+
 namespace mmltk::controller {
 
 bool visual_product_matches_frame(const VisualFrame& frame, const mmltk::frameworks::gpu::BorrowedImageProductReadView& product) noexcept {
@@ -16,22 +20,6 @@ bool visual_product_matches_frame(const VisualFrame& frame, const mmltk::framewo
 mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(
     const VisualFrame& frame, mmltk::frameworks::gpu::BorrowedImageProductReadView borrowed) {
     return visual_product_matches_frame(frame, borrowed) ? std::move(borrowed) : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
-}
-
-mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame,
-                                                                                    const detail::VisualRuntimeOwner& owner) {
-    return borrow_matching_visual_product(frame, owner.Borrow());
-}
-
-void report_visual_worker_failure(const VisualDiagnosticSink diagnostics, const VisualSystemKind system, const int device,
-                                  const std::string_view detail, const std::uint64_t generation) noexcept {
-    diagnostics({
-        .system = system,
-        .operation = VisualDiagnosticOperation::WorkerFailure,
-        .device = device,
-        .generation = generation,
-        .failure_detail = detail,
-    });
 }
 
 }  // namespace mmltk::controller

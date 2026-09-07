@@ -1,4 +1,6 @@
 #include "src/controller/subsystems/live/live_system.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <condition_variable>
 #include <limits>

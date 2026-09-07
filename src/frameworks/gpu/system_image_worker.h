@@ -14,19 +14,9 @@
 #include <thread>
 
 #include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/system_image_model.h"
 
 namespace mmltk::frameworks::gpu {
-
-class SystemImageModel {
-   public:
-    struct Release final {
-        bool all_released = true;
-        std::exception_ptr failure{};
-    };
-    virtual ~SystemImageModel() = default;
-    virtual void StopIngress() noexcept {}
-    [[nodiscard]] virtual Release ReleaseResources() noexcept { return {}; }
-};
 
 struct SystemImageRuntimeConfig final {
     int device = -1;

@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <atomic>
 #include <chrono>

@@ -23,5 +23,9 @@ target_link_libraries(mmltk_controller_live_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::controller::visual_runtime
         mmltk::backend::media::capture
         mmltk::backend::media::live)
+mmltk_link_declarations(mmltk_controller_live_system PUBLIC
+    mmltk::controller::visual_runtime)
+mmltk_register_header_isolation(mmltk_controller_live_system)

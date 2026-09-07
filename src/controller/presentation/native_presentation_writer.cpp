@@ -13,7 +13,7 @@
 
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/frameworks/gpu/exported_image_buffer.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
@@ -186,7 +186,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             throw std::runtime_error(error);
         mmltk::common::io::ScopedFd descriptor{allocation->export_descriptor(&error)};
         if (descriptor.get() < 0) throw std::runtime_error(error);
-        const std::uint64_t generation = native::detail::take_monotonic_identity(next_generation_);
+        const std::uint64_t generation = mmltk::common::types::take_monotonic_identity(next_generation_);
         const auto id = native::WorkspaceSurfaceImportId::generate();
         mmltk::common::io::ScopedFd frame_edge{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
         if (frame_edge.get() < 0) throw std::runtime_error("presentation frame eventfd creation failed");
@@ -396,7 +396,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             }
             DiagnoseAllocation(VisualDiagnosticOperation::PresentationSourceCopy, *target, static_cast<std::uint64_t>(status));
             if (status != cudaSuccess) throw std::runtime_error("presentation exported backbuffer copy failed");
-            presentation_revision = native::detail::take_monotonic_identity(next_presentation_revision_);
+            presentation_revision = mmltk::common::types::take_monotonic_identity(next_presentation_revision_);
             target->latest = NativeAllocation::LatestFrame{
                 .source = observation,
                 .presentation_revision = presentation_revision,
@@ -446,7 +446,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
     [[nodiscard]] std::uint64_t OfferLatest(NativeAllocation& allocation, cudaStream_t stream) {
         if (!allocation.timeline || !allocation.latest) throw std::runtime_error("presentation transfer has no completed frame");
-        const std::uint64_t transfer_sequence = native::detail::take_monotonic_identity(allocation.next_transfer_sequence);
+        const std::uint64_t transfer_sequence = mmltk::common::types::take_monotonic_identity(allocation.next_transfer_sequence);
         const std::uint64_t ready = native::detail::workspace_timeline_ready(transfer_sequence);
         allocation.timeline->SignalReady(stream, ready);
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation);

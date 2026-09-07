@@ -29,6 +29,22 @@ function(mmltk_configure_foreign_target target)
     _mmltk_configure_concrete_target_settings("${target}")
 endfunction()
 
+function(mmltk_configure_header_isolation target owner)
+    mmltk_configure_concrete_target("${target}")
+    set_target_properties("${target}" PROPERTIES
+        UNITY_BUILD OFF DISABLE_PRECOMPILE_HEADERS ON CXX_SCAN_FOR_MODULES OFF)
+    target_include_directories("${target}" PRIVATE
+        "$<TARGET_PROPERTY:${owner},INCLUDE_DIRECTORIES>")
+    target_include_directories("${target}" SYSTEM PRIVATE
+        "$<TARGET_PROPERTY:${owner},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
+    target_compile_definitions("${target}" PRIVATE
+        "$<TARGET_PROPERTY:${owner},COMPILE_DEFINITIONS>")
+    target_compile_options("${target}" PRIVATE
+        "$<TARGET_PROPERTY:${owner},COMPILE_OPTIONS>")
+    target_compile_features("${target}" PRIVATE
+        "$<TARGET_PROPERTY:${owner},COMPILE_FEATURES>")
+endfunction()
+
 function(mmltk_configure_component target)
     set(options PUBLIC_DECLARATIONS PRIVATE_DECLARATIONS)
     cmake_parse_arguments(MMLTK_COMPONENT

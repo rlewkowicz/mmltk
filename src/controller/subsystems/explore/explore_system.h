@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -16,6 +17,11 @@
 #include "src/controller/contracts/artifact_catalog.h"
 #include "src/controller/contracts/explore_filter.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/presentation/visual_diagnostics.h"
+#include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/system_image_model.h"
+#include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 

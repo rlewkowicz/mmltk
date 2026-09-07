@@ -25,6 +25,11 @@ target_link_libraries(mmltk_controller_browser_protocol_v13
         mmltk::controller::application_systems_projection
         mmltk::frameworks::reflection
         mmltk::frameworks::serialization)
+mmltk_register_header_isolation(mmltk_controller_browser_protocol_v13)
+mmltk_register_header_include_orders(mmltk_controller_browser_protocol_v13
+    src/controller/presentation/visual_system_types.h
+    src/controller/browser/application_schema.h
+    [=[static_assert(mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget() > 0U);]=])
 
 add_library(mmltk_controller_browser_direct STATIC)
 add_library(mmltk::controller::browser::direct ALIAS
@@ -47,6 +52,7 @@ target_link_libraries(mmltk_controller_browser_direct
         mmltk::frameworks::transport
     PRIVATE
         mmltk::controller::application_runtime)
+mmltk_register_header_isolation(mmltk_controller_browser_direct)
 
 set(MMLTK_APPLICATION_BINDINGS
     "${CMAKE_BINARY_DIR}/generated/frontend/iced/application_bindings.rs"

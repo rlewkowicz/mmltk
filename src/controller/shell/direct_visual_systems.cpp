@@ -5,6 +5,8 @@
 #include <utility>
 
 #include "src/controller/browser/application_materializer.h"
+#include "src/controller/presentation/visual_document.h"
+#include "src/controller/presentation/visual_runtime.h"
 
 namespace mmltk::controller::shell {
 namespace {

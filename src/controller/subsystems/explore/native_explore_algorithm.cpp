@@ -1,6 +1,7 @@
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
 

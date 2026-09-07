@@ -41,10 +41,14 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::controller::visual_runtime
         mmltk::backend::imaging::explore
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::export
         mmltk::backend::models::rfdetr::inference)
+mmltk_link_declarations(mmltk_controller_data_compute_systems PUBLIC
+    mmltk::controller::visual_runtime)
+mmltk_register_header_isolation(mmltk_controller_data_compute_systems)
 
 function(mmltk_add_controller_subsystems_system_tests)
     add_executable(mmltk_controller_data_compute_systems_tests EXCLUDE_FROM_ALL)

@@ -14,6 +14,7 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_diagnostics.h"
 
 namespace mmltk::controller::presentation {
 

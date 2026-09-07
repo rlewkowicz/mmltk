@@ -137,7 +137,7 @@ implementation naturally forms one coherent cutover.
   clarification; inspect later phases for material impact, remove completed
   phases entirely, and leave only remaining actionable steps. Record pertinent
   detours in the active phase while it remains actionable.
-- Before closing an implementation phase, spawn exactly one terra xhigh
+- Before closing an implementation phase, spawn exactly one sol xhigh
   reviewer after the work is complete. Give it the relevant complete diff.
   Wait for its report and use the report before updating the executor. Use
   the same reviewer for phase follow-ups. The reviewer must say `COMPLETE`
@@ -173,6 +173,104 @@ implementation naturally forms one coherent cutover.
 - After a reviewer marks a phase `COMPLETE` and the completed phase is removed,
   commit all outstanding tracked changes. Keep `actionplan.md` uncommitted.
 
+### Post-main-phase framework audit
+
+After committing an integer-numbered main implementation phase, run one
+framework audit before advancing to the next main phase. A heading such as
+`Phase 2` is a main phase; `Phase 2.1` is an audit-created subphase. Do not run
+this audit after a subphase, Final Validation, or a Final Validation checkpoint.
+
+Count the files changed by the main-phase commit. Spawn exactly one fresh astra
+max agent with no inherited conversation context. Give it the commit, main
+phase number and title, repository path, and the workflow-agnostic prompt below.
+The audit agent reads the repository sources of authority and complete commit
+itself. It may edit only `actionplan.md`; it does not edit implementation,
+requirements, contracts, or instructions, run builds or tests, or commit.
+
+The audit inserts only demonstrated, cohesive framework work as subphases of
+the completed main phase, numbered `<N>.1`, `<N>.2`, and so on, before the next
+main phase. It does not invent work to satisfy a phase count. It updates later
+phases only where the proposed framework cutovers materially change their
+dependencies, anchors, files, actions, or handoffs. The main agent reviews the
+revised plan for scope and architectural alignment, then executes the inserted
+subphases through the ordinary executor, review, plan-update, and commit
+workflow.
+
+Do not recursively audit those subphase commits. After all subphases created
+for one main phase are complete, inspect every later phase against the actual
+implemented framework. Update only materially affected dependencies, anchors,
+files, actions, and handoffs before starting the next main phase.
+
+Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
+`<PHASE COMMIT>`, and `<REPOSITORY>` with concrete values:
+
+> Work as a fresh standalone architecture and action-plan reviewer in
+> `<REPOSITORY>`. Do not rely on or request prior conversation context. Read
+> `AGENTS.md`, `CONTRACT.md`, and `actionplan.md` completely before acting.
+> Audit the complete diff and changed-file set of commit `<PHASE COMMIT>`, which
+> completed main Phase `<MAIN PHASE>` — `<PHASE TITLE>`. Inspect every changed
+> artifact and relevant unchanged caller, callee, dependency, configuration,
+> build rule, generated boundary, test, and persisted form. Confirm and report
+> the exact changed-file count.
+>
+> Find repeated concepts, cross-file change patterns, misplaced ownership,
+> hidden coupling, duplicated vocabulary, and boundaries whose blast radius is
+> larger than their product responsibility. Treat each affected C++ boundary as
+> if it needed C++20-module-quality dependency hygiene, but do not introduce
+> modules. Inspect the include, link, schema, generation, and concept
+> dependencies as a directed acyclic graph. Identify cycles, reverse
+> dependencies, transitive-include reliance, include-order requirements,
+> incomplete ordinary headers, implementation leakage, and declarations that
+> would not survive isolated compilation.
+>
+> Propose focused ordinary classes, sealed owners, factories, helpers, reusable
+> templates, or canonical C++26-reflected declarations only where they
+> consolidate a real shared concept, repeated behavior, or authoritative fact.
+> Prefer compile-time structural projection with no runtime lookup or storage
+> cost. Keep resource ownership, control flow, and product policy in ordinary
+> systems with direct APIs. Reduce future cross-file edits and make ownership
+> boundaries enforceable. Do not add facades, passthrough coordinators,
+> one-method wrappers, speculative abstractions, parallel registries,
+> reflection over resource or execution state, preprocessor-heavy mirrored
+> schemas, hidden control flow, or indirection without a measurable
+> deduplication, ownership, safety, or blast-radius benefit.
+>
+> Audit the C++ to generated-Rust boundary for one canonical native vocabulary,
+> exhaustive reflected projection and dispatch, stable field identity, schema
+> validation, and removal of handwritten member-wise or string-keyed mirrors.
+> Keep genuinely visual copy, component state, layout, styling, theme,
+> navigation, and interaction behavior owned by Rust and Iced. Treat
+> observability, tracing, logging, and correlation as effect-only diagnostics
+> unless the audited phase demonstrates a product requirement. Diagnostic
+> identities never become ordering, cache-validity, acknowledgement, or
+> resource-lifetime state. Do not introduce or inspect an external tracing
+> framework merely by analogy; evaluate one only when the commit presents a
+> concrete unmet requirement that the existing diagnostics cannot satisfy.
+>
+> Preserve every observable behavior, failure path, integration outcome,
+> persisted format, resource-lifetime guarantee, concurrency property, test
+> case, widget identity, styling fact, and user-facing function in the audited
+> commit. Reconstruct substantial moved, deleted, or replaced behavior through
+> its callers, callees, tests, and persisted forms. Reject any simplification
+> that silently loses capability.
+>
+> Edit only `actionplan.md`. Preserve its Goal and Summary, Scope, and
+> Architecture verbatim. If the audit demonstrates valuable framework work,
+> insert the minimum cohesive executable subphases numbered `<MAIN PHASE>.1`,
+> `<MAIN PHASE>.2`, and so on before the next main phase. For each subphase give
+> concrete goals, confirmed paths and line anchors, exact actions and
+> locations, dependencies, required cases and evidence, risks and handoffs,
+> and every expected file. Arrange complete cutovers without compatibility
+> layers. Update later phases only where the proposed work materially changes
+> their dependencies, anchors, files, actions, or handoffs. If no meaningful
+> subphase survives this audit, do not manufacture one; leave the plan
+> unchanged and explain why.
+>
+> Re-read the complete modified plan for internal consistency. Return the
+> changed-file count, a concise dependency and ownership assessment, every
+> inserted or updated phase, rejected abstractions with reasons, and any
+> demonstrated concern that remains represented in the plan.
+
 ### Final Validation workflow
 
 - Use `./mmltk --build` for both build stages below. The existing GUI-only
@@ -206,7 +304,7 @@ implementation naturally forms one coherent cutover.
   documented below.
 - After cleanup and tidy are clean, run exactly one initial cleanup adversarial
   review for the entire Final Validation, before the final rebuild. Spawn one
-  fresh terra xhigh reviewer and give it the complete diff from `pre cleanup`
+  fresh sol xhigh reviewer and give it the complete diff from `pre cleanup`
   and the workflow-agnostic verifier prompt below exactly once. Require it to
   prioritize time complexity and system-boundary demarcation while auditing
   cohesive ordinary C++ systems, high-quality DRY object-oriented design,

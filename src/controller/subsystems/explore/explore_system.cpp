@@ -1,4 +1,6 @@
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <algorithm>
 #include <exception>
@@ -10,7 +12,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 #include "src/controller/services/settings_system.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
@@ -446,7 +448,7 @@ class ExploreSystem::Impl final {
         return QueueDesired(
             [](ExploreSnapshot& desired) {
                 if (!desired.augmentation.enabled) throw contracts::UnavailableError("Explore augmentation reroll requires preview");
-                desired.augmentation.seed = presentation::detail::advance_monotonic_identity(desired.augmentation.seed);
+                desired.augmentation.seed = mmltk::common::types::advance_monotonic_identity(desired.augmentation.seed);
             },
             0, false, true);
     }
@@ -859,7 +861,7 @@ class ExploreSystem::Impl final {
         auto document = plan.mode == ExploreMode::Detail ? algorithm.Document() : nullptr;
         const bool clean_changed =
             plan.mode == ExploreMode::Gallery ? !preserve_gallery_clean : !document || document != previous_document;
-        const auto clean_revision = clean_changed ? presentation::detail::advance_monotonic_identity(previous_clean_revision)
+        const auto clean_revision = clean_changed ? mmltk::common::types::advance_monotonic_identity(previous_clean_revision)
                                                   : previous_clean_revision;
         auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, product_extent, output.revision());
         frame.content = plan.mode == ExploreMode::Detail ? algorithm.DetailContent(plan) : VisualRegion{};
@@ -961,7 +963,7 @@ class ExploreSystem::Impl final {
                         auto changed = state_;
                         changed.gallery = {.generation = advanced.generation, .slots = advanced.ready_slots};
                         changed.labels = algorithm.Labels();
-                        changed.revision = presentation::detail::advance_monotonic_identity(changed.revision);
+                        changed.revision = mmltk::common::types::advance_monotonic_identity(changed.revision);
                         auto notification = ChangedNotification(changed);
                         state_ = std::move(changed);
                         diagnostics_({.system = VisualSystemKind::Explore,
@@ -1035,13 +1037,13 @@ class ExploreSystem::Impl final {
                         stale = stop.stop_requested() || generation != latest_generation_ ||
                                 generation != active_gallery_generation_ || state_.mode != ExploreMode::Gallery;
                         if (!stale) {
-                            next_clean_revision = presentation::detail::advance_monotonic_identity(clean_revision_);
+                            next_clean_revision = mmltk::common::types::advance_monotonic_identity(clean_revision_);
                             frame.clean_revision = next_clean_revision;
                             changed = state_;
                             changed.gallery = {.generation = published.generation, .slots = published.ready_slots};
                             changed.frame = frame;
                             changed.labels = std::move(labels);
-                            changed.revision = presentation::detail::advance_monotonic_identity(changed.revision);
+                            changed.revision = mmltk::common::types::advance_monotonic_identity(changed.revision);
                             notification = ChangedNotification(changed);
                             runtime.CommitOutput(std::move(output));
                             algorithm.CommitOutputPublication();
@@ -1179,7 +1181,7 @@ class ExploreSystem::Impl final {
     }
     [[nodiscard]] std::uint64_t ReserveGeneration() {
         // CLEANUP-IGNORE: Explore owns its render-generation frontier separately from its observable snapshot revision.
-        return presentation::detail::take_monotonic_identity(next_generation_);
+        return mmltk::common::types::take_monotonic_identity(next_generation_);
     }
     [[nodiscard]] std::uint64_t NextGeneration() {
         latest_generation_ = ReserveGeneration();
@@ -1190,11 +1192,11 @@ class ExploreSystem::Impl final {
         latest_generation_ = generation;
         runtime_initialized_ = true;
     }
-    void AdvanceRevision() { state_.revision = presentation::detail::advance_monotonic_identity(state_.revision); }
+    void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
     static void Complete(ExploreSnapshot& snapshot) {
         snapshot.busy = false;
         snapshot.cancellation_requested = false;
-        snapshot.revision = presentation::detail::advance_monotonic_identity(snapshot.revision);
+        snapshot.revision = mmltk::common::types::advance_monotonic_identity(snapshot.revision);
     }
     void CompleteProduct(ExploreSnapshot& snapshot, const RenderedOutput& product) {
         snapshot.ready = true;
@@ -1224,7 +1226,7 @@ class ExploreSystem::Impl final {
     }
     [[nodiscard]] ExploreSnapshot UnavailableSnapshotLocked() const {
         return {
-            .revision = presentation::detail::advance_monotonic_identity(state_.revision),
+            .revision = mmltk::common::types::advance_monotonic_identity(state_.revision),
             .nproc = state_.nproc,
             .maximum_atlas_extent = state_.maximum_atlas_extent,
         };

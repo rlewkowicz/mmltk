@@ -1,11 +1,13 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <utility>
 
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 
 namespace mmltk::controller {
 namespace {
@@ -317,7 +319,7 @@ class AnnotationSystem::Impl final {
         // CLEANUP-IGNORE: Annotation advances its own snapshot revision when admission changes observable facts.
         AdvanceRevision();
     }
-    void AdvanceRevision() { state_.revision = presentation::detail::advance_monotonic_identity(state_.revision); }
+    void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
     template <class Install>
     void Settled(Install install) noexcept {
         AnnotationSnapshot settled;

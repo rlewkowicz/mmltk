@@ -1,5 +1,7 @@
 #include "src/controller/shell/application_shell.h"
 #include "src/controller/browser/client_record.h"
+#include "src/controller/presentation/visual_diagnostics.h"
+#include "src/controller/presentation/visual_runtime.h"
 
 #include <unistd.h>
 

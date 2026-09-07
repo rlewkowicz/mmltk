@@ -1,4 +1,5 @@
 #include "src/controller/browser/application_browser_host.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <catch2/catch_test_macros.hpp>
 

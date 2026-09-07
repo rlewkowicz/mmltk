@@ -22,6 +22,7 @@ target_link_libraries(mmltk_controller_explore_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::controller::visual_runtime
         mmltk::backend::data
         mmltk::backend::imaging::explore
         mmltk::backend::models::rfdetr::augmentation
@@ -29,3 +30,6 @@ target_link_libraries(mmltk_controller_explore_system
         mmltk::common::io
         mmltk::common::system
         mmltk::controller::data_compute_systems)
+mmltk_link_declarations(mmltk_controller_explore_system PUBLIC
+    mmltk::controller::visual_runtime)
+mmltk_register_header_isolation(mmltk_controller_explore_system)

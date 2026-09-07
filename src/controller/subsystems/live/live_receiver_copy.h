@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/image_types.h"
 
 namespace mmltk::controller::detail {
 

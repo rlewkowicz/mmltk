@@ -38,6 +38,7 @@
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/train/training_system.h"
+#include "src/frameworks/gpu/image_buffer.h"
 
 namespace mmltk::controller {
 namespace {

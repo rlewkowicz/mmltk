@@ -23,9 +23,20 @@ target_link_libraries(mmltk_controller_application_systems_projection INTERFACE
     mmltk::controller::application_boundary
     mmltk::frameworks::reflection
     mmltk::frameworks::serialization)
-target_include_directories(
-    mmltk_controller_application_systems_projection SYSTEM INTERFACE
-    ${CUDAToolkit_INCLUDE_DIRS})
+mmltk_link_declarations(
+    mmltk_controller_application_systems_projection INTERFACE
+    mmltk::controller::contracts
+    mmltk::controller::direct_services
+    mmltk::controller::presentation_system)
+if(BUILD_RFDETR_NATIVE)
+    mmltk_link_declarations(
+        mmltk_controller_application_systems_projection INTERFACE
+        mmltk::controller::annotation_system
+        mmltk::controller::data_compute_systems
+        mmltk::controller::explore_system
+        mmltk::controller::live_system
+        mmltk::controller::upscale_system)
+endif()
 
 add_library(mmltk_controller_contracts STATIC)
 add_library(mmltk::controller::contracts ALIAS mmltk_controller_contracts)

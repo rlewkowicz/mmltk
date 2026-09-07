@@ -1,4 +1,6 @@
 #include "src/controller/subsystems/upscale/upscale_system.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <cuda.h>
 
@@ -9,7 +11,7 @@
 #include <string>
 #include <utility>
 
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 
 import mmltk.backend.imaging.upscale.image_upscaler;
 import mmltk.backend.imaging.raster;
@@ -433,7 +435,7 @@ class UpscaleSystem::Impl final {
         }
         PublishChanged();
     }
-    void AdvanceRevision() { state_.revision = presentation::detail::advance_monotonic_identity(state_.revision); }
+    void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
 
    private:
     friend class UpscaleSystem;

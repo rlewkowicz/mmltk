@@ -12,6 +12,8 @@
 
 #include "src/frameworks/gpu/system_image_worker.h"
 #include "src/common/system/execution_policy.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/presentation/visual_system_types.h"
 
 namespace mmltk::controller::detail {
 
@@ -35,7 +37,7 @@ class VisualRuntimeOwner final {
         RetirementCompleted,
     };
     using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
-    using RuntimeFactory = std::function<std::unique_ptr<Runtime>()>;
+    using RuntimeFactory = VisualRuntimeFactory;
     using Notification = std::move_only_function<void()>;
     using DispatchObservation = std::move_only_function<void() noexcept>;
     using Work = std::move_only_function<Notification(Runtime&, std::stop_token)>;
@@ -107,3 +109,10 @@ class VisualRuntimeOwner final {
 };
 
 }  // namespace mmltk::controller::detail
+
+namespace mmltk::controller {
+
+[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(
+    const VisualFrame&, const detail::VisualRuntimeOwner&);
+
+}  // namespace mmltk::controller

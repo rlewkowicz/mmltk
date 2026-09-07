@@ -13,9 +13,11 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         gdr_mapped_buffer.h
         image_geometry.h
         image_buffer.h
+        image_types.h
         exported_image_buffer.h
         external_graphics_timeline.h
         system_image_worker.h
+        system_image_model.h
         cuda_high_water_allocation.h
         cuda_pitched_buffer_view.h
         unique_resource.h
@@ -56,6 +58,7 @@ target_link_libraries(mmltk_frameworks_gpu
         CUDA::cuda_driver
         mmltk_gdrcopy
 )
+mmltk_register_header_isolation(mmltk_frameworks_gpu)
 
 add_library(mmltk_frameworks_gpu_test_support STATIC EXCLUDE_FROM_ALL)
 mmltk_configure_component(

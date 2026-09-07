@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/frameworks/gpu/system_image_worker.h"
 
 #include <cuda_runtime_api.h>
 

@@ -13,6 +13,8 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/local_run.h"

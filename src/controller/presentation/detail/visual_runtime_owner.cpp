@@ -4,6 +4,15 @@
 #include <stdexcept>
 #include <utility>
 
+namespace mmltk::controller {
+
+mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame,
+                                                                                 const detail::VisualRuntimeOwner& owner) {
+    return borrow_matching_visual_product(frame, owner.Borrow());
+}
+
+}  // namespace mmltk::controller
+
 namespace mmltk::controller::detail {
 
 VisualRuntimeOwner::VisualRuntimeOwner(RuntimeFactory factory, FailureSink failures, ActivityObservation activity)

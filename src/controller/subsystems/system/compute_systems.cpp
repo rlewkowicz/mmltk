@@ -1,5 +1,9 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/system/compute_systems.h"
+#include "src/frameworks/gpu/system_image_worker.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_diagnostics.h"
+#include "src/common/system/execution_policy.h"
 
 #include <cuda_runtime_api.h>
 

@@ -30,8 +30,10 @@ target_link_libraries(mmltk_controller_shell
         mmltk::frameworks::reflection
         mmltk::frameworks::transport
     PRIVATE
+        mmltk::controller::visual_runtime
         mmltk::frameworks::serialization
 )
+mmltk_register_header_isolation(mmltk_controller_shell)
 
 function(mmltk_add_controller_shell_tests)
     add_library(

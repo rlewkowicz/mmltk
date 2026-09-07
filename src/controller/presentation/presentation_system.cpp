@@ -11,11 +11,12 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <thread>
 #include <utility>
 
 #include "src/common/io/scoped_fd.h"
-#include "src/controller/presentation/detail/monotonic_identity.h"
+#include "src/common/types/generation.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 
 namespace mmltk::controller {
@@ -52,7 +53,7 @@ class PresentationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             if (terminal_failure_) throw contracts::FailedError(*terminal_failure_);
             if (stopping_) throw contracts::UnavailableError("Presentation admission is closed");
-            selection_generation_ = presentation::detail::advance_monotonic_identity(selection_generation_);
+            selection_generation_ = mmltk::common::types::advance_monotonic_identity(selection_generation_);
             state_.selected = source;
             AdvanceRevision();
             pending_ = Pending{
@@ -157,7 +158,7 @@ class PresentationSystem::Impl final {
         std::uint64_t selection_generation = 0U;
     };
 
-    void AdvanceRevision() { state_.revision = presentation::detail::advance_monotonic_identity(state_.revision); }
+    void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
 
     std::span<const VisualSourceReader>::iterator Find(const PresentationSourceIdentity source) {
         return std::ranges::find(sources_, source, &VisualSourceReader::source);
@@ -293,7 +294,7 @@ class PresentationSystem::Impl final {
                     completed.completed_source_revision = observation.snapshot_revision;
                     completed.timeline_ready = outcome.publication.timeline_ready;
                     completed.presentation_revision = outcome.publication.presentation_revision;
-                    completed.revision = presentation::detail::advance_monotonic_identity(completed.revision);
+                    completed.revision = mmltk::common::types::advance_monotonic_identity(completed.revision);
                     state_ = completed;
                     publish = true;
                 }

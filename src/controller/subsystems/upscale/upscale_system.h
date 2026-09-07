@@ -7,6 +7,10 @@
 
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/presentation/visual_diagnostics.h"
+#include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
 
 namespace mmltk::controller {

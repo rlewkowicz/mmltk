@@ -47,9 +47,74 @@ function(mmltk_register_public_headers target)
 endfunction()
 
 function(mmltk_register_private_headers target)
+    set(_mmltk_headers)
     foreach(_mmltk_header IN LISTS ARGN)
         _mmltk_absolute_source(_mmltk_source "${_mmltk_header}")
-        target_sources("${target}" PRIVATE "${_mmltk_source}")
+        list(APPEND _mmltk_headers "${_mmltk_source}")
+    endforeach()
+    target_sources("${target}" PRIVATE
+        FILE_SET mmltk_private_headers TYPE HEADERS
+        BASE_DIRS "${CMAKE_SOURCE_DIR}"
+        FILES ${_mmltk_headers})
+endfunction()
+
+# A projection consumes declarations with the owner's complete transitive usage
+# requirements, without linking or constructing that owner's implementation.
+function(mmltk_link_declarations target visibility)
+    foreach(_mmltk_owner IN LISTS ARGN)
+        target_include_directories("${target}" "${visibility}"
+            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_INCLUDE_DIRECTORIES>")
+        target_include_directories("${target}" SYSTEM "${visibility}"
+            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
+        target_compile_definitions("${target}" "${visibility}"
+            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_DEFINITIONS>")
+        target_compile_options("${target}" "${visibility}"
+            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_OPTIONS>")
+        target_compile_features("${target}" "${visibility}"
+            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_FEATURES>")
+    endforeach()
+endfunction()
+
+function(mmltk_register_header_isolation target)
+    get_target_property(_mmltk_public "${target}" HEADER_SET_mmltk_public_headers)
+    get_target_property(_mmltk_private "${target}" HEADER_SET_mmltk_private_headers)
+    set(_mmltk_headers)
+    foreach(_mmltk_set IN ITEMS _mmltk_public _mmltk_private)
+        if(${_mmltk_set})
+            list(APPEND _mmltk_headers ${${_mmltk_set}})
+        endif()
+    endforeach()
+    if(NOT _mmltk_headers)
+        message(FATAL_ERROR "Header isolation requires registered headers for `${target}`")
+    endif()
+    list(REMOVE_DUPLICATES _mmltk_headers)
+    set(_mmltk_sources)
+    foreach(_mmltk_header IN LISTS _mmltk_headers)
+        file(RELATIVE_PATH _mmltk_relative "${CMAKE_SOURCE_DIR}" "${_mmltk_header}")
+        set(_mmltk_source
+            "${CMAKE_CURRENT_BINARY_DIR}/header-isolation/${target}/${_mmltk_relative}.cpp")
+        file(GENERATE OUTPUT "${_mmltk_source}"
+            CONTENT "#include \"${_mmltk_relative}\"\n")
+        list(APPEND _mmltk_sources "${_mmltk_source}")
+    endforeach()
+    set(_mmltk_check "${target}_header_isolation")
+    add_library("${_mmltk_check}" OBJECT EXCLUDE_FROM_ALL)
+    mmltk_configure_header_isolation("${_mmltk_check}" "${target}")
+    mmltk_register_ordinary_sources("${_mmltk_check}" ${_mmltk_sources})
+    add_dependencies("${target}" "${_mmltk_check}")
+endfunction()
+
+function(mmltk_register_header_include_orders target first second assertion)
+    foreach(_mmltk_order IN ITEMS forward reverse)
+        if(_mmltk_order STREQUAL "forward")
+            set(_mmltk_content "#include \"${first}\"\n#include \"${second}\"\n")
+        else()
+            set(_mmltk_content "#include \"${second}\"\n#include \"${first}\"\n")
+        endif()
+        set(_mmltk_source
+            "${CMAKE_CURRENT_BINARY_DIR}/header-isolation/${target}/include-order-${_mmltk_order}.cpp")
+        file(GENERATE OUTPUT "${_mmltk_source}" CONTENT "${_mmltk_content}${assertion}\n")
+        mmltk_register_ordinary_sources("${target}_header_isolation" "${_mmltk_source}")
     endforeach()
 endfunction()
 

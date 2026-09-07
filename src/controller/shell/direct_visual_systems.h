@@ -9,6 +9,9 @@
 
 #include "src/controller/browser/client_record.h"
 #include "src/controller/contracts/application_systems.h"
+#include "src/controller/presentation/visual_diagnostics.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/frameworks/gpu/device_execution.h"
 
 namespace mmltk::controller::shell {
 
