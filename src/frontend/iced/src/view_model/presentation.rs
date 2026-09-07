@@ -74,17 +74,8 @@ impl ApplicationModel {
     }
 
     pub(super) fn same_clean_source(left: &VisualFrame, right: &VisualFrame) -> bool {
-        let clean = |frame: &VisualFrame| {
-            if frame.cleanrevision == 0 {
-                frame.revision
-            } else {
-                frame.cleanrevision
-            }
-        };
-        left.source == right.source
-            && left.extent == right.extent
-            && left.content == right.content
-            && clean(left) == clean(right)
+        crate::generated::visual_clean_content_identity(left)
+            == crate::generated::visual_clean_content_identity(right)
     }
 
     pub fn displayed_upscale_kernel(&self) -> Option<crate::generated::UpscaleKernel> {
@@ -147,65 +138,35 @@ impl ApplicationModel {
     }
 
     pub(super) fn frame_for(&self, kind: PresentationSourceKind) -> Option<&VisualFrame> {
-        match kind {
-            PresentationSourceKind::Explore => self
-                .explore
-                .snapshot
-                .as_ref()
-                .map(|snapshot| &snapshot.frame),
-            PresentationSourceKind::Annotation => self
-                .annotation
-                .snapshot
-                .as_ref()
-                .map(|snapshot| &snapshot.frame),
-            PresentationSourceKind::Live => {
-                self.live_snapshot.as_ref().map(|snapshot| &snapshot.frame)
-            }
-            PresentationSourceKind::Upscale => {
-                self.current_upscale().map(|snapshot| &snapshot.frame)
-            }
-            PresentationSourceKind::Predict => self
-                .predict_snapshot
-                .as_ref()
-                .filter(|snapshot| {
-                    !snapshot.operation.active
-                        && snapshot.operation.terminal.outcome == ComputeOperationOutcome::Succeeded
-                })
-                .map(|snapshot| &snapshot.frame),
-            PresentationSourceKind::None => None,
+        if kind == PresentationSourceKind::Upscale && self.current_upscale().is_none() {
+            return None;
         }
-        .filter(|frame| Self::valid_visual_source(frame).is_some())
+        if kind == PresentationSourceKind::Predict
+            && self.predict_snapshot.as_ref().is_none_or(|snapshot| {
+                snapshot.operation.active
+                    || snapshot.operation.terminal.outcome != ComputeOperationOutcome::Succeeded
+            })
+        {
+            return None;
+        }
+        self.frame_observation_for(kind)
+            .map(|(frame, _)| frame)
+            .filter(|frame| Self::valid_visual_source(frame).is_some())
     }
 
     fn frame_observation_for(
         &self,
         kind: PresentationSourceKind,
     ) -> Option<(&VisualFrame, u64)> {
-        match kind {
-            PresentationSourceKind::Explore => self
-                .explore
-                .snapshot
-                .as_ref()
-                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
-            PresentationSourceKind::Annotation => self
-                .annotation
-                .snapshot
-                .as_ref()
-                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
-            PresentationSourceKind::Live => self
-                .live_snapshot
-                .as_ref()
-                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
-            PresentationSourceKind::Upscale => self
-                .upscale_snapshot
-                .as_ref()
-                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
-            PresentationSourceKind::Predict => self
-                .predict_snapshot
-                .as_ref()
-                .map(|snapshot| (&snapshot.frame, snapshot.revision)),
-            PresentationSourceKind::None => None,
+        crate::generated::ApplicationVisualSnapshots {
+            explore: self.explore.snapshot.as_ref(),
+            annotation: self.annotation.snapshot.as_ref(),
+            live: self.live_snapshot.as_ref(),
+            upscale: self.upscale_snapshot.as_ref(),
+            predict: self.predict_snapshot.as_ref(),
         }
+        .observe(kind)
+        .map(|observation| (observation.frame, observation.snapshotrevision))
     }
 
     pub fn source_for(&self, kind: PresentationSourceKind) -> Option<PresentationSourceIdentity> {
@@ -588,7 +549,36 @@ mod tests {
     }
 
     #[test]
-    fn reconnect requests_the_foreground_product_even_when_native_completion_matches() {
+    fn predict_observation_retains_native_metadata_revision() {
+        let mut model = bootstrapped();
+        let mut snapshot = model.predict_snapshot.clone().unwrap();
+        snapshot.revision = 10;
+        snapshot.operation.generationfrontier = 1;
+        snapshot.operation.terminal.generation = 1;
+        snapshot.operation.terminal.outcome = ComputeOperationOutcome::Succeeded;
+        snapshot.frame = visual_frame(PresentationSourceKind::Predict, 4);
+        model.install_predict_snapshot(snapshot.clone()).unwrap();
+        snapshot.revision = 12;
+        model.install_predict_snapshot(snapshot.clone()).unwrap();
+        let (frame, revision) = model.frame_observation_for(PresentationSourceKind::Predict).unwrap();
+        assert_eq!(frame, &snapshot.frame);
+        assert_eq!(revision, 12);
+        assert_eq!(model.install_predict_snapshot(snapshot.clone()).unwrap(), super::super::reduction::Observation::Current);
+        let mut conflict = snapshot.clone();
+        conflict.operation.progress.completed += 1;
+        assert!(model.install_predict_snapshot(conflict).is_err());
+        let mut conflict = snapshot.clone();
+        conflict.frame.revision += 1;
+        assert!(model.install_predict_snapshot(conflict).is_err());
+        assert_eq!(model.predict_snapshot.as_ref(), Some(&snapshot));
+        snapshot.revision = 11;
+        snapshot.frame.revision = 5;
+        assert_eq!(model.install_predict_snapshot(snapshot).unwrap(), super::super::reduction::Observation::Stale);
+        assert_eq!(model.frame_observation_for(PresentationSourceKind::Predict).unwrap().1, 12);
+    }
+
+    #[test]
+    fn reconnect_requests_the_foreground_product_even_when_native_completion_matches() {
         let mut model = bootstrapped();
         model.set_foreground_feature(FeatureId::Explore);
         let frame = visual_frame(PresentationSourceKind::Explore, 4);
@@ -734,6 +724,7 @@ mod tests {
     fn predict_and_upscale_keep_typed_private_source_continuity() {
         let mut model = bootstrapped();
         let mut predict = model.predict_snapshot.clone().unwrap();
+        predict.revision += 1;
         predict.operation.generationfrontier = 1;
         predict.operation.terminal.generation = 1;
         predict.operation.terminal.outcome = ComputeOperationOutcome::Succeeded;
@@ -828,6 +819,7 @@ mod tests {
     fn predict_generation_clears_old_frame_and_ignores_stale_failure() {
         let mut model = bootstrapped();
         let mut succeeded = model.predict_snapshot.clone().unwrap();
+        succeeded.revision += 1;
         succeeded.operation.generationfrontier = 1;
         succeeded.operation.terminal.generation = 1;
         succeeded.operation.terminal.outcome = ComputeOperationOutcome::Succeeded;
@@ -838,6 +830,7 @@ mod tests {
             },
         ));
         let mut running = model.predict_snapshot.clone().unwrap();
+        running.revision += 1;
         running.operation.generationfrontier = 2;
         running.operation.active = true;
         running.operation.terminal.generation = 2;
@@ -849,6 +842,7 @@ mod tests {
         ));
         assert!(model.source_for(PresentationSourceKind::Predict).is_none());
         let mut newer = running.clone();
+        newer.revision += 2;
         newer.operation.generationfrontier = 3;
         newer.operation.active = false;
         newer.operation.terminal.generation = 3;
@@ -858,6 +852,7 @@ mod tests {
             crate::generated::PredictChanged { snapshot: newer },
         ));
         running.operation.active = false;
+        running.revision += 1;
         running.operation.terminal.outcome = ComputeOperationOutcome::Failed;
         model.error = None;
         model.reduce_event(ApplicationEvent::PredictPredictFailed(

@@ -1,6 +1,8 @@
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_outer_routing_emitter.h"
+#include "src/controller/browser/application_visual_projection_emitter.h"
+#include "src/controller/browser/application_event_publisher.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -8,10 +10,12 @@
 #include <cctype>
 #include <concepts>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <ranges>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -287,13 +291,75 @@ struct RoutingSystems final {
     AdditionalSyntheticSystem* additional = nullptr;
 };
 
+struct SyntheticVisualOperation final {
+    std::uint64_t revision = 0U;
+    std::uint64_t alternate = 0U;
+};
+struct SyntheticVisualSnapshot final {
+    SyntheticVisualOperation operation{};
+    VisualFrame product{};
+};
+struct UnreflectedVisualOperation final {
+    std::uint64_t revision = 0U;
+};
+struct UnreflectedNestedVisualSnapshot final {
+    UnreflectedVisualOperation operation{};
+    VisualFrame product{};
+};
+MMLTK_REFLECT_FIELDS(SyntheticVisualOperation)
+MMLTK_REFLECT_FIELDS(SyntheticVisualSnapshot)
+MMLTK_REFLECT_FIELDS(UnreflectedNestedVisualSnapshot)
+
+template <PresentationSourceKind Kind, auto Revision =
+    mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>
+class SyntheticVisualSystem final {
+   public:
+    using event_type = std::variant<SyntheticChanged>;
+    using visual_source = VisualSourceProjection<SyntheticVisualSnapshot, Kind,
+        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>,
+        Revision>;
+    [[= contracts::reflection::direct::IntentEndpoint{}]] std::uint32_t Apply(SyntheticRequest request) { return request.value; }
+    [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] SyntheticVisualSnapshot snapshot() const {
+        ++samples;
+        SyntheticVisualSnapshot result;
+        result.operation.revision = 91U;
+        result.product = visual_frame({Kind, 1U}, {12U, 8U}, 7U);
+        return result;
+    }
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const { return {}; }
+    mutable std::size_t samples = 0U;
+};
+struct SyntheticVisualComposition final {
+    SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
+};
+struct ExtendedVisualComposition final {
+    SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Explore>* additional = nullptr;
+};
+struct DuplicateVisualComposition final {
+    SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Predict>* duplicate = nullptr;
+};
+struct VisualFingerprintComposition final {
+    TestSettingsSystem* settings = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
+};
+struct AlternateVisualFingerprintComposition final {
+    TestSettingsSystem* settings = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Predict,
+        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer = nullptr;
+};
+
 class RoutingTextWriter final {
    public:
     explicit RoutingTextWriter(std::ostringstream& output) : output_(output) {}
 
     [[nodiscard]] std::ostream& output() const noexcept { return output_; }
 
-    void reserve(std::string_view, std::string_view, std::string_view) {}
+    void reserve(const std::string_view scope, const std::string_view symbol, std::string_view) {
+        if (!symbols_.emplace(std::string(scope), std::string(symbol)).second)
+            throw std::logic_error("projected symbol collision");
+    }
 
     [[nodiscard]] std::string identifier(const std::string_view source, const bool upper) const {
         std::string result(source);
@@ -317,6 +383,7 @@ class RoutingTextWriter final {
 
    private:
     std::ostringstream& output_;
+    std::set<std::pair<std::string, std::string>> symbols_;
 };
 
 static_assert(!application_settings_surface_is_valid<TestSystems>());
@@ -511,6 +578,117 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
     CHECK(failed.disposition == InteractionDispatchDisposition::ApplicationRejected);
     REQUIRE(failed.error.has_value());
     CHECK(failed.error->category == contracts::ApplicationErrorCategory::Failed);
+}
+
+TEST_CASE("visual producer projections derive nested observations and composition routing", "[controller][browser][reflection]") {
+    STATIC_REQUIRE(ApplicationSchema<ApplicationSystems>::VisualSourceCount() == 5U);
+    STATIC_REQUIRE(ApplicationSchema<SyntheticVisualComposition>::VisualSourceCount() == 1U);
+    STATIC_REQUIRE(ApplicationSchema<ExtendedVisualComposition>::VisualSourceCount() == 2U);
+    STATIC_REQUIRE_FALSE(ApplicationSchema<DuplicateVisualComposition>::VisualSourcesAreUnique());
+    using namespace mmltk::frameworks::reflection;
+    using WrongOwner = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
+        member_path<&ExploreSnapshot::frame>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using WrongType = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
+        member_path<&SyntheticVisualSnapshot::operation>, member_path<&SyntheticVisualSnapshot::product>>;
+    using EmptyKind = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None,
+        member_path<&SyntheticVisualSnapshot::product>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using UnknownKind = VisualSourceProjection<SyntheticVisualSnapshot, static_cast<PresentationSourceKind>(255U),
+        member_path<&SyntheticVisualSnapshot::product>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    constexpr auto callable_frame = [](SyntheticVisualSnapshot& value) -> VisualFrame& { return value.product; };
+    constexpr auto callable_operation = [](SyntheticVisualSnapshot& value) -> SyntheticVisualOperation& { return value.operation; };
+    using CallableFrame = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
+        callable_frame, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using CallableSegment = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
+        member_path<&SyntheticVisualSnapshot::product>, member_path<callable_operation, &SyntheticVisualOperation::revision>>;
+    using UnreflectedSegment = VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict,
+        member_path<&UnreflectedNestedVisualSnapshot::product>,
+        member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
+    STATIC_REQUIRE_FALSE(WrongOwner::valid());
+    STATIC_REQUIRE_FALSE(WrongType::valid());
+    STATIC_REQUIRE_FALSE(EmptyKind::valid());
+    STATIC_REQUIRE_FALSE(UnknownKind::valid());
+    STATIC_REQUIRE_FALSE(CallableFrame::valid());
+    STATIC_REQUIRE_FALSE(CallableSegment::valid());
+    STATIC_REQUIRE_FALSE(UnreflectedSegment::valid());
+    STATIC_REQUIRE_FALSE(application_event_is_member<TestSystems, &TestSystems::counter, SyntheticChanged>());
+
+    SyntheticVisualSystem<PresentationSourceKind::Predict> producer;
+    SyntheticVisualSystem<PresentationSourceKind::Explore> additional;
+    auto readers = materialize_visual_source_readers(ExtendedVisualComposition{&producer, &additional});
+    for (const auto& reader : readers) {
+        const auto observation = reader.observe();
+        CHECK(observation.snapshot_revision == 91U);
+        CHECK(observation.frame.revision == 7U);
+        CHECK(observation.frame.source == reader.source);
+    }
+    CHECK(producer.samples == 1U);
+    CHECK(additional.samples == 1U);
+    std::ostringstream output;
+    RoutingTextWriter writer(output);
+    emit_application_visual_projection<ExtendedVisualComposition>(writer);
+    CHECK(output.str().find("snapshot.operation.revision") != std::string::npos);
+    CHECK(output.str().find("self.additional.map") != std::string::npos);
+    CHECK(output.str().find("snapshot.product") != std::string::npos);
+    std::ostringstream collision_output;
+    RoutingTextWriter collision(collision_output);
+    collision.reserve("module", "ApplicationVisualSnapshots", "conflicting declaration");
+    CHECK_THROWS_AS(emit_application_visual_projection<ExtendedVisualComposition>(collision), std::logic_error);
+    CHECK(application_schema_fingerprint<VisualFingerprintComposition>() !=
+          application_schema_fingerprint<AlternateVisualFingerprintComposition>());
+}
+
+TEST_CASE("materialized event publisher preserves transient and essential failure policy", "[controller][browser][reflection]") {
+    std::size_t lost = 0U;
+    std::function<void(SystemEvent)> failing = [](SystemEvent) { throw std::runtime_error("publication failed"); };
+    ApplicationEventPublisher<&RoutingSystems::additional, RoutingSystems> transient(failing, [&] { ++lost; });
+    transient(AdditionalSyntheticSystem::event_type{SyntheticChanged{}});
+    CHECK(lost == 0U);
+    ApplicationEventPublisher<&ApplicationSystems::explore> essential(failing, [&] { ++lost; });
+    essential(ExploreSystem::event_type{ExploreChanged{}});
+    CHECK(lost == 1U);
+    std::size_t delivered = 0U;
+    std::function<void(SystemEvent)> receiving = [&](SystemEvent) { ++delivered; };
+    ApplicationEventPublisher<&ApplicationSystems::explore> encoding(receiving, [&] { ++lost; });
+    ExploreFailed oversized;
+    oversized.detail.assign(kVisualFailureByteCapacity + 1U, 'x');
+    encoding(ExploreSystem::event_type{oversized});
+    CHECK(delivered == 0U);
+    CHECK(lost == 2U);
+    SystemEvent published;
+    std::function<void(SystemEvent)> latest_sink = [&](SystemEvent event) { published = std::move(event); };
+    ApplicationEventPublisher<&ApplicationSystems::presentation> latest(latest_sink, [&] { ++lost; });
+    latest(PresentationSystem::event_type{PresentationCompleted{.snapshot = {.revision = 73U}}});
+    CHECK(published.delivery == contracts::reflection::EventDelivery::LatestState);
+    CHECK(published.state_revision == 73U);
+    CHECK(published.event_id ==
+          ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationCompleted>::event_id);
+    CHECK(lost == 2U);
+}
+
+TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products",
+          "[controller][browser][reflection]") {
+    const std::array kinds{PresentationSourceKind::None, PresentationSourceKind::Explore, PresentationSourceKind::Annotation,
+                           PresentationSourceKind::Predict, PresentationSourceKind::Live, PresentationSourceKind::Upscale};
+    for (std::size_t session = 0U; session < kinds.size(); ++session)
+        CHECK(presentation_source_session(kinds[session]) == session);
+    auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, {32U, 24U}, 7U);
+    frame.content = {1U, 2U, 20U, 16U};
+    CHECK(visual_clean_content_identity(frame).revision == 7U);
+    frame.clean_revision = 43U;
+    const auto identity = visual_clean_content_identity(frame);
+    auto semantic = frame;
+    ++semantic.revision;
+    CHECK(visual_clean_content_identity(semantic) == identity);
+    const VisualSourceObservation metadata{semantic, 100U};
+    CHECK(visual_clean_content_identity(metadata.frame) == identity);
+    ++semantic.extent.width;
+    CHECK(visual_clean_content_identity(semantic) != identity);
+    semantic = frame;
+    ++semantic.content.x;
+    CHECK(visual_clean_content_identity(semantic) != identity);
+    semantic = frame;
+    ++semantic.source.instance;
+    CHECK(visual_clean_content_identity(semantic) != identity);
 }
 
 TEST_CASE("fixed text schema policy validates its complete native storage shape") {

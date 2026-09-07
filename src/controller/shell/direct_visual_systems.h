@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "src/controller/browser/client_record.h"
+#include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/visual_runtime.h"
@@ -81,7 +82,7 @@ class ApplicationSystemStorage final {
     std::unique_ptr<ExploreSystem> explore_;
     std::unique_ptr<AnnotationSystem> annotation_;
     std::unique_ptr<LiveSystem> live_;
-    std::array<VisualSourceReader, 5U> source_readers_{};
+    std::array<VisualSourceReader, browser::ApplicationSchema<ApplicationSystems>::VisualSourceCount()> source_readers_{};
     std::unique_ptr<PresentationSystem> presentation_;
     ApplicationSystems systems_{};
 };

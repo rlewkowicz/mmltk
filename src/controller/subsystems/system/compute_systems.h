@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/controller/presentation/visual_source_projection.h"
+
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -140,6 +142,7 @@ class ExportSystem final {
     std::unique_ptr<Impl> impl_;
 };
 struct PredictSnapshot final {
+    std::uint64_t revision = 0U;
     // CLEANUP-IGNORE: Predict composes compute facts with its private visual frame in one canonical snapshot.
     contracts::ComputeUiState operation{};
     VisualFrame frame{};
@@ -159,6 +162,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 class PredictSystem final {
    public:
+    using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict,
+        mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
+        mmltk::frameworks::reflection::member_path<&PredictSnapshot::revision>>;
     using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
     PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory,
                   SystemEventSink<event_type> = {});

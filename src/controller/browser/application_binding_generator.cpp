@@ -1,5 +1,6 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/application_outer_routing_emitter.h"
+#include "src/controller/browser/application_visual_projection_emitter.h"
 #include "src/controller/browser/application_schema.h"
 
 #include <algorithm>
@@ -631,6 +632,7 @@ class BindingEmitter final {
     }
 
     void VisitBoundaryTypes() {
+        EmitType<mmltk::controller::VisualCleanContentIdentity>();
         EmitType<mmltk::controller::contracts::FeatureId>();
         EmitType<mmltk::controller::contracts::reflection::OperationStateSemantic>();
         EmitType<mmltk::controller::contracts::reflection::ProgressFieldSemantic>();
@@ -773,6 +775,7 @@ class BindingEmitter final {
     void EmitIdentitiesAndApplicationEnums() {
         BindingOuterRoutingWriter writer(output_, symbols_);
         mmltk::controller::browser::emit_application_outer_routing<ApplicationSystems>(writer);
+        mmltk::controller::browser::emit_application_visual_projection<ApplicationSystems>(writer);
     }
 
     void EmitEndpoints() {

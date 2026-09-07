@@ -41,7 +41,28 @@ int main(const int argument_count, char* const* const arguments) {
     if (system_count != 13U || intent_count == 0U || interaction_count == 0U || event_count == 0U) return EXIT_FAILURE;
 
     using SettingsEvent = ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::settings, SettingsChanged>;
-    auto snapshot = mmltk::frameworks::serialization::reflected_value(contracts::SettingsUiState{});
+    Bootstrap bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words};
+    bool snapshots_valid = true;
+    ApplicationSchema<ApplicationSystems>::VisitSnapshotDefaults([&]<class Cell, class Snapshot>(Snapshot snapshot) {
+        if constexpr (requires { typename Cell::type::visual_source; }) {
+            using Projection = typename Cell::type::visual_source;
+            const auto session = presentation_source_session(Projection::kind);
+            auto& frame = mmltk::frameworks::reflection::access<Snapshot, Projection::frame>(snapshot);
+            frame = visual_frame({Projection::kind, 1U}, {32U, 24U}, 7U + session);
+            frame.content = {1U, 2U, 20U, 16U};
+            frame.clean_revision = 43U;
+            mmltk::frameworks::reflection::access<Snapshot, Projection::revision>(snapshot) =
+                std::numeric_limits<std::uint64_t>::max() - session;
+            snapshots_valid = snapshots_valid && visual_clean_content_identity(frame).revision == 43U;
+        }
+        auto encoded = mmltk::frameworks::serialization::reflected_value(snapshot);
+        if (!encoded) {
+            snapshots_valid = false;
+            return;
+        }
+        bootstrap.snapshots.push_back({.system_id = Cell::stable_id, .value = std::move(*encoded)});
+    });
+    if (!snapshots_valid) return EXIT_FAILURE;
     std::uint64_t dialog_id = 0U;
     ApplicationSchema<ApplicationSystems>::VisitApplicationSettingsLeaves(
         [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) {
@@ -68,13 +89,9 @@ int main(const int argument_count, char* const* const arguments) {
         .selection = selected,
     });
     auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
-    if (!snapshot || !cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
+    if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
     const std::array<ServerRecord, 4U> records{
-        Bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words,
-                  .snapshots = {{
-                      .system_id = application_system_stable_id<&ApplicationSystems::settings>(),
-                      .value = std::move(*snapshot),
-                  }}},
+        std::move(bootstrap),
         IntentReply{
             .correlation = 17U,
             .result = std::move(*cancelled_reply),

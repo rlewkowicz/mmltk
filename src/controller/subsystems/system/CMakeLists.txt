@@ -28,6 +28,8 @@ mmltk_register_ordinary_sources(
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
     compute_systems.cpp)
+mmltk_register_private_headers(
+    mmltk_controller_data_compute_systems detail/predict_revision.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(mmltk_controller_data_compute_systems
     PUBLIC

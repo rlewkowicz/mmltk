@@ -33,6 +33,7 @@
 #include "src/controller/services/persistence_storage.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/system/detail/predict_revision.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/local_run.h"
@@ -42,6 +43,34 @@
 
 namespace mmltk::controller {
 namespace {
+
+TEST_CASE("Predict revision capacity preserves cancellation and terminal observations", "[controller][systems][predict]") {
+    using Revision = detail::PredictRevision;
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    CHECK_THROWS_AS(Revision::Admit(maximum), contracts::FailedError);
+    CHECK_THROWS_AS(Revision::Admit(maximum - 1U), contracts::FailedError);
+    CHECK_THROWS_AS(Revision::Admit(maximum - 2U), contracts::FailedError);
+    CHECK_THROWS_AS(Revision::Admit(maximum - 3U), contracts::FailedError);
+    const auto admitted = Revision::Admit(maximum - 5U);
+    REQUIRE(admitted == maximum - 4U);
+    const auto progressed = Revision::Progress(admitted, false);
+    REQUIRE(progressed == maximum - 3U);
+    CHECK_FALSE(Revision::Progress(*progressed, false));
+    const auto cancelled = Revision::Cancel(*progressed);
+    REQUIRE(cancelled == maximum - 2U);
+    CHECK_FALSE(Revision::Progress(*cancelled, true));
+    const auto settled = Revision::Complete(*cancelled);
+    REQUIRE(settled == maximum - 1U);
+    CHECK_FALSE(Revision::Complete(*settled));
+    // A failure after successful settlement still receives a distinct identity.
+    CHECK(Revision::Fail(*settled) == maximum);
+    CHECK_FALSE(Revision::Fail(maximum));
+    CHECK(Revision::Fail(*cancelled) == maximum - 1U);
+    CHECK(Revision::Complete(Revision::Admit(maximum - 4U)) == maximum - 2U);
+    const auto earlier_cancel = Revision::Cancel(admitted);
+    REQUIRE(earlier_cancel == maximum - 3U);
+    CHECK(Revision::Progress(*earlier_cancel, true) == maximum - 2U);
+}
 
 class StopGate final {
    public:
@@ -1364,23 +1393,31 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
                                   predict_cancelled.set_value(std::move(event));
                           }};
     CHECK_FALSE(predict.BorrowFrame().valid());
-    static_cast<void>(predict.Start({}));
+    const auto first_admitted = predict.Start({});
+    CHECK(first_admitted.revision > 0U);
     CHECK_FALSE(predict.BorrowFrame().valid());
     CHECK_THROWS_AS(predict.Start({}), contracts::BusyError);
     predict_gate->Release();
     CHECK(std::holds_alternative<PredictFailed>(predict_failed.get_future().get()));
+    const auto failed_observation = predict.snapshot().revision;
+    CHECK(failed_observation > first_admitted.revision);
     CHECK_FALSE(predict.BorrowFrame().valid());
     static_cast<void>(predict.Start({}));
     CHECK(std::holds_alternative<PredictChanged>(predict_succeeded.get_future().get()));
+    const auto completed_observation = predict.snapshot().revision;
+    CHECK(completed_observation > failed_observation);
     CHECK(predict.snapshot().frame.valid());
     REQUIRE(predict.BorrowFrame().valid());
     predict_gate->Reset();
     const auto admitted = predict.Start({});
+    CHECK(admitted.revision > completed_observation);
     CHECK_FALSE(admitted.frame.valid());
     CHECK_FALSE(predict.BorrowFrame().valid());
-    static_cast<void>(predict.Stop({}));
+    const auto cancelled_request = predict.Stop({});
+    CHECK(cancelled_request.revision > admitted.revision);
     CHECK(std::holds_alternative<PredictChanged>(predict_cancelled.get_future().get()));
     CHECK(predict.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(predict.snapshot().revision >= cancelled_request.revision);
     CHECK_FALSE(predict.snapshot().frame.valid());
     CHECK_FALSE(predict.BorrowFrame().valid());
     CHECK(constructions == 2U);

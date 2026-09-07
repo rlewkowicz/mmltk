@@ -263,12 +263,54 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     };
     require(
         bootstrap.schema_fingerprint == mmltk_browser_app::generated::SCHEMA_FINGERPRINT
-            && matches!(
-                bootstrap.snapshots.as_slice(),
-                [ApplicationSnapshot::Settings(_)]
-            ),
+            && mmltk_browser_app::generated::application_bootstrap_complete(&bootstrap.snapshots),
         "native Bootstrap did not decode into the generated snapshot",
     )?;
+    let mut visual = mmltk_browser_app::generated::ApplicationVisualSnapshots {
+        explore: None,
+        annotation: None,
+        predict: None,
+        live: None,
+        upscale: None,
+    };
+    for snapshot in &bootstrap.snapshots {
+        match snapshot {
+            ApplicationSnapshot::Explore(value) => visual.explore = Some(value),
+            ApplicationSnapshot::Annotation(value) => visual.annotation = Some(value),
+            ApplicationSnapshot::Predict(value) => visual.predict = Some(value),
+            ApplicationSnapshot::Live(value) => visual.live = Some(value),
+            ApplicationSnapshot::Upscale(value) => visual.upscale = Some(value),
+            _ => {}
+        }
+    }
+    use mmltk_browser_app::generated as generated;
+    for (kind, session) in [
+        (generated::PresentationSourceKind::None, 0),
+        (generated::PresentationSourceKind::Explore, 1),
+        (generated::PresentationSourceKind::Annotation, 2),
+        (generated::PresentationSourceKind::Predict, 3),
+        (generated::PresentationSourceKind::Live, 4),
+        (generated::PresentationSourceKind::Upscale, 5),
+    ] {
+        require(generated::presentation_source_session(kind) == session, "stable browser session changed")?;
+        let Some(observed) = visual.observe(kind) else {
+            require(session == 0, "producer observation missing")?;
+            continue;
+        };
+        require(observed.snapshotrevision == u64::MAX - session && observed.frame.revision == 7 + session,
+            "native visual observation differs from Rust projection")?;
+        let clean = generated::visual_clean_content_identity(observed.frame);
+        require(clean.revision == 43 && clean.content.x == 1 && clean.extent.width == 32,
+            "native clean-content identity differs from Rust projection")?;
+        let mut semantic = observed.frame.clone();
+        semantic.revision += 1;
+        require(generated::visual_clean_content_identity(&semantic) == clean, "semantic-only change replaced clean identity")?;
+        semantic.cleanrevision = 0;
+        require(generated::visual_clean_content_identity(&semantic).revision == semantic.revision, "zero clean revision fallback changed")?;
+        semantic = observed.frame.clone();
+        semantic.extent.width += 1;
+        require(generated::visual_clean_content_identity(&semantic) != clean, "geometry change retained clean identity")?;
+    }
     for (correlation, selected) in [(17, false), (18, true)] {
         let Some(ServerRecord::IntentReply(reply)) = records.iter().find(|record| {
             matches!(

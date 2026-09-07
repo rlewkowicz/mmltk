@@ -4,6 +4,7 @@
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/system/execution_policy.h"
+#include "src/controller/subsystems/system/detail/predict_revision.h"
 
 #include <cuda_runtime_api.h>
 
@@ -483,6 +484,7 @@ class PredictSystem::Impl final {
             const auto prior = state_;
             const auto generation = contracts::next_compute_generation(state_.operation.generation_frontier);
             if (!generation) throw contracts::FailedError("prediction operation generation exhausted");
+            state_.revision = detail::PredictRevision::Admit(state_.revision);
             state_.operation.generation_frontier = *generation;
             state_.operation.active = true;
             state_.operation.progress = {};
@@ -530,9 +532,14 @@ class PredictSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             active = state_.operation.active;
-            if (active)
+            if (active && state_.operation.terminal.outcome != contracts::ComputeOperationOutcome::CancellationRequested) {
+                const auto revision = detail::PredictRevision::Cancel(state_.revision);
+                // Admission and progress preserve this identity while Running.
+                if (!revision) return state_;
+                state_.revision = *revision;
                 state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::CancellationRequested,
                                                                              state_.operation.generation_frontier);
+            }
         }
         if (active) worker_.RequestActiveStop();
         return snapshot();
@@ -560,6 +567,10 @@ class PredictSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (!state_.operation.active || !contracts::compute_progress_follows(progress, state_.operation.progress.sequence)) return;
+            const auto revision = detail::PredictRevision::Progress(
+                state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
+            if (!revision) return;
+            state_.revision = *revision;
             state_.operation.progress = progress;
             changed = state_;
         }
@@ -569,6 +580,9 @@ class PredictSystem::Impl final {
         PredictSnapshot changed;
         {
             std::scoped_lock lock(mutex_);
+            const auto revision = detail::PredictRevision::Complete(state_.revision);
+            if (!revision) return;
+            state_.revision = *revision;
             state_.operation.active = false;
             state_.operation.terminal = std::move(terminal);
             state_.frame = frame;
@@ -581,6 +595,9 @@ class PredictSystem::Impl final {
         PredictSnapshot failed;
         {
             std::scoped_lock lock(mutex_);
+            const auto revision = detail::PredictRevision::Fail(state_.revision);
+            if (!revision) return;
+            state_.revision = *revision;
             state_.operation.active = false;
             state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Failed,
                                                                          state_.operation.generation_frontier, 0U, {}, detail);

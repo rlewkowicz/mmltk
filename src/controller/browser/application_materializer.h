@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <expected>
 #include <functional>
 #include <iterator>
@@ -11,6 +13,7 @@
 #include <utility>
 
 #include "src/controller/browser/application_schema.h"
+#include "src/controller/presentation/presentation_system.h"
 #include "src/frameworks/serialization/serialization.h"
 
 namespace mmltk::controller::browser {
@@ -167,17 +170,31 @@ template <class Composition>
 
 template <auto Member, class Event, class Composition = mmltk::controller::ApplicationSystems>
 [[nodiscard]] SystemEvent encode_system_event(const Event& event) {
-    using Identity = ApplicationEventIdentity<Composition, Member, Event>;
-    constexpr auto metadata = application_schema_detail::annotation_value<^^Event, mmltk::controller::contracts::reflection::Event>();
+    using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
     auto value = application_materializer_detail::reflected_value(event);
     if (!value) throw std::runtime_error("system event cannot be encoded");
-    std::uint64_t state_revision = 0U;
-    if constexpr (metadata.delivery == contracts::reflection::EventDelivery::LatestState) state_revision = event.snapshot.revision;
-    return {.system_id = Identity::system_id,
-            .event_id = Identity::event_id,
-            .delivery = metadata.delivery,
-            .state_revision = state_revision,
+    return {.system_id = Descriptor::system_id,
+            .event_id = Descriptor::event_id,
+            .delivery = Descriptor::delivery,
+            .state_revision = Descriptor::StateRevision(event),
             .value = std::move(*value)};
+}
+
+template <class Composition>
+[[nodiscard]] auto materialize_visual_source_readers(const Composition& systems) {
+    using Schema = ApplicationSchema<Composition>;
+    std::array<VisualSourceReader, Schema::VisualSourceCount()> readers{};
+    std::size_t index = 0U;
+    Schema::VisitVisualSources([&]<class Cell, std::meta::info Snapshot, class Projection>() {
+        auto* system = systems.*Cell::pointer;
+        if (system == nullptr) throw std::logic_error("visual source is unavailable during application construction");
+        readers[index++] = {
+            .source = {Projection::kind, 1U},
+            .observe = [system] { return Projection::Observe(std::invoke(&[:Snapshot:], *system)); },
+            .borrow = [system] { return system->BorrowFrame(); },
+        };
+    });
+    return readers;
 }
 
 template <class Composition>

@@ -74,7 +74,7 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
 fn matches(snapshot: &ExploreSnapshot, frame: FrameReady) -> bool {
     snapshot.frame.source.kind == crate::generated::PresentationSourceKind::Explore
         && snapshot.frame.source.instance != 0
-        && frame.content_session == snapshot.frame.source.kind as u64
+        && frame.content_session == crate::generated::presentation_source_session(snapshot.frame.source.kind)
         && snapshot.frame.revision == frame.content_sequence
         && snapshot.frame.extent.width == frame.content_width
         && snapshot.frame.extent.height == frame.content_height

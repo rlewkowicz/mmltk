@@ -12,6 +12,7 @@ mmltk_register_public_headers(
         application_stable_identity.h
         application_schema.h
         application_materializer.h
+        application_event_publisher.h
         client_record.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_browser_protocol_v13
@@ -71,7 +72,7 @@ add_executable(mmltk_application_binding_generator EXCLUDE_FROM_ALL)
 mmltk_register_ordinary_sources(
     mmltk_application_binding_generator application_binding_generator.cpp)
 mmltk_register_private_headers(
-    mmltk_application_binding_generator application_outer_routing_emitter.h)
+    mmltk_application_binding_generator application_outer_routing_emitter.h application_visual_projection_emitter.h)
 mmltk_configure_component(
     mmltk_application_binding_generator PRIVATE_DECLARATIONS)
 target_link_libraries(
@@ -93,6 +94,7 @@ add_custom_command(
         application_stable_identity.h
         application_schema.h
         application_outer_routing_emitter.h
+        application_visual_projection_emitter.h
         application_materializer.h
         ${CMAKE_SOURCE_DIR}/src/controller/contracts/application_systems.h
     VERBATIM)
@@ -138,7 +140,8 @@ function(mmltk_add_controller_browser_tests)
     )
     mmltk_register_private_headers(
         mmltk_controller_browser_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_outer_routing_emitter.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_outer_routing_emitter.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_visual_projection_emitter.h)
     mmltk_configure_component(
         mmltk_controller_browser_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_browser_tests PRIVATE

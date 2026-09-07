@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <functional>
 #include <string_view>
@@ -64,7 +65,12 @@ class ReflectedMemberIdentity final {
         return result;
     }
 
-    [[nodiscard]] constexpr bool valid() const noexcept { return !root_.empty() && depth_ != 0U; }
+    [[nodiscard]] constexpr bool valid() const noexcept {
+        if (root_.empty() || depth_ == 0U || depth_ > segments_.size()) return false;
+        for (std::size_t index = 0U; index < depth_; ++index)
+            if (segments_[index].owner.empty() || segments_[index].member.empty()) return false;
+        return true;
+    }
     [[nodiscard]] constexpr std::string_view name() const noexcept {
         return depth_ == 0U ? std::string_view{} : segments_[depth_ - 1U].member;
     }
@@ -87,11 +93,20 @@ class ReflectedMemberIdentity final {
 
     template <auto Member>
     [[nodiscard]] static consteval ReflectedMemberSegment segment() {
-        using Owner = typename MemberPointerOwner<std::remove_cvref_t<decltype(Member)>>::type;
-        return {
-            reflected_type_name<Owner>(),
-            materialized_member_name<Member>(),
-        };
+        ReflectedMemberSegment result{};
+        if constexpr (std::is_member_object_pointer_v<decltype(Member)>) {
+            using Owner = typename MemberPointerOwner<std::remove_cvref_t<decltype(Member)>>::type;
+            if constexpr (requires { materialized_field_policies(std::type_identity<Owner>{}); }) {
+                visit_materialized_members<Owner>([&]<class Declaration>(const auto& fact) {
+                    if constexpr (std::same_as<std::remove_cvref_t<decltype(Declaration::pointer)>,
+                                               std::remove_cvref_t<decltype(Member)>>) {
+                        if (Declaration::pointer == Member)
+                            result = {reflected_type_name<Owner>(), fact.member_name};
+                    }
+                });
+            }
+        }
+        return result;
     }
 
     std::string_view root_{};

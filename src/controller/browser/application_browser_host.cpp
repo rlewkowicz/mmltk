@@ -73,6 +73,7 @@ struct ApplicationBrowserHost::Impl final {
                     .value = static_cast<std::uint64_t>(encoding.error().code),
                     .detail = static_cast<std::uint64_t>(record_priority),
                 });
+                if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
                 return false;
             }
             const auto* state = std::get_if<SystemEvent>(&record);
@@ -93,9 +94,11 @@ struct ApplicationBrowserHost::Impl final {
                     .value = static_cast<std::uint64_t>(result),
                     .detail = static_cast<std::uint64_t>(record_priority),
                 });
+                continuity_lost();
             }
             return accepted;
         } catch (...) {
+            if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
             if (diagnostics.valid()) {
                 const auto error = map_current_exception();
                 diagnostics.write({
@@ -113,11 +116,12 @@ struct ApplicationBrowserHost::Impl final {
     void opened() noexcept {
         try {
             auto* installed = systems.load(std::memory_order_acquire);
-            if (admission.load(std::memory_order_acquire) && installed != nullptr &&
-                publish_record(materialize_bootstrap(*installed), transport::BrowserRecordPriority::Critical))
+            if (admission.load(std::memory_order_acquire) && installed != nullptr) {
+                (void)publish_record(materialize_bootstrap(*installed), transport::BrowserRecordPriority::Critical);
                 return;
+            }
         } catch (...) {}
-        if (server) server->close_peer();
+        continuity_lost();
     }
 
     [[nodiscard]] bool record(const std::span<const std::byte> bytes) noexcept {
@@ -249,7 +253,7 @@ struct ApplicationBrowserHost::Impl final {
     void publish(SystemEvent event) noexcept {
         if (!admission.load(std::memory_order_acquire)) return;
         const auto record_priority = priority(event.delivery);
-        if (!publish_record(event, record_priority) && record_priority == transport::BrowserRecordPriority::Critical) server->close_peer();
+        (void)publish_record(event, record_priority);
     }
     void continuity_lost() noexcept {
         diagnostics.write({

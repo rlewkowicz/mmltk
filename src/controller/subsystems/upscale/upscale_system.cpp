@@ -339,13 +339,9 @@ class UpscaleSystem::Impl final {
                                       .value = plane.data,
                                       .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes});
                     }
-                    const auto clean_identity = [](const VisualFrame& frame) {
-                        return frame.clean_revision == 0U ? frame.revision : frame.clean_revision;
-                    };
                     const bool reuse_clean =
-                        processed_ && processed_->kernel == request.kernel && processed_->source.source == request.source.source &&
-                        processed_->source.extent == request.source.extent && processed_->source.content == request.source.content &&
-                        clean_identity(processed_->source) == clean_identity(request.source);
+                        processed_ && processed_->kernel == request.kernel &&
+                        visual_clean_content_identity(processed_->source) == visual_clean_content_identity(request.source);
                     auto output_candidate = runtime.AcquireOutput(stop, reuse_clean ? runtime.Completed() :
                         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
                     if (!output_candidate.valid()) return {};

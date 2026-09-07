@@ -1,4 +1,5 @@
 #include "src/controller/browser/application_browser_host.h"
+#include "src/controller/browser/application_event_publisher.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <catch2/catch_test_macros.hpp>
@@ -15,6 +16,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <meta>
@@ -619,6 +621,34 @@ TEST_CASE("direct host closes the peer when essential state continuity is lost")
     server.context()->owner->continuity_lost();
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));
+}
+
+TEST_CASE("essential typed encoding failure closes once and reconnect restores bootstrap") {
+    RunningHost server{OpenPressure::None};
+    std::size_t failures = 0U;
+    std::function<void(SystemEvent)> sink = [&](SystemEvent event) { server.context()->owner->publish(std::move(event)); };
+    ApplicationEventPublisher<&ApplicationSystems::explore> publisher(sink, [&] {
+        ++failures;
+        server.context()->owner->continuity_lost();
+    });
+    {
+        LoopbackWebSocket peer{server.websocket(), HandshakePolicy::AllowPeerClose};
+        REQUIRE(peer.receive());
+        publisher(ExploreSystem::event_type{ExploreFailed{
+            .detail = std::string(kVisualFailureByteCapacity + 1U, 'x'),
+        }});
+        const auto terminal = peer.receive();
+        CHECK((!terminal || terminal->opcode == 8U));
+        CHECK(failures == 1U);
+    }
+    LoopbackWebSocket reconnected{server.websocket()};
+    const auto frame = reconnected.receive();
+    REQUIRE(frame);
+    const auto record = decode(*frame);
+    REQUIRE(std::holds_alternative<Bootstrap>(record));
+    CHECK(std::get<Bootstrap>(record).schema_fingerprint == application_schema_fingerprint<ApplicationSystems>().words);
+    REQUIRE(std::get<Bootstrap>(record).snapshots.size() == 1U);
+    CHECK(std::get<Bootstrap>(record).snapshots.front().system_id == application_system_stable_id<&ApplicationSystems::settings>());
 }
 
 TEST_CASE("direct host preserves the final complete state across a snapshot burst") {

@@ -81,7 +81,7 @@ fn emit_surface_trace(line: &str) {
 fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreSnapshot>) -> String {
     snapshot.map_or_else(String::new, |snapshot| format!(
         ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?}",
-        snapshot.frame.source.kind as u64, snapshot.frame.source.instance, snapshot.frame.revision,
+        crate::generated::presentation_source_session(snapshot.frame.source.kind), snapshot.frame.source.instance, snapshot.frame.revision,
         snapshot.dataset.identity, snapshot.gallery.generation, snapshot.gallery.slots,
         snapshot.viewport.columns, snapshot.viewport.rowcount, snapshot.viewport.firstrow,
         snapshot.order.matchingcount, snapshot.order.visibleindices,
@@ -157,7 +157,7 @@ pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreSnapshot)
     if surface_trace_enabled() {
         emit_surface_trace(&format!(
             "{{\"event\":\"iced.gallery.source\",\"content_session\":{},\"content_width\":{},\"content_height\":{}{} }}",
-            snapshot.frame.source.kind as u64,
+            crate::generated::presentation_source_session(snapshot.frame.source.kind),
             snapshot.frame.extent.width,
             snapshot.frame.extent.height,
             gallery_trace_fields(Some(snapshot)),

@@ -25,6 +25,7 @@
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/contracts/workflows.h"
+#include "src/controller/presentation/visual_system_types.h"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -1028,6 +1029,41 @@ struct ApplicationEventIdentity final {
     static constexpr std::uint64_t event_id = application_stable_id(system_cell::name, mmltk::frameworks::reflection::type_name<Event>());
 };
 
+template <class Composition, auto Member, class Event>
+[[nodiscard]] consteval bool application_event_is_member() {
+    using Cell = typename ApplicationEventIdentity<Composition, Member, Event>::system_cell;
+    bool found = false;
+    application_schema_detail::Variant<typename Cell::type::event_type>::Visit(
+        [&]<class Candidate>() { found = found || std::same_as<Candidate, Event>; });
+    return found;
+}
+
+template <class Composition, auto Member, class Event>
+struct ApplicationEventDescriptor final {
+    using identity = ApplicationEventIdentity<Composition, Member, Event>;
+    using system_cell = typename identity::system_cell;
+    static_assert(application_event_is_member<Composition, Member, Event>(),
+                  "event must belong to the selected system event variant");
+    static_assert(application_schema_detail::annotation_count<^^Event, contracts::reflection::Event>() == 1U,
+                  "event requires exactly one delivery annotation");
+    static constexpr auto metadata = application_schema_detail::annotation_value<^^Event, contracts::reflection::Event>();
+    static constexpr auto delivery = metadata.delivery;
+    static_assert(mmltk::frameworks::reflection::enum_contains(delivery), "invalid event delivery");
+    static_assert(application_schema_detail::runtime_boundary_projectable<Event>(),
+                  "event record contains an unsupported or unreflected reachable type");
+    static_assert(delivery != contracts::reflection::EventDelivery::LatestState ||
+                  requires(const Event& event) { { event.snapshot.revision } -> std::same_as<const std::uint64_t&>; },
+                  "LatestState requires the canonical complete snapshot revision");
+    static constexpr auto system_id = identity::system_id;
+    static constexpr auto event_id = identity::event_id;
+    [[nodiscard]] static constexpr std::uint64_t StateRevision(const Event& event) noexcept {
+        if constexpr (delivery == contracts::reflection::EventDelivery::LatestState) {
+            return event.snapshot.revision;
+        }
+        return 0U;
+    }
+};
+
 template <class SystemCell, std::meta::info Method>
 struct ReflectedEndpoint final {
     static_assert(application_schema_detail::SupportedEndpointMethod<Method>,
@@ -1167,6 +1203,47 @@ struct ApplicationSchema final {
     using settings_type = typename application_schema_detail::CompositionSettingsSurface<Composition>::settings_type;
 
     template <class Visitor>
+    static constexpr void VisitVisualSources(Visitor&& visitor) {
+        VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
+            using System = typename SystemCell::type;
+            if constexpr (requires { typename System::visual_source; }) {
+                using Projection = typename System::visual_source;
+                using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;
+                static_assert(Projection::valid(), "malformed visual producer descriptor");
+                static_assert(std::same_as<typename Projection::snapshot_type, typename Signature::result_type>,
+                              "visual projection must name the system snapshot");
+                static_assert(requires(const System& system) {
+                    { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
+                }, "visual producer must expose borrowed-product access");
+                visitor.template operator()<SystemCell, Snapshot, Projection>();
+            }
+        });
+    }
+
+    [[nodiscard]] static consteval bool VisualSourcesAreUnique() {
+        std::array<bool, presentation_source_metadata.size()> seen{};
+        bool unique = true;
+        VisitVisualSources([&]<class, std::meta::info, class Projection>() {
+            std::size_t index = 0U;
+            for (; index < presentation_source_metadata.size(); ++index)
+                if (presentation_source_metadata[index].kind == Projection::kind) break;
+            if (index == seen.size() || seen[index]) {
+                unique = false;
+                return;
+            }
+            seen[index] = true;
+        });
+        return unique;
+    }
+
+    [[nodiscard]] static consteval std::size_t VisualSourceCount() {
+        static_assert(VisualSourcesAreUnique(), "visual producer source kinds must be unique");
+        std::size_t count = 0U;
+        VisitVisualSources([&]<class, std::meta::info, class>() { ++count; });
+        return count;
+    }
+
+    template <class Visitor>
     static constexpr void VisitSystems(Visitor&& visitor) {
         template for (constexpr auto cell : std::define_static_array(
                           std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
@@ -1225,21 +1302,8 @@ struct ApplicationSchema final {
             static_assert(application_schema_detail::ReflectedEventVariant<typename SystemCell::type>,
                           "ordinary system event_type must be one reflected std::variant");
             application_schema_detail::Variant<typename SystemCell::type::event_type>::Visit([&]<class Event>() {
-                static_assert(application_schema_detail::annotation_count<^^Event, mmltk::controller::contracts::reflection::Event>() == 1U,
-                              "every event record requires exactly one typed Event annotation");
-                static_assert(application_schema_detail::runtime_boundary_projectable<Event>(),
-                              "event record contains an unsupported or unreflected reachable type");
-                constexpr auto metadata =
-                    application_schema_detail::annotation_value<^^Event, mmltk::controller::contracts::reflection::Event>();
-                static_assert(mmltk::frameworks::reflection::enum_contains(metadata.delivery),
-                              "Event annotation has an invalid delivery policy");
-                if constexpr (metadata.delivery == mmltk::controller::contracts::reflection::EventDelivery::LatestState)
-                    static_assert(
-                        requires(const Event& event) {
-                            { event.snapshot.revision } -> std::same_as<const std::uint64_t&>;
-                        }, "LatestState events carry a complete snapshot with a canonical uint64 revision");
-                using Identity = ApplicationEventIdentity<Composition, &[:cell:], Event>;
-                visitor.template operator()<Identity, Event>(metadata);
+                using Identity = ApplicationEventDescriptor<Composition, &[:cell:], Event>;
+                visitor.template operator()<Identity, Event>(Identity::metadata);
             });
         }
     }
@@ -1433,6 +1497,40 @@ template <class Composition>
             if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
         };
         sink.append_number(kBrowserProtocolVersion);
+        sink.append("visual-source-projections");
+        application_schema_detail::append_type<VisualSourceObservation>(sink, seen_types);
+        application_schema_detail::append_type<VisualCleanContentIdentity>(sink, seen_types);
+        sink.append_number(ApplicationSchema<Composition>::VisualSourceCount());
+        for (const auto metadata : presentation_source_metadata) {
+            sink.append(mmltk::frameworks::reflection::enum_name(metadata.kind));
+            sink.append_number(metadata.session);
+        }
+        ApplicationSchema<Composition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+            sink.append_number(Cell::stable_id);
+            sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
+            Projection::relation::VisitMembers([&]<class Entry>() {
+                constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<
+                    typename Projection::snapshot_type, Entry::source>();
+                constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<
+                    VisualSourceObservation, Entry::destination>();
+                sink.append(source.view());
+                sink.append(destination.view());
+            });
+        });
+        sink.append("visual-clean-content-relation");
+        VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
+            constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, Entry::source>();
+            constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
+            sink.append(source.view());
+            sink.append(destination.view());
+        });
+        constexpr auto fallback_source = mmltk::frameworks::reflection::reflected_member_path<
+            VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
+        constexpr auto fallback_destination = mmltk::frameworks::reflection::reflected_member_path<
+            VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>();
+        sink.append("zero-fallback");
+        sink.append(fallback_source.view());
+        sink.append(fallback_destination.view());
         application_schema_detail::append_type<SystemEvent>(sink, seen_types);
         ApplicationSchema<Composition>::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
             using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;

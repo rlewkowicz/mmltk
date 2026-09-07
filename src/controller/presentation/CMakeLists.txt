@@ -8,7 +8,7 @@ mmltk_configure_component(
 mmltk_register_public_headers(
     mmltk_controller_visual_contract
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES visual_system_types.h visual_document.h)
+    FILES visual_system_types.h visual_document.h visual_source_projection.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_visual_contract
     visual_system_types.cpp

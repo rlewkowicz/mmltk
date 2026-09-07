@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/controller/presentation/visual_source_projection.h"
+
 #include <chrono>
 #include <memory>
 #include <stop_token>
@@ -64,6 +66,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 
 class LiveSystem final {
    public:
+    using visual_source = VisualSourceProjection<LiveSnapshot, PresentationSourceKind::Live,
+        mmltk::frameworks::reflection::member_path<&LiveSnapshot::frame>,
+        mmltk::frameworks::reflection::member_path<&LiveSnapshot::revision>>;
     using event_type = std::variant<LiveFrameCompleted, LiveChanged, LiveFailed>;
     LiveSystem(VisualDeviceSettings, VisualRuntimeFactory, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~LiveSystem();

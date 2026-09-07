@@ -726,6 +726,16 @@ pub(super) fn merge_predict_snapshot(
         *target = Some(incoming);
         return Ok(Observation::Installed);
     };
+    if incoming.revision < installed.revision {
+        return Ok(Observation::Stale);
+    }
+    if incoming.revision == installed.revision {
+        return if incoming == *installed {
+            Ok(Observation::Current)
+        } else {
+            Err(UiError::protocol("inconsistent Predict snapshot revision"))
+        };
+    }
     let prior_generation = installed.operation.generationfrontier;
     let incoming_generation = incoming.operation.generationfrontier;
     let mut operation = installed.operation.clone();
@@ -738,12 +748,14 @@ pub(super) fn merge_predict_snapshot(
         return Ok(Observation::Installed);
     }
     if operation_observation == Observation::Installed {
+        installed.revision = incoming.revision;
         installed.operation = operation;
         installed.frame = incoming.frame;
         return Ok(Observation::Installed);
     }
     if operation_observation == Observation::Current && incoming.frame == installed.frame {
-        return Ok(Observation::Current);
+        installed.revision = incoming.revision;
+        return Ok(Observation::Installed);
     }
     if incoming.frame.revision < installed.frame.revision {
         return Ok(Observation::Stale);
@@ -753,6 +765,7 @@ pub(super) fn merge_predict_snapshot(
             "inconsistent Predict frame for one operation observation",
         ));
     }
+    installed.revision = incoming.revision;
     installed.frame = incoming.frame;
     Ok(Observation::Installed)
 }
