@@ -972,20 +972,38 @@ mod tests {
 
     #[test]
     fn navigation_remains_local_when_optional_persistence_is_unavailable() {
-        let (mut app, task) = boot();
-        drop(task);
-        install_default_bootstrap(&mut app);
-        let pending = app
-            .model
-            .begin_intent(ApplicationIntentEndpoint::SettingsUpdate)
-            .unwrap();
-        drop(app.on_workspace(crate::view::router::Message::Navigation(
-            crate::view::navigation::Message::PageSelected(FeatureId::Validate),
-        )));
-        assert_eq!(app.workspace.active(), FeatureId::Validate);
-        assert_eq!(app.model.pending_count(), 1);
-        assert!(app.model.error.is_none());
-        app.model.abandon_intent(pending);
+        for condition in 0..3 {
+            let (mut app, task) = boot();
+            drop(task);
+            install_default_bootstrap(&mut app);
+            let pending = match condition {
+                0 => {
+                    app.settings = crate::view::settings::Component::default();
+                    app.model.settings_snapshot = None;
+                    None
+                }
+                1 => Some(app.model.begin_intent(ApplicationIntentEndpoint::SettingsUpdate).unwrap()),
+                _ => Some(app.model.begin_intent(ApplicationIntentEndpoint::SettingsReset).unwrap()),
+            };
+            let source = crate::view_model::test_support::visual_frame(PresentationSourceKind::Live, 1);
+            app.model.live_snapshot.as_mut().unwrap().frame = source.clone();
+            let (sender, mut receiver) = futures_channel::mpsc::channel(8);
+            app.connection = Some(Connection::new(sender));
+            drop(update(&mut app, Message::Workspace(crate::view::router::Message::Navigation(
+                crate::view::navigation::Message::PageSelected(FeatureId::Live),
+            ))));
+            assert_eq!(app.workspace.active(), FeatureId::Live);
+            assert!(app.model.error.is_none());
+            let crate::transport_connection::OutboundRecord::Intent(intent) = receiver.try_recv().unwrap() else {
+                panic!("expected Live foreground selection");
+            };
+            assert_eq!(intent, crate::generated::encode_presentation_Select(intent.correlation, source.source).record);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(app.model.pending_count(), usize::from(pending.is_some()) + 1);
+            if let Some(pending) = pending {
+                app.model.abandon_intent(pending);
+            }
+        }
     }
 
     #[test]

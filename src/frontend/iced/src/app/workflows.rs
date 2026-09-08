@@ -15,9 +15,10 @@ impl App {
         };
         match outcome {
             crate::view::router::Outcome::FeatureSelected(feature) => {
+                let task = self.transition_page(feature);
                 self.integration
                     .observe_navigation_outcome(feature, self.workspace.active());
-                self.transition_page(feature)
+                task
             }
             crate::view::router::Outcome::SettingsRequested => {
                 self.settings.open();

@@ -16,7 +16,6 @@ pub(super) struct Controller {
     retained: Option<Surface>,
     failed: bool,
     viewer: Option<(u64, u32)>,
-    viewer_method: Option<crate::generated::UpscaleKernel>,
     suspended: Option<SuspendedViewer>,
     pub(super) stop_requested: bool,
 }
@@ -47,7 +46,6 @@ impl Controller {
     }
 
     fn abandon_viewer(&mut self) -> Option<ViewerOutcome> {
-        self.viewer_method = None;
         self.suspended = None;
         self.viewer.take().map(|_| ViewerOutcome::Abandoned)
     }
@@ -78,7 +76,6 @@ impl Controller {
                 let abandoned = self.abandon_viewer();
                 if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
                     self.viewer = identity;
-                    self.viewer_method = Some(crate::generated::UpscaleKernel::Default);
                     return Some(ViewerOutcome::Replaced(crate::generated::UpscaleRequest {
                         source: snapshot.frame.clone(), document: snapshot.document.clone(),
                         kernel: crate::generated::UpscaleKernel::Default,
@@ -88,15 +85,11 @@ impl Controller {
             }
         }
         if identity == self.viewer {
-            if let Some(request) = model.explore.requested_upscale.as_ref() {
-                self.viewer_method = Some(request.kernel);
-            }
             return None;
         }
         if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
             let replacing = self.viewer.is_some();
             self.viewer = identity;
-            self.viewer_method = Some(crate::generated::UpscaleKernel::Default);
             let request = crate::generated::UpscaleRequest {
                 source: snapshot.frame.clone(),
                 kernel: crate::generated::UpscaleKernel::Default,
@@ -301,21 +294,25 @@ impl App {
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
         }
-        if self.settings.draft().is_none() || !self.model.settings_edit_available() {
-            return Task::none();
-        }
-        match self
-            .settings
-            .state_mut()
-            .edit(EditCadence::Immediate, |draft| {
-                crate::generated::edit_currentview(draft, feature)
-            }) {
-            Ok(schedule) => self.handle_settings_schedule(schedule),
-            Err(detail) => {
-                self.model.error = Some(UiError::invalid(detail));
-                Task::none()
+        let task = if self.settings.draft().is_some() && self.model.settings_edit_available() {
+            match self
+                .settings
+                .state_mut()
+                .edit(EditCadence::Immediate, |draft| {
+                    crate::generated::edit_currentview(draft, feature)
+                }) {
+                Ok(schedule) => self.handle_settings_schedule(schedule),
+                Err(detail) => {
+                    self.model.error = Some(UiError::invalid(detail));
+                    Task::none()
+                }
             }
-        }
+        } else {
+            Task::none()
+        };
+        self.reconcile_viewer();
+        self.dispatch_viewer_desired();
+        task
     }
 
     pub(super) fn select_presentation(&mut self, frame: VisualFrame) {
@@ -841,8 +838,7 @@ mod tests {
                 stopped |= intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop);
             }
             assert!(stopped);
-            app.rebase_page(FeatureId::Explore);
-            app.reconcile_presentation(false);
+            navigate(&mut app, FeatureId::Explore);
             let request = app.model.explore.requested_upscale.as_ref().unwrap();
             assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
             assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(request));
@@ -1246,7 +1242,7 @@ mod tests {
             app.present_native_frame(pending);
             match operation {
                 0 => {
-                    drop(app.transition_page(FeatureId::Train));
+                    navigate(&mut app, FeatureId::Train);
                 }
                 1 => {
                     drop(app.on_explore(crate::view::explore::Outcome::CloseDetailRequested));
@@ -1264,6 +1260,87 @@ mod tests {
                 assert!(test_releases().is_empty());
                 assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
             }
+        }
+    }
+
+    fn navigate(app: &mut App, feature: FeatureId) {
+        drop(crate::app::update(app, crate::message::Message::Workspace(
+            crate::view::router::Message::Navigation(
+                crate::view::navigation::Message::PageSelected(feature),
+            ),
+        )));
+    }
+
+    #[test]
+    fn mapped_navigation_preserves_current_viewer_and_dispatches_departure_and_reentry() {
+        for persist in [false, true] {
+            let (mut app, frame) = viewer_app();
+            app.model.settings_snapshot.as_mut().unwrap().settingsstate.currentview = FeatureId::Explore;
+            if persist {
+                app.settings.install(app.model.settings_snapshot.as_ref().unwrap());
+            }
+            app.reconcile_viewer();
+            let mut requested = app.model.explore.requested_upscale.clone().unwrap();
+            requested.kernel = crate::generated::UpscaleKernel::ShiftLut;
+            app.model.request_upscale(requested.clone());
+            let viewer = app.presentation.viewer;
+            app.present_native_frame(frame);
+            record_draw(&app, frame, [0, 0, 640, 480]);
+            crate::presentation_surface::release(frame);
+            let retained = crate::presentation_surface::drawn_detail();
+            let pending = FrameReady { presentation_revision: 6, slot: 1, ..frame };
+            app.present_native_frame(pending);
+            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+            app.connection = Some(Connection::new(sender));
+
+            navigate(&mut app, FeatureId::Explore);
+            assert_eq!(app.presentation.viewer, viewer);
+            assert_eq!(app.model.explore.requested_upscale.as_ref(), Some(&requested));
+            assert!(app.model.explore.sent_upscale.is_none());
+            assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
+            assert_eq!(crate::presentation_surface::drawn_detail(), retained);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(test_releases(), vec![frame]);
+
+            navigate(&mut app, FeatureId::Train);
+            assert_eq!(app.workspace.active(), FeatureId::Train);
+            assert!(app.presentation.viewer.is_none());
+            assert!(app.model.explore.requested_upscale.is_none());
+            assert!(app.model.explore.sent_upscale.is_none());
+            assert!(app.model.presentation_refresh().is_none());
+            assert_eq!(test_releases(), vec![frame, pending]);
+            let mut operations = Vec::new();
+            while let Ok(record) = receiver.try_recv() {
+                if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
+                    operations.push(intent.endpoint_id);
+                    if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop) {
+                        assert_eq!(intent, crate::generated::encode_upscale_Stop(intent.correlation).record);
+                    }
+                }
+            }
+            let mut expected = vec![ApplicationIntentEndpoint::UpscaleStop];
+            if persist {
+                expected.push(ApplicationIntentEndpoint::SettingsUpdate);
+                assert_eq!(app.settings.draft().unwrap().currentview, FeatureId::Train);
+            }
+            assert_eq!(operations, expected.into_iter().map(crate::generated::application_intent_endpoint_stable_id).collect::<Vec<_>>());
+
+            // No Settings or Presentation event arrives before reentry. Native
+            // completion already describes this same Explore source.
+            navigate(&mut app, FeatureId::Explore);
+            let basic = app.model.explore.requested_upscale.clone().unwrap();
+            assert_eq!(basic.kernel, crate::generated::UpscaleKernel::Default);
+            assert_eq!(basic.source, requested.source);
+            assert_eq!(basic.document, requested.document);
+            assert_eq!(app.presentation.viewer, viewer);
+            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&basic));
+            navigate(&mut app, FeatureId::Explore);
+            let crate::transport_connection::OutboundRecord::Intent(intent) = receiver.try_recv().unwrap() else {
+                panic!("expected automatic Basic");
+            };
+            assert_eq!(intent, crate::generated::encode_upscale_Start(intent.correlation, basic).record);
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(test_releases(), vec![frame, pending]);
         }
     }
 

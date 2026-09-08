@@ -173,7 +173,6 @@ impl Router {
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
                 navigation::Outcome::PageSelected(feature) => {
-                    self.active = feature;
                     Outcome::FeatureSelected(feature)
                 }
                 navigation::Outcome::SettingsRequested => Outcome::SettingsRequested,
@@ -283,8 +282,17 @@ mod tests {
     #[test]
     fn persistent_router_accepts_every_generated_feature() {
         let mut router = Router::default();
-        let model = ApplicationModel::default();
+        let mut model = ApplicationModel::default();
+        let mut settings = crate::view::settings::Component::default();
         for feature in crate::generated::FEATURE_ID_VALUES {
+            let previous = router.active();
+            let outcome = router.update(
+                &mut model,
+                &mut settings,
+                Message::Navigation(navigation::Message::PageSelected(*feature)),
+            ).unwrap();
+            assert!(matches!(outcome, Some(Outcome::FeatureSelected(selected)) if selected == *feature));
+            assert_eq!(router.active(), previous);
             router.select(*feature);
             assert_eq!(router.active(), *feature);
             drop(router.view(
