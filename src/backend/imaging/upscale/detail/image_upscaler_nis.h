@@ -8,12 +8,6 @@
 
 namespace mmltk::backend::imaging::upscale::image_upscaler_nis {
 
-enum class SourceLayout : std::uint8_t {
-    // CLEANUP-IGNORE: Vendor source-layout alternatives only coincide structurally with an internal Explore state tail.
-    NormalizedNchwFloat,
-    Rgba8,
-};
-
 // CLEANUP-IGNORE: This explicit NIS ABI configuration preserves its vendor-defined field order and types.
 struct Configuration final {
     std::uint32_t source_width = 0U;
@@ -24,7 +18,6 @@ struct Configuration final {
     std::uint32_t crop_height = 0U;
     std::uint32_t output_width = 0U;
     std::uint32_t output_height = 0U;
-    SourceLayout source_layout = SourceLayout::NormalizedNchwFloat;
 };
 
 struct ScratchRequirements final {

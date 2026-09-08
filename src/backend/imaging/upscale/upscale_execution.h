@@ -16,7 +16,10 @@ enum class ImageUpscalerKind : std::uint8_t { ShiftLUT, RealPLKSR, Count };
 enum class ImageUpscalerBackend : std::uint8_t { NisFallback, OnnxRuntime, TensorRt, Count };
 static_assert(static_cast<std::size_t>(ImageUpscalerKind::Count) == 2U);
 struct ImageUpscalerRequest {
-    const float* device_pixels = nullptr;
+    const std::uint8_t* device_pixels = nullptr;
+    std::size_t source_pitch = 0U;
+    std::uint8_t* target_pixels = nullptr;
+    std::size_t target_pitch = 0U;
     std::uint32_t source_width = 0U;
     std::uint32_t source_height = 0U;
     std::uint32_t crop_x = 0U;
@@ -41,7 +44,7 @@ enum class ImageUpscalerExecutionStage : std::uint8_t {
     GraphDestroyed, EventDestroyed, StreamDestroyed, BufferReleased, ContextReleased,
     InitializationAdmitted, ChecksumAdmitted, CacheLockAdmitted, CacheLockWaiting,
     BuildAdmitted, BasicAllocationAdmitted, BasicLaunchAdmitted, PreprocessAdmitted,
-    RestoredAllocationAdmitted, TilePrepared, BindingsReady, RuntimeEnqueued, Count,
+    TargetAdmitted, TilePrepared, BindingsReady, RuntimeEnqueued, Count,
 };
 // Effect-only, per-owner instrumentation. Empty in ordinary execution; failures
 // enter the same checked settlement path as failures of the preceding operation.

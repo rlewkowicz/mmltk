@@ -19,6 +19,7 @@ module;
 #include <vector>
 
 #include "detail/image_upscaler_cuda.h"
+#include "detail/shiftlut_onnx_ops.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -154,6 +155,7 @@ class OnnxImageUpscalerRuntime final
 
     void create_session(const bool graph) {
         Ort::SessionOptions options;
+        if (descriptor().kind == ImageUpscalerKind::ShiftLUT) shiftlut_operators_.Register(options);
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         options.SetIntraOpNumThreads(1);
         options.SetInterOpNumThreads(1);
@@ -286,6 +288,7 @@ class OnnxImageUpscalerRuntime final
             cleanup_.Record(cudaGraphDestroy(abandoned_capture_), "destroy abandoned ONNX capture"))
             abandoned_capture_ = nullptr;
         if (abandoned_capture_ == nullptr) {
+        if (!cleanup_.Record(shiftlut_operators_.Release(), "release resident ShiftLUT storage")) return cleanup_.status();
         binding_.reset();
         output_value_.reset();
         input_value_.reset();
@@ -385,7 +388,7 @@ class OnnxImageUpscalerRuntime final
                     ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX inference");
                     return false;
                 }
-                image_upscaler_cuda::stitch_request_tile(output_.data(), tile, descriptor().kind, descriptor().halo, restored_pixels(),
+                image_upscaler_cuda::stitch_request_tile(output_.data(), tile, descriptor().kind, descriptor().halo, request,
                                                          restored_width, restored_height, stream_);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch ONNX upscaler tile composition");
             }
@@ -400,8 +403,8 @@ class OnnxImageUpscalerRuntime final
                     device_id(), descriptor().label, timing_.sequence, timing_.first_inference, graph_enabled_, request.crop_width,
                     request.crop_height,
                     ((request.crop_width + core_extent - 1U) / core_extent) * ((request.crop_height + core_extent - 1U) / core_extent),
-                    elapsed, reinterpret_cast<std::uintptr_t>(restored_pixels()),
-                    static_cast<std::size_t>(restored_width) * restored_height * 3U * sizeof(float),
+                    elapsed, reinterpret_cast<std::uintptr_t>(request.target_pixels),
+                    request.target_pitch * restored_height,
                     reinterpret_cast<std::uintptr_t>(input_.data()), reinterpret_cast<std::uintptr_t>(output_.data()),
                     reinterpret_cast<std::uintptr_t>(binding_.get()));
             });
@@ -421,6 +424,7 @@ class OnnxImageUpscalerRuntime final
     cudaEvent_t completion_ = nullptr;
     UpscalerFloatBuffer input_;
     UpscalerFloatBuffer output_;
+    shiftlut::Operators shiftlut_operators_;
     Ort::RunOptions run_options_;
     bool graph_enabled_ = false;
     bool inference_submitted_ = false;

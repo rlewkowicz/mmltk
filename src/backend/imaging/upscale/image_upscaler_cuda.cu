@@ -29,7 +29,7 @@ __device__ __forceinline__ std::uint32_t reflect_coordinate(const int coordinate
     return static_cast<std::uint32_t>(reflected);
 }
 
-__global__ void prepare_tile_kernel(const float* source, const std::uint32_t source_width, const std::uint32_t source_height,
+__global__ void prepare_tile_kernel(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width, const std::uint32_t source_height,
                                     const std::uint32_t crop_x, const std::uint32_t crop_y, const std::uint32_t crop_width,
                                     const std::uint32_t crop_height, const Tile tile, const bool shift_lut, const std::uint32_t halo,
                                     float* input) {
@@ -42,14 +42,18 @@ __global__ void prepare_tile_kernel(const float* source, const std::uint32_t sou
     const int content_y = static_cast<int>(tile.origin_y) + static_cast<int>(local / kInputExtent) - static_cast<int>(halo);
     const std::uint32_t source_x = min(source_width - 1U, crop_x + reflect_coordinate(content_x, crop_width));
     const std::uint32_t source_y = min(source_height - 1U, crop_y + reflect_coordinate(content_y, crop_height));
-    const std::size_t source_plane = static_cast<std::size_t>(source_width) * source_height;
-    const float normalized =
-        source[static_cast<std::size_t>(channel) * source_plane + static_cast<std::size_t>(source_y) * source_width + source_x];
+    const float byte = static_cast<float>(source[static_cast<std::size_t>(source_y) * source_pitch +
+                                                static_cast<std::size_t>(source_x) * 4U + channel]);
+    // Retain NVCC's contracted multiply/subtract from the former normalization
+    // kernel, the rounded division, and the restoration FMA. Replacing this
+    // round trip with byte RGB changes decisions at LUT thresholds.
+    const float normalized = __fdiv_rn(__fmaf_rn(byte, 1.0F / 255.0F, -channel_mean(channel)), channel_std(channel));
     const float rgb = fminf(1.0F, fmaxf(0.0F, fmaf(normalized, channel_std(channel), channel_mean(channel))));
     input[index] = shift_lut ? rgb * 255.0F : rgb;
 }
 
-__global__ void stitch_tile_kernel(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, float* restored,
+__global__ void stitch_tile_kernel(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored,
+                                   const std::size_t restored_pitch,
                                    const std::uint32_t restored_width, const std::uint32_t restored_height) {
     const std::uint32_t core_output_width = tile.core_width * 4U;
     const std::uint32_t core_output_height = tile.core_height * 4U;
@@ -70,74 +74,31 @@ __global__ void stitch_tile_kernel(const float* output, const Tile tile, const b
                                scaled_halo;
     const float scale = shift_lut ? (1.0F / 255.0F) : 1.0F;
     const float value = fminf(1.0F, fmaxf(0.0F, output[source] * scale));
-    const std::size_t destination_plane = static_cast<std::size_t>(restored_width) * restored_height;
-    restored[static_cast<std::size_t>(channel) * destination_plane + static_cast<std::size_t>(destination_y) * restored_width +
-             destination_x] = value;
-}
-
-__global__ void rgba8_to_normalized_nchw_kernel(const std::uint8_t* source, const std::size_t pitch, const std::uint32_t width,
-                                                const std::uint32_t height, float* target) {
-    const std::uint64_t pixel = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t count = static_cast<std::uint64_t>(width) * height;
-    if (pixel >= count) return;
-    const std::uint32_t x = static_cast<std::uint32_t>(pixel % width);
-    const std::uint32_t y = static_cast<std::uint32_t>(pixel / width);
-    const auto* rgba = source + static_cast<std::size_t>(y) * pitch + static_cast<std::size_t>(x) * 4U;
-    for (std::uint32_t channel = 0U; channel < 3U; ++channel) {
-        const float rgb = static_cast<float>(rgba[channel]) * (1.0F / 255.0F);
-        target[static_cast<std::uint64_t>(channel) * count + pixel] = (rgb - channel_mean(channel)) / channel_std(channel);
-    }
-}
-
-__global__ void normalized_nchw_to_rgba8_kernel(const float* source, const std::uint32_t width, const std::uint32_t height,
-                                                std::uint8_t* target, const std::size_t pitch) {
-    const std::uint64_t pixel = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::uint64_t count = static_cast<std::uint64_t>(width) * height;
-    if (pixel >= count) return;
-    const std::uint32_t x = static_cast<std::uint32_t>(pixel % width);
-    const std::uint32_t y = static_cast<std::uint32_t>(pixel / width);
-    auto* rgba = target + static_cast<std::size_t>(y) * pitch + static_cast<std::size_t>(x) * 4U;
-    for (std::uint32_t channel = 0U; channel < 3U; ++channel) {
-        const float value = fminf(1.0F, fmaxf(0.0F, source[static_cast<std::uint64_t>(channel) * count + pixel]));
-        rgba[channel] = static_cast<std::uint8_t>(__float2uint_rn(value * 255.0F));
-    }
-    rgba[3] = 255U;
+    auto* rgba = restored + static_cast<std::size_t>(destination_y) * restored_pitch +
+                 static_cast<std::size_t>(destination_x) * 4U;
+    rgba[channel] = static_cast<std::uint8_t>(__float2uint_rn(value * 255.0F));
+    if (channel == 0U) rgba[3] = 255U;
 }
 
 }  // namespace
 
-void prepare_tile(const float* source, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t crop_x,
+void prepare_tile(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t crop_x,
                   const std::uint32_t crop_y, const std::uint32_t crop_width, const std::uint32_t crop_height, const Tile tile,
                   const bool shift_lut, const std::uint32_t halo, float* input, const cudaStream_t stream) {
     constexpr std::uint32_t kElements = kInputExtent * kInputExtent * 3U;
     constexpr std::uint32_t kThreads = 256U;
     prepare_tile_kernel<<<(kElements + kThreads - 1U) / kThreads, kThreads, 0U, stream>>>(
-        source, source_width, source_height, crop_x, crop_y, crop_width, crop_height, tile, shift_lut, halo, input);
+        source, source_pitch, source_width, source_height, crop_x, crop_y, crop_width, crop_height, tile, shift_lut, halo, input);
 }
 
-void stitch_tile(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, float* restored,
+void stitch_tile(const float* output, const Tile tile, const bool shift_lut, const std::uint32_t halo, std::uint8_t* restored,
+                 const std::size_t restored_pitch,
                  const std::uint32_t restored_width, const std::uint32_t restored_height, const cudaStream_t stream) {
     const std::uint64_t elements =
         static_cast<std::uint64_t>(tile.core_width) * 4U * static_cast<std::uint64_t>(tile.core_height) * 4U * 3U;
     constexpr std::uint32_t kThreads = 256U;
     stitch_tile_kernel<<<static_cast<unsigned int>((elements + kThreads - 1U) / kThreads), kThreads, 0U, stream>>>(
-        output, tile, shift_lut, halo, restored, restored_width, restored_height);
-}
-
-void rgba8_to_normalized_nchw(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t width,
-                              const std::uint32_t height, float* target, const cudaStream_t stream) {
-    const std::uint64_t count = static_cast<std::uint64_t>(width) * height;
-    constexpr std::uint32_t kThreads = 256U;
-    rgba8_to_normalized_nchw_kernel<<<static_cast<unsigned int>((count + kThreads - 1U) / kThreads), kThreads, 0U, stream>>>(
-        source, source_pitch, width, height, target);
-}
-
-void normalized_nchw_to_rgba8(const float* source, const std::uint32_t width, const std::uint32_t height, std::uint8_t* target,
-                              const std::size_t target_pitch, const cudaStream_t stream) {
-    const std::uint64_t count = static_cast<std::uint64_t>(width) * height;
-    constexpr std::uint32_t kThreads = 256U;
-    normalized_nchw_to_rgba8_kernel<<<static_cast<unsigned int>((count + kThreads - 1U) / kThreads), kThreads, 0U, stream>>>(
-        source, width, height, target, target_pitch);
+        output, tile, shift_lut, halo, restored, restored_pitch, restored_width, restored_height);
 }
 
 }  // namespace mmltk::backend::imaging::upscale::image_upscaler_cuda

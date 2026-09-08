@@ -328,7 +328,7 @@ class TensorRtImageUpscalerRuntime final
                     engine_->CheckOperation(false, "TensorRT upscaler enqueue failed");
                 }
                 if (!request.current()) return false;
-                image_upscaler_cuda::stitch_request_tile(lane.output.data(), tile, descriptor().kind, descriptor().halo, restored_pixels(),
+                image_upscaler_cuda::stitch_request_tile(lane.output.data(), tile, descriptor().kind, descriptor().halo, request,
                                                          restored_width, restored_height, lane.stream);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch TensorRT upscaler tile composition");
                 ensure_cuda_ok(cudaEventRecord(lane.completion, lane.stream), "cudaEventRecord for TensorRT upscaler tile");

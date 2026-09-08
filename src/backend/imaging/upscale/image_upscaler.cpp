@@ -159,7 +159,6 @@ struct ImageUpscaler::Impl {
 
         mutable std::mutex mutex;
         std::shared_ptr<ImageUpscalerRuntime> runtime;
-        UpscalerFloatBuffer rgba_source;
         ImageUpscalerKind kind = ImageUpscalerKind::ShiftLUT;
         ImageUpscalerModelHandle handle{};
     };
@@ -255,7 +254,6 @@ struct ImageUpscaler::Impl {
                 .crop_height = height,
                 .output_width = width * 4U,
                 .output_height = height * 4U,
-                .source_layout = image_upscaler_nis::SourceLayout::Rgba8,
             };
             const auto required = image_upscaler_nis::scratch_requirements(config);
             if (!required) throw std::runtime_error("invalid Basic scratch extent");
@@ -417,7 +415,6 @@ struct ImageUpscaler::Impl {
                     runtime_cleanup_failure, target.runtime->cleanup_failure());
             }
             if (!released) continue;
-            static_cast<void>(target.rgba_source.Release(&cleanup));
             target.runtime.reset();
             if (stream != nullptr && cleanup.Record(cudaStreamDestroy(stream), "destroy Upscale operation stream"))
                 stream = nullptr;
@@ -750,6 +747,10 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
     if (source == nullptr || target == nullptr || stream == nullptr || width == 0U || height == 0U ||
         width > std::numeric_limits<std::uint32_t>::max() / 4U || height > std::numeric_limits<std::uint32_t>::max() / 4U)
         throw std::invalid_argument("invalid Upscale execution geometry");
+    if (source_pitch < static_cast<std::size_t>(width) * 4U || target_pitch < static_cast<std::size_t>(width) * 16U ||
+        source_pitch > std::numeric_limits<std::size_t>::max() / height ||
+        target_pitch > std::numeric_limits<std::size_t>::max() / (static_cast<std::size_t>(height) * 4U))
+        throw std::invalid_argument("invalid Upscale execution pitch");
     if (owner_ == nullptr) throw std::invalid_argument("missing Upscale execution owner");
     if (!current()) return ImageUpscalerOutcome::Cancelled;
     auto* const owner = static_cast<ImageUpscaler::Impl*>(owner_.get());
@@ -791,19 +792,17 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
         activation = ActivationProgress::CompletedResident;
     }
     if (!image_upscaler_admitted(owner->checkpoint, ImageUpscalerExecutionStage::PreprocessAdmitted, current)) return cancel();
-    slot.rgba_source.ensure(checked_upscaler_elements(width, height, 3U), "cudaMalloc for image upscaler RGBA conversion");
-    if (!current()) return cancel();
     mmltk::common::logging::trace([&](auto& logger) {
         logger.trace(
             "event=image_upscaler_conversion_buffers mode={} width={} height={} source_pitch={} target_pitch={} "
-            "source={} target={} fp32_input={} fp32_bytes={} stream={}",
+            "source={} target={} stream={}",
             static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source),
-            reinterpret_cast<std::uintptr_t>(target), reinterpret_cast<std::uintptr_t>(slot.rgba_source.data()),
-            static_cast<std::size_t>(width) * height * 3U * sizeof(float), stream_handle);
+            reinterpret_cast<std::uintptr_t>(target), stream_handle);
     });
-    image_upscaler_cuda::rgba8_to_normalized_nchw(source, source_pitch, width, height, slot.rgba_source.data(), stream);
-    ensure_cuda_ok(cudaPeekAtLastError(), "convert neural Upscale input");
-    const ImageUpscalerRequest request{.device_pixels = slot.rgba_source.data(),
+    const ImageUpscalerRequest request{.device_pixels = source,
+                                       .source_pitch = source_pitch,
+                                       .target_pixels = target,
+                                       .target_pitch = target_pitch,
                                        .source_width = width,
                                        .source_height = height,
                                        .crop_x = 0U,
@@ -816,7 +815,6 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
     if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();
     if (output.device_pixels == nullptr || output.width != width * 4U || output.height != height * 4U)
         throw std::runtime_error("invalid Upscale runtime output");
-    image_upscaler_cuda::normalized_nchw_to_rgba8(output.device_pixels, output.width, output.height, target, target_pitch, stream);
     slot.runtime->mark_consumed(stream);
     ensure_cuda_ok(cudaPeekAtLastError(), "convert neural Upscale output");
     return ImageUpscalerOutcome::Completed;

@@ -41,26 +41,17 @@ constexpr std::uint32_t kThreads = 256U;
         !checked_elements(config.output_width, config.crop_height, horizontal_elements) ||
         !checked_elements(config.output_width, config.output_height, output_elements))
         return false;
-    if (config.source_layout == SourceLayout::NormalizedNchwFloat &&
-        source_elements > std::numeric_limits<std::size_t>::max() / (3U * sizeof(float)))
-        return false;
     constexpr std::uint64_t kMaxLaunchElements = static_cast<std::uint64_t>(std::numeric_limits<unsigned int>::max()) * kThreads;
     return horizontal_elements <= kMaxLaunchElements && output_elements <= kMaxLaunchElements;
 }
 
-__device__ __forceinline__ float3 source_pixel(const void* source, const std::size_t pitch, const Configuration config,
+__device__ __forceinline__ float3 source_pixel(const void* source, const std::size_t pitch,
                                                const std::uint32_t x, const std::uint32_t y) {
-    if (config.source_layout == SourceLayout::Rgba8) {
-        const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(y) * pitch;
-        const auto* value = row + static_cast<std::size_t>(x) * 4U;
-        constexpr float kByteScale = 1.0F / 255.0F;
-        return make_float3(static_cast<float>(value[0]) * kByteScale, static_cast<float>(value[1]) * kByteScale,
-                           static_cast<float>(value[2]) * kByteScale);
-    }
-    const auto* pixels = static_cast<const float*>(source);
-    return make_float3(device::normalized_channel(pixels, config.source_width, config.source_height, x, y, 0U),
-                       device::normalized_channel(pixels, config.source_width, config.source_height, x, y, 1U),
-                       device::normalized_channel(pixels, config.source_width, config.source_height, x, y, 2U));
+    const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(y) * pitch;
+    const auto* value = row + static_cast<std::size_t>(x) * 4U;
+    constexpr float kByteScale = 1.0F / 255.0F;
+    return make_float3(static_cast<float>(value[0]) * kByteScale, static_cast<float>(value[1]) * kByteScale,
+                       static_cast<float>(value[2]) * kByteScale);
 }
 
 __device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::uint32_t output_coordinate, const std::uint32_t crop_extent,
@@ -71,7 +62,6 @@ __device__ __forceinline__ std::uint32_t nearest_source_coordinate(const std::ui
 
 __device__ __forceinline__ std::uint8_t source_alpha_byte(const void* source, const std::size_t pitch, const Configuration config,
                                                           const std::uint32_t x, const std::uint32_t y) {
-    if (config.source_layout != SourceLayout::Rgba8) return 255U;
     const std::uint32_t source_x = config.crop_x + nearest_source_coordinate(x, config.crop_width, config.output_width);
     const std::uint32_t source_y = config.crop_y + nearest_source_coordinate(y, config.crop_height, config.output_height);
     const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(source_y) * pitch;
@@ -94,7 +84,7 @@ __global__ void horizontal_kernel(const void* source, const std::size_t source_p
         const std::uint32_t crop_x =
             static_cast<std::uint32_t>(max(0, min(static_cast<int>(config.crop_width) - 1, base + static_cast<int>(tap))));
         const float coefficient = device::kScaleCoefficients.values[source_phase][tap];
-        const float3 sample = source_pixel(source, source_pitch, config, config.crop_x + crop_x, config.crop_y + crop_y);
+        const float3 sample = source_pixel(source, source_pitch, config.crop_x + crop_x, config.crop_y + crop_y);
         color.x = fmaf(coefficient, sample.x, color.x);
         color.y = fmaf(coefficient, sample.y, color.y);
         color.z = fmaf(coefficient, sample.z, color.z);
@@ -202,7 +192,7 @@ cudaError_t launch_scale(const void* source, const std::size_t source_pitch, voi
                          const cudaStream_t stream) noexcept {
     if (source == nullptr || horizontal == nullptr || scaled == nullptr || stream == nullptr || !valid_configuration(config))
         return cudaErrorInvalidValue;
-    if (config.source_layout == SourceLayout::Rgba8 && source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
+    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
         return cudaErrorInvalidPitchValue;
     // CUDA launch status is host-thread local.  This public algorithm boundary
     // must report its own kernels rather than inherit an inspected error left
@@ -221,7 +211,7 @@ cudaError_t launch_sharpen(const void* source, const std::size_t source_pitch, c
                            const std::size_t target_pitch, const Configuration& config, const cudaStream_t stream) noexcept {
     if (source == nullptr || scaled == nullptr || target == nullptr || stream == nullptr || !valid_configuration(config))
         return cudaErrorInvalidValue;
-    if (config.source_layout == SourceLayout::Rgba8 && source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
+    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
         return cudaErrorInvalidPitchValue;
     if (target_pitch < static_cast<std::size_t>(config.output_width) * 4U) return cudaErrorInvalidPitchValue;
     static_cast<void>(cudaGetLastError());

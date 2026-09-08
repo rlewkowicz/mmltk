@@ -35,7 +35,7 @@ constexpr std::array<ImageUpscalerDescriptor, 2U> kDescriptors{{
         .filename = "ShiftLUT_fp32.onnx",
         .input_name = "image",
         .output_name = "upscaled",
-        .sha256 = "111ec75e71638aa37fd0728d513d01b277a8708e09422c546b094c0547255444",
+        .sha256 = "811f4e42557d549a06352c477f2ec4047cd84c57ca345955d8996bb271e727f7",
         .cache_name = "shiftlut-fp32",
         .label = "ShiftLUT",
         .halo = 32U,
@@ -162,7 +162,10 @@ TiledImageUpscalerRuntimeState::~TiledImageUpscalerRuntimeState() {
 ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream,
     void* backend, const ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint& checkpoint) {
     std::lock_guard lock(mutex_);
-    if (request.device_pixels == nullptr || consumer_stream == nullptr || request.crop_width == 0U || request.crop_height == 0U ||
+    if (request.device_pixels == nullptr || request.target_pixels == nullptr || consumer_stream == nullptr ||
+        request.source_pitch < static_cast<std::size_t>(request.source_width) * 4U ||
+        request.target_pitch < static_cast<std::size_t>(request.crop_width) * 16U ||
+        request.crop_width == 0U || request.crop_height == 0U ||
         request.source_width == 0U || request.source_height == 0U || request.crop_x > request.source_width ||
         request.crop_width > request.source_width - request.crop_x || request.crop_y > request.source_height ||
         request.crop_height > request.source_height - request.crop_y) {
@@ -181,14 +184,17 @@ ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUp
     }
     const std::uint32_t restored_width = request.crop_width * 4U;
     const std::uint32_t restored_height = request.crop_height * 4U;
-    if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::RestoredAllocationAdmitted, request.current))
+    static_cast<void>(checked_upscaler_elements(restored_width, restored_height, 4U));
+    if (request.source_pitch > std::numeric_limits<std::size_t>::max() / request.source_height ||
+        request.target_pitch > std::numeric_limits<std::size_t>::max() / restored_height)
+        throw std::overflow_error("Image upscaler pitched image size overflow");
+    if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::TargetAdmitted, request.current))
         return {.outcome = ImageUpscalerOutcome::Cancelled};
-    restored_.ensure(checked_upscaler_elements(restored_width, restored_height, 3U), "cudaMalloc for Image upscaler restored image");
     if (!request.current() || !submit_tiles(backend, request, consumer_stream, restored_width, restored_height))
         return {.outcome = ImageUpscalerOutcome::Cancelled};
     awaiting_consumer_ = true;
     return {
-        .device_pixels = restored_.data(),
+        .device_pixels = request.target_pixels,
         .width = restored_width,
         .height = restored_height,
     };
@@ -221,8 +227,7 @@ cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpsca
         settled = cleanup_.Record(cudaStreamSynchronize(cleanup_stream_), "settle neural cleanup stream") && settled;
     // Backend buffers are still referenced by an unsettled consumer.
     if (!settled) return cleanup_.status();
-    const bool backend_released = cleanup_.Record(release_backend(backend), "release neural backend");
-    if (backend_released) static_cast<void>(restored_.Release(&cleanup_));
+    cleanup_.Record(release_backend(backend), "release neural backend");
     if (consumer_done_ != nullptr) {
         if (cleanup_.Record(cudaEventDestroy(consumer_done_), "destroy neural consumer fence")) consumer_done_ = nullptr;
         cleanup_.Checkpoint(checkpoint, ImageUpscalerExecutionStage::EventDestroyed);

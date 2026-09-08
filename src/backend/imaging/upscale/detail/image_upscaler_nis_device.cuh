@@ -39,13 +39,6 @@ __device__ __forceinline__ std::uint32_t phase(const float source_coordinate) {
     return min(kPhaseCount - 1U, static_cast<std::uint32_t>(fraction * static_cast<float>(kPhaseCount)));
 }
 
-__device__ __forceinline__ float normalized_channel(const float* pixels, const std::uint32_t width, const std::uint32_t height,
-                                                    const std::uint32_t x, const std::uint32_t y, const std::uint32_t channel) {
-    const std::size_t plane = static_cast<std::size_t>(width) * height;
-    return pixels[static_cast<std::size_t>(channel) * plane + static_cast<std::size_t>(y) * width + x] * channel_std(channel) +
-           channel_mean(channel);
-}
-
 // Workflow-neutral direct sampler used by atlas-style consumers that cannot
 // materialize a single rectangular separable intermediate.
 __device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, const std::uint32_t width, const std::uint32_t height,

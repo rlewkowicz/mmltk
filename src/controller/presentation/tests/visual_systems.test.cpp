@@ -4883,12 +4883,19 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
     std::array<std::vector<std::uint8_t>, 6U> reference;
     for (const bool reference_run : {true, false}) {
         REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
-        auto runtime = make_native_upscale_runtime_factory(kDevice)(
+        using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+        std::size_t tensor_allocations = 0U;
+        std::size_t model_constructions = 0U;
+        auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+            if (stage == Stage::BuffersAllocated) ++tensor_allocations;
+            if (stage == Stage::ContextCreated) ++model_constructions;
+        })(
             std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
         runtime->BeginWork();
         auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
         REQUIRE(model != nullptr);
         CUdeviceptr previous_input = 0U, previous_output = 0U;
+        std::size_t warm_tensors = 0U, warm_models = 0U;
         for (std::size_t iteration = 0U; iteration < (reference_run ? 6U : 12U); ++iteration) {
             const auto pattern = iteration % 2U;
             const auto method = static_cast<UpscaleKernel>((iteration / 2U) % 3U);
@@ -4951,6 +4958,13 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
             download.WidthInBytes = width * 16U;
             download.Height = height * 4U;
             REQUIRE(cuMemcpy2D(&download) == CUDA_SUCCESS);
+            if (iteration == 5U) {
+                warm_tensors = tensor_allocations;
+                warm_models = model_constructions;
+            } else if (iteration > 5U) {
+                CHECK(tensor_allocations == warm_tensors);
+                CHECK(model_constructions == warm_models);
+            }
             if (reference_run)
                 reference[iteration] = std::move(actual);
             else
@@ -5023,7 +5037,7 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     const auto stage = GENERATE(Stage::InitializationAdmitted, Stage::ChecksumAdmitted,
         Stage::BasicAllocationAdmitted, Stage::BasicLaunchAdmitted, Stage::PreprocessAdmitted,
-        Stage::RestoredAllocationAdmitted, Stage::TilePrepared, Stage::ContextCreated,
+        Stage::TargetAdmitted, Stage::TilePrepared, Stage::ContextCreated,
         Stage::WarmInputSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureEnded,
         Stage::GraphInstantiated, Stage::ReplaySettled, Stage::CacheLockAdmitted);
     const bool stop = GENERATE(false, true);
@@ -5108,7 +5122,7 @@ TEST_CASE("Completed native activation survives same-method withdrawal without r
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
     const auto boundary = GENERATE(Stage::ReplaySettled, Stage::PreprocessAdmitted,
-        Stage::RestoredAllocationAdmitted, Stage::TilePrepared, Stage::RuntimeEnqueued, Stage::BindingsReady);
+        Stage::TargetAdmitted, Stage::TilePrepared, Stage::RuntimeEnqueued, Stage::BindingsReady);
     const auto method = boundary == Stage::BindingsReady ? UpscaleKernel::ShiftLut : UpscaleKernel::RealPlksr;
     std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
     bool current = true;
@@ -5152,7 +5166,7 @@ TEST_CASE("Native method failures are classified at the actual activation comple
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
     const auto boundary = GENERATE(Stage::ContextCreated, Stage::PreprocessAdmitted,
-                                  Stage::RestoredAllocationAdmitted, Stage::WarmSubmitted, Stage::RuntimeEnqueued);
+                                  Stage::TargetAdmitted, Stage::WarmSubmitted, Stage::RuntimeEnqueued);
     NativeUpscaleSource source;
     std::atomic_bool armed{true};
     std::promise<UpscaleFailed> failed;

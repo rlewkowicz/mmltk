@@ -1963,6 +1963,13 @@ run_toolchain_command() {
         docker_args+=(--env \
             "MMLTK_FIREFOX_STAGE_LOG_FILE=${container_firefox_stage_trace_file}")
     fi
+    if [[ "${invocation_mode}" == "export-shiftlut" ]]; then
+        docker_args+=(--volume "${shiftlut_source}:/shiftlut-source:ro")
+        docker_args+=(--env "MMLTK_SHIFTLUT_MODE=${shiftlut_operation}")
+        if [[ "${shiftlut_operation}" == "--verify-only" ]]; then
+            docker_args+=(--gpus all --env NVIDIA_DRIVER_CAPABILITIES=compute,utility)
+        fi
+    fi
     docker_args+=("${build_image_name}" -lc "${command}")
     docker "${docker_args[@]}"
 }
@@ -2166,6 +2173,34 @@ run_application_bindings_generation() {
              --target mmltk_generate_application_bindings
          python3 /workspace/tools/check_toolchain_invariants.py \
              --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release"'
+    release_mutation_locks
+}
+
+run_shiftlut_export() {
+    acquire_mutation_locks
+    ensure_docker
+    prepare_cache_layout
+    ensure_build_image
+    log "ShiftLUT ${shiftlut_operation}"
+    run_owned_toolchain_command "${release_build_container_name}-shiftlut-export" \
+        'set -euo pipefail
+         build="${MMLTK_CONTAINER_CACHE_ROOT}/cmake/shiftlut-export"
+         if [[ "${MMLTK_SHIFTLUT_MODE}" == "--export-only" ]]; then
+             /workspace/tools/configure_cmake_graph.sh release "${build}" \
+                 -DBUILD_MMLTK_BROWSER_HOST=OFF -DBUILD_MMLTK_FIREFOX_RUNTIME=OFF \
+                 -DMMLTK_BUILD_JOBS="${MMLTK_JOBS}"
+             cmake --build "${build}" --parallel "${MMLTK_JOBS}" \
+                 --target mmltk_shiftlut_model_generator
+         fi
+         if [[ "${MMLTK_SHIFTLUT_MODE}" == "--verify-only" ]]; then
+             build="${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release"
+         fi
+         python3 /workspace/src/backend/imaging/upscale/export_shiftlut_lut_onnx.py \
+             --source /shiftlut-source \
+             --generator "${build}/mmltk_shiftlut_model_generator" \
+             --output /workspace/src/backend/imaging/upscale/assets/ShiftLUT_fp32.onnx \
+             --validation /workspace/build/validation/atlas-viewer-residency/shiftlut \
+             "${MMLTK_SHIFTLUT_MODE}"'
     release_mutation_locks
 }
 
@@ -2831,6 +2866,7 @@ run_tests() {
         mmltk_backend_data_tests
         mmltk_backend_imaging_annotation_tests
         mmltk_backend_imaging_explore_tests
+        mmltk_backend_imaging_upscale_tests
         mmltk_backend_media_live_tests
         mmltk_backend_ml_layers_tests
         mmltk_backend_ml_cuda_tests
@@ -3177,6 +3213,9 @@ build_mode=0
 build_gui_mode=0
 generate_protocol_mode=0
 generate_application_bindings_mode=0
+export_shiftlut_mode=0
+shiftlut_source=""
+shiftlut_operation=""
 update_gui_lock_mode=0
 tidy_mode=0
 tidy_third_party=0
@@ -3216,6 +3255,10 @@ for arg in "$@"; do
     fi
     if [[ "${arg}" == "--generate-application-bindings" ]]; then
         generate_application_bindings_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--export-shiftlut" ]]; then
+        export_shiftlut_mode=1
         continue
     fi
     if [[ "${arg}" == "--update-gui-lock" ]]; then
@@ -3372,10 +3415,24 @@ if (( test_mode )) && [[ "${test_suite}" == "tsan" ]] && (( build_jobs > 8 )); t
     build_jobs=8
 fi
 
-if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode +
+if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode + export_shiftlut_mode +
       update_gui_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode > 1 ||
-      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode) && gui_mode )); then
-    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --update-gui-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
+      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || export_shiftlut_mode) && gui_mode )); then
+    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
+fi
+
+if (( export_shiftlut_mode )); then
+    ((${#passthrough_args[@]} == 3)) ||
+        die "--export-shiftlut requires --source PATH and --export-only or --verify-only"
+    [[ "${passthrough_args[0]}" == "--source" ]] || die "ShiftLUT requires --source PATH"
+    shiftlut_source="$(realpath -e -- "${passthrough_args[1]}")"
+    [[ -d "${shiftlut_source}/LUT_test/LUTs/ShiftLUT_sr_s7_int" ]] || die "missing ShiftLUT s7 tables"
+    shiftlut_operation="${passthrough_args[2]}"
+    [[ "${shiftlut_operation}" == "--export-only" || "${shiftlut_operation}" == "--verify-only" ]] ||
+        die "ShiftLUT requires --export-only or --verify-only"
+    invocation_mode="export-shiftlut"
+    run_shiftlut_export
+    exit $?
 fi
 
 if (( diagnose_nvidia_mode )); then

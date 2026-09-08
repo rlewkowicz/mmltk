@@ -89,7 +89,7 @@ class UpscalerFloatBuffer {
 };
 
 struct ImageUpscalerRuntimeOutput {
-    const float* device_pixels = nullptr;
+    const std::uint8_t* device_pixels = nullptr;
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     ImageUpscalerOutcome outcome = ImageUpscalerOutcome::Completed;
@@ -127,12 +127,10 @@ class TiledImageUpscalerRuntimeState {
     [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept { return cleanup_.failure(); }
     [[nodiscard]] inline const ImageUpscalerDescriptor& descriptor() const noexcept { return descriptor_; }
     [[nodiscard]] inline int device_id() const noexcept { return device_id_; }
-    [[nodiscard]] inline float* restored_pixels() noexcept { return restored_.data(); }
 
    private:
     ImageUpscalerDescriptor descriptor_;
     int device_id_ = 0;
-    UpscalerFloatBuffer restored_;
     cudaEvent_t consumer_done_ = nullptr;
     bool consumer_pending_ = false;
     bool awaiting_consumer_ = false;
@@ -177,7 +175,6 @@ class TiledImageUpscalerRuntimeAdapter : public ImageUpscalerRuntime {
    protected:
     [[nodiscard]] const ImageUpscalerDescriptor& descriptor() const noexcept { return state_.descriptor(); }
     [[nodiscard]] int device_id() const noexcept { return state_.device_id(); }
-    [[nodiscard]] float* restored_pixels() noexcept { return state_.restored_pixels(); }
     void Checkpoint(ImageUpscalerExecutionStage stage) const {
         if (checkpoint_) checkpoint_(stage);
     }
