@@ -151,6 +151,9 @@ struct ExploreRenderPlan final {
     ExploreDetailView detail{};
     std::uint64_t dataset_identity = 0U;
     std::uint64_t generation = 0U;
+    // Issued by ExploreSystem for native class/box/mask pixels, independently
+    // of demand generations and presentation-only overlay fields.
+    std::uint64_t semantic_identity = 0U;
 };
 struct ExploreOpened final {
     ExploreDatasetFacts dataset{};
@@ -170,6 +173,28 @@ struct ExploreGalleryPublication final {
     std::size_t remaining_tiles = 0U;
     std::size_t active_pinned_bytes = 0U;
     std::size_t stale_discarded = 0U;
+};
+struct ExploreDemandCheck final {
+    void* context = nullptr;
+    bool (*current)(void*, std::uint64_t) noexcept = nullptr;
+    [[nodiscard]] bool operator()(std::uint64_t generation) const noexcept {
+        return !current || current(context, generation);
+    }
+};
+enum class ExploreOutputChange : std::uint8_t { Initialize, Semantic, Unchanged };
+// Renderer-owned physical high-water capacities. Host bytes cover retained
+// cache meaning and render/scheduler metadata, not the compiled dataset, order,
+// presentation documents, worker infrastructure, or allocator bookkeeping.
+// Cache and descriptor bytes are subsets, not additions to device/pinned bytes.
+struct ExploreStorageFootprint final {
+    std::size_t host_bytes = 0U;
+    std::size_t device_bytes = 0U;
+    std::size_t pinned_bytes = 0U;
+    std::size_t cache_device_bytes = 0U;
+    std::size_t descriptor_bytes = 0U;
+    std::size_t augmentation_device_bytes = 0U;
+    std::size_t augmentation_pinned_bytes = 0U;
+    std::size_t cache_cards = 0U;
 };
 class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
@@ -208,10 +233,13 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual std::vector<ExploreLabel> Labels() const { return {}; }
     [[nodiscard]] virtual std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t offset) const = 0;
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
+    virtual void SetCurrentDemand(ExploreDemandCheck) = 0;
+    [[nodiscard]] virtual ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const = 0;
+    [[nodiscard]] virtual ExploreStorageFootprint StorageFootprint() const { return {}; }
     // Logical candidate meaning follows the prepared GPU output. Commit this
     // publication before committing its order; discard an order only after
     // checked rollback. False means physical completion requires retirement.
-    virtual void PrepareOutputPublication() = 0;
+    virtual void PrepareOutputPublication(ExploreOutputChange) = 0;
     virtual void CommitOutputPublication() noexcept = 0;
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
@@ -281,12 +309,21 @@ class ExploreAcceptanceGate final {
         std::size_t logical_size = 0U;
         std::size_t capacity_before = 0U;
         std::size_t capacity_after = 0U;
+        std::size_t copied_entries = 0U;
     };
     // Test controls are installed before constructing the native runtime.
     void SetProductObserver(void*, void (*)(void*, ProductObservation) noexcept) noexcept;
     void ObserveProduct(ProductObservation) const noexcept;
+    enum class SubmissionStage : std::uint8_t { Foreground, Background, Probe };
+    void SetSubmissionObserver(void*, void (*)(void*, std::uintptr_t, SubmissionStage)) noexcept;
+    void ObserveSubmission(std::uintptr_t, SubmissionStage) const;
+    // Install before admitting reads; invoked outside the lane control mutex.
+    void SetReadObserver(void*, void (*)(void*, std::uint64_t, std::uint32_t)) noexcept;
+    void ObserveRead(std::uint64_t, std::uint32_t) const;
     void FailNextPublicationAt(PublicationStage) noexcept;
     void CheckPublication(PublicationStage) const;
+    void FailNextProbe() noexcept;
+    void CheckProbe() const;
     enum class WaitResult : std::uint8_t {
         Proceed,
         Stale,

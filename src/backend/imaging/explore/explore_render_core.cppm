@@ -96,11 +96,12 @@ using ExploreRenderedCardProbe = detail::ExploreRenderedCardProbeAbi;
 [[nodiscard]] ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles,
                                                               const ExploreRenderSemanticView& semantics,
                                                               const ExploreRenderScratchView& scratch,
-                                                              const ExploreRenderTargetView& target, std::uintptr_t stream) noexcept;
+                                                              const ExploreRenderTargetView& target, std::uintptr_t stream,
+                                                              detail::ExploreRenderDemand demand = {}) noexcept;
 
 [[nodiscard]] ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics,
                                                          const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target,
-                                                         std::uintptr_t stream) noexcept;
+                                                         std::uintptr_t stream, detail::ExploreRenderDemand demand = {}) noexcept;
 
 // Adds the target's nonzero-alpha pixel count to a caller-owned device counter.
 // The caller controls clearing and transfer so diagnostics can reuse storage.
@@ -114,7 +115,8 @@ using ExploreRenderedCardProbe = detail::ExploreRenderedCardProbeAbi;
 
 // Counts rendered content, exact immediately-outside padding samples, semantic
 // box-edge pixels, semantic mask-interior pixels, and exact expected immediately-
-// inside content samples into five caller-owned device values.
+// inside content samples against the retained RGBA copy into five caller-owned
+// device values. The reference contains no borrowed compiled-image storage.
 [[nodiscard]] ExploreStorageStatus probe_explore_rendered_card(const ExploreRenderTargetView& clean,
                                                                const ExploreRenderTargetView& semantic,
                                                                const ExploreRenderedCardProbe& probe, std::uint64_t* device_counts,

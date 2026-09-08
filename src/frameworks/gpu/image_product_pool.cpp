@@ -48,6 +48,15 @@ void ImageProductPool::Availability::Notify() const noexcept {
     if (admission_) admission_->Notify();
 }
 ImageProductPool::Availability ImageProductPool::ObserveAvailability() const noexcept { return Availability{admission_}; }
+ImageStorageFootprint ImageProductPool::StorageFootprint() const noexcept {
+    ImageStorageFootprint result;
+    for (const auto& slot : slots_) {
+        const auto physical = slot->buffer.StorageFootprint();
+        result.device_bytes += physical.device_bytes;
+        result.pinned_bytes += physical.pinned_bytes;
+    }
+    return result;
+}
 
 ImageProductPool::Product::Product(std::shared_ptr<Slot> slot, std::uint64_t revision) noexcept
     : slot_(std::move(slot)), revision_(revision) {}

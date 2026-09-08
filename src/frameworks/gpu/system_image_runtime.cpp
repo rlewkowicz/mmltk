@@ -194,6 +194,7 @@ ImageProductPool::Availability SystemImageRuntime::ObserveOutputAvailability() c
     return ActiveState().output->ObserveAvailability();
 }
 ImageProductPool::Facts SystemImageRuntime::OutputFacts() const { return ActiveState().output->SelectedFacts(); }
+ImageStorageFootprint SystemImageRuntime::OutputStorageFootprint() const { return ActiveState().output->StorageFootprint(); }
 SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop, CompletedOutput baseline) {
     return ActiveState().output->Acquire(stop, std::move(baseline));
 }

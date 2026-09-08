@@ -138,6 +138,43 @@ class CudaStream final {
     cudaStream_t stream_ = nullptr;
 };
 
+TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha", "[backend][imaging][explore][probe]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    constexpr std::size_t pitch = 32U;
+    std::array<std::uint8_t, pitch * 4U> pixels{};
+    for (std::size_t y = 0U; y < 4U; ++y)
+        for (std::size_t x = 0U; x < 4U; ++x) {
+            pixels[y * pitch + x * 4U + 1U] = 255U;
+            pixels[y * pitch + x * 4U + 3U] = 255U;
+        }
+    auto reference = pixels;
+    reference[pitch + 4U + 3U] = 0U;
+    CudaBuffer clean(pixels.size());
+    CudaBuffer semantic(pixels.size());
+    CudaBuffer retained(reference.size());
+    CudaBuffer counts(5U * sizeof(std::uint64_t));
+    clean.upload<std::uint8_t>(pixels);
+    semantic.upload<std::uint8_t>(pixels);
+    retained.upload<std::uint8_t>(reference);
+    CudaStream stream;
+    REQUIRE(cudaMemsetAsync(counts.data(), 0, 5U * sizeof(std::uint64_t), stream.get()) == cudaSuccess);
+    const auto target = [](CudaBuffer& buffer) {
+        return ExploreRenderTargetView{.data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = 4U, .height = 4U};
+    };
+    const ExploreRenderedCardProbe probe{.reference = target(retained), .content_x = 1U, .content_y = 1U,
+                                         .content_width = 2U, .content_height = 2U, .box_width = 4U, .box_height = 4U};
+    REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()), stream.address()) ==
+            kExploreStorageSuccess);
+    std::array<std::uint64_t, 5U> result{};
+    REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    CHECK(result[0U] == 4U);
+    CHECK(result[2U] == 12U);
+    CHECK(result[3U] == 4U);
+    CHECK(result[4U] == 6U);
+}
+
 struct SemanticOracleResult final {
     std::vector<std::array<std::uint8_t, 4U>> pixels;
     std::uint64_t nonzero_alpha = 0U;

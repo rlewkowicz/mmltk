@@ -72,6 +72,7 @@ class SystemImageRuntime final {
     [[nodiscard]] CompletedOutput Completed() const;
     [[nodiscard]] ImageProductPool::Availability ObserveOutputAvailability() const;
     [[nodiscard]] ImageProductPool::Facts OutputFacts() const;
+    [[nodiscard]] ImageStorageFootprint OutputStorageFootprint() const;
     [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {});
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);

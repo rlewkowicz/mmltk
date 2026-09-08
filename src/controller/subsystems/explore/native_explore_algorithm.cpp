@@ -2,6 +2,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
+#include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -44,7 +45,12 @@ class ExploreAcceptanceGate::Impl final {
    public:
     void* product_context = nullptr;
     void (*product_observer)(void*, ProductObservation) noexcept = nullptr;
+    void* submission_context = nullptr;
+    void (*submission_observer)(void*, std::uintptr_t, SubmissionStage) = nullptr;
+    void* read_context = nullptr;
+    void (*read_observer)(void*, std::uint64_t, std::uint32_t) = nullptr;
     mutable std::atomic<PublicationStage> publication_failure{PublicationStage::None};
+    mutable std::atomic_bool probe_failure{false};
     explicit Impl(const int command_descriptor) : command_(command_descriptor), stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
         if (command_.get() < 0 || stop_.get() < 0) throw std::invalid_argument("invalid Explore acceptance gate descriptor");
     }
@@ -175,8 +181,26 @@ void ExploreAcceptanceGate::SetProductObserver(void* context, void (*observer)(v
 void ExploreAcceptanceGate::ObserveProduct(ProductObservation observation) const noexcept {
     if (impl_->product_observer) impl_->product_observer(impl_->product_context, std::move(observation));
 }
+void ExploreAcceptanceGate::SetSubmissionObserver(void* context, void (*observer)(void*, std::uintptr_t, SubmissionStage)) noexcept {
+    impl_->submission_context = context;
+    impl_->submission_observer = observer;
+}
+void ExploreAcceptanceGate::ObserveSubmission(const std::uintptr_t stream, const SubmissionStage stage) const {
+    if (impl_->submission_observer) impl_->submission_observer(impl_->submission_context, stream, stage);
+}
+void ExploreAcceptanceGate::SetReadObserver(void* context, void (*observer)(void*, std::uint64_t, std::uint32_t)) noexcept {
+    impl_->read_context = context;
+    impl_->read_observer = observer;
+}
+void ExploreAcceptanceGate::ObserveRead(const std::uint64_t generation, const std::uint32_t index) const {
+    if (impl_->read_observer) impl_->read_observer(impl_->read_context, generation, index);
+}
 void ExploreAcceptanceGate::FailNextPublicationAt(const PublicationStage stage) noexcept {
     impl_->publication_failure.store(stage, std::memory_order_release);
+}
+void ExploreAcceptanceGate::FailNextProbe() noexcept { impl_->probe_failure.store(true); }
+void ExploreAcceptanceGate::CheckProbe() const {
+    if (impl_->probe_failure.exchange(false)) throw std::runtime_error("Explore acceptance probe preparation failure");
 }
 void ExploreAcceptanceGate::CheckPublication(const PublicationStage stage) const {
     auto expected = stage;
@@ -246,7 +270,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     }
 
     [[nodiscard]] ExploreOpened Open(const std::string_view source, const std::stop_token stop) override {
-        gallery_.Quiesce();
+        gallery_.Suspend();
         open_candidate_.reset();
         auto opened = mmltk::backend::data::CompiledDataset::open_source(std::filesystem::path{source}, configuration_.image_limit);
         if (!opened) throw std::system_error(opened.error(), "Explore compiled source could not be opened");
@@ -317,7 +341,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
 
     [[nodiscard]] ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t shuffle_seed,
                                                       const std::size_t nproc, const std::stop_token stop) override {
-        gallery_.Quiesce();
+        gallery_.Suspend();
         auto& dataset = CandidateDataset();
         if (nproc != nproc_) throw std::logic_error("Explore nproc changed after runtime construction");
         const auto generation = ++candidate_generation_;
@@ -385,14 +409,19 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             .matching_count = static_cast<std::uint32_t>(order.size()),
             .shuffle_seed = candidate == nullptr ? committed_->shuffle_seed : candidate->order.shuffle_seed,
         };
+        const auto visible = VisibleRange(viewport, candidate);
+        facts.visible_indices.assign(visible.begin(), visible.end());
+        return facts;
+    }
+    [[nodiscard]] std::span<const std::uint32_t> VisibleRange(const ExploreViewport viewport,
+                                                            const ExploreOrderCandidate* candidate) const {
+        const auto& order = CandidateOrder(candidate);
         const std::size_t first =
             viewport.valid() ? std::min<std::size_t>(static_cast<std::size_t>(viewport.first_row) * viewport.columns, order.size()) : 0U;
         const std::size_t requested =
             viewport.valid() ? static_cast<std::size_t>(viewport.row_count) * viewport.columns : kExploreVisibleItemCapacity;
         const std::size_t count = std::min({requested, order.size() - first, kExploreVisibleItemCapacity});
-        facts.visible_indices.assign(order.begin() + static_cast<std::ptrdiff_t>(first),
-                                     order.begin() + static_cast<std::ptrdiff_t>(first + count));
-        return facts;
+        return std::span{order}.subspan(first, count);
     }
     [[nodiscard]] bool Contains(const std::uint32_t index) const override {
         RequireOpen();
@@ -421,8 +450,18 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     [[nodiscard]] std::vector<ExploreLabel> Labels() const override { return gallery_.Labels(); }
 
     void SetGalleryReadySink(GalleryReadySink sink) override { gallery_.SetReadySink(std::move(sink)); }
+    void SetCurrentDemand(ExploreDemandCheck check) override { gallery_.SetCurrentDemand(check); }
+    [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate) const override {
+        const auto* dataset = candidate != nullptr && open_candidate_ ? open_candidate_.get() : committed_.get();
+        const auto& order = CandidateOrder(candidate);
+        const auto first = GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
+        const auto count = GalleryThumbnailCache::CardCount(order.size(), plan.viewport.row_count, plan.viewport.columns);
+        return gallery_.OutputChange(plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) :
+                                                                             std::span<const std::uint32_t>{}, &dataset->store,
+                                     std::span{order}.subspan(first, count));
+    }
 
-    void PrepareOutputPublication() override { gallery_.PrepareOutputPublication(); }
+    void PrepareOutputPublication(ExploreOutputChange change) override { gallery_.PrepareOutputPublication(change); }
     void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
     [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
 
@@ -433,24 +472,25 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         auto& dataset = DatasetFor(candidate);
         if (nproc != nproc_ || !plan.viewport.valid() || plan.mode != ExploreMode::Gallery)
             throw contracts::InvalidIntentError("Explore gallery plan is invalid");
-        ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
-        auto visible = Visible(plan.viewport, candidate).visible_indices;
+        const auto visible = VisibleRange(plan.viewport, candidate);
         const auto& order = CandidateOrder(candidate);
-        const auto first = std::min<std::size_t>(static_cast<std::size_t>(plan.viewport.first_row) * plan.viewport.columns, order.size());
-        const auto end = first + visible.size();
-        std::vector<std::uint32_t> prefetch;
-        prefetch.reserve(nproc * 2U);
-        for (std::size_t distance = 0U; distance < nproc; ++distance) {
-            if (first > distance) prefetch.push_back(order[first - distance - 1U]);
-            if (end + distance < order.size()) prefetch.push_back(order[end + distance]);
-        }
+        const auto window_first = explore_detail::GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
+        const auto count = explore_detail::GalleryThumbnailCache::CardCount(order.size(), plan.viewport.row_count, plan.viewport.columns);
+        const auto window = std::span{order}.subspan(window_first, count);
+        if (gallery_.OutputChange(plan, visible, &dataset.store, window) != ExploreOutputChange::Unchanged)
+            ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
         auto store = std::shared_ptr<const data::CompiledDataset>{
             candidate != nullptr && open_candidate_ ? open_candidate_ : committed_, &dataset.store};
-        return gallery_.Begin(plan, std::move(visible), std::move(prefetch), std::move(store), dataset.annotated_indices,
+        return gallery_.Begin(plan, visible, window, window_first, std::move(store), dataset.annotated_indices,
                               render_classes_, clean, semantic, stream);
     }
 
     [[nodiscard]] ExploreGalleryPublication AdvanceGallery() override { return gallery_.Advance(); }
+    [[nodiscard]] ExploreStorageFootprint StorageFootprint() const override {
+        auto footprint = gallery_.StorageFootprint();
+        footprint.host_bytes += render_classes_.capacity() * sizeof(decltype(render_classes_)::value_type);
+        return footprint;
+    }
 
     [[nodiscard]] bool HasGalleryTiles() const override { return gallery_.HasReadyTiles(); }
 
@@ -465,7 +505,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         RequireOpen();
         if (nproc != nproc_ || !plan.selected_image || !Contains(*plan.selected_image))
             throw contracts::InvalidIntentError("Explore detail selection is unavailable");
-        ConfigureClasses(committed_->classes, plan.overlay, render_classes_);
+        if (gallery_.OutputChange(plan, {}, &committed_->store, {}) != ExploreOutputChange::Unchanged)
+            ConfigureClasses(committed_->classes, plan.overlay, render_classes_);
         gallery_.RenderDetail(plan, std::shared_ptr<const data::CompiledDataset>{committed_, &committed_->store},
                               committed_->annotated_indices, render_classes_, clean, semantic, stream);
     }
@@ -506,7 +547,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         return explore::rebuild_explore_order(dataset.summaries, filter, shuffled, seed, order, scratch, cancelled, 0U, nullptr,
                                               &gallery_.workers());
     }
-    static void ConfigureClasses(const std::span<const explore::ExploreRenderClassDescriptor> source, const ExploreOverlay overlay,
+    static void ConfigureClasses(const std::span<const explore::ExploreRenderClassDescriptor> source, const ExploreOverlay& overlay,
                                  std::vector<explore::ExploreRenderClassDescriptor>& classes) {
         classes.assign(source.begin(), source.end());
         const bool unrestricted = overlay.class_selection.mode == ExploreClassSelectionMode::All;

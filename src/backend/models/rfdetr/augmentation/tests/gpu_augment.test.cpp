@@ -452,9 +452,14 @@ TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuse
     auto full_input = repeated_pair<float>(input);
     (void)execute_and_copy(identity, full_input, full_indices, full_keys);
     const std::size_t at_capacity_bytes = identity.workspace_capacity_bytes();
+    CHECK(at_capacity_bytes == identity.device_capacity_bytes() + identity.pinned_capacity_bytes());
+    const auto pinned_capacity = identity.pinned_capacity_bytes();
+    const auto device_capacity = identity.device_capacity_bytes();
     (void)execute_and_copy(identity, input, indices, key_a);
     CHECK(identity.plan().active_size == 1U);
     CHECK(identity.workspace_capacity_bytes() == at_capacity_bytes);
+    CHECK(identity.pinned_capacity_bytes() == pinned_capacity);
+    CHECK(identity.device_capacity_bytes() == device_capacity);
 
     std::vector<std::uint8_t> rgba(4U * 4U * 4U);
     std::vector<float> planar(3U * 4U * 4U);

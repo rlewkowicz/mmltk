@@ -121,6 +121,8 @@ class GpuAugmentationExecutor final {
     [[nodiscard]] bool remaps_pixels() const noexcept;
     [[nodiscard]] std::size_t batch_capacity() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t device_capacity_bytes() const noexcept;
+    [[nodiscard]] std::size_t pinned_capacity_bytes() const noexcept;
 
    private:
     [[nodiscard]] const AugmentationBatchPlan& RunImpl(const GpuAugmentationBatchView& batch, std::span<const std::uint64_t> image_keys,

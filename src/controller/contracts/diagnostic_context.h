@@ -55,6 +55,11 @@ struct DiagnosticContext final {
     std::uint64_t capacity_width = 0U;
     std::uint64_t capacity_height = 0U;
     std::uint64_t staging_bytes = 0U;
+    std::uint64_t cache_bytes = 0U;
+    std::uint64_t descriptor_bytes = 0U;
+    std::uint64_t gpu_bytes = 0U;
+    std::uint64_t augmentation_device_bytes = 0U;
+    std::uint64_t augmentation_pinned_bytes = 0U;
     std::uint64_t surface_high = 0U;
     std::uint64_t surface_low = 0U;
     std::uint64_t selection_generation = 0U;

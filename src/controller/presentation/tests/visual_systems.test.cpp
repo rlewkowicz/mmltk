@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -42,6 +43,8 @@
 
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/subsystems/explore/detail/gallery_stream.h"
+#include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/subsystems/live/live_receiver_copy.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
@@ -65,6 +68,134 @@ namespace {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+
+TEST_CASE("Gallery row rings retain exact filtered positions through forward reverse and boundary windows", "[explore][cache]") {
+    using explore_detail::GalleryThumbnailCache;
+    const auto columns = GENERATE(4U, 10U);
+    ExploreViewport viewport{.extent = {columns * 32U, 96U}, .first_row = 17U, .row_count = 3U, .columns = columns};
+    const auto count = GalleryThumbnailCache::CardCount(1000U, viewport.row_count, columns);
+    CHECK(count == 17U * columns);
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == 10U * columns);
+    GalleryThumbnailCache cache;
+    const GalleryThumbnailCache::Identity identity{.dataset = 19U, .seed = 23U, .extent = 32U};
+    cache.Configure(count, identity);
+    auto meaning = std::make_shared<const explore_detail::GalleryTileMeaning>();
+    const std::uint64_t overlay = 1U;
+    const auto initial = GalleryThumbnailCache::WindowFirst(1000U, viewport);
+    for (auto position = initial; position < initial + count; ++position)
+        cache.Complete(position, static_cast<std::uint32_t>(position + 100U), meaning, overlay);
+    for (const auto row : {18U, 19U, 18U, 17U, 16U}) {
+        viewport.first_row = row;
+        const auto first = GalleryThumbnailCache::WindowFirst(1000U, viewport);
+        cache.Configure(count, identity);
+        for (auto position = std::max(initial, first); position < std::min(initial + count, first + count); ++position) {
+            REQUIRE(cache.Find(position, static_cast<std::uint32_t>(position + 100U)));
+            CHECK(cache.Find(position, static_cast<std::uint32_t>(position + 100U))->meaning == meaning);
+        }
+    }
+    CHECK_FALSE(cache.Find(initial + count, static_cast<std::uint32_t>(initial + 100U)));
+    CHECK_FALSE(cache.Find(initial, static_cast<std::uint32_t>(initial + 101U)));
+    cache.Complete(initial + count, 77U, meaning, overlay);
+    CHECK_FALSE(cache.Find(initial, static_cast<std::uint32_t>(initial + 100U)));
+    REQUIRE(cache.Find(initial + count, 77U));
+    viewport.first_row = 0U;
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == 0U);
+    viewport.first_row = 999U;
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) + count == 1000U);
+    CHECK(GalleryThumbnailCache::CardCount(0U, 3U, columns) == 0U);
+    CHECK(GalleryThumbnailCache::WindowFirst(0U, viewport) == 0U);
+    CHECK(GalleryThumbnailCache::CardCount(columns + 1U, 3U, columns) == columns + 1U);
+}
+
+TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and content identity", "[explore][cache]") {
+    using explore_detail::GalleryThumbnailCache;
+    explore_detail::GalleryProductState incumbent;
+    auto identity = GalleryThumbnailCache::Identity{.dataset = 31U, .seed = 37U, .extent = 16U};
+    incumbent.cache.Configure(20U, identity);
+    auto meaning = std::make_shared<explore_detail::GalleryTileMeaning>();
+    meaning->annotations.resize(2U);
+    meaning->runs.push_back({.start = 5U, .length = 3U});
+    const std::uint64_t overlay = 1U;
+    incumbent.cache.Complete(4U, 7U, meaning, overlay);
+    const auto bytes = incumbent.cache.MeaningBytes();
+    auto candidate = incumbent;
+    candidate.cache.Complete(4U, 7U, meaning, 2U, 1U);
+    REQUIRE(candidate.cache.Find(4U, 7U));
+    CHECK(candidate.cache.Find(4U, 7U)->meaning == incumbent.cache.Find(4U, 7U)->meaning);
+    CHECK(candidate.cache.Find(4U, 7U)->bank == 1U);
+    CHECK(incumbent.cache.Find(4U, 7U)->bank == 0U);
+    CHECK(candidate.cache.Find(4U, 7U)->semantic_identity != incumbent.cache.Find(4U, 7U)->semantic_identity);
+    CHECK(candidate.cache.MeaningBytes() == bytes);
+
+    SECTION("Changing the loaded artifact invalidates even when stable seed identity is unchanged") {
+        // Only identity comparison is exercised; the cache never dereferences
+        // an incarnation. Product storage retains the real artifact owner.
+        identity.incarnation = reinterpret_cast<const mmltk::backend::data::CompiledDataset*>(&incumbent);
+    }
+    SECTION("Changing augmentation seed invalidates clean pixels") { ++identity.seed; }
+    SECTION("Changing augmentation policy invalidates clean pixels") { identity.augmented = true; }
+    SECTION("Changing thumbnail extent invalidates clean pixels") { ++identity.extent; }
+    candidate.cache.Configure(20U, identity);
+    CHECK_FALSE(candidate.cache.Find(4U, 7U));
+    REQUIRE(incumbent.cache.Find(4U, 7U));
+    CHECK(incumbent.cache.Find(4U, 7U)->meaning->runs.front().start == 5U);
+    const auto capacity = candidate.Capacity();
+    candidate.Clear();
+    CHECK(candidate.Size() == 0U);
+    CHECK(candidate.Capacity() == capacity);
+    REQUIRE(incumbent.cache.Find(4U, 7U));
+}
+
+TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions", "[explore][cache]") {
+    explore_detail::GalleryThumbnailCache cache;
+    cache.Configure(20U, {.extent = 8U});
+    auto meaning = explore_detail::MakeGalleryShared<explore_detail::GalleryTileMeaning>();
+    meaning->annotations.reserve(3U);
+    meaning->runs.reserve(7U);
+    const std::uint64_t key = 1U;
+    cache.Complete(0U, 0U, meaning, key);
+    cache.Complete(1U, 1U, meaning, key);
+    const auto expected = cache.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry) +
+        explore_detail::GallerySharedBytes(meaning) +
+        meaning->annotations.capacity() * sizeof(decltype(meaning->annotations)::value_type) +
+        meaning->runs.capacity() * sizeof(decltype(meaning->runs)::value_type);
+    CHECK(cache.MeaningBytes() == expected);
+    const std::uint64_t other = 2U;
+    cache.Complete(2U, 2U, meaning, other);
+    CHECK(cache.MeaningBytes() == expected);
+    auto candidate = cache;
+    const auto incumbent_bytes = cache.MeaningBytes();
+    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry));
+    auto replacement = explore_detail::MakeGalleryShared<explore_detail::GalleryTileMeaning>();
+    replacement->runs.reserve(11U);
+    candidate.Complete(20U, 20U, replacement, other, 1U, 1U);
+    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry) +
+        explore_detail::GallerySharedBytes(replacement) + replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
+}
+
+TEST_CASE("Gallery product metadata accounts both retained vector high waters and bit storage", "[explore][cache]") {
+    explore_detail::GalleryProductState product;
+    product.visible_indices.resize(256U);
+    product.window_indices.resize(390U);
+    product.priority_slots.resize(390U);
+    product.active_classes.resize(kExploreClassCapacity);
+    product.completed_slots.resize(256U);
+    product.tile_meanings.resize(256U);
+    product.plan.overlay.class_selection.classes.resize(kExploreClassCapacity);
+    const auto expected = (product.visible_indices.capacity() + product.window_indices.capacity() +
+        product.priority_slots.capacity() + product.plan.overlay.class_selection.classes.capacity()) * sizeof(std::uint32_t) +
+        product.active_classes.capacity() * sizeof(decltype(product.active_classes)::value_type) +
+        product.completed_slots.capacity() / 8U +
+        product.tile_meanings.capacity() * sizeof(decltype(product.tile_meanings)::value_type);
+    CHECK(product.MetadataBytes() == expected);
+    explore_detail::GalleryProductState inactive;
+    inactive.ReserveFor(product);
+    CHECK(inactive.MetadataBytes() >= expected);
+    product.Clear();
+    inactive.Clear();
+    CHECK(product.MetadataBytes() == expected);
+    CHECK(inactive.MetadataBytes() >= expected);
+}
 
 struct LiveReceiverCopyProbe final {
     static inline cudaError_t wait_status = cudaSuccess;
@@ -233,11 +364,13 @@ struct ExploreDetailExtentProbe final {
 };
 
 class SynchronousExploreAlgorithm : public ExploreAlgorithm {
+    void SetCurrentDemand(ExploreDemandCheck) override {}
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
    public:
     void AbortRenderGeneration() override { generation_ = 0U; }
     void DiscardCandidate() override {}
     void SetGalleryReadySink(GalleryReadySink) final {}
-    void PrepareOutputPublication() final {}
+    void PrepareOutputPublication(ExploreOutputChange) final {}
     void CommitOutputPublication() noexcept final {}
     bool RollbackOutputPublication() noexcept final { return true; }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
@@ -397,6 +530,8 @@ struct StreamingExploreProbe final {
 }
 
 class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
+    void SetCurrentDemand(ExploreDemandCheck) override {}
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
    public:
     explicit ControlledStreamingExploreAlgorithm(std::shared_ptr<StreamingExploreProbe> probe) : probe_(std::move(probe)) {}
     ~ControlledStreamingExploreAlgorithm() override {
@@ -445,7 +580,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         std::scoped_lock lock(probe_->mutex);
         probe_->ready_sink = std::move(sink);
     }
-    void PrepareOutputPublication() override {
+    void PrepareOutputPublication(ExploreOutputChange) override {
         std::scoped_lock lock(probe_->mutex);
         if (checkpoint_) return;
         checkpoint_.emplace(PublicationCheckpoint{
@@ -2615,6 +2750,75 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     std::scoped_lock lock(probe->mutex);
     CHECK(probe->quiescences >= 1U);
     CHECK(probe->assignments.empty());
+}
+
+TEST_CASE("Explore storage diagnostics aggregate renderer and both output slots lazily") {
+    class StorageAlgorithm final : public TestExploreAlgorithm {
+       public:
+        explicit StorageAlgorithm(std::shared_ptr<std::atomic<std::size_t>> calls)
+            : TestExploreAlgorithm(std::make_shared<std::atomic<std::size_t>>(0U)), calls_(std::move(calls)) {}
+        [[nodiscard]] ExploreStorageFootprint StorageFootprint() const override {
+            ++*calls_;
+            return {.host_bytes = 101U, .device_bytes = 1000U, .pinned_bytes = 200U, .cache_device_bytes = 300U,
+                    .descriptor_bytes = 400U, .augmentation_device_bytes = 50U, .augmentation_pinned_bytes = 25U, .cache_cards = 60U};
+        }
+       private:
+        std::shared_ptr<std::atomic<std::size_t>> calls_;
+    };
+    struct Capture final {
+        std::mutex mutex;
+        VisualDiagnosticFact storage{};
+        std::atomic_bool enabled{true};
+    } capture;
+    const VisualDiagnosticSink diagnostics{
+        .context = &capture,
+        .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            if (fact.operation != VisualDiagnosticOperation::ExploreCacheStorage) return;
+            auto& capture = *static_cast<Capture*>(context);
+            std::scoped_lock lock(capture.mutex);
+            capture.storage = fact;
+        },
+        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled.load(); }};
+    auto calls = std::make_shared<std::atomic<std::size_t>>(0U);
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto factory = RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                  [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 2U);
+    mmltk::frameworks::gpu::SystemImageRuntime* physical = nullptr;
+    LoadedSettings settings;
+    EventGate events;
+    ExploreSystem explore{settings.system(), kDevice, 2U,
+        [factory = std::move(factory), &physical](auto revisions) mutable {
+            auto runtime = factory(std::move(revisions));
+            physical = runtime.get();
+            return runtime;
+        }, [&events](ExploreSystem::event_type) { events.Advance(); }, diagnostics};
+    static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}, .columns = 1U}, .compiled_source = "/test"}));
+    REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
+    const auto first_revision = explore.snapshot().frame.revision;
+    auto overlay = explore.snapshot().overlay;
+    overlay.show_masks = !overlay.show_masks;
+    static_cast<void>(explore.UpdateOverlay(overlay));
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > first_revision; }));
+    REQUIRE(physical);
+    const auto outputs = physical->OutputStorageFootprint();
+    CHECK(outputs.device_bytes == 4U * 32U * 32U * 4U);
+    {
+        std::scoped_lock lock(capture.mutex);
+        CHECK(capture.storage.value == 101U);
+        CHECK(capture.storage.context.gpu_bytes == 1000U + outputs.device_bytes);
+        CHECK(capture.storage.context.staging_bytes == 200U + outputs.pinned_bytes);
+        CHECK(capture.storage.context.cache_bytes == 401U);
+        CHECK(capture.storage.context.descriptor_bytes == 400U);
+        CHECK(capture.storage.context.augmentation_device_bytes == 50U);
+        CHECK(capture.storage.context.augmentation_pinned_bytes == 25U);
+    }
+    capture.enabled.store(false);
+    const auto collected = calls->load();
+    const auto before_disabled = explore.snapshot().frame.revision;
+    overlay.show_masks = !overlay.show_masks;
+    static_cast<void>(explore.UpdateOverlay(overlay));
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > before_disabled; }));
+    CHECK(calls->load() == collected);
 }
 
 TEST_CASE("Explore Open rejects never-loaded settings before runtime construction") {

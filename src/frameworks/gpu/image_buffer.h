@@ -16,6 +16,11 @@
 
 namespace mmltk::frameworks::gpu {
 
+struct ImageStorageFootprint final {
+    std::size_t device_bytes = 0U;
+    std::size_t pinned_bytes = 0U;
+};
+
 class ImageCopyBackend {
    public:
     virtual ~ImageCopyBackend() = default;
@@ -200,6 +205,9 @@ class ImageProductBuffer final {
     [[nodiscard]] std::uint32_t capacity_width() const noexcept;
     [[nodiscard]] std::uint32_t capacity_height() const noexcept;
     [[nodiscard]] std::size_t staging_capacity_bytes() const noexcept;
+    // Physical high-water ownership, including every plane, irrespective of
+    // the selected logical extent or product revision.
+    [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
 
    private:

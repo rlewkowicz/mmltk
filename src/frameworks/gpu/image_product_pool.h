@@ -88,6 +88,7 @@ class ImageProductPool final {
     [[nodiscard]] Product Selected() const;
     [[nodiscard]] Availability ObserveAvailability() const noexcept;
     [[nodiscard]] Facts SelectedFacts() const;
+    [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     void SetAvailabilitySink(std::function<void()>);
     [[nodiscard]] std::size_t size() const noexcept;

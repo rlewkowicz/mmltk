@@ -8,7 +8,9 @@ A real time interface for training, prediction, annotation, augmentation, and co
 
 Pytorch and Cuda take many many hours to build. Nvidia publishes a container with the latest pytorch and cuda, but it is licensed, so I cannot redistribute it. I do not want to build pytorch and cuda in this repo. So I pull their container, and I take just the selected binaries this repo needs. Our development and runtime images are built independently on Ubuntu 24.04; Nvidia's image is the binary donor. I'm not sure what that means. You can't claim the binaries are licensed if they are not licensed in the pytorch container. Things would get weird really fast.
 
-I'm going to implement yolo26. Glenn is very protective and broadly interprets that GPLv3. This project is open source so it does not affect me. [SAM3](https://github.com/facebookresearch/sam3/blob/main/LICENSE) for example, licenses their algorithms. It's explicit. IANAL (UANAL?) so who knows. But ultralytics license covers the code. This is C++. So I'm pretty sure they can kick rocks (I love ultralytics, and think they gave a TON to the community, I just mean that colloquially).
+I'm going to implement yolo26. Glenn is very protective and broadly interprets that GPLv3. This project is open source so it does not affect me in a sense because my modifications are public. [SAM3](https://github.com/facebookresearch/sam3/blob/main/LICENSE) for example, licenses their algorithms. It's explicit. IANAL (UANAL?) so who knows. I'm more of a birdlaw guy. But ultralytics license covers the code. This is C++. So I'm pretty sure they can kick rocks (I love ultralytics, and think they gave a TON to the community, I just mean that colloquially).
+
+I do my best to respect and post licenses. I just post my code as apache license. So if I claim a thing, and then they claim a thing, can they claim a thing against you if you use my thing?   
 
 ### OS Compatibility
 

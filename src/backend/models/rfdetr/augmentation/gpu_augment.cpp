@@ -560,8 +560,14 @@ bool GpuAugmentationExecutor::copy_paste_enabled() const noexcept { return impl_
 bool GpuAugmentationExecutor::remaps_pixels() const noexcept { return impl_->remap; }
 std::size_t GpuAugmentationExecutor::batch_capacity() const noexcept { return impl_->capacity; }
 std::size_t GpuAugmentationExecutor::workspace_capacity_bytes() const noexcept {
+    return device_capacity_bytes() + pinned_capacity_bytes();
+}
+std::size_t GpuAugmentationExecutor::device_capacity_bytes() const noexcept {
     return impl_->converted_input.bytes() + impl_->parameters.bytes() + impl_->keys.bytes() + impl_->input_slots.bytes() +
-           impl_->donor_slots.bytes() + impl_->staged_slots.bytes() + impl_->paste_parameters.bytes() + impl_->staged_keys.bytes() +
+           impl_->donor_slots.bytes() + impl_->paste_parameters.bytes();
+}
+std::size_t GpuAugmentationExecutor::pinned_capacity_bytes() const noexcept {
+    return impl_->staged_slots.bytes() + impl_->staged_keys.bytes() +
            impl_->staged_paste.bytes() + impl_->staged_parameters.bytes();
 }
 

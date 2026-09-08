@@ -7,6 +7,15 @@
 
 namespace mmltk::backend::imaging::explore::detail {
 
+// Non-owning host submission frontier. Never copied into a CUDA kernel;
+// already-submitted work keeps its ordinary completion/lifetime contract.
+struct ExploreRenderDemand final {
+    void* context = nullptr;
+    std::uint64_t generation = 0U;
+    bool (*current)(void*, std::uint64_t) noexcept = nullptr;
+    [[nodiscard]] bool valid() const noexcept { return current == nullptr || current(context, generation); }
+};
+
 // CLEANUP-IGNORE: The card input descriptor is a fixed kernel ABI, not an acceptance-state or host-layout record.
 struct ExploreRenderCardDescriptorAbi final {
     mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure{};
@@ -56,6 +65,7 @@ struct ExploreRenderTileDescriptorAbi final {
     std::uint32_t card_index = 0U;
     std::uint32_t destination_x = 0U;
     std::uint32_t destination_y = 0U;
+    std::int32_t semantic_y_offset = 0;
     std::uint32_t destination_width = 0U;
     std::uint32_t destination_height = 0U;
     ExploreRenderTileGenerationAbi generation{};
@@ -77,11 +87,9 @@ struct ExploreRenderTargetViewAbi final {
 };
 
 struct ExploreRenderedCardProbeAbi final {
-    // CLEANUP-IGNORE: Probe source identity is output evidence, distinct from host payload offsets.
-    const float* source_pixels = nullptr;
-    // CLEANUP-IGNORE: Probe source geometry reports kernel output rather than defining card input storage.
-    std::uint32_t source_width = 0U;
-    std::uint32_t source_height = 0U;
+    // The receiver-owned clean thumbnail is the physical-copy reference.
+    // Diagnostic collection never retains a raw compiled-image lane.
+    ExploreRenderTargetViewAbi reference{};
     std::uint32_t content_x = 0U;
     std::uint32_t content_y = 0U;
     std::uint32_t content_width = 0U;

@@ -378,6 +378,37 @@ TEST_CASE("receiver selects same peer and reusable staged copy paths") {
     CHECK(backend->staged_uploads == 2U);
 }
 
+TEST_CASE("output storage sums every physical plane and slot at retained high water") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime source{{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic}};
+    source.Publish(16U, 8U, [](auto, auto, auto) {});
+    SystemImageRuntime receiver{{.device = 1, .backend = backend,
+        .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U}};
+    CHECK(receiver.OutputStorageFootprint().device_bytes == 0U);
+    CHECK(receiver.OutputStorageFootprint().pinned_bytes == 0U);
+    backend->peer_access = false;
+    static_cast<void>(receiver.CopyFrom(source.Borrow()));
+    auto first = receiver.Completed();
+    const auto one = receiver.OutputStorageFootprint();
+    CHECK(one.device_bytes == 2U * 16U * 4U * 8U);
+    CHECK(one.pinned_bytes == 2U * 16U * 4U * 8U);
+    static_cast<void>(receiver.CopyFrom(source.Borrow()));
+    const auto both = receiver.OutputStorageFootprint();
+    CHECK(both.device_bytes == 4U * 16U * 4U * 8U);
+    CHECK(both.pinned_bytes == 4U * 16U * 4U * 8U);
+    first = {};
+    auto candidate = receiver.AcquireOutput();
+    receiver.Publish(candidate, 4U, 2U, [](auto, auto, auto) {});
+    // Uncommitted smaller logical output retains its exact physical allocation.
+    CHECK(receiver.OutputStorageFootprint().device_bytes == both.device_bytes);
+    CHECK(receiver.OutputStorageFootprint().pinned_bytes == both.pinned_bytes);
+    receiver.CommitOutput(std::move(candidate));
+    CHECK(receiver.OutputFacts().capacity_width == 16U);
+    CHECK(receiver.OutputFacts().capacity_height == 8U);
+    CHECK(receiver.OutputStorageFootprint().device_bytes == both.device_bytes);
+    CHECK(receiver.OutputStorageFootprint().pinned_bytes == both.pinned_bytes);
+}
+
 TEST_CASE("borrowed image storage remains stable until receiver completion") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();

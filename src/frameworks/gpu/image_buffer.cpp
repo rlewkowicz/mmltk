@@ -816,6 +816,17 @@ std::size_t ImageProductBuffer::staging_capacity_bytes() const noexcept {
         result = std::max(result, state_->planes_[index]->staging_capacity_bytes());
     return result;
 }
+ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
+    ImageStorageFootprint result;
+    for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
+        const auto& plane = *state_->planes_[index]->state_;
+        std::shared_lock lock(plane.access);
+        if (plane.plane.data != 0U)
+            result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
+        result.pinned_bytes += plane.staging_bytes;
+    }
+    return result;
+}
 std::uint64_t ImageProductBuffer::revision() const noexcept {
     std::shared_lock transaction(state_->transaction_);
     return state_->generation_;

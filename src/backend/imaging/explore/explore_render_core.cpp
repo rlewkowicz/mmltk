@@ -57,19 +57,22 @@ static_assert(rle_abi_layout_matches());
 
 ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles,
                                                 const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch,
-                                                const ExploreRenderTargetView& target, const std::uintptr_t stream) noexcept {
+                                                const ExploreRenderTargetView& target, const std::uintptr_t stream,
+                                                const detail::ExploreRenderDemand demand) noexcept {
+    if (!demand.valid()) return kExploreStorageSuccess;
     if (stream == 0U || !target.valid() || !scratch.valid() || !atlas_view_valid(view) || !valid_tile_batch(tiles, scratch) ||
         tiles.max_tile_width > view.card_extent || tiles.max_tile_height > view.card_extent || tiles.max_tile_width > target.width ||
         tiles.max_tile_height > target.height || view.card_count > scratch.card_capacity || !semantic_storage_valid(semantics, scratch)) {
         return static_cast<ExploreStorageStatus>(cudaErrorInvalidValue);
     }
     return static_cast<ExploreStorageStatus>(detail::render_explore_atlas_tiles_cuda(view, tiles, semantics, to_cuda_scratch_abi(scratch),
-                                                                                     target, reinterpret_cast<cudaStream_t>(stream)));
+                                                                                     target, reinterpret_cast<cudaStream_t>(stream), demand));
 }
 
 ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics,
                                            const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target,
-                                           const std::uintptr_t stream) noexcept {
+                                           const std::uintptr_t stream, const detail::ExploreRenderDemand demand) noexcept {
+    if (!demand.valid()) return kExploreStorageSuccess;
     if (stream == 0U || !target.valid() || !scratch.valid() || view.pixels == nullptr || view.source_width == 0U ||
         view.source_height == 0U || view.crop_width == 0U || view.crop_height == 0U || view.crop_x > view.source_width - 1U ||
         view.crop_y > view.source_height - 1U || view.crop_width > view.source_width - view.crop_x ||
@@ -77,7 +80,7 @@ ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, 
         return static_cast<ExploreStorageStatus>(cudaErrorInvalidValue);
     }
     return static_cast<ExploreStorageStatus>(
-        detail::render_explore_detail_cuda(view, semantics, to_cuda_scratch_abi(scratch), target, reinterpret_cast<cudaStream_t>(stream)));
+        detail::render_explore_detail_cuda(view, semantics, to_cuda_scratch_abi(scratch), target, reinterpret_cast<cudaStream_t>(stream), demand));
 }
 
 ExploreStorageStatus count_explore_nonzero_alpha(const ExploreRenderTargetView& target, std::uint64_t* const device_count,
@@ -97,7 +100,7 @@ ExploreStorageStatus checksum_explore_pixels(const ExploreRenderTargetView& targ
 ExploreStorageStatus probe_explore_rendered_card(const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic,
                                                  const ExploreRenderedCardProbe& probe, std::uint64_t* const device_counts,
                                                  const std::uintptr_t stream) noexcept {
-    const bool content_valid = probe.source_pixels != nullptr && probe.source_width != 0U && probe.source_height != 0U &&
+    const bool content_valid = probe.reference.valid() && probe.reference.width == clean.width && probe.reference.height == clean.height &&
                                probe.content_width != 0U && probe.content_height != 0U && probe.content_x < clean.width &&
                                probe.content_y < clean.height && probe.content_width <= clean.width - probe.content_x &&
                                probe.content_height <= clean.height - probe.content_y;

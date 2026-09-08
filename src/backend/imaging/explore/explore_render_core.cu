@@ -128,7 +128,9 @@ __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view
     const Target target = target_view(target_view_value);
     const std::uint32_t tile_index = blockIdx.z;
     if (tile_index >= batch.tile_count) return;
-    const auto tile = tiles[tile_index];
+    auto tile = tiles[tile_index];
+    if (view.draw_base == 0U)
+        tile.destination_y = static_cast<std::uint32_t>(static_cast<std::int64_t>(tile.destination_y) + tile.semantic_y_offset);
     if (tile.generation.viewport != batch.viewport_generation || tile.destination_width == 0U || tile.destination_height == 0U ||
         tile.destination_x >= target.width || tile.destination_y >= target.height ||
         tile.destination_width > target.width - tile.destination_x || tile.destination_height > target.height - tile.destination_y) {
@@ -274,7 +276,9 @@ __global__ void atlas_tile_box_kernel(const ExploreRenderTargetView target_view_
     const Target target = target_view(target_view_value);
     const std::uint32_t tile_index = blockIdx.z;
     if (tile_index >= batch.tile_count || semantics.show_boxes == 0U) return;
-    const auto tile = tiles[tile_index];
+    auto tile = tiles[tile_index];
+    if (view.draw_base == 0U)
+        tile.destination_y = static_cast<std::uint32_t>(static_cast<std::int64_t>(tile.destination_y) + tile.semantic_y_offset);
     if (tile.generation.viewport != batch.viewport_generation || tile.placeholder != 0U || tile.card_index >= view.card_count ||
         tile.destination_width == 0U || tile.destination_height == 0U || tile.destination_x >= target.width ||
         tile.destination_y >= target.height || tile.destination_width > target.width - tile.destination_x ||
@@ -361,14 +365,9 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
                                                   (probe.content_x != 0U && content_row && x == probe.content_x ? 1U : 0U) +
                                                   (content_right < clean.width && content_row && x + 1U == content_right ? 1U : 0U);
     if (inside_transition_count != 0U) {
-        const float source_x =
-            (static_cast<float>(x) + 0.5F) / static_cast<float>(clean.width) * static_cast<float>(probe.source_width) - 0.5F;
-        const float source_y =
-            (static_cast<float>(y) + 0.5F) / static_cast<float>(clean.height) * static_cast<float>(probe.source_height) - 0.5F;
-        const uchar4 expected =
-            make_uchar4(to_byte(sample_nchw(probe.source_pixels, probe.source_width, probe.source_height, 0U, source_x, source_y)),
-                        to_byte(sample_nchw(probe.source_pixels, probe.source_width, probe.source_height, 1U, source_x, source_y)),
-                        to_byte(sample_nchw(probe.source_pixels, probe.source_width, probe.source_height, 2U, source_x, source_y)), 255U);
+        const auto* reference_row = reinterpret_cast<const uchar4*>(
+            probe.reference.data + static_cast<std::size_t>(y) * probe.reference.pitch_bytes);
+        const uchar4 expected = reference_row[x];
         if (clean_pixel.x == expected.x && clean_pixel.y == expected.y && clean_pixel.z == expected.z && clean_pixel.w == expected.w)
             atomicAdd(counts + 4U, static_cast<unsigned long long>(inside_transition_count));
     }
@@ -383,7 +382,8 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
 
 cudaError_t render_explore_atlas_tiles_cuda(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles,
                                             const ExploreRenderSemanticView& semantics, const ExploreRenderScratchView& scratch,
-                                            const ExploreRenderTargetView& target, const cudaStream_t stream) noexcept {
+                                            const ExploreRenderTargetView& target, const cudaStream_t stream,
+                                            const ExploreRenderDemand demand) noexcept {
     const auto* cards = scratch.cards;
     const auto* annotations = scratch.annotations;
     const auto* pairs = static_cast<const ExploreRenderRlePair*>(scratch.rle_pairs);
@@ -394,9 +394,10 @@ cudaError_t render_explore_atlas_tiles_cuda(const ExploreRenderAtlasView& view, 
     const dim3 tile_grid{(tiles.max_tile_width + tile_block.x - 1U) / tile_block.x,
                          (tiles.max_tile_height + tile_block.y - 1U) / tile_block.y, tiles.tile_count};
     const dim3 tile_box_grid{1U, 1U, tiles.tile_count};
+    if (!demand.valid()) return cudaSuccess;
     atlas_tile_base_kernel<<<tile_grid, tile_block, 0U, stream>>>(target, cards, annotations, pairs, classes, tile_descriptors, view, tiles,
                                                                   semantics, scratch.capacities.annotations);
-    if (semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
+    if (demand.valid() && semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
         atlas_tile_box_kernel<<<tile_box_grid, threads, 0U, stream>>>(target, cards, annotations, classes, tile_descriptors, view, tiles,
                                                                       semantics, scratch.capacities.annotations);
     }
@@ -405,15 +406,16 @@ cudaError_t render_explore_atlas_tiles_cuda(const ExploreRenderAtlasView& view, 
 
 cudaError_t render_explore_detail_cuda(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics,
                                        const ExploreRenderScratchView& scratch, const ExploreRenderTargetView& target,
-                                       const cudaStream_t stream) noexcept {
+                                       const cudaStream_t stream, const ExploreRenderDemand demand) noexcept {
     const auto* annotations = scratch.annotations;
     const auto* pairs = static_cast<const ExploreRenderRlePair*>(scratch.rle_pairs);
     const auto* classes = scratch.classes;
     constexpr std::uint32_t threads = 256U;
     const std::uint64_t pixels = static_cast<std::uint64_t>(target.width) * target.height;
+    if (!demand.valid()) return cudaSuccess;
     detail_base_kernel<<<static_cast<unsigned int>((pixels + threads - 1U) / threads), threads, 0U, stream>>>(
         target, view, annotations, pairs, classes, semantics, scratch.capacities.annotations);
-    if (semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
+    if (demand.valid() && semantics.show_boxes != 0U && semantics.annotation_count != 0U) {
         detail_box_kernel<<<semantics.annotation_count, threads, 0U, stream>>>(target, annotations, classes, view, semantics);
     }
     return cudaPeekAtLastError();

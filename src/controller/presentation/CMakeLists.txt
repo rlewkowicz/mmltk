@@ -84,7 +84,8 @@ function(mmltk_add_controller_presentation_tests)
         mmltk_controller_visual_systems_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_visual_systems_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/visual_systems.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/visual_systems.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_gallery.test.cpp)
     mmltk_configure_component(
         mmltk_controller_visual_systems_tests PRIVATE_DECLARATIONS)
     target_link_libraries(
