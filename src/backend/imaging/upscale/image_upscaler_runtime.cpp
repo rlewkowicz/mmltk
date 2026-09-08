@@ -16,17 +16,15 @@ module;
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/image_failure.h"
+#include "upscale_execution.h"
 
 module mmltk.backend.imaging.upscale.image_upscaler;
-
-import mmltk.backend.ml.cuda.gpu_quiescence;
 
 #include "detail/image_upscaler_internal.h"
 
 namespace mmltk::backend::imaging::upscale {
 
-using mmltk::backend::ml::cuda::GpuBackendQuiescenceStrategy;
-using mmltk::backend::ml::cuda::next_gpu_backend_generation;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 
 namespace {
@@ -88,66 +86,81 @@ std::size_t checked_upscaler_elements(const std::uint32_t width, const std::uint
     return pixels * channels;
 }
 
-UpscalerFloatBuffer::~UpscalerFloatBuffer() { reset(); }
+cudaError_t settle_upscaler_stream(cudaStream_t stream, cudaGraph_t& abandoned_capture) noexcept {
+    if (stream == nullptr) return cudaSuccess;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    auto status = cudaStreamIsCapturing(stream, &capture);
+    if (status != cudaSuccess) return status;
+    if (capture != cudaStreamCaptureStatusNone) {
+        status = cudaStreamEndCapture(stream, &abandoned_capture);
+        if (status != cudaSuccess && status != cudaErrorStreamCaptureInvalidated) return status;
+        status = cudaStreamIsCapturing(stream, &capture);
+        if (status != cudaSuccess) return status;
+        if (capture != cudaStreamCaptureStatusNone) return cudaErrorStreamCaptureInvalidated;
+    }
+    return cudaStreamSynchronize(stream);
+}
+
+UpscalerFloatBuffer::~UpscalerFloatBuffer() {
+    if (data_ != nullptr || replacement_ != nullptr) std::terminate();
+}
 
 void UpscalerFloatBuffer::ensure(const std::size_t elements, const char* context) {
     if (elements <= capacity_) { return; }
     if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
         throw std::overflow_error(std::string(context) + " byte size overflow");
     }
-    float* replacement = nullptr;
-    ensure_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&replacement), elements * sizeof(float)), context);
+    if (replacement_ != nullptr) throw std::logic_error("failed Image upscaler buffer requires retirement");
+    ensure_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&replacement_), elements * sizeof(float)), context);
     if (data_ != nullptr) { ensure_cuda_ok(cudaFree(data_), "cudaFree while growing Image upscaler buffer"); }
-    data_ = replacement;
+    data_ = std::exchange(replacement_, nullptr);
     capacity_ = elements;
 }
 
-void UpscalerFloatBuffer::reset() noexcept { static_cast<void>(Release()); }
-
-cudaError_t UpscalerFloatBuffer::Release() noexcept {
+cudaError_t UpscalerFloatBuffer::Release(UpscalerCleanup* cleanup) noexcept {
+    cudaError_t failure = cudaSuccess;
     if (data_ != nullptr) {
-        const cudaError_t failure = cudaFree(data_);
-        if (failure != cudaSuccess) return failure;
-        data_ = nullptr;
-        capacity_ = 0U;
+        failure = cudaFree(data_);
+        if (cleanup) cleanup->Record(failure, "release neural float allocation");
+        if (failure == cudaSuccess) {
+            data_ = nullptr;
+            capacity_ = 0U;
+        }
     }
-    return cudaSuccess;
+    if (replacement_ != nullptr) {
+        const auto replacement_failure = cudaFree(replacement_);
+        if (cleanup) cleanup->Record(replacement_failure, "release neural replacement allocation");
+        if (replacement_failure == cudaSuccess) replacement_ = nullptr;
+        if (failure == cudaSuccess) failure = replacement_failure;
+    }
+    return failure;
 }
 
 TiledImageUpscalerRuntimeState::TiledImageUpscalerRuntimeState(ImageUpscalerDescriptor descriptor, const int device_id)
-    : descriptor_(descriptor), device_id_(device_id), generation_(next_gpu_backend_generation()) {
-    if (!generation_) { throw std::runtime_error("Image upscaler backend generation identity exhausted"); }
+    : descriptor_(descriptor), device_id_(device_id) {}
+
+ImageUpscalerOutcome TiledImageUpscalerRuntimeState::Activate(const ImageUpscalerExecutionCheckpoint& checkpoint,
+                                                             ImageUpscalerCurrent current) {
+    if (!current()) return ImageUpscalerOutcome::Cancelled;
     ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for Image upscaler runtime");
     ensure_cuda_ok(cudaEventCreateWithFlags(&consumer_done_, cudaEventDisableTiming),
                    "cudaEventCreate for Image upscaler output consumption");
-    const cudaError_t cleanup_stream_status = cudaStreamCreateWithFlags(&cleanup_stream_, cudaStreamNonBlocking);
-    if (cleanup_stream_status != cudaSuccess) {
-        static_cast<void>(cudaEventDestroy(consumer_done_));
-        consumer_done_ = nullptr;
-        ensure_cuda_ok(cleanup_stream_status, "cudaStreamCreate for Image upscaler cleanup");
-    }
-}
-
-GpuBackendQuiescenceRequirement TiledImageUpscalerRuntimeState::quiescence_requirement() const noexcept {
-    return {
-        .generation = generation_,
-        .device_id = device_id_,
-        .strategy = GpuBackendQuiescenceStrategy::TransitiveFence,
-        .user_compute_stream_owned = true,
-        .provider_copy_streams_ordered = true,
-        .auxiliary_streams_ordered = true,
-    };
+    if (checkpoint) checkpoint(ImageUpscalerExecutionStage::EventCreated);
+    if (!current()) return ImageUpscalerOutcome::Cancelled;
+    ensure_cuda_ok(cudaStreamCreateWithFlags(&cleanup_stream_, cudaStreamNonBlocking),
+                   "cudaStreamCreate for Image upscaler cleanup");
+    if (checkpoint) checkpoint(ImageUpscalerExecutionStage::StreamCreated);
+    return current() ? ImageUpscalerOutcome::Completed : ImageUpscalerOutcome::Cancelled;
 }
 
 TiledImageUpscalerRuntimeState::~TiledImageUpscalerRuntimeState() {
     std::lock_guard lock(mutex_);
     if ((!stopped_ && std::uncaught_exceptions() == 0) || awaiting_consumer_ || consumer_fatal_) std::terminate();
-    if (consumer_done_ != nullptr) { (void)cudaEventDestroy(consumer_done_); }
-    if (cleanup_stream_ != nullptr) (void)cudaStreamDestroy(cleanup_stream_);
+    if (consumer_done_ != nullptr || cleanup_stream_ != nullptr) std::terminate();
 }
 
 ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream,
-                                                                   void* backend, const ImageUpscalerSubmitTiles submit_tiles) {
+    void* backend, const ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint& checkpoint) {
     std::lock_guard lock(mutex_);
     if (request.device_pixels == nullptr || consumer_stream == nullptr || request.crop_width == 0U || request.crop_height == 0U ||
         request.source_width == 0U || request.source_height == 0U || request.crop_x > request.source_width ||
@@ -168,8 +181,11 @@ ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUp
     }
     const std::uint32_t restored_width = request.crop_width * 4U;
     const std::uint32_t restored_height = request.crop_height * 4U;
+    if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::RestoredAllocationAdmitted, request.current))
+        return {.outcome = ImageUpscalerOutcome::Cancelled};
     restored_.ensure(checked_upscaler_elements(restored_width, restored_height, 3U), "cudaMalloc for Image upscaler restored image");
-    if (!submit_tiles(backend, request, consumer_stream, restored_width, restored_height)) { return {}; }
+    if (!request.current() || !submit_tiles(backend, request, consumer_stream, restored_width, restored_height))
+        return {.outcome = ImageUpscalerOutcome::Cancelled};
     awaiting_consumer_ = true;
     return {
         .device_pixels = restored_.data(),
@@ -192,29 +208,32 @@ void TiledImageUpscalerRuntimeState::abandon_consumer() noexcept {
     consumer_fatal_ = true;
 }
 
-cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpscalerReleaseBackend release_backend) noexcept {
+cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpscalerReleaseBackend release_backend,
+                                               const ImageUpscalerExecutionCheckpoint& checkpoint) noexcept {
     std::lock_guard lock(mutex_);
     if (stopped_) return cudaSuccess;
-    if (awaiting_consumer_ || consumer_fatal_ || cleanup_stream_ == nullptr) return cudaErrorNotReady;
-    cudaError_t failure = cudaSetDevice(device_id_);
-    if (failure == cudaSuccess && consumer_pending_) failure = cudaEventSynchronize(consumer_done_);
-    if (failure == cudaSuccess) failure = cudaStreamSynchronize(cleanup_stream_);
-    if (failure != cudaSuccess) return failure;
-    failure = release_backend(backend);
-    if (failure != cudaSuccess) return failure;
-    failure = restored_.Release();
-    if (failure != cudaSuccess) return failure;
+    if (!cleanup_.Record(cudaSetDevice(device_id_), "bind neural cleanup device")) return cleanup_.status();
+    bool settled = cleanup_.Record(awaiting_consumer_ || consumer_fatal_ ? cudaErrorNotReady : cudaSuccess,
+                                   "settle neural consumer ownership");
+    if (consumer_pending_)
+        settled = cleanup_.Record(cudaEventSynchronize(consumer_done_), "settle neural consumer fence") && settled;
+    if (cleanup_stream_ != nullptr)
+        settled = cleanup_.Record(cudaStreamSynchronize(cleanup_stream_), "settle neural cleanup stream") && settled;
+    // Backend buffers are still referenced by an unsettled consumer.
+    if (!settled) return cleanup_.status();
+    const bool backend_released = cleanup_.Record(release_backend(backend), "release neural backend");
+    if (backend_released) static_cast<void>(restored_.Release(&cleanup_));
     if (consumer_done_ != nullptr) {
-        failure = cudaEventDestroy(consumer_done_);
-        if (failure != cudaSuccess) return failure;
-        consumer_done_ = nullptr;
+        if (cleanup_.Record(cudaEventDestroy(consumer_done_), "destroy neural consumer fence")) consumer_done_ = nullptr;
+        cleanup_.Checkpoint(checkpoint, ImageUpscalerExecutionStage::EventDestroyed);
     }
-    failure = cudaStreamDestroy(cleanup_stream_);
-    if (failure != cudaSuccess) return failure;
-    cleanup_stream_ = nullptr;
+    if (cleanup_stream_ != nullptr) {
+        if (cleanup_.Record(cudaStreamDestroy(cleanup_stream_), "destroy neural cleanup stream")) cleanup_stream_ = nullptr;
+        cleanup_.Checkpoint(checkpoint, ImageUpscalerExecutionStage::StreamDestroyed);
+    }
     consumer_pending_ = false;
-    stopped_ = true;
-    return cudaSuccess;
+    stopped_ = cleanup_.status() == cudaSuccess;
+    return cleanup_.status();
 }
 
 }  // namespace mmltk::backend::imaging::upscale

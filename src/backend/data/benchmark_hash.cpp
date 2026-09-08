@@ -86,21 +86,29 @@ Sha256Digest sha256_bytes(const std::span<const std::uint8_t> bytes) {
     return finish_digest(context.get());
 }
 
-Sha256Digest sha256_file(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+std::optional<Sha256Digest> try_sha256_file(const std::filesystem::path& path,
+    mmltk::common::concurrency::CancellationObservation cancel_requested) {
+    if (cancel_requested.requested()) return std::nullopt;
     const FileHandle file = FileHandle::open_readonly(path.string());
     const std::size_t file_size = file.size();
     DigestContext context = make_sha256_context();
     std::vector<std::uint8_t> buffer(std::min(kHashReadBytes, std::max<std::size_t>(file_size, 1U)));
     std::size_t offset = 0U;
     while (offset < file_size) {
-        benchmark_internal::throw_if_benchmark_cancelled(cancel_requested);
+        if (cancel_requested.requested()) return std::nullopt;
         const std::size_t count = std::min(buffer.size(), file_size - offset);
         file.pread_all(buffer.data(), count, offset);
         update_digest(context.get(), buffer.data(), count);
         offset += count;
     }
-    benchmark_internal::throw_if_benchmark_cancelled(cancel_requested);
+    if (cancel_requested.requested()) return std::nullopt;
     return finish_digest(context.get());
+}
+
+Sha256Digest sha256_file(const std::filesystem::path& path, mmltk::common::concurrency::CancellationObservation cancel_requested) {
+    const auto digest = try_sha256_file(path, cancel_requested);
+    if (!digest) throw std::runtime_error("benchmark dataset compilation cancelled");
+    return *digest;
 }
 
 std::string sha256_hex(const Sha256Digest& digest) { return mmltk::common::types::hex_encode(digest); }

@@ -16,7 +16,10 @@ TEST_CASE("application shell is a single non-copyable ordinary composition") {
 
 TEST_CASE("shell visual wiring exposes exact-frame Upscale warm-up") {
     STATIC_CHECK(std::is_same_v<decltype(UpscaleRequest{}.source), VisualFrame>);
-    STATIC_CHECK(noexcept(std::declval<UpscaleSystem&>().Warm()));
+    STATIC_CHECK(std::is_same_v<decltype(UpscaleRequest{}.document), VisualDocumentFacts>);
+    STATIC_CHECK(std::is_same_v<decltype(ExploreSnapshot{}.document), VisualDocumentFacts>);
+    STATIC_CHECK(std::is_trivially_copyable_v<UpscaleRequest>);
+    STATIC_CHECK(noexcept(std::declval<UpscaleSystem&>().Warm(VisualExtent{})));
     STATIC_CHECK(std::is_invocable_r_v<VisualDocumentRead, ExactVisualDocumentBorrower, const VisualFrame&>);
 }
 

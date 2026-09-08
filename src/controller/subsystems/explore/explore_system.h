@@ -138,6 +138,7 @@ struct ExploreSnapshot final {
     std::optional<std::uint32_t> selected_image{};
     std::optional<std::uint32_t> focused_image{};
     VisualFrame frame{};
+    VisualDocumentFacts document{};
     contracts::AnnotationSceneContent scene{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
 };

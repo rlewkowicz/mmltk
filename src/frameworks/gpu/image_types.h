@@ -9,6 +9,7 @@ namespace mmltk::frameworks::gpu {
 
 enum class ImageFormat : std::uint8_t { Rgba8 };
 enum class ImagePlaneKind : std::uint8_t { Clean, Semantic };
+enum class ImagePlanePreservation : std::uint8_t { All, Clean };
 
 struct ImagePlaneDescriptor final {
     ImagePlaneKind kind = ImagePlaneKind::Clean;

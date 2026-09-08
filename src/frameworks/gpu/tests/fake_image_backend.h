@@ -64,6 +64,8 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::atomic<int> pinned_receiver_device{-1};
     std::atomic<std::size_t> synchronized{0U};
     std::atomic<std::size_t> same_copies{0U};
+    std::atomic<std::uintptr_t> watched_copy_source{0U};
+    std::atomic<std::size_t> watched_source_copies{0U};
     std::atomic<std::size_t> peer_copies{0U};
     std::atomic<std::size_t> staged_downloads{0U};
     std::atomic<std::size_t> staged_uploads{0U};
@@ -184,6 +186,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             copy_changed_.wait(lock, [this] { return !defer_same_device_copies.load(std::memory_order_acquire); });
         }
         CopyImagePlane(destination, source);
+        if (source.data == watched_copy_source.load()) ++watched_source_copies;
         ++same_copies;
     }
     void CopyPeer(std::uintptr_t, std::uintptr_t, int, const ImagePlaneView& destination, std::uintptr_t, int,

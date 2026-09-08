@@ -4,12 +4,14 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <memory>
+#include "src/frameworks/gpu/image_failure.h"
+#include "upscale_execution.h"
 
 export module mmltk.backend.imaging.upscale.image_upscaler;
-
-export import mmltk.backend.imaging.upscale.image_upscaler_types;
 
 export namespace mmltk::backend::imaging::upscale {
 
@@ -17,13 +19,6 @@ enum class ImageUpscalerMode : std::uint8_t {
     Basic,
     ShiftLUT,
     RealPLKSR,
-    Count,
-};
-
-enum class ImageUpscalerBackend : std::uint8_t {
-    NisFallback,
-    OnnxRuntime,
-    TensorRt,
     Count,
 };
 
@@ -43,6 +38,9 @@ inline constexpr ImageUpscalerStatus kImageUpscalerSuccess = 0;
 
 struct ImageUpscalerAggregateConfig final {
     std::array<ImageUpscalerModelHandle, 3U> models{};
+    // Optional effect-only instrumentation, called with an already installed
+    // physical owner. Throwing exercises the same checked failure boundary.
+    ImageUpscalerExecutionCheckpoint checkpoint{};
     [[nodiscard]] bool valid() const noexcept {
         for (std::size_t index = 0U; index != models.size(); ++index)
             if (!models[index].valid() || models[index].id != index + 1U) return false;
@@ -105,10 +103,13 @@ class ImageUpscalerProcessOwner final {
     ~ImageUpscalerProcessOwner();
 
     [[nodiscard]] explicit operator bool() const noexcept;
-    [[nodiscard]] bool run_rgba8(ImageUpscalerModelHandle handle, ImageUpscalerMode mode, const std::uint8_t* source,
+    [[nodiscard]] ImageUpscalerOutcome run_rgba8(ImageUpscalerModelHandle handle, ImageUpscalerMode mode, const std::uint8_t* source,
                                  std::size_t source_pitch, std::uint32_t width, std::uint32_t height, std::uint8_t* target,
-                                 std::size_t target_pitch, std::uintptr_t stream);
-    [[nodiscard]] std::uintptr_t operation_stream(ImageUpscalerMode mode, int device_id);
+                                 std::size_t target_pitch, std::uintptr_t stream,
+                                 ImageUpscalerCurrent current = image_upscaler_current);
+    [[nodiscard]] std::uintptr_t operation_stream(ImageUpscalerMode mode, int device_id,
+        ImageUpscalerCurrent current = image_upscaler_current);
+    [[nodiscard]] bool graph_replay(ImageUpscalerMode mode) const;
 
    private:
     explicit ImageUpscalerProcessOwner(std::shared_ptr<void> owner) noexcept;
@@ -133,6 +134,7 @@ class ImageUpscaler final {
 
     [[nodiscard]] ImageUpscalerClient client() const noexcept;
     [[nodiscard]] ImageUpscalerStatus Stop() noexcept;
+    [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept;
     [[nodiscard]] std::uint64_t core_generation() const noexcept;
 
    private:

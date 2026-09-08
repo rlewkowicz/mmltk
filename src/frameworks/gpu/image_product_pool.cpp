@@ -103,16 +103,18 @@ void ImageProductPool::Product::Release() noexcept {
     revision_ = 0U;
     slot->admission->Available();
 }
-ImageProductPool::Candidate::Candidate(std::shared_ptr<Slot> slot, Product baseline) noexcept
-    : slot_(std::move(slot)), baseline_(std::move(baseline)) {}
+ImageProductPool::Candidate::Candidate(std::shared_ptr<Slot> slot, Product baseline, ImagePlanePreservation preservation) noexcept
+    : slot_(std::move(slot)), baseline_(std::move(baseline)), preservation_(preservation) {}
 ImageProductPool::Candidate::~Candidate() { Release(); }
 ImageProductPool::Candidate::Candidate(Candidate&& other) noexcept
-    : slot_(std::move(other.slot_)), baseline_(std::move(other.baseline_)), revision_(std::exchange(other.revision_, 0U)) {}
+    : slot_(std::move(other.slot_)), baseline_(std::move(other.baseline_)), preservation_(other.preservation_),
+      revision_(std::exchange(other.revision_, 0U)) {}
 ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& other) noexcept {
     if (this == &other) return *this;
     Release();
     slot_ = std::move(other.slot_);
     baseline_ = std::move(other.baseline_);
+    preservation_ = other.preservation_;
     revision_ = std::exchange(other.revision_, 0U);
     return *this;
 }
@@ -146,7 +148,7 @@ ImageProductPool::~ImageProductPool() {
     SetAvailabilitySink({});
     admission_->Notify();
 }
-ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Product baseline) {
+ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Product baseline, ImagePlanePreservation preservation) {
     if (baseline.slot_ && (baseline.slot_->admission != admission_ || !baseline.valid()))
         throw std::invalid_argument("image product baseline is invalid or foreign");
     const auto find = [&]() -> std::shared_ptr<Slot> {
@@ -165,7 +167,7 @@ ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Prod
             std::scoped_lock lock(admission_->mutex);
             if (auto slot = find()) {
                 slot->reserved = true;
-                return Candidate{std::move(slot), std::move(baseline)};
+                return Candidate{std::move(slot), std::move(baseline), preservation};
             }
         }
         if (!available.Wait(stop)) return {};
@@ -188,7 +190,7 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
         initialized = descriptor.width == width && descriptor.height == height &&
                       baseline.plane_count() == (slot.buffer.layout() == ImageProductLayout::Clean ? 1U : 2U);
         if (initialized && !same_slot)
-            static_cast<void>(slot.buffer.CopyFrom(stream, std::move(baseline)));
+            static_cast<void>(slot.buffer.CopyFromAs(stream, std::move(baseline), {}, 0U, false, candidate.preservation_));
     }
     {
         std::scoped_lock lock(admission_->mutex);

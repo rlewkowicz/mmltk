@@ -7,6 +7,7 @@ impl App {
         {
             return;
         }
+        self.presentation.suspend_viewer(&self.model, self.workspace.active());
         self.connection = None;
         self.model.peer_disconnected(error);
         self.settings.reset_transport();
@@ -45,6 +46,9 @@ impl App {
         }
         match event {
             TransportEvent::Connected(mut connection) => {
+                if self.model.connection == crate::view_model::ConnectionState::Connected {
+                    self.presentation.suspend_viewer(&self.model, self.workspace.active());
+                }
                 self.peer_generation = self.peer_generation.wrapping_add(1).max(1);
                 self.model.peer_connected();
                 self.settings.reset_transport();
@@ -85,15 +89,13 @@ impl App {
             return;
         }
         if let Some(authoritative) = self.model.settings_snapshot.as_ref() {
+            let route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
-            self.workspace
-                .rebase(authoritative.settingsstate.currentview, &self.model);
-            self.model
-                .set_foreground_feature(authoritative.settingsstate.currentview);
+            self.rebase_page(route);
         }
         self.workspace.bootstrap_components(&self.model);
         self.reconcile_explore_viewport();
-        self.reconcile_presentation(None, true);
+        self.reconcile_presentation(true);
     }
 
     pub(super) fn reduce_reply(&mut self, reply: IntentReply) {
@@ -124,7 +126,7 @@ impl App {
         }) && decoded.is_ok();
         let (filter_admission_revision, filter_failed) =
             Self::classify_explore_reply(context, &decoded);
-        let mut refresh = self.model.reduce_reply(reply.correlation, decoded);
+        let _ = self.model.reduce_reply(reply.correlation, decoded);
         let installed_settings = self
             .model
             .settings_snapshot
@@ -151,9 +153,8 @@ impl App {
             context,
             settings_mutation_succeeded,
             installed_settings,
-            &mut refresh,
         );
-        self.reconcile_presentation(refresh, false);
+        self.reconcile_presentation(false);
     }
 
     pub(super) fn reduce_event(&mut self, event: SystemEvent) {
@@ -176,7 +177,7 @@ impl App {
         );
         let reconcile_explore = system == crate::generated::ApplicationSystem::Explore;
         let explore_failed = Self::explore_event_failed(&event.event);
-        let refresh = self.model.reduce_event(event.event);
+        let _ = self.model.reduce_event(event.event);
         if failure_snapshot
             .as_ref()
             .is_some_and(|snapshot| self.model.presentation.as_ref() == Some(snapshot))
@@ -195,11 +196,7 @@ impl App {
         if settings_installed && let Some(authoritative) = self.model.settings_snapshot.as_ref() {
             let authoritative_route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
-            if self.workspace.active() != authoritative_route {
-                self.presentation.retire_frame();
-            }
-            self.workspace.rebase(authoritative_route, &self.model);
-            self.model.set_foreground_feature(authoritative_route);
+            self.rebase_page(authoritative_route);
             self.integration.observe_authoritative_route(
                 "settings.event",
                 authoritative_route,
@@ -214,7 +211,7 @@ impl App {
                 self.model.explore_mutation_available(),
             );
         }
-        self.reconcile_presentation(refresh, false);
+        self.reconcile_presentation(false);
     }
 
     pub(super) fn submit_intent(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string_view>
 #include "src/common/types/strong_id.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -66,6 +67,10 @@ struct DiagnosticContext final {
     std::uint64_t frame_revision = 0U;
     std::uint64_t condition = 0U;
     std::uint64_t outcome = 0U;
+    std::uint64_t observation_revision = 0U;
+    std::string_view document_resource{};
+    std::uint64_t document_revision = 0U;
+    std::uint64_t document_meaning_identity = 0U;
     DiagnosticSource source{};
     DiagnosticDemand demand{};
     DiagnosticPublication publication{};

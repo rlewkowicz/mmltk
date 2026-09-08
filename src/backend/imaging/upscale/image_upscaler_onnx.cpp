@@ -23,10 +23,11 @@ module;
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/image_failure.h"
+#include "upscale_execution.h"
 
 module mmltk.backend.imaging.upscale.image_upscaler;
 
-import mmltk.backend.ml.cuda.gpu_quiescence;
 
 import mmltk.common.logging.mmltk_logging;
 
@@ -59,21 +60,33 @@ void validate_shape(const std::vector<std::int64_t>& actual, const std::array<st
 class OnnxImageUpscalerRuntime final
     : public TiledImageUpscalerRuntimeAdapter<OnnxImageUpscalerRuntime, ImageUpscalerBackend::OnnxRuntime> {
    public:
-    OnnxImageUpscalerRuntime(const ImageUpscalerDescriptor& descriptor, const std::filesystem::path& model_path, const int device_id)
-        : TiledImageUpscalerRuntimeAdapter(descriptor, device_id),
+    [[nodiscard]] bool graph_replay() const noexcept override { return graph_enabled_ && inference_runs_ >= 3U; }
+    OnnxImageUpscalerRuntime(const ImageUpscalerDescriptor& descriptor, const std::filesystem::path& model_path, const int device_id,
+                             const ImageUpscalerExecutionCheckpoint& checkpoint)
+        : TiledImageUpscalerRuntimeAdapter(descriptor, device_id, checkpoint),
           model_path_(model_path),
           input_elements_(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U)),
-          output_elements_(checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U)) {
+          output_elements_(checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U)) {}
+
+    ImageUpscalerOutcome ActivateBackend(ImageUpscalerCurrent current) {
+        if (!current()) return ImageUpscalerOutcome::Cancelled;
+        const auto& descriptor = this->descriptor();
+        const auto device_id = this->device_id();
         bool diagnostics_enabled = false;
         mmltk::common::logging::trace([&](auto&) { diagnostics_enabled = true; });
         std::size_t free_before = 0U;
         std::size_t total_before = 0U;
         if (diagnostics_enabled) { (void)cudaMemGetInfo(&free_before, &total_before); }
-        try {
             ensure_cuda_ok(cudaSetDevice(device_id), "cudaSetDevice for ONNX Image upscaler");
             ensure_cuda_ok(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "cudaStreamCreate for ONNX Image upscaler");
+            Checkpoint(ImageUpscalerExecutionStage::StreamCreated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             ensure_cuda_ok(cudaEventCreateWithFlags(&source_ready_, cudaEventDisableTiming), "cudaEventCreate for ONNX upscaler source");
+            Checkpoint(ImageUpscalerExecutionStage::EventCreated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             ensure_cuda_ok(cudaEventCreateWithFlags(&completion_, cudaEventDisableTiming), "cudaEventCreate for ONNX upscaler completion");
+            Checkpoint(ImageUpscalerExecutionStage::EventCreated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
 
             const char* reference = std::getenv("MMLTK_UPSCALE_ONNX_REFERENCE");
             const bool reference_run = reference != nullptr && std::string_view(reference) == "1";
@@ -90,19 +103,29 @@ class OnnxImageUpscalerRuntime final
                     logger.trace("event=image_upscaler_onnx_graph_unavailable device={} model={} detail={}", device_id, descriptor.label,
                                  error.what());
                 });
+                if (!current()) return ImageUpscalerOutcome::Cancelled;
                 create_session(false);
             }
             if (!reference_run) run_options_.AddConfigEntry("disable_synchronize_execution_providers", "1");
             validate_model();
+            Checkpoint(ImageUpscalerExecutionStage::ContextCreated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
 
             input_.ensure(input_elements_, "cudaMalloc for ONNX upscaler FP32 input");
+            Checkpoint(ImageUpscalerExecutionStage::BuffersAllocated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             output_.ensure(output_elements_, "cudaMalloc for ONNX upscaler output");
+            Checkpoint(ImageUpscalerExecutionStage::BuffersAllocated);
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             device_memory_ = std::make_unique<Ort::MemoryInfo>("Cuda", OrtArenaAllocator, device_id, OrtMemTypeDefault);
             input_value_ = std::make_unique<Ort::Value>(
                 Ort::Value::CreateTensor<float>(*device_memory_, input_.data(), input_elements_, kInputShape.data(), kInputShape.size()));
             output_value_ = std::make_unique<Ort::Value>(Ort::Value::CreateTensor<float>(*device_memory_, output_.data(), output_elements_,
                                                                                          kOutputShape.data(), kOutputShape.size()));
             bind_tensors();
+            // All activation-owned objects are installed. Withdrawal here is
+            // handled by the resident execution path, not partial cleanup.
+            Checkpoint(ImageUpscalerExecutionStage::BindingsReady);
             mmltk::common::logging::trace([&](auto& logger) {
                 std::size_t free_after = 0U;
                 std::size_t total_after = 0U;
@@ -117,13 +140,14 @@ class OnnxImageUpscalerRuntime final
                     reinterpret_cast<std::uintptr_t>(output_.data()), graph_enabled_, free_before, free_after,
                     total_after != 0U ? total_after : total_before, free_before > free_after ? free_before - free_after : 0U);
             });
-        } catch (...) {
-            release();
-            throw;
-        }
+        return ImageUpscalerOutcome::Completed;
     }
 
-    ~OnnxImageUpscalerRuntime() override { release(); }
+    ~OnnxImageUpscalerRuntime() override {
+        if (stream_ != nullptr || source_ready_ != nullptr || completion_ != nullptr || abandoned_capture_ != nullptr
+            || session_ || binding_ || input_value_ || output_value_ || device_memory_)
+            std::terminate();
+    }
 
    private:
     friend class TiledImageUpscalerRuntimeAdapter<OnnxImageUpscalerRuntime, ImageUpscalerBackend::OnnxRuntime>;
@@ -192,44 +216,35 @@ class OnnxImageUpscalerRuntime final
     }
 
     [[nodiscard]] cudaError_t settle_stream() noexcept {
-        if (stream_ == nullptr) return cudaSuccess;
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        auto status = cudaStreamIsCapturing(stream_, &capture);
-        if (status != cudaSuccess) return status;
-        if (capture != cudaStreamCaptureStatusNone) {
-            // ORT's graph manager does not abort a capture left by a failed Run.
-            // CUDA requires EndCapture even for an invalidated sequence before
-            // this same stream may be synchronized, reused, or retired.
-            status = cudaStreamEndCapture(stream_, &abandoned_capture_);
-            if (status != cudaSuccess && status != cudaErrorStreamCaptureInvalidated) return status;
-            status = cudaStreamIsCapturing(stream_, &capture);
-            if (status != cudaSuccess) return status;
-            if (capture != cudaStreamCaptureStatusNone) return cudaErrorStreamCaptureInvalidated;
-        }
-        status = cudaStreamSynchronize(stream_);
-        if (status != cudaSuccess) return status;
-        if (abandoned_capture_ != nullptr) {
-            status = cudaGraphDestroy(abandoned_capture_);
-            if (status != cudaSuccess) return status;
-            abandoned_capture_ = nullptr;
-        }
-        return cudaSuccess;
+        return settle_upscaler_stream(stream_, abandoned_capture_);
+    }
+    [[nodiscard]] cudaError_t SettleBackend() noexcept {
+        cleanup_.Record(settle_stream(), "settle ONNX provider stream");
+        return cleanup_.status();
     }
 
-    void run_tile() {
+    ImageUpscalerOutcome run_tile(ImageUpscalerCurrent current) {
+        if (!current()) return ImageUpscalerOutcome::Cancelled;
         try {
             session_->Run(run_options_, *binding_);
+            Checkpoint(ImageUpscalerExecutionStage::WarmSubmitted);
         } catch (const Ort::Exception& error) {
             if (!graph_enabled_ || inference_submitted_ || !first_capture_rejected(error.what())) throw;
             ensure_cuda_ok(settle_stream(), "settle rejected ONNX CUDA graph capture");
+            if (abandoned_capture_ != nullptr) {
+                ensure_cuda_ok(cudaGraphDestroy(abandoned_capture_), "destroy rejected ONNX CUDA graph");
+                abandoned_capture_ = nullptr;
+            }
             // Only provider-owned state is replaced. The stream, input/output
             // allocations, OrtValues and current tile remain unchanged.
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             binding_.reset();
             session_.reset();
             graph_enabled_ = false;
             create_session(false);
             validate_model();
             bind_tensors();
+            if (!current()) return ImageUpscalerOutcome::Cancelled;
             mmltk::common::logging::trace([&](auto& logger) {
                 logger.trace("event=image_upscaler_onnx_first_capture_fallback device={} model={} detail={}", device_id(),
                              descriptor().label, error.what());
@@ -238,6 +253,8 @@ class OnnxImageUpscalerRuntime final
             session_->Run(run_options_, *binding_);
         }
         inference_submitted_ = true;
+        if (inference_runs_ < 3U) ++inference_runs_;
+        return ImageUpscalerOutcome::Completed;
     }
 
     struct CompletionTiming final {
@@ -261,34 +278,38 @@ class OnnxImageUpscalerRuntime final
         timing.pending.store(false, std::memory_order_release);
     }
 
-    void release() noexcept { static_cast<void>(ReleaseBackend()); }
-
     [[nodiscard]] cudaError_t ReleaseBackend() noexcept {
-        cudaError_t failure = settle_stream();
-        if (failure == cudaSuccess) failure = input_.Release();
-        if (failure == cudaSuccess) failure = output_.Release();
-        if (failure != cudaSuccess) return failure;
+        // Session/provider, binding and buffers all remain owned if stream
+        // settlement fails; no destructor may race the provider's work.
+        if (!cleanup_.Record(settle_stream(), "settle ONNX provider stream")) return cleanup_.status();
+        if (abandoned_capture_ != nullptr &&
+            cleanup_.Record(cudaGraphDestroy(abandoned_capture_), "destroy abandoned ONNX capture"))
+            abandoned_capture_ = nullptr;
+        if (abandoned_capture_ == nullptr) {
         binding_.reset();
         output_value_.reset();
         input_value_.reset();
         device_memory_.reset();
         session_.reset();
+        CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::ContextReleased);
+        static_cast<void>(input_.Release(&cleanup_));
+        CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::BufferReleased);
+        static_cast<void>(output_.Release(&cleanup_));
+        CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::BufferReleased);
+        }
         if (completion_ != nullptr) {
-            failure = cudaEventDestroy(completion_);
-            if (failure != cudaSuccess) return failure;
-            completion_ = nullptr;
+            if (cleanup_.Record(cudaEventDestroy(completion_), "destroy ONNX completion")) completion_ = nullptr;
+            CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::EventDestroyed);
         }
         if (source_ready_ != nullptr) {
-            failure = cudaEventDestroy(source_ready_);
-            if (failure != cudaSuccess) return failure;
-            source_ready_ = nullptr;
+            if (cleanup_.Record(cudaEventDestroy(source_ready_), "destroy ONNX source fence")) source_ready_ = nullptr;
+            CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::EventDestroyed);
         }
         if (stream_ != nullptr) {
-            failure = cudaStreamDestroy(stream_);
-            if (failure != cudaSuccess) return failure;
-            stream_ = nullptr;
+            if (cleanup_.Record(cudaStreamDestroy(stream_), "destroy ONNX stream")) stream_ = nullptr;
+            CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::StreamDestroyed);
         }
-        return cudaSuccess;
+        return cleanup_.status();
     }
 
     void validate_model() const {
@@ -319,11 +340,12 @@ class OnnxImageUpscalerRuntime final
 
     [[nodiscard]] bool submit_tiles(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream,
                                     const std::uint32_t restored_width, const std::uint32_t restored_height) {
+        if (!request.current()) return false;
         ensure_cuda_ok(cudaEventRecord(source_ready_, consumer_stream), "cudaEventRecord for ONNX upscaler source");
         ensure_cuda_ok(cudaStreamWaitEvent(stream_, source_ready_, 0U), "cudaStreamWaitEvent for ONNX upscaler source");
-        if (!submit_tiles_after_source(request, restored_width, restored_height)) { return false; }
+        const bool completed = submit_tiles_after_source(request, restored_width, restored_height);
         ensure_cuda_ok(cudaStreamWaitEvent(consumer_stream, completion_, 0U), "cudaStreamWaitEvent for ONNX upscaler completion");
-        return true;
+        return completed;
     }
 
     [[nodiscard]] bool submit_tiles_after_source(const ImageUpscalerRequest& request, const std::uint32_t restored_width,
@@ -341,13 +363,28 @@ class OnnxImageUpscalerRuntime final
         const std::uint32_t core_extent = kImageUpscalerInputExtent - descriptor().halo * 2U;
         for (std::uint32_t y = 0U; y < request.crop_height; y += core_extent) {
             for (std::uint32_t x = 0U; x < request.crop_width; x += core_extent) {
+                if (!request.current()) {
+                    if (timed) timing_.pending.store(false, std::memory_order_release);
+                    ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX tiles");
+                    return false;
+                }
                 const image_upscaler_cuda::Tile tile = image_upscaler_cuda::prepare_request_tile(
                     request, x, y, core_extent, descriptor().kind, descriptor().halo, input_.data(), stream_);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch ONNX upscaler tile preparation");
+                Checkpoint(ImageUpscalerExecutionStage::TilePrepared);
+                if (!request.current()) {
+                    if (timed) timing_.pending.store(false, std::memory_order_release);
+                    ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX preparation");
+                    return false;
+                }
                 // The fixed tensors and all preparation/stitching use this owned
                 // stream. ORT replays its captured tile only after the new input
                 // is ready; no tensor is resized or rebound during its lifetime.
-                run_tile();
+                if (run_tile(request.current) == ImageUpscalerOutcome::Cancelled || !request.current()) {
+                    if (timed) timing_.pending.store(false, std::memory_order_release);
+                    ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX inference");
+                    return false;
+                }
                 image_upscaler_cuda::stitch_request_tile(output_.data(), tile, descriptor().kind, descriptor().halo, restored_pixels(),
                                                          restored_width, restored_height, stream_);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch ONNX upscaler tile composition");
@@ -375,6 +412,7 @@ class OnnxImageUpscalerRuntime final
     }
 
     std::filesystem::path model_path_;
+    UpscalerCleanup cleanup_;
     std::size_t input_elements_ = 0U;
     std::size_t output_elements_ = 0U;
     cudaStream_t stream_ = nullptr;
@@ -386,6 +424,7 @@ class OnnxImageUpscalerRuntime final
     Ort::RunOptions run_options_;
     bool graph_enabled_ = false;
     bool inference_submitted_ = false;
+    std::uint32_t inference_runs_ = 0U;
     std::unique_ptr<Ort::Session> session_;
     std::unique_ptr<Ort::MemoryInfo> device_memory_;
     std::unique_ptr<Ort::Value> input_value_;
@@ -396,10 +435,10 @@ class OnnxImageUpscalerRuntime final
 }  // namespace
 
 std::shared_ptr<ImageUpscalerRuntime> make_onnx_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-                                                                 const std::filesystem::path& model_path, const int device_id) {
+    const std::filesystem::path& model_path, const int device_id, const ImageUpscalerExecutionCheckpoint& checkpoint) {
     // The environment must precede every ORT object, including member RunOptions.
     static_cast<void>(upscaler_ort_environment());
-    return std::make_shared<OnnxImageUpscalerRuntime>(descriptor, model_path, device_id);
+    return std::make_shared<OnnxImageUpscalerRuntime>(descriptor, model_path, device_id, checkpoint);
 }
 
 }  // namespace mmltk::backend::imaging::upscale

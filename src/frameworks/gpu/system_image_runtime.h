@@ -73,16 +73,19 @@ class SystemImageRuntime final {
     [[nodiscard]] ImageProductPool::Availability ObserveOutputAvailability() const;
     [[nodiscard]] ImageProductPool::Facts OutputFacts() const;
     [[nodiscard]] ImageStorageFootprint OutputStorageFootprint() const;
-    [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {});
+    [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {},
+                                               ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
     void SelectOutput(const CompletedOutput&);
     void SetOutputAvailableSink(std::function<void()>);
     [[nodiscard]] BorrowedImageProductReadView BorrowInput() const;
+    void PublishInput(std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] SystemImageModel* model() noexcept;
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(BorrowedImageProductReadView);
-    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyInputFrom(BorrowedImageProductReadView, ImageProductBuffer::MissingPlaneSubmit = {});
+    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyInputFrom(BorrowedImageProductReadView, ImageProductBuffer::MissingPlaneSubmit = {},
+                                                            bool preserve_clean = false);
     void Publish(std::uint32_t width, std::uint32_t height, ImageProductBuffer::ProductSubmit);
 
    private:

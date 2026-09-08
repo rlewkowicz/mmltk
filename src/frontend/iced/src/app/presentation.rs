@@ -15,6 +15,21 @@ pub(super) struct Controller {
     pending: Option<Surface>,
     retained: Option<Surface>,
     failed: bool,
+    viewer: Option<(u64, u32)>,
+    viewer_method: Option<crate::generated::UpscaleKernel>,
+    suspended: Option<SuspendedViewer>,
+    pub(super) stop_requested: bool,
+}
+
+struct SuspendedViewer {
+    route: FeatureId,
+    request: Option<crate::generated::UpscaleRequest>,
+}
+
+enum ViewerOutcome {
+    Opened(crate::generated::UpscaleRequest),
+    Replaced(crate::generated::UpscaleRequest),
+    Abandoned,
 }
 
 struct Update {
@@ -24,6 +39,77 @@ struct Update {
 }
 
 impl Controller {
+    pub(super) fn suspend_viewer(&mut self, model: &ApplicationModel, route: FeatureId) {
+        self.stop_requested |= model.has_pending(ApplicationIntentEndpoint::UpscaleStop);
+        if self.suspended.is_none() {
+            self.suspended = Some(SuspendedViewer { route, request: model.explore.requested_upscale.clone() });
+        }
+    }
+
+    fn abandon_viewer(&mut self) -> Option<ViewerOutcome> {
+        self.viewer_method = None;
+        self.suspended = None;
+        self.viewer.take().map(|_| ViewerOutcome::Abandoned)
+    }
+
+    fn reconcile_viewer(&mut self, model: &ApplicationModel, route: FeatureId) -> Option<ViewerOutcome> {
+        if model.connection != crate::view_model::ConnectionState::Connected {
+            return None;
+        }
+        let source = model.explore.snapshot.as_ref().filter(|snapshot|
+            route == FeatureId::Explore
+                && snapshot.mode == crate::generated::ExploreMode::Detail
+                && !model.explore.desired_close
+                && model.explore.desired_navigation.is_none()
+                && !model.has_pending(ApplicationIntentEndpoint::ExploreCloseDetail)
+                && !model.has_pending(ApplicationIntentEndpoint::ExploreNavigate)
+                && snapshot.selectedimage.is_some()
+                && model.explore.requested_selection.is_none_or(|image| snapshot.selectedimage == Some(image))
+        );
+        let identity = source.and_then(|snapshot| snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image)));
+        if let Some(suspended) = self.suspended.take() {
+            let matching = suspended.route == route && identity == self.viewer
+                && suspended.request.as_ref().is_some_and(|request|
+                    source.is_some_and(|snapshot| snapshot.frame == request.source && snapshot.document == request.document));
+            if matching {
+                return suspended.request.map(ViewerOutcome::Opened);
+            }
+            if self.viewer.is_some() {
+                let abandoned = self.abandon_viewer();
+                if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
+                    self.viewer = identity;
+                    self.viewer_method = Some(crate::generated::UpscaleKernel::Default);
+                    return Some(ViewerOutcome::Replaced(crate::generated::UpscaleRequest {
+                        source: snapshot.frame.clone(), document: snapshot.document.clone(),
+                        kernel: crate::generated::UpscaleKernel::Default,
+                    }));
+                }
+                return abandoned;
+            }
+        }
+        if identity == self.viewer {
+            if let Some(request) = model.explore.requested_upscale.as_ref() {
+                self.viewer_method = Some(request.kernel);
+            }
+            return None;
+        }
+        if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
+            let replacing = self.viewer.is_some();
+            self.viewer = identity;
+            self.viewer_method = Some(crate::generated::UpscaleKernel::Default);
+            let request = crate::generated::UpscaleRequest {
+                source: snapshot.frame.clone(),
+                kernel: crate::generated::UpscaleKernel::Default,
+                document: snapshot.document.clone(),
+            };
+            return Some(if replacing { ViewerOutcome::Replaced(request) } else { ViewerOutcome::Opened(request) });
+        }
+        if identity != self.viewer {
+            return self.abandon_viewer();
+        }
+        None
+    }
+
     pub(super) fn surface(&self) -> Option<Surface> {
         if let Some(pending) = self.pending {
             return Some(pending);
@@ -120,6 +206,47 @@ impl Drop for Controller {
 }
 
 impl App {
+    pub(super) fn abandon_viewer(&mut self) {
+        let outcome = self.presentation.abandon_viewer()
+            .or_else(|| self.model.explore.requested_upscale.is_some().then_some(ViewerOutcome::Abandoned));
+        self.finish_viewer_departure(outcome.is_some());
+    }
+
+    fn finish_viewer_departure(&mut self, stop: bool) {
+        self.model.abandon_viewer();
+        self.model.set_foreground_visual(Some(PresentationSourceKind::Explore));
+        self.presentation.retire_frame();
+        self.presentation.stop_requested |= stop;
+        self.dispatch_viewer_desired();
+    }
+
+    pub(super) fn rebase_page(&mut self, feature: FeatureId) {
+        let prior = self.presentation.suspended.as_ref().map_or(self.workspace.active(), |suspended| suspended.route);
+        if prior != feature {
+            self.abandon_viewer();
+        }
+        self.model.set_foreground_feature(feature);
+        self.workspace.rebase(feature, &self.model);
+    }
+
+    pub(super) fn reconcile_viewer(&mut self) {
+        let outcome = self.presentation.reconcile_viewer(&self.model, self.workspace.active());
+        self.on_viewer(outcome);
+    }
+
+    fn on_viewer(&mut self, outcome: Option<ViewerOutcome>) {
+        match outcome {
+            Some(ViewerOutcome::Opened(request)) => self.model.request_upscale(request),
+            Some(ViewerOutcome::Replaced(request)) => {
+                self.finish_viewer_departure(true);
+                self.model.request_upscale(request);
+            }
+            Some(ViewerOutcome::Abandoned) => {
+                self.finish_viewer_departure(true);
+            }
+            None => {}
+        }
+    }
     pub(super) fn on_presentation(&mut self, message: Message) -> Task<crate::message::Message> {
         let update = self.presentation.update(message, &self.model);
         if let Some((frame, surface)) = update.native {
@@ -165,7 +292,10 @@ impl App {
     }
 
     pub(super) fn transition_page(&mut self, feature: FeatureId) -> Task<crate::message::Message> {
-        self.presentation.retire_frame();
+        if self.workspace.active() == feature {
+            return Task::none();
+        }
+        self.abandon_viewer();
         self.workspace.select(feature);
         self.model.set_foreground_feature(feature);
         if let Some(frame) = self.model.presentation_refresh() {
@@ -233,7 +363,9 @@ impl App {
         self.reconcile_surface_frame();
     }
 
-    pub(super) fn reconcile_presentation(&mut self, refresh: Option<VisualFrame>, recovery: bool) {
+    pub(super) fn reconcile_presentation(&mut self, recovery: bool) {
+        self.reconcile_viewer();
+        self.dispatch_viewer_desired();
         if let Err(error) = self.model.completed_presentation_is_obsolete() {
             self.retire_peer(error);
             return;
@@ -254,7 +386,7 @@ impl App {
                 })
             })
         } else {
-            refresh
+            self.model.presentation_refresh()
         };
         if let Some(frame) = refresh {
             self.select_presentation(frame);
@@ -489,6 +621,234 @@ mod tests {
     use crate::generated::{ExploreMode, PresentationSourceKind};
     use crate::presentation_surface::{record_drawn_detail, reset_test_releases, test_releases};
 
+    #[test]
+    fn full_bootstrap_restores_only_the_exact_suspended_viewer() {
+        use crate::generated::{ApplicationSnapshot, UpscaleKernel};
+        for changed in 0..4 {
+            let (mut app, _) = viewer_app();
+            app.reconcile_viewer();
+            let mut request = app.model.explore.requested_upscale.clone().unwrap();
+            request.kernel = UpscaleKernel::RealPlksr;
+            app.model.request_upscale(request.clone());
+            app.reconcile_viewer();
+            let mut explore = app.model.explore.snapshot.clone().unwrap();
+            let mut settings = app.model.settings_snapshot.clone().unwrap();
+            let presentation = app.model.presentation.clone().unwrap();
+            settings.settingsstate.currentview = if changed == 3 { FeatureId::Train } else { FeatureId::Explore };
+            if changed == 1 {
+                explore.frame.revision += 1;
+                explore.frame.cleanrevision += 1;
+                explore.revision += 1;
+            } else if changed == 2 {
+                explore.document.meaningidentity += 1;
+                explore.revision += 1;
+            }
+            let snapshots = crate::generated::application_snapshot_defaults().unwrap().into_iter()
+                .map(|fact| match fact.value {
+                    ApplicationSnapshot::Explore(_) => ApplicationSnapshot::Explore(explore.clone()),
+                    ApplicationSnapshot::Settings(_) => ApplicationSnapshot::Settings(settings.clone()),
+                    ApplicationSnapshot::Presentation(_) => ApplicationSnapshot::Presentation(presentation.clone()),
+                    other => other,
+                }).collect();
+            app.retire_peer(UiError::transport("bootstrap identity test"));
+            let (sender, mut receiver) = futures_channel::mpsc::channel(64);
+            drop(app.on_transport(TransportEvent::Connected(Connection::new(sender))));
+            drop(app.on_transport(TransportEvent::Bootstrap(Bootstrap {
+                schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT, snapshots,
+            })));
+            let mut stops = 0;
+            let mut starts = 0;
+            while let Ok(record) = receiver.try_recv() {
+                if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
+                    if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop) {
+                        stops += 1;
+                    } else if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStart) {
+                        starts += 1;
+                    }
+                }
+            }
+            assert_eq!(stops, usize::from(changed != 0));
+            assert_eq!(starts, usize::from(changed != 3));
+            if changed == 3 {
+                assert!(app.presentation.viewer.is_none());
+                assert!(app.model.explore.requested_upscale.is_none());
+            } else {
+                let restored = app.model.explore.requested_upscale.as_ref().unwrap();
+                assert_eq!(restored.kernel, if changed == 0 { UpscaleKernel::RealPlksr } else { UpscaleKernel::Default });
+                assert_eq!(restored.source, explore.frame);
+                assert_eq!(restored.document, explore.document);
+                assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(restored));
+            }
+        }
+    }
+
+    #[test]
+    fn direct_viewer_replacement_uses_one_abandonment_before_basic_dispatch() {
+        let (mut app, _) = viewer_app();
+        app.reconcile_viewer();
+        let mut request = app.model.explore.requested_upscale.clone().unwrap();
+        request.kernel = crate::generated::UpscaleKernel::RealPlksr;
+        app.model.request_upscale(request);
+        app.reconcile_viewer();
+        let snapshot = app.model.explore.snapshot.as_mut().unwrap();
+        snapshot.selectedimage = Some(1);
+        snapshot.revision += 1;
+        snapshot.frame.revision += 1;
+        snapshot.frame.cleanrevision += 1;
+        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+        app.connection = Some(Connection::new(sender));
+        app.reconcile_presentation(false);
+        app.reconcile_presentation(false);
+        let requested = app.model.explore.requested_upscale.as_ref().unwrap();
+        assert_eq!(requested.kernel, crate::generated::UpscaleKernel::Default);
+        assert_eq!(app.presentation.viewer.unwrap().1, 1);
+        let mut operations = Vec::new();
+        while let Ok(record) = receiver.try_recv() {
+            if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
+                for endpoint in [ApplicationIntentEndpoint::UpscaleStop, ApplicationIntentEndpoint::UpscaleStart] {
+                    if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(endpoint) {
+                        operations.push(endpoint);
+                    }
+                }
+            }
+        }
+        assert_eq!(operations, vec![ApplicationIntentEndpoint::UpscaleStop, ApplicationIntentEndpoint::UpscaleStart]);
+    }
+
+    #[test]
+    fn viewer_owner_auto_runs_basic_once_and_abandons_only_on_departure() {
+        let (mut app, _) = viewer_app();
+        app.reconcile_viewer();
+        let request = app.model.explore.requested_upscale.clone().unwrap();
+        assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
+        app.model.request_upscale(crate::generated::UpscaleRequest {
+            kernel: crate::generated::UpscaleKernel::RealPlksr,
+            ..request.clone()
+        });
+        app.reconcile_viewer();
+        assert_eq!(app.model.explore.requested_upscale.as_ref().unwrap().kernel,
+            crate::generated::UpscaleKernel::RealPlksr);
+        assert!(matches!(app.presentation.reconcile_viewer(&app.model, FeatureId::Train),
+            Some(ViewerOutcome::Abandoned)));
+        assert!(app.presentation.reconcile_viewer(&app.model, FeatureId::Train).is_none());
+        assert!(matches!(app.presentation.reconcile_viewer(&app.model, FeatureId::Explore),
+            Some(ViewerOutcome::Opened(crate::generated::UpscaleRequest {
+                kernel: crate::generated::UpscaleKernel::Default, ..
+            }))));
+    }
+
+    #[test]
+    fn same_route_settings_and_same_image_updates_preserve_method_in_both_orders() {
+        for settings_first in [false, true] {
+            let (mut app, _) = viewer_app();
+            app.reconcile_viewer();
+            let source = app.model.explore.snapshot.as_ref().unwrap().frame.clone();
+            app.model.request_upscale(crate::generated::UpscaleRequest {
+                source, kernel: crate::generated::UpscaleKernel::ShiftLut,
+                document: app.model.explore.snapshot.as_ref().unwrap().document.clone(),
+            });
+            app.model.explore.sent_upscale = app.model.explore.requested_upscale.clone();
+            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+            app.connection = Some(Connection::new(sender));
+            app.model.settings_snapshot.as_mut().unwrap().settingsstate.currentview = FeatureId::Explore;
+            let mut revised = app.model.explore.snapshot.clone().unwrap();
+            revised.revision += 1;
+            revised.frame.revision += 1;
+            revised.frame.cleanrevision += 1;
+            let revised_frame = revised.frame.clone();
+            for settings in [settings_first, !settings_first] {
+                if settings {
+                    app.settle_settings_reply(None, true, true);
+                    app.reconcile_presentation(false);
+                } else {
+                    app.reduce_event(SystemEvent {
+                        delivery: crate::generated::EventDelivery::LatestState,
+                        event: crate::generated::ApplicationEvent::ExploreExploreChanged(
+                            crate::generated::ExploreChanged { snapshot: revised.clone() }),
+                    });
+                }
+            }
+            let requested = app.model.explore.requested_upscale.clone().unwrap();
+            assert_eq!(requested.kernel, crate::generated::UpscaleKernel::ShiftLut);
+            assert_eq!(requested.source, revised_frame);
+            assert_eq!(app.presentation.viewer, Some((revised.dataset.identity, 0)));
+            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
+            let mut dispatched = false;
+            while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) = receiver.try_recv() {
+                if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStart) {
+                    assert_eq!(intent, crate::generated::encode_upscale_Start(intent.correlation, requested.clone()).record);
+                    dispatched = true;
+                } else if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::PresentationSelect) {
+                    let admitted = app.model.presentation.clone().unwrap();
+                    app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::PresentationSelect(admitted)));
+                }
+            }
+            assert!(dispatched);
+            let mut completed = app.model.upscale_snapshot.clone().unwrap();
+            completed.revision += 1;
+            completed.ready = true;
+            completed.busy = false;
+            completed.pending = None;
+            completed.kernel = requested.kernel;
+            completed.input = requested.source.clone();
+            completed.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Upscale, 19);
+            completed.frame.extent.width = requested.source.extent.width * 4;
+            completed.frame.extent.height = requested.source.extent.height * 4;
+            completed.methods[1].available = true;
+            completed.methods[1].completed = Some(requested);
+            completed.methods[1].frame = completed.frame.clone();
+            app.reduce_event(SystemEvent {
+                delivery: crate::generated::EventDelivery::LatestState,
+                event: crate::generated::ApplicationEvent::UpscaleUpscaleChanged(
+                    crate::generated::UpscaleChanged { snapshot: completed.clone() }),
+            });
+            let mut presentation = app.model.presentation.clone().unwrap();
+            presentation.revision += 1;
+            presentation.presentationrevision += 1;
+            presentation.selected = completed.frame.source.clone();
+            presentation.completed = completed.frame.clone();
+            presentation.completedsourcerevision = completed.revision;
+            presentation.capability.generation += 1;
+            presentation.capability.extent = completed.frame.extent.clone();
+            app.reduce_event(SystemEvent {
+                delivery: crate::generated::EventDelivery::LatestState,
+                event: crate::generated::ApplicationEvent::PresentationPresentationCompleted(
+                    crate::generated::PresentationCompleted { snapshot: presentation }),
+            });
+            assert_eq!(app.model.viewed_explore_frame(), Some(completed.frame));
+        }
+    }
+
+    #[test]
+    fn authoritative_reset_and_failed_route_edit_abandon_and_reenter_the_same_image() {
+        for reset in [false, true] {
+            let (mut app, _) = viewer_app();
+            app.reconcile_viewer();
+            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+            app.connection = Some(Connection::new(sender));
+            app.model.settings_snapshot.as_mut().unwrap().settingsstate.currentview = FeatureId::Train;
+            app.settle_settings_reply(
+                Some(if reset { ApplicationIntentEndpoint::SettingsReset } else { ApplicationIntentEndpoint::SettingsUpdate }),
+                reset, reset,
+            );
+            assert_eq!(app.workspace.active(), FeatureId::Train);
+            assert!(app.presentation.viewer.is_none());
+            assert!(app.model.explore.requested_upscale.is_none());
+            assert!(app.model.explore.sent_upscale.is_none());
+            assert!(app.model.presentation_refresh().is_none());
+            let mut stopped = false;
+            while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) = receiver.try_recv() {
+                stopped |= intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop);
+            }
+            assert!(stopped);
+            app.rebase_page(FeatureId::Explore);
+            app.reconcile_presentation(false);
+            let request = app.model.explore.requested_upscale.as_ref().unwrap();
+            assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
+            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(request));
+        }
+    }
+
     fn record_draw(app: &App, frame: FrameReady, crop: [u32; 4]) {
         let surface = app.presentation.surface.unwrap();
         assert!(frame.belongs_to(surface));
@@ -634,7 +994,7 @@ mod tests {
                     explore.frame = snapshot.completed.clone();
                     explore.revision = snapshot.completedsourcerevision;
                 }
-                app.reconcile_presentation(None, true);
+                app.reconcile_presentation(true);
                 assert_eq!(app.presentation.pending.is_some(), matching);
                 assert_eq!(test_releases(), if complete_before_disconnect { vec![frame] } else { vec![] });
                 // Matching receiver custody suppresses another Select even
@@ -690,13 +1050,13 @@ mod tests {
                             let explore = app.model.explore.snapshot.as_mut().unwrap();
                             explore.frame.revision = 2;
                             explore.revision = 20;
-                            app.reconcile_presentation(None, false);
+                            app.reconcile_presentation(false);
                         } else if position == control_position {
                             let snapshot = app.model.presentation.as_mut().unwrap();
                             snapshot.completed.revision = 2;
                             snapshot.completedsourcerevision = 20;
                             snapshot.presentationrevision = 6;
-                            app.reconcile_presentation(None, false);
+                            app.reconcile_presentation(false);
                         } else if position == physical_position {
                             app.present_native_frame(next);
                         } else {
@@ -985,7 +1345,11 @@ mod tests {
         app.model.explore.requested_upscale = Some(crate::generated::UpscaleRequest {
             source: input,
             kernel: upscale.kernel,
+            document: explore.document.clone(),
         });
+        upscale.methods[0].available = true;
+        upscale.methods[0].completed = app.model.explore.requested_upscale.clone();
+        upscale.methods[0].frame = upscale.frame.clone();
         app.model
             .set_foreground_visual(Some(PresentationSourceKind::Upscale));
         app.model.presentation.as_mut().unwrap().completed = expected.clone();

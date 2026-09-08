@@ -687,6 +687,40 @@ TEST_CASE("candidate baselines remain exact across cached selection and handle m
     CHECK(foreign_candidate.valid());
 }
 
+TEST_CASE("clean-only candidate preservation excludes invalid semantics and rolls back without disturbing readers") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime{{.device = 0, .backend = backend,
+        .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 4U}};
+    runtime.Publish(8U, 8U, [](auto clean, auto semantic, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x17, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+    });
+    auto baseline = runtime.Completed();
+    auto reader = baseline.Borrow();
+    backend->watched_copy_source.store(reader.plane(1U).plane().data);
+    const auto copied = backend->same_copies.load();
+    {
+        auto candidate = runtime.AcquireOutput({}, baseline, ImagePlanePreservation::Clean);
+        CHECK_THROWS_WITH(runtime.Publish(candidate, 8U, 8U, [](auto, auto semantic, auto) {
+            std::memset(reinterpret_cast<void*>(semantic.data), 0x58, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+            throw std::runtime_error("semantic preparation failed");
+        }), "semantic preparation failed");
+    }
+    CHECK(runtime.Completed().revision() == baseline.revision());
+    CHECK(backend->same_copies.load() == copied + 1U);
+    CHECK(backend->watched_source_copies.load() == 0U);
+    auto candidate = runtime.AcquireOutput({}, baseline, ImagePlanePreservation::Clean);
+    runtime.Publish(candidate, 8U, 8U, [](auto, auto semantic, auto) {
+        std::memset(reinterpret_cast<void*>(semantic.data), 0x68, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+    });
+    auto completed = runtime.CommitOutput(std::move(candidate)).Borrow();
+    CHECK(backend->same_copies.load() == copied + 2U);
+    CHECK(backend->watched_source_copies.load() == 0U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(reader.plane(1U).plane().data) == 0x29U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) == 0x17U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(1U).plane().data) == 0x68U);
+}
+
 TEST_CASE("single-slot candidates expose only committed selection") {
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime runtime{{.device = 0, .backend = backend}};

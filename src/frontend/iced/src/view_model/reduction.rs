@@ -81,6 +81,8 @@ impl ApplicationModel {
             context == ApplicationIntentEndpoint::PresentationSelect && result.is_err();
         match result {
             Err(error) => {
+                let current_failure = context != ApplicationIntentEndpoint::UpscaleStart
+                    || self.explore.requested_upscale == self.explore.sent_upscale;
                 if context == ApplicationIntentEndpoint::UpscaleStart {
                     if self.explore.requested_upscale == self.explore.sent_upscale {
                         self.explore.requested_upscale = None;
@@ -105,7 +107,9 @@ impl ApplicationModel {
                         self.clear_dialog_target_if_matches(target);
                     }
                 }
-                self.error = Some(error.into());
+                if current_failure {
+                    self.error = Some(error.into());
+                }
             }
             Ok(reply) => {
                 if crate::generated::application_reply_endpoint(&reply) != context {
@@ -389,15 +393,18 @@ impl ApplicationModel {
             .snapshot
             .as_ref()
             .is_some_and(|previous| previous.dataset.identity != snapshot.dataset.identity);
+        let same_image = self.explore.snapshot.as_ref().is_some_and(|previous|
+            previous.selectedimage == snapshot.selectedimage);
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
             if let Some(request) = self.explore.requested_upscale.as_mut() {
                 if !dataset_changed
+                    && same_image
                     && snapshot.mode == crate::generated::ExploreMode::Detail
-                    && Self::same_clean_source(&snapshot.frame, &request.source)
                 {
                     request.source = snapshot.frame.clone();
+                    request.document = snapshot.document.clone();
                 } else {
                     self.explore.requested_upscale = None;
                     self.explore.sent_upscale = None;
@@ -406,6 +413,11 @@ impl ApplicationModel {
                     }
                 }
             }
+        }
+        if observation == Observation::Installed && self.explore.requested_upscale.is_some()
+            && self.current_upscale().is_none()
+        {
+            self.set_foreground_visual(Some(PresentationSourceKind::Explore));
         }
         Ok(observation)
     }

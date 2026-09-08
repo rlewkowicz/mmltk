@@ -1,6 +1,7 @@
 #include "src/controller/shell/direct_visual_systems.h"
 
 #include <array>
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -16,7 +17,11 @@ SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(Appli
                                                                            ApplicationSystemStorage::ContinuitySink continuity) {
     return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity))]
         (ExploreSystem::event_type event) noexcept {
-        if (const auto* changed = std::get_if<ExploreChanged>(&event); changed != nullptr && changed->snapshot.ready) upscale.Warm();
+        if (const auto* changed = std::get_if<ExploreChanged>(&event);
+            changed != nullptr && changed->snapshot.ready && !changed->snapshot.busy &&
+            (changed->snapshot.mode != ExploreMode::Gallery ||
+             std::ranges::all_of(changed->snapshot.gallery.slots, [](const bool ready) { return ready; })))
+            upscale.Warm({changed->snapshot.dataset.image_width, changed->snapshot.dataset.image_height});
         publisher(event);
     };
 }

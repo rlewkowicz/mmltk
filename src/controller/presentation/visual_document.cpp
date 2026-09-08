@@ -1,6 +1,7 @@
 #include "src/controller/presentation/visual_document.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
 #include <ranges>
@@ -9,6 +10,14 @@
 #include <utility>
 
 namespace mmltk::controller {
+
+std::uint64_t VisualDocument::NextIdentity() {
+    static std::atomic_uint64_t next{1U};
+    const auto identity = next.fetch_add(1U, std::memory_order_relaxed);
+    if (identity == 0U || identity == std::numeric_limits<std::uint64_t>::max()) std::terminate();
+    return identity;
+}
+
 namespace {
 
 // Inspect canonical field declarations once at compile time. Nonspatial trees

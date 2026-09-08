@@ -1,4 +1,8 @@
 #pragma once
+#include <algorithm>
+#include <cstdint>
+#include "src/backend/imaging/upscale/upscale_execution.h"
+#include "image_upscaler_cuda.h"
 
 namespace mmltk::backend::imaging::upscale::image_upscaler_cuda {
 

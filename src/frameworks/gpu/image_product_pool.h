@@ -67,10 +67,11 @@ class ImageProductPool final {
         [[nodiscard]] std::uint64_t revision() const noexcept;
 
        private:
-        Candidate(std::shared_ptr<Slot>, Product) noexcept;
+        Candidate(std::shared_ptr<Slot>, Product, ImagePlanePreservation) noexcept;
         void Release() noexcept;
         std::shared_ptr<Slot> slot_;
         Product baseline_;
+        ImagePlanePreservation preservation_ = ImagePlanePreservation::All;
         std::uint64_t revision_ = 0U;
         friend class ImageProductPool;
     };
@@ -80,7 +81,9 @@ class ImageProductPool final {
     ImageProductPool& operator=(const ImageProductPool&) = delete;
     // Moving the sole completed handle permits bounded in-place reuse in a
     // one-slot pool. Multi-slot candidates retain their exact baseline.
-    [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {});
+    // Clean preservation requires the publication callback to replace semantics.
+    [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {},
+                                    ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);

@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cstddef>
@@ -28,12 +29,86 @@
 #include "detail/tensorrt_engine_access.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
+#include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/gpu/image_failure.h"
 
 namespace mmltk::backend::ml::runtime {
 
 static_assert(NV_TENSORRT_MAJOR == 11, "mmltk requires TensorRT 11");
 
 namespace {
+
+class EngineErrors final : public nvinfer1::IErrorRecorder {
+   public:
+    explicit EngineErrors(nvinfer1::ILogger& logger) noexcept : logger_(logger) {}
+    int32_t getNbErrors() const noexcept override {
+        std::scoped_lock lock(mutex_);
+        return count_;
+    }
+    nvinfer1::ErrorCode getErrorCode(int32_t index) const noexcept override {
+        std::scoped_lock lock(mutex_);
+        return index >= 0 && index < count_ ? errors_[index] : nvinfer1::ErrorCode::kUNSPECIFIED_ERROR;
+    }
+    ErrorDesc getErrorDesc(int32_t) const noexcept override { return "TensorRT typed engine error"; }
+    bool hasOverflowed() const noexcept override {
+        std::scoped_lock lock(mutex_);
+        return overflow_;
+    }
+    void clear() noexcept override {
+        std::scoped_lock lock(mutex_);
+        count_ = 0;
+        overflow_ = false;
+    }
+    bool reportError(nvinfer1::ErrorCode code, ErrorDesc description) noexcept override {
+        {
+            std::scoped_lock lock(mutex_);
+            if (count_ < static_cast<int32_t>(errors_.size())) errors_[count_++] = code;
+            else overflow_ = true;
+        }
+        logger_.log(nvinfer1::ILogger::Severity::kERROR, description);
+        return code == nvinfer1::ErrorCode::kINTERNAL_ERROR;
+    }
+    RefCount incRefCount() noexcept override { return ++references_; }
+    RefCount decRefCount() noexcept override { return --references_; }
+    void Check(bool succeeded, std::string_view operation, bool cache = false) const {
+        using Code = nvinfer1::ErrorCode;
+        std::scoped_lock lock(mutex_);
+        if (succeeded && count_ == 0 && !overflow_) return;
+        bool integrity = count_ != 0 && !overflow_;
+        bool allocation = false;
+        bool physical = false;
+        std::exception_ptr reported;
+        for (int32_t index = 0; index < count_; ++index) {
+            const auto code = errors_[index];
+            integrity = integrity && (code == Code::kINVALID_ARGUMENT || code == Code::kINVALID_CONFIG);
+            allocation = allocation || code == Code::kFAILED_ALLOCATION;
+            physical = physical || code == Code::kINTERNAL_ERROR;
+            reported = mmltk::frameworks::gpu::combine_image_failures(reported,
+                std::make_exception_ptr(TensorRtOperationError(static_cast<std::int32_t>(code), operation)));
+        }
+        const auto cuda = cudaPeekAtLastError();
+        if (cuda != cudaSuccess) {
+            const mmltk::frameworks::gpu::CudaError failure(cuda, std::string(operation).c_str());
+            if (failure.shared_failure())
+                throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(failure), reported);
+            throw mmltk::frameworks::gpu::ImageFailure(std::make_exception_ptr(failure), reported);
+        }
+        if (physical) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(reported);
+        if (allocation) throw mmltk::frameworks::gpu::ImageFailure(std::make_exception_ptr(
+            mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, std::string(operation).c_str())), reported);
+        if (cache && integrity) throw TensorRtCacheIntegrityError(std::string(operation));
+        if (reported) std::rethrow_exception(reported);
+        throw std::runtime_error(std::string(operation));
+    }
+
+   private:
+    nvinfer1::ILogger& logger_;
+    mutable std::mutex mutex_;
+    std::array<nvinfer1::ErrorCode, 32U> errors_{};
+    int32_t count_ = 0;
+    bool overflow_ = false;
+    std::atomic<RefCount> references_{0};
+};
 
 void destroy_builder(nvinfer1::IBuilder* pointer) noexcept { delete pointer; }
 void destroy_network(nvinfer1::INetworkDefinition* pointer) noexcept { delete pointer; }
@@ -242,6 +317,7 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
         : sink_(std::move(sink)), continue_build_(std::move(continue_build)) {}
 
     void phaseStart(const char* phase_name, const char* parent_phase, const std::int32_t steps) noexcept override {
+        if (!sink_) return;
         try {
             std::lock_guard lock(mutex_);
             const std::string phase = phase_name != nullptr ? phase_name : "<unnamed>";
@@ -272,6 +348,7 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
     }
 
     void phaseFinish(const char* phase_name) noexcept override {
+        if (!sink_) return;
         try {
             std::lock_guard lock(mutex_);
             const std::string phase = phase_name != nullptr ? phase_name : "<unnamed>";
@@ -316,9 +393,11 @@ void configure_tf32(nvinfer1::IBuilderConfig& config, const bool allow_tf32) {
 
 struct TensorRtEngine::Impl {
     explicit Impl(std::filesystem::path path, TensorRtEngineOptions engine_options)
-        : model_path(std::move(path)), options(std::move(engine_options)), logger(options.context, options.log) {
+        : model_path(std::move(path)), options(std::move(engine_options)), logger(options.context, options.log), errors(logger) {
+        if (!admitted()) return;
         const cudaError_t set_device = cudaSetDevice(options.device);
-        if (set_device != cudaSuccess) { throw CudaOperationError{set_device, options.context + " cudaSetDevice"}; }
+        mmltk::frameworks::gpu::ensure_cuda_ok(set_device, (options.context + " cudaSetDevice").c_str());
+        if (!admitted()) return;
         std::string extension = model_path.extension().string();
         std::transform(extension.begin(), extension.end(), extension.begin(),
                        [](const unsigned char character) { return static_cast<char>(std::tolower(character)); });
@@ -330,6 +409,11 @@ struct TensorRtEngine::Impl {
         } else {
             throw std::invalid_argument(options.context + " expects a .engine or .onnx model");
         }
+        options.continue_build = {};
+    }
+    bool admitted() {
+        cancelled = options.continue_build && !options.continue_build();
+        return !cancelled;
     }
 
     void emit(const std::string& message) const {
@@ -337,23 +421,34 @@ struct TensorRtEngine::Impl {
     }
 
     void load_engine(const std::vector<char>& bytes) {
+        if (bytes.empty()) throw TensorRtCacheIntegrityError(options.context + " empty TensorRT engine");
+        if (!admitted()) return;
         runtime.reset(nvinfer1::createInferRuntime(logger));
         if (runtime == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT runtime"); }
+        runtime->setErrorRecorder(&errors);
+        if (!admitted()) return;
         engine.reset(runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
-        if (engine == nullptr) { throw std::runtime_error(options.context + " failed to deserialize TensorRT engine"); }
+        errors.Check(engine != nullptr, options.context + " deserialize TensorRT engine", true);
     }
 
     void build_engine() {
+        if (!admitted()) return;
         logger.set_threshold(nvinfer1::ILogger::Severity::kVERBOSE);
         BuilderOwner builder(nvinfer1::createInferBuilder(logger), destroy_builder);
         if (builder == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT builder"); }
+        builder->setErrorRecorder(&errors);
+        if (!admitted()) return;
         NetworkOwner network(builder->createNetworkV2(0), destroy_network);
+        if (network == nullptr) throw std::runtime_error(options.context + " failed to create TensorRT network");
+        if (!admitted()) return;
         ConfigOwner config(builder->createBuilderConfig(), destroy_config);
-        if (network == nullptr || config == nullptr) {
+        if (config == nullptr) {
             throw std::runtime_error(options.context + " failed to create TensorRT build objects");
         }
+        if (!admitted()) return;
         ParserOwner parser(nvonnxparser::createParser(*network, logger), destroy_parser);
         if (parser == nullptr) { throw std::runtime_error(options.context + " failed to create ONNX parser"); }
+        if (!admitted()) return;
         emit("[trt:build] parsing ONNX " + model_path.string());
         if (!parser->parseFromFile(model_path.string().c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE))) {
             const std::string diagnostics = parser_errors(*parser);
@@ -376,6 +471,7 @@ struct TensorRtEngine::Impl {
                      " dtype=" + tensor_rt_data_type_name(tensor->getType()) + " dims=" + format_dimensions(tensor->getDimensions()));
             }
         }
+        if (!admitted()) return;
         configure_optimization_profiles(*builder, *network, *config, options);
         config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, options.workspace_bytes);
         config->setProfilingVerbosity(profiling_verbosity(options.profiling_verbosity));
@@ -388,16 +484,25 @@ struct TensorRtEngine::Impl {
                  " tf32_permission=" + std::string(options.allow_tf32 ? "allowed" : "disabled"));
         }
         emit("[trt:build] building serialized engine");
+        if (!admitted()) return;
         serialized.reset(builder->buildSerializedNetwork(*network, *config));
+        // Inspect reported failures before cancellation: an OOM/context loss
+        // concurrent with withdrawal is not a successful cancellation.
+        if (errors.getNbErrors() != 0 || errors.hasOverflowed() || cudaPeekAtLastError() != cudaSuccess)
+            errors.Check(false, options.context + " build TensorRT engine");
+        if (!admitted()) return;
         if (serialized == nullptr) { throw std::runtime_error(options.context + " TensorRT buildSerializedNetwork failed"); }
         emit("[trt:build] serialized bytes=" + std::to_string(serialized->size()));
         if (!options.save_engine_path.empty()) {
             write_binary(options.save_engine_path, serialized->data(), serialized->size(), options.context);
         }
+        if (!admitted()) return;
         runtime.reset(nvinfer1::createInferRuntime(logger));
         if (runtime == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT runtime"); }
+        runtime->setErrorRecorder(&errors);
+        if (!admitted()) return;
         engine.reset(runtime->deserializeCudaEngine(serialized->data(), serialized->size()));
-        if (engine == nullptr) { throw std::runtime_error(options.context + " failed to deserialize built engine"); }
+        errors.Check(engine != nullptr, options.context + " deserialize built TensorRT engine");
         emit("[trt:build] engine ready");
         logger.set_threshold(nvinfer1::ILogger::Severity::kWARNING);
     }
@@ -405,10 +510,12 @@ struct TensorRtEngine::Impl {
     std::filesystem::path model_path;
     TensorRtEngineOptions options;
     Logger logger;
+    EngineErrors errors;
     RuntimeOwner runtime{nullptr, destroy_runtime};
     EngineOwner engine{nullptr, destroy_engine};
     HostMemoryOwner serialized{nullptr, destroy_host_memory};
     bool built_from_onnx = false;
+    bool cancelled = false;
 };
 
 TensorRtEngine::TensorRtEngine(const std::filesystem::path& model_path, TensorRtEngineOptions options)
@@ -417,6 +524,7 @@ TensorRtEngine::TensorRtEngine(const std::filesystem::path& model_path, TensorRt
 TensorRtEngine::~TensorRtEngine() = default;
 TensorRtEngine::TensorRtEngine(TensorRtEngine&&) noexcept = default;
 TensorRtEngine& TensorRtEngine::operator=(TensorRtEngine&&) noexcept = default;
+bool TensorRtEngine::cancelled() const noexcept { return impl_->cancelled; }
 
 std::int32_t TensorRtEngine::device() const noexcept { return impl_->options.device; }
 
@@ -427,6 +535,10 @@ const std::filesystem::path& TensorRtEngine::model_path() const noexcept { retur
 bool TensorRtEngine::built_from_onnx() const noexcept { return impl_->built_from_onnx; }
 
 std::uintptr_t TensorRtEngine::native_engine_handle() const noexcept { return reinterpret_cast<std::uintptr_t>(impl_->engine.get()); }
+
+void TensorRtEngine::CheckOperation(const bool succeeded, const std::string_view operation) const {
+    impl_->errors.Check(succeeded, operation);
+}
 
 void TensorRtEngine::Save(const std::filesystem::path& path) const {
     if (impl_->serialized == nullptr) { throw std::runtime_error(impl_->options.context + " has no serialized engine available to save"); }

@@ -39,7 +39,8 @@ class ShellWarmAlgorithm final : public UpscaleAlgorithm {
         if (probe_->fail) throw std::runtime_error("shell warm failure");
         probe_->completed.set_value();
     }
-    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t,
+             const std::function<bool()>&) override {}
 
    private:
     std::shared_ptr<ShellWarmProbe> probe_;
@@ -49,7 +50,7 @@ class ShellWarmAlgorithm final : public UpscaleAlgorithm {
                                           SystemEventSink<UpscaleSystem::event_type> events = {}) {
     return UpscaleSystem{{.device = 0, .maximum_width = 1024U, .maximum_height = 1024U},
                          RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                        [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }),
+                                        [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
                          [](const VisualFrame&) { return VisualDocumentRead{}; },
                          std::move(events)};
 }
@@ -126,6 +127,26 @@ TEST_CASE("shell forwards the first ready Explore event unchanged and warms Upsc
     CHECK(probe->calls.load(std::memory_order_acquire) == 1U);
 }
 
+TEST_CASE("shell prioritizes visible atlas completion before warming viewer methods") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<ShellWarmProbe>();
+    auto warmed = probe->completed.get_future();
+    auto upscale = shell_upscale(backend, probe);
+    ExploreRouteHarness route(upscale);
+    auto& snapshot = std::get<ExploreChanged>(route.ready()).snapshot;
+    snapshot.gallery.slots = {true, false};
+    route.Route();
+    CHECK(probe->calls.load() == 0U);
+    snapshot.gallery.slots[1U] = true;
+    snapshot.busy = true;
+    route.Route();
+    CHECK(probe->calls.load() == 0U);
+    snapshot.busy = false;
+    route.Route();
+    REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
+    CHECK(probe->calls.load() == 1U);
+}
+
 TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale failure") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<ShellWarmProbe>();
@@ -133,20 +154,24 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     std::atomic<std::size_t> upscale_failures{0U};
     std::atomic<std::size_t> other_upscale_events{0U};
     std::promise<void> failure_published;
+    std::promise<void> methods_settled;
     auto failed = failure_published.get_future();
+    auto settled = methods_settled.get_future();
     auto upscale =
-        shell_upscale(backend, probe, [&upscale_failures, &other_upscale_events, &failure_published](UpscaleSystem::event_type event) {
+        shell_upscale(backend, probe, [&upscale_failures, &other_upscale_events, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
             if (std::holds_alternative<UpscaleFailed>(event)) {
                 upscale_failures.fetch_add(1U, std::memory_order_acq_rel);
                 failure_published.set_value();
             } else {
                 other_upscale_events.fetch_add(1U, std::memory_order_acq_rel);
             }
+            if (std::visit([](const auto& value) { return value.snapshot.methods[2U].warm; }, event)) methods_settled.set_value();
         });
     ExploreRouteHarness route(upscale);
 
     route.Route();
     REQUIRE(failed.wait_for(2s) == std::future_status::ready);
+    REQUIRE(settled.wait_for(2s) == std::future_status::ready);
     REQUIRE(route.forwarded().size() == 1U);
     CHECK(route.forwarded().front() == route.expected());
     const auto* unchanged = std::get_if<ExploreChanged>(&route.ready());
@@ -154,7 +179,7 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     CHECK(unchanged->snapshot.ready);
     CHECK(unchanged->snapshot.frame.valid());
     CHECK(upscale_failures.load(std::memory_order_acquire) == 1U);
-    CHECK(other_upscale_events.load(std::memory_order_acquire) == 0U);
+    CHECK(other_upscale_events.load(std::memory_order_acquire) == 2U);
     route.Route();
     CHECK(probe->calls.load(std::memory_order_acquire) == 1U);
 }

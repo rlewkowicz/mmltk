@@ -157,20 +157,17 @@ impl ApplicationModel {
         }
     }
 
-    pub(super) fn same_clean_source(left: &VisualFrame, right: &VisualFrame) -> bool {
-        crate::generated::visual_clean_content_identity(left)
-            == crate::generated::visual_clean_content_identity(right)
-    }
-
     pub fn displayed_upscale_kernel(&self) -> Option<crate::generated::UpscaleKernel> {
-        let upscale = self.current_upscale()?;
-        let shown = self.viewed_explore_frame()?;
+        let explore = self.explore.snapshot.as_ref()?;
+        let upscale = self.upscale_snapshot.as_ref()?;
         let (surface, _) = crate::presentation_surface::drawn_detail()?;
         let drawn = surface.frame?;
-        (shown == upscale.frame
-            && drawn.matches_completed(self.presentation.as_ref()?)
-            && drawn.matches_content(&shown))
-            .then_some(upscale.kernel)
+        upscale.methods.iter().zip(crate::generated::UPSCALE_KERNEL_VALUES.iter().copied())
+            .find_map(|(method, kernel)| (method.available
+                && method.completed.as_ref().is_some_and(|request|
+                    request.source == explore.frame && request.document == explore.document && request.kernel == kernel)
+                && drawn.matches_content(&method.frame))
+                .then_some(kernel))
     }
 
     pub fn current_upscale(&self) -> Option<&crate::generated::UpscaleSnapshot> {
@@ -184,10 +181,11 @@ impl ApplicationModel {
                 .requested_selection
                 .is_none_or(|image| explore.selectedimage == Some(image))
             && upscale.ready
-            && !upscale.busy
             && upscale.kernel == request.kernel
             && upscale.input == request.source
-            && Self::same_clean_source(&explore.frame, &request.source))
+            && explore.frame == request.source && explore.document == request.document
+            && upscale.methods.iter().any(|method|
+                method.available && method.completed.as_ref() == Some(request) && method.frame == upscale.frame))
         .then_some(upscale)
     }
 
@@ -270,11 +268,21 @@ impl ApplicationModel {
     }
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
+        if feature == FeatureId::Explore
+            && matches!(self.presentation_model.foreground(),
+                Some(PresentationSourceKind::Explore | PresentationSourceKind::Upscale))
+        {
+            return;
+        }
+        self.abandon_viewer();
+        self.set_foreground_visual(Self::page_visual_source(feature));
+    }
+
+    pub(crate) fn abandon_viewer(&mut self) {
         self.explore.requested_upscale = None;
         self.explore.sent_upscale = None;
         self.explore.requested_selection = None;
         self.explore.desired_selection = None;
-        self.set_foreground_visual(Self::page_visual_source(feature));
     }
 
     pub fn presentation_refresh(&mut self) -> Option<VisualFrame> {
@@ -379,6 +387,7 @@ mod tests {
         model.explore.requested_upscale = Some(crate::generated::UpscaleRequest {
             source: source.clone(),
             kernel,
+            document: explore.document.clone(),
         });
         source
     }
@@ -394,6 +403,9 @@ mod tests {
         upscale.kernel = kernel;
         upscale.input = source;
         upscale.frame = visual_frame(PresentationSourceKind::Upscale, 13);
+        upscale.methods[1].available = true;
+        upscale.methods[1].completed = Some(request.clone());
+        upscale.methods[1].frame = upscale.frame.clone();
         let frame = upscale.frame.clone();
         let presentation = model.presentation.as_mut().unwrap();
         presentation.completed = frame.clone();
@@ -428,11 +440,11 @@ mod tests {
         let mut other = request.clone();
         other.kernel = crate::generated::UpscaleKernel::Default;
         model.request_upscale(other);
-        assert_eq!(model.displayed_upscale_kernel(), None);
+        assert_eq!(model.displayed_upscale_kernel(), Some(kernel));
         model.request_upscale(request);
         assert_eq!(model.displayed_upscale_kernel(), Some(kernel));
         model.upscale_snapshot.as_mut().unwrap().busy = true;
-        assert_eq!(model.displayed_upscale_kernel(), None);
+        assert_eq!(model.displayed_upscale_kernel(), Some(kernel));
         crate::presentation_surface::clear_drawn_detail();
     }
 
@@ -442,17 +454,17 @@ mod tests {
         let source = select_upscale_source(&mut model, crate::generated::UpscaleKernel::Default);
         let mut other = source.clone();
         other.content.x += 1;
-        assert!(!ApplicationModel::same_clean_source(&source, &other));
+        assert_ne!(crate::generated::visual_clean_content_identity(&source), crate::generated::visual_clean_content_identity(&other));
         let mut legacy = source.clone();
         legacy.cleanrevision = 0;
         other = legacy.clone();
         other.revision += 1;
-        assert!(!ApplicationModel::same_clean_source(&legacy, &other));
+        assert_ne!(crate::generated::visual_clean_content_identity(&legacy), crate::generated::visual_clean_content_identity(&other));
         other = source.clone();
         other.cleanrevision = 42;
         let mut semantic = other.clone();
         semantic.revision += 1;
-        assert!(ApplicationModel::same_clean_source(&other, &semantic));
+        assert_eq!(crate::generated::visual_clean_content_identity(&other), crate::generated::visual_clean_content_identity(&semantic));
     }
 
     #[test]
@@ -483,8 +495,10 @@ mod tests {
         failed.input = request.source.clone();
         model.reduce_event(ApplicationEvent::UpscaleUpscaleFailed(
             crate::generated::UpscaleFailed {
+                request: Some(request.clone()),
                 snapshot: failed,
                 detail: "model unavailable".into(),
+                kind: crate::generated::UpscaleFailureKind::Unavailable,
             },
         ));
         assert!(model.explore.requested_upscale.is_none());
@@ -631,6 +645,9 @@ mod tests {
             upscale.input = input;
             upscale.frame = newer_pixels;
             upscale.revision = 10;
+            upscale.methods[0].available = true;
+            upscale.methods[0].completed = model.explore.requested_upscale.clone();
+            upscale.methods[0].frame = upscale.frame.clone();
         }
         {
             let presentation = model.presentation.as_mut().unwrap();
@@ -646,6 +663,7 @@ mod tests {
         assert!(model.presentation_refresh().is_none());
         assert!(model.presentation_recovery_refresh().is_none());
         model.upscale_snapshot.as_mut().unwrap().frame = cached.clone();
+        model.upscale_snapshot.as_mut().unwrap().methods[0].frame = cached.clone();
         assert!(!model.completed_presentation_is_obsolete().unwrap());
         model.upscale_snapshot.as_mut().unwrap().revision = 21;
         assert!(!model.completed_presentation_is_obsolete().unwrap());
@@ -871,6 +889,9 @@ mod tests {
         upscale.revision += 1;
         upscale.ready = true;
         upscale.frame = visual_frame(PresentationSourceKind::Upscale, 1);
+        upscale.methods[0].available = true;
+        upscale.methods[0].completed = model.explore.requested_upscale.clone();
+        upscale.methods[0].frame = upscale.frame.clone();
         assert_eq!(
             model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
                 crate::generated::UpscaleChanged {
@@ -894,6 +915,9 @@ mod tests {
         model.upscale_snapshot = Some(upscale.clone());
         assert!(model.current_upscale().is_none());
         upscale.kernel = crate::generated::UpscaleKernel::RealPlksr;
+        upscale.methods[2].available = true;
+        upscale.methods[2].completed = model.explore.requested_upscale.clone();
+        upscale.methods[2].frame = upscale.frame.clone();
         model.upscale_snapshot = Some(upscale.clone());
         assert!(model.current_upscale().is_some());
         model.explore.requested_selection = Some(4);
@@ -919,17 +943,20 @@ mod tests {
         use crate::application_codec::IntoApplicationValue;
 
         let source = visual_frame(PresentationSourceKind::Explore, 19);
+        let document = bootstrapped().explore.snapshot.unwrap().document;
         for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
             let encoded = crate::generated::encode_upscale_Start(
                 41,
                 crate::generated::UpscaleRequest {
                     source: source.clone(),
                     kernel,
+                    document: document.clone(),
                 },
             );
             assert_eq!(encoded.endpoint, ApplicationIntentEndpoint::UpscaleStart);
             assert_eq!(encoded.record.correlation, 41);
-            assert_eq!(encoded.record.fields.len(), 2);
+            assert_eq!(encoded.record.fields.len(), 3);
+            assert_eq!(encoded.record.fields[2].value, document.clone().into_application_value());
             assert_eq!(
                 encoded.record.fields[0].value,
                 source.clone().into_application_value()

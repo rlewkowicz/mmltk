@@ -9,8 +9,6 @@ mmltk_configure_component(
     mmltk_backend_imaging_upscale PUBLIC_DECLARATIONS)
 
 mmltk_register_retained_module_providers(
-    mmltk_backend_imaging_upscale image_upscaler_types.cppm)
-mmltk_register_retained_module_providers(
     mmltk_backend_imaging_upscale image_upscaler.cppm)
 mmltk_register_retained_module_implementation_units(
     mmltk_backend_imaging_upscale
@@ -30,8 +28,10 @@ mmltk_register_private_headers(
     detail/image_upscaler_request_tile.h
     detail/image_upscaler_nis.h
     detail/image_upscaler_nis_coefficients.h
-    detail/image_upscaler_nis_device.cuh
 )
+mmltk_register_public_headers(mmltk_backend_imaging_upscale
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES upscale_execution.h)
 target_sources(mmltk_backend_imaging_upscale PRIVATE
     export_shiftlut_lut_onnx.py
     assets/ShiftLUT_fp32.onnx
@@ -42,7 +42,6 @@ target_include_directories(mmltk_backend_imaging_upscale PRIVATE
 )
 target_link_libraries(mmltk_backend_imaging_upscale
     PRIVATE
-        mmltk::backend::ml::cuda
         mmltk::backend::ml::runtime
         CUDA::cudart
         mmltk::backend::data
@@ -53,6 +52,13 @@ target_link_libraries(mmltk_backend_imaging_upscale
         mmltk::vendor::onnxruntime
         mmltk::vendor::tensorrt_nvinfer
 )
+mmltk_link_declarations(mmltk_backend_imaging_upscale PUBLIC
+    mmltk::frameworks::gpu)
+# Ordinary declarations are checked by the ordinary C++ isolation target.
+# The device-only implementation header belongs to NVCC's source set below.
+mmltk_register_header_isolation(mmltk_backend_imaging_upscale)
+mmltk_register_private_headers(mmltk_backend_imaging_upscale
+    detail/image_upscaler_nis_device.cuh)
 set_target_properties(mmltk_backend_imaging_upscale PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON

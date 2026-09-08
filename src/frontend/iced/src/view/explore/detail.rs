@@ -122,7 +122,8 @@ pub(super) fn view<'a>(
         .requested_upscale
         .as_ref()
         .filter(|request| active != Some(request.kernel))
-        .map(|request| request.kernel);
+        .map(|request| request.kernel)
+        .or_else(|| model.upscale_snapshot.as_ref()?.pending.as_ref().map(|request| request.kernel));
     let upscale = crate::generated::UPSCALE_KERNEL_VALUES
         .iter()
         .copied()

@@ -17,7 +17,7 @@ cudaError_t runtime_set_device(void*, const int device) noexcept { return cudaSe
 }  // namespace
 
 void ensure_cuda_ok(const cudaError_t status, const char* context) {
-    if (status != cudaSuccess) { throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status)); }
+    if (status != cudaSuccess) { throw CudaError(status, context); }
 }
 
 int current_cuda_highest_stream_priority() {

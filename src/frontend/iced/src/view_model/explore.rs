@@ -217,6 +217,9 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                 }
             }
             ApplicationEvent::UpscaleUpscaleFailed(value) => {
+                let current_failure = value.kind == crate::generated::UpscaleFailureKind::Physical
+                    || value.request.is_none()
+                    || value.request.as_ref() == self.explore.requested_upscale.as_ref();
                 match merge_observation(
                     &mut self.upscale_snapshot,
                     value.snapshot,
@@ -225,25 +228,30 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                 ) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
-                        let failed = self
-                            .upscale_snapshot
-                            .as_ref()
-                            .expect("installed Upscale failure");
                         if self
                             .explore
                             .requested_upscale
                             .as_ref()
-                            .is_some_and(|request| {
-                                request.kernel == failed.kernel && request.source == failed.input
-                            })
+                            .is_some_and(|request| value.request.as_ref() == Some(request))
                         {
                             self.explore.requested_upscale = None;
                             if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
                                 self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                             }
                         }
-                        self.explore.sent_upscale = None;
-                        self.failed(value.detail);
+                        if value.request.as_ref() == self.explore.sent_upscale.as_ref() {
+                            self.explore.sent_upscale = None;
+                        }
+                        if current_failure {
+                            let (kind, title) = match value.kind {
+                                crate::generated::UpscaleFailureKind::Unavailable =>
+                                    (UiErrorKind::Unavailable, "Service unavailable"),
+                                crate::generated::UpscaleFailureKind::Failed |
+                                crate::generated::UpscaleFailureKind::Physical =>
+                                    (UiErrorKind::Failed, "Operation failed"),
+                            };
+                            self.error = Some(UiError { kind, title, detail: value.detail });
+                        }
                     }
                     Ok(Observation::Current | Observation::Stale) => {}
                 }
@@ -262,6 +270,9 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     "Upscale",
                 ) {
                     self.error = Some(error);
+                }
+                if self.current_upscale().is_some() {
+                    self.set_foreground_visual(Some(PresentationSourceKind::Upscale));
                 }
             }
             ApplicationReply::UpscaleStop(()) => {}
@@ -385,6 +396,54 @@ mod tests {
     }
 
     #[test]
+    fn sent_method_failure_cannot_surface_over_a_newer_desired_method() {
+        let mut model = bootstrapped();
+        let mut explore = explore_snapshot();
+        explore.mode = crate::generated::ExploreMode::Detail;
+        explore.selectedimage = Some(0);
+        explore.ready = true;
+        explore.frame = super::super::test_support::visual_frame(PresentationSourceKind::Explore, 1);
+        let first = crate::generated::UpscaleRequest {
+            source: explore.frame.clone(), document: explore.document.clone(),
+            kernel: crate::generated::UpscaleKernel::Default,
+        };
+        let second = crate::generated::UpscaleRequest {
+            kernel: crate::generated::UpscaleKernel::ShiftLut, ..first.clone()
+        };
+        model.explore.snapshot = Some(explore);
+        let first_correlation = model.begin_intent(ApplicationIntentEndpoint::UpscaleStart).unwrap();
+        model.explore.sent_upscale = Some(first.clone());
+        model.request_upscale(second.clone());
+        let mut snapshot = model.upscale_snapshot.clone().unwrap();
+        snapshot.revision += 1;
+        model.reduce_event(ApplicationEvent::UpscaleUpscaleFailed(crate::generated::UpscaleFailed {
+            snapshot: snapshot.clone(), detail: "superseded Basic failure".into(),
+            request: Some(first), kind: crate::generated::UpscaleFailureKind::Failed,
+        }));
+        assert!(model.error.is_none());
+        assert!(model.explore.sent_upscale.is_none());
+        assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
+        model.reduce_reply(first_correlation, Err(crate::protocol::ApplicationError {
+            category: crate::generated::ApplicationErrorCategory::Failed,
+            detail: "superseded Basic admission failure".into(),
+        }));
+        assert!(model.error.is_none());
+        assert!(!model.has_pending(ApplicationIntentEndpoint::UpscaleStart));
+        model.explore.sent_upscale = Some(second.clone());
+        snapshot.revision += 1;
+        snapshot.ready = true;
+        snapshot.kernel = second.kernel;
+        snapshot.input = second.source.clone();
+        snapshot.frame = super::super::test_support::visual_frame(PresentationSourceKind::Upscale, 2);
+        snapshot.methods[1].available = true;
+        snapshot.methods[1].completed = Some(second.clone());
+        snapshot.methods[1].frame = snapshot.frame.clone();
+        model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(crate::generated::UpscaleChanged { snapshot }));
+        assert!(model.error.is_none());
+        assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
+    }
+
+    #[test]
     fn duplicate_upscale_failure_preserves_a_later_error() {
         let mut model = bootstrapped();
         let mut snapshot = model.upscale_snapshot.clone().unwrap();
@@ -392,6 +451,8 @@ mod tests {
         let event = ApplicationEvent::UpscaleUpscaleFailed(crate::generated::UpscaleFailed {
             snapshot,
             detail: "upscale failed".into(),
+            request: None,
+            kind: crate::generated::UpscaleFailureKind::Failed,
         });
 
         model.reduce_event(event.clone());

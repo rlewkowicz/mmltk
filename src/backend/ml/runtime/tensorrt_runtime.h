@@ -5,11 +5,26 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace mmltk::backend::ml::runtime {
+
+class TensorRtCacheIntegrityError final : public std::runtime_error {
+   public:
+    using std::runtime_error::runtime_error;
+};
+class TensorRtOperationError final : public std::runtime_error {
+   public:
+    TensorRtOperationError(std::int32_t code, std::string_view operation)
+        : std::runtime_error(std::string(operation)), code_(code) {}
+    [[nodiscard]] std::int32_t code() const noexcept { return code_; }
+
+   private:
+    std::int32_t code_;
+};
 
 enum class TensorRtProfilingVerbosity : std::uint8_t {
     LayerNames,
@@ -55,8 +70,14 @@ class TensorRtEngine final {
     [[nodiscard]] std::int32_t device() const noexcept;
     [[nodiscard]] const std::filesystem::path& model_path() const noexcept;
     [[nodiscard]] bool built_from_onnx() const noexcept;
+    // A cancelled synchronous construction owns no usable engine. Genuine
+    // vendor/CUDA failures still throw, even when cancellation races them.
+    [[nodiscard]] bool cancelled() const noexcept;
     [[nodiscard]] std::uintptr_t native_engine_handle() const noexcept;
     void Save(const std::filesystem::path& path) const;
+    // Preserve native allocation/execution errors without misclassifying a
+    // valid serialized engine as corrupt.
+    void CheckOperation(bool succeeded, std::string_view operation) const;
 
    private:
     struct Impl;

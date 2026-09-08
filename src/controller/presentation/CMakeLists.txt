@@ -101,6 +101,7 @@ function(mmltk_add_controller_presentation_tests)
         mmltk::controller::visual_runtime
         mmltk::frameworks::gpu
         mmltk_frameworks_gpu_test_support
+        mmltk::backend::ml::runtime
         nlohmann_json)
     catch_discover_tests(
         mmltk_controller_visual_systems_tests

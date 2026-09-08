@@ -21,5 +21,6 @@ target_link_libraries(mmltk_controller_upscale_system
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::upscale)
 mmltk_link_declarations(mmltk_controller_upscale_system PUBLIC
-    mmltk::controller::visual_runtime)
+    mmltk::controller::visual_runtime
+    mmltk::backend::imaging::upscale)
 mmltk_register_header_isolation(mmltk_controller_upscale_system)

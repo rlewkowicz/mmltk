@@ -6,7 +6,6 @@ impl App {
         endpoint: Option<ApplicationIntentEndpoint>,
         succeeded: bool,
         installed_settings: bool,
-        refresh: &mut Option<VisualFrame>,
     ) {
         if endpoint == Some(ApplicationIntentEndpoint::SettingsUpdate) {
             if succeeded {
@@ -23,11 +22,7 @@ impl App {
                 let authoritative = self.model.settings_snapshot.clone();
                 self.settings.settle_failure(authoritative.as_ref());
                 if let Some(authoritative) = authoritative {
-                    self.workspace
-                        .rebase(authoritative.settingsstate.currentview, &self.model);
-                    self.model
-                        .set_foreground_feature(authoritative.settingsstate.currentview);
-                    *refresh = self.model.presentation_refresh();
+                    self.rebase_page(authoritative.settingsstate.currentview);
                 }
             }
             self.reconcile_explore_viewport();
@@ -38,14 +33,12 @@ impl App {
             if let Some(authoritative) = self.model.settings_snapshot.clone() {
                 let authoritative_route = authoritative.settingsstate.currentview;
                 self.settings.reset(&authoritative);
-                self.workspace.rebase(authoritative_route, &self.model);
-                self.model.set_foreground_feature(authoritative_route);
+                self.rebase_page(authoritative_route);
                 self.integration.observe_authoritative_route(
                     "settings.reply",
                     authoritative_route,
                     self.workspace.active(),
                 );
-                *refresh = self.model.presentation_refresh();
             } else {
                 self.settings.settle_failure(None);
                 self.model.error = Some(UiError::protocol(
@@ -60,14 +53,12 @@ impl App {
         {
             let authoritative_route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
-            self.workspace.rebase(authoritative_route, &self.model);
-            self.model.set_foreground_feature(authoritative_route);
+            self.rebase_page(authoritative_route);
             self.integration.observe_authoritative_route(
                 "settings.reply",
                 authoritative_route,
                 self.workspace.active(),
             );
-            *refresh = self.model.presentation_refresh();
         }
     }
 
@@ -226,10 +217,7 @@ impl App {
             let authoritative = self.model.settings_snapshot.clone();
             self.settings.settle_failure(authoritative.as_ref());
             if let Some(authoritative) = authoritative {
-                self.workspace
-                    .rebase(authoritative.settingsstate.currentview, &self.model);
-                self.model
-                    .set_foreground_feature(authoritative.settingsstate.currentview);
+                self.rebase_page(authoritative.settingsstate.currentview);
             }
             self.reconcile_explore_viewport();
         }

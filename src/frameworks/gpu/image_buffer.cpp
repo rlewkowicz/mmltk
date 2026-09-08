@@ -708,12 +708,13 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
     state_->generation_ = revision;
 }
 std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source,
-                                                           MissingPlaneSubmit initialize_missing) {
-    return CopyFromAs(stream, std::move(source), std::move(initialize_missing), 0U);
+                                                           MissingPlaneSubmit initialize_missing, const bool preserve_clean) {
+    return CopyFromAs(stream, std::move(source), std::move(initialize_missing), 0U, preserve_clean);
 }
 std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream, BorrowedImageProductReadView source,
                                                              MissingPlaneSubmit initialize_missing,
-                                                             const std::uint64_t revision) {
+                                                             const std::uint64_t revision, const bool preserve_clean,
+                                                             const ImagePlanePreservation preservation) {
     if (!source.valid() || (source.plane_count() < state_->plane_count_ && !initialize_missing))
         throw std::invalid_argument("source image product lacks a receiver plane");
     if (source.lease_->product == state_) throw std::invalid_argument("an image product cannot copy from itself");
@@ -722,6 +723,12 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
     if (state_->context_.state_->backend != source.lease_->product->context_.state_->backend)
         throw std::invalid_argument("source and receiver use different image backends");
     std::unique_lock transaction(state_->transaction_);
+    if (preserve_clean) {
+        const auto& retained = state_->planes_[0U]->state_->plane.descriptor;
+        const auto& incoming = source.planes_[0U].plane().descriptor;
+        if (state_->generation_ == 0U || retained.width != incoming.width || retained.height != incoming.height)
+            throw std::invalid_argument("preserved clean input requires completed matching geometry");
+    }
     std::uint64_t next_generation = revision;
     if (revision == 0U)
         next_generation = state_->BeginWrite();
@@ -750,7 +757,9 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
     bool reads_submitted = false;
     bool receiver_completed = false;
     try {
-        for (std::size_t index = 0U; index != std::min(state_->plane_count_, source.plane_count()); ++index) {
+        const auto copied_planes = preservation == ImagePlanePreservation::Clean ? 1U :
+            std::min(state_->plane_count_, source.plane_count());
+        for (std::size_t index = preserve_clean ? 1U : 0U; index < copied_planes; ++index) {
             auto& receiver = *state_->planes_[index]->state_;
             const ImagePlaneView source_plane = source.planes_[index].plane();
             receiver.EnsurePlane(source_plane.descriptor.kind, source_plane.descriptor.width, source_plane.descriptor.height);

@@ -127,6 +127,8 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     UpscaleInputGeometry[[= detail::VisualDiagnosticName{"upscale.input.geometry"}]],
     UpscaleInputAllocation[[= detail::VisualDiagnosticName{"upscale.input.allocation"}]],
     UpscaleOutputAllocation[[= detail::VisualDiagnosticName{"upscale.output.allocation"}]],
+    UpscaleOutputAdmissionStarted[[= detail::VisualDiagnosticName{"upscale.output.admission.started"}]],
+    UpscaleOutputAdmissionCompleted[[= detail::VisualDiagnosticName{"upscale.output.admission.completed"}]],
     PresentationSourceWaitSubmitted[[= detail::VisualDiagnosticName{"presentation.source.wait_submitted"}]],
 };
 

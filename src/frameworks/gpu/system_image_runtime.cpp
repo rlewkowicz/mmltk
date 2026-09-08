@@ -195,8 +195,9 @@ ImageProductPool::Availability SystemImageRuntime::ObserveOutputAvailability() c
 }
 ImageProductPool::Facts SystemImageRuntime::OutputFacts() const { return ActiveState().output->SelectedFacts(); }
 ImageStorageFootprint SystemImageRuntime::OutputStorageFootprint() const { return ActiveState().output->StorageFootprint(); }
-SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop, CompletedOutput baseline) {
-    return ActiveState().output->Acquire(stop, std::move(baseline));
+SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std::stop_token stop, CompletedOutput baseline,
+                                                                    ImagePlanePreservation preservation) {
+    return ActiveState().output->Acquire(stop, std::move(baseline), preservation);
 }
 void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
                                  ImageProductBuffer::ProductSubmit submit) {
@@ -211,6 +212,16 @@ void SystemImageRuntime::SetOutputAvailableSink(std::function<void()> sink) {
     ActiveState().output->SetAvailabilitySink(std::move(sink));
 }
 BorrowedImageProductReadView SystemImageRuntime::BorrowInput() const { return ActiveState().input->Borrow(); }
+void SystemImageRuntime::PublishInput(const std::uint32_t width, const std::uint32_t height,
+                                      ImageProductBuffer::ProductSubmit submit) {
+    auto& state = ActiveState();
+    try {
+        state.input->Publish(*state.stream, width, height, std::move(submit));
+        state.stream->Synchronize();
+    } catch (...) {
+        state.stream->RethrowAfterSettlement(std::current_exception());
+    }
+}
 BorrowedImageProductReadView SystemImageRuntime::Borrow() const { return ActiveState().output->Borrow(); }
 SystemImageModel* SystemImageRuntime::model() noexcept { return state_ && !state_->retired ? state_->model.get() : nullptr; }
 std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductReadView source) {
@@ -218,9 +229,10 @@ std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductR
     return state.output->CopyFrom(*state.stream, std::move(source), TakeProductRevision());
 }
 std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source,
-                                                                ImageProductBuffer::MissingPlaneSubmit initialize_missing) {
+                                                                ImageProductBuffer::MissingPlaneSubmit initialize_missing,
+                                                                const bool preserve_clean) {
     auto& state = ActiveState();
-    return state.input->CopyFrom(*state.stream, std::move(source), std::move(initialize_missing));
+    return state.input->CopyFrom(*state.stream, std::move(source), std::move(initialize_missing), preserve_clean);
 }
 void SystemImageRuntime::Publish(const std::uint32_t width, const std::uint32_t height, ImageProductBuffer::ProductSubmit submit) {
     auto& state = ActiveState();

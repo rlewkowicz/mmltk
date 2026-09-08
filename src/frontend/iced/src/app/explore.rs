@@ -158,7 +158,10 @@ impl App {
                 };
                 self.integration.observe_upscale_request(kernel);
                 self.model
-                    .request_upscale(crate::generated::UpscaleRequest { source, kernel });
+                    .request_upscale(crate::generated::UpscaleRequest {
+                        source, kernel,
+                        document: self.model.explore.snapshot.as_ref().expect("selected source").document.clone(),
+                    });
                 self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::OverlayUpdated(request) => {
@@ -218,7 +221,7 @@ impl App {
                     .as_ref()
                     .is_none_or(|snapshot| snapshot.selectedimage != Some(compiledindex))
                 {
-                    self.presentation.retire_frame();
+                    self.abandon_viewer();
                 }
                 self.model.set_foreground_feature(FeatureId::Explore);
                 self.model.explore.requested_selection = Some(compiledindex);
@@ -234,7 +237,7 @@ impl App {
                 self.request_explore_navigation(ExploreNavigation::Next);
             }
             crate::view::explore::Outcome::CloseDetailRequested => {
-                self.presentation.retire_frame();
+                self.abandon_viewer();
                 self.model.set_foreground_feature(FeatureId::Explore);
                 self.model.explore.desired_navigation = None;
                 self.model.explore.desired_close = true;
@@ -347,6 +350,7 @@ impl App {
     }
 
     fn dispatch_explore_desired(&mut self) {
+        self.reconcile_viewer();
         if self.connection.is_none() {
             self.abandon_explore_edit(ApplicationIntentEndpoint::ExploreUpdateOverlay);
             return;
@@ -446,6 +450,19 @@ impl App {
         {
             self.model.explore.desired_selection = None;
         }
+        self.dispatch_viewer_desired();
+    }
+
+    pub(super) fn dispatch_viewer_desired(&mut self) {
+        if self.presentation.stop_requested {
+            if self.model.has_pending(ApplicationIntentEndpoint::UpscaleStop) {
+                return;
+            }
+            if !self.submit_intent(ApplicationIntentEndpoint::UpscaleStop, crate::generated::encode_upscale_Stop) {
+                return;
+            }
+            self.presentation.stop_requested = false;
+        }
         if !self
             .model
             .has_pending(ApplicationIntentEndpoint::UpscaleStart)
@@ -462,7 +479,7 @@ impl App {
     }
 
     fn request_explore_navigation(&mut self, direction: ExploreNavigation) {
-        self.presentation.retire_frame();
+        self.abandon_viewer();
         self.model.set_foreground_feature(FeatureId::Explore);
         self.model.explore.desired_close = false;
         self.model.explore.desired_navigation = Some(direction);

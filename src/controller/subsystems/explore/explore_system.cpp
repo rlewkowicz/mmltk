@@ -1314,6 +1314,7 @@ class ExploreSystem::Impl final {
             return;
         }
         snapshot.gallery = product.gallery;
+        snapshot.document = product.document ? product.document->facts() : VisualDocumentFacts{};
         snapshot.scene = product.document ? product.document->scene : contracts::AnnotationSceneContent{};
         snapshot.labels = product.labels;
     }
