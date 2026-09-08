@@ -229,7 +229,11 @@ class GalleryStream::Impl final {
     ~Impl();
     [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);
-    void SetCurrentDemand(ExploreDemandCheck check) { current_demand_ = check; }
+    void SetCurrentDemand(ExploreDemandCheck check) {
+        if (demand_bound_) throw std::logic_error("Explore gallery demand is already bound");
+        current_demand_ = std::move(check);
+        demand_bound_ = true;
+    }
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                    const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
@@ -446,12 +450,12 @@ class GalleryStream::Impl final {
     std::shared_ptr<const ExploreAlgorithm::GalleryReadySink> ready_sink_;
     std::atomic<std::uint64_t> desired_generation_{0U};
     ExploreDemandCheck current_demand_{};
+    bool demand_bound_ = false;
     [[nodiscard]] bool Current(std::uint64_t generation) const noexcept {
         return generation != 0U && generation == desired_generation_.load(std::memory_order_acquire) && current_demand_(generation);
     }
     [[nodiscard]] explore::detail::ExploreRenderDemand Demand() const noexcept {
-        return {.context = current_demand_.context, .generation = State().plan.generation,
-                .current = current_demand_.current};
+        return {.latest_generation = current_demand_.generation(), .generation = State().plan.generation};
     }
     std::atomic<std::size_t> stale_discarded_{0U};
     std::uint64_t next_tile_generation_ = 0U;
@@ -2935,7 +2939,7 @@ GalleryStream::~GalleryStream() {
 }
 mmltk::common::concurrency::WorkerPool& GalleryStream::workers() noexcept { return impl_->workers(); }
 void GalleryStream::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) { impl_->SetReadySink(std::move(sink)); }
-void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { impl_->SetCurrentDemand(check); }
+void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { impl_->SetCurrentDemand(std::move(check)); }
 ExploreOutputChange GalleryStream::OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                 const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
     return impl_->OutputChange(plan, visible, store, window);

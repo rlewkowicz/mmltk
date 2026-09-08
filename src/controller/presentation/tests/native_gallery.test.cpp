@@ -182,7 +182,7 @@ struct GalleryGpuPause final {
 class NativeGallery final {
    public:
     GalleryEvidence evidence;
-    std::atomic<std::uint64_t> demand{1U};
+    std::shared_ptr<std::atomic<std::uint64_t>> demand = std::make_shared<std::atomic<std::uint64_t>>(1U);
     std::shared_ptr<ExploreAcceptanceGate> gate;
     mmltk::common::io::ScopedFd commands;
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> runtime;
@@ -217,20 +217,18 @@ class NativeGallery final {
         runtime = make_native_explore_runtime_factory({.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U,
                                                        {.acceptance = gate, .diagnostics = evidence.Sink()})(
             std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
-        runtime->BeginWork();
         algorithm = dynamic_cast<ExploreAlgorithm*>(runtime->model());
         REQUIRE(algorithm);
+        algorithm->SetCurrentDemand(ExploreDemandCheck{demand});
+        runtime->BeginWork();
         algorithm->SetGalleryReadySink(ExploreAlgorithm::GalleryReadySink{[this] { evidence.Wake(); }});
-        algorithm->SetCurrentDemand({.context = &demand, .current = [](void* context, const std::uint64_t generation) noexcept {
-            return static_cast<std::atomic<std::uint64_t>*>(context)->load() == generation;
-        }});
         plan.viewport = {.extent = {columns * 8U, 16U}, .row_count = 2U, .columns = columns};
         plan.augmentation_config.enabled = false;
         plan.generation = 1U;
     }
     void Command(const std::uint8_t command) { REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command)); }
     ~NativeGallery() {
-        demand.store(0U);
+        demand->store(0U);
         if (algorithm) algorithm->StopIngress();
         if (runtime) static_cast<void>(runtime->Retire());
     }
@@ -289,7 +287,7 @@ class NativeGallery final {
                         static_cast<void>(algorithm->PublishGalleryTiles(clean, semantic, stream));
                     });
                 if (evidence.enabled.load()) transaction_storage = algorithm->StorageFootprint();
-                if (commit && demand.load() == plan.generation) {
+                if (commit && demand->load() == plan.generation) {
                     runtime->CommitOutput(std::move(output));
                     algorithm->CommitOutputPublication();
                     ++publications;
@@ -367,7 +365,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     const auto allocations = gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown);
     REQUIRE(reads == explore_detail::GalleryThumbnailCache::CardCount(203U, 2U, columns));
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 0U);
     gallery.Drain();
     CHECK(gallery.publications == published);
@@ -379,7 +377,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
 
     gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
@@ -398,7 +396,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
 
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     for (;;) {
         const auto previous = gallery.evidence.Epoch();
@@ -413,22 +411,22 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(gallery.transaction_storage.host_bytes > before_patch_bytes);
     gallery.plan.viewport.first_row = 2U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 0U);
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
 
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin(nullptr, false);
     CHECK(gallery.Pixels(0U) == original);
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.Pixels(0U) == original);
@@ -437,14 +435,14 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.plan.overlay.show_masks = true;
     gallery.plan.overlay.show_boxes = false;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto old_masks = gallery.Pixels(1U);
     const auto replacement = directory.path() / "replacement.bin";
     write_gallery_artifact(replacement, 0.75F, 17U);
     std::filesystem::rename(replacement, path);
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Open(path);
     gallery.Drain();
     CHECK(gallery.plan.dataset_identity == stable_seed_identity);
@@ -452,7 +450,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(gallery.Pixels(1U) != old_masks);
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto before_jump = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     gallery.Begin();
     gallery.Drain();
@@ -460,7 +458,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
 
     gallery.plan.viewport.extent = {columns * 16U, 32U};
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto before_resize = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     gallery.Begin();
     gallery.Drain();
@@ -470,7 +468,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.plan.augmentation_config.enabled = true;
     ++gallery.plan.augmentation.seed;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto before_augmentation = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     gallery.Begin();
     gallery.Drain();
@@ -482,7 +480,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(augmented_storage.pinned_bytes >= augmented_storage.augmentation_pinned_bytes);
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     for (;;) {
         const auto previous = gallery.evidence.Epoch();
@@ -498,7 +496,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(candidate_storage.augmentation_pinned_bytes == protected_storage.augmentation_pinned_bytes);
     gallery.plan.viewport.first_row = 203U / columns;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices.size() == 3U);
@@ -507,12 +505,12 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
 
     auto filtered = gallery.algorithm->PrepareFilter({.minimum_instances = 2U}, 0U, 2U, {});
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin(&filtered).remaining_tiles == 0U);
     gallery.algorithm->Commit(std::move(filtered));
     gallery.Drain();
     gallery.evidence.enabled.store(false);
-    gallery.demand.store(0U);
+    gallery.demand->store(0U);
     const auto stopped_reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == stopped_reads);
@@ -546,13 +544,13 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
     gallery.gate->FailNextPublicationAt(ExploreAcceptanceGate::PublicationStage::DescriptorsPrepared);
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     REQUIRE_THROWS(gallery.Begin());
     REQUIRE(gallery.algorithm->RollbackOutputPublication());
     CHECK(gallery.Pixels(0U) == retained);
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.Pixels(0U) != retained);
@@ -561,7 +559,7 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
     gallery.gate->FailNextProbe();
     gallery.plan.overlay.show_boxes = !gallery.plan.overlay.show_boxes;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreProbeFailed) == 1U);
@@ -571,7 +569,7 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
     const auto recorded = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
     gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == recorded);
@@ -594,14 +592,14 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     gallery.plan.overlay.class_selection.classes.resize(kExploreClassCapacity);
     std::iota(gallery.plan.overlay.class_selection.classes.begin(), gallery.plan.overlay.class_selection.classes.end(), 0U);
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto before_semantic = gallery.logical_copies.load();
     gallery.Begin();
     CHECK(gallery.logical_copies.load() - before_semantic == columns);
     gallery.plan.viewport.row_count = static_cast<std::uint32_t>(kExploreVisibleItemCapacity / columns);
     gallery.plan.viewport.extent.height = gallery.plan.viewport.row_count * 8U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
     gallery.evidence.enabled.store(false);
@@ -612,7 +610,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     for (unsigned repeat = 0U; repeat != 4U; ++repeat) {
         ++gallery.plan.generation;
         if (repeat != 0U) gallery.plan.focused_image = repeat;
-        gallery.demand.store(gallery.plan.generation);
+        gallery.demand->store(gallery.plan.generation);
         std::size_t allocations;
         ExploreGalleryPublication reused;
         {
@@ -633,7 +631,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     const auto transfers = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
     gallery.plan.focused_image = 7U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == descriptors);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders);
@@ -644,12 +642,12 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     gallery.plan.viewport.first_row = 400U / columns;
     gallery.plan.focused_image.reset();
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto cold_publications = gallery.publications;
     gallery.plan.focused_image = 403U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.publications == cold_publications);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
@@ -666,7 +664,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     gallery.plan.mode = ExploreMode::Detail;
     gallery.plan.selected_image = 403U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto detail_acquisitions = gallery.acquisitions;
     const auto detail_publications = gallery.publications;
@@ -679,7 +677,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     gallery.plan.focused_image = 402U;
     gallery.plan.detail.show_original_dimensions = true;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.evidence.enabled.store(false);
     std::size_t detail_allocations;
     {
@@ -694,7 +692,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     gallery.evidence.enabled.store(true);
     gallery.plan.focused_image = 401U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == detail_descriptors);
     CHECK(gallery.Pixels(0U) == detail_clean);
@@ -722,7 +720,7 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
         gallery.Drain();
         gallery.plan.viewport.first_row = 8U;
         ++gallery.plan.generation;
-        gallery.demand.store(gallery.plan.generation);
+        gallery.demand->store(gallery.plan.generation);
         gallery.Begin();
         gallery.pause = &held;
         const auto before = gallery.evidence.BackgroundSubmissions();
@@ -741,7 +739,7 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
     auto stopped_wait = stopped.get_future();
     auto retirement = std::async(std::launch::async, [&] {
         gallery.runtime->BindContext();
-        gallery.demand.store(0U);
+        gallery.demand->store(0U);
         gallery.algorithm->StopIngress();
         stopped.set_value();
         return gallery.runtime->Retire();
@@ -808,7 +806,7 @@ TEST_CASE("Native initialization commit reserves useful reads and isolates obsol
         gallery.plan.viewport.extent.height = 8U;
         if (scenario == 1U) gallery.plan.viewport.first_row = 30U;
         ++gallery.plan.generation;
-        gallery.demand.store(gallery.plan.generation);
+        gallery.demand->store(gallery.plan.generation);
         gallery.Begin();
         CHECK(gallery.algorithm->StorageFootprint().cache_cards == 60U);
         // Exercise scheduling while the old read is still physically held.
@@ -1069,7 +1067,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     gallery.plan.selected_image = 0U;
     gallery.plan.overlay.show_boxes = false;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto clean = gallery.Pixels(0U);
     const auto semantic = gallery.Pixels(1U);
@@ -1079,7 +1077,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     const auto published = gallery.publications;
     const auto copies = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.publications == published);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown) == allocations);
@@ -1089,13 +1087,13 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
 
     gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.Pixels(0U) == clean);
     CHECK(gallery.Pixels(1U) == std::vector<std::uint8_t>(8U * 8U * 4U, 0U));
     gallery.plan.overlay.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}};
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.Pixels(1U) == semantic);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
@@ -1106,7 +1104,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     gallery.plan.viewport.row_count = 5U;
     gallery.plan.focused_image = 0U;
     gallery.plan.detail.show_original_dimensions = true;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto detail_publications = gallery.publications;
     const auto detail_acquisitions = gallery.acquisitions;
     const auto detail_revision = gallery.runtime->Completed().revision();
@@ -1135,7 +1133,7 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     gallery.Drain();
     gallery.plan.overlay.show_boxes = false;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto clean = gallery.Pixels(0U);
     const auto semantic = gallery.Pixels(1U);
@@ -1143,7 +1141,7 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     // speculative 64..67 collide with incumbent 0..3 after a hot Begin.
     gallery.plan.viewport.first_row = 8U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 0U);
     GalleryGpuPause pause;
     gallery.pause = &pause;
@@ -1158,7 +1156,7 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
         }
     });
     const bool entered = pause.Wait();
-    gallery.demand.store(0U);
+    gallery.demand->store(0U);
     pause.Release();
     REQUIRE(entered);
     submitted.get();
@@ -1166,7 +1164,7 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     gallery.runtime->BindContext();
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     CHECK(gallery.Begin().remaining_tiles == 0U);
     CHECK(gallery.Pixels(0U) == clean);
@@ -1174,14 +1172,14 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.Pixels(0U) == clean);
     CHECK(gallery.Pixels(1U) == std::vector<std::uint8_t>(4U * 8U * 16U * 4U, 0U));
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::All;
     ++gallery.plan.generation;
-    gallery.demand.store(gallery.plan.generation);
+    gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.Pixels(1U) == semantic);
 }
@@ -1208,7 +1206,7 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
         return gallery.Step();
     });
     const bool entered = pause.Wait();
-    gallery.demand.store(0U);
+    gallery.demand->store(0U);
     pause.Release();
     REQUIRE(entered);
     static_cast<void>(submitted.get());

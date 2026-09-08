@@ -30,6 +30,15 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
     return *algorithm;
 }
 
+[[nodiscard]] VisualRuntimeFactory bind_explore_demand(VisualRuntimeFactory factory, ExploreDemandCheck demand) {
+    if (!factory) return {};
+    return [factory = std::move(factory), demand = std::move(demand)](auto revisions) {
+        auto runtime = factory(std::move(revisions));
+        if (runtime) explore_algorithm(*runtime).SetCurrentDemand(demand);
+        return runtime;
+    };
+}
+
 [[nodiscard]] bool selection_valid(const ExploreClassSelection& selection, const std::uint32_t class_count) {
     if (selection.mode == ExploreClassSelectionMode::All || selection.mode == ExploreClassSelectionMode::None)
         return selection.classes.empty();
@@ -137,7 +146,8 @@ class ExploreSystem::Impl final {
           state_{.nproc = nproc, .maximum_atlas_extent = {settings.maximum_width, settings.maximum_height}},
           gallery_wake_(std::make_shared<GalleryWakeGate>([this] { SubmitGalleryContinuation(); })),
           worker_(
-              std::move(factory), [this](const std::exception_ptr failure) { Failed(failure); },
+              bind_explore_demand(std::move(factory), ExploreDemandCheck{latest_generation_}),
+              [this](const std::exception_ptr failure) { Failed(failure); },
               diagnostics_.valid()
                   ? detail::VisualRuntimeOwner::ActivityObservation{[diagnostics](const detail::VisualRuntimeOwner::ActivityStage stage,
                                                                                   const std::uint64_t value) noexcept {
@@ -345,7 +355,7 @@ class ExploreSystem::Impl final {
 
     [[nodiscard]] std::uint64_t LastInteractionGeneration() const {
         std::scoped_lock lock(mutex_);
-        return latest_generation_;
+        return latest_generation_->load(std::memory_order_acquire);
     }
 
     [[nodiscard]] ExploreSnapshot UpdateFilter(const ExploreFilterUpdate request) {
@@ -513,7 +523,7 @@ class ExploreSystem::Impl final {
             // Stop abandons further thumbnails; the selected product retains
             // its readiness facts independently of this stream-demand decision.
             active_gallery_generation_ = 0U;
-            latest_generation_ = ReserveGeneration();
+            latest_generation_->store(ReserveGeneration(), std::memory_order_release);
             if (desired_) {
                 desired_.reset();
                 desired_settings_.reset();
@@ -537,11 +547,17 @@ class ExploreSystem::Impl final {
     }
 
     void Shutdown() noexcept {
+        std::uint64_t generation;
         {
             std::scoped_lock lock(mutex_);
-            latest_generation_ = ReserveGeneration();
+            generation = ReserveGeneration();
+            latest_generation_->store(generation, std::memory_order_release);
         }
         worker_.StopAndWait();
+        // A cancelled replacement may restore the incumbent while joining.
+        // Reapply the same issued invalidation before releasing the issuer.
+        std::scoped_lock lock(mutex_);
+        latest_generation_->store(generation, std::memory_order_release);
     }
     [[nodiscard]] bool stopped() const noexcept { return worker_.stopped(); }
     [[nodiscard]] ExploreSnapshot snapshot() const {
@@ -610,8 +626,8 @@ class ExploreSystem::Impl final {
         desired_navigation_ = (desired_navigation_ + navigation) % count;
         const auto offset = desired_navigation_;
         const auto generation = viewport_update && previous_viewport == desired_->viewport && active_gallery_generation_ != 0U &&
-                                        latest_generation_ != 0U
-                                    ? latest_generation_
+                                        latest_generation_->load(std::memory_order_acquire) != 0U
+                                    ? latest_generation_->load(std::memory_order_acquire)
                                     : NextGeneration();
         auto requested = *desired_;
         ExploreRenderPlan plan{.viewport = requested.viewport,
@@ -630,7 +646,7 @@ class ExploreSystem::Impl final {
                 std::uint64_t committed_generation = generation;
                 {
                     std::scoped_lock lock(mutex_);
-                    if (generation != latest_generation_) return {};
+                    if (generation != latest_generation_->load(std::memory_order_acquire)) return {};
                 }
                 auto& algorithm = explore_algorithm(runtime);
                 try {
@@ -640,13 +656,13 @@ class ExploreSystem::Impl final {
                         plan.focused_image.reset();
                         requested.focused_image.reset();
                         std::scoped_lock lock(mutex_);
-                        if (generation == latest_generation_ && desired_) desired_->focused_image.reset();
+                        if (generation == latest_generation_->load(std::memory_order_acquire) && desired_) desired_->focused_image.reset();
                     }
                     if (offset != 0 && requested.selected_image) {
                         const auto selected = algorithm.Adjacent(*requested.selected_image, offset);
                         if (!selected) throw contracts::UnavailableError("Explore filtered order is empty");
                         std::scoped_lock lock(mutex_);
-                        if (generation != latest_generation_) return {};
+                        if (generation != latest_generation_->load(std::memory_order_acquire)) return {};
                         requested.selected_image = selected;
                         plan.selected_image = selected;
                         desired_->selected_image = selected;
@@ -657,11 +673,11 @@ class ExploreSystem::Impl final {
                     bool superseded = false;
                     {
                         std::scoped_lock lock(mutex_);
-                        if (generation != latest_generation_ || stop.stop_requested()) {
+                        if (generation != latest_generation_->load(std::memory_order_acquire) || stop.stop_requested()) {
                             if (desired_ || state_.busy)
                                 superseded = true;
                             else
-                                committed_generation = latest_generation_;
+                                committed_generation = latest_generation_->load(std::memory_order_acquire);
                         } else {
                             if (desired_) requested.overlay.show_labels = desired_->overlay.show_labels;
                             if (settings && desired_settings_ && desired_augmentation_config_ == plan.augmentation_config) {
@@ -718,7 +734,7 @@ class ExploreSystem::Impl final {
                     bool superseded = false;
                     {
                         std::scoped_lock lock(mutex_);
-                        superseded = generation != latest_generation_ && (desired_ || state_.busy);
+                        superseded = generation != latest_generation_->load(std::memory_order_acquire) && (desired_ || state_.busy);
                         if (!superseded) {
                             desired_.reset();
                             desired_settings_.reset();
@@ -771,7 +787,7 @@ class ExploreSystem::Impl final {
                 bool stale;
                 {
                     std::scoped_lock decision_lock(mutex_);
-                    stale = stop.stop_requested() || generation != latest_generation_;
+                    stale = stop.stop_requested() || generation != latest_generation_->load(std::memory_order_acquire);
                 }
                 if (stale) return RestoreCommittedProduct(algorithm, {}, false, true);
                 ExploreSnapshot settled;
@@ -864,11 +880,6 @@ class ExploreSystem::Impl final {
         }
         plan.semantic_identity = semantic_identity_;
         if (configured_algorithm_ != &algorithm) {
-            algorithm.SetCurrentDemand({.context = this, .current = [](void* context, std::uint64_t generation) noexcept {
-                auto& owner = *static_cast<Impl*>(context);
-                std::scoped_lock lock(owner.mutex_);
-                return generation == owner.latest_generation_;
-            }});
             algorithm.SetGalleryReadySink(ExploreAlgorithm::GalleryReadySink{[wake = std::weak_ptr{gallery_wake_}] {
                 if (const auto gate = wake.lock()) gate->Invoke();
             }});
@@ -946,7 +957,7 @@ class ExploreSystem::Impl final {
             bool stale = false;
             {
                 std::scoped_lock lock(mutex_);
-                stale = generation != latest_generation_;
+                stale = generation != latest_generation_->load(std::memory_order_acquire);
             }
             if (stale) {
                 return std::nullopt;
@@ -995,7 +1006,9 @@ class ExploreSystem::Impl final {
                 {
                     std::scoped_lock lock(mutex_);
                     generation = active_gallery_generation_;
-                    if (generation == 0U || generation != latest_generation_ || state_.mode != ExploreMode::Gallery) return {};
+                    if (generation == 0U || generation != latest_generation_->load(std::memory_order_acquire) ||
+                        state_.mode != ExploreMode::Gallery)
+                        return {};
                     extent = state_.viewport.extent;
                 }
                 const auto advanced = algorithm.AdvanceGallery();
@@ -1020,8 +1033,8 @@ class ExploreSystem::Impl final {
                                               .staging_bytes = advanced.active_pinned_bytes}}; });
                 {
                     std::scoped_lock lock(mutex_);
-                    if (generation != latest_generation_ || generation != active_gallery_generation_ || advanced.generation != generation ||
-                        state_.mode != ExploreMode::Gallery)
+                    if (generation != latest_generation_->load(std::memory_order_acquire) || generation != active_gallery_generation_ ||
+                        advanced.generation != generation || state_.mode != ExploreMode::Gallery)
                         return {};
                 }
                 if (stop.stop_requested()) return {};
@@ -1105,7 +1118,7 @@ class ExploreSystem::Impl final {
                     bool stale = false;
                     {
                         std::scoped_lock lock(mutex_);
-                        stale = stop.stop_requested() || generation != latest_generation_ ||
+                        stale = stop.stop_requested() || generation != latest_generation_->load(std::memory_order_acquire) ||
                                 generation != active_gallery_generation_ || state_.mode != ExploreMode::Gallery;
                         if (!stale) {
                             frame.clean_revision = frame.revision;
@@ -1202,7 +1215,7 @@ class ExploreSystem::Impl final {
     };
     [[nodiscard]] Execution BeginExecution(const std::uint64_t generation) {
         std::scoped_lock lock(mutex_);
-        latest_generation_ = generation;
+        latest_generation_->store(generation, std::memory_order_release);
         auto requested = Plan(generation);
         return {
             .requested = std::move(requested),
@@ -1273,12 +1286,12 @@ class ExploreSystem::Impl final {
         return mmltk::common::types::take_monotonic_identity(next_generation_);
     }
     [[nodiscard]] std::uint64_t NextGeneration() {
-        latest_generation_ = ReserveGeneration();
-        return latest_generation_;
+        latest_generation_->store(ReserveGeneration(), std::memory_order_release);
+        return latest_generation_->load(std::memory_order_acquire);
     }
     void ActivateGeneration(const std::uint64_t generation) {
         std::scoped_lock lock(mutex_);
-        latest_generation_ = generation;
+        latest_generation_->store(generation, std::memory_order_release);
         runtime_initialized_ = true;
     }
     void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
@@ -1350,7 +1363,7 @@ class ExploreSystem::Impl final {
         if (discard_order) algorithm.DiscardCandidate();
         std::scoped_lock lock(mutex_);
         configured_algorithm_ = nullptr;
-        if (!desired_) latest_generation_ = active_gallery_generation_;
+        if (!desired_) latest_generation_->store(active_gallery_generation_, std::memory_order_release);
         auto restored = state_;
         const bool was_busy = restored.busy;
         Complete(restored);
@@ -1447,7 +1460,8 @@ class ExploreSystem::Impl final {
     ExploreOverlay semantic_overlay_{};
     std::uint64_t semantic_identity_ = 0U;
     std::uint64_t next_semantic_identity_ = 1U;
-    std::uint64_t latest_generation_ = 0U;
+    const std::shared_ptr<std::atomic<std::uint64_t>> latest_generation_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0U);
     std::uint64_t active_gallery_generation_ = 0U;
     ExploreAlgorithm* configured_algorithm_ = nullptr;
     std::uint64_t next_shuffle_seed_ = 1U;

@@ -364,9 +364,13 @@ struct ExploreDetailExtentProbe final {
 };
 
 class SynchronousExploreAlgorithm : public ExploreAlgorithm {
-    void SetCurrentDemand(ExploreDemandCheck) override {}
-    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
    public:
+    void SetCurrentDemand(ExploreDemandCheck demand) override {
+        if (demand_bound_) throw std::logic_error("test Explore demand rebound");
+        demand_ = std::move(demand);
+        demand_bound_ = true;
+    }
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
     void AbortRenderGeneration() override { generation_ = 0U; }
     void DiscardCandidate() override {}
     void SetGalleryReadySink(GalleryReadySink) final {}
@@ -397,7 +401,18 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
                                mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
 
    private:
+    ExploreDemandCheck demand_;
+    bool demand_bound_ = false;
     std::uint64_t generation_ = 0U;
+};
+
+struct ExplorePublicationDemandGate final {
+    ExploreDemandCheck demand;
+    std::uint64_t generation = 0U;
+    std::promise<void> entered;
+    std::promise<void> release;
+    std::shared_future<void> released = release.get_future().share();
+    std::atomic_bool release_timed_out{false};
 };
 
 struct StreamingExploreProbe final {
@@ -509,6 +524,9 @@ struct StreamingExploreProbe final {
     std::size_t rollbacks = 0U;
     std::string opened_source;
     std::shared_ptr<ExplorePostRenderGate> render_gate;
+    std::shared_ptr<ExplorePublicationDemandGate> publication_gate;
+    std::vector<ExploreDemandCheck> bound_demands;
+    std::size_t bound_opens = 0U;
 
    private:
     void SignalGate(bool& gate) {
@@ -530,7 +548,13 @@ struct StreamingExploreProbe final {
 }
 
 class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
-    void SetCurrentDemand(ExploreDemandCheck) override {}
+    void SetCurrentDemand(ExploreDemandCheck demand) override {
+        if (demand_bound_) throw std::logic_error("test streaming Explore demand rebound");
+        demand_ = std::move(demand);
+        demand_bound_ = true;
+        std::scoped_lock lock(probe_->mutex);
+        probe_->bound_demands.push_back(demand_);
+    }
     ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
    public:
     explicit ControlledStreamingExploreAlgorithm(std::shared_ptr<StreamingExploreProbe> probe) : probe_(std::move(probe)) {}
@@ -542,7 +566,9 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     }
 
     ExploreOpened Open(const std::string_view source, std::stop_token) override {
+        if (!demand_bound_ || !demand_.generation()) throw std::logic_error("Explore ingress preceded demand binding");
         std::scoped_lock lock(probe_->mutex);
+        ++probe_->bound_opens;
         probe_->opened_source = source;
         order_ = {0U, 1U, 2U, 3U, 4U, 5U};
         return {
@@ -594,7 +620,15 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
             .cumulative = probe_->cumulative,
         });
     }
-    void CommitOutputPublication() noexcept override { checkpoint_.reset(); }
+    void CommitOutputPublication() noexcept override {
+        checkpoint_.reset();
+        if (auto gate = std::exchange(probe_->publication_gate, {})) {
+            gate->demand = demand_;
+            gate->generation = probe_->generation;
+            gate->entered.set_value();
+            gate->release_timed_out.store(gate->released.wait_for(5s) != std::future_status::ready);
+        }
+    }
     bool RollbackOutputPublication() noexcept override {
         GalleryReadySink wake;
         {
@@ -794,6 +828,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     }
 
     std::shared_ptr<StreamingExploreProbe> probe_;
+    ExploreDemandCheck demand_;
+    bool demand_bound_ = false;
     std::vector<std::uint32_t> order_;
     std::uint64_t candidate_generation_ = 0U;
     std::optional<PublicationCheckpoint> checkpoint_;
@@ -966,7 +1002,13 @@ struct CancellationProbe final {
 
 class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
    public:
-    explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe) : probe_(std::move(probe)) {}
+    explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe,
+                                         std::shared_ptr<ExploreDemandCheck> demand = {})
+        : probe_(std::move(probe)), retained_demand_(std::move(demand)) {}
+    void SetCurrentDemand(ExploreDemandCheck demand) override {
+        if (retained_demand_) *retained_demand_ = demand;
+        SynchronousExploreAlgorithm::SetCurrentDemand(std::move(demand));
+    }
     ExploreOpened Open(std::string_view, const std::stop_token stop) override {
         if (opened_) {
             static_cast<void>(wait_for_cancellation(stop, *probe_));
@@ -999,6 +1041,7 @@ class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
 
    private:
     std::shared_ptr<CancellationProbe> probe_;
+    std::shared_ptr<ExploreDemandCheck> retained_demand_;
     std::vector<std::uint32_t> order_;
     bool opened_ = false;
 };
@@ -2309,6 +2352,135 @@ TEST_CASE("Explore parallelism follows the current Linux affinity limit") {
     CHECK(automatic <= kExploreMaximumParallelism);
     CHECK(normalize_explore_parallelism(kExploreMaximumParallelism + 100U) == automatic);
     CHECK(normalize_explore_parallelism(1U) == 1U);
+}
+
+TEST_CASE("Explore demand retains only its scalar and observes supersession and restoration", "[explore][demand]") {
+    CHECK(ExploreDemandCheck{}(0U));
+    CHECK(ExploreDemandCheck{}(99U));
+    ExploreDemandCheck retained;
+    std::weak_ptr<const std::atomic<std::uint64_t>> lifetime;
+    {
+        auto issuer = std::make_shared<std::atomic<std::uint64_t>>(11U);
+        lifetime = issuer;
+        retained = ExploreDemandCheck{issuer};
+        CHECK(retained(11U));
+        std::promise<void> superseded;
+        auto changed = superseded.get_future();
+        auto observer = std::async(std::launch::async, [retained, changed = std::move(changed)]() mutable {
+            changed.wait();
+            return !retained(11U) && retained(12U);
+        });
+        issuer->store(12U, std::memory_order_release);
+        superseded.set_value();
+        CHECK(observer.get());
+        issuer->store(11U, std::memory_order_release);
+        CHECK(retained(11U));
+        CHECK_FALSE(retained(12U));
+        issuer->store(0U, std::memory_order_release);
+    }
+    CHECK_FALSE(lifetime.expired());
+    CHECK_FALSE(retained(11U));
+    CHECK(retained(0U));
+    retained = {};
+    CHECK(lifetime.expired());
+}
+
+TEST_CASE("Explore demand completes on another thread while publication owns finalization", "[explore][demand]") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    auto gate = std::make_shared<ExplorePublicationDemandGate>();
+    probe->publication_gate = gate;
+    auto entered = gate->entered.get_future();
+    EventGate events;
+    ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
+                          [&events](ExploreSystem::event_type) { events.Advance(); }};
+    static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U},
+                                   .compiled_source = "/test"}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    auto observation = std::async(std::launch::async, [gate] { return gate->demand(gate->generation); });
+    // Release before joining or asserting: an owner-mutex demand callback must
+    // fail the bounded completion check without stranding either worker.
+    const auto completion = observation.wait_for(200ms);
+    gate->release.set_value();
+    CHECK(completion == std::future_status::ready);
+    CHECK(observation.get());
+    REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
+    CHECK_FALSE(gate->release_timed_out.load());
+}
+
+TEST_CASE("Each Explore runtime binds the same retained demand before ingress", "[explore][demand]") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<StreamingExploreProbe>();
+    auto replacement_probe = std::make_shared<StreamingExploreProbe>();
+    auto first_factory = streaming_explore_runtime_factory(backend, probe);
+    auto replacement_factory = streaming_explore_runtime_factory(backend, replacement_probe);
+    auto constructions = std::make_shared<std::atomic<std::size_t>>(0U);
+    ExploreDemandCheck retained;
+    std::uint64_t committed_generation = 0U;
+    {
+        EventGate events;
+        ExploreSystem explore{settings.system(), kDevice, 2U,
+                              [first_factory, replacement_factory, constructions](auto revisions) {
+                                  return constructions->fetch_add(1U) == 0U ? first_factory(std::move(revisions))
+                                                                            : replacement_factory(std::move(revisions));
+                              },
+                              [&events](ExploreSystem::event_type) { events.Advance(); }};
+        const ExploreViewport viewport{.extent = {8U, 4U}, .row_count = 1U, .columns = 2U};
+        open_streaming_gallery(explore, events, viewport);
+        {
+            std::scoped_lock lock(probe->mutex);
+            REQUIRE(probe->bound_demands.size() == 1U);
+            CHECK(probe->bound_opens == 1U);
+            retained = probe->bound_demands.front();
+        }
+        const auto first = explore.snapshot();
+        CHECK(retained(first.gallery.generation));
+        contracts::SettingsUpdateRequest update;
+        update.updates.push_back({.path = "workflows.explore.h2d_dataloader",
+                                  .value = mmltk::frameworks::serialization::wire::FlatValue{
+                                      !settings.system().explore_settings_candidate().loading.h2d_dataloader}});
+        static_cast<void>(settings.system().Update(std::move(update)));
+        static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/replacement"}));
+        REQUIRE(events.Wait([&] { return explore.snapshot().ready && explore.snapshot().frame.revision > first.frame.revision; }));
+        {
+            std::scoped_lock lock(replacement_probe->mutex);
+            REQUIRE(replacement_probe->bound_demands.size() == 1U);
+            CHECK(replacement_probe->bound_opens == 1U);
+            CHECK(replacement_probe->bound_demands.front().generation() == retained.generation());
+        }
+        committed_generation = explore.LastInteractionGeneration();
+        CHECK(retained(committed_generation));
+        CHECK_FALSE(retained(first.gallery.generation));
+    }
+    CHECK_FALSE(retained(committed_generation));
+}
+
+TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacement rollback", "[explore][demand]") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto probe = std::make_shared<CancellationProbe>();
+    auto retained = std::make_shared<ExploreDemandCheck>();
+    auto entered = probe->entered.get_future();
+    EventGate events;
+    ExploreSystem explore{
+        settings.system(), kDevice, 2U,
+        RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                       [probe, retained] { return std::make_unique<CancellableExploreAlgorithm>(probe, retained); }, 2U),
+        [&events](ExploreSystem::event_type) { events.Advance(); }};
+    const ExploreViewport viewport{.extent = {32U, 32U}};
+    static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/incumbent"}));
+    REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
+    const auto incumbent = explore.snapshot();
+    static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/replacement"}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    const auto replacement = explore.LastInteractionGeneration();
+    CHECK((*retained)(replacement));
+    explore.Shutdown();
+    CHECK(explore.snapshot().frame == incumbent.frame);
+    CHECK_FALSE((*retained)(incumbent.gallery.generation));
+    CHECK_FALSE((*retained)(replacement));
 }
 
 TEST_CASE("Explore publishes placeholders before loaders and patches released lanes incrementally") {

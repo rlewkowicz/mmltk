@@ -450,7 +450,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     [[nodiscard]] std::vector<ExploreLabel> Labels() const override { return gallery_.Labels(); }
 
     void SetGalleryReadySink(GalleryReadySink sink) override { gallery_.SetReadySink(std::move(sink)); }
-    void SetCurrentDemand(ExploreDemandCheck check) override { gallery_.SetCurrentDemand(check); }
+    void SetCurrentDemand(ExploreDemandCheck check) override { gallery_.SetCurrentDemand(std::move(check)); }
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate) const override {
         const auto* dataset = candidate != nullptr && open_candidate_ ? open_candidate_.get() : committed_.get();
         const auto& order = CandidateOrder(candidate);

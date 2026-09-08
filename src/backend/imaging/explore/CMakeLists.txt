@@ -42,6 +42,7 @@ set_target_properties(mmltk_backend_imaging_explore PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_SEPARABLE_COMPILATION ON
 )
+mmltk_register_header_isolation(mmltk_backend_imaging_explore)
 
 function(mmltk_add_backend_imaging_explore_tests)
     add_library(mmltk_backend_imaging_explore_test_support STATIC

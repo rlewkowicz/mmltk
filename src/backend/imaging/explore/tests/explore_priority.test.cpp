@@ -14,6 +14,7 @@
 
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
+#include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 #include "src/backend/imaging/raster/detail/raster_color.h"
@@ -137,6 +138,19 @@ class CudaStream final {
    private:
     cudaStream_t stream_ = nullptr;
 };
+
+TEST_CASE("Host render demand samples only the current atomic generation", "[backend][imaging][explore][demand]") {
+    CHECK(detail::ExploreRenderDemand{}.valid());
+    std::atomic<std::uint64_t> generation{9U};
+    const detail::ExploreRenderDemand demand{.latest_generation = &generation, .generation = 9U};
+    CHECK(demand.valid());
+    generation.store(10U, std::memory_order_release);
+    CHECK_FALSE(demand.valid());
+    generation.store(9U, std::memory_order_release);
+    CHECK(demand.valid());
+    generation.store(0U, std::memory_order_release);
+    CHECK_FALSE(demand.valid());
+}
 
 TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha", "[backend][imaging][explore][probe]") {
     int devices = 0;

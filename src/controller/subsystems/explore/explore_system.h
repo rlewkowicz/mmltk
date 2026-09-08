@@ -3,6 +3,7 @@
 #include "src/controller/presentation/visual_source_projection.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -98,6 +99,7 @@ struct ExploreOrderFacts final {
     [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<std::uint32_t> visible_indices{};
 };
 struct ExploreAugmentationPreview final {
+    bool operator==(const ExploreAugmentationPreview&) const = default;
     bool enabled = false;
     std::uint64_t seed = 0U;
 };
@@ -174,13 +176,21 @@ struct ExploreGalleryPublication final {
     std::size_t active_pinned_bytes = 0U;
     std::size_t stale_discarded = 0U;
 };
-struct ExploreDemandCheck final {
-    void* context = nullptr;
-    bool (*current)(void*, std::uint64_t) noexcept = nullptr;
+class ExploreDemandCheck final {
+   public:
+    ExploreDemandCheck() noexcept = default;
+    explicit ExploreDemandCheck(std::shared_ptr<const std::atomic<std::uint64_t>> generation) noexcept
+        : generation_(std::move(generation)) {}
     [[nodiscard]] bool operator()(std::uint64_t generation) const noexcept {
-        return !current || current(context, generation);
+        return !generation_ || generation_->load(std::memory_order_acquire) == generation;
     }
+    [[nodiscard]] const std::atomic<std::uint64_t>* generation() const noexcept { return generation_.get(); }
+
+   private:
+    // Retain only the issuer's authoritative scalar, never the system owner.
+    std::shared_ptr<const std::atomic<std::uint64_t>> generation_;
 };
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 enum class ExploreOutputChange : std::uint8_t { Initialize, Semantic, Unchanged };
 // Renderer-owned physical high-water capacities. Host bytes cover retained
 // cache meaning and render/scheduler metadata, not the compiled dataset, order,
@@ -233,6 +243,7 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual std::vector<ExploreLabel> Labels() const { return {}; }
     [[nodiscard]] virtual std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t offset) const = 0;
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
+    // Bind once during runtime construction, before any image ingress.
     virtual void SetCurrentDemand(ExploreDemandCheck) = 0;
     [[nodiscard]] virtual ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const = 0;
     [[nodiscard]] virtual ExploreStorageFootprint StorageFootprint() const { return {}; }

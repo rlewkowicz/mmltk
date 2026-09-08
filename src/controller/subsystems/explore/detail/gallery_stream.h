@@ -53,6 +53,7 @@ class GalleryStream final {
     ~GalleryStream();
     [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);
+    // Construction-only binding; retained unchanged through native retirement.
     void SetCurrentDemand(ExploreDemandCheck);
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan&, std::span<const std::uint32_t>,

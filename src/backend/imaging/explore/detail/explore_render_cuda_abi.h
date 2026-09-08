@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 
@@ -10,11 +11,13 @@ namespace mmltk::backend::imaging::explore::detail {
 // Non-owning host submission frontier. Never copied into a CUDA kernel;
 // already-submitted work keeps its ordinary completion/lifetime contract.
 struct ExploreRenderDemand final {
-    void* context = nullptr;
+    const std::atomic<std::uint64_t>* latest_generation = nullptr;
     std::uint64_t generation = 0U;
-    bool (*current)(void*, std::uint64_t) noexcept = nullptr;
-    [[nodiscard]] bool valid() const noexcept { return current == nullptr || current(context, generation); }
+    [[nodiscard]] bool valid() const noexcept {
+        return latest_generation == nullptr || latest_generation->load(std::memory_order_acquire) == generation;
+    }
 };
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
 // CLEANUP-IGNORE: The card input descriptor is a fixed kernel ABI, not an acceptance-state or host-layout record.
 struct ExploreRenderCardDescriptorAbi final {
