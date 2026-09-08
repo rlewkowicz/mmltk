@@ -29,8 +29,7 @@ struct VisualSourceProjection final {
     }
 
     using relation = mmltk::frameworks::reflection::StaticMemberRelation<
-        Snapshot, VisualSourceObservation, 2U,
-        mmltk::frameworks::reflection::MemberRelationEntry<Frame, &VisualSourceObservation::frame>,
+        Snapshot, VisualSourceObservation, 2U, mmltk::frameworks::reflection::MemberRelationEntry<Frame, &VisualSourceObservation::frame>,
         mmltk::frameworks::reflection::MemberRelationEntry<Revision, &VisualSourceObservation::snapshot_revision>>;
 
     [[nodiscard]] static constexpr VisualSourceObservation Observe(const Snapshot& snapshot) {

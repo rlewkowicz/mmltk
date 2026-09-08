@@ -38,19 +38,44 @@ class ImageUpscalerInitializationFailure final : public mmltk::frameworks::gpu::
 };
 
 enum class ImageUpscalerExecutionStage : std::uint8_t {
-    StreamCreated, EventCreated, ContextCreated, BuffersAllocated,
-    WarmInputSubmitted, WarmSubmitted, WarmSettled, CaptureBegan, CaptureSubmitted, CaptureEnded,
-    GraphInstantiated, ReplaySubmitted, ReplaySettled, GraphExecutableDestroyed,
-    GraphDestroyed, EventDestroyed, StreamDestroyed, BufferReleased, ContextReleased,
-    InitializationAdmitted, ChecksumAdmitted, CacheLockAdmitted, CacheLockWaiting,
-    BuildAdmitted, BasicAllocationAdmitted, BasicLaunchAdmitted, PreprocessAdmitted,
-    TargetAdmitted, TilePrepared, BindingsReady, RuntimeEnqueued, Count,
+    StreamCreated,
+    EventCreated,
+    ContextCreated,
+    BuffersAllocated,
+    WarmInputSubmitted,
+    WarmSubmitted,
+    WarmSettled,
+    CaptureBegan,
+    CaptureSubmitted,
+    CaptureEnded,
+    GraphInstantiated,
+    ReplaySubmitted,
+    ReplaySettled,
+    GraphExecutableDestroyed,
+    GraphDestroyed,
+    EventDestroyed,
+    StreamDestroyed,
+    BufferReleased,
+    ContextReleased,
+    InitializationAdmitted,
+    ChecksumAdmitted,
+    CacheLockAdmitted,
+    CacheLockWaiting,
+    BuildAdmitted,
+    BasicAllocationAdmitted,
+    BasicLaunchAdmitted,
+    PreprocessAdmitted,
+    TargetAdmitted,
+    TilePrepared,
+    BindingsReady,
+    RuntimeEnqueued,
+    Count,
 };
 // Effect-only, per-owner instrumentation. Empty in ordinary execution; failures
 // enter the same checked settlement path as failures of the preceding operation.
 using ImageUpscalerExecutionCheckpoint = std::function<void(ImageUpscalerExecutionStage)>;
-[[nodiscard]] inline bool image_upscaler_admitted(const ImageUpscalerExecutionCheckpoint& checkpoint,
-    ImageUpscalerExecutionStage stage, ImageUpscalerCurrent current) {
+[[nodiscard]] inline bool image_upscaler_admitted(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerExecutionStage stage,
+                                                  ImageUpscalerCurrent current) {
     if (checkpoint) checkpoint(stage);
     return current();
 }

@@ -247,10 +247,11 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
     unsigned collections = 0U;
     const auto ids = DiagnosticSpanIds::issued();
     DiagnosticCountingClock::reads = 0U;
-    RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact, DiagnosticCountingClock> span{target, [&] {
-        ++collections;
-        return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
-    }};
+    RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact, DiagnosticCountingClock> span{
+        target, [&] {
+            ++collections;
+            return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
+        }};
     span.FinishWith([&](auto&) { ++collections; });
     CHECK(collections == 0U);
     CHECK(DiagnosticCountingClock::reads == 0U);
@@ -267,9 +268,7 @@ TEST_CASE("diagnostic spans pair overlapping intervals and explicit asynchronous
     std::array<RuntimeDiagnosticFact, 4U> captured{};
     std::size_t count = 0U;
     Capture sink{&captured, &count};
-    auto facts = [] {
-        return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
-    };
+    auto facts = [] { return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}}; };
     DiagnosticCountingClock::reads = 0U;
     RuntimeDiagnosticSpan<Capture, RuntimeDiagnosticFact, DiagnosticCountingClock> outer{sink, facts};
     const auto parent = outer.link();
@@ -346,9 +345,15 @@ TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcom
     RuntimeDiagnostics probing{diagnostics.producer(), true};
     CHECK(probing.target().pixel_probes_enabled());
     const contracts::DiagnosticContext correlation{
-        .surface_high = 11U, .surface_low = 12U, .selection_generation = 13U, .frame_revision = 14U,
-        .source = {.source_session = 3U, .source_instance = 1U, .source_revision = 14U,
-                   .clean_revision = 10U, .source_observation_revision = 42U},
+        .surface_high = 11U,
+        .surface_low = 12U,
+        .selection_generation = 13U,
+        .frame_revision = 14U,
+        .source = {.source_session = 3U,
+                   .source_instance = 1U,
+                   .source_revision = 14U,
+                   .clean_revision = 10U,
+                   .source_observation_revision = 42U},
         .demand = {.demand_generation = 9U},
         .publication = {.presentation_revision = 17U},
         .allocation = {.allocation_generation = 8U},
@@ -413,9 +418,8 @@ TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][serv
         REQUIRE(operation.submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
     bool executed = false;
     {
-        RuntimeDiagnosticSpan span{target, [] {
-            return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
-        }};
+        RuntimeDiagnosticSpan span{
+            target, [] { return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}}; }};
         executed = true;
         span.Finish();
     }
@@ -423,9 +427,8 @@ TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][serv
     CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity);
     CHECK(diagnostics.counters().dropped == 2U);
     {
-        RuntimeDiagnosticSpan span{target, [] {
-            return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
-        }};
+        RuntimeDiagnosticSpan span{
+            target, [] { return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}}; }};
         diagnostics.close(DiagnosticsCloseMode::Discard);
     }
     CHECK_FALSE(target.valid());

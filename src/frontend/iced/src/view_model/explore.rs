@@ -106,7 +106,7 @@ impl ExploreModel {
 
 use super::{
     ApplicationEvent, ApplicationIntentEndpoint, ApplicationModel, ApplicationReply, Observation,
-    PresentationSourceKind, UiError, merge_observation,
+    PresentationSourceKind, UiError, UiErrorKind, merge_observation,
 };
 
 impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationModel {
@@ -123,7 +123,9 @@ impl crate::generated::ExploreApplicationProjection<UiError> for ApplicationMode
                 match self.install_explore_snapshot(value.snapshot, false) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
-                        if self.presentation_model.foreground() == Some(PresentationSourceKind::Explore) {
+                        if self.presentation_model.foreground()
+                            == Some(PresentationSourceKind::Explore)
+                        {
                             self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                         }
                     }
@@ -235,7 +237,9 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                             .is_some_and(|request| value.request.as_ref() == Some(request))
                         {
                             self.explore.requested_upscale = None;
-                            if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
+                            if self.presentation_model.foreground()
+                                == Some(PresentationSourceKind::Upscale)
+                            {
                                 self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                             }
                         }
@@ -244,13 +248,19 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                         }
                         if current_failure {
                             let (kind, title) = match value.kind {
-                                crate::generated::UpscaleFailureKind::Unavailable =>
-                                    (UiErrorKind::Unavailable, "Service unavailable"),
-                                crate::generated::UpscaleFailureKind::Failed |
-                                crate::generated::UpscaleFailureKind::Physical =>
-                                    (UiErrorKind::Failed, "Operation failed"),
+                                crate::generated::UpscaleFailureKind::Unavailable => {
+                                    (UiErrorKind::Unavailable, "Service unavailable")
+                                }
+                                crate::generated::UpscaleFailureKind::Failed
+                                | crate::generated::UpscaleFailureKind::Physical => {
+                                    (UiErrorKind::Failed, "Operation failed")
+                                }
                             };
-                            self.error = Some(UiError { kind, title, detail: value.detail });
+                            self.error = Some(UiError {
+                                kind,
+                                title,
+                                detail: value.detail,
+                            });
                         }
                     }
                     Ok(Observation::Current | Observation::Stale) => {}
@@ -349,7 +359,11 @@ mod tests {
             model.presentation_state(),
             ExplorePresentationState::Populated
         );
-        assert!(model.presentation_title().contains("last completed product"));
+        assert!(
+            model
+                .presentation_title()
+                .contains("last completed product")
+        );
     }
 
     #[test]
@@ -402,31 +416,43 @@ mod tests {
         explore.mode = crate::generated::ExploreMode::Detail;
         explore.selectedimage = Some(0);
         explore.ready = true;
-        explore.frame = super::super::test_support::visual_frame(PresentationSourceKind::Explore, 1);
+        explore.frame =
+            super::super::test_support::visual_frame(PresentationSourceKind::Explore, 1);
         let first = crate::generated::UpscaleRequest {
-            source: explore.frame.clone(), document: explore.document.clone(),
+            source: explore.frame.clone(),
+            document: explore.document.clone(),
             kernel: crate::generated::UpscaleKernel::Default,
         };
         let second = crate::generated::UpscaleRequest {
-            kernel: crate::generated::UpscaleKernel::ShiftLut, ..first.clone()
+            kernel: crate::generated::UpscaleKernel::ShiftLut,
+            ..first.clone()
         };
         model.explore.snapshot = Some(explore);
-        let first_correlation = model.begin_intent(ApplicationIntentEndpoint::UpscaleStart).unwrap();
+        let first_correlation = model
+            .begin_intent(ApplicationIntentEndpoint::UpscaleStart)
+            .unwrap();
         model.explore.sent_upscale = Some(first.clone());
         model.request_upscale(second.clone());
         let mut snapshot = model.upscale_snapshot.clone().unwrap();
         snapshot.revision += 1;
-        model.reduce_event(ApplicationEvent::UpscaleUpscaleFailed(crate::generated::UpscaleFailed {
-            snapshot: snapshot.clone(), detail: "superseded Basic failure".into(),
-            request: Some(first), kind: crate::generated::UpscaleFailureKind::Failed,
-        }));
+        model.reduce_event(ApplicationEvent::UpscaleUpscaleFailed(
+            crate::generated::UpscaleFailed {
+                snapshot: snapshot.clone(),
+                detail: "superseded Basic failure".into(),
+                request: Some(first),
+                kind: crate::generated::UpscaleFailureKind::Failed,
+            },
+        ));
         assert!(model.error.is_none());
         assert!(model.explore.sent_upscale.is_none());
         assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
-        model.reduce_reply(first_correlation, Err(crate::protocol::ApplicationError {
-            category: crate::generated::ApplicationErrorCategory::Failed,
-            detail: "superseded Basic admission failure".into(),
-        }));
+        model.reduce_reply(
+            first_correlation,
+            Err(crate::protocol::ApplicationError {
+                category: crate::generated::ApplicationErrorCategory::Failed,
+                detail: "superseded Basic admission failure".into(),
+            }),
+        );
         assert!(model.error.is_none());
         assert!(!model.has_pending(ApplicationIntentEndpoint::UpscaleStart));
         model.explore.sent_upscale = Some(second.clone());
@@ -434,11 +460,14 @@ mod tests {
         snapshot.ready = true;
         snapshot.kernel = second.kernel;
         snapshot.input = second.source.clone();
-        snapshot.frame = super::super::test_support::visual_frame(PresentationSourceKind::Upscale, 2);
+        snapshot.frame =
+            super::super::test_support::visual_frame(PresentationSourceKind::Upscale, 2);
         snapshot.methods[1].available = true;
         snapshot.methods[1].completed = Some(second.clone());
         snapshot.methods[1].frame = snapshot.frame.clone();
-        model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(crate::generated::UpscaleChanged { snapshot }));
+        model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
+            crate::generated::UpscaleChanged { snapshot },
+        ));
         assert!(model.error.is_none());
         assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
     }

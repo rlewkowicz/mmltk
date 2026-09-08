@@ -383,8 +383,8 @@ TEST_CASE("output storage sums every physical plane and slot at retained high wa
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime source{{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic}};
     source.Publish(16U, 8U, [](auto, auto, auto) {});
-    SystemImageRuntime receiver{{.device = 1, .backend = backend,
-        .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U}};
+    SystemImageRuntime receiver{
+        {.device = 1, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U}};
     CHECK(receiver.OutputStorageFootprint().device_bytes == 0U);
     CHECK(receiver.OutputStorageFootprint().pinned_bytes == 0U);
     backend->peer_access = false;
@@ -537,11 +537,9 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
 
     auto candidate = runtime.AcquireOutput({}, runtime.Completed());
     REQUIRE(candidate.valid());
-    runtime.Publish(candidate, 8U, 8U,
-                    [](const auto, const auto semantic, auto) {
-                        std::memset(reinterpret_cast<void*>(semantic.data), 0x65,
-                                    semantic.descriptor.pitch_bytes * semantic.descriptor.height);
-                    });
+    runtime.Publish(candidate, 8U, 8U, [](const auto, const auto semantic, auto) {
+        std::memset(reinterpret_cast<void*>(semantic.data), 0x65, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+    });
     const auto candidate_revision = candidate.revision();
     CHECK(candidate_revision > incumbent_revision);
     CHECK(runtime.Borrow().plane(0U).revision() == incumbent_revision);
@@ -555,9 +553,7 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
     CHECK(*reinterpret_cast<const std::uint8_t*>(incumbent.plane(1U).plane().data) == 0x43U);
 
     std::stop_source stop;
-    auto admission = std::async(std::launch::async, [&runtime, token = stop.get_token()] {
-        return runtime.AcquireOutput(token);
-    });
+    auto admission = std::async(std::launch::async, [&runtime, token = stop.get_token()] { return runtime.AcquireOutput(token); });
     CHECK(admission.wait_for(10ms) == std::future_status::timeout);
     incumbent = {};
     REQUIRE(admission.wait_for(1s) == std::future_status::ready);
@@ -621,8 +617,7 @@ TEST_CASE("failed candidate growth retains the committed product and later initi
         auto candidate = runtime.AcquireOutput({}, runtime.Completed());
         REQUIRE(candidate.valid());
         backend->FailAfter(FakeImageBackend::FailurePoint::AllocatePlane, 1U);
-        CHECK_THROWS(runtime.Publish(candidate, 16U, 16U,
-                                     [](auto, auto, auto) {}));
+        CHECK_THROWS(runtime.Publish(candidate, 16U, 16U, [](auto, auto, auto) {}));
     }
     auto retained = runtime.Borrow();
     REQUIRE(retained.valid());
@@ -633,9 +628,7 @@ TEST_CASE("failed candidate growth retains the committed product and later initi
     auto replacement = runtime.AcquireOutput({}, runtime.Completed());
     REQUIRE(replacement.valid());
     runtime.Publish(replacement, 16U, 16U,
-                    [](const auto clean, const auto, auto) {
-                        *reinterpret_cast<std::uint8_t*>(clean.data) = 0x7BU;
-                    });
+                    [](const auto clean, const auto, auto) { *reinterpret_cast<std::uint8_t*>(clean.data) = 0x7BU; });
     runtime.CommitOutput(std::move(replacement));
     auto completed = runtime.Borrow();
     REQUIRE(completed.valid());
@@ -646,8 +639,8 @@ TEST_CASE("failed candidate growth retains the committed product and later initi
 
 TEST_CASE("candidate baselines remain exact across cached selection and handle moves") {
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{.device = 0, .backend = backend,
-        .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U}};
+    SystemImageRuntime runtime{
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U}};
     const auto publish = [&](std::uint8_t value) {
         auto candidate = runtime.AcquireOutput();
         runtime.Publish(candidate, 8U, 8U, [value](auto clean, auto, auto) {
@@ -690,8 +683,8 @@ TEST_CASE("candidate baselines remain exact across cached selection and handle m
 
 TEST_CASE("clean-only candidate preservation excludes invalid semantics and rolls back without disturbing readers") {
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{.device = 0, .backend = backend,
-        .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 4U}};
+    SystemImageRuntime runtime{
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 4U}};
     runtime.Publish(8U, 8U, [](auto clean, auto semantic, auto) {
         std::memset(reinterpret_cast<void*>(clean.data), 0x17, clean.descriptor.pitch_bytes * clean.descriptor.height);
         std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
@@ -702,10 +695,13 @@ TEST_CASE("clean-only candidate preservation excludes invalid semantics and roll
     const auto copied = backend->same_copies.load();
     {
         auto candidate = runtime.AcquireOutput({}, baseline, ImagePlanePreservation::Clean);
-        CHECK_THROWS_WITH(runtime.Publish(candidate, 8U, 8U, [](auto, auto semantic, auto) {
-            std::memset(reinterpret_cast<void*>(semantic.data), 0x58, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
-            throw std::runtime_error("semantic preparation failed");
-        }), "semantic preparation failed");
+        CHECK_THROWS_WITH(runtime.Publish(candidate, 8U, 8U,
+                                          [](auto, auto semantic, auto) {
+                                              std::memset(reinterpret_cast<void*>(semantic.data), 0x58,
+                                                          semantic.descriptor.pitch_bytes * semantic.descriptor.height);
+                                              throw std::runtime_error("semantic preparation failed");
+                                          }),
+                          "semantic preparation failed");
     }
     CHECK(runtime.Completed().revision() == baseline.revision());
     CHECK(backend->same_copies.load() == copied + 1U);
@@ -809,10 +805,9 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
     auto plane = std::move(borrowed).TakePlane(0U);
     borrowed = {};
     std::stop_source stop;
-    auto admission = std::async(std::launch::async,
-        [&runtime, baseline = std::move(baseline), token = stop.get_token()]() mutable {
-            return runtime.AcquireOutput(token, std::move(baseline));
-        });
+    auto admission = std::async(std::launch::async, [&runtime, baseline = std::move(baseline), token = stop.get_token()]() mutable {
+        return runtime.AcquireOutput(token, std::move(baseline));
+    });
     CHECK(admission.wait_for(10ms) == std::future_status::timeout);
     plane = {};
     const auto status = admission.wait_for(1s);
@@ -850,8 +845,8 @@ TEST_CASE("retained completed handles bound admission and stopping releases its 
 
 TEST_CASE("completed custody retains only its slot and context after pool retirement") {
     auto backend = std::make_shared<FakeImageBackend>();
-    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
-        .device = 0, .backend = backend, .output_buffer_count = 2U});
+    auto runtime =
+        std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend, .output_buffer_count = 2U});
     runtime->Publish(8U, 8U, [](auto, auto, auto) {});
     auto retained = runtime->Completed();
     runtime->Publish(8U, 8U, [](auto, auto, auto) {});

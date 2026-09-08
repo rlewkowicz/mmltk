@@ -93,9 +93,8 @@ TEST_CASE("ShiftLUT packed storage rejects invalid lengths before scalar access"
 }
 
 TEST_CASE("ShiftLUT packed storage rejects nonfinite and excessive LUT magnitudes", "[shiftlut_format]") {
-    const auto value = GENERATE(std::numeric_limits<float>::quiet_NaN(),
-                               std::numeric_limits<float>::infinity(),
-                               -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
+    const auto value = GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
+                                -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
     const auto index = GENERATE(std::size_t{0}, lut::table_offset(lut::TableFamily::Shifts) - 1);
     std::vector<float> tables(lut::kTableElements);
     tables[index] = value;

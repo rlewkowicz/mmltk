@@ -18,8 +18,7 @@ class TensorRtCacheIntegrityError final : public std::runtime_error {
 };
 class TensorRtOperationError final : public std::runtime_error {
    public:
-    TensorRtOperationError(std::int32_t code, std::string_view operation)
-        : std::runtime_error(std::string(operation)), code_(code) {}
+    TensorRtOperationError(std::int32_t code, std::string_view operation) : std::runtime_error(std::string(operation)), code_(code) {}
     [[nodiscard]] std::int32_t code() const noexcept { return code_; }
 
    private:

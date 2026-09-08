@@ -63,10 +63,12 @@ class AnnotationSystem::Impl final {
                             return [this, detail = std::string(error.what())] { Rejected(detail, true, std::nullopt); };
                         }
                         const auto paths = runtime.CopyInputFrom(std::move(source.pixels));
-                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                      .operation = VisualDiagnosticOperation::CopyCompleted,
-                                      .device = settings_.device,
-                                      .copy_path = paths[0U]}; });
+                        diagnostics_.Emit([&] {
+                            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
+                                                        .operation = VisualDiagnosticOperation::CopyCompleted,
+                                                        .device = settings_.device,
+                                                        .copy_path = paths[0U]};
+                        });
                         const auto input = runtime.BorrowInput();
                         const auto source_plane = input.plane(0U).plane();
                         auto result = annotation_algorithm(runtime).Open(source_plane, std::move(scene), crop);
@@ -87,14 +89,17 @@ class AnnotationSystem::Impl final {
                                 state.ui = std::move(ui);
                                 state.frame = frame;
                             });
-                            diagnostics_.Emit([&] { return VisualDiagnosticFact{
-                                .system = contracts::DiagnosticOwner::Annotation,
-                                .operation = VisualDiagnosticOperation::DocumentOpened,
-                                .device = settings_.device,
-                                .generation = frame.revision,
-                                .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height,
-                                            .source = visual_diagnostic_source({.frame = frame})},
-                            }; });
+                            diagnostics_.Emit([&] {
+                                return VisualDiagnosticFact{
+                                    .system = contracts::DiagnosticOwner::Annotation,
+                                    .operation = VisualDiagnosticOperation::DocumentOpened,
+                                    .device = settings_.device,
+                                    .generation = frame.revision,
+                                    .context = {.capacity_width = frame.extent.width,
+                                                .capacity_height = frame.extent.height,
+                                                .source = visual_diagnostic_source({.frame = frame})},
+                                };
+                            });
                         };
                     },
                     [this] { Cancelled(); })) {
@@ -251,7 +256,7 @@ class AnnotationSystem::Impl final {
 
    private:
     [[nodiscard]] detail::VisualRuntimeOwner::Notification CompleteOperation(AnnotationOperationResult result,
-                                                                            const VisualFrame frame = {}) {
+                                                                             const VisualFrame frame = {}) {
         return [this, result = std::move(result), frame]() mutable {
             if (result.outcome == AnnotationOperationOutcome::Rejected) {
                 Rejected(std::move(result.detail), true, std::move(result.ui));
@@ -282,15 +287,16 @@ class AnnotationSystem::Impl final {
                         const auto source = input.plane(0U).plane();
                         if (stop.stop_requested()) return [this] { Cancelled(); };
                         auto result = operation(annotation_algorithm(runtime));
-                        if (result.outcome == AnnotationOperationOutcome::Rejected)
-                            return CompleteOperation(std::move(result));
+                        if (result.outcome == AnnotationOperationOutcome::Rejected) return CompleteOperation(std::move(result));
                         runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
                             annotation_algorithm(runtime).Render(source, clean, semantic, stream);
                         });
-                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                      .operation = diagnostic,
-                                      .device = settings_.device,
-                                      .generation = result.ui.document_revision}; });
+                        diagnostics_.Emit([&] {
+                            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
+                                                        .operation = diagnostic,
+                                                        .device = settings_.device,
+                                                        .generation = result.ui.document_revision};
+                        });
                         auto frame = Frame(runtime, extent);
                         return CompleteOperation(std::move(result), frame);
                     },

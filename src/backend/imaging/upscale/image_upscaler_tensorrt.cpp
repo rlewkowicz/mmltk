@@ -24,7 +24,6 @@ module;
 
 module mmltk.backend.imaging.upscale.image_upscaler;
 
-
 import mmltk.common.logging.mmltk_logging;
 
 #include "detail/image_upscaler_internal.h"
@@ -99,26 +98,24 @@ class TensorRtImageUpscalerRuntime final
         const auto& descriptor = this->descriptor();
         const auto device_id = this->device_id();
         ensure_cuda_ok(cudaSetDevice(device_id), "cudaSetDevice for TensorRT Image upscaler");
-            ensure_cuda_ok(cudaEventCreateWithFlags(&source_ready_, cudaEventDisableTiming),
-                           "cudaEventCreate for TensorRT upscaler source");
-            Checkpoint(ImageUpscalerExecutionStage::EventCreated);
-            for (TensorRtTileLane& lane : lanes_) {
-                if (!current() || initialize_lane(lane, current) == ImageUpscalerOutcome::Cancelled)
-                    return ImageUpscalerOutcome::Cancelled;
-            }
-            mmltk::common::logging::trace([&](auto& logger) {
-                const std::uint64_t context_bytes = native_engine(*engine_).getDeviceMemorySizeV2();
-                const std::uint64_t lane_buffer_bytes =
-                    static_cast<std::uint64_t>(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) +
-                                               checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U)) *
-                    sizeof(float);
-                logger.trace(
-                    "event=image_upscaler_tensorrt_runtime_allocated device={} model={} model_sha256={} lane_count={} "
-                    "context_device_memory_bytes={} total_context_device_memory_bytes={} lane_buffer_bytes={} "
-                    "total_lane_buffer_bytes={}",
-                    device_id, descriptor.label, descriptor.sha256, kLaneCount, context_bytes, context_bytes * kLaneCount,
-                    lane_buffer_bytes, lane_buffer_bytes * kLaneCount);
-            });
+        ensure_cuda_ok(cudaEventCreateWithFlags(&source_ready_, cudaEventDisableTiming), "cudaEventCreate for TensorRT upscaler source");
+        Checkpoint(ImageUpscalerExecutionStage::EventCreated);
+        for (TensorRtTileLane& lane : lanes_) {
+            if (!current() || initialize_lane(lane, current) == ImageUpscalerOutcome::Cancelled) return ImageUpscalerOutcome::Cancelled;
+        }
+        mmltk::common::logging::trace([&](auto& logger) {
+            const std::uint64_t context_bytes = native_engine(*engine_).getDeviceMemorySizeV2();
+            const std::uint64_t lane_buffer_bytes =
+                static_cast<std::uint64_t>(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) +
+                                           checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U)) *
+                sizeof(float);
+            logger.trace(
+                "event=image_upscaler_tensorrt_runtime_allocated device={} model={} model_sha256={} lane_count={} "
+                "context_device_memory_bytes={} total_context_device_memory_bytes={} lane_buffer_bytes={} "
+                "total_lane_buffer_bytes={}",
+                device_id, descriptor.label, descriptor.sha256, kLaneCount, context_bytes, context_bytes * kLaneCount, lane_buffer_bytes,
+                lane_buffer_bytes * kLaneCount);
+        });
         return ImageUpscalerOutcome::Completed;
     }
 
@@ -138,14 +135,12 @@ class TensorRtImageUpscalerRuntime final
     [[nodiscard]] cudaError_t ReleaseBackend() noexcept {
         bool settled = true;
         for (TensorRtTileLane& lane : lanes_) {
-            if (lane.stream != nullptr &&
-                !cleanup_.Record(settle_upscaler_stream(lane.stream, lane.graph), "settle TensorRT lane")) {
+            if (lane.stream != nullptr && !cleanup_.Record(settle_upscaler_stream(lane.stream, lane.graph), "settle TensorRT lane")) {
                 settled = false;
                 continue;
             }
             if (lane.graph_exec != nullptr) {
-                if (cleanup_.Record(cudaGraphExecDestroy(lane.graph_exec), "destroy TensorRT graph executable"))
-                    lane.graph_exec = nullptr;
+                if (cleanup_.Record(cudaGraphExecDestroy(lane.graph_exec), "destroy TensorRT graph executable")) lane.graph_exec = nullptr;
                 CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::GraphExecutableDestroyed);
             }
             if (lane.graph != nullptr) {
@@ -223,9 +218,7 @@ class TensorRtImageUpscalerRuntime final
             engine_->CheckOperation(false, "configure TensorRT upscaler input");
         }
         const std::int32_t missing = lane.context->inferShapes(0, nullptr);
-        if (missing != 0) {
-            engine_->CheckOperation(false, "resolve TensorRT upscaler fixed tile shapes");
-        }
+        if (missing != 0) { engine_->CheckOperation(false, "resolve TensorRT upscaler fixed tile shapes"); }
         constexpr std::array<std::int64_t, 4U> output_shape{1, 3, kImageUpscalerOutputExtent, kImageUpscalerOutputExtent};
         if (!shape_matches(lane.context->getTensorShape(descriptor().output_name), output_shape) ||
             !lane.context->setOutputTensorAddress(descriptor().output_name, lane.output.data())) {
@@ -233,8 +226,9 @@ class TensorRtImageUpscalerRuntime final
         }
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         ensure_cuda_ok(cudaMemsetAsync(lane.input.data(), 0,
-            checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) * sizeof(float), lane.stream),
-            "initialize TensorRT warm input");
+                                       checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) * sizeof(float),
+                                       lane.stream),
+                       "initialize TensorRT warm input");
         Checkpoint(ImageUpscalerExecutionStage::WarmInputSubmitted);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         engine_->CheckOperation(lane.context->enqueueV3(lane.stream), "TensorRT first warm inference");
@@ -348,7 +342,8 @@ class TensorRtImageUpscalerRuntime final
 }  // namespace
 
 std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-    std::unique_ptr<TensorRtEngine> engine, const int device_id, const ImageUpscalerExecutionCheckpoint& checkpoint) {
+                                                                     std::unique_ptr<TensorRtEngine> engine, const int device_id,
+                                                                     const ImageUpscalerExecutionCheckpoint& checkpoint) {
     return std::make_shared<TensorRtImageUpscalerRuntime>(descriptor, std::move(engine), device_id, checkpoint);
 }
 

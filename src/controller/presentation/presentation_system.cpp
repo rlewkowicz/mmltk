@@ -21,22 +21,29 @@
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 
 namespace mmltk::controller {
-VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation,
-                                                  const PresentationDiagnosticRecord& record, const int device,
-                                                  const std::uint64_t outcome) noexcept {
+VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record,
+                                                  const int device, const std::uint64_t outcome) noexcept {
     const auto& capability = record.publication.capability;
-    return {.system = contracts::DiagnosticOwner::Presentation, .operation = operation, .device = device,
-            .generation = capability.generation, .value = record.publication.presentation_revision, .detail = outcome,
-            .context = {.capacity_width = capability.extent.width, .capacity_height = capability.extent.height,
-                        .surface_high = capability.surface_high, .surface_low = capability.surface_low,
+    return {.system = contracts::DiagnosticOwner::Presentation,
+            .operation = operation,
+            .device = device,
+            .generation = capability.generation,
+            .value = record.publication.presentation_revision,
+            .detail = outcome,
+            .context = {.capacity_width = capability.extent.width,
+                        .capacity_height = capability.extent.height,
+                        .surface_high = capability.surface_high,
+                        .surface_low = capability.surface_low,
                         .selection_generation = record.submitted.selection_generation,
                         .frame_revision = record.submitted.observation.frame.revision,
-                        .condition = static_cast<std::uint64_t>(capability.condition), .outcome = outcome,
+                        .condition = static_cast<std::uint64_t>(capability.condition),
+                        .outcome = outcome,
                         .source = visual_diagnostic_source(record.submitted.observation),
                         .publication = {.presentation_revision = record.publication.presentation_revision},
                         .allocation = {.allocation_generation = capability.generation},
                         .transfer = {.transfer_sequence = record.publication.transfer_sequence,
-                                     .timeline_ready = record.publication.timeline_ready}, .link = record.link}};
+                                     .timeline_ready = record.publication.timeline_ready},
+                        .link = record.link}};
 }
 
 namespace gpu = mmltk::frameworks::gpu;
@@ -213,15 +220,13 @@ class PresentationSystem::Impl final {
             const VisualSourceObservation observation = reader->observe();
             const PresentationSubmittedSource submitted{observation, pending->generation};
             const auto& frame = observation.frame;
-            if (observation.valid() &&
-                (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
+            if (observation.valid() && (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
                 throw contracts::InvalidIntentError("presentation source exceeds backbuffer bounds");
             bool submit = false;
             {
                 std::scoped_lock lock(mutex_);
-                const bool reserved =
-                    in_flight_ && in_flight_->selection_generation == pending->generation &&
-                    in_flight_->observation.frame.source == pending->source;
+                const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
+                                      in_flight_->observation.frame.source == pending->source;
                 if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
                     pending->generation == selection_generation_ && state_.selected == pending->source) {
                     in_flight_ = submitted;
@@ -244,15 +249,15 @@ class PresentationSystem::Impl final {
             if (in_flight_ && diagnostics_.valid()) pump_source = visual_diagnostic_source(in_flight_->observation);
         }
         services::RuntimeDiagnosticSpan pump_span{pump_frame_revision != 0U ? diagnostics_ : VisualDiagnosticSink{}, [&] {
-            return visual_diagnostic_boundary(
-                {.system = contracts::DiagnosticOwner::Presentation,
-                 .operation = VisualDiagnosticOperation::PresentationPumpStarted,
-                 .device = settings_.device,
-                 .generation = pump_generation,
-                 .value = pump_frame_revision,
-                 .context = {.selection_generation = pump_generation, .source = pump_source}},
-                VisualDiagnosticOperation::PresentationPumpCompleted);
-        }};
+                                                      return visual_diagnostic_boundary(
+                                                          {.system = contracts::DiagnosticOwner::Presentation,
+                                                           .operation = VisualDiagnosticOperation::PresentationPumpStarted,
+                                                           .device = settings_.device,
+                                                           .generation = pump_generation,
+                                                           .value = pump_frame_revision,
+                                                           .context = {.selection_generation = pump_generation, .source = pump_source}},
+                                                          VisualDiagnosticOperation::PresentationPumpCompleted);
+                                                  }};
         const PresentationNativeOutcome outcome = writer_->Pump(pump_generation);
         pump_span.FinishWith([&](auto& fact) { fact.detail = static_cast<std::uint64_t>(outcome.progress); });
         PresentationSnapshot completed;
@@ -312,28 +317,31 @@ class PresentationSystem::Impl final {
         }
         if (wake_again && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation control notification failed")));
         if (publish_capability) {
-            diagnostics_.Emit([&] { return VisualDiagnosticFact{
-                .system = contracts::DiagnosticOwner::Presentation,
-                .operation = VisualDiagnosticOperation::PresentationCapabilityPublished,
-                .device = settings_.device,
-                .generation = capability_snapshot.capability.generation,
-                .value = capability_snapshot.revision,
-                .detail = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
-                .context = {.capacity_width = capability_snapshot.capability.extent.width,
-                            .capacity_height = capability_snapshot.capability.extent.height,
-                            .surface_high = capability_snapshot.capability.surface_high,
-                            .surface_low = capability_snapshot.capability.surface_low,
-                            .selection_generation = pump_generation,
-                            .frame_revision = pump_frame_revision,
-                            .condition = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
-                            .outcome = 1U},
-            }; });
+            diagnostics_.Emit([&] {
+                return VisualDiagnosticFact{
+                    .system = contracts::DiagnosticOwner::Presentation,
+                    .operation = VisualDiagnosticOperation::PresentationCapabilityPublished,
+                    .device = settings_.device,
+                    .generation = capability_snapshot.capability.generation,
+                    .value = capability_snapshot.revision,
+                    .detail = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
+                    .context = {.capacity_width = capability_snapshot.capability.extent.width,
+                                .capacity_height = capability_snapshot.capability.extent.height,
+                                .surface_high = capability_snapshot.capability.surface_high,
+                                .surface_low = capability_snapshot.capability.surface_low,
+                                .selection_generation = pump_generation,
+                                .frame_revision = pump_frame_revision,
+                                .condition = static_cast<std::uint64_t>(capability_snapshot.capability.condition),
+                                .outcome = 1U},
+                };
+            });
             Publish(event_type{PresentationCapabilityChanged{capability_snapshot}});
         }
         if (!publish) return;
         diagnostics_.Emit([&] {
-            auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady,
-                                                    {outcome.submitted, outcome.publication, outcome.diagnostic_link}, settings_.device, 1U);
+            auto fact =
+                presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady,
+                                             {outcome.submitted, outcome.publication, outcome.diagnostic_link}, settings_.device, 1U);
             fact.value = completed.timeline_ready;
             return fact;
         });
@@ -370,9 +378,7 @@ class PresentationSystem::Impl final {
         }
     }
 
-    [[nodiscard]] bool Wake() noexcept {
-        return mmltk::common::io::signal_event_fd(control_fd_.get());
-    }
+    [[nodiscard]] bool Wake() noexcept { return mmltk::common::io::signal_event_fd(control_fd_.get()); }
 
     void Failed(const std::exception_ptr failure) noexcept {
         auto detail = visual_failure_detail(failure, "Presentation native writer failed");
@@ -394,7 +400,8 @@ class PresentationSystem::Impl final {
             failed_selection_generation = selection_generation_;
         }
         if (!publish) return;
-        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail, failed_selection_generation);
+        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail,
+                                     failed_selection_generation);
         Publish(event_type{PresentationFailed{std::move(failed), std::move(detail)}});
     }
 

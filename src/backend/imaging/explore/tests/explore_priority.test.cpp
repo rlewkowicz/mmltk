@@ -176,10 +176,15 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
     const auto target = [](CudaBuffer& buffer) {
         return ExploreRenderTargetView{.data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = 4U, .height = 4U};
     };
-    const ExploreRenderedCardProbe probe{.reference = target(retained), .content_x = 1U, .content_y = 1U,
-                                         .content_width = 2U, .content_height = 2U, .box_width = 4U, .box_height = 4U};
-    REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()), stream.address()) ==
-            kExploreStorageSuccess);
+    const ExploreRenderedCardProbe probe{.reference = target(retained),
+                                         .content_x = 1U,
+                                         .content_y = 1U,
+                                         .content_width = 2U,
+                                         .content_height = 2U,
+                                         .box_width = 4U,
+                                         .box_height = 4U};
+    REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()),
+                                        stream.address()) == kExploreStorageSuccess);
     std::array<std::uint64_t, 5U> result{};
     REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);

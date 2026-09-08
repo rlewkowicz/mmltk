@@ -178,12 +178,15 @@ struct ImageUpscaler::Impl {
         [[nodiscard]] cudaStream_t ensure_stream(const int device_id) {
             // A failed method keeps its stream alive until the caller settles
             // the bridge. Reconstruct only on the next operation admission.
-            const bool retry = [this] { std::lock_guard lock(mutex); return failed; }();
+            const bool retry = [this] {
+                std::lock_guard lock(mutex);
+                return failed;
+            }();
             if (retry) {
                 const auto status = Stop();
                 if (status != cudaSuccess)
-                    throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(
-                        mmltk::frameworks::gpu::CudaError(status, "release failed Basic method"))};
+                    throw ImageUpscalerUnsettledFailure{
+                        std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(status, "release failed Basic method"))};
             }
             std::lock_guard lock(mutex);
             if (device_id < 0 || (owned_device >= 0 && owned_device != device_id)) return nullptr;
@@ -214,73 +217,70 @@ struct ImageUpscaler::Impl {
             if (event_status == cudaSuccess) return stream;
 
             if (terminal_event != nullptr) {
-                if (cleanup.Record(cudaEventDestroy(terminal_event), "destroy partial Basic event")) {
-                    terminal_event = nullptr;
-                }
+                if (cleanup.Record(cudaEventDestroy(terminal_event), "destroy partial Basic event")) { terminal_event = nullptr; }
             }
             if (stream != nullptr) {
-                if (cleanup.Record(cudaStreamDestroy(stream), "destroy partial Basic stream")) {
-                    stream = nullptr;
-                }
+                if (cleanup.Record(cudaStreamDestroy(stream), "destroy partial Basic stream")) { stream = nullptr; }
             }
             failed = true;
             if (cleanup.status() != cudaSuccess) {
                 cleanup_state = CleanupState::Fatal;
-                throw ImageUpscalerUnsettledFailure{std::make_exception_ptr(
-                    mmltk::frameworks::gpu::CudaError(event_status, "create Basic completion event")), cleanup.failure()};
+                throw ImageUpscalerUnsettledFailure{
+                    std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(event_status, "create Basic completion event")),
+                    cleanup.failure()};
             }
             ensure_cuda_ok(event_status, "create Basic completion event");
             return nullptr;
         }
 
         [[nodiscard]] ImageUpscalerOutcome run(const std::uint8_t* source, const std::size_t source_pitch, const std::uint32_t width,
-                               const std::uint32_t height, std::uint8_t* target, const std::size_t target_pitch,
-                               const cudaStream_t requested_stream, ImageUpscalerCurrent current,
-                               const ImageUpscalerExecutionCheckpoint& checkpoint) {
+                                               const std::uint32_t height, std::uint8_t* target, const std::size_t target_pitch,
+                                               const cudaStream_t requested_stream, ImageUpscalerCurrent current,
+                                               const ImageUpscalerExecutionCheckpoint& checkpoint) {
             std::lock_guard lock(mutex);
             if (failed || stream == nullptr || requested_stream != stream || owned_device < 0) {
                 failed = true;
                 throw std::runtime_error("Basic Upscale method is unavailable");
             }
             try {
-            if (!current()) return ImageUpscalerOutcome::Cancelled;
-            ensure_cuda_ok(cudaSetDevice(owned_device), "bind Basic launch device");
-            const image_upscaler_nis::Configuration config{
-                .source_width = width,
-                .source_height = height,
-                .crop_x = 0U,
-                .crop_y = 0U,
-                .crop_width = width,
-                .crop_height = height,
-                .output_width = width * 4U,
-                .output_height = height * 4U,
-            };
-            const auto required = image_upscaler_nis::scratch_requirements(config);
-            if (!required) throw std::runtime_error("invalid Basic scratch extent");
-            if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicAllocationAdmitted, current))
-                return ImageUpscalerOutcome::Cancelled;
-            ensure_buffer(horizontal, horizontal_capacity, required->horizontal_bytes);
-            if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicAllocationAdmitted, current))
-                return ImageUpscalerOutcome::Cancelled;
-            ensure_buffer(scaled, scaled_capacity, required->scaled_bytes);
-            if (!current()) return ImageUpscalerOutcome::Cancelled;
-            mmltk::common::logging::trace([&](auto& logger) {
-                logger.trace(
-                    "event=image_upscaler_basic_buffers width={} height={} source_pitch={} target_pitch={} horizontal={} "
-                    "horizontal_bytes={} scaled={} scaled_bytes={}",
-                    width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(horizontal), horizontal_capacity,
-                    reinterpret_cast<std::uintptr_t>(scaled), scaled_capacity);
-            });
-            if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicLaunchAdmitted, current))
-                return ImageUpscalerOutcome::Cancelled;
-            ensure_cuda_ok(image_upscaler_nis::launch_scale(source, source_pitch, horizontal, scaled, config, stream),
-                           "launch Basic scaling");
-            if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicLaunchAdmitted, current))
-                return ImageUpscalerOutcome::Cancelled;
-            ensure_cuda_ok(image_upscaler_nis::launch_sharpen(source, source_pitch, scaled, target, target_pitch, config, stream),
-                           "launch Basic sharpening");
-            ensure_cuda_ok(cudaEventRecord(terminal_event, stream), "record Basic completion");
-            return ImageUpscalerOutcome::Completed;
+                if (!current()) return ImageUpscalerOutcome::Cancelled;
+                ensure_cuda_ok(cudaSetDevice(owned_device), "bind Basic launch device");
+                const image_upscaler_nis::Configuration config{
+                    .source_width = width,
+                    .source_height = height,
+                    .crop_x = 0U,
+                    .crop_y = 0U,
+                    .crop_width = width,
+                    .crop_height = height,
+                    .output_width = width * 4U,
+                    .output_height = height * 4U,
+                };
+                const auto required = image_upscaler_nis::scratch_requirements(config);
+                if (!required) throw std::runtime_error("invalid Basic scratch extent");
+                if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicAllocationAdmitted, current))
+                    return ImageUpscalerOutcome::Cancelled;
+                ensure_buffer(horizontal, horizontal_capacity, required->horizontal_bytes);
+                if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicAllocationAdmitted, current))
+                    return ImageUpscalerOutcome::Cancelled;
+                ensure_buffer(scaled, scaled_capacity, required->scaled_bytes);
+                if (!current()) return ImageUpscalerOutcome::Cancelled;
+                mmltk::common::logging::trace([&](auto& logger) {
+                    logger.trace(
+                        "event=image_upscaler_basic_buffers width={} height={} source_pitch={} target_pitch={} horizontal={} "
+                        "horizontal_bytes={} scaled={} scaled_bytes={}",
+                        width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(horizontal), horizontal_capacity,
+                        reinterpret_cast<std::uintptr_t>(scaled), scaled_capacity);
+                });
+                if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicLaunchAdmitted, current))
+                    return ImageUpscalerOutcome::Cancelled;
+                ensure_cuda_ok(image_upscaler_nis::launch_scale(source, source_pitch, horizontal, scaled, config, stream),
+                               "launch Basic scaling");
+                if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::BasicLaunchAdmitted, current))
+                    return ImageUpscalerOutcome::Cancelled;
+                ensure_cuda_ok(image_upscaler_nis::launch_sharpen(source, source_pitch, scaled, target, target_pitch, config, stream),
+                               "launch Basic sharpening");
+                ensure_cuda_ok(cudaEventRecord(terminal_event, stream), "record Basic completion");
+                return ImageUpscalerOutcome::Completed;
             } catch (...) {
                 failed = true;
                 throw;
@@ -411,13 +411,12 @@ struct ImageUpscaler::Impl {
             bool released = true;
             if (target.runtime != nullptr) {
                 released = cleanup.Record(target.runtime->Stop(), "release Upscale method runtime");
-                runtime_cleanup_failure = mmltk::frameworks::gpu::combine_image_failures(
-                    runtime_cleanup_failure, target.runtime->cleanup_failure());
+                runtime_cleanup_failure =
+                    mmltk::frameworks::gpu::combine_image_failures(runtime_cleanup_failure, target.runtime->cleanup_failure());
             }
             if (!released) continue;
             target.runtime.reset();
-            if (stream != nullptr && cleanup.Record(cudaStreamDestroy(stream), "destroy Upscale operation stream"))
-                stream = nullptr;
+            if (stream != nullptr && cleanup.Record(cudaStreamDestroy(stream), "destroy Upscale operation stream")) stream = nullptr;
         }
         cleanup.Record(basic.Stop(), "release Basic Upscale method");
         if (cleanup.status() != cudaSuccess) return FailStop(cleanup.status());
@@ -443,8 +442,8 @@ struct ImageUpscaler::Impl {
         if (!image_upscaler_admitted(checkpoint, ImageUpscalerExecutionStage::ChecksumAdmitted, current))
             return ImageUpscalerOutcome::Cancelled;
         const std::filesystem::path path = image_upscaler_model_path(descriptor);
-        const auto digest = mmltk::backend::data::try_sha256_file(path,
-            mmltk::common::concurrency::CancellationObservation::Borrow(cancellation));
+        const auto digest =
+            mmltk::backend::data::try_sha256_file(path, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation));
         if (!digest) return ImageUpscalerOutcome::Cancelled;
         const std::string actual = mmltk::backend::data::sha256_hex(*digest);
         if (actual != descriptor.sha256) throw std::runtime_error(std::string(descriptor.label) + " model checksum mismatch");
@@ -739,10 +738,11 @@ void ImageUpscalerProcessOwner::release() noexcept {
 
 ImageUpscalerProcessOwner::operator bool() const noexcept { return owner_ != nullptr; }
 
-ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerModelHandle handle, const ImageUpscalerMode mode, const std::uint8_t* source,
-                                          const std::size_t source_pitch, const std::uint32_t width, const std::uint32_t height,
-                                          std::uint8_t* target, const std::size_t target_pitch, const std::uintptr_t stream_handle,
-                                          ImageUpscalerCurrent current) {
+ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerModelHandle handle, const ImageUpscalerMode mode,
+                                                          const std::uint8_t* source, const std::size_t source_pitch,
+                                                          const std::uint32_t width, const std::uint32_t height, std::uint8_t* target,
+                                                          const std::size_t target_pitch, const std::uintptr_t stream_handle,
+                                                          ImageUpscalerCurrent current) {
     const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
     if (source == nullptr || target == nullptr || stream == nullptr || width == 0U || height == 0U ||
         width > std::numeric_limits<std::uint32_t>::max() / 4U || height > std::numeric_limits<std::uint32_t>::max() / 4U)
@@ -767,82 +767,75 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
     const auto cancel = [&]() {
         const auto settled = cudaStreamSynchronize(stream);
         if (settled != cudaSuccess)
-            throw ImageUpscalerUnsettledFailure{{}, std::make_exception_ptr(
-                mmltk::frameworks::gpu::CudaError(settled, "settle cancelled Upscale consumer"))};
+            throw ImageUpscalerUnsettledFailure{
+                {}, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle cancelled Upscale consumer"))};
         if (slot.runtime) {
             if (activation != ActivationProgress::Activating && slot.runtime->Settle() != cudaSuccess)
                 throw ImageUpscalerUnsettledFailure{{}, slot.runtime->cleanup_failure()};
             slot.runtime->mark_consumed(stream);
             if (activation == ActivationProgress::Activating) {
-                if (slot.runtime->Stop() != cudaSuccess)
-                    throw ImageUpscalerUnsettledFailure{{}, slot.runtime->cleanup_failure()};
+                if (slot.runtime->Stop() != cudaSuccess) throw ImageUpscalerUnsettledFailure{{}, slot.runtime->cleanup_failure()};
                 slot.runtime.reset();
             }
         }
         return ImageUpscalerOutcome::Cancelled;
     };
     try {
-    if (slot.runtime == nullptr) {
-        if (!image_upscaler_admitted(owner->checkpoint, ImageUpscalerExecutionStage::InitializationAdmitted, current))
-            return cancel();
-        const auto initialized = kind == ImageUpscalerKind::ShiftLUT
-            ? owner->initialize_onnx(slot, current) : owner->initialize_tensorrt(slot, current);
-        if (initialized == ImageUpscalerOutcome::Cancelled) return cancel();
-        if (slot.runtime->Activate(current) == ImageUpscalerOutcome::Cancelled) return cancel();
-        activation = ActivationProgress::CompletedResident;
-    }
-    if (!image_upscaler_admitted(owner->checkpoint, ImageUpscalerExecutionStage::PreprocessAdmitted, current)) return cancel();
-    mmltk::common::logging::trace([&](auto& logger) {
-        logger.trace(
-            "event=image_upscaler_conversion_buffers mode={} width={} height={} source_pitch={} target_pitch={} "
-            "source={} target={} stream={}",
-            static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source),
-            reinterpret_cast<std::uintptr_t>(target), stream_handle);
-    });
-    const ImageUpscalerRequest request{.device_pixels = source,
-                                       .source_pitch = source_pitch,
-                                       .target_pixels = target,
-                                       .target_pitch = target_pitch,
-                                       .source_width = width,
-                                       .source_height = height,
-                                       .crop_x = 0U,
-                                       .crop_y = 0U,
-                                       .crop_width = width,
-                                       .crop_height = height,
-                                       .current = current};
-    const ImageUpscalerRuntimeOutput output = slot.runtime->enqueue(request, stream);
-    if (owner->checkpoint) owner->checkpoint(ImageUpscalerExecutionStage::RuntimeEnqueued);
-    if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();
-    if (output.device_pixels == nullptr || output.width != width * 4U || output.height != height * 4U)
-        throw std::runtime_error("invalid Upscale runtime output");
-    slot.runtime->mark_consumed(stream);
-    ensure_cuda_ok(cudaPeekAtLastError(), "convert neural Upscale output");
-    return ImageUpscalerOutcome::Completed;
-    } catch (const ImageUpscalerUnsettledFailure&) {
-        throw;
-    } catch (...) {
+        if (slot.runtime == nullptr) {
+            if (!image_upscaler_admitted(owner->checkpoint, ImageUpscalerExecutionStage::InitializationAdmitted, current)) return cancel();
+            const auto initialized =
+                kind == ImageUpscalerKind::ShiftLUT ? owner->initialize_onnx(slot, current) : owner->initialize_tensorrt(slot, current);
+            if (initialized == ImageUpscalerOutcome::Cancelled) return cancel();
+            if (slot.runtime->Activate(current) == ImageUpscalerOutcome::Cancelled) return cancel();
+            activation = ActivationProgress::CompletedResident;
+        }
+        if (!image_upscaler_admitted(owner->checkpoint, ImageUpscalerExecutionStage::PreprocessAdmitted, current)) return cancel();
+        mmltk::common::logging::trace([&](auto& logger) {
+            logger.trace(
+                "event=image_upscaler_conversion_buffers mode={} width={} height={} source_pitch={} target_pitch={} "
+                "source={} target={} stream={}",
+                static_cast<std::uint32_t>(mode), width, height, source_pitch, target_pitch, reinterpret_cast<std::uintptr_t>(source),
+                reinterpret_cast<std::uintptr_t>(target), stream_handle);
+        });
+        const ImageUpscalerRequest request{.device_pixels = source,
+                                           .source_pitch = source_pitch,
+                                           .target_pixels = target,
+                                           .target_pitch = target_pitch,
+                                           .source_width = width,
+                                           .source_height = height,
+                                           .crop_x = 0U,
+                                           .crop_y = 0U,
+                                           .crop_width = width,
+                                           .crop_height = height,
+                                           .current = current};
+        const ImageUpscalerRuntimeOutput output = slot.runtime->enqueue(request, stream);
+        if (owner->checkpoint) owner->checkpoint(ImageUpscalerExecutionStage::RuntimeEnqueued);
+        if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();
+        if (output.device_pixels == nullptr || output.width != width * 4U || output.height != height * 4U)
+            throw std::runtime_error("invalid Upscale runtime output");
+        slot.runtime->mark_consumed(stream);
+        ensure_cuda_ok(cudaPeekAtLastError(), "convert neural Upscale output");
+        return ImageUpscalerOutcome::Completed;
+    } catch (const ImageUpscalerUnsettledFailure&) { throw; } catch (...) {
         const auto failure = std::current_exception();
         const auto settled = cudaStreamSynchronize(stream);
         if (settled != cudaSuccess)
-            throw ImageUpscalerUnsettledFailure{failure, std::make_exception_ptr(
-                mmltk::frameworks::gpu::CudaError(settled, "settle failed neural Upscale method"))};
+            throw ImageUpscalerUnsettledFailure{
+                failure, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle failed neural Upscale method"))};
         if (slot.runtime) {
             try {
                 slot.runtime->mark_consumed(stream);
-            } catch (...) {
-                throw ImageUpscalerUnsettledFailure{failure, std::current_exception()};
-            }
-            if (slot.runtime->Stop() != cudaSuccess)
-                throw ImageUpscalerUnsettledFailure{failure, slot.runtime->cleanup_failure()};
+            } catch (...) { throw ImageUpscalerUnsettledFailure{failure, std::current_exception()}; }
+            if (slot.runtime->Stop() != cudaSuccess) throw ImageUpscalerUnsettledFailure{failure, slot.runtime->cleanup_failure()};
         }
         slot.runtime.reset();
         if (activation == ActivationProgress::Activating) throw ImageUpscalerInitializationFailure(failure);
         std::rethrow_exception(failure);
-        }
     }
+}
 
 std::uintptr_t ImageUpscalerProcessOwner::operation_stream(const ImageUpscalerMode mode, const int device_id,
-                                                          ImageUpscalerCurrent current) {
+                                                           ImageUpscalerCurrent current) {
     if (!current()) return 0U;
     const std::size_t index = static_cast<std::size_t>(mode);
     if (owner_ == nullptr) return 0U;
@@ -859,8 +852,8 @@ std::uintptr_t ImageUpscalerProcessOwner::operation_stream(const ImageUpscalerMo
 }
 bool ImageUpscalerProcessOwner::graph_replay(const ImageUpscalerMode mode) const {
     if (!owner_ || mode == ImageUpscalerMode::Basic || mode >= ImageUpscalerMode::Count) return false;
-    auto& slot = static_cast<ImageUpscaler::Impl*>(owner_.get())->slot(
-        mode == ImageUpscalerMode::ShiftLUT ? ImageUpscalerKind::ShiftLUT : ImageUpscalerKind::RealPLKSR);
+    auto& slot = static_cast<ImageUpscaler::Impl*>(owner_.get())
+                     ->slot(mode == ImageUpscalerMode::ShiftLUT ? ImageUpscalerKind::ShiftLUT : ImageUpscalerKind::RealPLKSR);
     std::lock_guard lock(slot.mutex);
     return slot.runtime && slot.runtime->graph_replay();
 }
@@ -889,7 +882,8 @@ std::uint64_t ImageUpscaler::core_generation() const noexcept {
 
 std::exception_ptr ImageUpscaler::cleanup_failure() const noexcept {
     if (!owner_) return {};
-    return mmltk::frameworks::gpu::combine_image_failures(owner_->cleanup.failure(),
+    return mmltk::frameworks::gpu::combine_image_failures(
+        owner_->cleanup.failure(),
         mmltk::frameworks::gpu::combine_image_failures(owner_->runtime_cleanup_failure, owner_->basic.cleanup_failure()));
 }
 

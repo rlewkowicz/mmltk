@@ -9,14 +9,15 @@
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/controller/presentation/visual_runtime.h"
+#include "src/frameworks/gpu/system_image_runtime.h"
 
 namespace mmltk::controller::shell {
 
 SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink& sink,
                                                                            UpscaleSystem& upscale,
                                                                            ApplicationSystemStorage::ContinuitySink continuity) {
-    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity))]
-        (ExploreSystem::event_type event) noexcept {
+    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity))](
+               ExploreSystem::event_type event) noexcept {
         if (const auto* changed = std::get_if<ExploreChanged>(&event);
             changed != nullptr && changed->snapshot.ready && !changed->snapshot.busy &&
             (changed->snapshot.mode != ExploreMode::Gallery ||
@@ -47,9 +48,8 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
                                                    const VisualDiagnosticSink diagnostics, ContinuitySink continuity)
     : events_(std::move(events)), continuity_(std::move(continuity)) {
     const auto borrow_exact = [this](const VisualFrame& frame) { return BorrowDocument(frame); };
-    settings_ = std::make_unique<SettingsSystem>(
-        [this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(events_, continuity_)]
-        (SettingsSystem::event_type event) noexcept {
+    settings_ = std::make_unique<SettingsSystem>([this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(
+                                                            events_, continuity_)](SettingsSystem::event_type event) noexcept {
         publisher(event);
         if (explore_) explore_->ExecutionSettingsChanged();
     });
@@ -92,8 +92,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
         configuration.output_visual, make_native_upscale_runtime_factory(configuration.output_visual), borrow_exact,
         browser::ApplicationEventPublisher<&ApplicationSystems::upscale>(events_, continuity_), diagnostics);
     explore_ = make_shell_explore_system(*settings_, configuration, *compute.execution,
-                                         make_explore_upscale_event_sink(events_, *upscale_, continuity_),
-                                         diagnostics);
+                                         make_explore_upscale_event_sink(events_, *upscale_, continuity_), diagnostics);
     annotation_ = std::make_unique<AnnotationSystem>(
         configuration.output_visual, make_native_annotation_runtime_factory(configuration.output_visual), borrow_exact,
         browser::ApplicationEventPublisher<&ApplicationSystems::annotation>(events_, continuity_), diagnostics);
@@ -117,8 +116,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     presentation_ = std::make_unique<PresentationSystem>(
         configuration.output_visual,
         make_native_presentation_writer_factory(configuration.output_visual, std::move(configuration.presentation), diagnostics),
-        source_readers_, browser::ApplicationEventPublisher<&ApplicationSystems::presentation>(events_, continuity_),
-        diagnostics);
+        source_readers_, browser::ApplicationEventPublisher<&ApplicationSystems::presentation>(events_, continuity_), diagnostics);
     systems_.presentation = presentation_.get();
 }
 

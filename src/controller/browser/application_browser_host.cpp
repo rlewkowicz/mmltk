@@ -67,12 +67,14 @@ struct ApplicationBrowserHost::Impl final {
             encoded.reserve(kMaxIntentValueBytes);
             const auto encoding = encode_server_record(record, encoded);
             if (!encoding) {
-                diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                    .event = "browser.record.encode_rejected",
-                    .value = static_cast<std::uint64_t>(encoding.error().code),
-                    .detail = static_cast<std::uint64_t>(record_priority),
-                }; });
+                diagnostics.Emit([&] {
+                    return services::RuntimeDiagnosticFact{
+                        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                        .event = "browser.record.encode_rejected",
+                        .value = static_cast<std::uint64_t>(encoding.error().code),
+                        .detail = static_cast<std::uint64_t>(record_priority),
+                    };
+                });
                 if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
                 return false;
             }
@@ -88,12 +90,14 @@ struct ApplicationBrowserHost::Impl final {
             const bool accepted =
                 record_priority == transport::BrowserRecordPriority::Transient || result == transport::BrowserRecordPush::Enqueued;
             if (!accepted) {
-                diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                    .event = "browser.record.publish_rejected",
-                    .value = static_cast<std::uint64_t>(result),
-                    .detail = static_cast<std::uint64_t>(record_priority),
-                }; });
+                diagnostics.Emit([&] {
+                    return services::RuntimeDiagnosticFact{
+                        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                        .event = "browser.record.publish_rejected",
+                        .value = static_cast<std::uint64_t>(result),
+                        .detail = static_cast<std::uint64_t>(record_priority),
+                    };
+                });
                 continuity_lost();
             }
             return accepted;
@@ -101,13 +105,15 @@ struct ApplicationBrowserHost::Impl final {
             if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
             if (diagnostics.valid()) {
                 const auto error = map_current_exception();
-                diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                    .event = "browser.record.publish_exception",
-                    .value = static_cast<std::uint64_t>(error.category),
-                    .detail = static_cast<std::uint64_t>(record_priority),
-                    .message = error.detail,
-                }; });
+                diagnostics.Emit([&] {
+                    return services::RuntimeDiagnosticFact{
+                        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                        .event = "browser.record.publish_exception",
+                        .value = static_cast<std::uint64_t>(error.category),
+                        .detail = static_cast<std::uint64_t>(record_priority),
+                        .message = error.detail,
+                    };
+                });
             }
             return false;
         }
@@ -127,23 +133,27 @@ struct ApplicationBrowserHost::Impl final {
     [[nodiscard]] bool record(const std::span<const std::byte> bytes) noexcept {
         auto* installed = systems.load(std::memory_order_acquire);
         if (!admission.load(std::memory_order_acquire) || installed == nullptr) {
-            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                .event = "browser.record.unavailable",
-                .value = bytes.size(),
-                .detail = installed == nullptr ? 1U : 0U,
-            }; });
+            diagnostics.Emit([&] {
+                return services::RuntimeDiagnosticFact{
+                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                    .event = "browser.record.unavailable",
+                    .value = bytes.size(),
+                    .detail = installed == nullptr ? 1U : 0U,
+                };
+            });
             return false;
         }
         try {
             auto decoded = decode_client_record({.first = bytes});
             if (!decoded) {
-                diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                    .event = "browser.record.decode_rejected",
-                    .value = bytes.size(),
-                    .detail = static_cast<std::uint64_t>(decoded.error().code),
-                }; });
+                diagnostics.Emit([&] {
+                    return services::RuntimeDiagnosticFact{
+                        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                        .event = "browser.record.decode_rejected",
+                        .value = bytes.size(),
+                        .detail = static_cast<std::uint64_t>(decoded.error().code),
+                    };
+                });
                 return false;
             }
             return std::visit(
@@ -154,84 +164,100 @@ struct ApplicationBrowserHost::Impl final {
                         const auto correlation = value.correlation;
                         const auto reply = dispatch_intent(*installed, std::move(value));
                         if (reply.error.has_value()) {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.intent.rejected",
-                                .sequence = endpoint_id,
-                                .value = correlation,
-                                .detail = static_cast<std::uint64_t>(reply.error->category),
-                                .message = reply.error->detail,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.intent.rejected",
+                                    .sequence = endpoint_id,
+                                    .value = correlation,
+                                    .detail = static_cast<std::uint64_t>(reply.error->category),
+                                    .message = reply.error->detail,
+                                };
+                            });
                         } else {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.intent.accepted",
-                                .sequence = endpoint_id,
-                                .value = correlation,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.intent.accepted",
+                                    .sequence = endpoint_id,
+                                    .value = correlation,
+                                };
+                            });
                         }
                         const bool published = publish_record(reply, transport::BrowserRecordPriority::Critical);
                         if (!published) {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.intent.reply_rejected",
-                                .sequence = endpoint_id,
-                                .value = correlation,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.intent.reply_rejected",
+                                    .sequence = endpoint_id,
+                                    .value = correlation,
+                                };
+                            });
                         }
                         return published;
                     } else if constexpr (std::same_as<Type, Interaction>) {
                         const auto result = dispatch_interaction(*installed, std::move(value));
                         if (result.disposition == InteractionDispatchDisposition::ProtocolInvalid) {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.interaction.protocol_invalid",
-                                .sequence = result.endpoint_id,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.interaction.protocol_invalid",
+                                    .sequence = result.endpoint_id,
+                                };
+                            });
                             return false;
                         }
                         if (result.disposition == InteractionDispatchDisposition::ApplicationRejected && result.error.has_value()) {
                             const auto& error = result.error.value();
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.interaction.rejected",
-                                .participant = result.endpoint_name,
-                                .sequence = result.endpoint_id,
-                                .value = static_cast<std::uint64_t>(error.category),
-                                .message = error.detail,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.interaction.rejected",
+                                    .participant = result.endpoint_name,
+                                    .sequence = result.endpoint_id,
+                                    .value = static_cast<std::uint64_t>(error.category),
+                                    .message = error.detail,
+                                };
+                            });
                         } else if (result.disposition == InteractionDispatchDisposition::Accepted) {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.interaction.accepted",
-                                .participant = result.endpoint_name,
-                                .sequence = result.endpoint_id,
-                                .value = result.generation,
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.interaction.accepted",
+                                    .participant = result.endpoint_name,
+                                    .sequence = result.endpoint_id,
+                                    .value = result.generation,
+                                };
+                            });
                         }
                         return true;
                     } else {
                         auto* presentation = installed->presentation;
                         if (presentation == nullptr) {
-                            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.renderer_observation.unavailable",
-                                .sequence = value.sample_revision,
-                                .value = static_cast<std::uint64_t>(value.kind),
-                            }; });
+                            diagnostics.Emit([&] {
+                                return services::RuntimeDiagnosticFact{
+                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                    .event = "browser.renderer_observation.unavailable",
+                                    .sequence = value.sample_revision,
+                                    .value = static_cast<std::uint64_t>(value.kind),
+                                };
+                            });
                             return false;
                         }
                         presentation->Observe({
                             .completed_sample = value.kind == RendererObservationKind::Presented ? value.sample_revision : 0U,
                             .redraw_requested = value.kind != RendererObservationKind::Presented,
                         });
-                        diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                            .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                            .event = "browser.renderer_observation.accepted",
-                            .sequence = value.sample_revision,
-                            .value = static_cast<std::uint64_t>(value.kind),
-                            .context = {.capacity_width = value.width, .capacity_height = value.height},
-                        }; });
+                        diagnostics.Emit([&] {
+                            return services::RuntimeDiagnosticFact{
+                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                .event = "browser.renderer_observation.accepted",
+                                .sequence = value.sample_revision,
+                                .value = static_cast<std::uint64_t>(value.kind),
+                                .context = {.capacity_width = value.width, .capacity_height = value.height},
+                            };
+                        });
                         return true;
                     }
                 },
@@ -239,12 +265,14 @@ struct ApplicationBrowserHost::Impl final {
         } catch (...) {
             if (diagnostics.valid()) {
                 const auto error = map_current_exception();
-                diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                    .event = "browser.record.exception",
-                    .value = static_cast<std::uint64_t>(error.category),
-                    .message = error.detail,
-                }; });
+                diagnostics.Emit([&] {
+                    return services::RuntimeDiagnosticFact{
+                        .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                        .event = "browser.record.exception",
+                        .value = static_cast<std::uint64_t>(error.category),
+                        .message = error.detail,
+                    };
+                });
             }
             return false;
         }
@@ -256,10 +284,12 @@ struct ApplicationBrowserHost::Impl final {
         (void)publish_record(event, record_priority);
     }
     void continuity_lost() noexcept {
-        diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-            .owner = contracts::DiagnosticOwner::BrowserRuntime,
-            .event = "browser.state_continuity_lost",
-        }; });
+        diagnostics.Emit([&] {
+            return services::RuntimeDiagnosticFact{
+                .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                .event = "browser.state_continuity_lost",
+            };
+        });
         if (server) server->close_peer();
     }
 
@@ -275,11 +305,13 @@ struct ApplicationBrowserHost::Impl final {
     static void Closed(void* context) noexcept { static_cast<Impl*>(context)->closed(); }
     static void Diagnostic(void* context, const transport::BrowserServerEvent event, const std::size_t value) noexcept {
         auto& self = *static_cast<Impl*>(context);
-        self.diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{
-            .owner = contracts::DiagnosticOwner::BrowserRuntime,
-            .event = diagnostic_name(event),
-            .value = value,
-        }; });
+        self.diagnostics.Emit([&] {
+            return services::RuntimeDiagnosticFact{
+                .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                .event = diagnostic_name(event),
+                .value = value,
+            };
+        });
     }
 
     transport::BrowserServer* server = nullptr;

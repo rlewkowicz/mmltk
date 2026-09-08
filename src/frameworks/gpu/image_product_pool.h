@@ -23,6 +23,7 @@ class ImageProductPool final {
         Availability() noexcept = default;
         [[nodiscard]] bool Wait(std::stop_token = {}) const;
         void Notify() const noexcept;
+
        private:
         explicit Availability(std::shared_ptr<Admission>) noexcept;
         std::shared_ptr<Admission> admission_;
@@ -82,8 +83,7 @@ class ImageProductPool final {
     // Moving the sole completed handle permits bounded in-place reuse in a
     // one-slot pool. Multi-slot candidates retain their exact baseline.
     // Clean preservation requires the publication callback to replace semantics.
-    [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {},
-                                    ImagePlanePreservation = ImagePlanePreservation::All);
+    [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {}, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);

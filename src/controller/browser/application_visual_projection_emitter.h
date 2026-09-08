@@ -28,23 +28,23 @@ void emit_application_visual_projection(Writer& writer) {
     using Schema = ApplicationSchema<Composition>;
     constexpr auto count = Schema::VisualSourceCount();
     auto& output = writer.output();
-    for (const auto symbol : {"ApplicationVisualSnapshots", "ApplicationVisualObservation",
-                              "presentation_source_session", "visual_clean_content_identity"})
+    for (const auto symbol :
+         {"ApplicationVisualSnapshots", "ApplicationVisualObservation", "presentation_source_session", "visual_clean_content_identity"})
         writer.reserve("module", symbol, "canonical visual source projections");
 
     const auto kind_type = writer.template rust_type<PresentationSourceKind>();
     output << "pub const fn presentation_source_session(kind: " << kind_type << ") -> u64 { match kind {\n";
     for (const auto source : presentation_source_metadata)
-        output << kind_type << "::" << writer.identifier(mmltk::frameworks::reflection::enum_name(source.kind), true)
-               << " => " << source.session << ",\n";
+        output << kind_type << "::" << writer.identifier(mmltk::frameworks::reflection::enum_name(source.kind), true) << " => "
+               << source.session << ",\n";
     output << "} }\n";
     output << "pub struct ApplicationVisualObservation<'a> {\n";
     Schema::template VisitFields<VisualSourceObservation>([&]<class, class Declaration>(const auto& fact) {
         using Member = typename Declaration::member_type;
         const auto field = writer.identifier(fact.member_name, false);
         writer.reserve("struct ApplicationVisualObservation", field, "native observation " + std::string(fact.member_name));
-        output << "pub " << field << ": " << (std::same_as<Member, VisualFrame> ? "&'a " : "")
-               << writer.template rust_type<Member>() << ",\n";
+        output << "pub " << field << ": " << (std::same_as<Member, VisualFrame> ? "&'a " : "") << writer.template rust_type<Member>()
+               << ",\n";
     });
     output << "}\n";
     output << "pub struct ApplicationVisualSnapshots" << (count == 0U ? "" : "<'a>") << " {\n";
@@ -64,11 +64,11 @@ void emit_application_visual_projection(Writer& writer) {
             found = true;
             output << "self." << writer.identifier(Cell::name, false) << ".map(|snapshot| ApplicationVisualObservation { ";
             Projection::relation::VisitMembers([&]<class Entry>() {
-                constexpr bool frame = std::same_as<
-                    mmltk::frameworks::reflection::accessor_value_t<typename Projection::snapshot_type, Entry::source>, VisualFrame>;
-                output << visual_projection_path<VisualSourceObservation, Entry::destination>(writer) << ": "
-                       << (frame ? "&" : "") << "snapshot."
-                       << visual_projection_path<typename Projection::snapshot_type, Entry::source>(writer) << ", ";
+                constexpr bool frame =
+                    std::same_as<mmltk::frameworks::reflection::accessor_value_t<typename Projection::snapshot_type, Entry::source>,
+                                 VisualFrame>;
+                output << visual_projection_path<VisualSourceObservation, Entry::destination>(writer) << ": " << (frame ? "&" : "")
+                       << "snapshot." << visual_projection_path<typename Projection::snapshot_type, Entry::source>(writer) << ", ";
             });
             output << "})";
         });
@@ -78,16 +78,16 @@ void emit_application_visual_projection(Writer& writer) {
     output << "} } }\n";
     // This is a structural relation with an explicit zero fallback, not native function translation.
     output << "pub fn visual_clean_content_identity(frame: &" << writer.template rust_type<VisualFrame>() << ") -> "
-           << writer.template rust_type<VisualCleanContentIdentity>() << " { let mut identity = "
-           << writer.template rust_type<VisualCleanContentIdentity>() << " {\n";
+           << writer.template rust_type<VisualCleanContentIdentity>()
+           << " { let mut identity = " << writer.template rust_type<VisualCleanContentIdentity>() << " {\n";
     VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
         output << visual_projection_path<VisualCleanContentIdentity, Entry::destination>(writer) << ": frame."
                << visual_projection_path<VisualFrame, Entry::source>(writer) << ".clone(),\n";
     });
-    const auto destination = visual_projection_path<VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>(writer);
+    const auto destination =
+        visual_projection_path<VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>(writer);
     output << "}; if identity." << destination << " == 0 { identity." << destination << " = frame."
-           << visual_projection_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>(writer)
-           << "; } identity }\n";
+           << visual_projection_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>(writer) << "; } identity }\n";
 }
 
 }  // namespace mmltk::controller::browser

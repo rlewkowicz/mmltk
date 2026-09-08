@@ -87,6 +87,7 @@ class VisualRuntimeOwner final {
         StagedReplacement(const StagedReplacement&) = delete;
         StagedReplacement& operator=(const StagedReplacement&) = delete;
         [[nodiscard]] std::exception_ptr Finish(bool promote) noexcept;
+
        private:
         VisualRuntimeOwner* owner_;
     };
@@ -135,7 +136,7 @@ class VisualRuntimeOwner final {
 
 namespace mmltk::controller {
 
-[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(
-    const VisualFrame&, const detail::VisualRuntimeOwner&);
+[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&,
+                                                                                                  const detail::VisualRuntimeOwner&);
 
 }  // namespace mmltk::controller

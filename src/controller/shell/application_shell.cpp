@@ -144,9 +144,11 @@ void ApplicationShell::request_shutdown(const services::ApplicationShutdownReaso
         shutdown_requested_.store(true, std::memory_order_release);
         const auto diagnostics = runtime_diagnostics_.target();
         if (diagnostics.valid())
-            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::BrowserRuntime,
-                               .event = "shutdown.requested",
-                               .detail = static_cast<std::uint64_t>(reason)}; });
+            diagnostics.Emit([&] {
+                return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::BrowserRuntime,
+                                                       .event = "shutdown.requested",
+                                                       .detail = static_cast<std::uint64_t>(reason)};
+            });
         emit_shutdown_event("shutdown.ingress.started");
         browser_host_.close_admission();
         emit_shutdown_event("shutdown.ingress.completed");
@@ -247,10 +249,12 @@ bool ApplicationShell::join_systems() noexcept {
 bool ApplicationShell::healthy() const noexcept { return shutdown_complete_ && healthy_; }
 
 void ApplicationShell::emit_shutdown_event(const std::string_view event) noexcept {
-    runtime_diagnostics_.target().Emit([&] { return services::RuntimeDiagnosticFact{
-        .owner = contracts::DiagnosticOwner::BrowserRuntime,
-        .event = event,
-    }; });
+    runtime_diagnostics_.target().Emit([&] {
+        return services::RuntimeDiagnosticFact{
+            .owner = contracts::DiagnosticOwner::BrowserRuntime,
+            .event = event,
+        };
+    });
 }
 
 }  // namespace mmltk::controller::shell

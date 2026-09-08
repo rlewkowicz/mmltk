@@ -179,8 +179,8 @@ int main(int argc, char** argv) {
         mmltk::controller::shell::ApplicationShellConfig config;
         const char* const pixel_trace = std::getenv("MMLTK_GUI_PIXEL_TRACE");
         const char* const lifecycle_trace = std::getenv("MMLTK_GUI_TRACE_FILE");
-        const bool pixel_probes = pixel_trace != nullptr && std::string_view{pixel_trace} == "1"
-            && lifecycle_trace != nullptr && *lifecycle_trace != '\0';
+        const bool pixel_probes =
+            pixel_trace != nullptr && std::string_view{pixel_trace} == "1" && lifecycle_trace != nullptr && *lifecycle_trace != '\0';
         config.pixel_probes = pixel_probes;
         config.presentation = std::move(runtime.presentation);
         config.h2d_dataloader = runtime.h2d_dataloader;

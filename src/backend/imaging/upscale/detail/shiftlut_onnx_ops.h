@@ -7,7 +7,9 @@
 #include <memory>
 #include <span>
 
-namespace Ort { struct SessionOptions; }
+namespace Ort {
+struct SessionOptions;
+}
 
 namespace mmltk::backend::imaging::upscale::shiftlut {
 
@@ -24,6 +26,7 @@ class Operators final {
     // Verification-only opt-in: copy captured integer lookup inputs after the
     // caller settles inference. Ordinary runtimes allocate no decision storage.
     cudaError_t ReadDecisions(std::span<std::int8_t>) noexcept;
+
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

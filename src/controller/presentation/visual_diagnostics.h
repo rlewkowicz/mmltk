@@ -213,7 +213,9 @@ struct VisualDiagnosticSink final {
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
         if (!valid()) return;
-        try { write(context, std::forward<Factory>(factory)()); } catch (...) {}
+        try {
+            write(context, std::forward<Factory>(factory)());
+        } catch (...) {}
     }
 };
 [[nodiscard]] contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation&) noexcept;
@@ -224,14 +226,16 @@ struct VisualDiagnosticSink final {
 [[nodiscard]] inline VisualDiagnosticSink visual_diagnostic_sink(services::RuntimeDiagnosticTarget& target) noexcept {
     return {
         .context = &target,
-        .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact));
-        },
+        .write =
+            [](void* context, VisualDiagnosticFact fact) noexcept {
+                static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact));
+            },
         .enabled = [](void* context) noexcept { return static_cast<services::RuntimeDiagnosticTarget*>(context)->valid(); },
         .pixel_probes = target.pixel_probes_enabled(),
     };
 }
-void report_visual_worker_failure(VisualDiagnosticSink, contracts::DiagnosticOwner, int, std::string_view, std::uint64_t generation = 0U) noexcept;
+void report_visual_worker_failure(VisualDiagnosticSink, contracts::DiagnosticOwner, int, std::string_view,
+                                  std::uint64_t generation = 0U) noexcept;
 
 inline constexpr std::size_t kVisualFailureByteCapacity = 1024U;
 

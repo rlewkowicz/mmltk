@@ -85,8 +85,8 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class UpscaleSystem final {
    public:
     using visual_source = VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale,
-        mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
-        mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>>;
     using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
     UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                   VisualDiagnosticSink = {});

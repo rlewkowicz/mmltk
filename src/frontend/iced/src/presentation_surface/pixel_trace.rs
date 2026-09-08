@@ -14,7 +14,9 @@ pub(crate) fn enabled() -> bool {
         ENABLED.with(|enabled| *enabled)
     }
     #[cfg(not(target_arch = "wasm32"))]
-    { false }
+    {
+        false
+    }
 }
 
 // One active mapping and one newest owned image. No external mailbox borrow
@@ -35,12 +37,20 @@ struct Requests<T> {
 }
 
 impl<T> Default for Requests<T> {
-    fn default() -> Self { Self { active: false, closed: false, pending: None } }
+    fn default() -> Self {
+        Self {
+            active: false,
+            closed: false,
+            pending: None,
+        }
+    }
 }
 
 impl<T> Requests<T> {
     fn enqueue(&mut self, request: T) -> Option<T> {
-        if self.closed { return None; }
+        if self.closed {
+            return None;
+        }
         if self.active {
             self.pending = Some(request);
             None
@@ -56,8 +66,14 @@ impl<T> Requests<T> {
     }
 
     fn finish(&mut self, succeeded: bool) -> Option<T> {
-        if !succeeded { self.close(); }
-        let next = if self.closed { None } else { self.pending.take() };
+        if !succeeded {
+            self.close();
+        }
+        let next = if self.closed {
+            None
+        } else {
+            self.pending.take()
+        };
         self.active = next.is_some();
         next
     }
@@ -72,31 +88,51 @@ struct Probe {
 
 impl PixelTrace {
     pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
-        enabled().then(|| Self { state: Arc::new(Probe {
-            device: device.clone(),
-            queue: queue.clone(),
-            buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("mmltk bounded pixel evidence"),
-                size: 25 * 256,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
+        enabled().then(|| Self {
+            state: Arc::new(Probe {
+                device: device.clone(),
+                queue: queue.clone(),
+                buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("mmltk bounded pixel evidence"),
+                    size: 25 * 256,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                requests: Mutex::new(Requests::default()),
             }),
-            requests: Mutex::new(Requests::default()),
-        }) })
+        })
     }
 
     pub(super) fn sample(&self, texture: &wgpu::Texture, surface: Surface) {
-        let Some(frame) = surface.frame else { return; };
-        if frame.content_width == 0 || frame.content_height == 0 { return; }
-        let request = Request { texture: texture.clone(), surface };
-        let request = self.state.requests.lock().unwrap_or_else(|error| error.into_inner()).enqueue(request);
-        if let Some(request) = request { self.state.clone().start(request); }
+        let Some(frame) = surface.frame else {
+            return;
+        };
+        if frame.content_width == 0 || frame.content_height == 0 {
+            return;
+        }
+        let request = Request {
+            texture: texture.clone(),
+            surface,
+        };
+        let request = self
+            .state
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .enqueue(request);
+        if let Some(request) = request {
+            self.state.clone().start(request);
+        }
     }
 }
 
 impl Drop for PixelTrace {
     fn drop(&mut self) {
-        self.state.requests.lock().unwrap_or_else(|error| error.into_inner()).close();
+        self.state
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close();
     }
 }
 
@@ -105,24 +141,44 @@ impl Probe {
         let surface = request.surface;
         let frame = surface.frame.expect("validated owned probe frame");
         let coordinate = |index: usize, size: u32| {
-            [0, 191.min(size - 1), 383.min(size - 1), (size - 1) / 2, size - 1][index]
+            [
+                0,
+                191.min(size - 1),
+                383.min(size - 1),
+                (size - 1) / 2,
+                size - 1,
+            ][index]
         };
-        let coordinates: [(u32, u32); 25] = std::array::from_fn(|index| (
-            coordinate(index % 5, frame.content_width),
-            coordinate(index / 5, frame.content_height),
-        ));
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mmltk receiver pixel evidence"),
+        let coordinates: [(u32, u32); 25] = std::array::from_fn(|index| {
+            (
+                coordinate(index % 5, frame.content_width),
+                coordinate(index / 5, frame.content_height),
+            )
         });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mmltk receiver pixel evidence"),
+            });
         for (index, &(x, y)) in coordinates.iter().enumerate() {
             let mut source = request.texture.as_image_copy();
             source.origin = wgpu::Origin3d { x, y, z: 0 };
-            encoder.copy_texture_to_buffer(source, wgpu::TexelCopyBufferInfo {
-                buffer: &self.buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: index as u64 * 256, bytes_per_row: Some(256), rows_per_image: None,
+            encoder.copy_texture_to_buffer(
+                source,
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: index as u64 * 256,
+                        bytes_per_row: Some(256),
+                        rows_per_image: None,
+                    },
                 },
-            }, wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 });
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
         self.queue.submit([encoder.finish()]);
         let buffer = self.buffer.clone();

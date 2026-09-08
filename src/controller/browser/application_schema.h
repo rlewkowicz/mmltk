@@ -1042,8 +1042,7 @@ template <class Composition, auto Member, class Event>
 struct ApplicationEventDescriptor final {
     using identity = ApplicationEventIdentity<Composition, Member, Event>;
     using system_cell = typename identity::system_cell;
-    static_assert(application_event_is_member<Composition, Member, Event>(),
-                  "event must belong to the selected system event variant");
+    static_assert(application_event_is_member<Composition, Member, Event>(), "event must belong to the selected system event variant");
     static_assert(application_schema_detail::annotation_count<^^Event, contracts::reflection::Event>() == 1U,
                   "event requires exactly one delivery annotation");
     static constexpr auto metadata = application_schema_detail::annotation_value<^^Event, contracts::reflection::Event>();
@@ -1051,15 +1050,14 @@ struct ApplicationEventDescriptor final {
     static_assert(mmltk::frameworks::reflection::enum_contains(delivery), "invalid event delivery");
     static_assert(application_schema_detail::runtime_boundary_projectable<Event>(),
                   "event record contains an unsupported or unreflected reachable type");
-    static_assert(delivery != contracts::reflection::EventDelivery::LatestState ||
-                  requires(const Event& event) { { event.snapshot.revision } -> std::same_as<const std::uint64_t&>; },
-                  "LatestState requires the canonical complete snapshot revision");
+    static_assert(
+        delivery != contracts::reflection::EventDelivery::LatestState || requires(const Event& event) {
+            { event.snapshot.revision } -> std::same_as<const std::uint64_t&>;
+        }, "LatestState requires the canonical complete snapshot revision");
     static constexpr auto system_id = identity::system_id;
     static constexpr auto event_id = identity::event_id;
     [[nodiscard]] static constexpr std::uint64_t StateRevision(const Event& event) noexcept {
-        if constexpr (delivery == contracts::reflection::EventDelivery::LatestState) {
-            return event.snapshot.revision;
-        }
+        if constexpr (delivery == contracts::reflection::EventDelivery::LatestState) { return event.snapshot.revision; }
         return 0U;
     }
 };
@@ -1212,9 +1210,10 @@ struct ApplicationSchema final {
                 static_assert(Projection::valid(), "malformed visual producer descriptor");
                 static_assert(std::same_as<typename Projection::snapshot_type, typename Signature::result_type>,
                               "visual projection must name the system snapshot");
-                static_assert(requires(const System& system) {
-                    { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
-                }, "visual producer must expose borrowed-product access");
+                static_assert(
+                    requires(const System& system) {
+                        { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
+                    }, "visual producer must expose borrowed-product access");
                 visitor.template operator()<SystemCell, Snapshot, Projection>();
             }
         });
@@ -1509,10 +1508,10 @@ template <class Composition>
             sink.append_number(Cell::stable_id);
             sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
             Projection::relation::VisitMembers([&]<class Entry>() {
-                constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<
-                    typename Projection::snapshot_type, Entry::source>();
-                constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<
-                    VisualSourceObservation, Entry::destination>();
+                constexpr auto source =
+                    mmltk::frameworks::reflection::reflected_member_path<typename Projection::snapshot_type, Entry::source>();
+                constexpr auto destination =
+                    mmltk::frameworks::reflection::reflected_member_path<VisualSourceObservation, Entry::destination>();
                 sink.append(source.view());
                 sink.append(destination.view());
             });
@@ -1520,14 +1519,16 @@ template <class Composition>
         sink.append("visual-clean-content-relation");
         VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
             constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, Entry::source>();
-            constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
+            constexpr auto destination =
+                mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
             sink.append(source.view());
             sink.append(destination.view());
         });
-        constexpr auto fallback_source = mmltk::frameworks::reflection::reflected_member_path<
-            VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
-        constexpr auto fallback_destination = mmltk::frameworks::reflection::reflected_member_path<
-            VisualCleanContentIdentity, VisualCleanContentRelation::zero_fallback_destination>();
+        constexpr auto fallback_source =
+            mmltk::frameworks::reflection::reflected_member_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
+        constexpr auto fallback_destination =
+            mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity,
+                                                                 VisualCleanContentRelation::zero_fallback_destination>();
         sink.append("zero-fallback");
         sink.append(fallback_source.view());
         sink.append(fallback_destination.view());

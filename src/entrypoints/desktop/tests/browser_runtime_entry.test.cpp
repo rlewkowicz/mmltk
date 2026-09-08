@@ -191,7 +191,7 @@ TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing
         std::string text(log.size(), '\0');
         if (!text.empty()) log.pread_all(text.data(), text.size(), 0U);
         const std::string expected = "mmltk fake Firefox tracing lifecycle=" + std::to_string(tracing != 0) +
-            " pixels=" + std::to_string(tracing == 2) + " environment=" + std::to_string(tracing == 2);
+                                     " pixels=" + std::to_string(tracing == 2) + " environment=" + std::to_string(tracing == 2);
         CHECK(text.find(expected) != std::string::npos);
     }
 }

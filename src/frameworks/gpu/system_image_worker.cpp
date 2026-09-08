@@ -22,13 +22,9 @@ void SystemImageWorker::RequestStop() noexcept {
     signals_.notify_all();
 }
 
-void SystemImageWorker::WaitStopped() noexcept {
-    stopped_.wait(false, std::memory_order_acquire);
-}
+void SystemImageWorker::WaitStopped() noexcept { stopped_.wait(false, std::memory_order_acquire); }
 
-bool SystemImageWorker::stopped() const noexcept {
-    return stopped_.load(std::memory_order_acquire);
-}
+bool SystemImageWorker::stopped() const noexcept { return stopped_.load(std::memory_order_acquire); }
 
 void SystemImageWorker::Run(const std::stop_token stop) {
     while (!stop.stop_requested()) {

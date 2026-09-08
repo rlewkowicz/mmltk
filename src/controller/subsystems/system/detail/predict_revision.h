@@ -19,26 +19,19 @@ class PredictRevision final {
         return *next;
     }
 
-    [[nodiscard]] static constexpr std::optional<std::uint64_t> Progress(
-        const std::uint64_t current, const bool cancellation_requested) noexcept {
+    [[nodiscard]] static constexpr std::optional<std::uint64_t> Progress(const std::uint64_t current,
+                                                                         const bool cancellation_requested) noexcept {
         return Next(current, cancellation_requested ? 2U : 3U);
     }
 
-    [[nodiscard]] static constexpr std::optional<std::uint64_t> Cancel(const std::uint64_t current) noexcept {
-        return Next(current, 2U);
-    }
+    [[nodiscard]] static constexpr std::optional<std::uint64_t> Cancel(const std::uint64_t current) noexcept { return Next(current, 2U); }
 
-    [[nodiscard]] static constexpr std::optional<std::uint64_t> Complete(const std::uint64_t current) noexcept {
-        return Next(current, 1U);
-    }
+    [[nodiscard]] static constexpr std::optional<std::uint64_t> Complete(const std::uint64_t current) noexcept { return Next(current, 1U); }
 
-    [[nodiscard]] static constexpr std::optional<std::uint64_t> Fail(const std::uint64_t current) noexcept {
-        return Next(current, 0U);
-    }
+    [[nodiscard]] static constexpr std::optional<std::uint64_t> Fail(const std::uint64_t current) noexcept { return Next(current, 0U); }
 
    private:
-    [[nodiscard]] static constexpr std::optional<std::uint64_t> Next(
-        const std::uint64_t current, const std::uint64_t reserved) noexcept {
+    [[nodiscard]] static constexpr std::optional<std::uint64_t> Next(const std::uint64_t current, const std::uint64_t reserved) noexcept {
         if (current >= std::numeric_limits<std::uint64_t>::max() - reserved) return std::nullopt;
         return current + 1U;
     }

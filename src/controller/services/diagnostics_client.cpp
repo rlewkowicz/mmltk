@@ -402,16 +402,14 @@ DiagnosticsProducer::Operation::Operation(std::shared_ptr<DiagnosticsClient::Sta
 bool DiagnosticsProducer::Operation::enabled() const noexcept {
     return state_ != nullptr && state_->enabled.load(std::memory_order_acquire);
 }
-DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record) const noexcept {
-    return submit(record, true);
-}
+DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record) const noexcept { return submit(record, true); }
 DiagnosticSubmitResult DiagnosticsProducer::Operation::try_submit(const DiagnosticRecord record) const noexcept {
     return submit(record, false);
 }
 std::mutex& DiagnosticsClient::queue_mutex_for_test() noexcept { return state_->mutex; }
 
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record, const bool wait_for_capacity,
-                                                             const bool validate) const noexcept {
+                                                              const bool validate) const noexcept {
     if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
     if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
         state_->dropped.fetch_add(1U, std::memory_order_relaxed);

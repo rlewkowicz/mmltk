@@ -365,8 +365,8 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
                                                   (probe.content_x != 0U && content_row && x == probe.content_x ? 1U : 0U) +
                                                   (content_right < clean.width && content_row && x + 1U == content_right ? 1U : 0U);
     if (inside_transition_count != 0U) {
-        const auto* reference_row = reinterpret_cast<const uchar4*>(
-            probe.reference.data + static_cast<std::size_t>(y) * probe.reference.pitch_bytes);
+        const auto* reference_row =
+            reinterpret_cast<const uchar4*>(probe.reference.data + static_cast<std::size_t>(y) * probe.reference.pitch_bytes);
         const uchar4 expected = reference_row[x];
         if (clean_pixel.x == expected.x && clean_pixel.y == expected.y && clean_pixel.z == expected.z && clean_pixel.w == expected.w)
             atomicAdd(counts + 4U, static_cast<unsigned long long>(inside_transition_count));

@@ -22,26 +22,25 @@ using mmltk::backend::ml::runtime::TensorRtEngine;
 // resources, and the installed runtime retains the complete typed failure tree.
 class UpscalerCleanup {
    public:
-    bool Record(cudaError_t status, const char* operation) noexcept {
+    inline bool Record(cudaError_t status, const char* operation) noexcept {
         if (status == cudaSuccess) return true;
         if (status_ == cudaSuccess) status_ = status;
         try {
             throw mmltk::frameworks::gpu::CudaError(status, operation);
-        } catch (...) {
-            failure_ = mmltk::frameworks::gpu::combine_image_failures(failure_, std::current_exception());
-        }
+        } catch (...) { failure_ = mmltk::frameworks::gpu::combine_image_failures(failure_, std::current_exception()); }
         return false;
     }
-    void Checkpoint(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerExecutionStage stage) noexcept {
+    inline void Checkpoint(const ImageUpscalerExecutionCheckpoint& checkpoint, ImageUpscalerExecutionStage stage) noexcept {
         if (!checkpoint) return;
-        try { checkpoint(stage); }
-        catch (...) {
+        try {
+            checkpoint(stage);
+        } catch (...) {
             if (status_ == cudaSuccess) status_ = cudaErrorUnknown;
             failure_ = mmltk::frameworks::gpu::combine_image_failures(failure_, std::current_exception());
         }
     }
-    [[nodiscard]] cudaError_t status() const noexcept { return status_; }
-    [[nodiscard]] std::exception_ptr failure() const noexcept { return failure_; }
+    [[nodiscard]] inline cudaError_t status() const noexcept { return status_; }
+    [[nodiscard]] inline std::exception_ptr failure() const noexcept { return failure_; }
 
    private:
     cudaError_t status_ = cudaSuccess;
@@ -124,7 +123,7 @@ class TiledImageUpscalerRuntimeState {
     void abandon_consumer() noexcept;
     [[nodiscard]] cudaError_t Stop(void* backend, ImageUpscalerReleaseBackend release_backend,
                                    const ImageUpscalerExecutionCheckpoint&) noexcept;
-    [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept { return cleanup_.failure(); }
+    [[nodiscard]] inline std::exception_ptr cleanup_failure() const noexcept { return cleanup_.failure(); }
     [[nodiscard]] inline const ImageUpscalerDescriptor& descriptor() const noexcept { return descriptor_; }
     [[nodiscard]] inline int device_id() const noexcept { return device_id_; }
 
@@ -144,13 +143,11 @@ class TiledImageUpscalerRuntimeState {
 template <typename BackendOwner, ImageUpscalerBackend Backend>
 class TiledImageUpscalerRuntimeAdapter : public ImageUpscalerRuntime {
    public:
-    TiledImageUpscalerRuntimeAdapter(ImageUpscalerDescriptor descriptor, const int device_id,
-                                     ImageUpscalerExecutionCheckpoint checkpoint)
+    TiledImageUpscalerRuntimeAdapter(ImageUpscalerDescriptor descriptor, const int device_id, ImageUpscalerExecutionCheckpoint checkpoint)
         : state_(descriptor, device_id), checkpoint_(std::move(checkpoint)) {}
 
     [[nodiscard]] ImageUpscalerOutcome Activate(ImageUpscalerCurrent current) final {
-        if (state_.Activate(checkpoint_, current) == ImageUpscalerOutcome::Cancelled)
-            return ImageUpscalerOutcome::Cancelled;
+        if (state_.Activate(checkpoint_, current) == ImageUpscalerOutcome::Cancelled) return ImageUpscalerOutcome::Cancelled;
         return owner().ActivateBackend(current);
     }
     [[nodiscard]] ImageUpscalerBackend backend() const noexcept final { return Backend; }
@@ -165,8 +162,8 @@ class TiledImageUpscalerRuntimeAdapter : public ImageUpscalerRuntime {
     void abandon_consumer() noexcept final { state_.abandon_consumer(); }
     [[nodiscard]] cudaError_t Settle() noexcept final { return owner().SettleBackend(); }
     [[nodiscard]] cudaError_t Stop() noexcept final {
-        return state_.Stop(&owner(), [](void* context) noexcept { return static_cast<BackendOwner*>(context)->ReleaseBackend(); },
-                           checkpoint_);
+        return state_.Stop(
+            &owner(), [](void* context) noexcept { return static_cast<BackendOwner*>(context)->ReleaseBackend(); }, checkpoint_);
     }
     [[nodiscard]] std::exception_ptr cleanup_failure() const noexcept final {
         return mmltk::frameworks::gpu::combine_image_failures(state_.cleanup_failure(), owner().cleanup_.failure());
@@ -191,8 +188,10 @@ class TiledImageUpscalerRuntimeAdapter : public ImageUpscalerRuntime {
 };
 
 [[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_onnx_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-    const std::filesystem::path& model_path, int device_id, const ImageUpscalerExecutionCheckpoint&);
+                                                                               const std::filesystem::path& model_path, int device_id,
+                                                                               const ImageUpscalerExecutionCheckpoint&);
 [[nodiscard]] std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-    std::unique_ptr<TensorRtEngine> engine, int device_id, const ImageUpscalerExecutionCheckpoint&);
+                                                                                   std::unique_ptr<TensorRtEngine> engine, int device_id,
+                                                                                   const ImageUpscalerExecutionCheckpoint&);
 
 }  // namespace mmltk::backend::imaging::upscale

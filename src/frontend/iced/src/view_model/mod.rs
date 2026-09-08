@@ -16,8 +16,8 @@ pub(crate) use reduction::invalid_visual_frame;
 pub use crate::generated::ApplicationIntentEndpoint;
 pub use annotation::AnnotationModel;
 pub use explore::{ExploreModel, ExplorePresentationState};
-pub(crate) use presentation::Reconciliation as PresentationReconciliation;
 pub(crate) use model_selection::{ModelSettingsProjection, model_settings_projection};
+pub(crate) use presentation::Reconciliation as PresentationReconciliation;
 use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,

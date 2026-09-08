@@ -86,7 +86,9 @@ impl ApplicationModel {
                 if context == ApplicationIntentEndpoint::UpscaleStart {
                     if self.explore.requested_upscale == self.explore.sent_upscale {
                         self.explore.requested_upscale = None;
-                        if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
+                        if self.presentation_model.foreground()
+                            == Some(PresentationSourceKind::Upscale)
+                        {
                             self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                         }
                     }
@@ -393,8 +395,11 @@ impl ApplicationModel {
             .snapshot
             .as_ref()
             .is_some_and(|previous| previous.dataset.identity != snapshot.dataset.identity);
-        let same_image = self.explore.snapshot.as_ref().is_some_and(|previous|
-            previous.selectedimage == snapshot.selectedimage);
+        let same_image = self
+            .explore
+            .snapshot
+            .as_ref()
+            .is_some_and(|previous| previous.selectedimage == snapshot.selectedimage);
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
@@ -408,13 +413,15 @@ impl ApplicationModel {
                 } else {
                     self.explore.requested_upscale = None;
                     self.explore.sent_upscale = None;
-                    if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale) {
+                    if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale)
+                    {
                         self.set_foreground_visual(Some(PresentationSourceKind::Explore));
                     }
                 }
             }
         }
-        if observation == Observation::Installed && self.explore.requested_upscale.is_some()
+        if observation == Observation::Installed
+            && self.explore.requested_upscale.is_some()
             && self.current_upscale().is_none()
         {
             self.set_foreground_visual(Some(PresentationSourceKind::Explore));

@@ -41,7 +41,7 @@ int main(const int argument_count, char* const* const arguments) {
     if (system_count != 13U || intent_count == 0U || interaction_count == 0U || event_count == 0U) return EXIT_FAILURE;
 
     using SettingsEvent = ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::settings, SettingsChanged>;
-    Bootstrap bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words};
+    Bootstrap bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words, .snapshots = {}};
     bool snapshots_valid = true;
     ApplicationSchema<ApplicationSystems>::VisitSnapshotDefaults([&]<class Cell, class Snapshot>(Snapshot snapshot) {
         if constexpr (requires { typename Cell::type::visual_source; }) {

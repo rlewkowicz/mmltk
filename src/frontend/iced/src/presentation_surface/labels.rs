@@ -93,7 +93,9 @@ pub(crate) fn view<'a, Message: 'a>(
     source: Source,
 ) -> Element<'a, Message> {
     let surface = match &source {
-        Source::Gallery(_) => super::gallery::displayed().map_or(program.surface, |(surface, _)| surface),
+        Source::Gallery(_) => {
+            super::gallery::displayed().map_or(program.surface, |(surface, _)| surface)
+        }
         Source::Detail(_) => super::retained_detail().map_or(program.surface, |(retained, _)| {
             if program.surface.frame == retained.frame
                 && super::same_allocation(program.surface, retained)
@@ -383,7 +385,8 @@ mod tests {
             });
             labels
         };
-        let detail = |scene: &crate::generated::AnnotationSceneContent, overlay: &crate::generated::ExploreOverlay| {
+        let detail = |scene: &crate::generated::AnnotationSceneContent,
+                      overlay: &crate::generated::ExploreOverlay| {
             let mut snapshot = crate::view_model::test_support::explore_snapshot();
             snapshot.scene = scene.clone();
             snapshot.overlay = overlay.clone();
@@ -410,10 +413,7 @@ mod tests {
         assert!(collect(detail(&snapshot.scene, &snapshot.overlay)).is_empty());
         snapshot.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::Subset;
         snapshot.overlay.classselection.classes = vec![0];
-        assert_eq!(
-            collect(detail(&snapshot.scene, &snapshot.overlay)).len(),
-            1
-        );
+        assert_eq!(collect(detail(&snapshot.scene, &snapshot.overlay)).len(), 1);
         snapshot.scene.objects[0].enabled = false;
         assert!(collect(detail(&snapshot.scene, &snapshot.overlay)).is_empty());
     }

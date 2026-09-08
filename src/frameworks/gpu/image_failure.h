@@ -20,8 +20,8 @@ class ImageFailure : public std::runtime_error {
     static const char* Message(const std::exception_ptr& failure) noexcept {
         try {
             if (failure) std::rethrow_exception(failure);
-        } catch (const std::exception& error) { return error.what(); }
-        catch (...) {}
+        } catch (const std::exception& error) { return error.what(); } catch (...) {
+        }
         return "image stream completion boundary was not established";
     }
     std::exception_ptr primary_;
@@ -39,12 +39,10 @@ template <class Failure>
 [[nodiscard]] std::exception_ptr find_image_failure(const std::exception_ptr& failure) noexcept {
     try {
         if (failure) std::rethrow_exception(failure);
-    } catch (const Failure&) { return failure; }
-    catch (const ImageFailure& aggregate) {
+    } catch (const Failure&) { return failure; } catch (const ImageFailure& aggregate) {
         if (auto primary = find_image_failure<Failure>(aggregate.primary())) return primary;
         return find_image_failure<Failure>(aggregate.secondary());
-    }
-    catch (...) {}
+    } catch (...) {}
     return {};
 }
 
@@ -52,8 +50,7 @@ template <class Failure>
     return static_cast<bool>(find_image_failure<ImageStreamExecutionFailure>(failure));
 }
 
-[[nodiscard]] inline std::exception_ptr combine_image_failures(std::exception_ptr primary,
-                                                              std::exception_ptr secondary) noexcept {
+[[nodiscard]] inline std::exception_ptr combine_image_failures(std::exception_ptr primary, std::exception_ptr secondary) noexcept {
     if (!primary) return secondary;
     if (!secondary || secondary == primary) return primary;
     try {

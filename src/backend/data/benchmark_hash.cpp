@@ -87,7 +87,7 @@ Sha256Digest sha256_bytes(const std::span<const std::uint8_t> bytes) {
 }
 
 std::optional<Sha256Digest> try_sha256_file(const std::filesystem::path& path,
-    mmltk::common::concurrency::CancellationObservation cancel_requested) {
+                                            mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (cancel_requested.requested()) return std::nullopt;
     const FileHandle file = FileHandle::open_readonly(path.string());
     const std::size_t file_size = file.size();

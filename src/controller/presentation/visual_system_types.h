@@ -69,12 +69,13 @@ MMLTK_REFLECT_FIELDS(VisualFrame)
 MMLTK_REFLECT_FIELDS(VisualSourceObservation)
 MMLTK_REFLECT_FIELDS(VisualCleanContentIdentity)
 
-struct VisualCleanContentRelation final : mmltk::frameworks::reflection::StaticMemberRelation<
-    VisualFrame, VisualCleanContentIdentity, 4U,
-    mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::source, &VisualCleanContentIdentity::source>,
-    mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::extent, &VisualCleanContentIdentity::extent>,
-    mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::content, &VisualCleanContentIdentity::content>,
-    mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::clean_revision, &VisualCleanContentIdentity::revision>> {
+struct VisualCleanContentRelation final
+    : mmltk::frameworks::reflection::StaticMemberRelation<
+          VisualFrame, VisualCleanContentIdentity, 4U,
+          mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::source, &VisualCleanContentIdentity::source>,
+          mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::extent, &VisualCleanContentIdentity::extent>,
+          mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::content, &VisualCleanContentIdentity::content>,
+          mmltk::frameworks::reflection::MemberRelationEntry<&VisualFrame::clean_revision, &VisualCleanContentIdentity::revision>> {
     static constexpr auto zero_fallback_source = &VisualFrame::revision;
     static constexpr auto zero_fallback_destination = &VisualCleanContentIdentity::revision;
 };

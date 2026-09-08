@@ -9,7 +9,15 @@
 namespace mmltk::controller::contracts {
 
 enum class DiagnosticOwner : std::uint8_t {
-    BrowserRuntime, BrowserServer, FirefoxProcess, Explore, Annotation, Upscale, Live, Presentation, AnnotationResource,
+    BrowserRuntime,
+    BrowserServer,
+    FirefoxProcess,
+    Explore,
+    Annotation,
+    Upscale,
+    Live,
+    Presentation,
+    AnnotationResource,
 };
 
 // Copies of identities owned elsewhere. None of these facts participates in

@@ -140,15 +140,14 @@ TiledImageUpscalerRuntimeState::TiledImageUpscalerRuntimeState(ImageUpscalerDesc
     : descriptor_(descriptor), device_id_(device_id) {}
 
 ImageUpscalerOutcome TiledImageUpscalerRuntimeState::Activate(const ImageUpscalerExecutionCheckpoint& checkpoint,
-                                                             ImageUpscalerCurrent current) {
+                                                              ImageUpscalerCurrent current) {
     if (!current()) return ImageUpscalerOutcome::Cancelled;
     ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for Image upscaler runtime");
     ensure_cuda_ok(cudaEventCreateWithFlags(&consumer_done_, cudaEventDisableTiming),
                    "cudaEventCreate for Image upscaler output consumption");
     if (checkpoint) checkpoint(ImageUpscalerExecutionStage::EventCreated);
     if (!current()) return ImageUpscalerOutcome::Cancelled;
-    ensure_cuda_ok(cudaStreamCreateWithFlags(&cleanup_stream_, cudaStreamNonBlocking),
-                   "cudaStreamCreate for Image upscaler cleanup");
+    ensure_cuda_ok(cudaStreamCreateWithFlags(&cleanup_stream_, cudaStreamNonBlocking), "cudaStreamCreate for Image upscaler cleanup");
     if (checkpoint) checkpoint(ImageUpscalerExecutionStage::StreamCreated);
     return current() ? ImageUpscalerOutcome::Completed : ImageUpscalerOutcome::Cancelled;
 }
@@ -160,13 +159,13 @@ TiledImageUpscalerRuntimeState::~TiledImageUpscalerRuntimeState() {
 }
 
 ImageUpscalerRuntimeOutput TiledImageUpscalerRuntimeState::enqueue(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream,
-    void* backend, const ImageUpscalerSubmitTiles submit_tiles, const ImageUpscalerExecutionCheckpoint& checkpoint) {
+                                                                   void* backend, const ImageUpscalerSubmitTiles submit_tiles,
+                                                                   const ImageUpscalerExecutionCheckpoint& checkpoint) {
     std::lock_guard lock(mutex_);
     if (request.device_pixels == nullptr || request.target_pixels == nullptr || consumer_stream == nullptr ||
         request.source_pitch < static_cast<std::size_t>(request.source_width) * 4U ||
-        request.target_pitch < static_cast<std::size_t>(request.crop_width) * 16U ||
-        request.crop_width == 0U || request.crop_height == 0U ||
-        request.source_width == 0U || request.source_height == 0U || request.crop_x > request.source_width ||
+        request.target_pitch < static_cast<std::size_t>(request.crop_width) * 16U || request.crop_width == 0U ||
+        request.crop_height == 0U || request.source_width == 0U || request.source_height == 0U || request.crop_x > request.source_width ||
         request.crop_width > request.source_width - request.crop_x || request.crop_y > request.source_height ||
         request.crop_height > request.source_height - request.crop_y) {
         throw std::invalid_argument("Image upscaler request has invalid source geometry");
@@ -215,14 +214,13 @@ void TiledImageUpscalerRuntimeState::abandon_consumer() noexcept {
 }
 
 cudaError_t TiledImageUpscalerRuntimeState::Stop(void* backend, const ImageUpscalerReleaseBackend release_backend,
-                                               const ImageUpscalerExecutionCheckpoint& checkpoint) noexcept {
+                                                 const ImageUpscalerExecutionCheckpoint& checkpoint) noexcept {
     std::lock_guard lock(mutex_);
     if (stopped_) return cudaSuccess;
     if (!cleanup_.Record(cudaSetDevice(device_id_), "bind neural cleanup device")) return cleanup_.status();
-    bool settled = cleanup_.Record(awaiting_consumer_ || consumer_fatal_ ? cudaErrorNotReady : cudaSuccess,
-                                   "settle neural consumer ownership");
-    if (consumer_pending_)
-        settled = cleanup_.Record(cudaEventSynchronize(consumer_done_), "settle neural consumer fence") && settled;
+    bool settled =
+        cleanup_.Record(awaiting_consumer_ || consumer_fatal_ ? cudaErrorNotReady : cudaSuccess, "settle neural consumer ownership");
+    if (consumer_pending_) settled = cleanup_.Record(cudaEventSynchronize(consumer_done_), "settle neural consumer fence") && settled;
     if (cleanup_stream_ != nullptr)
         settled = cleanup_.Record(cudaStreamSynchronize(cleanup_stream_), "settle neural cleanup stream") && settled;
     // Backend buffers are still referenced by an unsettled consumer.

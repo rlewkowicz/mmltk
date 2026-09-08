@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/io/event_fd.h"
@@ -347,8 +348,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto generation = ++candidate_generation_;
         std::atomic_bool cancelled = false;
         std::stop_callback cancellation{stop, [&cancelled] { cancelled.store(true, std::memory_order_release); }};
-        if (!RebuildOrder(dataset, filter, shuffle_seed != 0U, shuffle_seed, candidate_order_, candidate_scratch_, &cancelled))
-            return {};
+        if (!RebuildOrder(dataset, filter, shuffle_seed != 0U, shuffle_seed, candidate_order_, candidate_scratch_, &cancelled)) return {};
         candidate_inverse_.assign(dataset.summaries.size(), std::numeric_limits<std::uint32_t>::max());
         for (std::size_t position = 0; position < candidate_order_.size(); ++position)
             candidate_inverse_[candidate_order_[position]] = static_cast<std::uint32_t>(position);
@@ -414,7 +414,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         return facts;
     }
     [[nodiscard]] std::span<const std::uint32_t> VisibleRange(const ExploreViewport viewport,
-                                                            const ExploreOrderCandidate* candidate) const {
+                                                              const ExploreOrderCandidate* candidate) const {
         const auto& order = CandidateOrder(candidate);
         const std::size_t first =
             viewport.valid() ? std::min<std::size_t>(static_cast<std::size_t>(viewport.first_row) * viewport.columns, order.size()) : 0U;
@@ -456,9 +456,9 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto& order = CandidateOrder(candidate);
         const auto first = GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
         const auto count = GalleryThumbnailCache::CardCount(order.size(), plan.viewport.row_count, plan.viewport.columns);
-        return gallery_.OutputChange(plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) :
-                                                                             std::span<const std::uint32_t>{}, &dataset->store,
-                                     std::span{order}.subspan(first, count));
+        return gallery_.OutputChange(
+            plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) : std::span<const std::uint32_t>{},
+            &dataset->store, std::span{order}.subspan(first, count));
     }
 
     void PrepareOutputPublication(ExploreOutputChange change) override { gallery_.PrepareOutputPublication(change); }
@@ -479,10 +479,10 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto window = std::span{order}.subspan(window_first, count);
         if (gallery_.OutputChange(plan, visible, &dataset.store, window) != ExploreOutputChange::Unchanged)
             ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
-        auto store = std::shared_ptr<const data::CompiledDataset>{
-            candidate != nullptr && open_candidate_ ? open_candidate_ : committed_, &dataset.store};
-        return gallery_.Begin(plan, visible, window, window_first, std::move(store), dataset.annotated_indices,
-                              render_classes_, clean, semantic, stream);
+        auto store = std::shared_ptr<const data::CompiledDataset>{candidate != nullptr && open_candidate_ ? open_candidate_ : committed_,
+                                                                  &dataset.store};
+        return gallery_.Begin(plan, visible, window, window_first, std::move(store), dataset.annotated_indices, render_classes_, clean,
+                              semantic, stream);
     }
 
     [[nodiscard]] ExploreGalleryPublication AdvanceGallery() override { return gallery_.Advance(); }

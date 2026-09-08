@@ -48,14 +48,13 @@ struct StaticMemberRelation {
         std::size_t index = 0U;
         bool compatible = true;
         VisitMembers([&]<class Entry>() {
-            if constexpr (accessor_is_applicable<Source, Entry::source>() &&
-                          accessor_is_applicable<Destination, Entry::destination>()) {
+            if constexpr (accessor_is_applicable<Source, Entry::source>() && accessor_is_applicable<Destination, Entry::destination>()) {
                 using SourceValue = accessor_value_t<Source, Entry::source>;
                 using DestinationValue = accessor_value_t<Destination, Entry::destination>;
                 sources[index] = accessor_member_identity<Source, Entry::source>();
                 destinations[index] = accessor_member_identity<Destination, Entry::destination>();
-                compatible = compatible && Entry::transform::template accepts<SourceValue, DestinationValue>() &&
-                             sources[index].valid() && destinations[index].valid();
+                compatible = compatible && Entry::transform::template accepts<SourceValue, DestinationValue>() && sources[index].valid() &&
+                             destinations[index].valid();
             } else {
                 compatible = false;
             }

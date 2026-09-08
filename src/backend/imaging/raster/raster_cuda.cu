@@ -12,14 +12,13 @@ namespace mmltk::backend::imaging::raster::detail {
 namespace cuda_launch = mmltk::backend::ml::cuda::launch;
 
 __global__ void probe_rgba_kernel(const draw_launch::ProbeRgbaLaunch launch) {
-    const unsigned index = threadIdx.x;
+    const auto index = static_cast<std::size_t>(threadIdx.x);
     if (index >= 25U) return;
     const auto x = launch.coordinates[index * 2U];
     const auto y = launch.coordinates[index * 2U + 1U];
-    const auto* pixel = launch.source.pixels + y * launch.source.pitch_bytes + x * 4U;
-    launch.samples[index] = static_cast<std::uint32_t>(pixel[0]) |
-        (static_cast<std::uint32_t>(pixel[1]) << 8U) | (static_cast<std::uint32_t>(pixel[2]) << 16U) |
-        (static_cast<std::uint32_t>(pixel[3]) << 24U);
+    const auto* pixel = launch.source.pixels + static_cast<std::size_t>(y) * launch.source.pitch_bytes + static_cast<std::size_t>(x) * 4U;
+    launch.samples[index] = static_cast<std::uint32_t>(pixel[0]) | (static_cast<std::uint32_t>(pixel[1]) << 8U) |
+                            (static_cast<std::uint32_t>(pixel[2]) << 16U) | (static_cast<std::uint32_t>(pixel[3]) << 24U);
 }
 
 cudaError_t launch_probe_rgba(const draw_launch::ProbeRgbaLaunch& launch) noexcept {

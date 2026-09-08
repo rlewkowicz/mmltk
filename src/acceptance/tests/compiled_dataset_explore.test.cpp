@@ -316,8 +316,8 @@ void wait_for_native_gallery(NativeExploreAudit& audit, const controller::Explor
     const auto generation = audit.last_placeholder_generation();
     const bool completed = audit.Wait([&] {
         const auto snapshot = system.snapshot();
-        return audit.tile_count() > tile_count && audit.last_tile_generation() == generation && audit.last_tile_cumulative() == ready_tiles &&
-               !snapshot.busy && audit.last_ready_frame() == snapshot.frame.revision;
+        return audit.tile_count() > tile_count && audit.last_tile_generation() == generation &&
+               audit.last_tile_cumulative() == ready_tiles && !snapshot.busy && audit.last_ready_frame() == snapshot.frame.revision;
     });
     if (!completed) {
         const auto snapshot = system.snapshot();
@@ -1351,8 +1351,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
     controller::ExploreSystem system{
         settings, device, 1U,
-        controller::make_native_explore_runtime_factory(
-            device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
+        controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
         [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }};
     struct StopGate {
         controller::ExploreAcceptanceGate& gate;

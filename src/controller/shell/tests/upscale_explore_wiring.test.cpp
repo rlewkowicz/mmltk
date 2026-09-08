@@ -49,8 +49,9 @@ class ShellWarmAlgorithm final : public UpscaleAlgorithm {
 [[nodiscard]] UpscaleSystem shell_upscale(const std::shared_ptr<FakeImageBackend>& backend, const std::shared_ptr<ShellWarmProbe>& probe,
                                           SystemEventSink<UpscaleSystem::event_type> events = {}) {
     return UpscaleSystem{{.device = 0, .maximum_width = 1024U, .maximum_height = 1024U},
-                         RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                        [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
+                         RuntimeFactory(
+                             0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
+                             [probe] { return std::make_unique<ShellWarmAlgorithm>(probe); }, 4U),
                          [](const VisualFrame&) { return VisualDocumentRead{}; },
                          std::move(events)};
 }
@@ -157,8 +158,8 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     std::promise<void> methods_settled;
     auto failed = failure_published.get_future();
     auto settled = methods_settled.get_future();
-    auto upscale =
-        shell_upscale(backend, probe, [&upscale_failures, &other_upscale_events, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
+    auto upscale = shell_upscale(
+        backend, probe, [&upscale_failures, &other_upscale_events, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
             if (std::holds_alternative<UpscaleFailed>(event)) {
                 upscale_failures.fetch_add(1U, std::memory_order_acq_rel);
                 failure_published.set_value();
@@ -189,12 +190,10 @@ TEST_CASE("shell routes essential event encoding failure through continuity reco
     auto probe = std::make_shared<ShellWarmProbe>();
     auto upscale = shell_upscale(backend, probe);
     std::vector<browser::SystemEvent> forwarded;
-    ApplicationSystemStorage::EventSink events{
-        [&forwarded](browser::SystemEvent event) { forwarded.push_back(std::move(event)); }};
+    ApplicationSystemStorage::EventSink events{[&forwarded](browser::SystemEvent event) { forwarded.push_back(std::move(event)); }};
     std::atomic_uint64_t continuity_losses{0U};
-    auto route = make_explore_upscale_event_sink(events, upscale, [&continuity_losses] {
-        continuity_losses.fetch_add(1U, std::memory_order_acq_rel);
-    });
+    auto route = make_explore_upscale_event_sink(events, upscale,
+                                                 [&continuity_losses] { continuity_losses.fetch_add(1U, std::memory_order_acq_rel); });
     route(ExploreFailed{
         .snapshot = {.revision = 8U},
         .detail = std::string(kVisualFailureByteCapacity + 1U, 'x'),

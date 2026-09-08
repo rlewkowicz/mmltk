@@ -475,8 +475,7 @@ struct SurfaceAudit final {
                                  event == "presentation.release_wait.completed";
         if (copying || transferred) {
             if (scalar(record, "source_revision") != scalar(record, "frame_revision") ||
-                scalar(record, "allocation_generation") != generation ||
-                scalar(record, "presentation_revision") != scalar(record, "value"))
+                scalar(record, "allocation_generation") != generation || scalar(record, "presentation_revision") != scalar(record, "value"))
                 reject("native operation mixes source allocation or publication identities");
             if (copying && (scalar(record, "presentation_revision") != 0U || scalar(record, "transfer_sequence") != 0U ||
                             scalar(record, "timeline_ready") != 0U))
@@ -508,14 +507,14 @@ struct SurfaceAudit final {
             if (scalar(record, "outcome") != 1U) reject("native physical retirement failed");
             state.native_retired = true;
         } else {
-            const bool span_end = event == "presentation.source_borrow.completed" ||
-                                  event == "presentation.ready_sync.completed" ||
+            const bool span_end = event == "presentation.source_borrow.completed" || event == "presentation.ready_sync.completed" ||
                                   event == "presentation.release_wait.completed";
             if (span_end) {
                 const auto span_outcome = scalar(record, "span_outcome");
                 state.ended_spans.insert_or_assign(scalar(record, "span_id"), span_outcome);
                 if (span_outcome != static_cast<std::uint64_t>(mmltk::controller::contracts::DiagnosticSpanOutcome::Success) ||
-                    scalar(record, "outcome") != 1U) return;
+                    scalar(record, "outcome") != 1U)
+                    return;
             }
             if (event == "presentation.source.copy" && scalar(record, "outcome") != 0U) return;
             auto& steps = state.source_steps[scalar(record, "frame_revision")];
@@ -691,7 +690,7 @@ struct SurfaceAudit final {
 };
 
 struct PixelBoundaryAudit final {
-    explicit PixelBoundaryAudit(bool enabled = true) : enabled(enabled) {}
+    explicit PixelBoundaryAudit(const bool pixel_enabled = true) : enabled(pixel_enabled) {}
     bool enabled = true;
     using Key = std::pair<std::string, std::uint64_t>;
     struct Sample final {
@@ -734,11 +733,11 @@ struct PixelBoundaryAudit final {
             const auto& receipt = publication.receivers[0].identity;
             for (const auto receiver : {0U, 1U}) {
                 const auto& evidence = publication.receivers[receiver].identity;
-                if (!evidence.empty() && (allocation ||
-                    scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence"))) return false;
+                if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
+                    return false;
             }
             const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
-                scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
+                                      scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
             if (!publication.forwarded.empty() && (allocation || same_attempt)) {
                 if (publication.forwarded.value("pixel_probe", true)) return false;
                 if (!allocation) {
@@ -747,8 +746,7 @@ struct PixelBoundaryAudit final {
                 }
                 forwarded = true;
             }
-            if (!allocation && !receipt.empty() &&
-                scalar(receipt, "layer") == scalar(failed, "layer") &&
+            if (!allocation && !receipt.empty() && scalar(receipt, "layer") == scalar(failed, "layer") &&
                 scalar(receipt, "slot") == scalar(failed, "slot") &&
                 scalar(receipt, "transfer_sequence") > scalar(failed, "transfer_sequence") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
@@ -763,11 +761,10 @@ struct PixelBoundaryAudit final {
         std::set<std::uint64_t> expected;
         bool summary = false;
         [[nodiscard]] bool complete() const {
-            return summary && !expected.empty() && cards.size() == expected.size() &&
-                std::ranges::all_of(cards, [&](const auto& card) {
-                    return expected.contains(card.first) &&
-                        std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); });
-                });
+            return summary && !expected.empty() && cards.size() == expected.size() && std::ranges::all_of(cards, [&](const auto& card) {
+                       return expected.contains(card.first) &&
+                              std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); });
+                   });
         }
     };
     using CompositionKey = std::tuple<std::uint64_t, std::string, std::uint64_t>;
@@ -801,24 +798,26 @@ struct PixelBoundaryAudit final {
             authoritative_route = false;
         } else if (event == "integration.navigation_message" && (navigation_stage == 1U || navigation_stage == 5U)) {
             const bool train = navigation_stage == 1U;
-            if (control != (train ? "navigation.train" : "navigation.explore") ||
-                detail != (train ? "Explore" : "Train")) reject("wrong mapped navigation message path");
-            else ++navigation_stage;
+            if (control != (train ? "navigation.train" : "navigation.explore") || detail != (train ? "Explore" : "Train"))
+                reject("wrong mapped navigation message path");
+            else
+                ++navigation_stage;
         } else if (event == "integration.navigation_outcome" && navigation_stage > 0U && navigation_stage < 8U) {
             const bool train = navigation_stage == 2U;
             if ((!train && navigation_stage != 6U) || control != (train ? "navigation.train" : "navigation.explore") ||
-                detail != (train ? "Train" : "Explore")) reject("navigation outcome lacks its mapped root/router message");
-            else ++navigation_stage;
+                detail != (train ? "Train" : "Explore"))
+                reject("navigation outcome lacks its mapped root/router message");
+            else
+                ++navigation_stage;
         } else if (event == "integration.route_state" && (navigation_stage == 3U || navigation_stage == 7U)) {
             if (detail == "settings.reply" && scalar(record, "a") == 1U &&
                 control == (navigation_stage == 3U ? "navigation.train" : "navigation.explore"))
                 authoritative_route = true;
         } else if (event == "integration.viewer_route_confirmed") {
             const bool train = navigation_stage == 3U;
-            if ((!train && navigation_stage != 7U) ||
-                control != (train ? "navigation.train" : "navigation.explore") ||
-                (train ? detail != "None" : (detail != "Explore" && detail != "Upscale")) ||
-                scalar(record, "c") != 1U || (scalar(record, "b") != 0U) != route_persistence ||
+            if ((!train && navigation_stage != 7U) || control != (train ? "navigation.train" : "navigation.explore") ||
+                (train ? detail != "None" : (detail != "Explore" && detail != "Upscale")) || scalar(record, "c") != 1U ||
+                (scalar(record, "b") != 0U) != route_persistence ||
                 (route_persistence && (!authoritative_route || scalar(record, "a") <= route_revision))) {
                 reject("mapped route foreground or authoritative persistence is incomplete");
             } else {
@@ -827,8 +826,10 @@ struct PixelBoundaryAudit final {
                 authoritative_route = false;
             }
         } else if (event == "integration.viewer_abandoned") {
-            if (navigation_stage != 4U) reject("viewer abandoned before mapped departure confirmation");
-            else navigation_stage = 5U;
+            if (navigation_stage != 4U)
+                reject("viewer abandoned before mapped departure confirmation");
+            else
+                navigation_stage = 5U;
         } else if (event == "integration.viewer_basic_reentry") {
             if (navigation_stage != 8U || scalar(record, "a") == 0U || scalar(record, "b") == 0U)
                 reject("automatic Basic lacks mapped reentry and completed draw");
@@ -840,11 +841,11 @@ struct PixelBoundaryAudit final {
             if (navigation_stage != 9U || scalar(record, "b") == 0U ||
                 reentry_product != std::array{scalar(record, "a"), scalar(record, "c"), scalar(record, "d")})
                 reject("reconnect did not restore the same completed viewer product");
-            else navigation_stage = 10U;
+            else
+                navigation_stage = 10U;
             successful_viewer = std::pair{scalar(record, "b"), scalar(record, "a")};
         } else if (event == "integration.explore_reopened" && navigation_stage == 10U) {
-            if (detail == "usable-after-reopen" && scalar(record, "c") > 0U && scalar(record, "d") > 0U)
-                navigation_stage = 11U;
+            if (detail == "usable-after-reopen" && scalar(record, "c") > 0U && scalar(record, "d") > 0U) navigation_stage = 11U;
         }
         if (event == "integration.viewer_complete" && detail != "copy")
             successful_viewer = std::pair{scalar(record, "a"), scalar(record, "b")};
@@ -852,8 +853,8 @@ struct PixelBoundaryAudit final {
 
     [[nodiscard]] bool raw_complete() const {
         return failure.empty() && std::ranges::any_of(samples, [](const auto& entry) {
-            return std::ranges::all_of(entry.second.counted, [](bool counted) { return counted; });
-        });
+                   return std::ranges::all_of(entry.second.counted, [](bool counted) { return counted; });
+               });
     }
     [[nodiscard]] bool viewer_nonblack_complete() const {
         if (!successful_viewer || !failure.empty()) return false;
@@ -864,27 +865,24 @@ struct PixelBoundaryAudit final {
                 scalar(publication.receivers[3].identity, "content_sequence") != successful_viewer->second)
                 return false;
             const auto has_color = [](const auto& boundary) {
-                return std::ranges::any_of(boundary.values, [](const auto& value) {
-                    return value && colored(value->rgba);
-                });
+                return std::ranges::any_of(boundary.values, [](const auto& value) { return value && colored(value->rgba); });
             };
             const auto& canvas = publication.receivers[3];
             const auto& imported = publication.receivers[0];
             const auto& mailbox = publication.receivers[1];
             const auto& owned = publication.receivers[2];
             const auto attempt = publication.native.find(scalar(imported.identity, "transfer_sequence"));
-            if (attempt == publication.native.end() || !imported.complete() || !mailbox.complete() ||
-                !owned.complete() || canvas.identity != owned.identity) return false;
+            if (attempt == publication.native.end() || !imported.complete() || !mailbox.complete() || !owned.complete() ||
+                canvas.identity != owned.identity)
+                return false;
             const auto& native = attempt->second;
             return native.complete() && native.identity == native.publication_fact &&
-                scalar(native.identity, "source_revision") == successful_viewer->second &&
-                has_color(native) && has_color(canvas);
+                   scalar(native.identity, "source_revision") == successful_viewer->second && has_color(native) && has_color(canvas);
         });
     }
 
     static bool colored(std::uint32_t value) {
-        return (value >> 24U) != 0U && ((value & 255U) > 8U ||
-            ((value >> 8U) & 255U) > 8U || ((value >> 16U) & 255U) > 8U);
+        return (value >> 24U) != 0U && ((value & 255U) > 8U || ((value >> 8U) & 255U) > 8U || ((value >> 16U) & 255U) > 8U);
     }
     void reject(std::string_view reason) {
         if (failure.empty()) failure = reason;
@@ -892,19 +890,24 @@ struct PixelBoundaryAudit final {
     static nlohmann::json identity_of(const nlohmann::json& record, std::size_t boundary) {
         nlohmann::json identity = nlohmann::json::object();
         const auto copy = [&](const char* field) { identity[field] = scalar(record, field); };
-        for (const auto* field : {"presentation_revision"}) copy(field);
+        for (const auto* field : {"presentation_revision"})
+            copy(field);
         if (boundary == 0U) {
-            for (const auto* field : {"source_session", "source_instance", "source_revision", "clean_revision",
-                 "source_observation_revision", "source_width", "source_height", "content_x", "content_y",
-                 "content_width", "content_height", "allocation_generation", "capacity_width", "capacity_height",
-                 "transfer_sequence", "timeline_ready"}) copy(field);
+            for (const auto* field :
+                 {"source_session", "source_instance", "source_revision", "clean_revision", "source_observation_revision", "source_width",
+                  "source_height", "content_x", "content_y", "content_width", "content_height", "allocation_generation", "capacity_width",
+                  "capacity_height", "transfer_sequence", "timeline_ready"})
+                copy(field);
         } else {
-            for (const auto* field : {"content_session", "content_width", "content_height", "layer", "slot"}) copy(field);
+            for (const auto* field : {"content_session", "content_width", "content_height", "layer", "slot"})
+                copy(field);
             identity["content_sequence"] = scalar(record, boundary < 3U ? "content_sequence" : "frame_revision");
             if (boundary < 3U) {
-                for (const auto* field : {"transfer_sequence", "timeline_ready", "timeline_release"}) copy(field);
+                for (const auto* field : {"transfer_sequence", "timeline_ready", "timeline_release"})
+                    copy(field);
             } else {
-                for (const auto* field : {"allocation_generation", "width", "height"}) copy(field);
+                for (const auto* field : {"allocation_generation", "width", "height"})
+                    copy(field);
             }
         }
         return identity;
@@ -912,8 +915,8 @@ struct PixelBoundaryAudit final {
     void reconcile(Publication& publication) {
         const auto& imported = publication.receivers[0];
         if (imported.identity.empty() || publication.forwarded.empty()) return;
-        for (const auto* field : {"content_session", "content_sequence", "presentation_revision",
-            "content_width", "content_height", "layer", "slot"})
+        for (const auto* field :
+             {"content_session", "content_sequence", "presentation_revision", "content_width", "content_height", "layer", "slot"})
             if (scalar(imported.identity, field) != scalar(publication.forwarded, field))
                 reject("Firefox pixel receipt differs from the forwarded physical mailbox");
         if (scalar(imported.identity, "layer") !=
@@ -927,41 +930,37 @@ struct PixelBoundaryAudit final {
         if (source.publication_fact.empty()) return;
         if (fact != source.publication_fact) reject("native pixels differ from the canonical publication fact");
         const auto width = scalar(fact, "source_width"), height = scalar(fact, "source_height");
-        if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") ||
-            height > scalar(fact, "capacity_height") || scalar(fact, "source_session") == 0U ||
-            scalar(fact, "source_instance") == 0U || scalar(fact, "source_revision") == 0U ||
+        if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") || height > scalar(fact, "capacity_height") ||
+            scalar(fact, "source_session") == 0U || scalar(fact, "source_instance") == 0U || scalar(fact, "source_revision") == 0U ||
             scalar(fact, "clean_revision") == 0U || scalar(fact, "source_observation_revision") == 0U ||
-            scalar(fact, "allocation_generation") == 0U ||
-            scalar(fact, "content_x") + scalar(fact, "content_width") > width ||
+            scalar(fact, "allocation_generation") == 0U || scalar(fact, "content_x") + scalar(fact, "content_width") > width ||
             scalar(fact, "content_y") + scalar(fact, "content_height") > height ||
             scalar(fact, "timeline_ready") != scalar(fact, "transfer_sequence") * 2U - 1U) {
             reject("invalid native product, content, allocation, or transfer fact");
             return;
         }
-        std::array<const Boundary*, 4> raw{&source, &publication.receivers[0],
-            &publication.receivers[1], &publication.receivers[2]};
+        std::array<const Boundary*, 4> raw{&source, &publication.receivers[0], &publication.receivers[1], &publication.receivers[2]};
         for (std::size_t owner = 1U; owner < raw.size(); ++owner) {
             const auto& identity = raw[owner]->identity;
             if (identity.empty()) continue;
             if (scalar(identity, "content_session") != scalar(fact, "source_session") ||
-                scalar(identity, "content_sequence") != scalar(fact, "source_revision") ||
-                scalar(identity, "content_width") != width || scalar(identity, "content_height") != height ||
-                scalar(identity, "layer") != scalar(imported.identity, "layer") ||
-                scalar(identity, "slot") != scalar(imported.identity, "slot") ||
-                scalar(identity, "layer") >= 3U || scalar(identity, "slot") >= 2U)
+                scalar(identity, "content_sequence") != scalar(fact, "source_revision") || scalar(identity, "content_width") != width ||
+                scalar(identity, "content_height") != height || scalar(identity, "layer") != scalar(imported.identity, "layer") ||
+                scalar(identity, "slot") != scalar(imported.identity, "slot") || scalar(identity, "layer") >= 3U ||
+                scalar(identity, "slot") >= 2U)
                 reject("receiver content or physical mailbox identity differs");
             if (owner < 3U && (scalar(identity, "transfer_sequence") != scalar(fact, "transfer_sequence") ||
-                scalar(identity, "timeline_ready") != scalar(fact, "timeline_ready") ||
-                scalar(identity, "timeline_release") != scalar(fact, "timeline_ready") + 1U))
+                               scalar(identity, "timeline_ready") != scalar(fact, "timeline_ready") ||
+                               scalar(identity, "timeline_release") != scalar(fact, "timeline_ready") + 1U))
                 reject("Firefox physical timeline receipt differs");
             if (owner == 3U && (scalar(identity, "allocation_generation") != scalar(fact, "allocation_generation") ||
-                scalar(identity, "width") != scalar(fact, "capacity_width") ||
-                scalar(identity, "height") != scalar(fact, "capacity_height")))
+                                scalar(identity, "width") != scalar(fact, "capacity_width") ||
+                                scalar(identity, "height") != scalar(fact, "capacity_height")))
                 reject("Iced allocation differs from native publication");
         }
         const auto coordinate = [](std::size_t index, std::uint64_t size) {
-            return std::array<std::uint64_t, 5>{0U, std::min(191UL, size - 1U),
-                std::min(383UL, size - 1U), (size - 1U) / 2U, size - 1U}[index];
+            return std::array<std::uint64_t, 5>{0U, std::min(191UL, size - 1U), std::min(383UL, size - 1U), (size - 1U) / 2U,
+                                                size - 1U}[index];
         };
         for (std::size_t owner = 0U; owner < raw.size(); ++owner) {
             for (std::size_t index = 0U; index < 25U; ++index) {
@@ -969,11 +968,11 @@ struct PixelBoundaryAudit final {
                 if (!sample) continue;
                 if (sample->x != coordinate(index % 5U, width) || sample->y != coordinate(index / 5U, height))
                     reject("raw probe coordinate differs from logical-content multiset");
-                if (owner != 0U && raw[owner - 1U]->values[index] &&
-                    sample != raw[owner - 1U]->values[index]) reject("ordered raw RGBA or alpha divergence");
+                if (owner != 0U && raw[owner - 1U]->values[index] && sample != raw[owner - 1U]->values[index])
+                    reject("ordered raw RGBA or alpha divergence");
             }
-            if (owner != 0U && !publication.counted[owner - 1U] &&
-                raw[owner - 1U]->complete() && raw[owner]->complete() && failure.empty()) {
+            if (owner != 0U && !publication.counted[owner - 1U] && raw[owner - 1U]->complete() && raw[owner]->complete() &&
+                failure.empty()) {
                 publication.counted[owner - 1U] = true;
                 ++joined[owner - 1U];
             }
@@ -983,38 +982,42 @@ struct PixelBoundaryAudit final {
             if (!canvas.identity.empty() && !raw[3]->identity.empty() && canvas.identity != raw[3]->identity)
                 reject("canvas does not name the captured physical publication");
             for (std::size_t index = 0U; index < 25U; ++index) {
-                if (canvas.values[index] && (canvas.values[index]->x != coordinate(index % 5U, width) ||
-                    canvas.values[index]->y != coordinate(index / 5U, height)))
+                if (canvas.values[index] &&
+                    (canvas.values[index]->x != coordinate(index % 5U, width) || canvas.values[index]->y != coordinate(index / 5U, height)))
                     reject("canvas probe does not name its logical source sample");
-                if (canvas.values[index] && raw[3]->values[index] &&
-                    colored(raw[3]->values[index]->rgba) && !colored(canvas.values[index]->rgba))
+                if (canvas.values[index] && raw[3]->values[index] && colored(raw[3]->values[index]->rgba) &&
+                    !colored(canvas.values[index]->rgba))
                     reject("successful owned capture produced an unexplained black viewer canvas");
             }
         }
-        if (source.complete() && width == 384U && height == 384U &&
-            scalar(fact, "capacity_width") == 894U && scalar(fact, "capacity_height") == 1080U)
+        if (source.complete() && width == 384U && height == 384U && scalar(fact, "capacity_width") == 894U &&
+            scalar(fact, "capacity_height") == 1080U)
             retained_logical_content = true;
-        if (source.complete() && width == 1536U && height == 1536U &&
-            scalar(fact, "allocation_generation") > 1U) upscale_growth = true;
+        if (source.complete() && width == 1536U && height == 1536U && scalar(fact, "allocation_generation") > 1U) upscale_growth = true;
     }
 
     void consume(const nlohmann::json& record) {
         const std::string event = record.value("event", "");
         consume_continuity(record, event);
         if (event == "firefox.workspace.probe_failed") {
-            if (!enabled || probe_failures.size() >= 16U) reject("unexpected or excessive probe preparation failures");
-            else probe_failures.push_back(record);
+            if (!enabled || probe_failures.size() >= 16U)
+                reject("unexpected or excessive probe preparation failures");
+            else
+                probe_failures.push_back(record);
             return;
         }
         if (event == "upscale.stop.requested") {
             if (stop_observations.size() < kAcceptanceRecordLimit)
                 stop_observations.push_back(scalar(record, "observation_revision"));
-            else reject("Stop observations exceeded bounded acceptance capacity");
+            else
+                reject("Stop observations exceeded bounded acceptance capacity");
         }
         if (event == "integration.upscale_cached") {
             const auto method = scalar(record, "c");
-            if (method < 3U) cached_methods.insert(method);
-            else reject("unknown cached Upscale method");
+            if (method < 3U)
+                cached_methods.insert(method);
+            else
+                reject("unknown cached Upscale method");
         }
         if (event == "integration.viewer_departure_started") departure_begin = scalar(record, "a");
         if (event == "integration.viewer_abandoned") departure_end = scalar(record, "a");
@@ -1022,29 +1025,30 @@ struct PixelBoundaryAudit final {
         if (event == "integration.viewer_basic_reentry") basic_reentry = true;
         if (event == "integration.viewer_reconnected") reconnected = true;
         if (event == "integration.atlas_composition" || event == "integration.atlas_composition_complete") {
-            const CompositionKey key{scalar(record, "columns"), record.value("surface", ""),
-                scalar(record, "presentation_revision")};
-            if ((std::get<0>(key) != 4U && std::get<0>(key) != 10U) ||
-                std::get<1>(key).empty() || std::get<2>(key) == 0U) {
-                reject("invalid composition publication or columns"); return;
+            const CompositionKey key{scalar(record, "columns"), record.value("surface", ""), scalar(record, "presentation_revision")};
+            if ((std::get<0>(key) != 4U && std::get<0>(key) != 10U) || std::get<1>(key).empty() || std::get<2>(key) == 0U) {
+                reject("invalid composition publication or columns");
+                return;
             }
             if (!compositions.contains(key) && compositions.size() >= kAcceptanceRecordLimit) {
-                reject("composition evidence exceeded bounded publication capacity"); return;
+                reject("composition evidence exceeded bounded publication capacity");
+                return;
             }
             auto& composition = compositions[key];
             const auto identity = identity_of(record, 3U);
             if (!composition.identity.empty() && composition.identity != identity)
                 reject("composition mixed physical publications");
-            else composition.identity = identity;
+            else
+                composition.identity = identity;
             if (event == "integration.atlas_composition_complete") {
-                if (!record.contains("cards") || !record["cards"].is_array() ||
-                    record["cards"].empty() || record["cards"].size() > 256U) {
-                    reject("invalid expected composition card set"); return;
+                if (!record.contains("cards") || !record["cards"].is_array() || record["cards"].empty() || record["cards"].size() > 256U) {
+                    reject("invalid expected composition card set");
+                    return;
                 }
                 std::set<std::uint64_t> expected;
-                for (const auto& card : record["cards"]) expected.insert(card.get<std::uint64_t>());
-                if (expected.size() != record["cards"].size() ||
-                    scalar(record, "emitted") != expected.size() * 4U ||
+                for (const auto& card : record["cards"])
+                    expected.insert(card.get<std::uint64_t>());
+                if (expected.size() != record["cards"].size() || scalar(record, "emitted") != expected.size() * 4U ||
                     (composition.summary && composition.expected != expected))
                     reject("conflicting or incomplete composition summary");
                 composition.expected = std::move(expected);
@@ -1054,22 +1058,22 @@ struct PixelBoundaryAudit final {
             } else {
                 const auto card = scalar(record, "card"), kind = scalar(record, "kind");
                 if (kind >= 4U || (!composition.cards.contains(card) && composition.cards.size() >= 256U)) {
-                    reject("composition card or kind exceeds bounded contract"); return;
+                    reject("composition card or kind exceeds bounded contract");
+                    return;
                 }
                 if (composition.summary && !composition.expected.contains(card)) reject("extra composition card");
                 const auto valid_channels = [&](const char* field) {
                     return record.contains(field) && record[field].is_array() && record[field].size() == 4U &&
-                        std::ranges::all_of(record[field], [](const auto& value) {
-                            return value.is_number() && value.template get<double>() >= 0.0 &&
-                                value.template get<double>() <= 255.0;
-                        });
+                           std::ranges::all_of(record[field], [](const auto& value) {
+                               return value.is_number() && value.template get<double>() >= 0.0 && value.template get<double>() <= 255.0;
+                           });
                 };
                 if (!valid_channels("expected") || !valid_channels("observed")) {
-                    reject("invalid composition RGBA arrays"); return;
+                    reject("invalid composition RGBA arrays");
+                    return;
                 }
                 for (std::size_t channel = 0U; channel < 4U; ++channel)
-                    if (std::abs(record["expected"][channel].get<double>() -
-                        record["observed"][channel].get<double>()) > 4.0)
+                    if (std::abs(record["expected"][channel].get<double>() - record["observed"][channel].get<double>()) > 4.0)
                         reject("deterministic composition RGBA differs");
                 for (const auto* axis : {"x", "y"}) {
                     const std::string sample_field = std::string{"sample_"} + axis;
@@ -1082,34 +1086,43 @@ struct PixelBoundaryAudit final {
                     const auto canvas = record.value(canvas_field, -1.0);
                     if (content == 0U || extent <= 0.0 || !std::isfinite(canvas) || sample < 0.0 ||
                         sample >= static_cast<double>(content) ||
-                        std::abs(canvas - (record.value(origin_field, 0.0) +
-                            sample * extent / static_cast<double>(content))) > 0.01)
+                        std::abs(canvas - (record.value(origin_field, 0.0) + sample * extent / static_cast<double>(content))) > 0.01)
                         reject("composition transformed canvas coordinate differs");
                 }
                 auto& value = composition.cards[card][kind];
-                if (value && *value != record) reject("duplicate-conflicting composition card sample");
-                else value = record;
+                if (value && *value != record)
+                    reject("duplicate-conflicting composition card sample");
+                else
+                    value = record;
             }
             return;
         }
         std::size_t boundary = 0U;
-        if (event == "presentation.pixel" || event == "presentation.frame.edge") boundary = 0U;
-        else if (event == "firefox.workspace.frame_forwarded") boundary = 1U;
+        if (event == "presentation.pixel" || event == "presentation.frame.edge")
+            boundary = 0U;
+        else if (event == "firefox.workspace.frame_forwarded")
+            boundary = 1U;
         else if (event == "firefox.workspace.pixel") {
             const auto owner = record.value("boundary", "");
-            if (owner != "import" && owner != "mailbox") { reject("unknown Firefox pixel owner"); return; }
+            if (owner != "import" && owner != "mailbox") {
+                reject("unknown Firefox pixel owner");
+                return;
+            }
             boundary = owner == "import" ? 1U : 2U;
-        }
-        else if (event == "iced.surface.pixel") boundary = 3U;
+        } else if (event == "iced.surface.pixel")
+            boundary = 3U;
         else if (event == "iced.surface.canvas_pixel") {
             boundary = 4U;
             canvas_seen = true;
-        }
-        else return;
+        } else
+            return;
         if (!enabled && (event == "presentation.frame.edge" || event == "firefox.workspace.frame_forwarded")) return;
         const std::string surface = boundary == 0U ? SurfaceAudit::native_identity(record) : record.value("surface", "");
         const Key key{surface, scalar(record, "presentation_revision")};
-        if (surface.empty() || key.second == 0U) { reject("invalid physical pixel publication"); return; }
+        if (surface.empty() || key.second == 0U) {
+            reject("invalid physical pixel publication");
+            return;
+        }
         if (!samples.contains(key) && samples.size() >= kAcceptanceRecordLimit) {
             if (failure.empty()) failure = "pixel evidence exceeded its bounded acceptance capacity";
             return;
@@ -1120,7 +1133,8 @@ struct PixelBoundaryAudit final {
             identity["pixel_probe"] = record.value("pixel_probe", false);
             if (!publication.forwarded.empty() && publication.forwarded != identity)
                 reject("forwarded physical mailbox changed within a publication");
-            else publication.forwarded = identity;
+            else
+                publication.forwarded = identity;
             reconcile(publication);
             return;
         }
@@ -1136,51 +1150,66 @@ struct PixelBoundaryAudit final {
             reconcile(publication);
             return;
         }
-        if (!target.identity.empty() && target.identity != identity) reject("immutable owner identity changed");
-        else target.identity = identity;
+        if (!target.identity.empty() && target.identity != identity)
+            reject("immutable owner identity changed");
+        else
+            target.identity = identity;
         const auto index = scalar(record, "sample_index");
-        if (index >= 25U) { reject("pixel index exceeds fixed sample contract"); return; }
+        if (index >= 25U) {
+            reject("pixel index exceeds fixed sample contract");
+            return;
+        }
         const Sample value{scalar(record, "sample_x"), scalar(record, "sample_y"),
-            static_cast<std::uint32_t>(scalar(record, "sample_rgba"))};
-        if (boundary != 4U && target.values[index] && target.values[index] != value)
-            reject("immutable owner pixel changed");
+                           static_cast<std::uint32_t>(scalar(record, "sample_rgba"))};
+        if (boundary != 4U && target.values[index] && target.values[index] != value) reject("immutable owner pixel changed");
         target.values[index] = value;
-        publication.viewer = publication.viewer ||
-            (boundary == 4U && record.value("control", "") == "explore.detail.workspace");
+        publication.viewer = publication.viewer || (boundary == 4U && record.value("control", "") == "explore.detail.workspace");
         if (publication.viewer && boundary == 4U) ++viewer_canvas_joins;
         reconcile(publication);
     }
 
     [[nodiscard]] bool composition_complete() const {
         return failure.empty() && std::ranges::all_of(std::array{4U, 10U}, [&](const auto columns) {
-            return std::ranges::any_of(compositions, [&](const auto& value) {
-                return std::get<0>(value.first) == columns && value.second.complete();
-            });
-        });
+                   return std::ranges::any_of(
+                       compositions, [&](const auto& value) { return std::get<0>(value.first) == columns && value.second.complete(); });
+               });
     }
     [[nodiscard]] bool continuity_complete(bool require_gallery = true) const {
-        return failure.empty() && (!enabled || navigation_stage >= (require_gallery ? 11U : 10U)) &&
-            cached_methods.size() == 3U && settings_preserved && basic_reentry && reconnected &&
-            departure_begin != 0U && departure_end > departure_begin &&
-            std::ranges::count_if(stop_observations, [&](const auto revision) {
-                return revision >= departure_begin && revision < departure_end;
-            }) == 1;
+        return failure.empty() && (!enabled || navigation_stage >= (require_gallery ? 11U : 10U)) && cached_methods.size() == 3U &&
+               settings_preserved && basic_reentry && reconnected && departure_begin != 0U && departure_end > departure_begin &&
+               std::ranges::count_if(stop_observations,
+                                     [&](const auto revision) { return revision >= departure_begin && revision < departure_end; }) == 1;
     }
 };
 
 TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[workspace][audit][pixel]") {
-    const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U}, {"surface_low", 2U},
-        {"presentation_revision", 7U}, {"source_session", 1U}, {"source_instance", 3U}, {"source_revision", 9U},
-        {"clean_revision", 8U}, {"source_observation_revision", 11U}, {"source_width", 384U}, {"source_height", 384U},
-        {"content_width", 384U}, {"content_height", 384U}, {"capacity_width", 894U}, {"capacity_height", 1080U},
-        {"allocation_generation", 2U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U}, {"sample_rgba", 0xff705030U}};
+    const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U},      {"surface_low", 2U},
+                                {"presentation_revision", 7U},   {"source_session", 1U},    {"source_instance", 3U},
+                                {"source_revision", 9U},         {"clean_revision", 8U},    {"source_observation_revision", 11U},
+                                {"source_width", 384U},          {"source_height", 384U},   {"content_width", 384U},
+                                {"content_height", 384U},        {"capacity_width", 894U},  {"capacity_height", 1080U},
+                                {"allocation_generation", 2U},   {"transfer_sequence", 4U}, {"timeline_ready", 7U},
+                                {"sample_rgba", 0xff705030U}};
     const std::string surface = SurfaceAudit::native_identity(native);
     const auto pixel = [&](const char* event, const char* boundary) {
-        return nlohmann::json{{"event", event}, {"boundary", boundary}, {"surface", surface},
-            {"presentation_revision", 7U}, {"content_session", 1U}, {"content_sequence", 9U}, {"frame_revision", 9U},
-            {"content_width", 384U}, {"content_height", 384U}, {"width", 894U}, {"height", 1080U},
-            {"allocation_generation", 2U}, {"transfer_sequence", 4U}, {"timeline_ready", 7U}, {"timeline_release", 8U},
-            {"layer", 0U}, {"slot", 1U}, {"sample_rgba", 0xff705030U}};
+        return nlohmann::json{{"event", event},
+                              {"boundary", boundary},
+                              {"surface", surface},
+                              {"presentation_revision", 7U},
+                              {"content_session", 1U},
+                              {"content_sequence", 9U},
+                              {"frame_revision", 9U},
+                              {"content_width", 384U},
+                              {"content_height", 384U},
+                              {"width", 894U},
+                              {"height", 1080U},
+                              {"allocation_generation", 2U},
+                              {"transfer_sequence", 4U},
+                              {"timeline_ready", 7U},
+                              {"timeline_release", 8U},
+                              {"layer", 0U},
+                              {"slot", 1U},
+                              {"sample_rgba", 0xff705030U}};
     };
     auto imported = pixel("firefox.workspace.pixel", "import");
     auto mailbox = pixel("firefox.workspace.pixel", "mailbox");
@@ -1190,8 +1219,8 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         constexpr std::array<unsigned, 5> coordinates{0U, 191U, 383U, 191U, 383U};
         for (std::size_t index = 0U; index < 25U; ++index) {
             for (auto record : {changed, mailbox, imported, native}) {
-                if (!missing_owner.empty() && (record.value("boundary", "") == missing_owner ||
-                    record.value("event", "") == missing_owner)) continue;
+                if (!missing_owner.empty() && (record.value("boundary", "") == missing_owner || record.value("event", "") == missing_owner))
+                    continue;
                 if (missing && index == 24U && record.value("event", "") == "iced.surface.pixel") continue;
                 record["presentation_revision"] = publication;
                 record["sample_index"] = index;
@@ -1225,8 +1254,8 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     PixelBoundaryAudit partial;
     fill(partial, owned, true);
     CHECK(partial.joined.back() == 0U);
-    for (const auto field : {"source_instance", "clean_revision", "source_observation_revision",
-        "content_x", "capacity_width", "timeline_ready"}) {
+    for (const auto field :
+         {"source_instance", "clean_revision", "source_observation_revision", "content_x", "capacity_width", "timeline_ready"}) {
         PixelBoundaryAudit audit;
         fill(audit, owned);
         auto edge = native;
@@ -1324,20 +1353,37 @@ TEST_CASE("composition evidence requires every card and kind in each column publ
             for (const auto card : {3U, 8U}) {
                 for (unsigned kind = 0U; kind < 4U; ++kind) {
                     if (defect == "missing" && columns == 10U && card == 8U && kind == 3U) continue;
-                    nlohmann::json record{{"event", "integration.atlas_composition"}, {"surface", "surface"},
-                        {"columns", columns}, {"presentation_revision", columns}, {"card", card}, {"kind", kind},
-                        {"content_width", 100U}, {"content_height", 100U},
-                        {"image_x", 0.0}, {"image_y", 0.0}, {"image_width", 100.0}, {"image_height", 100.0},
-                        {"sample_x", 10.5}, {"sample_y", 10.5}, {"canvas_x", 10.5}, {"canvas_y", 10.5},
-                        {"expected", {120, 80, 40, 255}}, {"observed", {120, 80, 40, 255}}};
+                    nlohmann::json record{{"event", "integration.atlas_composition"},
+                                          {"surface", "surface"},
+                                          {"columns", columns},
+                                          {"presentation_revision", columns},
+                                          {"card", card},
+                                          {"kind", kind},
+                                          {"content_width", 100U},
+                                          {"content_height", 100U},
+                                          {"image_x", 0.0},
+                                          {"image_y", 0.0},
+                                          {"image_width", 100.0},
+                                          {"image_height", 100.0},
+                                          {"sample_x", 10.5},
+                                          {"sample_y", 10.5},
+                                          {"canvas_x", 10.5},
+                                          {"canvas_y", 10.5},
+                                          {"expected", {120, 80, 40, 255}},
+                                          {"observed", {120, 80, 40, 255}}};
                     if (defect == "mask-as-box" && kind == 2U) record["observed"] = {74, 80, 86, 255};
                     if (defect == "mixed" && kind == 3U) record["presentation_revision"] = 99U;
                     audit.consume(record);
                 }
             }
-            audit.consume({{"event", "integration.atlas_composition_complete"}, {"surface", "surface"},
-                {"columns", columns}, {"presentation_revision", columns}, {"cards", {3U, 8U}}, {"emitted", 8U},
-                {"content_width", 100U}, {"content_height", 100U}});
+            audit.consume({{"event", "integration.atlas_composition_complete"},
+                           {"surface", "surface"},
+                           {"columns", columns},
+                           {"presentation_revision", columns},
+                           {"cards", {3U, 8U}},
+                           {"emitted", 8U},
+                           {"content_width", 100U},
+                           {"content_height", 100U}});
         }
     };
     PixelBoundaryAudit valid;
@@ -1350,48 +1396,41 @@ TEST_CASE("composition evidence requires every card and kind in each column publ
     }
 }
 
-TEST_CASE("viewer continuity requires mapped routes foreground persistence and the same restored product",
-          "[workspace][audit][pixel]") {
+TEST_CASE("viewer continuity requires mapped routes foreground persistence and the same restored product", "[workspace][audit][pixel]") {
     const auto fill = [](PixelBoundaryAudit& audit, std::string_view defect, bool persistence) {
-        const auto event = [&](const char* name, const char* control = "", const char* detail = "",
-                               unsigned a = 0U, unsigned b = 0U, unsigned c = 0U, unsigned d = 0U) {
-            audit.consume({{"event", name}, {"control", control}, {"detail", detail},
-                {"a", a}, {"b", b}, {"c", c}, {"d", d}});
+        const auto event = [&](const char* name, const char* control = "", const char* detail = "", unsigned a = 0U, unsigned b = 0U,
+                               unsigned c = 0U, unsigned d = 0U) {
+            audit.consume({{"event", name}, {"control", control}, {"detail", detail}, {"a", a}, {"b", b}, {"c", c}, {"d", d}});
         };
         for (unsigned kernel = 0U; kernel < 3U; ++kernel)
             event("integration.upscale_cached", "", "", 0U, 0U, kernel);
         event("integration.viewer_settings_preserved");
         event("integration.viewer_departure_started", "", "", 20U, persistence ? 1U : 0U, 30U);
         audit.consume({{"event", "upscale.stop.requested"}, {"observation_revision", 20U}});
-        if (defect == "duplicate-stop")
-            audit.consume({{"event", "upscale.stop.requested"}, {"observation_revision", 20U}});
+        if (defect == "duplicate-stop") audit.consume({{"event", "upscale.stop.requested"}, {"observation_revision", 20U}});
         for (const bool train : {true, false}) {
             const auto* route = train ? "navigation.train" : "navigation.explore";
-            if (defect != "direct")
-                event("integration.navigation_message", route, train ? "Explore" : "Train");
-            if (defect != "missing-outcome")
-                event("integration.navigation_outcome", route, train ? "Train" : "Explore");
-            if (persistence && defect != "missing-persistence")
-                event("integration.route_state", route, "settings.reply", 1U);
+            if (defect != "direct") event("integration.navigation_message", route, train ? "Explore" : "Train");
+            if (defect != "missing-outcome") event("integration.navigation_outcome", route, train ? "Train" : "Explore");
+            if (persistence && defect != "missing-persistence") event("integration.route_state", route, "settings.reply", 1U);
             event("integration.viewer_route_confirmed", route,
-                defect == "foreground" ? "Annotation" : train ? "None" : "Upscale",
-                train ? 31U : 32U, persistence ? 1U : 0U, 1U);
+                  defect == "foreground" ? "Annotation"
+                  : train                ? "None"
+                                         : "Upscale",
+                  train ? 31U : 32U, persistence ? 1U : 0U, 1U);
             if (train) event("integration.viewer_abandoned", "", "", 21U);
         }
-        if (defect != "missing-basic")
-            event("integration.viewer_basic_reentry", "", "automatic-completed-draw", 41U, 50U, 3U, 40U);
-        event("integration.viewer_reconnected", "", "matching-completed-draw",
-            defect == "different-product" ? 42U : 41U, 51U, 3U, 40U);
-        if (defect != "missing-gallery")
-            event("integration.explore_reopened", "", "usable-after-reopen", 60U, 61U, 10U, 128U);
+        if (defect != "missing-basic") event("integration.viewer_basic_reentry", "", "automatic-completed-draw", 41U, 50U, 3U, 40U);
+        event("integration.viewer_reconnected", "", "matching-completed-draw", defect == "different-product" ? 42U : 41U, 51U, 3U, 40U);
+        if (defect != "missing-gallery") event("integration.explore_reopened", "", "usable-after-reopen", 60U, 61U, 10U, 128U);
     };
     for (const bool persistence : {false, true}) {
         PixelBoundaryAudit valid;
         fill(valid, "", persistence);
         CHECK(valid.continuity_complete());
     }
-    for (const auto defect : {"direct", "missing-outcome", "foreground", "missing-persistence",
-        "duplicate-stop", "missing-basic", "different-product", "missing-gallery"}) {
+    for (const auto defect : {"direct", "missing-outcome", "foreground", "missing-persistence", "duplicate-stop", "missing-basic",
+                              "different-product", "missing-gallery"}) {
         PixelBoundaryAudit audit;
         fill(audit, defect, true);
         CHECK_FALSE(audit.continuity_complete());
@@ -2026,8 +2065,9 @@ struct AtlasDrawAudit final {
     using CaptureKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
     using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>;
     static constexpr std::initializer_list<const char*> source_fields{
-        "content_session", "source_kind", "source_instance", "source_revision", "content_width", "content_height",
-        "dataset_identity", "gallery_generation", "columns", "rows", "first_row", "matching_count", "visible_indices"};
+        "content_session", "source_kind",      "source_instance",    "source_revision", "content_width",
+        "content_height",  "dataset_identity", "gallery_generation", "columns",         "rows",
+        "first_row",       "matching_count",   "visible_indices"};
     std::map<SourceKey, nlohmann::json> sources;
     std::map<std::pair<std::uint64_t, std::uint64_t>, SourceKey> sessions;
     std::map<CaptureKey, nlohmann::json> captures;
@@ -2657,15 +2697,14 @@ struct BrowserAudit final {
                 const double low = std::min({observed[0], observed[1], observed[2]});
                 const double scale = event == "integration.annotation_pixel" ? record.value("source_to_screen", 0.0) : 1.0;
                 matched = matched && std::isfinite(scale) && scale > 0.0;
-                if (event == "integration.annotation_pixel" && scale > 0.0 && scale < 1.0 &&
-                    std::ranges::max(expected) == 255.0 && std::ranges::min(expected) == 0.0 && peak - low >= 127.5) {
+                if (event == "integration.annotation_pixel" && scale > 0.0 && scale < 1.0 && std::ranges::max(expected) == 255.0 &&
+                    std::ranges::min(expected) == 0.0 && peak - low >= 127.5) {
                     minimum = low;
                     gain = 255.0 / (peak - low);
                 }
                 for (std::size_t channel = 0U; channel < 3U; ++channel)
-                    matched = matched && std::isfinite(expected[channel]) && std::isfinite(observed[channel]) &&
-                              expected[channel] >= 0.0 && expected[channel] <= 255.0 && observed[channel] >= 0.0 &&
-                              observed[channel] <= 255.0 &&
+                    matched = matched && std::isfinite(expected[channel]) && std::isfinite(observed[channel]) && expected[channel] >= 0.0 &&
+                              expected[channel] <= 255.0 && observed[channel] >= 0.0 && observed[channel] <= 255.0 &&
                               std::abs(expected[channel] - (observed[channel] - minimum) * gain) <= tolerance;
             }
             annotation_pixels_valid = annotation_pixels_valid && matched;
@@ -3499,8 +3538,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     if (permitted_cpus < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
     const bool h2d = GENERATE(true, false);
     const char* pixel_environment = std::getenv("MMLTK_GUI_PIXEL_TRACE");
-    const bool pixel_probes = pixel_fixture || !probe_failure.empty() ||
-        (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
+    const bool pixel_probes =
+        pixel_fixture || !probe_failure.empty() || (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
     INFO("selected H2D dataset transport: " << h2d);
     if (!h2d && !gdr_transport_available()) SKIP("GDR hardware unavailable; packaged Wayland GDR behavior remains unverified");
 
@@ -3675,8 +3714,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             native.presentation_ready && native.explore_rendered &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
             pixel_audit.probe_failure_complete(probe_failure) &&
-            (viewer_scenario != "square" || !pixel_probes ||
-                (pixel_audit.retained_logical_content && pixel_audit.upscale_growth)))
+            (viewer_scenario != "square" || !pixel_probes || (pixel_audit.retained_logical_content && pixel_audit.upscale_growth)))
             break;
         if (const auto* slots = browser.final_cursor_slots()) {
             if (const auto identified = native.final_generations_for(*slots)) final_generations = *identified;
@@ -3734,8 +3772,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         }
         if (!terminal_failure_observed && (native.product_ready(final_generations) || expected_window_close) && browser.product_ready() &&
             rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-            pixel_audit.probe_failure_complete(probe_failure) &&
-            (!pixel_fixture || pixel_audit.composition_complete()))
+            pixel_audit.probe_failure_complete(probe_failure) && (!pixel_fixture || pixel_audit.composition_complete()))
             break;
         if (viewer_scenario.empty() && !terminal_failure_observed && browser.terminal_evidence_settled() && !browser.product_ready()) {
             const auto blocker = browser.readiness_blocker();
@@ -4175,17 +4212,27 @@ namespace {
 [[nodiscard]] nlohmann::json native_surface_record(const char* event, const std::uint64_t low = 12U) {
     const std::string_view name{event};
     const bool copying = name.starts_with("presentation.source_borrow.") || name == "presentation.source.copy";
-    return {{"kind", "gui_runtime"}, {"event", event},        {"sequence", 7U},
-            {"surface_high", 11U},   {"surface_low", low},    {"selection_generation", 19U},
-            {"frame_revision", 23U}, {"capacity_width", 64U}, {"capacity_height", 32U},
-            {"condition", 2U},       {"outcome", name == "presentation.source.copy" ? 0U : 1U},
-            {"value", copying ? 0U : 1U}, {"source_revision", 23U}, {"allocation_generation", 7U},
-            {"presentation_revision", copying ? 0U : 1U}, {"transfer_sequence", copying ? 0U : 1U},
+    return {{"kind", "gui_runtime"},
+            {"event", event},
+            {"sequence", 7U},
+            {"surface_high", 11U},
+            {"surface_low", low},
+            {"selection_generation", 19U},
+            {"frame_revision", 23U},
+            {"capacity_width", 64U},
+            {"capacity_height", 32U},
+            {"condition", 2U},
+            {"outcome", name == "presentation.source.copy" ? 0U : 1U},
+            {"value", copying ? 0U : 1U},
+            {"source_revision", 23U},
+            {"allocation_generation", 7U},
+            {"presentation_revision", copying ? 0U : 1U},
+            {"transfer_sequence", copying ? 0U : 1U},
             {"timeline_ready", copying ? 0U : 1U},
             {"span_id", 31U},
             {"span_outcome", static_cast<std::uint64_t>(std::string_view{event}.ends_with(".completed")
-                ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
-                : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
+                                                            ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
+                                                            : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
 }
 
 [[nodiscard]] nlohmann::json browser_surface_record(const char* event, const std::uint64_t low = 12U) {
@@ -4233,10 +4280,11 @@ TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]"
 
 TEST_CASE("surface join records failed span endings without accepting a completed physical transition", "[workspace][audit]") {
     using mmltk::controller::contracts::DiagnosticSpanOutcome;
-    for (const auto outcome : {DiagnosticSpanOutcome::Unspecified, DiagnosticSpanOutcome::ScopeExit,
-                               DiagnosticSpanOutcome::Cancelled, DiagnosticSpanOutcome::Exception}) {
+    for (const auto outcome : {DiagnosticSpanOutcome::Unspecified, DiagnosticSpanOutcome::ScopeExit, DiagnosticSpanOutcome::Cancelled,
+                               DiagnosticSpanOutcome::Exception}) {
         SurfaceAudit audit;
-        for (std::size_t index = 0U; index < 5U; ++index) audit.native(native_surface_record(native_surface_events[index]));
+        for (std::size_t index = 0U; index < 5U; ++index)
+            audit.native(native_surface_record(native_surface_events[index]));
         auto ended = native_surface_record("presentation.source_borrow.completed");
         ended["span_outcome"] = static_cast<std::uint64_t>(outcome);
         audit.native(ended);
@@ -4523,7 +4571,7 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         CHECK(browser.owned_atlas_interrupted);
     }
     for (const auto* event : {"iced.gallery.source", "iced.surface.renderer_reconstructed", "iced.surface.owned_capture_submitted",
-                             "iced.surface.owned_draw_selected"}) {
+                              "iced.surface.owned_draw_selected"}) {
         auto browser = observed;
         auto pending = atlas_draw_record(24U, 3U, 5U, -37.25);
         pending["event"] = event;

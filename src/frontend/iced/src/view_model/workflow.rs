@@ -273,7 +273,9 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
                 match merge_live_snapshot(&mut self.live_snapshot, snapshot) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
-                        if self.presentation_model.foreground() == Some(PresentationSourceKind::Live) {
+                        if self.presentation_model.foreground()
+                            == Some(PresentationSourceKind::Live)
+                        {
                             self.set_foreground_visual(Some(PresentationSourceKind::Live));
                         }
                     }

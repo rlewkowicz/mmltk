@@ -65,8 +65,8 @@ ExploreStorageStatus render_explore_atlas_tiles(const ExploreRenderAtlasView& vi
         tiles.max_tile_height > target.height || view.card_count > scratch.card_capacity || !semantic_storage_valid(semantics, scratch)) {
         return static_cast<ExploreStorageStatus>(cudaErrorInvalidValue);
     }
-    return static_cast<ExploreStorageStatus>(detail::render_explore_atlas_tiles_cuda(view, tiles, semantics, to_cuda_scratch_abi(scratch),
-                                                                                     target, reinterpret_cast<cudaStream_t>(stream), demand));
+    return static_cast<ExploreStorageStatus>(detail::render_explore_atlas_tiles_cuda(
+        view, tiles, semantics, to_cuda_scratch_abi(scratch), target, reinterpret_cast<cudaStream_t>(stream), demand));
 }
 
 ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, const ExploreRenderSemanticView& semantics,
@@ -79,8 +79,8 @@ ExploreStorageStatus render_explore_detail(const ExploreRenderDetailView& view, 
         view.crop_height > view.source_height - view.crop_y || !semantic_storage_valid(semantics, scratch)) {
         return static_cast<ExploreStorageStatus>(cudaErrorInvalidValue);
     }
-    return static_cast<ExploreStorageStatus>(
-        detail::render_explore_detail_cuda(view, semantics, to_cuda_scratch_abi(scratch), target, reinterpret_cast<cudaStream_t>(stream), demand));
+    return static_cast<ExploreStorageStatus>(detail::render_explore_detail_cuda(view, semantics, to_cuda_scratch_abi(scratch), target,
+                                                                                reinterpret_cast<cudaStream_t>(stream), demand));
 }
 
 ExploreStorageStatus count_explore_nonzero_alpha(const ExploreRenderTargetView& target, std::uint64_t* const device_count,

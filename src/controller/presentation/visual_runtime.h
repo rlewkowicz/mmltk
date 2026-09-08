@@ -10,7 +10,7 @@
 namespace mmltk::frameworks::gpu {
 class SystemImageRuntime;
 class ImageProductRevisionSequence;
-}
+}  // namespace mmltk::frameworks::gpu
 
 namespace mmltk::controller {
 

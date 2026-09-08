@@ -62,8 +62,10 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
     bool reportError(nvinfer1::ErrorCode code, ErrorDesc description) noexcept override {
         {
             std::scoped_lock lock(mutex_);
-            if (count_ < static_cast<int32_t>(errors_.size())) errors_[count_++] = code;
-            else overflow_ = true;
+            if (count_ < static_cast<int32_t>(errors_.size()))
+                errors_[count_++] = code;
+            else
+                overflow_ = true;
         }
         logger_.log(nvinfer1::ILogger::Severity::kERROR, description);
         return code == nvinfer1::ErrorCode::kINTERNAL_ERROR;
@@ -83,8 +85,8 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
             integrity = integrity && (code == Code::kINVALID_ARGUMENT || code == Code::kINVALID_CONFIG);
             allocation = allocation || code == Code::kFAILED_ALLOCATION;
             physical = physical || code == Code::kINTERNAL_ERROR;
-            reported = mmltk::frameworks::gpu::combine_image_failures(reported,
-                std::make_exception_ptr(TensorRtOperationError(static_cast<std::int32_t>(code), operation)));
+            reported = mmltk::frameworks::gpu::combine_image_failures(
+                reported, std::make_exception_ptr(TensorRtOperationError(static_cast<std::int32_t>(code), operation)));
         }
         const auto cuda = cudaPeekAtLastError();
         if (cuda != cudaSuccess) {
@@ -94,8 +96,10 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
             throw mmltk::frameworks::gpu::ImageFailure(std::make_exception_ptr(failure), reported);
         }
         if (physical) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(reported);
-        if (allocation) throw mmltk::frameworks::gpu::ImageFailure(std::make_exception_ptr(
-            mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, std::string(operation).c_str())), reported);
+        if (allocation)
+            throw mmltk::frameworks::gpu::ImageFailure(
+                std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, std::string(operation).c_str())),
+                reported);
         if (cache && integrity) throw TensorRtCacheIntegrityError(std::string(operation));
         if (reported) std::rethrow_exception(reported);
         throw std::runtime_error(std::string(operation));
@@ -442,9 +446,7 @@ struct TensorRtEngine::Impl {
         if (network == nullptr) throw std::runtime_error(options.context + " failed to create TensorRT network");
         if (!admitted()) return;
         ConfigOwner config(builder->createBuilderConfig(), destroy_config);
-        if (config == nullptr) {
-            throw std::runtime_error(options.context + " failed to create TensorRT build objects");
-        }
+        if (config == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT build objects"); }
         if (!admitted()) return;
         ParserOwner parser(nvonnxparser::createParser(*network, logger), destroy_parser);
         if (parser == nullptr) { throw std::runtime_error(options.context + " failed to create ONNX parser"); }

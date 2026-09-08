@@ -310,14 +310,13 @@ MMLTK_REFLECT_FIELDS(SyntheticVisualOperation)
 MMLTK_REFLECT_FIELDS(SyntheticVisualSnapshot)
 MMLTK_REFLECT_FIELDS(UnreflectedNestedVisualSnapshot)
 
-template <PresentationSourceKind Kind, auto Revision =
-    mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>
+template <PresentationSourceKind Kind, auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation,
+                                                                                                  &SyntheticVisualOperation::revision>>
 class SyntheticVisualSystem final {
    public:
     using event_type = std::variant<SyntheticChanged>;
     using visual_source = VisualSourceProjection<SyntheticVisualSnapshot, Kind,
-        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>,
-        Revision>;
+                                                 mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision>;
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::uint32_t Apply(SyntheticRequest request) { return request.value; }
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] SyntheticVisualSnapshot snapshot() const {
         ++samples;
@@ -346,8 +345,10 @@ struct VisualFingerprintComposition final {
 };
 struct AlternateVisualFingerprintComposition final {
     TestSettingsSystem* settings = nullptr;
-    SyntheticVisualSystem<PresentationSourceKind::Predict,
-        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer = nullptr;
+    SyntheticVisualSystem<
+        PresentationSourceKind::Predict,
+        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer =
+        nullptr;
 };
 
 class RoutingTextWriter final {
@@ -357,8 +358,7 @@ class RoutingTextWriter final {
     [[nodiscard]] std::ostream& output() const noexcept { return output_; }
 
     void reserve(const std::string_view scope, const std::string_view symbol, std::string_view) {
-        if (!symbols_.emplace(std::string(scope), std::string(symbol)).second)
-            throw std::logic_error("projected symbol collision");
+        if (!symbols_.emplace(std::string(scope), std::string(symbol)).second) throw std::logic_error("projected symbol collision");
     }
 
     [[nodiscard]] std::string identifier(const std::string_view source, const bool upper) const {
@@ -586,23 +586,29 @@ TEST_CASE("visual producer projections derive nested observations and compositio
     STATIC_REQUIRE(ApplicationSchema<ExtendedVisualComposition>::VisualSourceCount() == 2U);
     STATIC_REQUIRE_FALSE(ApplicationSchema<DuplicateVisualComposition>::VisualSourcesAreUnique());
     using namespace mmltk::frameworks::reflection;
-    using WrongOwner = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
-        member_path<&ExploreSnapshot::frame>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
-    using WrongType = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
-        member_path<&SyntheticVisualSnapshot::operation>, member_path<&SyntheticVisualSnapshot::product>>;
-    using EmptyKind = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None,
-        member_path<&SyntheticVisualSnapshot::product>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using WrongOwner =
+        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&ExploreSnapshot::frame>,
+                               member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using WrongType =
+        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::operation>,
+                               member_path<&SyntheticVisualSnapshot::product>>;
+    using EmptyKind =
+        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None, member_path<&SyntheticVisualSnapshot::product>,
+                               member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
     using UnknownKind = VisualSourceProjection<SyntheticVisualSnapshot, static_cast<PresentationSourceKind>(255U),
-        member_path<&SyntheticVisualSnapshot::product>, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+                                               member_path<&SyntheticVisualSnapshot::product>,
+                                               member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
     constexpr auto callable_frame = [](SyntheticVisualSnapshot& value) -> VisualFrame& { return value.product; };
     constexpr auto callable_operation = [](SyntheticVisualSnapshot& value) -> SyntheticVisualOperation& { return value.operation; };
-    using CallableFrame = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
-        callable_frame, member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
-    using CallableSegment = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict,
-        member_path<&SyntheticVisualSnapshot::product>, member_path<callable_operation, &SyntheticVisualOperation::revision>>;
-    using UnreflectedSegment = VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict,
-        member_path<&UnreflectedNestedVisualSnapshot::product>,
-        member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
+    using CallableFrame = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, callable_frame,
+                                                 member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using CallableSegment =
+        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::product>,
+                               member_path<callable_operation, &SyntheticVisualOperation::revision>>;
+    using UnreflectedSegment =
+        VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict,
+                               member_path<&UnreflectedNestedVisualSnapshot::product>,
+                               member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
     STATIC_REQUIRE_FALSE(WrongOwner::valid());
     STATIC_REQUIRE_FALSE(WrongType::valid());
     STATIC_REQUIRE_FALSE(EmptyKind::valid());
@@ -665,10 +671,9 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     CHECK(lost == 2U);
 }
 
-TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products",
-          "[controller][browser][reflection]") {
-    const std::array kinds{PresentationSourceKind::None, PresentationSourceKind::Explore, PresentationSourceKind::Annotation,
-                           PresentationSourceKind::Predict, PresentationSourceKind::Live, PresentationSourceKind::Upscale};
+TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products", "[controller][browser][reflection]") {
+    const std::array kinds{PresentationSourceKind::None,    PresentationSourceKind::Explore, PresentationSourceKind::Annotation,
+                           PresentationSourceKind::Predict, PresentationSourceKind::Live,    PresentationSourceKind::Upscale};
     for (std::size_t session = 0U; session < kinds.size(); ++session)
         CHECK(presentation_source_session(kinds[session]) == session);
     auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, {32U, 24U}, 7U);

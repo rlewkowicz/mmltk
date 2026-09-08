@@ -140,8 +140,8 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class AnnotationSystem final {
    public:
     using visual_source = VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
-        mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
-        mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>>;
     using event_type = std::variant<AnnotationChanged, AnnotationFailed>;
     AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                      VisualDiagnosticSink = {});

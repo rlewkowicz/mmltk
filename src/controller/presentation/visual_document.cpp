@@ -9,6 +9,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/controller/contracts/application_boundary.h"
+
 namespace mmltk::controller {
 
 std::uint64_t VisualDocument::NextIdentity() {

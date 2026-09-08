@@ -225,7 +225,7 @@ class ImageProductBuffer final {
     // Optional receiver initialization for planes absent from the source.
     // The initializer joins the same completion boundary as the copied planes.
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {},
-                                                       bool preserve_clean = false);
+                                                         bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] ImageProductLayout layout() const noexcept;
     [[nodiscard]] std::uint32_t capacity_width() const noexcept;
@@ -241,9 +241,9 @@ class ImageProductBuffer final {
     friend class BorrowedImageProductReadView;
     friend class ImageStream;
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
-    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit,
-                                                          std::uint64_t, bool preserve_clean = false,
-                                                          ImagePlanePreservation = ImagePlanePreservation::All);
+    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t,
+                                                           bool preserve_clean = false,
+                                                           ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] bool writable() const;
     [[nodiscard]] bool terminal() const noexcept;
     [[nodiscard]] bool Owns(const BorrowedImageProductReadView&) const noexcept;

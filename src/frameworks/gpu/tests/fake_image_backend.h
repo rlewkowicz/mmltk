@@ -162,8 +162,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     }
     void ClearPlane(std::uintptr_t, std::uintptr_t, const ImagePlaneView& plane) override {
         for (std::uint32_t row = 0U; row != plane.descriptor.height; ++row)
-            std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes, 0,
-                        plane.descriptor.row_bytes());
+            std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes());
     }
     [[nodiscard]] std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement*,
                                                        const std::size_t bytes) override {
@@ -276,17 +275,18 @@ class FakeImageBackend final : public ImageCopyBackend {
 [[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(
     const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
     std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U) {
-    return [device, backend, layout, model = std::move(model), output_buffer_count](std::shared_ptr<ImageProductRevisionSequence> revisions) {
-        return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
-            .device = device,
-            .backend = backend,
-            .model = model ? model() : nullptr,
-            .input_layout = layout,
-            .output_layout = layout,
-            .output_buffer_count = output_buffer_count,
-            .product_revisions = std::move(revisions),
-        });
-    };
+    return
+        [device, backend, layout, model = std::move(model), output_buffer_count](std::shared_ptr<ImageProductRevisionSequence> revisions) {
+            return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+                .device = device,
+                .backend = backend,
+                .model = model ? model() : nullptr,
+                .input_layout = layout,
+                .output_layout = layout,
+                .output_buffer_count = output_buffer_count,
+                .product_revisions = std::move(revisions),
+            });
+        };
 }
 
 }  // namespace mmltk::frameworks::gpu::test_support

@@ -159,8 +159,16 @@ impl App {
                 self.integration.observe_upscale_request(kernel);
                 self.model
                     .request_upscale(crate::generated::UpscaleRequest {
-                        source, kernel,
-                        document: self.model.explore.snapshot.as_ref().expect("selected source").document.clone(),
+                        source,
+                        kernel,
+                        document: self
+                            .model
+                            .explore
+                            .snapshot
+                            .as_ref()
+                            .expect("selected source")
+                            .document
+                            .clone(),
                     });
                 self.dispatch_explore_desired();
             }
@@ -455,10 +463,16 @@ impl App {
 
     pub(super) fn dispatch_viewer_desired(&mut self) {
         if self.presentation.stop_requested {
-            if self.model.has_pending(ApplicationIntentEndpoint::UpscaleStop) {
+            if self
+                .model
+                .has_pending(ApplicationIntentEndpoint::UpscaleStop)
+            {
                 return;
             }
-            if !self.submit_intent(ApplicationIntentEndpoint::UpscaleStop, crate::generated::encode_upscale_Stop) {
+            if !self.submit_intent(
+                ApplicationIntentEndpoint::UpscaleStop,
+                crate::generated::encode_upscale_Stop,
+            ) {
                 return;
             }
             self.presentation.stop_requested = false;

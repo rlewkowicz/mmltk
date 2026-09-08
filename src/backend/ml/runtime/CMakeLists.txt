@@ -95,6 +95,7 @@ if(BUILD_RFDETR_NATIVE)
     target_link_libraries(mmltk_backend_ml_runtime
         PRIVATE
             CUDA::cudart
+            mmltk::frameworks::gpu
             mmltk::vendor::onnxruntime
             mmltk::vendor::tensorrt_nvinfer
             mmltk::vendor::tensorrt_parser

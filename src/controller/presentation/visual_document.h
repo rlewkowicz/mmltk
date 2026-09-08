@@ -27,6 +27,7 @@ struct VisualDocument final {
     contracts::AnnotationSceneContent scene{};
     std::function<bool(std::size_t, float, float)> mask_contains{};
     [[nodiscard]] VisualDocumentFacts facts() const { return {scene.document, meaning_identity_}; }
+
    private:
     [[nodiscard]] static std::uint64_t NextIdentity();
     const std::uint64_t meaning_identity_ = NextIdentity();

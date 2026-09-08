@@ -277,8 +277,8 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class ExploreSystem final {
    public:
     using visual_source = VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
-        mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
-        mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>>;
     using event_type = std::variant<ExploreChanged, ExploreFailed>;
     // CLEANUP-IGNORE: Explore construction retains its own generated system identity and runtime dependencies.
     ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {},

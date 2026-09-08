@@ -22,9 +22,11 @@ class DiagnosticSpanIds final {
         } while (!sequence_.compare_exchange_weak(previous, previous + 1U, std::memory_order_relaxed));
         const auto value = previous + 1U;
         return {.trace_id = parent.trace_id ? parent.trace_id : contracts::DiagnosticTraceId{value},
-                .span_id = contracts::DiagnosticSpanId{value}, .parent_span_id = parent.span_id};
+                .span_id = contracts::DiagnosticSpanId{value},
+                .parent_span_id = parent.span_id};
     }
     [[nodiscard]] static std::uint64_t issued() noexcept { return sequence_.load(std::memory_order_relaxed); }
+
    private:
     static inline std::atomic<std::uint64_t> sequence_{0U};
 };
@@ -36,6 +38,7 @@ class RuntimeDiagnosticSpan final {
     static_assert(noexcept(Clock::now()));
     static_assert(noexcept(std::declval<const Sink&>().valid()));
     static_assert(noexcept(std::declval<const Sink&>()(std::declval<Fact>())));
+
    public:
     template <class Factory>
     RuntimeDiagnosticSpan(Sink sink, Factory&& facts, const contracts::DiagnosticLink parent = {}) noexcept : sink_(std::move(sink)) {
@@ -57,14 +60,14 @@ class RuntimeDiagnosticSpan final {
     ~RuntimeDiagnosticSpan() noexcept {
         if (!ended_) return;
         Finish(std::uncaught_exceptions() > exceptions_ ? contracts::DiagnosticSpanOutcome::Exception
-                                                      : contracts::DiagnosticSpanOutcome::ScopeExit);
+                                                        : contracts::DiagnosticSpanOutcome::ScopeExit);
     }
     void Finish(contracts::DiagnosticSpanOutcome outcome = contracts::DiagnosticSpanOutcome::Success) noexcept {
         if (!ended_) return;
         if (sink_.valid()) {
             ended_->context.span = {
-                .duration_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    Clock::now() - started_).count()),
+                .duration_ns =
+                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started_).count()),
                 .span_outcome = outcome,
             };
             sink_(*ended_);
@@ -100,6 +103,7 @@ class RuntimeDiagnosticSpan final {
 template <class Sink, class Factory>
 RuntimeDiagnosticSpan(Sink, Factory) -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
 template <class Sink, class Factory>
-RuntimeDiagnosticSpan(Sink, Factory, contracts::DiagnosticLink) -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
+RuntimeDiagnosticSpan(Sink, Factory, contracts::DiagnosticLink)
+    -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
 
 }  // namespace mmltk::controller::services

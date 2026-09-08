@@ -59,11 +59,11 @@ class GalleryStream final {
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan&, std::span<const std::uint32_t>,
                                                    const mmltk::backend::data::CompiledDataset*, std::span<const std::uint32_t>) const;
     void StopIngress() noexcept;
-    [[nodiscard]] ExploreGalleryPublication Begin(const ExploreRenderPlan&, std::span<const std::uint32_t>, std::span<const std::uint32_t>, std::size_t,
-                                                  std::shared_ptr<const mmltk::backend::data::CompiledDataset>, std::span<const std::uint32_t>,
-                                                  std::span<const mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi>,
-                                                  mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
-                                                  std::uintptr_t);
+    [[nodiscard]] ExploreGalleryPublication Begin(
+        const ExploreRenderPlan&, std::span<const std::uint32_t>, std::span<const std::uint32_t>, std::size_t,
+        std::shared_ptr<const mmltk::backend::data::CompiledDataset>, std::span<const std::uint32_t>,
+        std::span<const mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi>, mmltk::frameworks::gpu::ImagePlaneView,
+        mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     [[nodiscard]] ExploreGalleryPublication Advance();
     [[nodiscard]] bool HasReadyTiles() const;
     void PrepareOutputPublication(ExploreOutputChange);
@@ -71,9 +71,10 @@ class GalleryStream final {
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
                                                          std::uintptr_t);
-    void RenderDetail(const ExploreRenderPlan&, std::shared_ptr<const mmltk::backend::data::CompiledDataset>, std::span<const std::uint32_t>,
-                      std::span<const mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi>, mmltk::frameworks::gpu::ImagePlaneView,
-                      mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
+    void RenderDetail(const ExploreRenderPlan&, std::shared_ptr<const mmltk::backend::data::CompiledDataset>,
+                      std::span<const std::uint32_t>,
+                      std::span<const mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi>,
+                      mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     void Quiesce();
     // Stop/settle ingress without discarding reusable physical input custody.
     void Suspend();
@@ -82,6 +83,7 @@ class GalleryStream final {
     void ClearLogicalState();
     [[nodiscard]] mmltk::frameworks::gpu::SystemImageModel::Release ReleaseAfterRuntimeSettlement() noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::SystemImageModel::Release ResetBuffersChecked() noexcept;
+
    private:
     class Impl;
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner terminal_{1U};

@@ -283,7 +283,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
-    use mmltk_browser_app::generated as generated;
+    use mmltk_browser_app::generated;
     for (kind, session) in [
         (generated::PresentationSourceKind::None, 0),
         (generated::PresentationSourceKind::Explore, 1),
@@ -292,24 +292,41 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         (generated::PresentationSourceKind::Live, 4),
         (generated::PresentationSourceKind::Upscale, 5),
     ] {
-        require(generated::presentation_source_session(kind) == session, "stable browser session changed")?;
+        require(
+            generated::presentation_source_session(kind) == session,
+            "stable browser session changed",
+        )?;
         let Some(observed) = visual.observe(kind) else {
             require(session == 0, "producer observation missing")?;
             continue;
         };
-        require(observed.snapshotrevision == u64::MAX - session && observed.frame.revision == 7 + session,
-            "native visual observation differs from Rust projection")?;
+        require(
+            observed.snapshotrevision == u64::MAX - session
+                && observed.frame.revision == 7 + session,
+            "native visual observation differs from Rust projection",
+        )?;
         let clean = generated::visual_clean_content_identity(observed.frame);
-        require(clean.revision == 43 && clean.content.x == 1 && clean.extent.width == 32,
-            "native clean-content identity differs from Rust projection")?;
+        require(
+            clean.revision == 43 && clean.content.x == 1 && clean.extent.width == 32,
+            "native clean-content identity differs from Rust projection",
+        )?;
         let mut semantic = observed.frame.clone();
         semantic.revision += 1;
-        require(generated::visual_clean_content_identity(&semantic) == clean, "semantic-only change replaced clean identity")?;
+        require(
+            generated::visual_clean_content_identity(&semantic) == clean,
+            "semantic-only change replaced clean identity",
+        )?;
         semantic.cleanrevision = 0;
-        require(generated::visual_clean_content_identity(&semantic).revision == semantic.revision, "zero clean revision fallback changed")?;
+        require(
+            generated::visual_clean_content_identity(&semantic).revision == semantic.revision,
+            "zero clean revision fallback changed",
+        )?;
         semantic = observed.frame.clone();
         semantic.extent.width += 1;
-        require(generated::visual_clean_content_identity(&semantic) != clean, "geometry change retained clean identity")?;
+        require(
+            generated::visual_clean_content_identity(&semantic) != clean,
+            "geometry change retained clean identity",
+        )?;
     }
     for (correlation, selected) in [(17, false), (18, true)] {
         let Some(ServerRecord::IntentReply(reply)) = records.iter().find(|record| {

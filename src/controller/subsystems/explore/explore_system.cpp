@@ -151,10 +151,12 @@ class ExploreSystem::Impl final {
               diagnostics_.valid()
                   ? detail::VisualRuntimeOwner::ActivityObservation{[diagnostics](const detail::VisualRuntimeOwner::ActivityStage stage,
                                                                                   const std::uint64_t value) noexcept {
-                        diagnostics.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                     .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                                     .value = value,
-                                     .detail = 30U + static_cast<std::uint64_t>(stage)}; });
+                        diagnostics.Emit([&] {
+                            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                        .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
+                                                        .value = value,
+                                                        .detail = 30U + static_cast<std::uint64_t>(stage)};
+                        });
                     }}
                   : detail::VisualRuntimeOwner::ActivityObservation{}) {
         if (!settings_.valid() || nproc == 0U || nproc > kExploreMaximumParallelism)
@@ -287,7 +289,8 @@ class ExploreSystem::Impl final {
                         CompleteProduct(settled, *rendered);
                         ExploreSettingsCandidate runtime_settings;
                         const auto catalog_identity = settled.dataset.class_catalog_identity;
-                        auto notification = CommitPreparedProduct(runtime, algorithm, std::move(*rendered), std::move(settled),
+                        auto notification = CommitPreparedProduct(
+                            runtime, algorithm, std::move(*rendered), std::move(settled),
                             [&] {
                                 if (catalog_changed) {
                                     settings_system_.persist_explore_class_catalog(settings_candidate, catalog_identity, preferences);
@@ -315,7 +318,8 @@ class ExploreSystem::Impl final {
                             algorithm.DiscardCandidate();
                             throw;
                         }
-                        return RestoreCommittedProduct(algorithm, visual_failure_detail(std::current_exception(), "Explore dataset candidate failed"), false, true);
+                        return RestoreCommittedProduct(
+                            algorithm, visual_failure_detail(std::current_exception(), "Explore dataset candidate failed"), false, true);
                     }
                 },
                 std::move(prior), reconstruct);
@@ -578,8 +582,7 @@ class ExploreSystem::Impl final {
         std::shared_ptr<const VisualDocument> document;
         {
             std::scoped_lock lock(mutex_);
-            if (!state_.ready || state_.mode != ExploreMode::Detail || state_.frame != frame)
-                return {};
+            if (!state_.ready || state_.mode != ExploreMode::Detail || state_.frame != frame) return {};
             document = document_;
         }
         return {borrow_matching_visual_product(frame, worker_), std::move(document)};
@@ -708,7 +711,8 @@ class ExploreSystem::Impl final {
                     }
                     const ExploreFilterUpdate policy{.filter = requested.filter, .overlay = requested.overlay};
                     const auto augmentation = requested.augmentation.enabled;
-                    auto notification = CommitPreparedProduct(runtime, algorithm, std::move(*rendered), std::move(requested),
+                    auto notification = CommitPreparedProduct(
+                        runtime, algorithm, std::move(*rendered), std::move(requested),
                         [&] {
                             if (settings && persist)
                                 settings = settings_system_.persist_explore_product(*settings, policy, augmentation);
@@ -782,8 +786,7 @@ class ExploreSystem::Impl final {
                 render_plan.viewport = ClampViewport(render_plan.viewport, candidate.order.matching_count);
                 if (render_overlay) render_plan.overlay = *render_overlay;
                 auto rendered = RenderGallery(runtime, algorithm, render_plan, candidate, generation, stop);
-                if (!rendered || stop.stop_requested())
-                    return RestoreCommittedProduct(algorithm, {}, false, true);
+                if (!rendered || stop.stop_requested()) return RestoreCommittedProduct(algorithm, {}, false, true);
                 bool stale;
                 {
                     std::scoped_lock decision_lock(mutex_);
@@ -799,8 +802,8 @@ class ExploreSystem::Impl final {
                 settled.viewport = render_plan.viewport;
                 CompleteProduct(settled, *rendered);
                 std::optional<ExploreSettingsCandidate> refreshed_settings;
-                auto notification = CommitPreparedProduct(runtime, algorithm, std::move(*rendered), std::move(settled),
-                    [&] { refreshed_settings = persist(execution.settings); },
+                auto notification = CommitPreparedProduct(
+                    runtime, algorithm, std::move(*rendered), std::move(settled), [&] { refreshed_settings = persist(execution.settings); },
                     [&] noexcept {
                         algorithm.Commit(std::move(candidate));
                         if (refreshed_settings) installed_settings_ = std::move(*refreshed_settings);
@@ -838,9 +841,10 @@ class ExploreSystem::Impl final {
     };
 
     template <class Persist, class Install>
-    [[nodiscard]] detail::VisualRuntimeOwner::Notification CommitPreparedProduct(
-        mmltk::frameworks::gpu::SystemImageRuntime& runtime, ExploreAlgorithm& algorithm, PreparedProduct&& product,
-        ExploreSnapshot settled, Persist persist, Install install) {
+    [[nodiscard]] detail::VisualRuntimeOwner::Notification CommitPreparedProduct(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                                                 ExploreAlgorithm& algorithm, PreparedProduct&& product,
+                                                                                 ExploreSnapshot settled, Persist persist,
+                                                                                 Install install) {
         static_assert(std::is_nothrow_invocable_v<Install>);
         // Every allocating projection is prepared while the incumbent is still
         // selected. Stop and finalization share this boundary for every route.
@@ -851,8 +855,10 @@ class ExploreSystem::Impl final {
         const bool continue_gallery = product.gallery.generation != 0U;
         {
             std::scoped_lock lock(mutex_);
-            if (product.output.valid()) runtime.CommitOutput(std::move(product.output));
-            else runtime.SelectOutput(product.retained);
+            if (product.output.valid())
+                runtime.CommitOutput(std::move(product.output));
+            else
+                runtime.SelectOutput(product.retained);
             algorithm.CommitOutputPublication();
             install();
             document_ = std::move(product.document);
@@ -864,16 +870,15 @@ class ExploreSystem::Impl final {
     }
 
     [[nodiscard]] std::optional<PreparedProduct> Render(mmltk::frameworks::gpu::SystemImageRuntime& runtime, ExploreAlgorithm& algorithm,
-                                                       ExploreRenderPlan& plan, const std::uint64_t generation,
-                                                       const ExploreOrderCandidate* candidate = nullptr,
-                                                       const std::stop_token stop = {}, const bool new_artifact = false) {
+                                                        ExploreRenderPlan& plan, const std::uint64_t generation,
+                                                        const ExploreOrderCandidate* candidate = nullptr, const std::stop_token stop = {},
+                                                        const bool new_artifact = false) {
         if (stop.stop_possible() && stop.stop_requested()) return std::nullopt;
         // This worker is the sole issuer. Demand and presentation changes do
         // not invalidate native semantics, and failed candidates cannot recycle
         // an identity previously attached to retained cache pixels.
         if (semantic_identity_ == 0U || semantic_overlay_.show_boxes != plan.overlay.show_boxes ||
-            semantic_overlay_.show_masks != plan.overlay.show_masks ||
-            semantic_overlay_.class_selection != plan.overlay.class_selection) {
+            semantic_overlay_.show_masks != plan.overlay.show_masks || semantic_overlay_.class_selection != plan.overlay.class_selection) {
             const auto identity = mmltk::common::types::take_monotonic_identity(next_semantic_identity_);
             semantic_overlay_ = plan.overlay;
             semantic_identity_ = identity;
@@ -897,18 +902,17 @@ class ExploreSystem::Impl final {
         std::shared_ptr<const VisualDocument> previous_document;
         bool preserve_gallery_clean = false;
         const bool has_committed_physical_product = runtime.Completed().valid();
-        const auto candidate_visible =
-            plan.mode == ExploreMode::Gallery && candidate != nullptr ? algorithm.Visible(plan.viewport, candidate).visible_indices
-                                                                     : std::vector<std::uint32_t>{};
+        const auto candidate_visible = plan.mode == ExploreMode::Gallery && candidate != nullptr
+                                           ? algorithm.Visible(plan.viewport, candidate).visible_indices
+                                           : std::vector<std::uint32_t>{};
         {
             std::scoped_lock lock(mutex_);
             nproc = state_.nproc;
             previous_clean_revision = state_.frame.clean_revision;
             previous_document = document_;
-            const bool same_gallery_clean =
-                state_.ready && state_.mode == ExploreMode::Gallery && plan.mode == ExploreMode::Gallery &&
-                plan.dataset_identity == state_.dataset.identity && plan.viewport == state_.viewport &&
-                plan.augmentation_config == augmentation_config_ && plan.augmentation == state_.augmentation;
+            const bool same_gallery_clean = state_.ready && state_.mode == ExploreMode::Gallery && plan.mode == ExploreMode::Gallery &&
+                                            plan.dataset_identity == state_.dataset.identity && plan.viewport == state_.viewport &&
+                                            plan.augmentation_config == augmentation_config_ && plan.augmentation == state_.augmentation;
             preserve_gallery_clean = !new_artifact && has_committed_physical_product && same_gallery_clean &&
                                      (candidate == nullptr || candidate_visible == state_.order.visible_indices);
         }
@@ -921,8 +925,9 @@ class ExploreSystem::Impl final {
             else
                 algorithm.RenderDetail(plan, nproc, {}, {}, 0U);
         } else {
-            output = runtime.AcquireOutput(stop, change == ExploreOutputChange::Semantic ? runtime.Completed() :
-                                                                                           mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
+            output = runtime.AcquireOutput(stop, change == ExploreOutputChange::Semantic
+                                                     ? runtime.Completed()
+                                                     : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
             if (!output.valid()) return std::nullopt;
             runtime.Publish(output, product_extent.width, product_extent.height,
                             [&](const auto clean, const auto semantic, const auto stream) {
@@ -934,8 +939,7 @@ class ExploreSystem::Impl final {
         }
         DiagnoseStorage(runtime, algorithm, generation);
         auto document = plan.mode == ExploreMode::Detail ? algorithm.Document() : nullptr;
-        const bool clean_changed =
-            plan.mode == ExploreMode::Gallery ? !preserve_gallery_clean : !document || document != previous_document;
+        const bool clean_changed = plan.mode == ExploreMode::Gallery ? !preserve_gallery_clean : !document || document != previous_document;
         // A changed clean product takes its identity from the producer's
         // lifetime sequence; semantic-only output retains the selected identity.
         const auto revision = retained.valid() ? retained.revision() : output.revision();
@@ -959,36 +963,40 @@ class ExploreSystem::Impl final {
                 std::scoped_lock lock(mutex_);
                 stale = generation != latest_generation_->load(std::memory_order_acquire);
             }
-            if (stale) {
-                return std::nullopt;
-            }
+            if (stale) { return std::nullopt; }
             if (change != ExploreOutputChange::Unchanged)
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                          .operation = VisualDiagnosticOperation::PlaceholderPublished,
-                          .device = settings_.device,
-                          .generation = generation,
-                          .value = plan.viewport.first_row,
-                          .context = {.capacity_width = plan.viewport.extent.width,
-                                      .capacity_height = plan.viewport.extent.height,
-                                      .staging_bytes = publication.active_pinned_bytes}}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::PlaceholderPublished,
+                                                .device = settings_.device,
+                                                .generation = generation,
+                                                .value = plan.viewport.first_row,
+                                                .context = {.capacity_width = plan.viewport.extent.width,
+                                                            .capacity_height = plan.viewport.extent.height,
+                                                            .staging_bytes = publication.active_pinned_bytes}};
+                });
             if (change != ExploreOutputChange::Unchanged && publication.cumulative_tiles != 0U)
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = VisualDiagnosticOperation::TileBatchPublished,
-                              .device = settings_.device,
-                              .generation = generation,
-                              .value = publication.cumulative_tiles,
-                              .detail = publication.reused_tiles,
-                              .context = {.staging_bytes = publication.active_pinned_bytes}}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::TileBatchPublished,
+                                                .device = settings_.device,
+                                                .generation = generation,
+                                                .value = publication.cumulative_tiles,
+                                                .detail = publication.reused_tiles,
+                                                .context = {.staging_bytes = publication.active_pinned_bytes}};
+                });
         } else {
             rendered.gallery = {};
         }
         if (change != ExploreOutputChange::Unchanged) DiagnoseFrame(rendered.frame, generation);
-        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                      .operation = VisualDiagnosticOperation::RenderCompleted,
-                      .device = settings_.device,
-                      .generation = generation,
-                      .value = nproc,
-                      .detail = (plan.augmentation.enabled ? 1U : 0U) | (plan.augmentation_config.enabled ? 2U : 0U)}; });
+        diagnostics_.Emit([&] {
+            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                        .operation = VisualDiagnosticOperation::RenderCompleted,
+                                        .device = settings_.device,
+                                        .generation = generation,
+                                        .value = nproc,
+                                        .detail = (plan.augmentation.enabled ? 1U : 0U) | (plan.augmentation_config.enabled ? 2U : 0U)};
+        });
         return rendered;
     }
     void SubmitGalleryContinuation() noexcept { static_cast<void>(worker_.NotifyContinuation()); }
@@ -996,9 +1004,11 @@ class ExploreSystem::Impl final {
         worker_.RegisterContinuation(
             [this](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                    const std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                              .device = settings_.device}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
+                                                .device = settings_.device};
+                });
                 if (stop.stop_requested()) return {};
                 auto& algorithm = explore_algorithm(runtime);
                 std::uint64_t generation;
@@ -1013,24 +1023,28 @@ class ExploreSystem::Impl final {
                 }
                 const auto advanced = algorithm.AdvanceGallery();
                 DiagnoseStorage(runtime, algorithm, generation);
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                              .device = settings_.device,
-                              .generation = advanced.generation,
-                              .value = advanced.cumulative_tiles,
-                              .detail = 20U,
-                              .context = {.capacity_width = static_cast<std::uint32_t>(advanced.remaining_tiles),
-                                          .staging_bytes = advanced.active_pinned_bytes}}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
+                                                .device = settings_.device,
+                                                .generation = advanced.generation,
+                                                .value = advanced.cumulative_tiles,
+                                                .detail = 20U,
+                                                .context = {.capacity_width = static_cast<std::uint32_t>(advanced.remaining_tiles),
+                                                            .staging_bytes = advanced.active_pinned_bytes}};
+                });
                 if (stop.stop_requested()) return {};
                 if (advanced.stale_discarded != 0U)
-                    diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                  .operation = VisualDiagnosticOperation::StaleThumbnailDiscarded,
-                                  .device = settings_.device,
-                                  .generation = advanced.generation,
-                                  .value = advanced.stale_discarded,
-                                  .context = {.capacity_width = extent.width,
-                                              .capacity_height = extent.height,
-                                              .staging_bytes = advanced.active_pinned_bytes}}; });
+                    diagnostics_.Emit([&] {
+                        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                    .operation = VisualDiagnosticOperation::StaleThumbnailDiscarded,
+                                                    .device = settings_.device,
+                                                    .generation = advanced.generation,
+                                                    .value = advanced.stale_discarded,
+                                                    .context = {.capacity_width = extent.width,
+                                                                .capacity_height = extent.height,
+                                                                .staging_bytes = advanced.active_pinned_bytes}};
+                    });
                 {
                     std::scoped_lock lock(mutex_);
                     if (generation != latest_generation_->load(std::memory_order_acquire) || generation != active_gallery_generation_ ||
@@ -1047,15 +1061,17 @@ class ExploreSystem::Impl final {
                         changed.revision = mmltk::common::types::advance_monotonic_identity(changed.revision);
                         auto notification = ChangedNotification(changed);
                         state_ = std::move(changed);
-                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                      .operation = VisualDiagnosticOperation::TileBatchPublished,
-                                      .device = settings_.device,
-                                      .generation = generation,
-                                      .value = advanced.cumulative_tiles,
-                                      .detail = advanced.reused_tiles,
-                                      .context = {.capacity_width = extent.width,
-                                                  .capacity_height = extent.height,
-                                                  .staging_bytes = advanced.active_pinned_bytes}}; });
+                        diagnostics_.Emit([&] {
+                            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                        .operation = VisualDiagnosticOperation::TileBatchPublished,
+                                                        .device = settings_.device,
+                                                        .generation = generation,
+                                                        .value = advanced.cumulative_tiles,
+                                                        .detail = advanced.reused_tiles,
+                                                        .context = {.capacity_width = extent.width,
+                                                                    .capacity_height = extent.height,
+                                                                    .staging_bytes = advanced.active_pinned_bytes}};
+                        });
                         // Completion freed physical lanes. Preserve this capacity
                         // event while the current notification leaves the worker.
                         SubmitGalleryContinuation();
@@ -1063,54 +1079,61 @@ class ExploreSystem::Impl final {
                     }
                 }
                 const bool ready_tiles = algorithm.HasGalleryTiles();
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                              .device = settings_.device,
-                              .generation = generation,
-                              .value = ready_tiles ? 1U : 0U,
-                              .detail = 21U}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
+                                                .device = settings_.device,
+                                                .generation = generation,
+                                                .value = ready_tiles ? 1U : 0U,
+                                                .detail = 21U};
+                });
                 if (!ready_tiles) return {};
                 algorithm.PrepareOutputPublication(ExploreOutputChange::Semantic);
                 ExploreGalleryPublication published;
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                     .operation = VisualDiagnosticOperation::TileBatchPublishStarted,
-                     .device = settings_.device,
-                     .generation = generation,
-                     .value = advanced.cumulative_tiles,
-                     .context = {
-                         .capacity_width = extent.width, .capacity_height = extent.height, .staging_bytes = advanced.active_pinned_bytes}}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::TileBatchPublishStarted,
+                                                .device = settings_.device,
+                                                .generation = generation,
+                                                .value = advanced.cumulative_tiles,
+                                                .context = {.capacity_width = extent.width,
+                                                            .capacity_height = extent.height,
+                                                            .staging_bytes = advanced.active_pinned_bytes}};
+                });
                 auto output = runtime.AcquireOutput(stop, runtime.Completed());
                 if (!output.valid()) {
                     RollbackOutput(algorithm);
                     return {};
                 }
                 try {
-                    runtime.Publish(output, extent.width, extent.height,
-                                    [&](const auto clean, const auto semantic, const auto stream) {
-                                        services::RuntimeDiagnosticSpan compose_span{diagnostics_, [&] {
-                                            return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
-                                                      .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
-                                                      .device = settings_.device,
-                                                      .generation = generation,
-                                                      .value = advanced.cumulative_tiles,
-                                                      .context = {.capacity_width = extent.width,
-                                                                  .capacity_height = extent.height,
-                                                                  .staging_bytes = advanced.active_pinned_bytes,
-                                                                  .demand = {.demand_generation = generation}}},
+                    runtime.Publish(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
+                        services::RuntimeDiagnosticSpan compose_span{
+                            diagnostics_, [&] {
+                                return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
+                                                                   .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
+                                                                   .device = settings_.device,
+                                                                   .generation = generation,
+                                                                   .value = advanced.cumulative_tiles,
+                                                                   .context = {.capacity_width = extent.width,
+                                                                               .capacity_height = extent.height,
+                                                                               .staging_bytes = advanced.active_pinned_bytes,
+                                                                               .demand = {.demand_generation = generation}}},
                                                                   VisualDiagnosticOperation::TileBatchComposeCompleted);
-                                        }};
-                                        published = algorithm.PublishGalleryTiles(clean, semantic, stream);
-                                        compose_span.FinishWith([&](auto& fact) {
-                                            fact.value = published.cumulative_tiles;
-                                            fact.context.staging_bytes = published.active_pinned_bytes;
-                                        });
-                                    });
+                            }};
+                        published = algorithm.PublishGalleryTiles(clean, semantic, stream);
+                        compose_span.FinishWith([&](auto& fact) {
+                            fact.value = published.cumulative_tiles;
+                            fact.context.staging_bytes = published.active_pinned_bytes;
+                        });
+                    });
                     DiagnoseStorage(runtime, algorithm, generation);
                     auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, extent, output.revision());
                     PreparedProduct product{
                         .output = std::move(output),
+                        .retained = {},
                         .frame = frame,
                         .gallery = {.generation = published.generation, .slots = published.ready_slots},
+                        .document = {},
                         .labels = algorithm.Labels(),
                     };
                     ExploreSnapshot changed;
@@ -1133,8 +1156,8 @@ class ExploreSystem::Impl final {
                         RollbackOutput(algorithm);
                         return {};
                     }
-                    auto notification = CommitPreparedProduct(runtime, algorithm, std::move(product), std::move(changed),
-                                                              [] {}, [] noexcept {});
+                    auto notification =
+                        CommitPreparedProduct(runtime, algorithm, std::move(product), std::move(changed), [] {}, [] noexcept {});
                     if (!notification) {
                         transaction.unlock();
                         return RestoreCommittedProduct(algorithm);
@@ -1144,15 +1167,16 @@ class ExploreSystem::Impl final {
                 } catch (...) {
                     if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;
                     return RestoreCommittedProduct(
-                        algorithm,
-                        visual_failure_detail(std::current_exception(), "Explore progressive publication failed"));
+                        algorithm, visual_failure_detail(std::current_exception(), "Explore progressive publication failed"));
                 }
             },
             [this]() noexcept {
-                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                              .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                              .device = settings_.device,
-                              .detail = 22U}; });
+                diagnostics_.Emit([&] {
+                    return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
+                                                .device = settings_.device,
+                                                .detail = 22U};
+                });
             });
     }
     void DiagnoseStorage(const mmltk::frameworks::gpu::SystemImageRuntime& runtime, const ExploreAlgorithm& algorithm,
@@ -1161,33 +1185,38 @@ class ExploreSystem::Impl final {
             const auto renderer = algorithm.StorageFootprint();
             const auto outputs = runtime.OutputStorageFootprint();
             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                .operation = VisualDiagnosticOperation::ExploreCacheStorage, .device = settings_.device,
-                .generation = generation, .value = renderer.host_bytes,
-                .detail = renderer.device_bytes + outputs.device_bytes,
-                .context = {.capacity_width = renderer.cache_cards,
-                            .staging_bytes = renderer.pinned_bytes + outputs.pinned_bytes,
-                            .cache_bytes = renderer.host_bytes + renderer.cache_device_bytes,
-                            .descriptor_bytes = renderer.descriptor_bytes,
-                            .gpu_bytes = renderer.device_bytes + outputs.device_bytes,
-                            .augmentation_device_bytes = renderer.augmentation_device_bytes,
-                            .augmentation_pinned_bytes = renderer.augmentation_pinned_bytes}};
+                                        .operation = VisualDiagnosticOperation::ExploreCacheStorage,
+                                        .device = settings_.device,
+                                        .generation = generation,
+                                        .value = renderer.host_bytes,
+                                        .detail = renderer.device_bytes + outputs.device_bytes,
+                                        .context = {.capacity_width = renderer.cache_cards,
+                                                    .staging_bytes = renderer.pinned_bytes + outputs.pinned_bytes,
+                                                    .cache_bytes = renderer.host_bytes + renderer.cache_device_bytes,
+                                                    .descriptor_bytes = renderer.descriptor_bytes,
+                                                    .gpu_bytes = renderer.device_bytes + outputs.device_bytes,
+                                                    .augmentation_device_bytes = renderer.augmentation_device_bytes,
+                                                    .augmentation_pinned_bytes = renderer.augmentation_pinned_bytes}};
         });
     }
     void DiagnoseFrame(const VisualFrame& frame, const std::uint64_t generation) const noexcept {
         if (!diagnostics_.valid()) return;
-        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                      .operation = VisualDiagnosticOperation::ExploreFramePublished,
-                      .device = settings_.device,
-                      .generation = generation,
-                      .value = frame.revision,
-                      .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height,
-                                  .source = visual_diagnostic_source({.frame = frame}),
-                                  .demand = {.demand_generation = generation}}}; });
+        diagnostics_.Emit([&] {
+            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                        .operation = VisualDiagnosticOperation::ExploreFramePublished,
+                                        .device = settings_.device,
+                                        .generation = generation,
+                                        .value = frame.revision,
+                                        .context = {.capacity_width = frame.extent.width,
+                                                    .capacity_height = frame.extent.height,
+                                                    .source = visual_diagnostic_source({.frame = frame}),
+                                                    .demand = {.demand_generation = generation}}};
+        });
     }
     [[nodiscard]] std::optional<PreparedProduct> RenderGallery(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                              ExploreAlgorithm& algorithm, ExploreRenderPlan& plan,
-                                                              ExploreOrderCandidate& candidate, const std::uint64_t generation,
-                                                              const std::stop_token stop) {
+                                                               ExploreAlgorithm& algorithm, ExploreRenderPlan& plan,
+                                                               ExploreOrderCandidate& candidate, const std::uint64_t generation,
+                                                               const std::stop_token stop) {
         plan.mode = ExploreMode::Gallery;
         plan.selected_image.reset();
         auto rendered = Render(runtime, algorithm, plan, generation, &candidate, stop);
@@ -1333,18 +1362,15 @@ class ExploreSystem::Impl final {
     static void RollbackOutput(ExploreAlgorithm& algorithm) {
         if (!algorithm.RollbackOutputPublication()) {
             const auto initiating_failure = std::current_exception();
-            auto rollback_failure = std::make_exception_ptr(
-                std::runtime_error("Explore candidate rollback could not establish physical completion"));
-            throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
-                initiating_failure ? initiating_failure : rollback_failure,
-                initiating_failure ? rollback_failure : std::exception_ptr{});
+            auto rollback_failure =
+                std::make_exception_ptr(std::runtime_error("Explore candidate rollback could not establish physical completion"));
+            throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(initiating_failure ? initiating_failure : rollback_failure,
+                                                                      initiating_failure ? rollback_failure : std::exception_ptr{});
         }
     }
     [[nodiscard]] detail::VisualRuntimeOwner::Notification RollbackOpenCancellation(ExploreAlgorithm& algorithm,
                                                                                     const bool had_committed_product) {
-        if (had_committed_product) {
-            return RestoreCommittedProduct(algorithm, {}, false, true);
-        }
+        if (had_committed_product) { return RestoreCommittedProduct(algorithm, {}, false, true); }
         RollbackOutput(algorithm);
         algorithm.DiscardCandidate();
         algorithm.Reset();
@@ -1358,8 +1384,9 @@ class ExploreSystem::Impl final {
         active_gallery_generation_ = 0U;
         return notification;
     }
-    [[nodiscard]] detail::VisualRuntimeOwner::Notification RestoreCommittedProduct(
-        ExploreAlgorithm& algorithm, std::string failure = {}, const bool preserve_busy = false, const bool discard_order = false) {
+    [[nodiscard]] detail::VisualRuntimeOwner::Notification RestoreCommittedProduct(ExploreAlgorithm& algorithm, std::string failure = {},
+                                                                                   const bool preserve_busy = false,
+                                                                                   const bool discard_order = false) {
         RollbackOutput(algorithm);
         if (discard_order) algorithm.DiscardCandidate();
         std::scoped_lock lock(mutex_);
@@ -1461,8 +1488,7 @@ class ExploreSystem::Impl final {
     ExploreOverlay semantic_overlay_{};
     std::uint64_t semantic_identity_ = 0U;
     std::uint64_t next_semantic_identity_ = 1U;
-    const std::shared_ptr<std::atomic<std::uint64_t>> latest_generation_ =
-        std::make_shared<std::atomic<std::uint64_t>>(0U);
+    const std::shared_ptr<std::atomic<std::uint64_t>> latest_generation_ = std::make_shared<std::atomic<std::uint64_t>>(0U);
     std::uint64_t active_gallery_generation_ = 0U;
     ExploreAlgorithm* configured_algorithm_ = nullptr;
     std::uint64_t next_shuffle_seed_ = 1U;

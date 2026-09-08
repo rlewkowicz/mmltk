@@ -19,12 +19,12 @@ struct BrowserContentSession final {
 };
 
 enum class PresentationSourceKind : std::uint8_t {
-    None [[= BrowserContentSession{0U}]],
-    Explore [[= BrowserContentSession{1U}]],
-    Annotation [[= BrowserContentSession{2U}]],
-    Predict [[= BrowserContentSession{3U}]],
-    Live [[= BrowserContentSession{4U}]],
-    Upscale [[= BrowserContentSession{5U}]],
+    None[[= BrowserContentSession{0U}]],
+    Explore[[= BrowserContentSession{1U}]],
+    Annotation[[= BrowserContentSession{2U}]],
+    Predict[[= BrowserContentSession{3U}]],
+    Live[[= BrowserContentSession{4U}]],
+    Upscale[[= BrowserContentSession{5U}]],
 };
 
 struct PresentationSourceMetadata final {
@@ -70,9 +70,7 @@ struct PresentationSourceIdentity final {
     PresentationSourceKind kind = PresentationSourceKind::None;
     std::uint32_t instance = 0U;
 
-    [[nodiscard]] constexpr bool valid() const noexcept {
-        return presentation_source_session(kind) != 0U && instance != 0U;
-    }
+    [[nodiscard]] constexpr bool valid() const noexcept { return presentation_source_session(kind) != 0U && instance != 0U; }
     constexpr auto operator<=>(const PresentationSourceIdentity&) const = default;
 };
 

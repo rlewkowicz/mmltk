@@ -8,7 +8,7 @@
 namespace mmltk::controller {
 
 mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame& frame,
-                                                                                 const detail::VisualRuntimeOwner& owner) {
+                                                                                    const detail::VisualRuntimeOwner& owner) {
     return borrow_matching_visual_product(frame, owner.Borrow());
 }
 
@@ -323,8 +323,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
             runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested()) {
             if (continuation_dispatched_) continuation_dispatched_();
-            if (!worker_stop.stop_requested() && !operation_stop.stop_requested())
-                notification = continuation_(*runtime, operation_stop);
+            if (!worker_stop.stop_requested() && !operation_stop.stop_requested()) notification = continuation_(*runtime, operation_stop);
         }
     }
     Observe(ActivityStage::WorkCompleted);
@@ -380,8 +379,7 @@ void VisualRuntimeOwner::ReportFailure(std::exception_ptr failure) noexcept {
         active_stop_ = std::stop_source{std::nostopstate};
         active_discrete_ = false;
         runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
-        if (continuation_ && !runtime_retirement_blocked_)
-            continuation_state_.store(kContinuationEnabled, std::memory_order_release);
+        if (continuation_ && !runtime_retirement_blocked_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
     }
     NotifyReaders();
     if (!failures_) return;

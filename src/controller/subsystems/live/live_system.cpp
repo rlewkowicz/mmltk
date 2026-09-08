@@ -77,12 +77,14 @@ class LiveSystem::Impl final {
                             };
                         }
                         PublishFrame();
-                        diagnostics_.Emit([&] { return VisualDiagnosticFact{
-                            .system = contracts::DiagnosticOwner::Live,
-                            .operation = VisualDiagnosticOperation::FrameCompleted,
-                            .device = settings_.device,
-                            .generation = runtime.OutputFacts().revision,
-                        }; });
+                        diagnostics_.Emit([&] {
+                            return VisualDiagnosticFact{
+                                .system = contracts::DiagnosticOwner::Live,
+                                .operation = VisualDiagnosticOperation::FrameCompleted,
+                                .device = settings_.device,
+                                .generation = runtime.OutputFacts().revision,
+                            };
+                        });
                         cadence_ready.wait_for(cadence_lock, worker_stop, cadence, [] { return false; });
                     }
                     return [this, algorithm] { Settle(algorithm); };

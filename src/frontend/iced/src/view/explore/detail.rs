@@ -71,9 +71,11 @@ pub(super) fn view<'a>(
     let surface = surface.map(|mut surface| {
         if !shown.as_ref().is_some_and(|shown| {
             surface.frame.is_some_and(|frame| {
-                model.presentation.as_ref().is_some_and(|presentation| {
-                    frame.matches_completed(presentation)
-                }) && frame.matches_content(shown)
+                model
+                    .presentation
+                    .as_ref()
+                    .is_some_and(|presentation| frame.matches_completed(presentation))
+                    && frame.matches_content(shown)
             })
         }) {
             surface.frame = None;
@@ -110,9 +112,10 @@ pub(super) fn view<'a>(
                 },
                 crate::presentation_surface::retained_detail()
                     .filter(|(retained, _)| retained.viewer_identity == surface.viewer_identity)
-                    .map_or(crate::presentation_surface::labels::Source::Hidden, |(_, content)| {
-                        crate::presentation_surface::labels::Source::Detail(content)
-                    }),
+                    .map_or(
+                        crate::presentation_surface::labels::Source::Hidden,
+                        |(_, content)| crate::presentation_surface::labels::Source::Detail(content),
+                    ),
             )
         },
     );
@@ -123,7 +126,14 @@ pub(super) fn view<'a>(
         .as_ref()
         .filter(|request| active != Some(request.kernel))
         .map(|request| request.kernel)
-        .or_else(|| model.upscale_snapshot.as_ref()?.pending.as_ref().map(|request| request.kernel));
+        .or_else(|| {
+            model
+                .upscale_snapshot
+                .as_ref()?
+                .pending
+                .as_ref()
+                .map(|request| request.kernel)
+        });
     let upscale = crate::generated::UPSCALE_KERNEL_VALUES
         .iter()
         .copied()

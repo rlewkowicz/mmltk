@@ -14,24 +14,25 @@ class ApplicationEventPublisher final {
     using Sink = std::function<void(SystemEvent)>;
     using ContinuitySink = std::function<void()>;
 
-    ApplicationEventPublisher(Sink& sink, ContinuitySink continuity)
-        : sink_(sink), continuity_(std::move(continuity)) {}
+    ApplicationEventPublisher(Sink& sink, ContinuitySink continuity) : sink_(sink), continuity_(std::move(continuity)) {}
 
     template <class Variant>
     void operator()(const Variant& event) const noexcept {
         if (!sink_) return;
-        std::visit([this]<class Event>(const Event& value) noexcept {
-            using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
-            try {
-                sink_(encode_system_event<Member, Event, Composition>(value));
-            } catch (...) {
-                if constexpr (Descriptor::delivery != contracts::reflection::EventDelivery::Transient) {
-                    try {
-                        if (continuity_) continuity_();
-                    } catch (...) {}
+        std::visit(
+            [this]<class Event>(const Event& value) noexcept {
+                using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
+                try {
+                    sink_(encode_system_event<Member, Event, Composition>(value));
+                } catch (...) {
+                    if constexpr (Descriptor::delivery != contracts::reflection::EventDelivery::Transient) {
+                        try {
+                            if (continuity_) continuity_();
+                        } catch (...) {}
+                    }
                 }
-            }
-        }, event);
+            },
+            event);
     }
 
    private:

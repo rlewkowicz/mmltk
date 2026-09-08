@@ -95,8 +95,8 @@ struct PresentationDiagnosticRecord final {
     PresentationPublication publication{};
     contracts::DiagnosticLink link{};
 };
-[[nodiscard]] VisualDiagnosticFact presentation_diagnostic_fact(
-    VisualDiagnosticOperation, const PresentationDiagnosticRecord&, int device, std::uint64_t outcome = 0U) noexcept;
+[[nodiscard]] VisualDiagnosticFact presentation_diagnostic_fact(VisualDiagnosticOperation, const PresentationDiagnosticRecord&, int device,
+                                                                std::uint64_t outcome = 0U) noexcept;
 enum class PresentationNativeProgress : std::uint8_t {
     Waiting,
     Superseded,

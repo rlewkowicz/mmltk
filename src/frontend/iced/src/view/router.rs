@@ -172,9 +172,7 @@ impl Router {
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
             Message::Navigation(message) => match navigation::update(message) {
-                navigation::Outcome::PageSelected(feature) => {
-                    Outcome::FeatureSelected(feature)
-                }
+                navigation::Outcome::PageSelected(feature) => Outcome::FeatureSelected(feature),
                 navigation::Outcome::SettingsRequested => Outcome::SettingsRequested,
             },
             Message::Train(message) => {
@@ -286,12 +284,16 @@ mod tests {
         let mut settings = crate::view::settings::Component::default();
         for feature in crate::generated::FEATURE_ID_VALUES {
             let previous = router.active();
-            let outcome = router.update(
-                &mut model,
-                &mut settings,
-                Message::Navigation(navigation::Message::PageSelected(*feature)),
-            ).unwrap();
-            assert!(matches!(outcome, Some(Outcome::FeatureSelected(selected)) if selected == *feature));
+            let outcome = router
+                .update(
+                    &mut model,
+                    &mut settings,
+                    Message::Navigation(navigation::Message::PageSelected(*feature)),
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, Some(Outcome::FeatureSelected(selected)) if selected == *feature)
+            );
             assert_eq!(router.active(), previous);
             router.select(*feature);
             assert_eq!(router.active(), *feature);

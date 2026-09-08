@@ -40,7 +40,9 @@ class RuntimeDiagnosticTarget final {
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
         if (!valid()) return;
-        try { write(std::forward<Factory>(factory)()); } catch (...) {}
+        try {
+            write(std::forward<Factory>(factory)());
+        } catch (...) {}
     }
     void write(RuntimeDiagnosticFact fact) const noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept;

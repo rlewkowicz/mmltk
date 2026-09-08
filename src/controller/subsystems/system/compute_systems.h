@@ -163,8 +163,8 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 class PredictSystem final {
    public:
     using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict,
-        mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
-        mmltk::frameworks::reflection::member_path<&PredictSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::revision>>;
     using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
     PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory,
                   SystemEventSink<event_type> = {});

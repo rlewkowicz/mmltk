@@ -332,18 +332,22 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 if (!contains(committed, id)) committed.push_back(id);
                 if (diagnostics.valid()) {
                     const auto admission = find_admission(id);
-                    diagnostics.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                         .operation = VisualDiagnosticOperation::PresentationAdmissionWritten,
-                         .generation = admission == admitted.end() ? 0U : admission->second.generation,
-                         .context = {.capacity_width = admission == admitted.end() ? 0U : admission->second.width,
-                                     .capacity_height = admission == admitted.end() ? 0U : admission->second.height,
-                                     .surface_high = id.high,
-                                     .surface_low = id.low,
-                                     .selection_generation = admission == admitted.end() ? 0U : admission->second.selection_generation,
-                                     .frame_revision = admission == admitted.end() ? 0U : admission->second.frame_revision,
-                                     .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
-                                     .outcome = 1U,
-                                     .allocation = {.allocation_generation = admission == admitted.end() ? 0U : admission->second.generation}}}; });
+                    diagnostics.Emit([&] {
+                        return VisualDiagnosticFact{
+                            .system = contracts::DiagnosticOwner::Presentation,
+                            .operation = VisualDiagnosticOperation::PresentationAdmissionWritten,
+                            .generation = admission == admitted.end() ? 0U : admission->second.generation,
+                            .context = {
+                                .capacity_width = admission == admitted.end() ? 0U : admission->second.width,
+                                .capacity_height = admission == admitted.end() ? 0U : admission->second.height,
+                                .surface_high = id.high,
+                                .surface_low = id.low,
+                                .selection_generation = admission == admitted.end() ? 0U : admission->second.selection_generation,
+                                .frame_revision = admission == admitted.end() ? 0U : admission->second.frame_revision,
+                                .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
+                                .outcome = 1U,
+                                .allocation = {.allocation_generation = admission == admitted.end() ? 0U : admission->second.generation}}};
+                    });
                 }
             }
             pending.erase(pending.begin());
@@ -642,17 +646,19 @@ bool WorkspaceSurfaceImportChannel::admit(const WorkspaceSurfaceImportId id, con
                                                      .frame_revision = frame_revision,
                                                      .width = width,
                                                      .height = height});
-    impl_->diagnostics.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                        .operation = VisualDiagnosticOperation::PresentationAdmissionEnqueued,
-                        .generation = generation,
-                        .context = {.capacity_width = width,
-                                    .capacity_height = height,
-                                    .surface_high = id.high,
-                                    .surface_low = id.low,
-                                    .selection_generation = selection_generation,
-                                    .frame_revision = frame_revision,
-                                    .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
-                                    .allocation = {.allocation_generation = generation}}}; });
+    impl_->diagnostics.Emit([&] {
+        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+                                    .operation = VisualDiagnosticOperation::PresentationAdmissionEnqueued,
+                                    .generation = generation,
+                                    .context = {.capacity_width = width,
+                                                .capacity_height = height,
+                                                .surface_high = id.high,
+                                                .surface_low = id.low,
+                                                .selection_generation = selection_generation,
+                                                .frame_revision = frame_revision,
+                                                .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
+                                                .allocation = {.allocation_generation = generation}}};
+    });
     if (!impl_->send(record, descriptors)) {
         std::erase(impl_->seen, id);
         std::erase_if(impl_->admitted, [id](const auto& item) { return item.first == id; });

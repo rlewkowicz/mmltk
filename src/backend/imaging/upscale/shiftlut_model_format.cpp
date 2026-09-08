@@ -15,8 +15,7 @@ void validate_tables(std::span<const std::byte> bytes) {
     for (std::size_t index = 0; index < kTableElements; ++index) {
         float value;
         std::memcpy(&value, bytes.data() + index * sizeof(float), sizeof(value));
-        if (!std::isfinite(value) || std::abs(value) > 32767.0F)
-            throw std::invalid_argument("invalid ShiftLUT table value");
+        if (!std::isfinite(value) || std::abs(value) > 32767.0F) throw std::invalid_argument("invalid ShiftLUT table value");
         if (index >= table_offset(TableFamily::Shifts) && (std::abs(value) > 1.0F || std::trunc(value) != value))
             throw std::invalid_argument("invalid ShiftLUT shift");
     }

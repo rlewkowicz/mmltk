@@ -12,7 +12,9 @@ struct ImageProductPool::Admission final {
         Notify();
         const auto retained = sink.load(std::memory_order_acquire);
         if (retained) {
-            try { (*retained)(); } catch (...) {}
+            try {
+                (*retained)();
+            } catch (...) {}
         }
     }
     void Notify() noexcept {
@@ -107,7 +109,9 @@ ImageProductPool::Candidate::Candidate(std::shared_ptr<Slot> slot, Product basel
     : slot_(std::move(slot)), baseline_(std::move(baseline)), preservation_(preservation) {}
 ImageProductPool::Candidate::~Candidate() { Release(); }
 ImageProductPool::Candidate::Candidate(Candidate&& other) noexcept
-    : slot_(std::move(other.slot_)), baseline_(std::move(other.baseline_)), preservation_(other.preservation_),
+    : slot_(std::move(other.slot_)),
+      baseline_(std::move(other.baseline_)),
+      preservation_(other.preservation_),
       revision_(std::exchange(other.revision_, 0U)) {}
 ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& other) noexcept {
     if (this == &other) return *this;
@@ -174,8 +178,8 @@ ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Prod
     }
     return {};
 }
-void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height,
-                               std::uint64_t revision, ImageProductBuffer::ProductSubmit submit) {
+void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height, std::uint64_t revision,
+                               ImageProductBuffer::ProductSubmit submit) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)
         throw std::invalid_argument("image product candidate is invalid");
     if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
@@ -200,17 +204,13 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
     try {
         slot.buffer.PublishAs(stream, width, height, revision, !initialized, std::move(submit));
         stream.Synchronize();
-    } catch (...) {
-        stream.RethrowAfterSettlement(std::current_exception());
-    }
+    } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
     candidate.revision_ = revision;
 }
-std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source,
-                                                        std::uint64_t revision) {
+std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source, std::uint64_t revision) {
     if (revision == 0U) throw std::invalid_argument("image product revision is invalid");
     const auto planes = slots_.front()->buffer.layout() == ImageProductLayout::Clean ? 1U : 2U;
-    if (!source.valid() || source.plane_count() < planes)
-        throw std::invalid_argument("source image product lacks a receiver plane");
+    if (!source.valid() || source.plane_count() < planes) throw std::invalid_argument("source image product lacks a receiver plane");
     for (const auto& slot : slots_)
         if (slot->buffer.Owns(source)) throw std::invalid_argument("an image product cannot copy from its own pool");
     auto candidate = Acquire();
@@ -235,7 +235,8 @@ ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
     {
         std::scoped_lock lock(admission_->mutex);
         candidate.slot_->facts = facts;
-        for (const auto& slot : slots_) slot->selected = slot == candidate.slot_;
+        for (const auto& slot : slots_)
+            slot->selected = slot == candidate.slot_;
         candidate.slot_->reserved = false;
         ++candidate.slot_->products;
         completed = Product{candidate.slot_, candidate.revision_};
@@ -253,7 +254,8 @@ void ImageProductPool::Select(const Product& product) {
         std::scoped_lock lock(admission_->mutex);
         if (!product.slot_->Readable() || product.slot_->facts.revision != product.revision_)
             throw std::invalid_argument("completed image product is unavailable");
-        for (const auto& slot : slots_) slot->selected = slot == product.slot_;
+        for (const auto& slot : slots_)
+            slot->selected = slot == product.slot_;
     }
     admission_->Available();
 }

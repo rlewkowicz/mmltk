@@ -99,7 +99,7 @@ class GalleryThumbnailCache final {
     void Complete(std::size_t position, std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning>,
                   std::uint64_t semantic_identity, std::uint8_t bank = 0U, std::uint8_t semantic_bank = 0U);
     [[nodiscard]] std::size_t MeaningBytes(const GalleryThumbnailCache* other = nullptr,
-        std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings = {}) const;
+                                           std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings = {}) const;
 
    private:
     Identity identity_{};

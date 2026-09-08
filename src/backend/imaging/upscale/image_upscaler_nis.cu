@@ -45,8 +45,7 @@ constexpr std::uint32_t kThreads = 256U;
     return horizontal_elements <= kMaxLaunchElements && output_elements <= kMaxLaunchElements;
 }
 
-__device__ __forceinline__ float3 source_pixel(const void* source, const std::size_t pitch,
-                                               const std::uint32_t x, const std::uint32_t y) {
+__device__ __forceinline__ float3 source_pixel(const void* source, const std::size_t pitch, const std::uint32_t x, const std::uint32_t y) {
     const auto* row = static_cast<const std::uint8_t*>(source) + static_cast<std::size_t>(y) * pitch;
     const auto* value = row + static_cast<std::size_t>(x) * 4U;
     constexpr float kByteScale = 1.0F / 255.0F;
@@ -192,8 +191,7 @@ cudaError_t launch_scale(const void* source, const std::size_t source_pitch, voi
                          const cudaStream_t stream) noexcept {
     if (source == nullptr || horizontal == nullptr || scaled == nullptr || stream == nullptr || !valid_configuration(config))
         return cudaErrorInvalidValue;
-    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
-        return cudaErrorInvalidPitchValue;
+    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U) return cudaErrorInvalidPitchValue;
     // CUDA launch status is host-thread local.  This public algorithm boundary
     // must report its own kernels rather than inherit an inspected error left
     // by an unrelated caller on the same executor thread.
@@ -211,8 +209,7 @@ cudaError_t launch_sharpen(const void* source, const std::size_t source_pitch, c
                            const std::size_t target_pitch, const Configuration& config, const cudaStream_t stream) noexcept {
     if (source == nullptr || scaled == nullptr || target == nullptr || stream == nullptr || !valid_configuration(config))
         return cudaErrorInvalidValue;
-    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U)
-        return cudaErrorInvalidPitchValue;
+    if (source_pitch < static_cast<std::size_t>(config.source_width) * 4U) return cudaErrorInvalidPitchValue;
     if (target_pitch < static_cast<std::size_t>(config.output_width) * 4U) return cudaErrorInvalidPitchValue;
     static_cast<void>(cudaGetLastError());
     const std::uint64_t output_elements = static_cast<std::uint64_t>(config.output_width) * config.output_height;

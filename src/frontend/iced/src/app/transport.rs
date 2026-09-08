@@ -7,7 +7,8 @@ impl App {
         {
             return;
         }
-        self.presentation.suspend_viewer(&self.model, self.workspace.active());
+        self.presentation
+            .suspend_viewer(&self.model, self.workspace.active());
         self.connection = None;
         self.model.peer_disconnected(error);
         self.settings.reset_transport();
@@ -47,7 +48,8 @@ impl App {
         match event {
             TransportEvent::Connected(mut connection) => {
                 if self.model.connection == crate::view_model::ConnectionState::Connected {
-                    self.presentation.suspend_viewer(&self.model, self.workspace.active());
+                    self.presentation
+                        .suspend_viewer(&self.model, self.workspace.active());
                 }
                 self.peer_generation = self.peer_generation.wrapping_add(1).max(1);
                 self.model.peer_connected();
@@ -149,11 +151,7 @@ impl App {
         }) {
             self.workspace.install_authoritative_components(&self.model);
         }
-        self.settle_settings_reply(
-            context,
-            settings_mutation_succeeded,
-            installed_settings,
-        );
+        self.settle_settings_reply(context, settings_mutation_succeeded, installed_settings);
         self.reconcile_presentation(false);
     }
 

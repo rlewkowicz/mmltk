@@ -123,7 +123,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     }
     app.reconcile_surface_frame();
     let frame = app.presentation.surface().and_then(|surface| surface.frame);
-    let presentation_task = app.presentation.redraw(previous_surface).map(Message::Presentation);
+    let presentation_task = app
+        .presentation
+        .redraw(previous_surface)
+        .map(Message::Presentation);
     Task::batch([
         task,
         presentation_task,
@@ -982,24 +985,45 @@ mod tests {
                     app.model.settings_snapshot = None;
                     None
                 }
-                1 => Some(app.model.begin_intent(ApplicationIntentEndpoint::SettingsUpdate).unwrap()),
-                _ => Some(app.model.begin_intent(ApplicationIntentEndpoint::SettingsReset).unwrap()),
+                1 => Some(
+                    app.model
+                        .begin_intent(ApplicationIntentEndpoint::SettingsUpdate)
+                        .unwrap(),
+                ),
+                _ => Some(
+                    app.model
+                        .begin_intent(ApplicationIntentEndpoint::SettingsReset)
+                        .unwrap(),
+                ),
             };
-            let source = crate::view_model::test_support::visual_frame(PresentationSourceKind::Live, 1);
+            let source =
+                crate::view_model::test_support::visual_frame(PresentationSourceKind::Live, 1);
             app.model.live_snapshot.as_mut().unwrap().frame = source.clone();
             let (sender, mut receiver) = futures_channel::mpsc::channel(8);
             app.connection = Some(Connection::new(sender));
-            drop(update(&mut app, Message::Workspace(crate::view::router::Message::Navigation(
-                crate::view::navigation::Message::PageSelected(FeatureId::Live),
-            ))));
+            drop(update(
+                &mut app,
+                Message::Workspace(crate::view::router::Message::Navigation(
+                    crate::view::navigation::Message::PageSelected(FeatureId::Live),
+                )),
+            ));
             assert_eq!(app.workspace.active(), FeatureId::Live);
             assert!(app.model.error.is_none());
-            let crate::transport_connection::OutboundRecord::Intent(intent) = receiver.try_recv().unwrap() else {
+            let crate::transport_connection::OutboundRecord::Intent(intent) =
+                receiver.try_recv().unwrap()
+            else {
                 panic!("expected Live foreground selection");
             };
-            assert_eq!(intent, crate::generated::encode_presentation_Select(intent.correlation, source.source).record);
+            assert_eq!(
+                intent,
+                crate::generated::encode_presentation_Select(intent.correlation, source.source)
+                    .record
+            );
             assert!(receiver.try_recv().is_err());
-            assert_eq!(app.model.pending_count(), usize::from(pending.is_some()) + 1);
+            assert_eq!(
+                app.model.pending_count(),
+                usize::from(pending.is_some()) + 1
+            );
             if let Some(pending) = pending {
                 app.model.abandon_intent(pending);
             }

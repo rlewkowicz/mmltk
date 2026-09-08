@@ -1088,10 +1088,23 @@ export function mmltkIntegrationWindowClose() {
 "#)]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationBoundaryPixels)]
-    fn boundary_pixels_js(points: &[f32], fields: &str, control: &str, source: f64, presentation: f64);
+    fn boundary_pixels_js(
+        points: &[f32],
+        fields: &str,
+        control: &str,
+        source: f64,
+        presentation: f64,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAtlasComposition)]
-    fn atlas_composition_js(points: &[f32], cards: &[u32], fields: &str, source: f64,
-        presentation: f64, columns: u32, completed: &wasm_bindgen::JsValue);
+    fn atlas_composition_js(
+        points: &[f32],
+        cards: &[u32],
+        fields: &str,
+        source: f64,
+        presentation: f64,
+        columns: u32,
+        completed: &wasm_bindgen::JsValue,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAnnotationSwatch)]
     fn annotation_swatch_js(
         css_bounds: &[f64],
@@ -1178,35 +1191,74 @@ extern "C" {
     fn window_close_js() -> u32;
 }
 
-pub(crate) fn sample_boundary_pixels(surface: crate::presentation_surface::Surface,
-                                    control: &str, image: Rectangle, clip: Rectangle) {
+pub(crate) fn sample_boundary_pixels(
+    surface: crate::presentation_surface::Surface,
+    control: &str,
+    image: Rectangle,
+    clip: Rectangle,
+) {
     #[cfg(target_arch = "wasm32")]
     {
-        if !crate::presentation_surface::pixel_trace::enabled() { return; }
-        let Some(frame) = surface.frame else { return; };
+        if !crate::presentation_surface::pixel_trace::enabled() {
+            return;
+        }
+        let Some(frame) = surface.frame else {
+            return;
+        };
         let [crop_x, crop_y, crop_width, crop_height] = surface.content_region();
-        if crop_width == 0 || crop_height == 0 { return; }
+        if crop_width == 0 || crop_height == 0 {
+            return;
+        }
         let coordinate = |index: usize, size: u32| {
-            [0, 191.min(size - 1), 383.min(size - 1), (size - 1) / 2, size - 1][index]
+            [
+                0,
+                191.min(size - 1),
+                383.min(size - 1),
+                (size - 1) / 2,
+                size - 1,
+            ][index]
         };
         let mut points = [0.0f32; 25 * 5];
         let mut count = 0;
         for index in 0..25 {
             let x = coordinate(index % 5, frame.content_width);
             let y = coordinate(index / 5, frame.content_height);
-            if x < crop_x || y < crop_y || x >= crop_x + crop_width || y >= crop_y + crop_height { continue; }
+            if x < crop_x || y < crop_y || x >= crop_x + crop_width || y >= crop_y + crop_height {
+                continue;
+            }
             let screen = iced::Point::new(
                 image.x + (x - crop_x) as f32 * image.width / crop_width as f32,
-                image.y + (y - crop_y) as f32 * image.height / crop_height as f32);
-            let Some(visible) = clip.intersection(&image) else { continue; };
-            if screen.x < visible.x + 2.0 || screen.y < visible.y + 2.0
-                || screen.x >= visible.x + visible.width - 2.0 || screen.y >= visible.y + visible.height - 2.0 { continue; }
-            points[count..count + 5].copy_from_slice(&[x as f32, y as f32, screen.x, screen.y, index as f32]);
+                image.y + (y - crop_y) as f32 * image.height / crop_height as f32,
+            );
+            let Some(visible) = clip.intersection(&image) else {
+                continue;
+            };
+            if screen.x < visible.x + 2.0
+                || screen.y < visible.y + 2.0
+                || screen.x >= visible.x + visible.width - 2.0
+                || screen.y >= visible.y + visible.height - 2.0
+            {
+                continue;
+            }
+            points[count..count + 5].copy_from_slice(&[
+                x as f32,
+                y as f32,
+                screen.x,
+                screen.y,
+                index as f32,
+            ]);
             count += 5;
         }
-        boundary_pixels_js(&points[..count],
-            &format!("{{{}}}", crate::presentation_surface::surface_trace_fields(surface, surface)),
-            control, frame.content_sequence as f64, frame.presentation_revision as f64);
+        boundary_pixels_js(
+            &points[..count],
+            &format!(
+                "{{{}}}",
+                crate::presentation_surface::surface_trace_fields(surface, surface)
+            ),
+            control,
+            frame.content_sequence as f64,
+            frame.presentation_revision as f64,
+        );
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (surface, control, image, clip);
@@ -1215,13 +1267,23 @@ pub(crate) fn sample_boundary_pixels(surface: crate::presentation_surface::Surfa
 fn sample_atlas_composition(draw: &AtlasDraw) {
     #[cfg(target_arch = "wasm32")]
     {
-        if !crate::presentation_surface::pixel_trace::enabled() { return; }
+        if !crate::presentation_surface::pixel_trace::enabled() {
+            return;
+        }
         let snapshot = &draw.snapshot;
-        if !pixel_fixture_enabled() || snapshot.augmentation.enabled || snapshot.overlay.showlabels
-            || !snapshot.overlay.showmasks || !snapshot.overlay.showboxes
+        if !pixel_fixture_enabled()
+            || snapshot.augmentation.enabled
+            || snapshot.overlay.showlabels
+            || !snapshot.overlay.showmasks
+            || !snapshot.overlay.showboxes
             || !matches!(snapshot.viewport.columns, 4 | 10)
-            || snapshot.gallery.slots.iter().any(|ready| !*ready) { return; }
-        let Some(frame) = draw.surface.frame else { return; };
+            || snapshot.gallery.slots.iter().any(|ready| !*ready)
+        {
+            return;
+        }
+        let Some(frame) = draw.surface.frame else {
+            return;
+        };
         // The fixture is a constant clean image and a rectangular mask with a
         // central hole. Four isolated samples exclude all label geometry.
         let mut points = [0.0f32; 256 * 4 * 10];
@@ -1233,54 +1295,89 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
         for label in &snapshot.labels {
             let slot = (label.box_.first.y / side) as usize * columns as usize
                 + (label.box_.first.x / side) as usize;
-            if snapshot.order.visibleindices.get(slot) != Some(&label.compiledindex) { continue; }
-            if !snapshot.gallery.slots.get(slot).copied().unwrap_or(false) { continue; }
+            if snapshot.order.visibleindices.get(slot) != Some(&label.compiledindex) {
+                continue;
+            }
+            if !snapshot.gallery.slots.get(slot).copied().unwrap_or(false) {
+                continue;
+            }
             let card_origin = iced::Point::new(
-                draw.image.x + (slot % columns as usize) as f32 * side * draw.image.width / frame.content_width as f32,
-                draw.image.y + (slot / columns as usize) as f32 * side * draw.image.height / frame.content_height as f32);
-            let card_end = iced::Point::new(card_origin.x + side * draw.image.width / frame.content_width as f32 - 1.0,
-                card_origin.y + side * draw.image.height / frame.content_height as f32 - 1.0);
+                draw.image.x
+                    + (slot % columns as usize) as f32 * side * draw.image.width
+                        / frame.content_width as f32,
+                draw.image.y
+                    + (slot / columns as usize) as f32 * side * draw.image.height
+                        / frame.content_height as f32,
+            );
+            let card_end = iced::Point::new(
+                card_origin.x + side * draw.image.width / frame.content_width as f32 - 1.0,
+                card_origin.y + side * draw.image.height / frame.content_height as f32 - 1.0,
+            );
             // Eligibility is independent of whether individual probes succeed:
             // all ready annotated cards fully inside the visible clip.
-            if !draw.clip.contains(card_origin) || !draw.clip.contains(card_end) { continue; }
-            let Some(color) = snapshot.dataset.palette.get(label.category as usize) else { continue; };
+            if !draw.clip.contains(card_origin) || !draw.clip.contains(card_end) {
+                continue;
+            }
+            let Some(color) = snapshot.dataset.palette.get(label.category as usize) else {
+                continue;
+            };
             let color = crate::presentation_surface::labels::class_color(color);
             let rgb = [color.r, color.g, color.b].map(|value| (value * 255.0).round());
             let width = label.box_.second.x - label.box_.first.x;
             let height = label.box_.second.y - label.box_.first.y;
-            if cards[..card_count].contains(&label.compiledindex) { continue; }
-            if card_count == cards.len() { return; }
+            if cards[..card_count].contains(&label.compiledindex) {
+                continue;
+            }
+            if card_count == cards.len() {
+                return;
+            }
             cards[card_count] = label.compiledindex;
             card_count += 1;
             let start = count;
-            for (kind, (relative_x, relative_y)) in [(0.2,0.7),(0.5,0.5),(0.0,0.7),(-0.25,0.7)].into_iter().enumerate() {
-                if count + 10 > points.len() { break; }
+            for (kind, (relative_x, relative_y)) in
+                [(0.2, 0.7), (0.5, 0.5), (0.0, 0.7), (-0.25, 0.7)]
+                    .into_iter()
+                    .enumerate()
+            {
+                if count + 10 > points.len() {
+                    break;
+                }
                 let x = (label.box_.first.x + width * relative_x).floor()
                     + if kind == 2 { -0.5 } else { 0.5 };
                 let y = (label.box_.first.y + height * relative_y).floor() + 0.5;
                 let screen = iced::Point::new(
                     draw.image.x + x * draw.image.width / frame.content_width as f32,
-                    draw.image.y + y * draw.image.height / frame.content_height as f32);
-                if !draw.clip.contains(screen) { continue; }
-                let base = [48.0,80.0,112.0];
+                    draw.image.y + y * draw.image.height / frame.content_height as f32,
+                );
+                if !draw.clip.contains(screen) {
+                    continue;
+                }
+                let base = [48.0, 80.0, 112.0];
                 // Canvas pixel centers generally do not coincide with source
                 // texel centers. Follow the existing linear sampler, including
                 // the one-pixel stroke's clean/mask neighbours.
-                let texel_x = (screen.x.floor() + 0.5 - draw.image.x)
-                    * frame.content_width as f32 / draw.image.width - 0.5;
-                let texel_y = (screen.y.floor() + 0.5 - draw.image.y)
-                    * frame.content_height as f32 / draw.image.height - 0.5;
+                let texel_x = (screen.x.floor() + 0.5 - draw.image.x) * frame.content_width as f32
+                    / draw.image.width
+                    - 0.5;
+                let texel_y = (screen.y.floor() + 0.5 - draw.image.y) * frame.content_height as f32
+                    / draw.image.height
+                    - 0.5;
                 let alpha_at = |px: f32, py: f32| {
                     let left = label.box_.first.x.floor() - 1.0;
                     let top = label.box_.first.y.floor() - 1.0;
                     let right = label.box_.second.x.ceil();
                     let bottom = label.box_.second.y.ceil();
                     if ((px == left || px == right) && py >= top && py <= bottom)
-                        || ((py == top || py == bottom) && px >= left && px <= right) { return 1.0; }
+                        || ((py == top || py == bottom) && px >= left && px <= right)
+                    {
+                        return 1.0;
+                    }
                     let center_x = px + 0.5;
                     let center_y = py + 0.5;
-                    let inside = center_x >= label.box_.first.x && center_x < label.box_.second.x
-                        && center_y >= label.box_.first.y && center_y < label.box_.second.y;
+                    let inside = center_x >= label.box_.first.x
+                        && center_x < label.box_.second.x
+                        && center_y >= label.box_.first.y
+                        && center_y < label.box_.second.y;
                     let hole = center_x >= label.box_.first.x + width * 0.375
                         && center_x < label.box_.first.x + width * 0.625
                         && center_y >= label.box_.first.y + height * 0.375
@@ -1294,26 +1391,57 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
                         let alpha = alpha_at(texel_x.floor() + dx, texel_y.floor() + dy);
                         (base[channel] * (1.0 - alpha) + rgb[channel] * alpha).round()
                     };
-                    ((color_at(0.0,0.0) * (1.0-tx) + color_at(1.0,0.0) * tx) * (1.0-ty)
-                        + (color_at(0.0,1.0) * (1.0-tx) + color_at(1.0,1.0) * tx) * ty).round()
+                    ((color_at(0.0, 0.0) * (1.0 - tx) + color_at(1.0, 0.0) * tx) * (1.0 - ty)
+                        + (color_at(0.0, 1.0) * (1.0 - tx) + color_at(1.0, 1.0) * tx) * ty)
+                        .round()
                 });
-                points[count..count+10].copy_from_slice(&[x,y,screen.x,screen.y,
-                    expected[0],expected[1],expected[2],255.0,kind as f32,label.compiledindex as f32]);
+                points[count..count + 10].copy_from_slice(&[
+                    x,
+                    y,
+                    screen.x,
+                    screen.y,
+                    expected[0],
+                    expected[1],
+                    expected[2],
+                    255.0,
+                    kind as f32,
+                    label.compiledindex as f32,
+                ]);
                 count += 10;
             }
-            if count - start != 40 { return; }
+            if count - start != 40 {
+                return;
+            }
         }
-        let Some(mut output) = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
-            else { return; };
+        let Some(mut output) =
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+        else {
+            return;
+        };
         let receipt = draw.clone();
         let completed = pixel_result_callback(move |expected, matched| {
-            let _ = output.try_send(Message::AtlasComposition { receipt, expected, matched });
+            let _ = output.try_send(Message::AtlasComposition {
+                receipt,
+                expected,
+                matched,
+            });
         });
-        atlas_composition_js(&points[..count], &cards[..card_count],
-            &format!("{{{},\"image_x\":{},\"image_y\":{},\"image_width\":{},\"image_height\":{}}}",
+        atlas_composition_js(
+            &points[..count],
+            &cards[..card_count],
+            &format!(
+                "{{{},\"image_x\":{},\"image_y\":{},\"image_width\":{},\"image_height\":{}}}",
                 crate::presentation_surface::surface_trace_fields(draw.surface, draw.surface),
-                draw.image.x, draw.image.y, draw.image.width, draw.image.height),
-            frame.content_sequence as f64, frame.presentation_revision as f64, snapshot.viewport.columns, &completed);
+                draw.image.x,
+                draw.image.y,
+                draw.image.width,
+                draw.image.height
+            ),
+            frame.content_sequence as f64,
+            frame.presentation_revision as f64,
+            snapshot.viewport.columns,
+            &completed,
+        );
     }
     #[cfg(not(target_arch = "wasm32"))]
     let _ = draw;
@@ -1332,7 +1460,9 @@ fn pixel_fixture_enabled() -> bool {
         FIXTURE.with(|enabled| *enabled)
     }
     #[cfg(not(target_arch = "wasm32"))]
-    { false }
+    {
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1831,11 +1961,15 @@ fn sampleable_presentation(
     source_revision: u64,
 ) -> Option<SampleablePresentation> {
     let viewed = (source == crate::generated::PresentationSourceKind::Explore
-        && model.explore.snapshot.as_ref().is_some_and(|snapshot|
-            snapshot.mode == crate::generated::ExploreMode::Detail && snapshot.frame.revision == source_revision))
-        .then(|| model.viewed_explore_frame()).flatten();
-    let (source, source_revision) = viewed.as_ref().map_or((source, source_revision),
-        |viewed| (viewed.source.kind, viewed.revision));
+        && model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.mode == crate::generated::ExploreMode::Detail
+                && snapshot.frame.revision == source_revision
+        }))
+    .then(|| model.viewed_explore_frame())
+    .flatten();
+    let (source, source_revision) = viewed.as_ref().map_or((source, source_revision), |viewed| {
+        (viewed.source.kind, viewed.revision)
+    });
     let presentation = model.presentation.as_ref()?;
     let frame = frame?;
     (presentation.completed.source.kind == source
@@ -3117,8 +3251,14 @@ impl Controller {
                 }
                 return None;
             }
-            Message::AtlasComposition { receipt, expected, matched } => {
-                if expected != 0 && expected == matched { self.atlas_composition = Some(receipt); }
+            Message::AtlasComposition {
+                receipt,
+                expected,
+                matched,
+            } => {
+                if expected != 0 && expected == matched {
+                    self.atlas_composition = Some(receipt);
+                }
                 return None;
             }
             Message::AtlasPixels {
@@ -4448,140 +4588,306 @@ impl Controller {
         }
         match self.phase.clone() {
             Phase::AtlasPixelColumns(columns) => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                if snapshot.viewport.columns != columns || snapshot.busy || model.has_explore_pending()
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.viewport.columns != columns
+                    || snapshot.busy
+                    || model.has_explore_pending()
                     || snapshot.overlay.showlabels
-                    || !snapshot.overlay.showmasks || !snapshot.overlay.showboxes
-                    || self.atlas_composition.as_ref().is_none_or(|draw| draw.snapshot.frame != snapshot.frame
-                        || draw.snapshot.viewport.columns != columns)
-                    || self.atlas_pixels.as_ref().is_none_or(|draw| draw.snapshot.frame != snapshot.frame
-                        || draw.snapshot.gallery.slots.iter().any(|ready| !*ready)) {
+                    || !snapshot.overlay.showmasks
+                    || !snapshot.overlay.showboxes
+                    || self.atlas_composition.as_ref().is_none_or(|draw| {
+                        draw.snapshot.frame != snapshot.frame
+                            || draw.snapshot.viewport.columns != columns
+                    })
+                    || self.atlas_pixels.as_ref().is_none_or(|draw| {
+                        draw.snapshot.frame != snapshot.frame
+                            || draw.snapshot.gallery.slots.iter().any(|ready| !*ready)
+                    })
+                {
                     return Task::none();
                 }
                 let next = if columns == 4 { 10 } else { self.atlas_columns };
-                self.phase = if columns == 4 { Phase::AtlasPixelColumns(10) } else { Phase::AtlasPixelRestore };
-                let next_columns = explore_message(explore::Message::Gallery(explore::gallery::Message::ColumnsChanged(next as i32)));
+                self.phase = if columns == 4 {
+                    Phase::AtlasPixelColumns(10)
+                } else {
+                    Phase::AtlasPixelRestore
+                };
+                let next_columns = explore_message(explore::Message::Gallery(
+                    explore::gallery::Message::ColumnsChanged(next as i32),
+                ));
                 if columns == 10 {
-                    next_columns.chain(explore_message(explore::Message::Gallery(
-                        explore::gallery::Message::Overlay(explore::overlay::Message::LabelsToggled(self.atlas_fixture_labels)))))
-                        .chain(explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
-                            explore::overlay::Message::MasksToggled(self.atlas_fixture_masks)))))
-                        .chain(explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
-                            explore::overlay::Message::BoxesToggled(self.atlas_fixture_boxes)))))
-                } else { next_columns }
+                    next_columns
+                        .chain(explore_message(explore::Message::Gallery(
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::LabelsToggled(self.atlas_fixture_labels),
+                            ),
+                        )))
+                        .chain(explore_message(explore::Message::Gallery(
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::MasksToggled(self.atlas_fixture_masks),
+                            ),
+                        )))
+                        .chain(explore_message(explore::Message::Gallery(
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::BoxesToggled(self.atlas_fixture_boxes),
+                            ),
+                        )))
+                } else {
+                    next_columns
+                }
             }
             Phase::AtlasPixelRestore => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                if snapshot.viewport.columns != self.atlas_columns || snapshot.busy || model.has_explore_pending()
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.viewport.columns != self.atlas_columns
+                    || snapshot.busy
+                    || model.has_explore_pending()
                     || snapshot.overlay.showlabels != self.atlas_fixture_labels
                     || snapshot.overlay.showmasks != self.atlas_fixture_masks
                     || snapshot.overlay.showboxes != self.atlas_fixture_boxes
-                    || self.atlas_pixels.as_ref().is_none_or(|draw| draw.snapshot.frame != snapshot.frame) {
+                    || self
+                        .atlas_pixels
+                        .as_ref()
+                        .is_none_or(|draw| draw.snapshot.frame != snapshot.frame)
+                {
                     return Task::none();
                 }
                 self.advance_to(Phase::AwaitExploreReady)
             }
             Phase::ViewerConfirmSettings | Phase::ViewerRestoreSettings => {
                 let restore = self.phase == Phase::ViewerRestoreSettings;
-                let Some(snapshot) = settled_settings_snapshot(model, settings,
-                    self.viewer_continuity_settings_revision) else { return Task::none(); };
-                let expected = if restore { self.viewer_continuity_performance } else { !self.viewer_continuity_performance };
-                if snapshot.settingsstate.ui.showworkspaceperformance != expected { return Task::none(); }
+                let Some(snapshot) = settled_settings_snapshot(
+                    model,
+                    settings,
+                    self.viewer_continuity_settings_revision,
+                ) else {
+                    return Task::none();
+                };
+                let expected = if restore {
+                    self.viewer_continuity_performance
+                } else {
+                    !self.viewer_continuity_performance
+                };
+                if snapshot.settingsstate.ui.showworkspaceperformance != expected {
+                    return Task::none();
+                }
                 if model.explore.requested_upscale != self.viewer_continuity_request
-                    || model.current_upscale().is_none_or(|upscale|
-                        self.upscale_cached_frames[2].as_ref() != Some(&upscale.frame)) {
+                    || model.current_upscale().is_none_or(|upscale| {
+                        self.upscale_cached_frames[2].as_ref() != Some(&upscale.frame)
+                    })
+                {
                     self.fail("same-route Settings confirmation changed the resident viewer demand or result");
                     return Task::none();
                 }
                 self.viewer_continuity_settings_revision = snapshot.revision;
                 if !restore {
                     self.phase = Phase::ViewerRestoreSettings;
-                    return Task::done(RootMessage::Settings(crate::view::settings::Message::PerformanceChanged(
-                        self.viewer_continuity_performance)));
+                    return Task::done(RootMessage::Settings(
+                        crate::view::settings::Message::PerformanceChanged(
+                            self.viewer_continuity_performance,
+                        ),
+                    ));
                 }
-                report("integration.viewer_settings_preserved", explore::DETAIL_WORKSPACE_ID,
-                    "confirmed-native-settings", [snapshot.revision as f64, 1.0, 0.0, 0.0]);
-                self.viewer_route_persistence = settings.draft().is_some() && model.settings_edit_available();
-                report("integration.viewer_departure_started", explore::DETAIL_WORKSPACE_ID,
-                    "upscale-observation", [model.upscale_snapshot.as_ref().map_or(0, |state| state.revision) as f64,
-                        u8::from(self.viewer_route_persistence) as f64, snapshot.revision as f64, 0.0]);
+                report(
+                    "integration.viewer_settings_preserved",
+                    explore::DETAIL_WORKSPACE_ID,
+                    "confirmed-native-settings",
+                    [snapshot.revision as f64, 1.0, 0.0, 0.0],
+                );
+                self.viewer_route_persistence =
+                    settings.draft.is_some() && model.settings_edit_available();
+                report(
+                    "integration.viewer_departure_started",
+                    explore::DETAIL_WORKSPACE_ID,
+                    "upscale-observation",
+                    [
+                        model
+                            .upscale_snapshot
+                            .as_ref()
+                            .map_or(0, |state| state.revision) as f64,
+                        u8::from(self.viewer_route_persistence) as f64,
+                        snapshot.revision as f64,
+                        0.0,
+                    ],
+                );
                 self.phase = Phase::ViewerDepart;
-                Task::done(RootMessage::Settings(crate::view::settings::Message::Close))
-                    .chain(Task::done(RootMessage::Workspace(crate::view::router::Message::Navigation(
-                        crate::view::navigation::Message::PageSelected(FeatureId::Train)))))
+                Task::done(RootMessage::Settings(crate::view::settings::Message::Close)).chain(
+                    Task::done(RootMessage::Workspace(
+                        crate::view::router::Message::Navigation(
+                            crate::view::navigation::Message::PageSelected(FeatureId::Train),
+                        ),
+                    )),
+                )
             }
             Phase::ViewerDepart => {
-                if active != FeatureId::Train || model.explore.requested_upscale.is_some()
+                if active != FeatureId::Train
+                    || model.explore.requested_upscale.is_some()
                     || model.has_pending(crate::generated::ApplicationIntentEndpoint::UpscaleStop)
-                    || !route_edit_available(model, settings) { return Task::none(); }
+                    || !route_edit_available(model, settings)
+                {
+                    return Task::none();
+                }
                 if model.foreground_visual().is_some() {
                     self.fail("mapped Train departure retained a visual foreground");
                     return Task::none();
                 }
-                if self.viewer_route_persistence && !model.settings_snapshot.as_ref().is_some_and(|snapshot|
-                    snapshot.revision > self.viewer_continuity_settings_revision
-                        && snapshot.settingsstate.currentview == FeatureId::Train) { return Task::none(); }
-                self.viewer_continuity_settings_revision =
-                    model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision);
-                if crate::presentation_surface::pixel_trace::enabled() {
-                    report("integration.viewer_route_confirmed", "navigation.train", "None",
-                        [self.viewer_continuity_settings_revision as f64,
-                            u8::from(self.viewer_route_persistence) as f64, 1.0, 0.0]);
+                if self.viewer_route_persistence
+                    && !model.settings_snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.revision > self.viewer_continuity_settings_revision
+                            && snapshot.settingsstate.currentview == FeatureId::Train
+                    })
+                {
+                    return Task::none();
                 }
-                report("integration.viewer_abandoned", explore::DETAIL_WORKSPACE_ID,
-                    "mapped-route-departure", [model.upscale_snapshot.as_ref().map_or(0, |state| state.revision) as f64,
-                        0.0, 0.0, 0.0]);
+                self.viewer_continuity_settings_revision = model
+                    .settings_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.revision);
+                if crate::presentation_surface::pixel_trace::enabled() {
+                    report(
+                        "integration.viewer_route_confirmed",
+                        "navigation.train",
+                        "None",
+                        [
+                            self.viewer_continuity_settings_revision as f64,
+                            u8::from(self.viewer_route_persistence) as f64,
+                            1.0,
+                            0.0,
+                        ],
+                    );
+                }
+                report(
+                    "integration.viewer_abandoned",
+                    explore::DETAIL_WORKSPACE_ID,
+                    "mapped-route-departure",
+                    [
+                        model
+                            .upscale_snapshot
+                            .as_ref()
+                            .map_or(0, |state| state.revision) as f64,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                );
                 self.phase = Phase::ViewerReenter;
                 self.viewer_drawn = None;
                 SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None);
-                Task::done(RootMessage::Workspace(crate::view::router::Message::Navigation(
-                    crate::view::navigation::Message::PageSelected(FeatureId::Explore))))
+                Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Navigation(
+                        crate::view::navigation::Message::PageSelected(FeatureId::Explore),
+                    ),
+                ))
             }
             Phase::ViewerReenter => {
-                if active != FeatureId::Explore { return Task::none(); }
-                if !route_edit_available(model, settings) { return Task::none(); }
-                if self.viewer_route_persistence && !model.settings_snapshot.as_ref().is_some_and(|snapshot|
-                    snapshot.revision > self.viewer_continuity_settings_revision
-                        && snapshot.settingsstate.currentview == FeatureId::Explore) { return Task::none(); }
-                let Some(upscale) = model.current_upscale() else { return Task::none(); };
-                let Some(request) = model.explore.requested_upscale.as_ref() else { return Task::none(); };
-                if request.kernel != crate::generated::UpscaleKernel::Default
-                    || self.viewer_continuity_request.as_ref().is_none_or(|prior|
-                        prior.source != request.source || prior.document != request.document)
-                    || model.displayed_upscale_kernel() != Some(crate::generated::UpscaleKernel::Default)
-                    || self.upscale_cached_frames[0].as_ref() != Some(&upscale.frame)
-                    || self.viewer_drawn.is_none_or(|(_, source, _)| source != upscale.frame.revision) {
+                if active != FeatureId::Explore {
                     return Task::none();
                 }
-                if !matches!(model.foreground_visual(), Some(crate::generated::PresentationSourceKind::Explore
-                    | crate::generated::PresentationSourceKind::Upscale)) {
+                if !route_edit_available(model, settings) {
+                    return Task::none();
+                }
+                if self.viewer_route_persistence
+                    && !model.settings_snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.revision > self.viewer_continuity_settings_revision
+                            && snapshot.settingsstate.currentview == FeatureId::Explore
+                    })
+                {
+                    return Task::none();
+                }
+                let Some(upscale) = model.current_upscale() else {
+                    return Task::none();
+                };
+                let Some(request) = model.explore.requested_upscale.as_ref() else {
+                    return Task::none();
+                };
+                if request.kernel != crate::generated::UpscaleKernel::Default
+                    || self.viewer_continuity_request.as_ref().is_none_or(|prior| {
+                        prior.source != request.source || prior.document != request.document
+                    })
+                    || model.displayed_upscale_kernel()
+                        != Some(crate::generated::UpscaleKernel::Default)
+                    || self.upscale_cached_frames[0].as_ref() != Some(&upscale.frame)
+                    || self
+                        .viewer_drawn
+                        .is_none_or(|(_, source, _)| source != upscale.frame.revision)
+                {
+                    return Task::none();
+                }
+                if !matches!(
+                    model.foreground_visual(),
+                    Some(
+                        crate::generated::PresentationSourceKind::Explore
+                            | crate::generated::PresentationSourceKind::Upscale
+                    )
+                ) {
                     self.fail("mapped Explore reentry has a mismatched visual foreground");
                     return Task::none();
                 }
-                let Some(sampleable) = sampleable_presentation(model, frame,
-                    crate::generated::PresentationSourceKind::Upscale, upscale.frame.revision) else { return Task::none(); };
-                if self.viewer_drawn.is_none_or(|(drawn, _, _)| drawn != sampleable.presentation_revision) {
+                let Some(sampleable) = sampleable_presentation(
+                    model,
+                    frame,
+                    crate::generated::PresentationSourceKind::Upscale,
+                    upscale.frame.revision,
+                ) else {
+                    return Task::none();
+                };
+                if self
+                    .viewer_drawn
+                    .is_none_or(|(drawn, _, _)| drawn != sampleable.presentation_revision)
+                {
                     return Task::none();
                 }
                 if crate::presentation_surface::pixel_trace::enabled() {
-                    report("integration.viewer_route_confirmed", "navigation.explore",
-                        if model.foreground_visual() == Some(crate::generated::PresentationSourceKind::Upscale)
-                            { "Upscale" } else { "Explore" },
-                        [model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision) as f64,
-                            u8::from(self.viewer_route_persistence) as f64, 1.0, 0.0]);
+                    report(
+                        "integration.viewer_route_confirmed",
+                        "navigation.explore",
+                        if model.foreground_visual()
+                            == Some(crate::generated::PresentationSourceKind::Upscale)
+                        {
+                            "Upscale"
+                        } else {
+                            "Explore"
+                        },
+                        [
+                            model
+                                .settings_snapshot
+                                .as_ref()
+                                .map_or(0, |snapshot| snapshot.revision)
+                                as f64,
+                            u8::from(self.viewer_route_persistence) as f64,
+                            1.0,
+                            0.0,
+                        ],
+                    );
                 }
-                report("integration.viewer_basic_reentry", explore::DETAIL_WORKSPACE_ID,
-                    "automatic-completed-draw", [upscale.frame.revision as f64, sampleable.presentation_revision as f64,
-                        upscale.frame.source.instance as f64, upscale.frame.cleanrevision as f64]);
+                report(
+                    "integration.viewer_basic_reentry",
+                    explore::DETAIL_WORKSPACE_ID,
+                    "automatic-completed-draw",
+                    [
+                        upscale.frame.revision as f64,
+                        sampleable.presentation_revision as f64,
+                        upscale.frame.source.instance as f64,
+                        upscale.frame.cleanrevision as f64,
+                    ],
+                );
                 self.viewer_continuity_request = Some(request.clone());
                 self.phase = Phase::ViewerAwaitDisconnect;
                 // Retiring the real outbound owner closes the worker's socket;
                 // the ordinary transport subscription performs the reconnect.
-                Task::done(RootMessage::Transport(crate::transport::TransportEvent::Disconnected(
-                    "rendered continuity acceptance".into())))
+                Task::done(RootMessage::Transport(
+                    crate::transport::TransportEvent::Disconnected(
+                        "rendered continuity acceptance".into(),
+                    ),
+                ))
             }
             Phase::ViewerAwaitDisconnect => {
-                if model.connection == crate::view_model::ConnectionState::Connected { return Task::none(); }
+                if model.connection == crate::view_model::ConnectionState::Connected {
+                    return Task::none();
+                }
                 self.viewer_drawn = None;
                 SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None);
                 self.phase = Phase::ViewerReconnect;
@@ -4589,27 +4895,62 @@ impl Controller {
             }
             Phase::ViewerReconnect => {
                 if model.connection != crate::view_model::ConnectionState::Connected
-                    || model.error.is_some() || active != FeatureId::Explore
-                    || model.explore.requested_upscale != self.viewer_continuity_request {
+                    || model.error.is_some()
+                    || active != FeatureId::Explore
+                    || model.explore.requested_upscale != self.viewer_continuity_request
+                {
                     return Task::none();
                 }
-                let Some(upscale) = model.current_upscale() else { return Task::none(); };
-                let Some((drawn, source, _)) = self.viewer_drawn else { return Task::none(); };
-                if source != upscale.frame.revision || model.displayed_upscale_kernel()
-                    != Some(crate::generated::UpscaleKernel::Default)
-                    || self.upscale_cached_frames[0].as_ref() != Some(&upscale.frame) { return Task::none(); }
-                let Some(sampleable) = sampleable_presentation(model, frame,
-                    crate::generated::PresentationSourceKind::Upscale, source) else { return Task::none(); };
-                if drawn != sampleable.presentation_revision { return Task::none(); }
-                report("integration.viewer_reconnected", explore::DETAIL_WORKSPACE_ID,
-                    "matching-completed-draw", [source as f64, drawn as f64,
-                        upscale.frame.source.instance as f64, upscale.frame.cleanrevision as f64]);
+                let Some(upscale) = model.current_upscale() else {
+                    return Task::none();
+                };
+                let Some((drawn, source, _)) = self.viewer_drawn else {
+                    return Task::none();
+                };
+                if source != upscale.frame.revision
+                    || model.displayed_upscale_kernel()
+                        != Some(crate::generated::UpscaleKernel::Default)
+                    || self.upscale_cached_frames[0].as_ref() != Some(&upscale.frame)
+                {
+                    return Task::none();
+                }
+                let Some(sampleable) = sampleable_presentation(
+                    model,
+                    frame,
+                    crate::generated::PresentationSourceKind::Upscale,
+                    source,
+                ) else {
+                    return Task::none();
+                };
+                if drawn != sampleable.presentation_revision {
+                    return Task::none();
+                }
+                report(
+                    "integration.viewer_reconnected",
+                    explore::DETAIL_WORKSPACE_ID,
+                    "matching-completed-draw",
+                    [
+                        source as f64,
+                        drawn as f64,
+                        upscale.frame.source.instance as f64,
+                        upscale.frame.cleanrevision as f64,
+                    ],
+                );
                 self.annotation_sample_baseline = drawn;
                 let (next, control) = match self.viewer_scenario.as_str() {
                     "copy" => (Phase::OpenAnnotation, EXPLORE_ANNOTATE),
                     "semantics" => (Phase::ViewerNoAspect, "explore.detail.aspect"),
-                    _ => (Phase::DetailNext(model.explore.snapshot.as_ref()
-                        .and_then(|snapshot| snapshot.selectedimage).unwrap_or_default()), EXPLORE_NEXT),
+                    _ => (
+                        Phase::DetailNext(
+                            model
+                                .explore
+                                .snapshot
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.selectedimage)
+                                .unwrap_or_default(),
+                        ),
+                        EXPLORE_NEXT,
+                    ),
                 };
                 self.phase = next;
                 self.arm(control)
@@ -5444,12 +5785,23 @@ impl Controller {
                         self.atlas_fixture_boxes = snapshot.overlay.showboxes;
                         self.phase = Phase::AtlasPixelColumns(4);
                         return explore_message(explore::Message::Gallery(
-                            explore::gallery::Message::Overlay(explore::overlay::Message::LabelsToggled(false))))
-                            .chain(explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
-                                explore::overlay::Message::MasksToggled(true)))))
-                            .chain(explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
-                                explore::overlay::Message::BoxesToggled(true)))))
-                            .chain(explore_message(explore::Message::Gallery(explore::gallery::Message::ColumnsChanged(4))));
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::LabelsToggled(false),
+                            ),
+                        ))
+                        .chain(explore_message(explore::Message::Gallery(
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::MasksToggled(true),
+                            ),
+                        )))
+                        .chain(explore_message(explore::Message::Gallery(
+                            explore::gallery::Message::Overlay(
+                                explore::overlay::Message::BoxesToggled(true),
+                            ),
+                        )))
+                        .chain(explore_message(
+                            explore::Message::Gallery(explore::gallery::Message::ColumnsChanged(4)),
+                        ));
                     }
                     if !self.viewer_scenario.is_empty() {
                         self.selection_grid = Some((
@@ -6147,10 +6499,18 @@ impl Controller {
                     return Task::none();
                 };
                 let content = &snapshot.frame.content;
-                let Some(viewed) = model.viewed_explore_frame() else { return Task::none(); };
+                let Some(viewed) = model.viewed_explore_frame() else {
+                    return Task::none();
+                };
                 let viewed_content = &viewed.content;
                 if drawn_revision != viewed.revision
-                    || drawn.crop != [viewed_content.x, viewed_content.y, viewed_content.width, viewed_content.height]
+                    || drawn.crop
+                        != [
+                            viewed_content.x,
+                            viewed_content.y,
+                            viewed_content.width,
+                            viewed_content.height,
+                        ]
                 {
                     return Task::none();
                 }
@@ -6502,9 +6862,11 @@ impl Controller {
                 if actual != expected
                     || snapshot.busy
                     || !model.explore_mutation_available()
-                    || self
-                        .viewer_drawn
-                        .is_none_or(|(_, source, _)| model.viewed_explore_frame().is_none_or(|viewed| source != viewed.revision))
+                    || self.viewer_drawn.is_none_or(|(_, source, _)| {
+                        model
+                            .viewed_explore_frame()
+                            .is_none_or(|viewed| source != viewed.revision)
+                    })
                 {
                     return Task::none();
                 }
@@ -6527,20 +6889,41 @@ impl Controller {
                 }
             }
             Phase::ViewerSquareBasic => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                let Some(request) = model.explore.requested_upscale.as_ref() else { return Task::none(); };
-                let Some(upscale) = model.current_upscale() else { return Task::none(); };
-                if snapshot.frame.extent.width != 384 || snapshot.frame.extent.height != 384
-                    || request.source != snapshot.frame || request.kernel != crate::generated::UpscaleKernel::Default
-                    || upscale.frame.extent.width != 1536 || upscale.frame.extent.height != 1536
-                    || model.displayed_upscale_kernel() != Some(crate::generated::UpscaleKernel::Default) {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                let Some(request) = model.explore.requested_upscale.as_ref() else {
+                    return Task::none();
+                };
+                let Some(upscale) = model.current_upscale() else {
+                    return Task::none();
+                };
+                if snapshot.frame.extent.width != 384
+                    || snapshot.frame.extent.height != 384
+                    || request.source != snapshot.frame
+                    || request.kernel != crate::generated::UpscaleKernel::Default
+                    || upscale.frame.extent.width != 1536
+                    || upscale.frame.extent.height != 1536
+                    || model.displayed_upscale_kernel()
+                        != Some(crate::generated::UpscaleKernel::Default)
+                {
                     return Task::none();
                 }
-                let Some(sampleable) = sampleable_presentation(model, frame,
-                    crate::generated::PresentationSourceKind::Upscale, upscale.frame.revision) else { return Task::none(); };
-                if sampleable.content_width != 1536 || sampleable.content_height != 1536
-                    || self.viewer_drawn.is_none_or(|(drawn, source, _)|
-                        drawn != sampleable.presentation_revision || source != upscale.frame.revision) {
+                let Some(sampleable) = sampleable_presentation(
+                    model,
+                    frame,
+                    crate::generated::PresentationSourceKind::Upscale,
+                    upscale.frame.revision,
+                ) else {
+                    return Task::none();
+                };
+                if sampleable.content_width != 1536
+                    || sampleable.content_height != 1536
+                    || self.viewer_drawn.is_none_or(|(drawn, source, _)| {
+                        drawn != sampleable.presentation_revision
+                            || source != upscale.frame.revision
+                    })
+                {
                     return Task::none();
                 }
                 self.phase = Phase::ViewerNoAspect;
@@ -6713,7 +7096,8 @@ impl Controller {
                     return Task::none();
                 }
                 if upscale.frame.revision != upscale_frame_revision
-                    && sampleable.presentation_revision <= presentation_revision {
+                    && sampleable.presentation_revision <= presentation_revision
+                {
                     return Task::none();
                 }
                 let Some(expected_width) = source_width.checked_mul(4) else {
@@ -6825,27 +7209,52 @@ impl Controller {
                         self.fail("cached method changed its completed physical product");
                         return Task::none();
                     }
-                    report("integration.upscale_cached", EXPLORE_UPSCALE_ACTIONS[kernel],
+                    report(
+                        "integration.upscale_cached",
+                        EXPLORE_UPSCALE_ACTIONS[kernel],
                         "same-resident-product-drawn",
-                        [source as f64, drawn as f64, kernel as f64, upscale.revision as f64]);
-                    if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() && self.viewer_continuity_request.is_none() {
-                        let Some(snapshot) = model.settings_snapshot.as_ref() else { return Task::none(); };
-                        if !route_edit_available(model, settings) { return Task::none(); }
+                        [
+                            source as f64,
+                            drawn as f64,
+                            kernel as f64,
+                            upscale.revision as f64,
+                        ],
+                    );
+                    if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len()
+                        && self.viewer_continuity_request.is_none()
+                    {
+                        let Some(snapshot) = model.settings_snapshot.as_ref() else {
+                            return Task::none();
+                        };
+                        if !route_edit_available(model, settings) {
+                            return Task::none();
+                        }
                         self.viewer_continuity_request = model.explore.requested_upscale.clone();
                         self.viewer_continuity_settings_revision = snapshot.revision;
-                        self.viewer_continuity_performance = snapshot.settingsstate.ui.showworkspaceperformance;
+                        self.viewer_continuity_performance =
+                            snapshot.settingsstate.ui.showworkspaceperformance;
                         self.phase = Phase::ViewerConfirmSettings;
-                        return Task::done(RootMessage::Workspace(crate::view::router::Message::Navigation(
-                            crate::view::navigation::Message::SettingsRequested)))
-                            .chain(Task::done(RootMessage::Settings(crate::view::settings::Message::PerformanceChanged(
-                                !self.viewer_continuity_performance))));
+                        return Task::done(RootMessage::Workspace(
+                            crate::view::router::Message::Navigation(
+                                crate::view::navigation::Message::SettingsRequested,
+                            ),
+                        ))
+                        .chain(Task::done(RootMessage::Settings(
+                            crate::view::settings::Message::PerformanceChanged(
+                                !self.viewer_continuity_performance,
+                            ),
+                        )));
                     }
                 } else {
                     self.upscale_cached_frames[kernel] = Some(upscale.frame.clone());
-                    if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() && self.viewer_scenario != "rapid" {
+                    if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len()
+                        && self.viewer_scenario != "rapid"
+                    {
                         self.upscale_cache_pass = true;
                         self.phase = Phase::StartUpscale {
-                            kernel: 0, source_width, source_height,
+                            kernel: 0,
+                            source_width,
+                            source_height,
                             upscale_revision: upscale.revision,
                             upscale_frame_revision: upscale.frame.revision,
                             presentation_revision: sampleable.presentation_revision,
@@ -7040,9 +7449,13 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                if self.gallery_drawn.is_none_or(|(presentation, source)|
-                    source != snapshot.frame.revision || model.presentation.as_ref()
-                        .is_none_or(|current| current.presentationrevision != presentation)) {
+                if self.gallery_drawn.is_none_or(|(presentation, source)| {
+                    source != snapshot.frame.revision
+                        || model
+                            .presentation
+                            .as_ref()
+                            .is_none_or(|current| current.presentationrevision != presentation)
+                }) {
                     return Task::none();
                 }
                 report(
@@ -7093,7 +7506,9 @@ impl Controller {
                     return Task::none();
                 }
                 if self.viewer_drawn.is_none_or(|(presentation, source, _)| {
-                    model.viewed_explore_frame().is_none_or(|viewed| source != viewed.revision)
+                    model
+                        .viewed_explore_frame()
+                        .is_none_or(|viewed| source != viewed.revision)
                         || model
                             .presentation
                             .as_ref()
@@ -7949,7 +8364,25 @@ mod tests {
             visible: 1,
             nonblack: 1,
         });
-        assert_eq!(controller.atlas_pixels, Some(draw));
+        assert_eq!(controller.atlas_pixels, Some(draw.clone()));
+        let _ = controller.update(Message::AtlasComposition {
+            receipt: draw.clone(),
+            expected: 1,
+            matched: 0,
+        });
+        assert!(controller.atlas_composition.is_none());
+        let _ = controller.update(Message::AtlasComposition {
+            receipt: draw.clone(),
+            expected: 0,
+            matched: 0,
+        });
+        assert!(controller.atlas_composition.is_none());
+        let _ = controller.update(Message::AtlasComposition {
+            receipt: draw.clone(),
+            expected: 1,
+            matched: 1,
+        });
+        assert_eq!(controller.atlas_composition, Some(draw));
     }
 
     #[test]

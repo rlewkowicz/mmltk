@@ -29,12 +29,20 @@ impl PresentationModel {
         }
     }
 
-    fn refresh(&mut self, frame: Option<VisualFrame>, decision: Reconciliation) -> Option<VisualFrame> {
+    fn refresh(
+        &mut self,
+        frame: Option<VisualFrame>,
+        decision: Reconciliation,
+    ) -> Option<VisualFrame> {
         let Some(frame) = frame else {
             self.clear_sent();
             return None;
         };
-        if self.sent.as_ref().is_some_and(|sent| sent.source != frame.source) {
+        if self
+            .sent
+            .as_ref()
+            .is_some_and(|sent| sent.source != frame.source)
+        {
             self.clear_sent();
         }
         (decision == Reconciliation::Superseded && self.sent.as_ref() != Some(&frame))
@@ -58,7 +66,10 @@ impl PresentationModel {
         if domain.frame.source != completed.completed.source {
             return Ok(Reconciliation::Superseded);
         }
-        match domain.snapshotrevision.cmp(&completed.completedsourcerevision) {
+        match domain
+            .snapshotrevision
+            .cmp(&completed.completedsourcerevision)
+        {
             std::cmp::Ordering::Less => Ok(Reconciliation::MetadataPending),
             std::cmp::Ordering::Greater => Ok(Reconciliation::Superseded),
             std::cmp::Ordering::Equal => Err(UiError::protocol(
@@ -94,7 +105,8 @@ impl ApplicationModel {
         completed: &PresentationSnapshot,
     ) -> Result<Reconciliation, UiError> {
         let observed = self.observed_presentation_source(foreground, completed);
-        let decision = PresentationModel::reconcile(self.frame_observation_for(observed), completed)?;
+        let decision =
+            PresentationModel::reconcile(self.frame_observation_for(observed), completed)?;
         // Once the matching Upscale metadata arrives, it can prove a different
         // method/image is pending. Until then the physical product must wait.
         if observed != foreground
@@ -124,15 +136,19 @@ impl ApplicationModel {
             return Ok(Reconciliation::Superseded);
         }
         match self.reconcile_foreground(kind, presentation)? {
-            Reconciliation::Matching if
-                (completed.source.kind == PresentationSourceKind::Upscale && self.current_upscale().is_none())
-                || (kind == PresentationSourceKind::Explore
-                    && self.explore.requested_selection.is_some_and(|image| {
-                        self.explore
-                            .snapshot
-                            .as_ref()
-                            .is_none_or(|snapshot| snapshot.selectedimage != Some(image))
-                    })) => Ok(Reconciliation::Superseded),
+            Reconciliation::Matching
+                if (completed.source.kind == PresentationSourceKind::Upscale
+                    && self.current_upscale().is_none())
+                    || (kind == PresentationSourceKind::Explore
+                        && self.explore.requested_selection.is_some_and(|image| {
+                            self.explore
+                                .snapshot
+                                .as_ref()
+                                .is_none_or(|snapshot| snapshot.selectedimage != Some(image))
+                        })) =>
+            {
+                Ok(Reconciliation::Superseded)
+            }
             decision => Ok(decision),
         }
     }
@@ -166,12 +182,20 @@ impl ApplicationModel {
         let upscale = self.upscale_snapshot.as_ref()?;
         let (surface, _) = crate::presentation_surface::drawn_detail()?;
         let drawn = surface.frame?;
-        upscale.methods.iter().zip(crate::generated::UPSCALE_KERNEL_VALUES.iter().copied())
-            .find_map(|(method, kernel)| (method.available
-                && method.completed.as_ref().is_some_and(|request|
-                    request.source == explore.frame && request.document == explore.document && request.kernel == kernel)
-                && drawn.matches_content(&method.frame))
-                .then_some(kernel))
+        upscale
+            .methods
+            .iter()
+            .zip(crate::generated::UPSCALE_KERNEL_VALUES.iter().copied())
+            .find_map(|(method, kernel)| {
+                (method.available
+                    && method.completed.as_ref().is_some_and(|request| {
+                        request.source == explore.frame
+                            && request.document == explore.document
+                            && request.kernel == kernel
+                    })
+                    && drawn.matches_content(&method.frame))
+                .then_some(kernel)
+            })
     }
 
     pub fn current_upscale(&self) -> Option<&crate::generated::UpscaleSnapshot> {
@@ -187,9 +211,13 @@ impl ApplicationModel {
             && upscale.ready
             && upscale.kernel == request.kernel
             && upscale.input == request.source
-            && explore.frame == request.source && explore.document == request.document
-            && upscale.methods.iter().any(|method|
-                method.available && method.completed.as_ref() == Some(request) && method.frame == upscale.frame))
+            && explore.frame == request.source
+            && explore.document == request.document
+            && upscale.methods.iter().any(|method| {
+                method.available
+                    && method.completed.as_ref() == Some(request)
+                    && method.frame == upscale.frame
+            }))
         .then_some(upscale)
     }
 
@@ -273,8 +301,10 @@ impl ApplicationModel {
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
         if feature == FeatureId::Explore
-            && matches!(self.presentation_model.foreground(),
-                Some(PresentationSourceKind::Explore | PresentationSourceKind::Upscale))
+            && matches!(
+                self.presentation_model.foreground(),
+                Some(PresentationSourceKind::Explore | PresentationSourceKind::Upscale)
+            )
         {
             return;
         }
@@ -297,7 +327,9 @@ impl ApplicationModel {
         }
         let foreground = self.presentation_model.foreground();
         let frame = foreground.and_then(|kind| self.frame_for(kind)).cloned();
-        let decision = if let (Some(presentation), Some(foreground)) = (self.presentation.as_ref(), foreground) {
+        let decision = if let (Some(presentation), Some(foreground)) =
+            (self.presentation.as_ref(), foreground)
+        {
             match self.reconcile_foreground(foreground, presentation) {
                 Ok(decision) => decision,
                 Err(error) => {
@@ -314,8 +346,7 @@ impl ApplicationModel {
     pub fn presentation_recovery_refresh(&self) -> Option<VisualFrame> {
         let kind = self.presentation_model.foreground()?;
         if let Some(snapshot) = self.presentation.as_ref()
-            && self.reconcile_foreground(kind, snapshot).ok()?
-                == Reconciliation::MetadataPending
+            && self.reconcile_foreground(kind, snapshot).ok()? == Reconciliation::MetadataPending
         {
             return None;
         }
@@ -323,7 +354,12 @@ impl ApplicationModel {
     }
 
     pub fn record_presentation_sent(&mut self, frame: VisualFrame) {
-        if self.presentation_model.foreground().and_then(|kind| self.frame_for(kind)) == Some(&frame) {
+        if self
+            .presentation_model
+            .foreground()
+            .and_then(|kind| self.frame_for(kind))
+            == Some(&frame)
+        {
             self.presentation_model.sent(frame);
         }
     }
@@ -458,17 +494,26 @@ mod tests {
         let source = select_upscale_source(&mut model, crate::generated::UpscaleKernel::Default);
         let mut other = source.clone();
         other.content.x += 1;
-        assert_ne!(crate::generated::visual_clean_content_identity(&source), crate::generated::visual_clean_content_identity(&other));
+        assert_ne!(
+            crate::generated::visual_clean_content_identity(&source),
+            crate::generated::visual_clean_content_identity(&other)
+        );
         let mut legacy = source.clone();
         legacy.cleanrevision = 0;
         other = legacy.clone();
         other.revision += 1;
-        assert_ne!(crate::generated::visual_clean_content_identity(&legacy), crate::generated::visual_clean_content_identity(&other));
+        assert_ne!(
+            crate::generated::visual_clean_content_identity(&legacy),
+            crate::generated::visual_clean_content_identity(&other)
+        );
         other = source.clone();
         other.cleanrevision = 42;
         let mut semantic = other.clone();
         semantic.revision += 1;
-        assert_eq!(crate::generated::visual_clean_content_identity(&other), crate::generated::visual_clean_content_identity(&semantic));
+        assert_eq!(
+            crate::generated::visual_clean_content_identity(&other),
+            crate::generated::visual_clean_content_identity(&semantic)
+        );
     }
 
     #[test]
@@ -708,10 +753,15 @@ mod tests {
         model.install_predict_snapshot(snapshot.clone()).unwrap();
         snapshot.revision = 12;
         model.install_predict_snapshot(snapshot.clone()).unwrap();
-        let observation = model.frame_observation_for(PresentationSourceKind::Predict).unwrap();
+        let observation = model
+            .frame_observation_for(PresentationSourceKind::Predict)
+            .unwrap();
         assert_eq!(observation.frame, &snapshot.frame);
         assert_eq!(observation.snapshotrevision, 12);
-        assert_eq!(model.install_predict_snapshot(snapshot.clone()).unwrap(), super::super::reduction::Observation::Current);
+        assert_eq!(
+            model.install_predict_snapshot(snapshot.clone()).unwrap(),
+            super::super::reduction::Observation::Current
+        );
         let mut conflict = snapshot.clone();
         conflict.operation.progress.completed += 1;
         assert!(model.install_predict_snapshot(conflict).is_err());
@@ -721,8 +771,17 @@ mod tests {
         assert_eq!(model.predict_snapshot.as_ref(), Some(&snapshot));
         snapshot.revision = 11;
         snapshot.frame.revision = 5;
-        assert_eq!(model.install_predict_snapshot(snapshot).unwrap(), super::super::reduction::Observation::Stale);
-        assert_eq!(model.frame_observation_for(PresentationSourceKind::Predict).unwrap().snapshotrevision, 12);
+        assert_eq!(
+            model.install_predict_snapshot(snapshot).unwrap(),
+            super::super::reduction::Observation::Stale
+        );
+        assert_eq!(
+            model
+                .frame_observation_for(PresentationSourceKind::Predict)
+                .unwrap()
+                .snapshotrevision,
+            12
+        );
     }
 
     #[test]
@@ -960,7 +1019,10 @@ mod tests {
             assert_eq!(encoded.endpoint, ApplicationIntentEndpoint::UpscaleStart);
             assert_eq!(encoded.record.correlation, 41);
             assert_eq!(encoded.record.fields.len(), 3);
-            assert_eq!(encoded.record.fields[2].value, document.clone().into_application_value());
+            assert_eq!(
+                encoded.record.fields[2].value,
+                document.clone().into_application_value()
+            );
             assert_eq!(
                 encoded.record.fields[0].value,
                 source.clone().into_application_value()

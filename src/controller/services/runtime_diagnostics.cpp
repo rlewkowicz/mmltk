@@ -115,13 +115,20 @@ class BoundedJsonWriter final {
                           std::is_same_v<Value, contracts::DiagnosticTraceId> || std::is_same_v<Value, contracts::DiagnosticSpanId>) {
                 valid = append(",") && string(field.member_name) && append(":");
                 if (!valid) return;
-                if constexpr (std::is_same_v<Value, contracts::DiagnosticOwner>) valid = string(owner_name(value));
-                else if constexpr (std::is_same_v<Value, std::string_view>) valid = string(value);
-                else if constexpr (std::is_enum_v<Value>) valid = integer_value(static_cast<std::underlying_type_t<Value>>(value));
-                else if constexpr (std::is_same_v<Value, bool>) valid = append(value ? "true" : "false");
-                else if constexpr (std::is_floating_point_v<Value>) valid = floating(value);
-                else if constexpr (std::is_integral_v<Value>) valid = integer_value(value);
-                else valid = integer_value(value.value());
+                if constexpr (std::is_same_v<Value, contracts::DiagnosticOwner>)
+                    valid = string(owner_name(value));
+                else if constexpr (std::is_same_v<Value, std::string_view>)
+                    valid = string(value);
+                else if constexpr (std::is_enum_v<Value>)
+                    valid = integer_value(static_cast<std::underlying_type_t<Value>>(value));
+                else if constexpr (std::is_same_v<Value, bool>)
+                    valid = append(value ? "true" : "false");
+                else if constexpr (std::is_floating_point_v<Value>)
+                    valid = floating(value);
+                else if constexpr (std::is_integral_v<Value>)
+                    valid = integer_value(value);
+                else
+                    valid = integer_value(value.value());
             } else {
                 valid = reflected_fields(value);
             }
@@ -153,13 +160,23 @@ class BoundedJsonWriter final {
             if (remaining != 0U) {
                 if ((byte & 0xc0U) != 0x80U) return false;
                 codepoint = (codepoint << 6U) | (byte & 0x3fU);
-                if (--remaining == 0U && (codepoint < minimum || codepoint > 0x10ffffU ||
-                                         (codepoint >= 0xd800U && codepoint <= 0xdfffU))) return false;
+                if (--remaining == 0U && (codepoint < minimum || codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)))
+                    return false;
             } else if (byte >= 0x80U) {
-                if (byte >= 0xc2U && byte <= 0xdfU) { remaining = 1U; codepoint = byte & 0x1fU; minimum = 0x80U; }
-                else if (byte >= 0xe0U && byte <= 0xefU) { remaining = 2U; codepoint = byte & 0x0fU; minimum = 0x800U; }
-                else if (byte >= 0xf0U && byte <= 0xf4U) { remaining = 3U; codepoint = byte & 0x07U; minimum = 0x10000U; }
-                else return false;
+                if (byte >= 0xc2U && byte <= 0xdfU) {
+                    remaining = 1U;
+                    codepoint = byte & 0x1fU;
+                    minimum = 0x80U;
+                } else if (byte >= 0xe0U && byte <= 0xefU) {
+                    remaining = 2U;
+                    codepoint = byte & 0x0fU;
+                    minimum = 0x800U;
+                } else if (byte >= 0xf0U && byte <= 0xf4U) {
+                    remaining = 3U;
+                    codepoint = byte & 0x07U;
+                    minimum = 0x10000U;
+                } else
+                    return false;
             }
             switch (byte) {
                 case '"':
@@ -332,8 +349,7 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact) con
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         std::array<char, DiagnosticsClient::kRecordCapacity> record;
         BoundedJsonWriter writer{record};
-        if (writer.runtime_event(fact, steady_ns))
-            static_cast<void>(operation.try_submit_encoded({.json = writer.view()}));
+        if (writer.runtime_event(fact, steady_ns)) static_cast<void>(operation.try_submit_encoded({.json = writer.view()}));
     } catch (...) {}
 }
 
@@ -353,8 +369,8 @@ void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view 
 void RuntimeDiagnosticTarget::State::write_benchmark_trace(const std::string_view event,
                                                            const std::string_view json_fields) const noexcept {
     const DiagnosticsProducer::Operation operation = producer.acquire();
-    if (!operation.enabled() || !valid_event_name(event) || json_fields.empty() || json_fields.size() > DiagnosticsClient::kRecordCapacity ||
-        json_fields.find_first_of("\r\n") != std::string_view::npos)
+    if (!operation.enabled() || !valid_event_name(event) || json_fields.empty() ||
+        json_fields.size() > DiagnosticsClient::kRecordCapacity || json_fields.find_first_of("\r\n") != std::string_view::npos)
         return;
     try {
         const auto parsed = nlohmann::json::parse(json_fields, nullptr, false);

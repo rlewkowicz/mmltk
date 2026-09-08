@@ -103,9 +103,10 @@ int main(const int argc, char* argv[]) {
     const std::string_view page{argv[9]};
     const char* pixel = std::getenv("MMLTK_GUI_PIXEL_TRACE");
     if (std::printf("mmltk fake Firefox tracing lifecycle=%d pixels=%d environment=%d\n",
-        static_cast<int>(page.find("mmltk_surface_trace=1") != std::string_view::npos),
-        static_cast<int>(page.find("mmltk_pixel_trace=1") != std::string_view::npos),
-        static_cast<int>(pixel != nullptr && std::string_view{pixel} == "1")) < 0) return 75;
+                    static_cast<int>(page.find("mmltk_surface_trace=1") != std::string_view::npos),
+                    static_cast<int>(page.find("mmltk_pixel_trace=1") != std::string_view::npos),
+                    static_cast<int>(pixel != nullptr && std::string_view{pixel} == "1")) < 0)
+        return 75;
     if (std::fputs("mmltk fake Firefox stdout\n", stdout) == EOF || std::fputs("mmltk fake Firefox stderr\n", stderr) == EOF ||
         std::fflush(stdout) != 0 || std::fflush(stderr) != 0) {
         return 75;

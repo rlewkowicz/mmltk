@@ -1,7 +1,9 @@
 use super::model_selection::effective_model_selection;
 use super::*;
 
-pub(crate) fn physical_surface(frame: crate::presentation_surface::FrameReady) -> crate::presentation_surface::Surface {
+pub(crate) fn physical_surface(
+    frame: crate::presentation_surface::FrameReady,
+) -> crate::presentation_surface::Surface {
     crate::presentation_surface::Surface {
         high: frame.high,
         low: frame.low,

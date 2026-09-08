@@ -100,8 +100,7 @@ class ReflectedMemberIdentity final {
                 visit_materialized_members<Owner>([&]<class Declaration>(const auto& fact) {
                     if constexpr (std::same_as<std::remove_cvref_t<decltype(Declaration::pointer)>,
                                                std::remove_cvref_t<decltype(Member)>>) {
-                        if (Declaration::pointer == Member)
-                            result = {reflected_type_name<Owner>(), fact.member_name};
+                        if (Declaration::pointer == Member) result = {reflected_type_name<Owner>(), fact.member_name};
                     }
                 });
             }

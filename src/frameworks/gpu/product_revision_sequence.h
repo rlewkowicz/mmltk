@@ -9,6 +9,7 @@ class ImageProductRevisionSequence final {
    public:
     explicit ImageProductRevisionSequence(std::uint64_t next = 1U);
     [[nodiscard]] std::uint64_t Take();
+
    private:
     std::mutex mutex_;
     std::uint64_t next_;
