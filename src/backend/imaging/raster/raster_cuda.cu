@@ -11,6 +11,22 @@ namespace mmltk::backend::imaging::raster::detail {
 
 namespace cuda_launch = mmltk::backend::ml::cuda::launch;
 
+__global__ void probe_rgba_kernel(const draw_launch::ProbeRgbaLaunch launch) {
+    const unsigned index = threadIdx.x;
+    if (index >= 25U) return;
+    const auto x = launch.coordinates[index * 2U];
+    const auto y = launch.coordinates[index * 2U + 1U];
+    const auto* pixel = launch.source.pixels + y * launch.source.pitch_bytes + x * 4U;
+    launch.samples[index] = static_cast<std::uint32_t>(pixel[0]) |
+        (static_cast<std::uint32_t>(pixel[1]) << 8U) | (static_cast<std::uint32_t>(pixel[2]) << 16U) |
+        (static_cast<std::uint32_t>(pixel[3]) << 24U);
+}
+
+cudaError_t launch_probe_rgba(const draw_launch::ProbeRgbaLaunch& launch) noexcept {
+    probe_rgba_kernel<<<1, 32, 0, launch.stream>>>(launch);
+    return cudaGetLastError();
+}
+
 __constant__ unsigned char d_font5x7[10][7] = {
     {0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70},  // 0
     {0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70},  // 1

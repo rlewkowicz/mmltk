@@ -3,6 +3,8 @@
 #include <stb_image_write.h>
 
 #include <array>
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -29,8 +31,15 @@ std::vector<uint8_t> stub_rgb_pixels(const std::string& path, int width, int hei
     return pixels;
 }
 
-void write_png_stub(const std::string& path, int width, int height) {
+void write_png_stub(const std::string& path, int width, int height, bool pixel_evidence) {
     std::vector<uint8_t> pixels = stub_rgb_pixels(path, width, height);
+    if (pixel_evidence) {
+        for (std::size_t index = 0; index < pixels.size(); index += 3U) {
+            pixels[index] = 48U;
+            pixels[index + 1U] = 80U;
+            pixels[index + 2U] = 112U;
+        }
+    }
     stbi_write_png(path.c_str(), width, height, 3, pixels.data(), width * 3);
 }
 
@@ -39,23 +48,31 @@ constexpr std::array<const char*, 6> kClassNames{
 };
 
 void write_synthetic_sample(const fs::path& split_dir, const int image_index, const int width, const int height,
-                            const int background_images) {
+                            const int background_images, const bool pixel_evidence) {
     std::array<char, 64> fname{};
     std::snprintf(fname.data(), fname.size(), "%06d.png", image_index);
-    write_png_stub((split_dir / fname.data()).string(), width, height);
+    write_png_stub((split_dir / fname.data()).string(), width, height, pixel_evidence);
 
     std::snprintf(fname.data(), fname.size(), "%06d.jsonl", image_index);
     std::ofstream annotations(split_dir / fname.data(), std::ios::trunc);
     if (image_index <= background_images) return;
     const int cls = (image_index - background_images - 1) % static_cast<int>(kClassNames.size());
-    constexpr int x1 = 10;
-    constexpr int y1 = 10;
-    const int x2 = std::min(width - 1, 30);
-    const int y2 = std::min(height - 1, 30);
+    const int x1 = pixel_evidence ? width / 4 : 10;
+    const int y1 = pixel_evidence ? height / 4 : 10;
+    const int x2 = pixel_evidence ? width * 3 / 4 : std::min(width - 1, 30);
+    const int y2 = pixel_evidence ? height * 3 / 4 : std::min(height - 1, 30);
     std::string rle;
     for (int row = y1; row < y2; ++row) {
-        if (!rle.empty()) rle += " ";
-        rle += std::to_string(row * width + x1) + ":" + std::to_string(x2 - x1);
+        const auto append_run = [&](int first, int last) {
+            if (!rle.empty()) rle += " ";
+            rle += std::to_string(row * width + first) + ":" + std::to_string(last - first);
+        };
+        if (pixel_evidence && row >= height * 7 / 16 && row < height * 9 / 16) {
+            append_run(x1, width * 7 / 16);
+            append_run(width * 9 / 16, x2);
+        } else {
+            append_run(x1, x2);
+        }
     }
     annotations << R"({"class":")" << kClassNames[cls] << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << "," << y2
                 << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle << R"(","image_size_wh":[)" << width << ","
@@ -105,7 +122,7 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
     }
 
     for (int i = 1; i <= spec.num_images; ++i) {
-        write_synthetic_sample(split_dir, i, spec.width, spec.height, background_images);
+        write_synthetic_sample(split_dir, i, spec.width, spec.height, background_images, spec.pixel_evidence);
     }
 }
 
@@ -113,7 +130,7 @@ void replace_synthetic_image(const FixtureSpec& spec, const int image_index, con
     if (image_index < 1 || image_index > spec.num_images || width <= 30 || height <= 30)
         throw std::invalid_argument("synthetic replacement image is invalid");
     write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height,
-                           std::clamp(spec.background_images, 0, spec.num_images));
+                           std::clamp(spec.background_images, 0, spec.num_images), spec.pixel_evidence);
 }
 
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height) {

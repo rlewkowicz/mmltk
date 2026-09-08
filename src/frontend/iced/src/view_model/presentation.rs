@@ -69,6 +69,10 @@ impl PresentationModel {
 }
 
 impl ApplicationModel {
+    pub(crate) fn foreground_visual(&self) -> Option<PresentationSourceKind> {
+        self.presentation_model.foreground()
+    }
+
     fn observed_presentation_source(
         &self,
         foreground: PresentationSourceKind,

@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <limits>
 #include <stdexcept>
@@ -17,6 +18,7 @@
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/frameworks/gpu/exported_image_buffer.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 
 import mmltk.backend.imaging.raster;
 
@@ -26,6 +28,12 @@ namespace {
 namespace gpu = mmltk::frameworks::gpu;
 namespace native = mmltk::controller::presentation;
 namespace raster = mmltk::backend::imaging::raster;
+
+struct PixelDeviceDeleter final {
+    void operator()(std::uint32_t* pointer) const noexcept {
+        if (pointer != nullptr) static_cast<void>(cudaFree(pointer));
+    }
+};
 
 struct NativeAllocation final {
     struct LatestFrame final {
@@ -64,6 +72,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         // A receiver whose CUDA completion cannot be established must never
         // release a borrowed producer into concurrent reuse during destruction.
         if (!SettleSourceRead()) std::terminate();
+        if (pixel_samples_) {
+            try {
+                context_.Bind();
+                pixel_device_.reset();
+                static_cast<void>(pixel_samples_->ReleaseSettled());
+            } catch (...) { std::terminate(); }
+        }
     }
 
     void Submit(const PresentationSubmittedSource submitted,
@@ -108,7 +123,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     void SetExpectedBrowserProcessGroup(const pid_t process_group) override { channel_.set_expected_process_group(process_group); }
 
     Retirement BrowserPeerLost() noexcept override {
-        if (terminal_retired_) return {.all_released = terminal_release_succeeded_, .safe_to_destroy = !source_read_};
+        if (terminal_retired_) return {.all_released = terminal_release_succeeded_,
+            .safe_to_destroy = !source_read_ && !source_completion_ && !pixel_work_pending_};
         bool context_bound = true;
         try {
             context_.Bind();
@@ -117,7 +133,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         channel_.reset_peer();
         browser_terminal_ = true;
         terminal_release_succeeded_ = RetirePhysical() && context_bound;
-        return {.all_released = terminal_release_succeeded_, .safe_to_destroy = !source_read_};
+        return {.all_released = terminal_release_succeeded_,
+            .safe_to_destroy = !source_read_ && !source_completion_ && !pixel_work_pending_};
     }
 
    private:
@@ -128,13 +145,17 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     };
 
     [[nodiscard]] bool SettleSourceRead() noexcept {
-        if (!source_read_) return true;
+        if (!source_read_ && !source_completion_ && !pixel_work_pending_) return true;
         const auto settled = stream_.Settle();
         if (!settled.completion_reached) {
-            source_read_->Quarantine();
+            if (source_read_) source_read_->Quarantine();
+            if (source_completion_ && source_completion_->pending()) source_completion_->Quarantine();
             return false;
         }
+        if (source_completion_) source_completion_->Complete();
+        source_completion_.reset();
         source_read_.reset();
+        pixel_work_pending_ = false;
         return true;
     }
 
@@ -454,12 +475,55 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         const std::uint64_t transfer_sequence = mmltk::common::types::take_monotonic_identity(allocation.next_transfer_sequence);
         const std::uint64_t ready = native::detail::workspace_timeline_ready(transfer_sequence);
         allocation.latest->transfer_sequence = transfer_sequence;
+        if (diagnostics_.pixel_probes_enabled() && !pixel_probe_failed_ && source_read_) {
+            source_completion_.emplace(std::move(*source_read_));
+            source_read_.reset();
+            // Access-count release is callback-safe; mutex unlock and physical
+            // storage destruction stay on this borrowing thread.
+            pixel_work_pending_ = true;
+            if (cudaLaunchHostFunc(stream, [](void* completion) {
+                static_cast<gpu::ImageProductReadCompletion*>(completion)->Complete();
+            }, std::addressof(*source_completion_)) != cudaSuccess) {
+                // No diagnostics may extend a producer lease when its precise
+                // copy-completion notification could not be queued.
+                pixel_probe_failed_ = true;
+            }
+        }
+        services::RuntimeDiagnosticSpan probe_span{diagnostics_.pixel_probes_enabled() ? diagnostics_ : VisualDiagnosticSink{}, [&] {
+            return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationPixelProbeStarted, allocation),
+                                              VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
+        }, allocation.latest->diagnostic_link};
+        if (SamplePixels(allocation, stream)) {
+            pixel_fact_ = AllocationFact(VisualDiagnosticOperation::PresentationPixel, allocation);
+            pixel_fact_.context.link = probe_span.link();
+            if (cudaLaunchHostFunc(stream, [](void* context) {
+                auto& self = *static_cast<NativePresentationWriter*>(context);
+                const auto* samples = static_cast<const std::uint32_t*>(self.pixel_samples_->data());
+                for (std::size_t index = 0U; index < self.pixel_coordinates_.size(); ++index) {
+                    auto fact = self.pixel_fact_;
+                    fact.context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
+                                          .sample_x = self.pixel_coordinates_[index][0],
+                                          .sample_y = self.pixel_coordinates_[index][1],
+                                          .sample_rgba = samples[index]};
+                    self.diagnostics_(fact);
+                }
+            }, this) != cudaSuccess) pixel_probe_failed_ = true;
+        }
+        probe_span.FinishWith([&](auto& fact) { fact.context.outcome = pixel_probe_failed_ ? 0U : 1U; });
+        // Every exported-image read, D2H and host callback precedes the odd
+        // ownership transfer. The existing ready synchronization settles all
+        // partial probe work, without another steady-state CPU wait.
         allocation.timeline->SignalReady(stream, ready);
         services::RuntimeDiagnosticSpan ready_span{diagnostics_, [&] {
             return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation),
                                               VisualDiagnosticOperation::PresentationReadySyncCompleted);
         }, allocation.latest->diagnostic_link};
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("presentation ready publication failed");
+        pixel_work_pending_ = false;
+        if (source_completion_) source_completion_->Complete();
+        source_completion_.reset();
+        source_read_.reset();
+        if (diagnostics_.pixel_probes_enabled()) context_.Bind();
         ready_span.FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
         const auto& latest = *allocation.latest;
         const auto& frame = latest.submitted.observation.frame;
@@ -503,6 +567,52 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         static_cast<void>(OfferLatest(allocation, stream));
     }
 
+    // Read only receiver-owned storage. One gather and one bounded DMA join
+    // an asynchronous receiver completion; no source borrow, additional wait, or
+    // per-frame allocation is needed.
+    [[nodiscard]] bool SamplePixels(const NativeAllocation& allocation, cudaStream_t stream) noexcept {
+        if (!diagnostics_.pixel_probes_enabled() || pixel_probe_failed_) return false;
+        try {
+            if (!pixel_samples_) {
+                pixel_samples_ = gpu::PinnedHostBuffer::ForCurrentDevice();
+                pixel_samples_->ensure_bytes(pixel_coordinates_.size() * sizeof(std::uint32_t));
+                void* device = nullptr;
+                if (cudaMalloc(&device, pixel_coordinates_.size() * sizeof(std::uint32_t)) != cudaSuccess)
+                    throw std::runtime_error("pixel probe storage unavailable");
+                pixel_device_.reset(static_cast<std::uint32_t*>(device));
+            }
+            const auto extent = allocation.latest->submitted.observation.frame.extent;
+            const auto coordinate = [](std::size_t index, std::uint32_t size) {
+                const std::array<std::uint32_t, 5> points{0U, std::min(191U, size - 1U),
+                    std::min(383U, size - 1U), (size - 1U) / 2U, size - 1U};
+                return points[index];
+            };
+            std::array<std::uint32_t, 50> coordinates{};
+            const auto* source = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(allocation.buffer->data()));
+            for (std::size_t index = 0U; index < pixel_coordinates_.size(); ++index) {
+                const auto x = coordinate(index % 5U, extent.width);
+                const auto y = coordinate(index / 5U, extent.height);
+                pixel_coordinates_[index] = {x, y};
+                coordinates[index * 2U] = x;
+                coordinates[index * 2U + 1U] = y;
+            }
+            // Set before the first enqueue: even a failed later enqueue can
+            // leave a kernel, DMA or callback naming this allocation in flight.
+            pixel_work_pending_ = true;
+            if (raster::probe_rgba({source, allocation.pitch, static_cast<int>(extent.width), static_cast<int>(extent.height)},
+                                  pixel_device_.get(), coordinates, reinterpret_cast<std::uintptr_t>(stream)) != cudaSuccess ||
+                cudaMemcpyAsync(pixel_samples_->data(), pixel_device_.get(), pixel_coordinates_.size() * sizeof(std::uint32_t),
+                                cudaMemcpyDeviceToHost, stream) != cudaSuccess) {
+                pixel_probe_failed_ = true;
+                return false;
+            }
+            return true;
+        } catch (...) {
+            pixel_probe_failed_ = true;
+            return false;
+        }
+    }
+
     void DiagnoseAllocation(const VisualDiagnosticOperation operation, const NativeAllocation& allocation,
                             const std::uint64_t outcome = 0U) const noexcept {
         if (!diagnostics_.valid()) return;
@@ -543,8 +653,15 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::optional<PresentationDiagnosticRecord> release_diagnostic_;
     native::WorkspaceSurfaceImportChannel channel_;
     gpu::DeviceContext context_;
+    std::unique_ptr<gpu::PinnedHostBuffer> pixel_samples_;
+    std::unique_ptr<std::uint32_t, PixelDeviceDeleter> pixel_device_;
+    std::array<std::array<std::uint32_t, 2>, 25> pixel_coordinates_{};
+    VisualDiagnosticFact pixel_fact_{};
+    bool pixel_probe_failed_ = false;
+    bool pixel_work_pending_ = false;
     gpu::ImageStream stream_;
     std::optional<gpu::BorrowedImageProductReadView> source_read_;
+    std::optional<gpu::ImageProductReadCompletion> source_completion_;
     std::unique_ptr<NativeAllocation> active_;
     std::unique_ptr<NativeAllocation> candidate_;
     std::unique_ptr<NativeAllocation> retiring_;

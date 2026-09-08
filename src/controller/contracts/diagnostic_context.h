@@ -52,6 +52,12 @@ struct DiagnosticSpanTiming final {
     std::uint64_t duration_ns = 0U;
     DiagnosticSpanOutcome span_outcome = DiagnosticSpanOutcome::Unspecified;
 };
+struct DiagnosticPixel final {
+    std::uint32_t sample_index = 0U;
+    std::uint32_t sample_x = 0U;
+    std::uint32_t sample_y = 0U;
+    std::uint32_t sample_rgba = 0U;
+};
 struct DiagnosticContext final {
     std::uint64_t capacity_width = 0U;
     std::uint64_t capacity_height = 0U;
@@ -78,6 +84,7 @@ struct DiagnosticContext final {
     DiagnosticTransfer transfer{};
     DiagnosticLink link{};
     DiagnosticSpanTiming span{};
+    DiagnosticPixel pixel{};
 };
 
 MMLTK_REFLECT_ENUM(DiagnosticOwner)
@@ -89,6 +96,7 @@ MMLTK_REFLECT_FIELDS(DiagnosticAllocation)
 MMLTK_REFLECT_FIELDS(DiagnosticTransfer)
 MMLTK_REFLECT_FIELDS(DiagnosticLink)
 MMLTK_REFLECT_FIELDS(DiagnosticSpanTiming)
+MMLTK_REFLECT_FIELDS(DiagnosticPixel)
 MMLTK_REFLECT_FIELDS(DiagnosticContext)
 
 }  // namespace mmltk::controller::contracts

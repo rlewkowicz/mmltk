@@ -77,12 +77,17 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
 }
 
 [[nodiscard]] EntryResult run_entry(const std::filesystem::path& executable, const std::filesystem::path& firefox_log,
-                                    const std::filesystem::path& working_directory, const std::filesystem::path& firefox_root) {
+                                    const std::filesystem::path& working_directory, const std::filesystem::path& firefox_root,
+                                    const int tracing = 0) {
     const std::string executable_path = executable.string();
+    const std::string diagnostics_path = (working_directory / "trace.jsonl").string();
     const pid_t child = ::fork();
     if (child < 0) { throw std::runtime_error(std::string{"failed to fork browser entry fixture: "} + std::strerror(errno)); }
     if (child == 0) {
         if (::chdir(working_directory.c_str()) != 0) std::_Exit(126);
+        if ((tracing == 0 ? ::unsetenv("MMLTK_GUI_TRACE_FILE") : ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_path.c_str(), 1)) != 0 ||
+            ::setenv("MMLTK_GUI_PIXEL_TRACE", tracing == 2 ? "1" : "0", 1) != 0)
+            std::_Exit(126);
         if (firefox_log.empty()) {
             static_cast<void>(::unsetenv("MMLTK_FIREFOX_LOG_FILE"));
         } else if (::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_log.c_str(), 1) != 0) {
@@ -173,6 +178,22 @@ TEST_CASE("browser runtime entry redirects Firefox logs and returns startup fail
     REQUIRE(refused_firefox.terminal == EntryTerminal::Reaped);
     REQUIRE(refused_firefox.exited());
     CHECK(refused_firefox.exit_code() != 0);
+}
+
+TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing", "[gui][browser-runtime][entry][pixel]") {
+    for (int tracing = 0; tracing != 3; ++tracing) {
+        TemporaryFirefoxLog output;
+        const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(),
+                                      MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, tracing);
+        REQUIRE(result.exited());
+        REQUIRE(result.exit_code() == 0);
+        const auto log = FileHandle::open_readonly(output.path().string());
+        std::string text(log.size(), '\0');
+        if (!text.empty()) log.pread_all(text.data(), text.size(), 0U);
+        const std::string expected = "mmltk fake Firefox tracing lifecycle=" + std::to_string(tracing != 0) +
+            " pixels=" + std::to_string(tracing == 2) + " environment=" + std::to_string(tracing == 2);
+        CHECK(text.find(expected) != std::string::npos);
+    }
 }
 
 }  // namespace

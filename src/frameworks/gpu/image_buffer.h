@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <functional>
 #include <exception>
 #include <memory>
@@ -83,6 +84,7 @@ class DeviceContext final {
 };
 
 class BorrowedImageProductReadView;
+class ImageProductReadCompletion;
 
 class ImageStream final {
    public:
@@ -130,6 +132,7 @@ class BorrowedImageReadView final {
     std::unique_ptr<Lease> lease_;
     friend class ImageBuffer;
     friend class ImageProductBuffer;
+    friend class ImageProductReadCompletion;
 };
 
 class ImageBuffer final {
@@ -184,6 +187,28 @@ class BorrowedImageProductReadView final {
     std::size_t count_ = 0U;
     friend class ImageProductBuffer;
     friend class ImageStream;
+    friend class ImageProductReadCompletion;
+};
+
+// Converts thread-affine CPU read locks into a receiver-completion access
+// count. Construct and destroy on the borrowing thread. Complete may run in
+// a GPU host callback: it releases access and notifies availability, but never
+// destroys a GPU resource. Retain this owner until receiver work is settled.
+class ImageProductReadCompletion final {
+   public:
+    explicit ImageProductReadCompletion(BorrowedImageProductReadView&&);
+    ~ImageProductReadCompletion();
+    ImageProductReadCompletion(const ImageProductReadCompletion&) = delete;
+    ImageProductReadCompletion& operator=(const ImageProductReadCompletion&) = delete;
+    void Complete() noexcept;
+    void Quarantine() noexcept;
+    [[nodiscard]] bool pending() const noexcept;
+
+   private:
+    void ReleaseAccess() noexcept;
+    BorrowedImageProductReadView source_;
+    std::atomic_bool pending_{false};
+    std::shared_ptr<const std::function<void()>> available_;
 };
 
 class ImageProductBuffer final {
@@ -222,6 +247,8 @@ class ImageProductBuffer final {
     [[nodiscard]] bool writable() const;
     [[nodiscard]] bool terminal() const noexcept;
     [[nodiscard]] bool Owns(const BorrowedImageProductReadView&) const noexcept;
+    // Wake-only notification: may run at receiver completion on a GPU callback
+    // thread. It must not execute CUDA or synchronously perform product work.
     void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>);
     struct State;
     std::shared_ptr<State> state_;

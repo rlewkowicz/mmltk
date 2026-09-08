@@ -825,6 +825,16 @@ impl ExternalTimelineQueueSubmission {
         Ok(Some(current))
     }
 
+    /// A single nonblocking observation for effect-only receiver diagnostics.
+    /// It neither consumes producer edges nor changes queue ownership.
+    pub fn submitted_release_complete(&self, release: u64) -> Result<bool, vk::Result> {
+        if release == 0 || release & 1 != 0
+            || release > self.submitted_release.load(Ordering::Acquire) {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
+        Ok(self.timeline_value()? >= release)
+    }
+
     fn wait_for_submitted_release(&self, timeout_ns: u64) -> Result<(), vk::Result> {
         let release = self.submitted_release.load(Ordering::Acquire);
         if release == 0 {

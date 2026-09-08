@@ -1888,9 +1888,23 @@ impl MmltkWorkspaceFrameIdentity {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MmltkWorkspacePixelReceipt {
+    snapshot: MmltkWorkspaceFrameSnapshot,
+    coordinates: [(u32, u32); 25],
+    copy_index: usize,
+    release: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MmltkWorkspaceMailboxReceipt {
+    identity: MmltkWorkspaceFrameIdentity,
+    pixels: Option<MmltkWorkspacePixelReceipt>,
+}
+
 #[derive(Default)]
 struct MmltkWorkspaceMailboxes {
-    occupied: [[Option<MmltkWorkspaceFrameIdentity>; MMLTK_WORKSPACE_MAILBOX_SLOTS];
+    occupied: [[Option<MmltkWorkspaceMailboxReceipt>; MMLTK_WORKSPACE_MAILBOX_SLOTS];
         MMLTK_WORKSPACE_LAYER_COUNT],
     next: [usize; MMLTK_WORKSPACE_LAYER_COUNT],
     latest_presented_revision: [u64; MMLTK_WORKSPACE_LAYER_COUNT],
@@ -1914,13 +1928,14 @@ impl MmltkWorkspaceMailboxes {
             .map(|slot| slot as u32)
     }
 
-    fn occupy(&mut self, identity: MmltkWorkspaceFrameIdentity, slot: u32) -> bool {
+    fn occupy(&mut self, receipt: MmltkWorkspaceMailboxReceipt, slot: u32) -> bool {
+        let identity = receipt.identity;
         let layer = identity.layer as usize;
         let slot = slot as usize;
         if self.already_presented(identity) || self.occupied[layer][slot].is_some() {
             return false;
         }
-        self.occupied[layer][slot] = Some(identity);
+        self.occupied[layer][slot] = Some(receipt);
         // Transfer retries can arrive after a page release. Publication revisions
         // remain monotonic for this surface even when no slot is occupied.
         self.latest_presented_revision[layer] = identity.presentation_revision;
@@ -1928,16 +1943,15 @@ impl MmltkWorkspaceMailboxes {
         true
     }
 
-    fn release(&mut self, identity: MmltkWorkspaceFrameIdentity, slot: u32) -> bool {
+    fn release(&mut self, identity: MmltkWorkspaceFrameIdentity, slot: u32) -> Option<MmltkWorkspaceMailboxReceipt> {
         if slot >= MMLTK_WORKSPACE_MAILBOX_SLOTS as u32 {
-            return false;
+            return None;
         }
         let occupied = &mut self.occupied[identity.layer as usize][slot as usize];
-        if *occupied != Some(identity) {
-            return false;
+        if occupied.as_ref().map(|receipt| receipt.identity) != Some(identity) {
+            return None;
         }
-        *occupied = None;
-        true
+        occupied.take()
     }
 
     fn note_capacity_exhausted(&mut self, identity: MmltkWorkspaceFrameIdentity) -> bool {
@@ -1959,7 +1973,8 @@ impl MmltkWorkspaceMailboxes {
     fn drain(&mut self, mut release: impl FnMut(MmltkWorkspaceFrameIdentity, u32)) {
         for (layer, slots) in self.occupied.iter_mut().enumerate() {
             for (slot, occupied) in slots.iter_mut().enumerate() {
-                if let Some(identity) = occupied.take() {
+                if let Some(receipt) = occupied.take() {
+                    let identity = receipt.identity;
                     debug_assert_eq!(identity.layer as usize, layer);
                     release(identity, slot as u32);
                 }
@@ -2242,6 +2257,36 @@ fn submit_mmltk_workspace_transfer(
             .map(|slot| (identity, slot))
     });
     let copy_slot = reserved.and_then(|(identity, slot)| identity.copy_index(slot));
+    let mut pixels = if entry.blit.pixels.is_some() {
+        if let Some(slot) = copy_slot {
+            let extent = entry.blit.extent;
+            if snapshot.content_width == 0 || snapshot.content_height == 0
+                || snapshot.content_width > extent.width || snapshot.content_height > extent.height
+                || !MmltkWorkspacePixels::reusable(
+                    entry.blit.pixels.as_ref().unwrap().submitted_release[slot], |release|
+                    entry.blit.submission().submitted_release_complete(release).unwrap_or(false)) {
+                // Only this physical slot misses evidence. Product commands
+                // remain reusable, but are not reset without exact completion.
+                None
+            } else {
+                let receipt = MmltkWorkspacePixelReceipt {
+                    snapshot,
+                    coordinates: std::array::from_fn(|index| (
+                        MmltkWorkspacePixels::coordinate(index % 5, snapshot.content_width),
+                        MmltkWorkspacePixels::coordinate(index / 5, snapshot.content_height),
+                    )),
+                    copy_index: slot,
+                    release: 0,
+                };
+                // Only a never-used or receiver-released physical slot is writable.
+                // Its previous receipt established GPU completion before reuse.
+                unsafe { entry.blit.device.reset_command_buffer(
+                    entry.blit.copy_commands[slot], vk::CommandBufferResetFlags::empty()) }?;
+                entry.blit.record_copy(entry.blit.destination, extent, slot, Some(&receipt.coordinates))?;
+                Some(receipt)
+            }
+        } else { None }
+    } else { None };
     let submitted = entry
         .blit
         .submission()
@@ -2275,6 +2320,14 @@ fn submit_mmltk_workspace_transfer(
         copy_slot,
         false,
     )?;
+    if let Some(receipt) = pixels.as_mut() {
+        receipt.release = submitted.ready().checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+    }
+    if let (Some(probe), Some(slot)) = (entry.blit.pixels.as_mut(), copy_slot) {
+        // Track every use, including a copy whose diagnostic receipt was
+        // dropped. A later free-slot admission can recover without polling.
+        probe.submitted_release[slot] = submitted.ready().checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+    }
     let Some((identity, slot)) = reserved else {
         if let Some(identity) = visible_identity {
             let retry_required = entry.mailboxes.note_capacity_exhausted(identity);
@@ -2292,7 +2345,7 @@ fn submit_mmltk_workspace_transfer(
         }
         return Ok(());
     };
-    if !entry.mailboxes.occupy(identity, slot) {
+    if !entry.mailboxes.occupy(MmltkWorkspaceMailboxReceipt { identity, pixels }, slot) {
         return Err(vk::Result::ERROR_UNKNOWN);
     }
     mmltk_workspace_channel::send_mailbox_presented(
@@ -2754,9 +2807,15 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                 .get(&surface_id)
                                 .and_then(|frame_fd| entries.get_mut(frame_fd))
                             {
-                                if entry.texture_id.is_some()
-                                    && entry.mailboxes.release(identity, slot)
-                                {
+                                if let Some(receipt) = entry.texture_id.is_some()
+                                    .then(|| entry.mailboxes.release(identity, slot)).flatten() {
+                                    if let Some(pixels) = receipt.pixels {
+                                        if entry.blit.submission().submitted_release_complete(pixels.release).unwrap_or(false) {
+                                            if let Some(probe) = &entry.blit.pixels {
+                                                probe.report(surface_id, identity, slot, pixels);
+                                            }
+                                        }
+                                    }
                                     mmltk_workspace_channel::send_mailbox_completed(
                                         surface_id,
                                         identity.layer,
@@ -3138,28 +3197,77 @@ mod mmltk_workspace_transition_tests {
             ..r1
         };
         let mut mailboxes = MmltkWorkspaceMailboxes::default();
+        let receipt = |identity: MmltkWorkspaceFrameIdentity| MmltkWorkspaceMailboxReceipt {
+            identity,
+            pixels: Some(MmltkWorkspacePixelReceipt {
+                snapshot: MmltkWorkspaceFrameSnapshot {
+                    timeline_ready: (identity.presentation_revision - 18) * 2 - 1,
+                    transfer_sequence: identity.presentation_revision - 18,
+                    layer: identity.layer as u64,
+                    content_session: identity.session,
+                    content_sequence: identity.sequence,
+                    presentation_revision: identity.presentation_revision,
+                    content_width: 384,
+                    content_height: 384,
+                },
+                coordinates: std::array::from_fn(|index| (
+                    MmltkWorkspacePixels::coordinate(index % 5, 384),
+                    MmltkWorkspacePixels::coordinate(index / 5, 384),
+                )),
+                copy_index: identity.copy_index(if identity == r2 { 1 } else { 0 }).unwrap(),
+                release: (identity.presentation_revision - 18) * 2,
+            }),
+        };
         assert_eq!(mailboxes.writable_slot(r1), Some(0));
-        assert!(mailboxes.occupy(r1, 0));
+        assert!(mailboxes.occupy(receipt(r1), 0));
         assert_eq!(mailboxes.writable_slot(r1), None);
         assert_eq!(mailboxes.writable_slot(r2), Some(1));
-        assert!(mailboxes.occupy(r2, 1));
+        assert!(mailboxes.occupy(receipt(r2), 1));
         assert_eq!(mailboxes.writable_slot(r3), None);
         assert!(!mailboxes.note_capacity_exhausted(r2));
-        assert!(!mailboxes.release(r2, 0));
-        assert!(mailboxes.release(r1, 0));
+        assert!(mailboxes.release(r2, 0).is_none());
+        let released = mailboxes.release(r1, 0).unwrap().pixels.unwrap();
+        // The older physical copy keeps its own completion value and logical
+        // coordinates even while the other mailbox holds a newer submission.
+        assert_eq!(released.release, 2);
+        assert_eq!(released.coordinates[24], (383, 383));
+        assert_eq!(released.coordinates[18], (191, 191));
+        assert_eq!(released.copy_index, 2);
         assert!(!mailboxes.take_retry_after_release(r1));
         assert_eq!(mailboxes.writable_slot(r1), None);
-        assert!(!mailboxes.occupy(r1, 0));
+        assert!(!mailboxes.occupy(receipt(r1), 0));
         assert!(!mailboxes.note_capacity_exhausted(r1));
         assert_eq!(mailboxes.writable_slot(r3), Some(0));
         assert!(mailboxes.note_capacity_exhausted(r3));
         assert!(!mailboxes.note_capacity_exhausted(r2));
-        assert!(mailboxes.release(r2, 1));
+        assert!(mailboxes.release(r2, 1).is_some());
         assert!(mailboxes.take_retry_after_release(r2));
         assert!(!mailboxes.take_retry_after_release(r2));
-        assert!(mailboxes.occupy(r3, 0));
-        assert!(mailboxes.release(r3, 0));
+        assert!(mailboxes.occupy(receipt(r3), 0));
+        assert!(mailboxes.release(r3, 0).is_some());
         assert_eq!(mailboxes.writable_slot(r3), None);
+    }
+
+    #[test]
+    fn pixel_slot_completion_misses_are_local_and_recover_on_exact_reuse() {
+        let mut releases = [0; MMLTK_WORKSPACE_MAILBOX_COUNT];
+        releases[0] = 2;
+        let completed = 0;
+        assert!(!MmltkWorkspacePixels::reusable(releases[0], |value| value <= completed));
+        assert!(MmltkWorkspacePixels::reusable(releases[1], |_| false));
+        releases[1] = 4;
+        assert!(MmltkWorkspacePixels::reusable(releases[0], |value| value <= 2));
+        assert!(!MmltkWorkspacePixels::reusable(releases[1], |value| value <= 2));
+        // A probe-skipped product submission still advances this command
+        // slot's completion requirement. Reuse never tests an older receipt.
+        releases[0] = 6;
+        assert!(!MmltkWorkspacePixels::reusable(releases[0], |value| value <= 4));
+        assert!(MmltkWorkspacePixels::reusable(releases[0], |value| value <= 6));
+        assert_eq!(releases.len(), MMLTK_WORKSPACE_MAILBOX_COUNT);
+        let mut mailboxes = MmltkWorkspaceMailboxes::default();
+        mailboxes.drain(|_, _| {});
+        // Page drain does not erase in-flight command ownership.
+        assert_eq!(releases[0], 6);
     }
 
     #[test]
@@ -3298,6 +3406,97 @@ mod mmltk_workspace_transition_tests {
     }
 }
 
+// Fixed receiver-owned evidence for the imported source and completed mailbox.
+// Commands and coherent mappings are reused for the lifetime of the import.
+struct MmltkWorkspacePixels {
+    device: ash::Device,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: usize,
+    submitted_release: [u64; MMLTK_WORKSPACE_MAILBOX_COUNT],
+}
+
+impl MmltkWorkspacePixels {
+    const SAMPLES: usize = 25;
+    const SLOT_BYTES: usize = Self::SAMPLES * 4 * 2;
+
+    fn new(hal: &wgh::vulkan::Device) -> Option<Self> {
+        if !mmltk_workspace_channel::workspace_pixel_probes_enabled() { return None; }
+        let device = hal.raw_device();
+        let mut probe = Self {
+            device: device.clone(), buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(),
+            mapped: 0, submitted_release: [0; MMLTK_WORKSPACE_MAILBOX_COUNT],
+        };
+        probe.buffer = unsafe { device.create_buffer(&vk::BufferCreateInfo::default()
+            .size((Self::SLOT_BYTES * MMLTK_WORKSPACE_MAILBOX_COUNT) as u64)
+            .usage(vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }.ok()?;
+        let requirements = unsafe { device.get_buffer_memory_requirements(probe.buffer) };
+        let properties = unsafe { hal.shared_instance().raw_instance()
+            .get_physical_device_memory_properties(hal.raw_physical_device()) };
+        let memory_type = select_memory_type(&properties,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            Some(requirements.memory_type_bits))?;
+        probe.memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size).memory_type_index(memory_type), None) }.ok()?;
+        unsafe { device.bind_buffer_memory(probe.buffer, probe.memory, 0) }.ok()?;
+        probe.mapped = unsafe { device.map_memory(probe.memory, 0, requirements.size,
+            vk::MemoryMapFlags::empty()) }.ok()? as usize;
+        Some(probe)
+    }
+
+    fn coordinate(index: usize, size: u32) -> u32 {
+        [0, 191.min(size - 1), 383.min(size - 1), (size - 1) / 2, size - 1][index]
+    }
+
+    fn reusable(release: u64, complete: impl FnOnce(u64) -> bool) -> bool {
+        release == 0 || complete(release)
+    }
+
+    fn record(&self, commands: vk::CommandBuffer, image: vk::Image,
+              layout: vk::ImageLayout, layer: u32, slot: usize, boundary: usize,
+              coordinates: &[(u32, u32); Self::SAMPLES]) {
+        let regions: [vk::BufferImageCopy; Self::SAMPLES] = std::array::from_fn(|index| {
+            vk::BufferImageCopy::default()
+                .buffer_offset((slot * Self::SLOT_BYTES + (boundary * Self::SAMPLES + index) * 4) as u64)
+                .image_subresource(vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR).base_array_layer(layer).layer_count(1))
+                .image_offset(vk::Offset3D { x: coordinates[index].0 as i32,
+                    y: coordinates[index].1 as i32, z: 0 })
+                .image_extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+        });
+        unsafe { self.device.cmd_copy_image_to_buffer(commands, image, layout, self.buffer, &regions) };
+    }
+
+    fn report(&self, surface: mmltk_workspace_channel::SurfaceId,
+              identity: MmltkWorkspaceFrameIdentity, slot: u32, receipt: MmltkWorkspacePixelReceipt) {
+        // Caller established completion and still owns this exact mailbox.
+        let samples = unsafe { std::slice::from_raw_parts(
+            (self.mapped + receipt.copy_index * Self::SLOT_BYTES) as *const u32, Self::SAMPLES * 2) };
+        for (index, rgba) in samples.iter().enumerate() {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.workspace.pixel\",\"boundary\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"sample_index\":{},\"sample_x\":{},\"sample_y\":{},\"sample_rgba\":{}}}",
+                if index < Self::SAMPLES { "import" } else { "mailbox" }, surface,
+                identity.layer, slot, identity.session, identity.sequence, identity.presentation_revision,
+                receipt.snapshot.content_width, receipt.snapshot.content_height,
+                receipt.snapshot.transfer_sequence, receipt.snapshot.timeline_ready, receipt.release, index % Self::SAMPLES,
+                receipt.coordinates[index % Self::SAMPLES].0,
+                receipt.coordinates[index % Self::SAMPLES].1, rgba,
+            ));
+        }
+    }
+}
+
+impl Drop for MmltkWorkspacePixels {
+    fn drop(&mut self) {
+        unsafe {
+            if self.mapped != 0 { self.device.unmap_memory(self.memory); }
+            self.device.destroy_buffer(self.buffer, None);
+            self.device.free_memory(self.memory, None);
+        }
+    }
+}
+
 struct MmltkWorkspaceBlit {
     device: ash::Device,
     queue: vk::Queue,
@@ -3315,6 +3514,9 @@ struct MmltkWorkspaceBlit {
     submission: Option<Arc<wgh::vulkan::ExternalTimelineQueueSubmission>>,
     source: vk::Image,
     source_memory: vk::DeviceMemory,
+    pixels: Option<MmltkWorkspacePixels>,
+    destination: vk::Image,
+    extent: vk::Extent3D,
 }
 
 impl MmltkWorkspaceBlit {
@@ -3324,8 +3526,9 @@ impl MmltkWorkspaceBlit {
             .expect("workspace timeline registration must outlive its blit")
     }
 
-    /// Records the copy once. The same command buffer is submitted on every
-    /// edge, so nothing is recorded or allocated per frame.
+    /// Records the reusable copy. With probes disabled this is done once.
+    /// Opt-in probes re-record only an exact completed physical mailbox slot
+    /// to address its current logical content, without allocating GPU storage.
     ///
     /// The destination returns from WebGPU in `SHADER_READ_ONLY_OPTIMAL`, is
     /// overwritten completely, then returns to the same layout tracked by
@@ -3335,6 +3538,7 @@ impl MmltkWorkspaceBlit {
         destination: vk::Image,
         extent: vk::Extent3D,
         slot: usize,
+        coordinates: Option<&[(u32, u32); 25]>,
     ) -> Result<(), vk::Result> {
         let source_subresource = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3389,6 +3593,33 @@ impl MmltkWorkspaceBlit {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &region,
             );
+            if let (Some(probe), Some(coordinates)) = (&self.pixels, coordinates) {
+                probe.record(commands, self.source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, 0, slot, 0, coordinates);
+                let readable = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(destination).subresource_range(destination_subresource);
+                self.device.cmd_pipeline_barrier(commands, vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[readable]);
+                probe.record(commands, destination, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, slot as u32, slot, 1, coordinates);
+                let writable = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(destination).subresource_range(destination_subresource);
+                self.device.cmd_pipeline_barrier(commands, vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::HOST_READ)], &[], &[writable]);
+            }
             self.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::TRANSFER,
@@ -3560,6 +3791,7 @@ impl Drop for MmltkWorkspaceBlit {
             self.device.destroy_image(self.source, None);
             self.device.free_memory(self.source_memory, None);
         }
+        drop(self.pixels.take());
     }
 }
 
@@ -3809,7 +4041,10 @@ impl Global {
             .array_layers(MMLTK_WORKSPACE_MAILBOX_COUNT as u32)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED
+                | if mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+                    vk::ImageUsageFlags::TRANSFER_SRC
+                } else { vk::ImageUsageFlags::empty() })
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&image_info, None) }.ok()?;
@@ -3923,6 +4158,7 @@ impl Global {
                 .into_boxed_slice();
             let submission_copy_commands = copy_commands.clone();
             let release_commands = allocated[MMLTK_WORKSPACE_MAILBOX_COUNT];
+            let pixels = MmltkWorkspacePixels::new(hal_device);
             Some(MmltkWorkspaceBlit {
                 device: device.clone(),
                 queue: hal_device.raw_queue(),
@@ -3939,6 +4175,9 @@ impl Global {
                 )),
                 source,
                 source_memory,
+                pixels,
+                destination,
+                extent,
             })
         })();
         let Some(blit) = blit else {
@@ -3956,7 +4195,7 @@ impl Global {
                 .copy_commands
                 .iter()
                 .enumerate()
-                .any(|(slot, _)| blit.record_copy(destination, extent, slot).is_err())
+                .any(|(slot, _)| blit.record_copy(destination, extent, slot, None).is_err())
             || blit.record_release_only().is_err()
         {
             return None;

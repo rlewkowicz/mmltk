@@ -78,6 +78,7 @@ class SystemImageRuntime final {
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
     void SelectOutput(const CompletedOutput&);
+    // Wake-only; never execute CUDA/product work from this notification.
     void SetOutputAvailableSink(std::function<void()>);
     [[nodiscard]] BorrowedImageProductReadView BorrowInput() const;
     void PublishInput(std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);

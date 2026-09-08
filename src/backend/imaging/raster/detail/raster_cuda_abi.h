@@ -35,6 +35,12 @@ struct ScaleRgbaLaunch {
     MutableSurfaceU8 target;
     cudaStream_t stream = nullptr;
 };
+struct ProbeRgbaLaunch {
+    ConstSurfaceU8 source;
+    std::uint32_t* samples = nullptr;
+    std::uint32_t coordinates[50]{};
+    cudaStream_t stream = nullptr;
+};
 
 struct PackedImageU8 {
     std::uint8_t* pixels = nullptr;
@@ -246,6 +252,7 @@ struct SkeletonRgbaPitchedLaunch {
 
 MMLTK_RASTER_CUDA_LAUNCHER(launch_build_instance_colors_from_zero_based_labels, InstanceColorBuildLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_scale_rgba, ScaleRgbaLaunch)
+MMLTK_RASTER_CUDA_LAUNCHER(launch_probe_rgba, ProbeRgbaLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_draw_masks_boxes, MaskBoxLabelRgbLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_draw_boxes_labels_bgr_pitched, BoxLabelBgrPitchedLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_draw_masks_boxes_labels_bgr_pitched, MaskBoxLabelBgrPitchedLaunch)

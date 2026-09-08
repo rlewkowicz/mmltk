@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <future>
 #include <memory>
+#include <optional>
 #include <limits>
 #include <cstring>
 #include <string_view>
@@ -1133,6 +1134,53 @@ TEST_CASE("terminal product custody retains pixels without blocking source shutd
     borrowed = {};
     CHECK(backend->planes_freed == 1U);
     CHECK(backend->contexts_destroyed == 1U);
+}
+
+TEST_CASE("receiver completion releases product access across threads but retains physical storage") {
+    using namespace std::chrono_literals;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto source = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 1U});
+    source->Publish(8U, 8U, [](auto, auto, auto) {});
+    std::atomic<unsigned> available{0U};
+    source->SetOutputAvailableSink([&] { available.fetch_add(1U); });
+    std::optional<ImageProductReadCompletion> completion;
+    completion.emplace(source->Borrow());
+    CHECK(completion->pending());
+    const auto before = available.load();
+    auto writer = std::async(std::launch::async, [&] { source->Publish(8U, 8U, [](auto, auto, auto) {}); });
+    CHECK(writer.wait_for(10ms) == std::future_status::timeout);
+    auto callback = std::async(std::launch::async, [&] { completion->Complete(); });
+    callback.get();
+    CHECK_FALSE(completion->pending());
+    CHECK(available.load() > before);
+    // A one-slot producer can reuse its planes before diagnostic ownership of
+    // the old physical handles is destroyed, without waiting for another sync.
+    REQUIRE(writer.wait_for(1s) == std::future_status::ready);
+    writer.get();
+    CHECK(backend->planes_allocated == 2U);
+    completion->Complete();
+    source.reset();
+    CHECK(backend->planes_freed == 0U);
+    completion.reset();
+    CHECK(backend->planes_freed == 2U);
+    CHECK(backend->contexts_destroyed == 1U);
+}
+
+TEST_CASE("unproved completion quarantines access without releasing physical custody") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto source = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
+    source->Publish(8U, 8U, [](auto, auto, auto) {});
+    std::optional<ImageProductReadCompletion> completion;
+    completion.emplace(source->Borrow());
+    completion->Quarantine();
+    CHECK_FALSE(completion->pending());
+    CHECK_FALSE(source->Borrow().valid());
+    CHECK_THROWS_WITH(source->Publish(8U, 8U, [](auto, auto, auto) {}), "image product storage is quarantined");
+    source.reset();
+    CHECK(backend->planes_freed == 0U);
+    completion.reset();
+    CHECK(backend->planes_freed == 1U);
 }
 
 TEST_CASE("unprovable receiver copies quarantine source storage and preserve ordinary runtime retirement") {

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) mod gallery;
 pub(crate) mod labels;
+pub(crate) mod pixel_trace;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
@@ -53,7 +54,7 @@ fn frame_trace_fields(frame: Option<FrameReady>) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn surface_trace_fields(surface: Surface, requested: Surface) -> String {
+pub(crate) fn surface_trace_fields(surface: Surface, requested: Surface) -> String {
     format!(
         "\"surface\":\"{:016x}{:016x}\",\"requested_surface\":\"{:016x}{:016x}\",\"generation\":{},\"width\":{},\"height\":{},\"allocation_generation\":{},\"timeline_ready\":{}{}",
         surface.high, surface.low, requested.high, requested.low,
@@ -1234,6 +1235,7 @@ struct Imported {
     geometry_key: GeometryKey,
     drawn_revision: AtomicU64,
     draw_count: AtomicU64,
+    pixel_trace: Option<pixel_trace::PixelTrace>,
 }
 
 // CPU facts travel with their receiver-owned pixels, including across an
@@ -1681,7 +1683,8 @@ impl SurfaceRenderer {
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | if pixel_trace::enabled() { wgpu::TextureUsages::COPY_SRC } else { wgpu::TextureUsages::empty() },
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1704,6 +1707,7 @@ impl SurfaceRenderer {
             geometry_key,
             drawn_revision: AtomicU64::new(0),
             draw_count: AtomicU64::new(0),
+            pixel_trace: pixel_trace::PixelTrace::new(device, queue),
         };
         imported.capture(device, queue, &self.capture, &self.layout, &self.sampler);
         self.discard_pending();
@@ -1800,6 +1804,9 @@ impl SurfaceRenderer {
             control_id,
         );
         trace_draw("draw_encoded", control_id, draw, image, clip);
+        if draw.surface.integration {
+            crate::integration_control::sample_boundary_pixels(draw.surface, control_id, image, clip);
+        }
         if draw.surface.integration {
             if draw.gallery.is_some() {
                 crate::integration_control::report_atlas_draw(
@@ -2163,6 +2170,9 @@ impl Imported {
             notify_surface(Notification::Completed(frame));
             trace_surface("owned_capture_notified", captured_surface);
         });
+        if let Some(probe) = &self.pixel_trace {
+            probe.sample(&self.owned[owned_index].texture, captured_surface);
+        }
         self.image.pending_capture = Some(PendingImage {
             surface: self.image.surface,
             gallery: self.image.gallery.clone(),

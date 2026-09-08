@@ -93,6 +93,7 @@ class ImageProductPool final {
     [[nodiscard]] Facts SelectedFacts() const;
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
+    // Wake-only; receiver completion may notify from a GPU host callback.
     void SetAvailabilitySink(std::function<void()>);
     [[nodiscard]] std::size_t size() const noexcept;
 

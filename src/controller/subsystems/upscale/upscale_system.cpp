@@ -694,6 +694,13 @@ class UpscaleSystem::Impl final {
     void Stop() noexcept {
         {
             std::scoped_lock lock(mutex_);
+            diagnostics_.Emit([&] { return VisualDiagnosticFact{
+                .system = contracts::DiagnosticOwner::Upscale,
+                .operation = VisualDiagnosticOperation::UpscaleStopRequested,
+                .device = settings_.device,
+                .generation = demand_,
+                .context = {.observation_revision = state_.revision,
+                            .source = visual_diagnostic_source({.frame = state_.input})}}; });
             ++demand_;
             state_.busy = false;
             state_.ready = false;

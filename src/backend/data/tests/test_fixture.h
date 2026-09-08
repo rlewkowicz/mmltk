@@ -13,6 +13,7 @@ struct FixtureSpec {
     int num_images = 20;
     int first_class_id = 1;
     int background_images = 10;
+    bool pixel_evidence = false;
 };
 
 std::string dataset_dir(const FixtureSpec& spec);

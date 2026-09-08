@@ -589,11 +589,19 @@ struct ImageProductBuffer::State final {
         context_.state_->backend->DestroyEvent(context_.state_->context, completion_);
     }
     [[nodiscard]] std::uint64_t BeginWrite() {
+        AwaitReceiverReads();
         if (unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
         if (generation_sequence_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("image product generation exhausted");
         generation_ = 0U;
         return generation_sequence_ + 1U;
+    }
+    void AwaitReceiverReads() const noexcept {
+        auto readers = receiver_reads_.load(std::memory_order_acquire);
+        while (readers != 0U) {
+            receiver_reads_.wait(readers, std::memory_order_acquire);
+            readers = receiver_reads_.load(std::memory_order_acquire);
+        }
     }
     [[nodiscard]] std::array<std::unique_lock<std::shared_mutex>, 2U> LockPlanes() {
         std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
@@ -610,6 +618,7 @@ struct ImageProductBuffer::State final {
     std::size_t plane_count_;
     std::uintptr_t completion_ = 0U;
     mutable std::shared_mutex transaction_;
+    std::atomic<std::uint32_t> receiver_reads_{0U};
     std::uint64_t generation_ = 0U;
     std::uint64_t generation_sequence_ = 0U;
     std::optional<BorrowedImageProductReadView> unsettled_source_;
@@ -620,6 +629,7 @@ struct BorrowedImageProductReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageProductBuffer::State> owner)
         : product(std::move(owner)), lock(product->transaction_), generation(product->generation_) {}
     ~Lease() {
+        if (completion_access) return;
         const auto availability = product->availability_sink_;
         if (lock.owns_lock()) lock.unlock();
         product.reset();
@@ -632,6 +642,7 @@ struct BorrowedImageProductReadView::Lease final {
     std::shared_ptr<ImageProductBuffer::State> product;
     std::shared_lock<std::shared_mutex> lock;
     std::uint64_t generation = 0U;
+    bool completion_access = false;
 };
 
 void ImageStream::Await(const BorrowedImageProductReadView& source) {
@@ -649,7 +660,7 @@ BorrowedImageProductReadView::BorrowedImageProductReadView(std::shared_ptr<Lease
 BorrowedImageProductReadView::BorrowedImageProductReadView(BorrowedImageProductReadView&&) noexcept = default;
 BorrowedImageProductReadView& BorrowedImageProductReadView::operator=(BorrowedImageProductReadView&&) noexcept = default;
 bool BorrowedImageProductReadView::valid() const noexcept {
-    if (!lease_ || lease_->generation == 0U || count_ == 0U) return false;
+    if (!lease_ || lease_->completion_access || lease_->generation == 0U || count_ == 0U) return false;
     for (std::size_t index = 0U; index != count_; ++index)
         if (!planes_[index].valid()) return false;
     return true;
@@ -669,9 +680,52 @@ void BorrowedImageProductReadView::Quarantine() noexcept {
         planes_[index].Quarantine();
 }
 
+ImageProductReadCompletion::ImageProductReadCompletion(BorrowedImageProductReadView&& source)
+    : source_(std::move(source)) {
+    if (!source_.valid()) throw std::invalid_argument("receiver completion requires an intact product borrow");
+    auto& lease = *source_.lease_;
+    available_ = lease.product->availability_sink_;
+    lease.product->receiver_reads_.fetch_add(1U, std::memory_order_acq_rel);
+    lease.completion_access = true;
+    pending_.store(true, std::memory_order_release);
+    // These shared_mutex locks belong to this thread. The callback releases
+    // only the counted access established before unlocking them.
+    for (std::size_t index = 0U; index != source_.count_; ++index)
+        source_.planes_[index].lease_->lock.unlock();
+    lease.lock.unlock();
+}
+ImageProductReadCompletion::~ImageProductReadCompletion() {
+    if (pending()) std::terminate();
+}
+bool ImageProductReadCompletion::pending() const noexcept {
+    return pending_.load(std::memory_order_acquire);
+}
+void ImageProductReadCompletion::Complete() noexcept {
+    if (!pending_.exchange(false, std::memory_order_acq_rel)) return;
+    ReleaseAccess();
+}
+void ImageProductReadCompletion::ReleaseAccess() noexcept {
+    auto& lease = *source_.lease_;
+    lease.product->receiver_reads_.fetch_sub(1U, std::memory_order_release);
+    lease.product->receiver_reads_.notify_all();
+    // Registered availability sinks are wake-only notifications. Keep their
+    // retained function and every physical GPU owner alive on the caller.
+    if (available_) {
+        try { (*available_)(); } catch (...) {}
+    }
+}
+void ImageProductReadCompletion::Quarantine() noexcept {
+    if (!pending_.exchange(false, std::memory_order_acq_rel)) return;
+    source_.Quarantine();
+    ReleaseAccess();
+}
+
 ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout)
     : state_(std::make_shared<State>(std::move(context), layout)) {}
-ImageProductBuffer::~ImageProductBuffer() { std::unique_lock transaction(state_->transaction_); }
+ImageProductBuffer::~ImageProductBuffer() {
+    std::unique_lock transaction(state_->transaction_);
+    state_->AwaitReceiverReads();
+}
 void ImageProductBuffer::Publish(ImageStream& stream, const std::uint32_t width, const std::uint32_t height, ProductSubmit submit) {
     std::uint64_t next_generation = 0U;
     {
@@ -844,6 +898,7 @@ bool ImageProductBuffer::writable() const {
     if (terminal()) throw std::runtime_error("image product storage is quarantined");
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock()) return false;
+    if (state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
     if (state_->unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
     std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {

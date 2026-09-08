@@ -35,6 +35,14 @@ pub(super) fn workspace_diagnostics_enabled() -> bool {
     diagnostics_enabled_for(value.as_deref())
 }
 
+pub(super) fn workspace_pixel_probes_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        workspace_diagnostics_enabled()
+            && std::env::var_os("MMLTK_GUI_PIXEL_TRACE").is_some_and(|value| value == "1")
+    })
+}
+
 pub(super) fn write_diagnostic(arguments: fmt::Arguments<'_>) {
     if !workspace_diagnostics_enabled() {
         return;

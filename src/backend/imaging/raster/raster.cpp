@@ -12,6 +12,22 @@ module;
 module mmltk.backend.imaging.raster;
 
 namespace mmltk::backend::imaging::raster {
+std::int32_t probe_rgba(const ConstBytes source, std::uint32_t* samples,
+                       const std::span<const std::uint32_t, 50> coordinates, const std::uintptr_t stream) noexcept {
+    if (!source.valid(4U) || samples == nullptr) return cudaErrorInvalidValue;
+    detail::draw_launch::ProbeRgbaLaunch launch{
+        .source = {source.pixels, source.pitch_bytes, source.width, source.height},
+        .samples = samples,
+        .stream = reinterpret_cast<cudaStream_t>(stream),
+    };
+    for (std::size_t index = 0U; index < coordinates.size(); ++index) {
+        if (coordinates[index] >= static_cast<std::uint32_t>(index % 2U == 0U ? source.width : source.height))
+            return cudaErrorInvalidValue;
+        launch.coordinates[index] = coordinates[index];
+    }
+    return detail::launch_probe_rgba(launch);
+}
+
 namespace {
 namespace launch = detail::draw_launch;
 

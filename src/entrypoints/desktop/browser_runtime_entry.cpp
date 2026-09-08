@@ -177,6 +177,11 @@ int main(int argc, char** argv) {
             arguments.emplace_back(argv[index]);
         auto runtime = parse_browser_runtime_options(arguments);
         mmltk::controller::shell::ApplicationShellConfig config;
+        const char* const pixel_trace = std::getenv("MMLTK_GUI_PIXEL_TRACE");
+        const char* const lifecycle_trace = std::getenv("MMLTK_GUI_TRACE_FILE");
+        const bool pixel_probes = pixel_trace != nullptr && std::string_view{pixel_trace} == "1"
+            && lifecycle_trace != nullptr && *lifecycle_trace != '\0';
+        config.pixel_probes = pixel_probes;
         config.presentation = std::move(runtime.presentation);
         config.h2d_dataloader = runtime.h2d_dataloader;
         std::string integration_file_dialog_root;
@@ -206,6 +211,9 @@ int main(int argc, char** argv) {
             std::string page_query;
             if (integration != nullptr && std::string_view{integration} == "1") {
                 page_query = "mmltk_integration=1";
+                if (const char* fixture = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE");
+                    fixture != nullptr && std::string_view{fixture} == "1")
+                    page_query += "&mmltk_integration_pixel_fixture=1";
                 if (const char* scenario = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO"); scenario != nullptr)
                     page_query += "&mmltk_integration_viewer_scenario=" + query_value(scenario);
                 const char* const window_close = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_WINDOW_CLOSE");
@@ -222,6 +230,10 @@ int main(int argc, char** argv) {
             if (const char* trace = std::getenv("MMLTK_GUI_TRACE_FILE"); trace != nullptr && *trace != '\0') {
                 if (!page_query.empty()) page_query += '&';
                 page_query += "mmltk_surface_trace=1";
+            }
+            if (pixel_probes) {
+                if (!page_query.empty()) page_query += '&';
+                page_query += "mmltk_pixel_trace=1";
             }
             if (!shell.start_browser_host({.asset_root = assets, .session_token = session_token(), .page_query = std::move(page_query)})) {
                 return fail_closed(shell, "browser host start failed");
