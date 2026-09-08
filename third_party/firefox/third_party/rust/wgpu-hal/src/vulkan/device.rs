@@ -760,13 +760,13 @@ fn import_dmabuf_memory(
 
     pub fn register_external_timeline_submission(
         &self,
-        copy_command_buffers: Box<[vk::CommandBuffer]>,
+        copy_slot_count: usize,
         release_command_buffer: vk::CommandBuffer,
         timeline: vk::Semaphore,
     ) -> Arc<super::ExternalTimelineQueueSubmission> {
         Arc::new(super::ExternalTimelineQueueSubmission {
             device: Arc::clone(&self.shared),
-            copy_command_buffers,
+            copy_slot_count,
             release_command_buffer,
             timeline,
             submitted_release: core::sync::atomic::AtomicU64::new(0),

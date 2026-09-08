@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cctype>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -173,7 +174,8 @@ class BrowserHostProcess final {
                        const std::filesystem::path& runtime_log, const std::filesystem::path& firefox_log,
                        const std::filesystem::path& working_directory, const TerminationMode termination,
                        const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::string& viewer_scenario,
-                       const bool logging = true, const bool high_dpi = false, const bool h2d = true, const bool pixel_probes = false) {
+                       const bool logging = true, const bool high_dpi = false, const bool h2d = true, const bool pixel_probes = false,
+                       const std::string& probe_failure = {}) {
         const std::string executable_text = executable.string();
         const std::string diagnostics_text = diagnostics.string();
         const std::string runtime_log_text = runtime_log.string();
@@ -212,6 +214,7 @@ class BrowserHostProcess final {
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence ? "1" : "0", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", viewer_scenario == "rapid" && logging ? "1" : "0", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 &&
@@ -714,6 +717,45 @@ struct PixelBoundaryAudit final {
         bool viewer = false;
     };
     std::map<Key, Publication> samples;
+    std::vector<nlohmann::json> probe_failures;
+
+    [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
+        if (expected.empty()) return probe_failures.empty();
+        if (!failure.empty() || probe_failures.size() != 1U) return false;
+        const auto& failed = probe_failures.front();
+        std::string boundary{expected};
+        boundary.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(boundary.front())));
+        if (failed.value("boundary", "") != boundary) return false;
+        const auto surface = failed.value("surface", "");
+        const bool allocation = expected == "allocation";
+        bool forwarded = false, recovered = false;
+        for (const auto& [key, publication] : samples) {
+            if (key.first != surface) continue;
+            const auto& receipt = publication.receivers[0].identity;
+            for (const auto receiver : {0U, 1U}) {
+                const auto& evidence = publication.receivers[receiver].identity;
+                if (!evidence.empty() && (allocation ||
+                    scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence"))) return false;
+            }
+            const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
+                scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
+            if (!publication.forwarded.empty() && (allocation || same_attempt)) {
+                if (publication.forwarded.value("pixel_probe", true)) return false;
+                if (!allocation) {
+                    for (const auto* field : {"layer", "slot", "content_session", "content_sequence"})
+                        if (scalar(publication.forwarded, field) != scalar(failed, field)) return false;
+                }
+                forwarded = true;
+            }
+            if (!allocation && !receipt.empty() &&
+                scalar(receipt, "layer") == scalar(failed, "layer") &&
+                scalar(receipt, "slot") == scalar(failed, "slot") &&
+                scalar(receipt, "transfer_sequence") > scalar(failed, "transfer_sequence") &&
+                std::ranges::all_of(publication.counted, [](bool value) { return value; }))
+                recovered = true;
+        }
+        return forwarded && (allocation || recovered) && raw_complete() && viewer_nonblack_complete();
+    }
     std::array<std::size_t, 3> joined{};
     struct Composition final {
         nlohmann::json identity;
@@ -959,6 +1001,11 @@ struct PixelBoundaryAudit final {
     void consume(const nlohmann::json& record) {
         const std::string event = record.value("event", "");
         consume_continuity(record, event);
+        if (event == "firefox.workspace.probe_failed") {
+            if (!enabled || probe_failures.size() >= 16U) reject("unexpected or excessive probe preparation failures");
+            else probe_failures.push_back(record);
+            return;
+        }
         if (event == "upscale.stop.requested") {
             if (stop_observations.size() < kAcceptanceRecordLimit)
                 stop_observations.push_back(scalar(record, "observation_revision"));
@@ -1069,7 +1116,8 @@ struct PixelBoundaryAudit final {
         }
         auto& publication = samples[key];
         if (event == "firefox.workspace.frame_forwarded") {
-            const auto identity = identity_of(record, 1U);
+            auto identity = identity_of(record, 1U);
+            identity["pixel_probe"] = record.value("pixel_probe", false);
             if (!publication.forwarded.empty() && publication.forwarded != identity)
                 reject("forwarded physical mailbox changed within a publication");
             else publication.forwarded = identity;
@@ -1212,6 +1260,40 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     colored_viewer.consume(canvas);
     colored_viewer.consume(selected);
     CHECK(colored_viewer.viewer_nonblack_complete());
+    for (const auto* boundary : {"Allocation", "Reset", "Begin", "End"}) {
+        const bool allocation = std::string_view{boundary} == "Allocation";
+        std::string target{boundary};
+        target.front() = static_cast<char>(std::tolower(static_cast<unsigned char>(target.front())));
+        auto audit = colored_viewer;
+        auto failed = pixel("firefox.workspace.probe_failed", boundary);
+        failed["presentation_revision"] = 6U;
+        failed["transfer_sequence"] = 3U;
+        if (allocation) failed["surface"] = "allocation-failed-surface";
+        audit.consume(failed);
+        CHECK_FALSE(audit.probe_failure_complete(target));
+        auto ordinary = failed;
+        ordinary["event"] = "firefox.workspace.frame_forwarded";
+        ordinary["pixel_probe"] = false;
+        audit.consume(ordinary);
+        CHECK(audit.probe_failure_complete(target));
+        auto wrong_slot = audit;
+        wrong_slot.probe_failures.front()["slot"] = 0U;
+        if (!allocation) CHECK_FALSE(wrong_slot.probe_failure_complete(target));
+        auto stale_receipt = audit;
+        auto successful = failed;
+        successful["event"] = "firefox.workspace.pixel";
+        successful["boundary"] = "mailbox";
+        successful["sample_index"] = 0U;
+        successful["sample_x"] = 0U;
+        successful["sample_y"] = 0U;
+        stale_receipt.consume(successful);
+        CHECK_FALSE(stale_receipt.probe_failure_complete(target));
+        if (!allocation) {
+            auto no_recovery = audit;
+            no_recovery.samples.at({surface, 7U}).counted.fill(false);
+            CHECK_FALSE(no_recovery.probe_failure_complete(target));
+        }
+    }
     for (const auto missing_owner : {"import", "mailbox", "iced.surface.pixel"}) {
         PixelBoundaryAudit audit;
         fill(audit, owned, false, false, {}, 8U);
@@ -3411,13 +3493,14 @@ class ArtifactNotifications final {
 }
 
 void run_workspace_wayland_product(const TerminationMode termination, const std::string& viewer_scenario = {}, const bool logging = true,
-                                   const bool pixel_fixture = false) {
+                                   const bool pixel_fixture = false, const std::string& probe_failure = {}) {
     if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
     const auto permitted_cpus = permitted_cpu_count();
     if (permitted_cpus < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
     const bool h2d = GENERATE(true, false);
     const char* pixel_environment = std::getenv("MMLTK_GUI_PIXEL_TRACE");
-    const bool pixel_probes = pixel_fixture || (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
+    const bool pixel_probes = pixel_fixture || !probe_failure.empty() ||
+        (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
     INFO("selected H2D dataset transport: " << h2d);
     if (!h2d && !gdr_transport_available()) SKIP("GDR hardware unavailable; packaged Wayland GDR behavior remains unverified");
 
@@ -3450,7 +3533,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         .height = 384,
         .num_images = viewer_scenario == "rapid" ? 300 : 128,
         .background_images = viewer_scenario.empty() ? 7 : 10,
-        .pixel_evidence = pixel_fixture,
+        .pixel_evidence = pixel_fixture || !probe_failure.empty(),
     };
     mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
     if (viewer_scenario == "square")
@@ -3493,7 +3576,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                                logging,
                                high_dpi,
                                h2d,
-                               pixel_probes};
+                               pixel_probes,
+                               probe_failure};
     ScopedFd deadline{::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)};
     if (deadline.get() < 0)
         throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
@@ -3590,6 +3674,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         if (!viewer_scenario.empty() && browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
             native.presentation_ready && native.explore_rendered &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
+            pixel_audit.probe_failure_complete(probe_failure) &&
             (viewer_scenario != "square" || !pixel_probes ||
                 (pixel_audit.retained_logical_content && pixel_audit.upscale_growth)))
             break;
@@ -3649,6 +3734,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         }
         if (!terminal_failure_observed && (native.product_ready(final_generations) || expected_window_close) && browser.product_ready() &&
             rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
+            pixel_audit.probe_failure_complete(probe_failure) &&
             (!pixel_fixture || pixel_audit.composition_complete()))
             break;
         if (viewer_scenario.empty() && !terminal_failure_observed && browser.terminal_evidence_settled() && !browser.product_ready()) {
@@ -3755,6 +3841,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     CHECK(surface_audit.joined_failure().empty());
     INFO("pixel boundary evidence: " << pixel_audit.failure);
     CHECK(pixel_audit.failure.empty());
+    CHECK(pixel_audit.probe_failure_complete(probe_failure));
     if (pixel_probes) {
         CHECK(pixel_audit.raw_complete());
         for (const auto joined : pixel_audit.joined)
@@ -3982,6 +4069,11 @@ void workspace_wayland_viewer_semantics() { run_workspace_wayland_product(Termin
 void workspace_wayland_viewer_copy() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "copy"); }
 void workspace_wayland_viewer_rapid() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "rapid"); }
 void workspace_wayland_atlas_overlay() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, {}, true, true); }
+void workspace_wayland_pixel_probe_failure() {
+    const std::string boundary = GENERATE("allocation", "reset", "begin", "end");
+    const auto termination = GENERATE(TerminationMode::SignalInterrupt, TerminationMode::AbruptPeerLoss);
+    run_workspace_wayland_product(termination, {}, true, false, boundary);
+}
 
 void add_rendered_probe_audit_fixture(NativeAudit& audit, const NativeAudit::PaddingOrientation orientation, const std::uint64_t generation,
                                       const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t frame_revision) {
@@ -4071,6 +4163,7 @@ MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][vi
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_copy]", workspace_wayland_viewer_copy);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_rapid]", workspace_wayland_viewer_rapid);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][atlas_overlay]", workspace_wayland_atlas_overlay);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][pixel_probe_failure]", workspace_wayland_pixel_probe_failure);
 MMLTK_REGISTER_TEST_CASE("[workspace_wayland_integration][rendered_probe_audit]", rendered_probe_audit_rejects_mismatched_identity);
 
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][sigint_without_logging]",

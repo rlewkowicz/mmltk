@@ -561,13 +561,13 @@ impl Drop for DeviceShared {
     }
 }
 
-/// A generic pair of raw command buffers synchronized by one external timeline
-/// semaphore. Odd values are ready work supplied by another API. The event
-/// owner chooses the visible command only for an authorized frame; every other
-/// edge uses the release-only command and leaves the destination unchanged.
+/// Queue and release ownership for one external timeline semaphore. Odd values
+/// are ready work supplied by another API. The event owner supplies one prepared
+/// physical copy for an authorized frame; every other edge uses the registered
+/// release-only command and leaves the destination unchanged.
 pub struct ExternalTimelineQueueSubmission {
     device: Arc<DeviceShared>,
-    copy_command_buffers: Box<[vk::CommandBuffer]>,
+    copy_slot_count: usize,
     release_command_buffer: vk::CommandBuffer,
     timeline: vk::Semaphore,
     submitted_release: AtomicU64,
@@ -577,6 +577,22 @@ pub struct ExternalTimelineQueueSubmission {
     preconsumed_edges: AtomicU64,
     destination_attached: AtomicBool,
     active: AtomicBool,
+}
+
+/// One shell-prepared command and its original physical destination mailbox.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalTimelineCopy {
+    pub slot: usize,
+    pub command: vk::CommandBuffer,
+}
+
+impl ExternalTimelineCopy {
+    fn validate(self, slot_count: usize) -> Result<Self, vk::Result> {
+        if self.slot >= slot_count || self.command == vk::CommandBuffer::null() {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
+        Ok(self)
+    }
 }
 
 /// The exact odd timeline value consumed at the external transfer boundary.
@@ -715,15 +731,16 @@ impl ExternalTimelineQueueSubmission {
 
     /// Consumes producer eventfd edges at the sole external-frame submission
     /// point. `published_ready` comes from the stable sidecar and
-    /// `copy_slot` says the event owner reserved one validated writable
+    /// `copy` carries the prepared command for one validated writable
     /// destination mailbox slot. A rejected edge releases the producer
     /// slot without mutating the visible destination.
     pub fn submit_frame_edges(
         &self,
         edges: u64,
         published_ready: Option<u64>,
-        copy_slot: Option<usize>,
+        copy: Option<ExternalTimelineCopy>,
     ) -> Result<Option<ExternalTimelineSubmittedFrame>, vk::Result> {
+        let copy_slot = copy.map(|copy| copy.slot);
         if edges == 0 {
             return Ok(None);
         }
@@ -744,14 +761,14 @@ impl ExternalTimelineQueueSubmission {
         let credits = self.preconsumed_edges.load(Ordering::Acquire);
         let submitted_release = self.submitted_release.load(Ordering::Acquire);
         let destination_attached = self.destination_attached.load(Ordering::Acquire);
-        if copy_slot.is_some_and(|slot| slot >= self.copy_command_buffers.len()) {
-            log::error!(
-                "external timeline rejected an out-of-range copy slot; step=copy_slot_range, \
-                 copy_slot={copy_slot:?}, command_buffers={}, edges={edges}",
-                self.copy_command_buffers.len()
-            );
-            return Err(vk::Result::ERROR_UNKNOWN);
-        }
+        let copy = copy.map(|copy| copy.validate(self.copy_slot_count)).transpose()
+            .inspect_err(|error| {
+                log::error!(
+                    "external timeline rejected an invalid prepared copy; step=copy_slot_range, \
+                     copy_slot={copy_slot:?}, slot_count={}, edges={edges}, error={error:?}",
+                    self.copy_slot_count
+                );
+            })?;
         let Some(expected_ready) = submitted_release.checked_add(1) else {
             log::error!(
                 "external timeline exhausted its release counter; step=release_overflow, \
@@ -790,8 +807,9 @@ impl ExternalTimelineQueueSubmission {
             return Ok(None);
         };
         let (command_buffer, wait_stage) = if let Some(slot) = copied_slot {
+            let prepared = copy.filter(|copy| copy.slot == slot).ok_or(vk::Result::ERROR_UNKNOWN)?;
             (
-                self.copy_command_buffers[slot],
+                prepared.command,
                 vk::PipelineStageFlags::TRANSFER,
             )
         } else {
@@ -896,8 +914,30 @@ impl ExternalTimelineQueueSubmission {
 
 #[cfg(test)]
 mod external_timeline_submission_tests {
-    use super::{plan_external_timeline_edge, reconcile_external_timeline_edges};
+    use super::{plan_external_timeline_edge, reconcile_external_timeline_edges, ExternalTimelineCopy};
     use ash::vk;
+    use ash::vk::Handle;
+
+    #[test]
+    fn prepared_commands_retain_physical_slots_and_release_only_edges() {
+        // Normal and optional commands have different handles but the same
+        // physical mailbox identity. HAL never treats the handle as a slot.
+        for command in [vk::CommandBuffer::from_raw(11), vk::CommandBuffer::from_raw(29)] {
+            let copy = ExternalTimelineCopy { slot: 3, command }.validate(6).unwrap();
+            assert_eq!(copy.slot, 3);
+            assert_eq!(copy.command, command);
+            assert_eq!(plan_external_timeline_edge(0, 0, 1, Some(1), Some(copy.slot), true, None),
+                Ok((0, Some((1, Some(3))))));
+            assert_eq!(plan_external_timeline_edge(0, 0, 1, Some(1), Some(copy.slot), false, None),
+                Ok((0, Some((1, None)))));
+            assert_eq!(plan_external_timeline_edge(2, 1, 1, Some(1), Some(copy.slot), false, None),
+                Ok((0, None)));
+        }
+        assert!(ExternalTimelineCopy { slot: 6, command: vk::CommandBuffer::from_raw(11) }.validate(6).is_err());
+        assert!(ExternalTimelineCopy { slot: 3, command: vk::CommandBuffer::null() }.validate(6).is_err());
+        assert_eq!(plan_external_timeline_edge(0, 0, 1, Some(1), None, true, None),
+            Ok((0, Some((1, None)))));
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     struct FrameQueue {

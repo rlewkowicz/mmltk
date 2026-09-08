@@ -2262,11 +2262,9 @@ fn submit_mmltk_workspace_transfer(
             let extent = entry.blit.extent;
             if snapshot.content_width == 0 || snapshot.content_height == 0
                 || snapshot.content_width > extent.width || snapshot.content_height > extent.height
-                || !MmltkWorkspacePixels::reusable(
-                    entry.blit.pixels.as_ref().unwrap().submitted_release[slot], |release|
-                    entry.blit.submission().submitted_release_complete(release).unwrap_or(false)) {
-                // Only this physical slot misses evidence. Product commands
-                // remain reusable, but are not reset without exact completion.
+                || !entry.blit.probe_slot_reusable(slot)? {
+                // Only this physical slot misses evidence. Its immutable
+                // product command remains available without resetting probes.
                 None
             } else {
                 let receipt = MmltkWorkspacePixelReceipt {
@@ -2278,19 +2276,35 @@ fn submit_mmltk_workspace_transfer(
                     copy_index: slot,
                     release: 0,
                 };
-                // Only a never-used or receiver-released physical slot is writable.
-                // Its previous receipt established GPU completion before reuse.
-                unsafe { entry.blit.device.reset_command_buffer(
-                    entry.blit.copy_commands[slot], vk::CommandBufferResetFlags::empty()) }?;
-                entry.blit.record_copy(entry.blit.destination, extent, slot, Some(&receipt.coordinates))?;
-                Some(receipt)
+                // The exact last submitted even release established completion;
+                // a diagnostic receipt is never needed for resource reuse.
+                let command = entry.blit.pixels.as_ref().unwrap().commands[slot];
+                let preparation = MmltkWorkspacePixels::check_failure(MmltkWorkspaceProbeFailure::Reset)
+                    .and_then(|()| unsafe { entry.blit.device.reset_command_buffer(
+                        command, vk::CommandBufferResetFlags::empty()) })
+                    .map_err(|error| (MmltkWorkspaceProbeFailure::Reset, error))
+                    .and_then(|()| entry.blit.record_copy(command, entry.blit.destination, extent,
+                        slot, Some(&receipt.coordinates)));
+                match preparation {
+                    Ok(()) => Some(receipt),
+                    Err((boundary, error)) => {
+                        if error == vk::Result::ERROR_DEVICE_LOST { return Err(error); }
+                        MmltkWorkspacePixels::report_failure(entry.surface_id, boundary, Some((identity, slot, snapshot)));
+                        None
+                    }
+                }
             }
         } else { None }
     } else { None };
+    let prepared_copy = copy_slot.map(|slot| wgh::vulkan::ExternalTimelineCopy {
+        slot,
+        command: pixels.as_ref().map(|_| entry.blit.pixels.as_ref().unwrap().commands[slot])
+            .unwrap_or(entry.blit.copy_commands[slot]),
+    });
     let submitted = entry
         .blit
         .submission()
-        .submit_frame_edges(edges, Some(snapshot.timeline_ready), copy_slot)
+        .submit_frame_edges(edges, Some(snapshot.timeline_ready), prepared_copy)
         .inspect_err(|error| {
             log::error!(
                 "mmltk workspace transfer submit failed; step=submit_frame_edges, edges={edges}, \
@@ -2373,7 +2387,7 @@ fn submit_mmltk_workspace_transfer(
     };
     if mmltk_workspace_acceptance_trace_enabled() {
         mmltk_workspace_channel::write_diagnostic(format_args!(
-            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{}}}",
+            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{}}}",
             entry.surface_id,
             identity.layer,
             slot,
@@ -2381,7 +2395,11 @@ fn submit_mmltk_workspace_transfer(
             identity.sequence,
             identity.presentation_revision,
             snapshot.content_width,
-            snapshot.content_height
+            snapshot.content_height,
+            snapshot.transfer_sequence,
+            submitted.ready(),
+            submitted.ready() + 1,
+            pixels.is_some()
         ));
     }
     Ok(())
@@ -3249,6 +3267,35 @@ mod mmltk_workspace_transition_tests {
     }
 
     #[test]
+    fn failed_optional_work_preserves_mailbox_progress_and_later_receipts() {
+        let mut mailboxes = MmltkWorkspaceMailboxes::default();
+        let failed = frame(1, 1, 0, 11, 21);
+        let identity = failed.identity().unwrap();
+        let slot = mailboxes.writable_slot(identity).unwrap();
+        assert!(mailboxes.occupy(MmltkWorkspaceMailboxReceipt { identity, pixels: None }, slot));
+        // An unrelated physical slot remains available before this one releases.
+        let overlapping = frame(2, 3, 0, 11, 22).identity().unwrap();
+        assert_ne!(mailboxes.writable_slot(overlapping), Some(slot));
+        assert!(mailboxes.release(identity, slot).unwrap().pixels.is_none());
+        let recovered = frame(3, 5, 0, 11, 23);
+        let recovered_identity = recovered.identity().unwrap();
+        let receipt = MmltkWorkspacePixelReceipt {
+            snapshot: recovered,
+            coordinates: std::array::from_fn(|index| (
+                MmltkWorkspacePixels::coordinate(index % 5, recovered.content_width),
+                MmltkWorkspacePixels::coordinate(index / 5, recovered.content_height))),
+            copy_index: recovered_identity.copy_index(slot).unwrap(),
+            release: 6,
+        };
+        assert!(mailboxes.occupy(MmltkWorkspaceMailboxReceipt {
+            identity: recovered_identity, pixels: Some(receipt),
+        }, slot));
+        assert!(mailboxes.release(identity, slot).is_none());
+        assert_eq!(mailboxes.release(recovered_identity, slot).unwrap().pixels.unwrap().release, 6);
+        mailboxes.drain(|_, _| panic!("released products must not be drained again"));
+    }
+
+    #[test]
     fn pixel_slot_completion_misses_are_local_and_recover_on_exact_reuse() {
         let mut releases = [0; MMLTK_WORKSPACE_MAILBOX_COUNT];
         releases[0] = 2;
@@ -3408,8 +3455,13 @@ mod mmltk_workspace_transition_tests {
 
 // Fixed receiver-owned evidence for the imported source and completed mailbox.
 // Commands and coherent mappings are reused for the lifetime of the import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MmltkWorkspaceProbeFailure { Allocation, Reset, Begin, End }
+
 struct MmltkWorkspacePixels {
     device: ash::Device,
+    pool: vk::CommandPool,
+    commands: Vec<vk::CommandBuffer>,
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: usize,
@@ -3420,29 +3472,73 @@ impl MmltkWorkspacePixels {
     const SAMPLES: usize = 25;
     const SLOT_BYTES: usize = Self::SAMPLES * 4 * 2;
 
-    fn new(hal: &wgh::vulkan::Device) -> Option<Self> {
-        if !mmltk_workspace_channel::workspace_pixel_probes_enabled() { return None; }
+    fn check_failure(boundary: MmltkWorkspaceProbeFailure) -> Result<(), vk::Result> {
+        static TARGET: OnceLock<Option<MmltkWorkspaceProbeFailure>> = OnceLock::new();
+        static CONSUMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let target = TARGET.get_or_init(|| {
+            if !mmltk_workspace_acceptance_trace_enabled()
+                || !mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+                return None;
+            }
+            match std::env::var("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE").as_deref() {
+                Ok("allocation") => Some(MmltkWorkspaceProbeFailure::Allocation),
+                Ok("reset") => Some(MmltkWorkspaceProbeFailure::Reset),
+                Ok("begin") => Some(MmltkWorkspaceProbeFailure::Begin),
+                Ok("end") => Some(MmltkWorkspaceProbeFailure::End),
+                _ => None,
+            }
+        });
+        if *target == Some(boundary) && !CONSUMED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        }
+        Ok(())
+    }
+
+    fn report_failure(surface: mmltk_workspace_channel::SurfaceId,
+                      boundary: MmltkWorkspaceProbeFailure,
+                      frame: Option<(MmltkWorkspaceFrameIdentity, usize, MmltkWorkspaceFrameSnapshot)>) {
+        if !mmltk_workspace_acceptance_trace_enabled() { return; }
+        if let Some((identity, index, snapshot)) = frame {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\",\"layer\":{},\"slot\":{},\"presentation_revision\":{},\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{}}}",
+                identity.layer, index % MMLTK_WORKSPACE_MAILBOX_SLOTS, identity.presentation_revision,
+                snapshot.transfer_sequence, identity.session, identity.sequence));
+        } else {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\"}}"));
+        }
+    }
+
+    fn new(hal: &wgh::vulkan::Device) -> Result<Self, vk::Result> {
+        Self::check_failure(MmltkWorkspaceProbeFailure::Allocation)?;
         let device = hal.raw_device();
         let mut probe = Self {
             device: device.clone(), buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(),
+            pool: vk::CommandPool::null(), commands: Vec::new(),
             mapped: 0, submitted_release: [0; MMLTK_WORKSPACE_MAILBOX_COUNT],
         };
+        probe.pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(hal.queue_family_index()), None) }?;
+        probe.commands = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+            .command_pool(probe.pool).level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(MMLTK_WORKSPACE_MAILBOX_COUNT as u32)) }?;
         probe.buffer = unsafe { device.create_buffer(&vk::BufferCreateInfo::default()
             .size((Self::SLOT_BYTES * MMLTK_WORKSPACE_MAILBOX_COUNT) as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }.ok()?;
+            .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }?;
         let requirements = unsafe { device.get_buffer_memory_requirements(probe.buffer) };
         let properties = unsafe { hal.shared_instance().raw_instance()
             .get_physical_device_memory_properties(hal.raw_physical_device()) };
         let memory_type = select_memory_type(&properties,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            Some(requirements.memory_type_bits))?;
+            Some(requirements.memory_type_bits)).ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
         probe.memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size).memory_type_index(memory_type), None) }.ok()?;
-        unsafe { device.bind_buffer_memory(probe.buffer, probe.memory, 0) }.ok()?;
+            .allocation_size(requirements.size).memory_type_index(memory_type), None) }?;
+        unsafe { device.bind_buffer_memory(probe.buffer, probe.memory, 0) }?;
         probe.mapped = unsafe { device.map_memory(probe.memory, 0, requirements.size,
-            vk::MemoryMapFlags::empty()) }.ok()? as usize;
-        Some(probe)
+            vk::MemoryMapFlags::empty()) }? as usize;
+        Ok(probe)
     }
 
     fn coordinate(index: usize, size: u32) -> u32 {
@@ -3490,6 +3586,7 @@ impl MmltkWorkspacePixels {
 impl Drop for MmltkWorkspacePixels {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_command_pool(self.pool, None);
             if self.mapped != 0 { self.device.unmap_memory(self.memory); }
             self.device.destroy_buffer(self.buffer, None);
             self.device.free_memory(self.memory, None);
@@ -3520,26 +3617,37 @@ struct MmltkWorkspaceBlit {
 }
 
 impl MmltkWorkspaceBlit {
+    fn probe_slot_reusable(&self, slot: usize) -> Result<bool, vk::Result> {
+        let release = self.pixels.as_ref().unwrap().submitted_release[slot];
+        let mut observed = Ok(false);
+        let reusable = MmltkWorkspacePixels::reusable(release, |release| {
+            observed = self.submission().submitted_release_complete(release);
+            observed.unwrap_or(false)
+        });
+        if observed == Err(vk::Result::ERROR_DEVICE_LOST) { return Err(vk::Result::ERROR_DEVICE_LOST); }
+        Ok(reusable)
+    }
+
     fn submission(&self) -> &wgh::vulkan::ExternalTimelineQueueSubmission {
         self.submission
             .as_deref()
             .expect("workspace timeline registration must outlive its blit")
     }
 
-    /// Records the reusable copy. With probes disabled this is done once.
-    /// Opt-in probes re-record only an exact completed physical mailbox slot
-    /// to address its current logical content, without allocating GPU storage.
+    /// Records the immutable normal command or a separate optional command.
+    /// Only the optional command is reset after its exact slot completes.
     ///
     /// The destination returns from WebGPU in `SHADER_READ_ONLY_OPTIMAL`, is
     /// overwritten completely, then returns to the same layout tracked by
     /// WebGPU. Queue serialization makes the one recording reusable.
     fn record_copy(
         &self,
+        commands: vk::CommandBuffer,
         destination: vk::Image,
         extent: vk::Extent3D,
         slot: usize,
         coordinates: Option<&[(u32, u32); 25]>,
-    ) -> Result<(), vk::Result> {
+    ) -> Result<(), (MmltkWorkspaceProbeFailure, vk::Result)> {
         let source_subresource = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -3571,11 +3679,14 @@ impl MmltkWorkspaceBlit {
             .src_subresource(source_layers)
             .dst_subresource(destination_layers)
             .extent(extent)];
-        let commands = self.copy_commands[slot];
-
         unsafe {
+            if coordinates.is_some() {
+                MmltkWorkspacePixels::check_failure(MmltkWorkspaceProbeFailure::Begin)
+                    .map_err(|error| (MmltkWorkspaceProbeFailure::Begin, error))?;
+            }
             self.device
-                .begin_command_buffer(commands, &vk::CommandBufferBeginInfo::default())?;
+                .begin_command_buffer(commands, &vk::CommandBufferBeginInfo::default())
+                .map_err(|error| (MmltkWorkspaceProbeFailure::Begin, error))?;
             self.device.cmd_pipeline_barrier(
                 commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -3629,7 +3740,12 @@ impl MmltkWorkspaceBlit {
                 &[],
                 &release,
             );
+            if coordinates.is_some() {
+                MmltkWorkspacePixels::check_failure(MmltkWorkspaceProbeFailure::End)
+                    .map_err(|error| (MmltkWorkspaceProbeFailure::End, error))?;
+            }
             self.device.end_command_buffer(commands)
+                .map_err(|error| (MmltkWorkspaceProbeFailure::End, error))
         }
     }
 
@@ -4156,9 +4272,17 @@ impl Global {
             let copy_commands = allocated[..MMLTK_WORKSPACE_MAILBOX_COUNT]
                 .to_vec()
                 .into_boxed_slice();
-            let submission_copy_commands = copy_commands.clone();
             let release_commands = allocated[MMLTK_WORKSPACE_MAILBOX_COUNT];
-            let pixels = MmltkWorkspacePixels::new(hal_device);
+            let pixels = if mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+                match MmltkWorkspacePixels::new(hal_device) {
+                    Ok(probe) => Some(probe),
+                    Err(vk::Result::ERROR_DEVICE_LOST) => return None,
+                    Err(_) => {
+                        MmltkWorkspacePixels::report_failure(surface_id, MmltkWorkspaceProbeFailure::Allocation, None);
+                        None
+                    }
+                }
+            } else { None };
             Some(MmltkWorkspaceBlit {
                 device: device.clone(),
                 queue: hal_device.raw_queue(),
@@ -4169,7 +4293,7 @@ impl Global {
                 release_commands,
                 timeline,
                 submission: Some(hal_device.register_external_timeline_submission(
-                    submission_copy_commands,
+                    MMLTK_WORKSPACE_MAILBOX_COUNT,
                     release_commands,
                     timeline,
                 )),
@@ -4195,7 +4319,7 @@ impl Global {
                 .copy_commands
                 .iter()
                 .enumerate()
-                .any(|(slot, _)| blit.record_copy(destination, extent, slot, None).is_err())
+                .any(|(slot, &commands)| blit.record_copy(commands, destination, extent, slot, None).is_err())
             || blit.record_release_only().is_err()
         {
             return None;
