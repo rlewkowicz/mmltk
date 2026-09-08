@@ -1,4 +1,6 @@
 #include "detail/shiftlut_onnx_ops.h"
+#include "detail/shiftlut_model_format.h"
+#include <cuda_runtime_api.h>
 #include <onnxruntime_cxx_api.h>
 
 #define ONNX_NAMESPACE mmltk_onnx
@@ -12,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +24,30 @@
 namespace {
 
 namespace onnx = mmltk_onnx;
+namespace lut = mmltk::backend::imaging::upscale::shiftlut;
+
+void describe_layout() {
+    std::cout << "{\"domain\":\"" << lut::kDomain << "\",\"operator\":\"" << lut::kOperator
+              << "\",\"version\":" << lut::kVersion << ",\"dtype\":\"<f4\",\"element_bytes\":" << sizeof(float)
+              << ",\"elements\":" << lut::kTableElements << ",\"bytes\":" << lut::kTableBytes
+              << ",\"channels\":" << lut::kChannels << ",\"rgb_channels\":" << lut::kRgbChannels
+              << ",\"rotations\":" << lut::kRotations << ",\"stages\":" << lut::kStages
+              << ",\"shift_axes\":" << lut::kShiftAxes << ",\"scale\":" << lut::kScale
+              << ",\"maximum_tile_extent\":" << lut::kMaximumTileExtent
+              << ",\"scratch_elements\":" << lut::kScratchElements
+              << ",\"decision_checkpoints\":" << lut::kDecisionCheckpoints
+              << ",\"blocks\":[";
+    for (std::size_t index = 0; index < lut::kTableBlocks; ++index) {
+        const auto block = lut::table_block(index);
+        if (index != 0) std::cout << ',';
+        std::cout << "{\"name\":\"" << block.name.data() << "\",\"kind\":\""
+                  << (block.family == lut::TableFamily::Shifts ? "shifts" : "lut")
+                  << "\",\"dimensions\":[" << block.shape.outer << ',' << block.shape.inner << ',' << block.shape.domain
+                  << "],\"offset\":" << block.offset << ",\"elements\":" << block.shape.elements() << '}';
+    }
+    std::cout << "]}\n";
+    if (!std::cout) throw std::runtime_error("write ShiftLUT layout description");
+}
 
 void image_type(onnx::ValueInfoProto& value, const char* name, bool output) {
     value.set_name(name);
@@ -28,7 +55,7 @@ void image_type(onnx::ValueInfoProto& value, const char* name, bool output) {
     tensor->set_elem_type(onnx::TensorProto::FLOAT);
     auto* shape = tensor->mutable_shape();
     shape->add_dim()->set_dim_value(1);
-    shape->add_dim()->set_dim_value(3);
+    shape->add_dim()->set_dim_value(lut::kRgbChannels);
     shape->add_dim()->set_dim_param(output ? "height4" : "height");
     shape->add_dim()->set_dim_param(output ? "width4" : "width");
 }
@@ -41,13 +68,13 @@ void metadata(onnx::ModelProto& model, const char* name, std::string_view value)
 
 void generate(const std::filesystem::path& tables, const std::filesystem::path& output,
               std::string_view lut_digest, std::string_view source_digest) {
-    namespace lut = mmltk::backend::imaging::upscale::shiftlut;
     static_assert(std::endian::native == std::endian::little);
-    const std::size_t bytes = lut::kTableElements * sizeof(float);
+    const std::size_t bytes = lut::kTableBytes;
     if (std::filesystem::file_size(tables) != bytes) throw std::invalid_argument("invalid checked ShiftLUT interchange length");
     std::string data(bytes, '\0');
     std::ifstream input(tables, std::ios::binary);
     if (!input.read(data.data(), static_cast<std::streamsize>(data.size()))) throw std::runtime_error("read ShiftLUT interchange");
+    lut::validate_tables(std::as_bytes(std::span{data.data(), data.size()}));
     onnx::ModelProto model;
     model.set_ir_version(10);
     model.set_producer_name("mmltk_shiftlut_model_generator");
@@ -111,8 +138,8 @@ class VerificationStorage final {
     float* Output() noexcept { return data_ + kInputElements; }
     cudaStream_t Stream() noexcept { return stream_; }
    private:
-    static constexpr std::size_t kInputElements = 3 * 256 * 256;
-    static constexpr std::size_t kOutputElements = kInputElements * 16;
+    static constexpr std::size_t kInputElements = lut::kRgbChannels * lut::kMaximumTilePixels;
+    static constexpr std::size_t kOutputElements = kInputElements * lut::kOutputPhases;
     float* data_ = nullptr;
     cudaStream_t stream_ = nullptr;
 };
@@ -128,7 +155,6 @@ std::vector<float> read_vector(const std::filesystem::path& path, std::size_t co
 
 void verify(const std::filesystem::path& path, const std::filesystem::path& directory,
             std::string_view lut_digest, std::string_view source_digest) {
-    namespace lut = mmltk::backend::imaging::upscale::shiftlut;
     onnx::ModelProto graph;
     std::ifstream model_file(path, std::ios::binary);
     if (!graph.ParseFromIstream(&model_file)) throw std::invalid_argument("invalid production ONNX");
@@ -164,18 +190,19 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
             std::int64_t height = 0, width = 0;
             std::size_t cases = 0;
             while (vectors >> label >> height >> width) {
-                if (height < 1 || width < 1 || height > 256 || width > 256 ||
+                if (height < 1 || width < 1 || height > lut::kMaximumTileExtent || width > lut::kMaximumTileExtent ||
                     label.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
                     throw std::invalid_argument("invalid upstream vector manifest");
-                const auto input_count = static_cast<std::size_t>(height * width * 3);
+                const auto input_count = static_cast<std::size_t>(height * width * lut::kRgbChannels);
                 const auto input = read_vector(directory / (label + ".input.f32"), input_count);
-                const auto expected = read_vector(directory / (label + ".expected.f32"), input_count * 16);
+                const auto expected = read_vector(directory / (label + ".expected.f32"), input_count * lut::kOutputPhases);
                 cuda_checked(cudaMemcpyAsync(storage.Input(), input.data(), input_count * sizeof(float),
                     cudaMemcpyHostToDevice, storage.Stream()), "copy changed verification pixels");
-                const std::array<std::int64_t, 4> input_shape{1, 3, height, width}, output_shape{1, 3, height * 4, width * 4};
+                const std::array<std::int64_t, 4> input_shape{1, lut::kRgbChannels, height, width},
+                    output_shape{1, lut::kRgbChannels, height * lut::kScale, width * lut::kScale};
                 auto input_value = Ort::Value::CreateTensor<float>(memory, storage.Input(), input_count,
                     input_shape.data(), input_shape.size());
-                auto output_value = Ort::Value::CreateTensor<float>(memory, storage.Output(), input_count * 16,
+                auto output_value = Ort::Value::CreateTensor<float>(memory, storage.Output(), input_count * lut::kOutputPhases,
                     output_shape.data(), output_shape.size());
                 Ort::IoBinding binding{session};
                 binding.BindInput("image", input_value);
@@ -200,7 +227,7 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
                 }
                 const bool probe_decisions = height * width <= 1024;
                 if (probe_decisions) {
-                    const auto count = static_cast<std::size_t>(16 * 12 * 16 * height * width);
+                    const auto count = lut::decision_elements(static_cast<std::size_t>(height * width));
                     std::vector<std::int8_t> decisions(count), expected_decisions(count);
                     const auto decision_path = directory / (label + ".decisions.i8");
                     if (std::filesystem::file_size(decision_path) != count)
@@ -236,6 +263,10 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--describe-layout") {
+            describe_layout();
+            return 0;
+        }
         if (argc == 6 && std::string_view(argv[1]) == "--verify") {
             verify(argv[2], argv[3], argv[4], argv[5]);
             return 0;

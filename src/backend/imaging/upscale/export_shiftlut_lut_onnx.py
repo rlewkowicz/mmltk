@@ -7,6 +7,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
@@ -67,18 +68,65 @@ def _asset_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _table(reference, root: Path, name: str, domain: int, inputs: int) -> np.ndarray:
+def _layout(generator: Path) -> dict:
+    layout = json.loads(subprocess.run([str(generator), "--describe-layout"], check=True,
+                                      capture_output=True, text=True).stdout)
+    if (layout["domain"], layout["operator"], layout["version"], layout["dtype"], layout["element_bytes"]) != (
+            "mmltk.upscale", "ShiftLutS7", 1, "<f4", 4):
+        raise ValueError("unsupported native ShiftLUT layout")
+    facts = ("elements", "bytes", "channels", "rgb_channels", "rotations", "stages", "shift_axes",
+             "scale", "maximum_tile_extent", "scratch_elements", "decision_checkpoints")
+    if any(type(layout[key]) is not int or layout[key] <= 0 for key in facts):
+        raise ValueError("invalid native ShiftLUT format facts")
+    # Bound the external description before any table allocation or file write.
+    if layout["bytes"] > 64 * 1024 * 1024 or layout["bytes"] != layout["elements"] * layout["element_bytes"]:
+        raise ValueError("invalid native ShiftLUT storage length")
+    if (layout["scratch_elements"] != layout["rgb_channels"] * layout["rotations"] *
+            layout["channels"] * layout["maximum_tile_extent"] ** 2 or
+            layout["decision_checkpoints"] != layout["stages"] * 2):
+        raise ValueError("inconsistent native ShiftLUT storage extents")
+    blocks = layout["blocks"]
+    if not isinstance(blocks, list) or len(blocks) != 1 + layout["stages"] * 2 + 2:
+        raise ValueError("invalid native ShiftLUT block inventory")
+    names = set()
+    offset = 0
+    for index, block in enumerate(blocks):
+        name, shape = block["name"], block["dimensions"]
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_]+", name) is None or name in names:
+            raise ValueError("invalid native ShiftLUT external table name")
+        names.add(name)
+        if not isinstance(shape, list) or len(shape) != 3 or any(type(size) is not int or size <= 0 for size in shape):
+            raise ValueError("invalid native ShiftLUT block dimensions")
+        if (type(block["offset"]) is not int or type(block["elements"]) is not int or
+                block["offset"] != offset or block["elements"] != math.prod(shape)):
+            raise ValueError("noncontiguous native ShiftLUT block")
+        if index == len(blocks) - 1:
+            if block["kind"] != "shifts" or shape != [layout["stages"], layout["shift_axes"], layout["channels"]]:
+                raise ValueError("invalid native ShiftLUT shift block")
+        elif block["kind"] != "lut":
+            raise ValueError("invalid native ShiftLUT table block")
+        offset += block["elements"]
+        if offset > layout["elements"]:
+            raise ValueError("native ShiftLUT block exceeds storage")
+    if offset != layout["elements"]:
+        raise ValueError("incomplete native ShiftLUT storage")
+    return layout
+
+
+def _table(reference, root: Path, block: dict) -> np.ndarray:
+    name = block["name"]
+    outputs, inputs, domain = block["dimensions"]
     metadata = json.loads((root / f"{name}.json").read_text())
-    if metadata["IN"] != inputs or metadata["OUT"] != 16:
+    if metadata["IN"] != inputs or metadata["OUT"] != outputs:
         raise ValueError(f"unexpected table shape for {name}")
     steps = {(int(item["in"]), int(item["out"])): int(item["step"]) for item in metadata["LUTs"]}
-    if len(metadata["LUTs"]) != inputs * 16 or set(steps) != {(i, o) for o in range(16) for i in range(inputs)}:
+    if len(metadata["LUTs"]) != inputs * outputs or set(steps) != {(i, o) for o in range(outputs) for i in range(inputs)}:
         raise ValueError(f"incomplete or duplicated table metadata for {name}")
-    result = np.empty((16, inputs, domain), dtype="<f4")
+    result = np.empty((outputs, inputs, domain), dtype="<f4")
     with np.load(root / f"{name}.npz", allow_pickle=False) as arrays:
-        if set(arrays.files) != {f"i{i}o{o}" for o in range(16) for i in range(inputs)}:
+        if set(arrays.files) != {f"i{i}o{o}" for o in range(outputs) for i in range(inputs)}:
             raise ValueError(f"unexpected table members for {name}")
-        for out in range(16):
+        for out in range(outputs):
             for inp in range(inputs):
                 step = steps[inp, out]
                 raw = arrays[f"i{inp}o{out}"]
@@ -95,21 +143,26 @@ def _table(reference, root: Path, name: str, domain: int, inputs: int) -> np.nda
     return result.reshape(-1)
 
 
-def _table_specs():
-    yield "DW0_LSB", 4, 9
-    for stage in range(8):
-        yield f"DW{stage}_MSB", 64, 9
-        yield f"PW{stage}_MSB", 64, 16
-    yield "UP_MSB", 64, 16
-
-
-def _prepare(reference, root: Path, output: Path) -> None:
-    parts = [_table(reference, root, name, domain, inputs) for name, domain, inputs in _table_specs()]
-    offsets = np.load(root / "offset.npy", allow_pickle=False)
-    if offsets.shape != (8, 2, 16) or np.any(np.abs(offsets) > 1) or np.any(offsets != np.trunc(offsets)):
-        raise ValueError("unexpected ShiftLUT offsets")
-    parts.append(offsets.astype("<f4").reshape(-1))
-    np.concatenate(parts).astype("<f4", copy=False).tofile(output)
+def _prepare(reference, root: Path, output: Path, layout: dict) -> None:
+    packed = np.empty(layout["elements"], dtype=layout["dtype"])
+    for block in layout["blocks"]:
+        if block["kind"] == "shifts":
+            values = np.load(root / f"{block['name']}.npy", allow_pickle=False)
+            if (values.shape != tuple(block["dimensions"]) or not np.all(np.isfinite(values)) or
+                    np.any(np.abs(values) > 1) or np.any(values != np.trunc(values))):
+                raise ValueError("unexpected ShiftLUT offsets")
+            values = values.astype(layout["dtype"]).reshape(-1)
+        else:
+            values = _table(reference, root, block)
+        if values.size != block["elements"] or not np.all(np.isfinite(values)) or np.any(np.abs(values) > 32767):
+            raise ValueError("invalid prepared ShiftLUT table")
+        packed[block["offset"]:block["offset"] + block["elements"]] = values
+    packed.tofile(output)
+    # Check the interchange round trip bit-for-bit, including signed zero, before
+    # passing these bytes to the native validator and ONNX serializer.
+    if (output.stat().st_size != layout["bytes"] or
+            not np.array_equal(np.fromfile(output, dtype="<u4"), packed.view("<u4"))):
+        raise RuntimeError("ShiftLUT packed interchange round trip failed")
 
 
 def _probes():
@@ -204,7 +257,7 @@ def _verify(reference, root: Path, model_path: Path, generator: Path, output: Pa
                     _asset_digest(root), _SOURCE_SHA256], check=True)
 
 
-def _verify_rounding(reference, generator: Path, output: Path) -> None:
+def _verify_rounding(reference, generator: Path, output: Path, layout: dict) -> None:
     # Synthetic interpolation tables run through the unmodified upstream LUT
     # implementation. Half-integer averages exercise both ties and both signs
     # before saturation, for depthwise and pointwise stages independently.
@@ -213,17 +266,21 @@ def _verify_rounding(reference, generator: Path, output: Path) -> None:
             case = output / f"ties_{active}_{sign}"
             root = case / "tables"
             root.mkdir(parents=True, exist_ok=True)
-            np.save(root / "offset.npy", np.zeros((8, 2, 16), dtype=np.int32))
-            for name, domain, inputs in _table_specs():
+            for block in layout["blocks"]:
+                name = block["name"]
+                if block["kind"] == "shifts":
+                    np.save(root / f"{name}.npy", np.zeros(block["dimensions"], dtype=np.int32))
+                    continue
+                outputs, inputs, domain = block["dimensions"]
                 step = 2 if name == active else 1
                 values = sign * np.arange(domain // 2 + 1, dtype=np.int32) if step == 2 else np.zeros(domain, dtype=np.int32)
-                np.savez(root / f"{name}.npz", **{f"i{i}o{o}": values for o in range(16) for i in range(inputs)})
+                np.savez(root / f"{name}.npz", **{f"i{i}o{o}": values for o in range(outputs) for i in range(inputs)})
                 (root / f"{name}.json").write_text(json.dumps({
-                    "IN": inputs, "OUT": 16,
-                    "LUTs": [{"in": i, "out": o, "step": step} for o in range(16) for i in range(inputs)],
+                    "IN": inputs, "OUT": outputs,
+                    "LUTs": [{"in": i, "out": o, "step": step} for o in range(outputs) for i in range(inputs)],
                 }))
             interchange = case / "tables.f32"
-            _prepare(reference, root, interchange)
+            _prepare(reference, root, interchange, layout)
             model = case / "synthetic.onnx"
             subprocess.run([str(generator), str(interchange), str(model), _asset_digest(root), _SOURCE_SHA256], check=True)
             probes = [(f"tie_{value}", torch.full((1, 3, 3, 5), float(value))) for value in (116, 124, 132, 140)]
@@ -240,13 +297,15 @@ def main() -> None:
     modes.add_argument("--export-only", action="store_true")
     modes.add_argument("--verify-only", action="store_true")
     args = parser.parse_args()
+    layout = _layout(args.generator)
     reference, source_digest = _reference(args.source)
     root = args.source / "LUT_test/LUTs/ShiftLUT_sr_s7_int"
     lut_digest = _asset_digest(root)
     args.validation.mkdir(parents=True, exist_ok=True)
+    (args.validation / "layout.json").write_text(json.dumps(layout, indent=2) + "\n")
     if args.export_only:
         interchange = args.validation / "tables.f32"
-        _prepare(reference, root, interchange)
+        _prepare(reference, root, interchange, layout)
         temporary = args.validation / "ShiftLUT_fp32.onnx"
         subprocess.run([str(args.generator), str(interchange), str(temporary), lut_digest, source_digest], check=True)
         data = temporary.read_bytes()
@@ -261,7 +320,7 @@ def main() -> None:
     else:
         # Verification never writes the production asset or its descriptor.
         _verify(reference, root, args.output, args.generator, args.validation)
-        _verify_rounding(reference, args.generator, args.validation)
+        _verify_rounding(reference, args.generator, args.validation, layout)
     (args.validation / "source_manifest.json").write_text(json.dumps({
         "source_sha256": source_digest, "lut_sha256": lut_digest,
         "model_sha256": hashlib.sha256(args.output.read_bytes()).hexdigest(),

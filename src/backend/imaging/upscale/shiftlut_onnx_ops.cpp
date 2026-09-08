@@ -1,9 +1,10 @@
 #include "detail/shiftlut_onnx_ops.h"
+#include "detail/shiftlut_lookup_cuda.h"
+#include "detail/shiftlut_model_format.h"
 #include <onnxruntime_cxx_api.h>
 
 #include <array>
 #include <atomic>
-#include <cmath>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -25,11 +26,10 @@ class Storage final {
     void Install(const float* tables) {
         if (data_ != nullptr) return;
         checked(cudaGetDevice(&device_), "bind ShiftLUT allocation");
-        checked(cudaMalloc(reinterpret_cast<void**>(&data_), kTableElements * sizeof(float) +
-            (2 * kScratchElements + decision_capacity_ * 16 * 12 * 16) * sizeof(std::int8_t)),
+        checked(cudaMalloc(reinterpret_cast<void**>(&data_), resident_bytes(decision_capacity_)),
                 "allocate resident ShiftLUT tables and stages");
         allocations.fetch_add(1, std::memory_order_relaxed);
-        checked(cudaMemcpy(data_, tables, kTableElements * sizeof(float), cudaMemcpyHostToDevice),
+        checked(cudaMemcpy(data_, tables, kTableBytes, cudaMemcpyHostToDevice),
                 "install immutable ShiftLUT tables");
     }
     ~Storage() {
@@ -48,17 +48,17 @@ class Storage final {
         return released == cudaSuccess ? restored : released;
     }
     explicit Storage(std::size_t decision_capacity) : decision_capacity_(decision_capacity) {
-        if (decision_capacity > 256U * 256U) throw std::invalid_argument("invalid ShiftLUT diagnostic capacity");
+        if (decision_capacity > kMaximumTilePixels) throw std::invalid_argument("invalid ShiftLUT diagnostic capacity");
     }
     Storage(const Storage&) = delete;
     Storage& operator=(const Storage&) = delete;
     float* data() noexcept { return data_; }
     std::int8_t* Decisions(std::size_t pixels) noexcept {
         if (decision_capacity_ == 0 || pixels > decision_capacity_ || data_ == nullptr) return nullptr;
-        return reinterpret_cast<std::int8_t*>(data_ + kTableElements) + 2 * kScratchElements;
+        return reinterpret_cast<std::int8_t*>(data_ + kTableElements) + kDecisionStorageOffset;
     }
     cudaError_t ReadDecisions(std::span<std::int8_t> target) noexcept {
-        if (target.empty() || target.size() > decision_capacity_ * 16 * 12 * 16 || data_ == nullptr)
+        if (target.empty() || target.size() > decision_elements(decision_capacity_) || data_ == nullptr)
             return cudaErrorInvalidValue;
         return cudaMemcpy(target.data(), Decisions(1), target.size_bytes(), cudaMemcpyDeviceToHost);
     }
@@ -81,12 +81,7 @@ class Kernel final {
             std::vector<std::int64_t>{static_cast<std::int64_t>(kTableElements)})
             throw std::invalid_argument("invalid ShiftLUT v1 table layout");
         const auto* data = table.GetTensorData<float>();
-        for (std::size_t index = 0; index < kTableElements; ++index) {
-            if (!std::isfinite(data[index]) || std::abs(data[index]) > 32767.0F)
-                throw std::invalid_argument("invalid ShiftLUT table value");
-            if (index >= kShiftOffset && (std::abs(data[index]) > 1.0F || std::trunc(data[index]) != data[index]))
-                throw std::invalid_argument("invalid ShiftLUT shift");
-        }
+        validate_tables(std::as_bytes(std::span{data, kTableElements}));
         storage_.Install(data);
     }
 
@@ -99,12 +94,13 @@ class Kernel final {
             if (type.GetDimensionsCount() != shape.size())
                 throw std::invalid_argument("ShiftLUT input must be NCHW");
             Ort::ThrowOnError(Ort::GetApi().GetDimensions(type, shape.data(), shape.size()));
-            if (shape[0] != 1 || shape[1] != 3 || shape[2] < 1 || shape[3] < 1 || shape[2] > 256 || shape[3] > 256)
+            if (shape[0] != 1 || shape[1] != kRgbChannels || shape[2] < 1 || shape[3] < 1 ||
+                shape[2] > kMaximumTileExtent || shape[3] > kMaximumTileExtent)
                 throw std::invalid_argument("ShiftLUT requires one RGB tile with extent at most 256");
             const auto height = static_cast<std::uint32_t>(shape[2]);
             const auto width = static_cast<std::uint32_t>(shape[3]);
-            shape[2] *= 4;
-            shape[3] *= 4;
+            shape[2] *= kScale;
+            shape[3] *= kScale;
             auto output = context.GetOutput(0, shape.data(), shape.size());
             auto* first = reinterpret_cast<std::int8_t*>(storage_.data() + kTableElements);
             checked(enqueue(input.GetTensorData<float>(), storage_.data(), first, first + kScratchElements,
