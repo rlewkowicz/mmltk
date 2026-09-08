@@ -30,7 +30,7 @@ class LiveSystem::Impl final {
                   AdvanceRevision();
                   settled = state_;
               }
-              report_visual_worker_failure(diagnostics_, VisualSystemKind::Live, settings_.device, detail);
+              report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Live, settings_.device, detail);
               Publish(event_type{LiveFailed{std::move(settled), std::move(detail)}});
           }) {
         if (!settings_.valid()) throw contracts::InvalidIntentError("Live device settings are invalid");
@@ -77,12 +77,12 @@ class LiveSystem::Impl final {
                             };
                         }
                         PublishFrame();
-                        diagnostics_({
-                            .system = VisualSystemKind::Live,
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{
+                            .system = contracts::DiagnosticOwner::Live,
                             .operation = VisualDiagnosticOperation::FrameCompleted,
                             .device = settings_.device,
                             .generation = runtime.OutputFacts().revision,
-                        });
+                        }; });
                         cadence_ready.wait_for(cadence_lock, worker_stop, cadence, [] { return false; });
                     }
                     return [this, algorithm] { Settle(algorithm); };

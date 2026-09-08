@@ -35,10 +35,11 @@ mmltk_register_ordinary_sources(mmltk_controller_visual_runtime
 target_link_libraries(mmltk_controller_visual_runtime
     PUBLIC
         mmltk::controller::contracts
+        mmltk::controller::visual_contract
         mmltk::frameworks::gpu
-        mmltk::frameworks::reflection
-    PRIVATE
-        mmltk::controller::visual_contract)
+        mmltk::frameworks::reflection)
+mmltk_link_declarations(mmltk_controller_visual_runtime PUBLIC
+    mmltk::controller::direct_services)
 mmltk_register_header_isolation(mmltk_controller_visual_runtime)
 
 add_library(mmltk_controller_presentation_system STATIC)
@@ -90,6 +91,7 @@ function(mmltk_add_controller_presentation_tests)
         mmltk_controller_visual_systems_tests PRIVATE
         mmltk_acceptance_support
         mmltk::controller::browser::protocol_v13
+        mmltk::controller::direct_services
         mmltk::controller::annotation_system
         mmltk::controller::explore_system
         mmltk::controller::live_system
@@ -97,7 +99,8 @@ function(mmltk_add_controller_presentation_tests)
         mmltk::controller::upscale_system
         mmltk::controller::visual_runtime
         mmltk::frameworks::gpu
-        mmltk_frameworks_gpu_test_support)
+        mmltk_frameworks_gpu_test_support
+        nlohmann_json)
     catch_discover_tests(
         mmltk_controller_visual_systems_tests
         TEST_PREFIX "controller::visual-systems::"

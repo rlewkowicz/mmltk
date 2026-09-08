@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string_view>
 
 #include "src/common/io/scoped_fd.h"
@@ -21,6 +22,7 @@ enum class DiagnosticSubmitResult : std::uint8_t {
     RecordTooLarge,
     InvalidJson,
     Closed,
+    Contended,
 };
 
 enum class DiagnosticsCloseMode : std::uint8_t { Flush, Discard };
@@ -66,6 +68,8 @@ class DiagnosticsClient final {
     void wait_closed() noexcept;
 
    private:
+    [[nodiscard]] std::mutex& queue_mutex_for_test() noexcept;
+    friend struct DiagnosticsClientTestAccess;
     void initialize(mmltk::common::io::ScopedFd descriptor, DiagnosticsExecutionPolicy policy) noexcept;
 
     struct State;
@@ -80,8 +84,15 @@ class DiagnosticsProducer final {
         Operation() noexcept = default;
         [[nodiscard]] bool enabled() const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record) const noexcept;
+        // Effect-only instrumentation must never wait for diagnostic capacity.
+        [[nodiscard]] DiagnosticSubmitResult try_submit(DiagnosticRecord record) const noexcept;
 
        private:
+        [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
+        [[nodiscard]] DiagnosticSubmitResult try_submit_encoded(DiagnosticRecord record) const noexcept {
+            return submit(record, false, false);
+        }
+        friend class RuntimeDiagnosticTarget;
         explicit Operation(std::shared_ptr<DiagnosticsClient::State> state) noexcept;
         std::shared_ptr<DiagnosticsClient::State> state_;
         friend class DiagnosticsProducer;

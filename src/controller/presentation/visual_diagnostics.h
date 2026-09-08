@@ -12,19 +12,14 @@
 #include <utility>
 
 #include "src/controller/contracts/diagnostic_context.h"
+#include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/runtime_diagnostic_span.h"
 #include "src/frameworks/gpu/image_types.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 
 namespace mmltk::controller {
-
-enum class VisualSystemKind : std::uint8_t {
-    Explore,
-    Annotation,
-    Upscale,
-    Live,
-    Presentation,
-};
 namespace detail {
 
 struct VisualDiagnosticName final {
@@ -174,7 +169,7 @@ inline constexpr auto kVisualDiagnosticNames =
     return index < detail::kVisualDiagnosticNames.size() ? detail::kVisualDiagnosticNames[index] : std::string_view{};
 }
 struct VisualDiagnosticFact final {
-    VisualSystemKind system = VisualSystemKind::Explore;
+    contracts::DiagnosticOwner system = contracts::DiagnosticOwner::Explore;
     VisualDiagnosticOperation operation = VisualDiagnosticOperation::WorkerFailure;
     int device = -1;
     std::uint64_t generation = 0U;
@@ -184,18 +179,45 @@ struct VisualDiagnosticFact final {
     contracts::DiagnosticContext context{};
     std::string_view failure_detail{};
 };
-MMLTK_REFLECT_ENUM(VisualSystemKind)
+[[nodiscard]] inline auto visual_diagnostic_boundary(VisualDiagnosticFact begin, const VisualDiagnosticOperation end) noexcept {
+    auto completed = begin;
+    completed.operation = end;
+    return std::pair{begin, completed};
+}
 MMLTK_REFLECT_ENUM(VisualDiagnosticOperation)
 struct VisualDiagnosticSink final {
     void* context = nullptr;
     void (*write)(void*, VisualDiagnosticFact) noexcept = nullptr;
+    bool (*enabled)(void*) noexcept = nullptr;
+    bool pixel_probes = false;
 
-    [[nodiscard]] bool valid() const noexcept { return context != nullptr && write != nullptr; }
+    [[nodiscard]] bool valid() const noexcept { return context != nullptr && write != nullptr && (!enabled || enabled(context)); }
+    [[nodiscard]] bool pixel_probes_enabled() const noexcept { return pixel_probes && valid(); }
     void operator()(const VisualDiagnosticFact fact) const noexcept {
         if (valid()) write(context, fact);
     }
+    template <class Factory>
+    void Emit(Factory&& factory) const noexcept {
+        if (!valid()) return;
+        try { write(context, std::forward<Factory>(factory)()); } catch (...) {}
+    }
 };
-void report_visual_worker_failure(VisualDiagnosticSink, VisualSystemKind, int, std::string_view, std::uint64_t generation = 0U) noexcept;
+[[nodiscard]] contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation&) noexcept;
+[[nodiscard]] services::RuntimeDiagnosticFact visual_runtime_diagnostic(VisualDiagnosticFact) noexcept;
+
+// The shell owns the target until after every visual worker is joined. Test
+// sinks retain their direct typed injection, including dynamic disablement.
+[[nodiscard]] inline VisualDiagnosticSink visual_diagnostic_sink(services::RuntimeDiagnosticTarget& target) noexcept {
+    return {
+        .context = &target,
+        .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact));
+        },
+        .enabled = [](void* context) noexcept { return static_cast<services::RuntimeDiagnosticTarget*>(context)->valid(); },
+        .pixel_probes = target.pixel_probes_enabled(),
+    };
+}
+void report_visual_worker_failure(VisualDiagnosticSink, contracts::DiagnosticOwner, int, std::string_view, std::uint64_t generation = 0U) noexcept;
 
 inline constexpr std::size_t kVisualFailureByteCapacity = 1024U;
 

@@ -40,6 +40,7 @@ struct ApplicationShellConfig final {
     LiveNativeConfiguration live{};
     ExploreNativeConfiguration explore{};
     services::DiagnosticsClient diagnostics{};
+    bool pixel_probes = false;
     std::optional<services::VastBridgeConfig> vast_provider{};
     std::string_view file_dialog_helper{"zenity"};
     std::string_view file_dialog_launch_directory{"/host"};
@@ -78,6 +79,7 @@ class ApplicationShell final {
 
     services::DiagnosticsClient diagnostics_client_;
     services::RuntimeDiagnostics runtime_diagnostics_;
+    services::RuntimeDiagnosticTarget visual_diagnostic_target_;
     transport::BrowserServer browser_server_;
     browser::ApplicationBrowserHost browser_host_;
     services::VastProviderOwner provider_owner_;

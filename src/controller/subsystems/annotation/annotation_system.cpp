@@ -63,10 +63,10 @@ class AnnotationSystem::Impl final {
                             return [this, detail = std::string(error.what())] { Rejected(detail, true, std::nullopt); };
                         }
                         const auto paths = runtime.CopyInputFrom(std::move(source.pixels));
-                        diagnostics_({.system = VisualSystemKind::Annotation,
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
                                       .operation = VisualDiagnosticOperation::CopyCompleted,
                                       .device = settings_.device,
-                                      .copy_path = paths[0U]});
+                                      .copy_path = paths[0U]}; });
                         const auto input = runtime.BorrowInput();
                         const auto source_plane = input.plane(0U).plane();
                         auto result = annotation_algorithm(runtime).Open(source_plane, std::move(scene), crop);
@@ -87,13 +87,14 @@ class AnnotationSystem::Impl final {
                                 state.ui = std::move(ui);
                                 state.frame = frame;
                             });
-                            diagnostics_({
-                                .system = VisualSystemKind::Annotation,
+                            diagnostics_.Emit([&] { return VisualDiagnosticFact{
+                                .system = contracts::DiagnosticOwner::Annotation,
                                 .operation = VisualDiagnosticOperation::DocumentOpened,
                                 .device = settings_.device,
                                 .generation = frame.revision,
-                                .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height},
-                            });
+                                .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height,
+                                            .source = visual_diagnostic_source({.frame = frame})},
+                            }; });
                         };
                     },
                     [this] { Cancelled(); })) {
@@ -286,10 +287,10 @@ class AnnotationSystem::Impl final {
                         runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
                             annotation_algorithm(runtime).Render(source, clean, semantic, stream);
                         });
-                        diagnostics_({.system = VisualSystemKind::Annotation,
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
                                       .operation = diagnostic,
                                       .device = settings_.device,
-                                      .generation = result.ui.document_revision});
+                                      .generation = result.ui.document_revision}; });
                         auto frame = Frame(runtime, extent);
                         return CompleteOperation(std::move(result), frame);
                     },
@@ -380,7 +381,7 @@ class AnnotationSystem::Impl final {
             AdvanceRevision();
             failed = state_;
         }
-        report_visual_worker_failure(diagnostics_, VisualSystemKind::Annotation, settings_.device, detail);
+        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Annotation, settings_.device, detail);
         Publish(AnnotationFailed{std::move(failed), std::move(detail)});
     }
     template <class Event>

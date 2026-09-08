@@ -22,6 +22,7 @@ mmltk_register_public_headers(
         persistence_storage.h
         persistence_types.h
         runtime_diagnostics.h
+        runtime_diagnostic_span.h
         settings_location.h
         settings_store.h
         settings_types.h

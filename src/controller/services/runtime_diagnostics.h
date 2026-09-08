@@ -8,23 +8,12 @@
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/frameworks/serialization/cbor_wire.h"
+#include "src/frameworks/reflection/reflected_field_policy.h"
 
 namespace mmltk::controller::services {
 
-enum class RuntimeDiagnosticOwner : std::uint8_t {
-    BrowserRuntime,
-    BrowserServer,
-    FirefoxProcess,
-    Explore,
-    Annotation,
-    Upscale,
-    Live,
-    Presentation,
-    AnnotationResource,
-};
-
 struct RuntimeDiagnosticFact final {
-    RuntimeDiagnosticOwner owner = RuntimeDiagnosticOwner::BrowserRuntime;
+    contracts::DiagnosticOwner owner = contracts::DiagnosticOwner::BrowserRuntime;
     std::string_view event;
     std::string_view participant{};
     std::uint64_t sequence = 0U;
@@ -34,6 +23,7 @@ struct RuntimeDiagnosticFact final {
     contracts::DiagnosticContext context{};
     std::string_view message{};
 };
+MMLTK_REFLECT_FIELDS(RuntimeDiagnosticFact)
 
 class RuntimeDiagnostics;
 
@@ -45,6 +35,13 @@ class RuntimeDiagnosticTarget final {
     RuntimeDiagnosticTarget() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept;
+    [[nodiscard]] bool pixel_probes_enabled() const noexcept;
+    void operator()(RuntimeDiagnosticFact fact) const noexcept { write(fact); }
+    template <class Factory>
+    void Emit(Factory&& factory) const noexcept {
+        if (!valid()) return;
+        try { write(std::forward<Factory>(factory)()); } catch (...) {}
+    }
     void write(RuntimeDiagnosticFact fact) const noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept;
     [[nodiscard]] bool benchmark_trace_enabled() const noexcept;
@@ -62,7 +59,7 @@ class RuntimeDiagnosticTarget final {
 // transport and process paths perform no trace collection or formatting.
 class RuntimeDiagnostics final {
    public:
-    explicit RuntimeDiagnostics(DiagnosticsProducer producer) noexcept;
+    explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false) noexcept;
 
     [[nodiscard]] RuntimeDiagnosticTarget target() noexcept;
     void write(RuntimeDiagnosticFact fact) noexcept;

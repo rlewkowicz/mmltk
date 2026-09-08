@@ -14,6 +14,8 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
@@ -32,11 +34,25 @@
 #include "src/controller/services/file_dialog_catalog.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/services/runtime_diagnostic_span.h"
 #include "src/controller/services/settings_store.h"
 
 namespace mmltk::controller::services {
+struct DiagnosticsClientTestAccess final {
+    [[nodiscard]] static std::unique_lock<std::mutex> LockQueue(DiagnosticsClient& client) {
+        return std::unique_lock{client.queue_mutex_for_test()};
+    }
+};
 namespace {
 
+struct DiagnosticCountingClock final {
+    using time_point = std::chrono::steady_clock::time_point;
+    static inline std::uint64_t reads = 0U;
+    [[nodiscard]] static time_point now() noexcept {
+        ++reads;
+        return time_point{std::chrono::nanoseconds{static_cast<std::int64_t>(reads)}};
+    }
+};
 using mmltk::common::io::ScopedFd;
 
 class ScopedEnvironmentVariable final {
@@ -227,6 +243,213 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
     RuntimeDiagnostics runtime{diagnostics.producer()};
     const auto target = runtime.target();
     CHECK_FALSE(target.benchmark_trace_enabled());
+    CHECK_FALSE(target.pixel_probes_enabled());
+    unsigned collections = 0U;
+    const auto ids = DiagnosticSpanIds::issued();
+    DiagnosticCountingClock::reads = 0U;
+    RuntimeDiagnosticSpan<RuntimeDiagnosticTarget, RuntimeDiagnosticFact, DiagnosticCountingClock> span{target, [&] {
+        ++collections;
+        return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
+    }};
+    span.FinishWith([&](auto&) { ++collections; });
+    CHECK(collections == 0U);
+    CHECK(DiagnosticCountingClock::reads == 0U);
+    CHECK(DiagnosticSpanIds::issued() == ids);
+}
+
+TEST_CASE("diagnostic spans pair overlapping intervals and explicit asynchronous parents", "[gui][services]") {
+    struct Capture final {
+        std::array<RuntimeDiagnosticFact, 4U>* output;
+        std::size_t* size;
+        [[nodiscard]] bool valid() const noexcept { return true; }
+        void operator()(RuntimeDiagnosticFact fact) const noexcept { (*output)[(*size)++] = fact; }
+    };
+    std::array<RuntimeDiagnosticFact, 4U> captured{};
+    std::size_t count = 0U;
+    Capture sink{&captured, &count};
+    auto facts = [] {
+        return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
+    };
+    DiagnosticCountingClock::reads = 0U;
+    RuntimeDiagnosticSpan<Capture, RuntimeDiagnosticFact, DiagnosticCountingClock> outer{sink, facts};
+    const auto parent = outer.link();
+    RuntimeDiagnosticSpan<Capture, RuntimeDiagnosticFact, DiagnosticCountingClock> child{sink, facts, parent};
+    outer.Finish();
+    child.Finish(contracts::DiagnosticSpanOutcome::Cancelled);
+    REQUIRE(count == 4U);
+    CHECK(captured[0U].context.span.span_outcome == contracts::DiagnosticSpanOutcome::Unspecified);
+    CHECK(captured[1U].context.span.span_outcome == contracts::DiagnosticSpanOutcome::Unspecified);
+    CHECK(captured[0U].context.link.span_id == captured[2U].context.link.span_id);
+    CHECK(captured[1U].context.link.span_id == captured[3U].context.link.span_id);
+    CHECK(captured[1U].context.link.span_id != parent.span_id);
+    CHECK(captured[1U].context.link.trace_id == parent.trace_id);
+    CHECK(captured[1U].context.link.parent_span_id == parent.span_id);
+    CHECK(DiagnosticCountingClock::reads == 4U);
+}
+
+TEST_CASE("effect-only submission drops on queue-lock contention while lossless submission waits", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-contention"};
+    const int descriptor = ::open((temporary.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    const auto operation = diagnostics.producer().acquire();
+    std::promise<void> locked;
+    std::promise<void> release;
+    auto release_ready = release.get_future();
+    std::jthread holder{[&] {
+        auto lock = DiagnosticsClientTestAccess::LockQueue(diagnostics);
+        locked.set_value();
+        release_ready.wait();
+    }};
+    locked.get_future().wait();
+    auto lossy = std::async(std::launch::async, [operation] { return operation.try_submit({"{\"event\":\"lossy\"}"}); });
+    const auto ready = lossy.wait_for(std::chrono::seconds{2});
+    auto lossless = std::async(std::launch::async, [operation] { return operation.submit({"{\"event\":\"lossless\"}"}); });
+    const auto waiting = lossless.wait_for(std::chrono::milliseconds{20});
+    release.set_value();
+    holder.join();
+    CHECK(ready == std::future_status::ready);
+    CHECK(lossy.get() == DiagnosticSubmitResult::Contended);
+    CHECK(waiting == std::future_status::timeout);
+    CHECK(lossless.get() == DiagnosticSubmitResult::Accepted);
+    CHECK(diagnostics.counters().dropped == 1U);
+}
+
+TEST_CASE("bounded runtime projection escapes valid text and rejects malformed UTF8", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-text"};
+    const auto path = temporary.path() / "trace.jsonl";
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    const std::string message{"quoted \"line\"\n\t\xc3\xa9"};
+    runtime.write({.event = "text", .message = message});
+    runtime.write({.event = "text", .message = "\xc0\x80"});
+    runtime.write({.event = "text", .message = "\xed\xa0\x80"});
+    CHECK(diagnostics.counters().accepted == 1U);
+    diagnostics.close();
+    const auto json = nlohmann::json::parse(read_file(path));
+    CHECK(json["message"] == message);
+    CHECK(json["span_outcome"] == static_cast<std::uint8_t>(contracts::DiagnosticSpanOutcome::Unspecified));
+}
+
+TEST_CASE("diagnostic spans preserve typed correlation and explicit scope outcomes", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostic-spans"};
+    const auto path = temporary.path() / "spans.jsonl";
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    const auto target = runtime.target();
+    REQUIRE(target.valid());
+    CHECK_FALSE(target.pixel_probes_enabled());
+    RuntimeDiagnostics probing{diagnostics.producer(), true};
+    CHECK(probing.target().pixel_probes_enabled());
+    const contracts::DiagnosticContext correlation{
+        .surface_high = 11U, .surface_low = 12U, .selection_generation = 13U, .frame_revision = 14U,
+        .source = {.source_session = 3U, .source_instance = 1U, .source_revision = 14U,
+                   .clean_revision = 10U, .source_observation_revision = 42U},
+        .demand = {.demand_generation = 9U},
+        .publication = {.presentation_revision = 17U},
+        .allocation = {.allocation_generation = 8U},
+        .transfer = {.transfer_sequence = 21U, .timeline_ready = 41U},
+    };
+    const auto facts = [&] {
+        RuntimeDiagnosticFact begin{.owner = contracts::DiagnosticOwner::Presentation, .event = "boundary.started", .context = correlation};
+        auto end = begin;
+        end.event = "boundary.completed";
+        return std::pair{begin, end};
+    };
+    {
+        RuntimeDiagnosticSpan span{target, facts};
+        span.Finish();
+    }
+    {
+        RuntimeDiagnosticSpan span{target, facts};
+        span.Finish(contracts::DiagnosticSpanOutcome::Cancelled);
+    }
+    try {
+        RuntimeDiagnosticSpan span{target, facts};
+        throw std::runtime_error("boundary failed");
+    } catch (const std::runtime_error&) {}
+    { RuntimeDiagnosticSpan span{target, facts}; }
+    diagnostics.close();
+    const std::array outcomes{contracts::DiagnosticSpanOutcome::Success, contracts::DiagnosticSpanOutcome::Cancelled,
+                              contracts::DiagnosticSpanOutcome::Exception, contracts::DiagnosticSpanOutcome::ScopeExit};
+    std::ifstream input{path};
+    std::string line;
+    for (const auto outcome : outcomes) {
+        REQUIRE(static_cast<bool>(std::getline(input, line)));
+        CHECK(nlohmann::json::parse(line)["event"] == "boundary.started");
+        REQUIRE(static_cast<bool>(std::getline(input, line)));
+        const auto record = nlohmann::json::parse(line);
+        CHECK(record["event"] == "boundary.completed");
+        CHECK(record["owner"] == "presentation");
+        CHECK(record["source_revision"] == 14U);
+        CHECK(record["clean_revision"] == 10U);
+        CHECK(record["source_observation_revision"] == 42U);
+        CHECK(record["demand_generation"] == 9U);
+        CHECK(record["selection_generation"] == 13U);
+        CHECK(record["presentation_revision"] == 17U);
+        CHECK(record["allocation_generation"] == 8U);
+        CHECK(record["transfer_sequence"] == 21U);
+        CHECK(record["span_outcome"] == static_cast<std::uint8_t>(outcome));
+        CHECK(record["duration_ns"].is_number_unsigned());
+    }
+    CHECK_FALSE(std::getline(input, line));
+    CHECK_FALSE(target.valid());
+    CHECK_FALSE(probing.target().pixel_probes_enabled());
+}
+
+TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][services]") {
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostic-span-overflow"};
+    const int descriptor = ::open((temporary.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    REQUIRE(descriptor >= 0);
+    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    auto target = runtime.target();
+    const auto operation = diagnostics.producer().acquire();
+    for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity; ++index)
+        REQUIRE(operation.submit({"{\"event\":\"full\"}"}) == DiagnosticSubmitResult::Accepted);
+    bool executed = false;
+    {
+        RuntimeDiagnosticSpan span{target, [] {
+            return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
+        }};
+        executed = true;
+        span.Finish();
+    }
+    CHECK(executed);
+    CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity);
+    CHECK(diagnostics.counters().dropped == 2U);
+    {
+        RuntimeDiagnosticSpan span{target, [] {
+            return std::pair{RuntimeDiagnosticFact{.event = "begin"}, RuntimeDiagnosticFact{.event = "end"}};
+        }};
+        diagnostics.close(DiagnosticsCloseMode::Discard);
+    }
+    CHECK_FALSE(target.valid());
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+}
+
+TEST_CASE("runtime trace overflow never waits for a stalled background writer", "[gui][services]") {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    ScopedFd writer{descriptors[1]};
+    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+    DiagnosticsClient diagnostics{std::move(writer)};
+    const auto operation = diagnostics.producer().acquire();
+    const std::string record = maximum_diagnostic_record();
+    REQUIRE(operation.submit({record}) == DiagnosticSubmitResult::Accepted);
+    pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
+    REQUIRE(::poll(&readable, 1U, 5000) == 1);
+    RuntimeDiagnostics runtime{diagnostics.producer()};
+    for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity + 2U; ++index)
+        runtime.target().write({.event = "capacity", .sequence = index});
+    CHECK(diagnostics.counters().dropped >= 2U);
+    diagnostics.close(DiagnosticsCloseMode::Discard);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
 }
 
 TEST_CASE("diagnostics environment uses only the canonical GUI trace path", "[gui][services]") {
@@ -266,6 +489,8 @@ TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][servi
     const auto target = runtime.target();
     REQUIRE(target.benchmark_trace_enabled());
     target.write_benchmark_trace("benchmark.publication.complete", R"({"output":"/tmp/compiled","train_images":100})");
+    target.write_benchmark_trace("benchmark.publication.complete", "{\n\"train_images\":100}");
+    target.write_benchmark_trace("benchmark.publication.complete", R"({"train_images":})");
     CHECK(diagnostics.counters().accepted == 1U);
     diagnostics.flush();
     std::array<char, DiagnosticsClient::kRecordCapacity> record{};

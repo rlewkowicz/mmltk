@@ -30,10 +30,36 @@ pub(crate) fn trace_surface(event: &str, surface: Surface) {
 fn trace_frame(event: &str, frame: FrameReady) {
     if surface_trace_enabled() {
         emit_surface_trace(&format!(
-            "{{\"event\":\"iced.frame.{event}\",\"surface\":\"{:016x}{:016x}\",\"source_revision\":{},\"presentation_revision\":{}}}",
-            frame.high, frame.low, frame.content_sequence, frame.presentation_revision,
+            "{{\"event\":\"iced.frame.{event}\",\"surface\":\"{:016x}{:016x}\",\"source_revision\":{}{}}}",
+            frame.high, frame.low, frame.content_sequence, frame_trace_fields(Some(frame)),
         ));
     }
+}
+
+// One projection of the physical native receipt. Capture notifications carry
+// the receipt by value, including when the requested surface has since changed.
+#[cfg(target_arch = "wasm32")]
+fn frame_trace_fields(frame: Option<FrameReady>) -> String {
+    format!(
+        ",\"frame_revision\":{},\"presentation_revision\":{},\"content_session\":{},\"layer\":{},\"slot\":{},\"content_width\":{},\"content_height\":{}",
+        frame.map_or(0, |f| f.content_sequence),
+        frame.map_or(0, |f| f.presentation_revision),
+        frame.map_or(0, |f| f.content_session),
+        frame.map_or(0, |f| f.layer),
+        frame.map_or(0, |f| f.slot),
+        frame.map_or(0, |f| f.content_width),
+        frame.map_or(0, |f| f.content_height),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn surface_trace_fields(surface: Surface, requested: Surface) -> String {
+    format!(
+        "\"surface\":\"{:016x}{:016x}\",\"requested_surface\":\"{:016x}{:016x}\",\"generation\":{},\"width\":{},\"height\":{},\"allocation_generation\":{},\"timeline_ready\":{}{}",
+        surface.high, surface.low, requested.high, requested.low,
+        surface.generation, surface.width, surface.height, surface.generation,
+        surface.timeline_ready, frame_trace_fields(surface.frame),
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -45,21 +71,8 @@ fn trace_surface_request(event: &str, surface: Surface, requested: Surface, cont
         return;
     }
     let line = format!(
-        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",\"surface\":\"{:016x}{:016x}\",\"generation\":{},\"width\":{},\"height\":{},\"frame_revision\":{},\"presentation_revision\":{},\"requested_surface\":\"{:016x}{:016x}\",\"content_session\":{},\"layer\":{},\"slot\":{},\"content_width\":{},\"content_height\":{}}}",
-        surface.high,
-        surface.low,
-        surface.generation,
-        surface.width,
-        surface.height,
-        surface.frame.map_or(0, |frame| frame.content_sequence),
-        surface.frame.map_or(0, |frame| frame.presentation_revision),
-        requested.high,
-        requested.low,
-        surface.frame.map_or(0, |frame| frame.content_session),
-        surface.frame.map_or(0, |frame| frame.layer),
-        surface.frame.map_or(0, |frame| frame.slot),
-        surface.frame.map_or(0, |frame| frame.content_width),
-        surface.frame.map_or(0, |frame| frame.content_height),
+        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}}}",
+        surface_trace_fields(surface, requested),
     );
     emit_surface_trace(&line);
 }
@@ -80,8 +93,9 @@ fn emit_surface_trace(line: &str) {
 #[cfg(target_arch = "wasm32")]
 fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreSnapshot>) -> String {
     snapshot.map_or_else(String::new, |snapshot| format!(
-        ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?}",
+        ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"source_observation_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?}",
         crate::generated::presentation_source_session(snapshot.frame.source.kind), snapshot.frame.source.instance, snapshot.frame.revision,
+        crate::generated::visual_clean_content_identity(&snapshot.frame).revision, snapshot.revision,
         snapshot.dataset.identity, snapshot.gallery.generation, snapshot.gallery.slots,
         snapshot.viewport.columns, snapshot.viewport.rowcount, snapshot.viewport.firstrow,
         snapshot.order.matchingcount, snapshot.order.visibleindices,
@@ -100,7 +114,7 @@ fn trace_image(
     if !surface_trace_enabled() {
         return;
     }
-    let Some(frame) = surface.frame else {
+    let Some(_) = surface.frame else {
         return;
     };
     let geometry = geometry.map_or_else(String::new, |(bounds, visible)| {
@@ -111,21 +125,8 @@ fn trace_image(
         format!(",\"bounds\":{}{visible}", rect(bounds))
     });
     emit_surface_trace(&format!(
-        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",\"surface\":\"{:016x}{:016x}\",\"requested_surface\":\"{:016x}{:016x}\",\"generation\":{},\"width\":{},\"height\":{},\"presentation_revision\":{},\"frame_revision\":{},\"content_session\":{},\"layer\":{},\"slot\":{},\"content_width\":{},\"content_height\":{}{}{geometry}}}",
-        surface.high,
-        surface.low,
-        requested.high,
-        requested.low,
-        surface.generation,
-        surface.width,
-        surface.height,
-        frame.presentation_revision,
-        frame.content_sequence,
-        frame.content_session,
-        frame.layer,
-        frame.slot,
-        frame.content_width,
-        frame.content_height,
+        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}{}{geometry}}}",
+        surface_trace_fields(surface, requested),
         gallery_trace_fields(snapshot),
     ));
 }

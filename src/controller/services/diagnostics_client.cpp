@@ -403,19 +403,34 @@ bool DiagnosticsProducer::Operation::enabled() const noexcept {
     return state_ != nullptr && state_->enabled.load(std::memory_order_acquire);
 }
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record) const noexcept {
+    return submit(record, true);
+}
+DiagnosticSubmitResult DiagnosticsProducer::Operation::try_submit(const DiagnosticRecord record) const noexcept {
+    return submit(record, false);
+}
+std::mutex& DiagnosticsClient::queue_mutex_for_test() noexcept { return state_->mutex; }
+
+DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record, const bool wait_for_capacity,
+                                                             const bool validate) const noexcept {
     if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
     if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
         state_->dropped.fetch_add(1U, std::memory_order_relaxed);
         return DiagnosticSubmitResult::RecordTooLarge;
     }
-    if (!valid_json_object(record.json)) {
+    if (validate && !valid_json_object(record.json)) {
         state_->dropped.fetch_add(1U, std::memory_order_relaxed);
         return DiagnosticSubmitResult::InvalidJson;
     }
-    std::unique_lock lock(state_->mutex);
+    std::unique_lock lock(state_->mutex, std::defer_lock);
+    if (wait_for_capacity) {
+        lock.lock();
+    } else if (!lock.try_lock()) {
+        state_->dropped.fetch_add(1U, std::memory_order_relaxed);
+        return DiagnosticSubmitResult::Contended;
+    }
     if (state_->closing || state_->failed || state_->descriptor.get() < 0) return DiagnosticSubmitResult::Closed;
     if (state_->size == DiagnosticsClient::kQueueCapacity) {
-        if (state_->policy == DiagnosticsExecutionPolicy::CallerDriven) {
+        if (!wait_for_capacity || state_->policy == DiagnosticsExecutionPolicy::CallerDriven) {
             state_->dropped.fetch_add(1U, std::memory_order_relaxed);
             return DiagnosticSubmitResult::Capacity;
         }

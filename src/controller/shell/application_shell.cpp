@@ -31,44 +31,12 @@ void normalize(ApplicationShellConfig::PresentationConfig& config) {
         throw std::invalid_argument("invalid presentation configuration");
 }
 
-void visual_diagnostic(void* context, VisualDiagnosticFact fact) noexcept {
-    if (!context) return;
-    std::optional<services::RuntimeDiagnosticOwner> owner;
-    switch (fact.system) {
-        case VisualSystemKind::Explore:
-            owner = services::RuntimeDiagnosticOwner::Explore;
-            break;
-        case VisualSystemKind::Annotation:
-            owner = services::RuntimeDiagnosticOwner::Annotation;
-            break;
-        case VisualSystemKind::Upscale:
-            owner = services::RuntimeDiagnosticOwner::Upscale;
-            break;
-        case VisualSystemKind::Live:
-            owner = services::RuntimeDiagnosticOwner::Live;
-            break;
-        case VisualSystemKind::Presentation:
-            owner = services::RuntimeDiagnosticOwner::Presentation;
-            break;
-    }
-    const auto event = visual_diagnostic_event_name(fact.operation);
-    if (!owner || event.empty()) return;
-    static_cast<services::RuntimeDiagnostics*>(context)->write(
-        {.owner = *owner,
-         .event = event,
-         .sequence = fact.generation,
-         .value = fact.value,
-         .detail = fact.detail != 0U ? fact.detail : static_cast<std::uint64_t>(fact.copy_path),
-         .device = fact.device,
-         .context = fact.context,
-         .message = fact.failure_detail});
-}
-
 }  // namespace
 
 ApplicationShell::ApplicationShell(ApplicationShellConfig config)
     : diagnostics_client_(std::move(config.diagnostics)),
-      runtime_diagnostics_(diagnostics_client_.producer()),
+      runtime_diagnostics_(diagnostics_client_.producer(), config.pixel_probes),
+      visual_diagnostic_target_(runtime_diagnostics_.target()),
       browser_host_(browser_server_, runtime_diagnostics_.target()),
       provider_owner_(std::move(config.vast_provider)),
       file_dialog_owner_(config.file_dialog_helper, config.file_dialog_launch_directory),
@@ -87,9 +55,7 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
         .maximum_height = output_extent.height,
         .numa_node = base_visual.numa_node,
     };
-    const VisualDiagnosticSink diagnostics = runtime_diagnostics_.target().valid()
-                                                 ? VisualDiagnosticSink{.context = &runtime_diagnostics_, .write = &visual_diagnostic}
-                                                 : VisualDiagnosticSink{};
+    const VisualDiagnosticSink diagnostics = visual_diagnostic_sink(visual_diagnostic_target_);
     auto explore_configuration = std::move(config.explore);
     explore_configuration.diagnostics = diagnostics;
     systems_ = std::make_unique<ApplicationSystemStorage>(
@@ -178,9 +144,9 @@ void ApplicationShell::request_shutdown(const services::ApplicationShutdownReaso
         shutdown_requested_.store(true, std::memory_order_release);
         const auto diagnostics = runtime_diagnostics_.target();
         if (diagnostics.valid())
-            diagnostics.write({.owner = services::RuntimeDiagnosticOwner::BrowserRuntime,
+            diagnostics.Emit([&] { return services::RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::BrowserRuntime,
                                .event = "shutdown.requested",
-                               .detail = static_cast<std::uint64_t>(reason)});
+                               .detail = static_cast<std::uint64_t>(reason)}; });
         emit_shutdown_event("shutdown.ingress.started");
         browser_host_.close_admission();
         emit_shutdown_event("shutdown.ingress.completed");
@@ -281,10 +247,10 @@ bool ApplicationShell::join_systems() noexcept {
 bool ApplicationShell::healthy() const noexcept { return shutdown_complete_ && healthy_; }
 
 void ApplicationShell::emit_shutdown_event(const std::string_view event) noexcept {
-    runtime_diagnostics_.target().write({
-        .owner = services::RuntimeDiagnosticOwner::BrowserRuntime,
+    runtime_diagnostics_.target().Emit([&] { return services::RuntimeDiagnosticFact{
+        .owner = contracts::DiagnosticOwner::BrowserRuntime,
         .event = event,
-    });
+    }; });
 }
 
 }  // namespace mmltk::controller::shell

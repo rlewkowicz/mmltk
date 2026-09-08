@@ -50,6 +50,7 @@
 #include "src/controller/browser/application_stable_identity.h"
 #include "src/controller/contracts/gui_settings.h"
 #include "src/controller/contracts/annotation.h"
+#include "src/controller/contracts/diagnostic_context.h"
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/services/firefox_process_owner.h"
@@ -397,6 +398,7 @@ struct SurfaceAudit final {
         std::size_t retired = 0U;
         std::optional<Reconstruction> reconstruction;
         std::map<std::uint64_t, unsigned> source_steps;
+        std::map<std::uint64_t, std::uint64_t> ended_spans;
         std::map<std::uint64_t, std::uint64_t> publications;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> samples;
     };
@@ -460,6 +462,22 @@ struct SurfaceAudit final {
         state.generation = generation;
         state.width = width;
         state.height = height;
+        const bool copying = event == "presentation.source_borrow.started" || event == "presentation.source_borrow.completed" ||
+                             event == "presentation.source.copy";
+        const bool transferred = event == "presentation.ready_sync.started" || event == "presentation.ready_sync.completed" ||
+                                 event == "presentation.frame.edge" || event == "presentation.release_wait.started" ||
+                                 event == "presentation.release_wait.completed";
+        if (copying || transferred) {
+            if (scalar(record, "source_revision") != scalar(record, "frame_revision") ||
+                scalar(record, "allocation_generation") != generation ||
+                scalar(record, "presentation_revision") != scalar(record, "value"))
+                reject("native operation mixes source allocation or publication identities");
+            if (copying && (scalar(record, "presentation_revision") != 0U || scalar(record, "transfer_sequence") != 0U ||
+                            scalar(record, "timeline_ready") != 0U))
+                reject("new native copy inherited an incumbent physical publication");
+            if (transferred && (scalar(record, "transfer_sequence") == 0U || scalar(record, "timeline_ready") == 0U))
+                reject("native physical operation omitted its transfer identity");
+        }
         if (state.native_retired) reject("native transition after physical retirement");
         const auto advance = [&](const unsigned from) {
             if (state.native_stage != from) reject("native admission stages are missing, duplicate, or reordered");
@@ -484,6 +502,16 @@ struct SurfaceAudit final {
             if (scalar(record, "outcome") != 1U) reject("native physical retirement failed");
             state.native_retired = true;
         } else {
+            const bool span_end = event == "presentation.source_borrow.completed" ||
+                                  event == "presentation.ready_sync.completed" ||
+                                  event == "presentation.release_wait.completed";
+            if (span_end) {
+                const auto span_outcome = scalar(record, "span_outcome");
+                state.ended_spans.insert_or_assign(scalar(record, "span_id"), span_outcome);
+                if (span_outcome != static_cast<std::uint64_t>(mmltk::controller::contracts::DiagnosticSpanOutcome::Success) ||
+                    scalar(record, "outcome") != 1U) return;
+            }
+            if (event == "presentation.source.copy" && scalar(record, "outcome") != 0U) return;
             auto& steps = state.source_steps[scalar(record, "frame_revision")];
             const auto step = [&](const unsigned required, const unsigned next) {
                 if (state.native_stage != 4U || state.import_failed || steps != required)
@@ -3387,10 +3415,19 @@ MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][si
 namespace {
 
 [[nodiscard]] nlohmann::json native_surface_record(const char* event, const std::uint64_t low = 12U) {
+    const std::string_view name{event};
+    const bool copying = name.starts_with("presentation.source_borrow.") || name == "presentation.source.copy";
     return {{"kind", "gui_runtime"}, {"event", event},        {"sequence", 7U},
             {"surface_high", 11U},   {"surface_low", low},    {"selection_generation", 19U},
             {"frame_revision", 23U}, {"capacity_width", 64U}, {"capacity_height", 32U},
-            {"condition", 2U},       {"outcome", 1U},         {"value", 1U}};
+            {"condition", 2U},       {"outcome", name == "presentation.source.copy" ? 0U : 1U},
+            {"value", copying ? 0U : 1U}, {"source_revision", 23U}, {"allocation_generation", 7U},
+            {"presentation_revision", copying ? 0U : 1U}, {"transfer_sequence", copying ? 0U : 1U},
+            {"timeline_ready", copying ? 0U : 1U},
+            {"span_id", 31U},
+            {"span_outcome", static_cast<std::uint64_t>(std::string_view{event}.ends_with(".completed")
+                ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
+                : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
 }
 
 [[nodiscard]] nlohmann::json browser_surface_record(const char* event, const std::uint64_t low = 12U) {
@@ -3434,6 +3471,23 @@ TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]"
     SurfaceAudit audit;
     audit.browser(nlohmann::json{{"event", "iced.surface.texture_create"}, {"surface", "not-a-capability"}});
     CHECK_FALSE(audit.joined_failure().empty());
+}
+
+TEST_CASE("surface join records failed span endings without accepting a completed physical transition", "[workspace][audit]") {
+    using mmltk::controller::contracts::DiagnosticSpanOutcome;
+    for (const auto outcome : {DiagnosticSpanOutcome::Unspecified, DiagnosticSpanOutcome::ScopeExit,
+                               DiagnosticSpanOutcome::Cancelled, DiagnosticSpanOutcome::Exception}) {
+        SurfaceAudit audit;
+        for (std::size_t index = 0U; index < 5U; ++index) audit.native(native_surface_record(native_surface_events[index]));
+        auto ended = native_surface_record("presentation.source_borrow.completed");
+        ended["span_outcome"] = static_cast<std::uint64_t>(outcome);
+        audit.native(ended);
+        const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(ended));
+        CHECK(surface.source_steps.at(23U) == 1U);
+        CHECK(surface.ended_spans.at(31U) == static_cast<std::uint64_t>(outcome));
+        audit.native(native_surface_record("presentation.source.copy"));
+        CHECK_FALSE(audit.joined_failure().empty());
+    }
 }
 
 TEST_CASE("surface join rejects omitted or reordered admission and copy stages", "[workspace][audit]") {

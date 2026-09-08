@@ -141,10 +141,10 @@ class ExploreSystem::Impl final {
               diagnostics_.valid()
                   ? detail::VisualRuntimeOwner::ActivityObservation{[diagnostics](const detail::VisualRuntimeOwner::ActivityStage stage,
                                                                                   const std::uint64_t value) noexcept {
-                        diagnostics({.system = VisualSystemKind::Explore,
+                        diagnostics.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                      .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
                                      .value = value,
-                                     .detail = 30U + static_cast<std::uint64_t>(stage)});
+                                     .detail = 30U + static_cast<std::uint64_t>(stage)}; });
                     }}
                   : detail::VisualRuntimeOwner::ActivityObservation{}) {
         if (!settings_.valid() || nproc == 0U || nproc > kExploreMaximumParallelism)
@@ -914,32 +914,32 @@ class ExploreSystem::Impl final {
             if (stale) {
                 return std::nullopt;
             }
-            diagnostics_({.system = VisualSystemKind::Explore,
+            diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                           .operation = VisualDiagnosticOperation::PlaceholderPublished,
                           .device = settings_.device,
                           .generation = generation,
                           .value = plan.viewport.first_row,
                           .context = {.capacity_width = plan.viewport.extent.width,
                                       .capacity_height = plan.viewport.extent.height,
-                                      .staging_bytes = publication.active_pinned_bytes}});
+                                      .staging_bytes = publication.active_pinned_bytes}}; });
             if (publication.cumulative_tiles != 0U)
-                diagnostics_({.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                               .operation = VisualDiagnosticOperation::TileBatchPublished,
                               .device = settings_.device,
                               .generation = generation,
                               .value = publication.cumulative_tiles,
                               .detail = publication.reused_tiles,
-                              .context = {.staging_bytes = publication.active_pinned_bytes}});
+                              .context = {.staging_bytes = publication.active_pinned_bytes}}; });
         } else {
             rendered.gallery = {};
         }
         DiagnoseFrame(rendered.frame, generation);
-        diagnostics_({.system = VisualSystemKind::Explore,
+        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                       .operation = VisualDiagnosticOperation::RenderCompleted,
                       .device = settings_.device,
                       .generation = generation,
                       .value = nproc,
-                      .detail = (plan.augmentation.enabled ? 1U : 0U) | (plan.augmentation_config.enabled ? 2U : 0U)});
+                      .detail = (plan.augmentation.enabled ? 1U : 0U) | (plan.augmentation_config.enabled ? 2U : 0U)}; });
         return rendered;
     }
     void SubmitGalleryContinuation() noexcept { static_cast<void>(worker_.NotifyContinuation()); }
@@ -947,9 +947,9 @@ class ExploreSystem::Impl final {
         worker_.RegisterContinuation(
             [this](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                    const std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
-                diagnostics_({.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                               .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
-                              .device = settings_.device});
+                              .device = settings_.device}; });
                 if (stop.stop_requested()) return {};
                 auto& algorithm = explore_algorithm(runtime);
                 std::uint64_t generation;
@@ -961,24 +961,24 @@ class ExploreSystem::Impl final {
                     extent = state_.viewport.extent;
                 }
                 const auto advanced = algorithm.AdvanceGallery();
-                diagnostics_({.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                               .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
                               .device = settings_.device,
                               .generation = advanced.generation,
                               .value = advanced.cumulative_tiles,
                               .detail = 20U,
                               .context = {.capacity_width = static_cast<std::uint32_t>(advanced.remaining_tiles),
-                                          .staging_bytes = advanced.active_pinned_bytes}});
+                                          .staging_bytes = advanced.active_pinned_bytes}}; });
                 if (stop.stop_requested()) return {};
                 if (advanced.stale_discarded != 0U)
-                    diagnostics_({.system = VisualSystemKind::Explore,
+                    diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                   .operation = VisualDiagnosticOperation::StaleThumbnailDiscarded,
                                   .device = settings_.device,
                                   .generation = advanced.generation,
                                   .value = advanced.stale_discarded,
                                   .context = {.capacity_width = extent.width,
                                               .capacity_height = extent.height,
-                                              .staging_bytes = advanced.active_pinned_bytes}});
+                                              .staging_bytes = advanced.active_pinned_bytes}}; });
                 {
                     std::scoped_lock lock(mutex_);
                     if (generation != latest_generation_ || generation != active_gallery_generation_ || advanced.generation != generation ||
@@ -995,7 +995,7 @@ class ExploreSystem::Impl final {
                         changed.revision = mmltk::common::types::advance_monotonic_identity(changed.revision);
                         auto notification = ChangedNotification(changed);
                         state_ = std::move(changed);
-                        diagnostics_({.system = VisualSystemKind::Explore,
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                       .operation = VisualDiagnosticOperation::TileBatchPublished,
                                       .device = settings_.device,
                                       .generation = generation,
@@ -1003,7 +1003,7 @@ class ExploreSystem::Impl final {
                                       .detail = advanced.reused_tiles,
                                       .context = {.capacity_width = extent.width,
                                                   .capacity_height = extent.height,
-                                                  .staging_bytes = advanced.active_pinned_bytes}});
+                                                  .staging_bytes = advanced.active_pinned_bytes}}; });
                         // Completion freed physical lanes. Preserve this capacity
                         // event while the current notification leaves the worker.
                         SubmitGalleryContinuation();
@@ -1011,23 +1011,22 @@ class ExploreSystem::Impl final {
                     }
                 }
                 const bool ready_tiles = algorithm.HasGalleryTiles();
-                diagnostics_({.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                               .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
                               .device = settings_.device,
                               .generation = generation,
                               .value = ready_tiles ? 1U : 0U,
-                              .detail = 21U});
+                              .detail = 21U}; });
                 if (!ready_tiles) return {};
                 algorithm.PrepareOutputPublication();
                 ExploreGalleryPublication published;
-                diagnostics_(
-                    {.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                      .operation = VisualDiagnosticOperation::TileBatchPublishStarted,
                      .device = settings_.device,
                      .generation = generation,
                      .value = advanced.cumulative_tiles,
                      .context = {
-                         .capacity_width = extent.width, .capacity_height = extent.height, .staging_bytes = advanced.active_pinned_bytes}});
+                         .capacity_width = extent.width, .capacity_height = extent.height, .staging_bytes = advanced.active_pinned_bytes}}; });
                 auto output = runtime.AcquireOutput(stop, runtime.Completed());
                 if (!output.valid()) {
                     RollbackOutput(algorithm);
@@ -1036,23 +1035,23 @@ class ExploreSystem::Impl final {
                 try {
                     runtime.Publish(output, extent.width, extent.height,
                                     [&](const auto clean, const auto semantic, const auto stream) {
-                                        diagnostics_({.system = VisualSystemKind::Explore,
+                                        services::RuntimeDiagnosticSpan compose_span{diagnostics_, [&] {
+                                            return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
                                                       .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
                                                       .device = settings_.device,
                                                       .generation = generation,
                                                       .value = advanced.cumulative_tiles,
                                                       .context = {.capacity_width = extent.width,
                                                                   .capacity_height = extent.height,
-                                                                  .staging_bytes = advanced.active_pinned_bytes}});
+                                                                  .staging_bytes = advanced.active_pinned_bytes,
+                                                                  .demand = {.demand_generation = generation}}},
+                                                                  VisualDiagnosticOperation::TileBatchComposeCompleted);
+                                        }};
                                         published = algorithm.PublishGalleryTiles(clean, semantic, stream);
-                                        diagnostics_({.system = VisualSystemKind::Explore,
-                                                      .operation = VisualDiagnosticOperation::TileBatchComposeCompleted,
-                                                      .device = settings_.device,
-                                                      .generation = generation,
-                                                      .value = published.cumulative_tiles,
-                                                      .context = {.capacity_width = extent.width,
-                                                                  .capacity_height = extent.height,
-                                                                  .staging_bytes = published.active_pinned_bytes}});
+                                        compose_span.FinishWith([&](auto& fact) {
+                                            fact.value = published.cumulative_tiles;
+                                            fact.context.staging_bytes = published.active_pinned_bytes;
+                                        });
                                     });
                     auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, extent, output.revision());
                     PreparedProduct product{
@@ -1097,20 +1096,22 @@ class ExploreSystem::Impl final {
                 }
             },
             [this]() noexcept {
-                diagnostics_({.system = VisualSystemKind::Explore,
+                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                               .operation = VisualDiagnosticOperation::ExploreContinuationStarted,
                               .device = settings_.device,
-                              .detail = 22U});
+                              .detail = 22U}; });
             });
     }
     void DiagnoseFrame(const VisualFrame& frame, const std::uint64_t generation) const noexcept {
         if (!diagnostics_.valid()) return;
-        diagnostics_({.system = VisualSystemKind::Explore,
+        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                       .operation = VisualDiagnosticOperation::ExploreFramePublished,
                       .device = settings_.device,
                       .generation = generation,
                       .value = frame.revision,
-                      .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height}});
+                      .context = {.capacity_width = frame.extent.width, .capacity_height = frame.extent.height,
+                                  .source = visual_diagnostic_source({.frame = frame}),
+                                  .demand = {.demand_generation = generation}}}; });
     }
     [[nodiscard]] std::optional<PreparedProduct> RenderGallery(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                               ExploreAlgorithm& algorithm, ExploreRenderPlan& plan,
@@ -1346,7 +1347,7 @@ class ExploreSystem::Impl final {
             }
             resume_gallery = retain_product && active_gallery_generation_ != 0U;
         }
-        report_visual_worker_failure(diagnostics_, VisualSystemKind::Explore, settings_.device, detail);
+        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Explore, settings_.device, detail);
         Publish(ExploreFailed{std::move(failed), std::move(detail)});
         if (resume_gallery) SubmitGalleryContinuation();
     }

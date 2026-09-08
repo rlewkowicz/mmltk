@@ -8,6 +8,8 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <cuda_runtime_api.h>
+#include <fcntl.h>
+#include <nlohmann/json.hpp>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -22,6 +24,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <limits>
@@ -31,6 +34,8 @@
 #include <optional>
 #include <ranges>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -47,6 +52,9 @@
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/services/settings_system.h"
+#include "src/controller/services/diagnostics_client.h"
+#include "src/controller/services/runtime_diagnostics.h"
+#include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "filesystem_test_utils.hpp"
@@ -1397,6 +1405,7 @@ struct TestPresentationWriterState final {
     std::atomic_bool terminal_release_succeeds{true};
     std::atomic_bool terminal_source_settled{true};
     std::promise<void> first_submission;
+    std::promise<void> second_submission;
     std::promise<void> third_submission;
     std::promise<void> allocation_retired;
     std::promise<void> pump_entered;
@@ -1424,6 +1433,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
         const auto submission = state_->submissions.fetch_add(1U, std::memory_order_acq_rel);
         if (submission == 0U) state_->first_submission.set_value();
+        if (submission == 1U) state_->second_submission.set_value();
         if (submission == 2U) state_->third_submission.set_value();
         submitted_ = submitted;
         const auto& frame = submitted.observation.frame;
@@ -1504,6 +1514,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             active_ = std::exchange(candidate_, std::nullopt);
         }
         pending_->timeline_ready = state_->timeline.fetch_add(1U, std::memory_order_acq_rel) + 1U;
+        pending_->transfer_sequence = pending_->timeline_ready;
         pending_->presentation_revision = state_->presentation_revision.fetch_add(1U, std::memory_order_acq_rel) + 1U;
         auto outcome = PresentationNativeOutcome{
             .progress = PresentationNativeProgress::Published,
@@ -1628,7 +1639,7 @@ class DiagnosticCapture final {
     }
     std::atomic<std::uint64_t> count{0U};
     std::atomic<std::uint64_t> stale_discarded{0U};
-    std::atomic<VisualSystemKind> last_system{VisualSystemKind::Explore};
+    std::atomic<contracts::DiagnosticOwner> last_system{contracts::DiagnosticOwner::Explore};
 };
 
 constexpr VisualDeviceSettings kDevice{
@@ -2012,10 +2023,12 @@ struct UpscaleSourceFixture final {
 
 class PresentationSourceFixture final {
    public:
-    PresentationSourceFixture()
+    explicit PresentationSourceFixture(const std::size_t buffers = 1U)
         : backend_(std::make_shared<FakeImageBackend>()),
+          revisions_(std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>()),
           source_(std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
-              mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
+              mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                  .device = 0, .backend = backend_, .output_buffer_count = buffers, .product_revisions = revisions_})),
           sources_{VisualSourceReader{
               .source = identity_,
               .observe =
@@ -2036,14 +2049,28 @@ class PresentationSourceFixture final {
     void AdvanceObservation() { snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel); }
     void Advance() {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
+        UpdateObservation();
+    }
+    [[nodiscard]] auto Completed() const { return source_->Completed(); }
+    void SelectCompleted(const mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput& product) {
+        source_->SelectOutput(product);
+        UpdateObservation();
+    }
+    void Reconstruct() {
+        source_ = std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
+            mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_, .product_revisions = revisions_});
+        Advance();
+    }
+   private:
+    void UpdateObservation() {
         const auto borrowed = source_->Borrow();
         REQUIRE(borrowed.valid());
         latest_revision_.store(borrowed.plane(0U).revision(), std::memory_order_release);
         snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel);
     }
 
-   private:
     std::shared_ptr<FakeImageBackend> backend_;
+    std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence> revisions_;
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> source_;
     std::atomic<std::uint64_t> latest_revision_{1U};
     std::atomic<std::uint64_t> snapshot_revision_{1U};
@@ -2685,7 +2712,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
     CHECK(observed_nproc->load(std::memory_order_acquire) == 4U);
     CHECK(diagnostics.count.load(std::memory_order_acquire) != 0U);
-    CHECK(diagnostics.last_system.load(std::memory_order_acquire) == VisualSystemKind::Explore);
+    CHECK(diagnostics.last_system.load(std::memory_order_acquire) == contracts::DiagnosticOwner::Explore);
 
     EventGate annotation_events;
     auto document_revision = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -5043,6 +5070,104 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
 
+TEST_CASE("Presentation diagnostics retain exact observations across supersession cache reuse reconnect and reconstruction") {
+    PresentationSourceFixture source{2U};
+    EventGate events;
+    struct Capture final {
+        std::array<VisualDiagnosticFact, 6U> completed{};
+        std::size_t count = 0U;
+    } capture;
+    const VisualDiagnosticSink diagnostics{
+        .context = &capture,
+        .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            auto& output = *static_cast<Capture*>(context);
+            if (fact.operation == VisualDiagnosticOperation::TimelineReady && output.count < output.completed.size())
+                output.completed[output.count++] = fact;
+        }};
+    auto writer = std::make_shared<TestPresentationWriterState>();
+    PresentationSystem presentation{
+        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
+        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    const auto await_publication = [&](std::uint64_t revision) {
+        writer->SignalReadiness();
+        REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision == revision; }));
+    };
+    auto first = source.Completed();
+    static_cast<void>(presentation.Select(source.identity()));
+    await_publication(1U);
+    writer->allow_publication.store(false);
+    source.Advance();
+    auto second = source.Completed();
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(writer->second_submission.get_future().wait_for(2s) == std::future_status::ready);
+    source.SelectCompleted(first);
+    static_cast<void>(presentation.Select(source.identity()));
+    writer->allow_publication.store(true);
+    await_publication(2U);
+    source.SelectCompleted(second);
+    static_cast<void>(presentation.Select(source.identity()));
+    await_publication(3U);
+    source.SelectCompleted(first);
+    static_cast<void>(presentation.Select(source.identity()));
+    await_publication(4U);
+    presentation.Observe({.redraw_requested = true});  // Reconnected renderer requests a new physical receipt.
+    await_publication(5U);
+    first = {};
+    second = {};
+    source.Reconstruct();
+    static_cast<void>(presentation.Select(source.identity()));
+    await_publication(6U);
+    presentation.CloseAdmission();
+    presentation.BrowserPeerLost();
+    REQUIRE(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+    REQUIRE(capture.count == 6U);
+    constexpr std::array products{1U, 1U, 2U, 1U, 1U, 3U};
+    constexpr std::array observations{1U, 3U, 4U, 5U, 5U, 6U};
+    for (std::size_t index = 0U; index < capture.count; ++index) {
+        const auto& fact = capture.completed[index];
+        CHECK(fact.context.frame_revision == products[index]);
+        CHECK(fact.context.source.source_revision == products[index]);
+        CHECK(fact.context.source.source_observation_revision == observations[index]);
+        CHECK(fact.context.source.clean_revision == products[index]);
+        CHECK(fact.context.publication.presentation_revision == index + 1U);
+        CHECK(fact.context.transfer.transfer_sequence == index + 1U);
+        CHECK(fact.context.transfer.timeline_ready == fact.value);
+        CHECK(fact.context.allocation.allocation_generation == 1U);
+        CHECK(fact.context.surface_high == capture.completed[0U].context.surface_high);
+        CHECK(fact.context.surface_low == capture.completed[0U].context.surface_low);
+    }
+    CHECK(capture.completed[4U].context.selection_generation == capture.completed[3U].context.selection_generation);
+}
+
+TEST_CASE("Presentation operation projection never combines a new borrow with an incumbent publication") {
+    const PresentationCapability allocation{.surface_high = 10U, .surface_low = 11U, .extent = {32U, 32U},
+                                            .generation = 7U, .condition = PresentationCapabilityCondition::Ready};
+    const PresentationSubmittedSource first{{.frame = {.source = {PresentationSourceKind::Explore, 1U},
+                                                        .extent = {16U, 16U}, .revision = 9U, .clean_revision = 5U},
+                                             .snapshot_revision = 20U}, 30U};
+    const PresentationSubmittedSource second{{.frame = {.source = {PresentationSourceKind::Explore, 1U},
+                                                         .extent = {16U, 16U}, .revision = 12U, .clean_revision = 8U},
+                                              .snapshot_revision = 21U}, 31U};
+    const PresentationDiagnosticRecord incumbent{first, {.capability = allocation, .timeline_ready = 17U,
+                                                         .presentation_revision = 40U, .transfer_sequence = 9U}};
+    const auto released = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationReleaseWaitCompleted, incumbent, 0, 1U);
+    CHECK(released.context.selection_generation == first.selection_generation);
+    CHECK(released.context.frame_revision == released.context.source.source_revision);
+    CHECK(released.context.source.source_revision == 9U);
+    CHECK(released.value == released.context.publication.presentation_revision);
+    CHECK(released.value == 40U);
+    CHECK(released.context.transfer.transfer_sequence == 9U);
+    const auto borrowed = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationSourceBorrowStarted,
+                                                       {second, {.capability = allocation}}, 0);
+    CHECK(borrowed.context.selection_generation == second.selection_generation);
+    CHECK(borrowed.context.frame_revision == borrowed.context.source.source_revision);
+    CHECK(borrowed.context.source.source_revision == 12U);
+    CHECK(borrowed.value == 0U);
+    CHECK(borrowed.context.publication.presentation_revision == 0U);
+    CHECK(borrowed.context.transfer.transfer_sequence == 0U);
+    CHECK(borrowed.context.transfer.timeline_ready == 0U);
+}
+
 TEST_CASE("Presentation switches sources while Live advances in background") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {40U, 20U}};
@@ -5877,6 +6002,172 @@ TEST_CASE("Visual diagnostics name every canonical completion and failure") {
         CAPTURE(raw);
         CHECK(visual_diagnostic_event_name(operation).empty() == !enum_contains(operation));
     }
+}
+
+TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exception text") {
+    std::string payload;
+    std::string expected;
+    SECTION("valid multibyte text crossing the byte limit is omitted whole") {
+        const auto point = GENERATE(std::string_view{"\xc3\xa9"}, std::string_view{"\xe2\x82\xac"},
+                                    std::string_view{"\xf0\x9f\x98\x80"});
+        expected.assign(kVisualFailureByteCapacity - 1U, 'a');
+        payload = expected + std::string{point} + "tail";
+    }
+    SECTION("a complete code point at the byte limit is preserved") {
+        payload.assign(kVisualFailureByteCapacity - 4U, 'a');
+        payload += "\xf0\x9f\x98\x80";
+        expected = payload;
+        payload += "tail";
+    }
+    SECTION("malformed bytes are replaced without losing subsequent valid text") {
+        const auto malformed = GENERATE(std::string_view{"\xff"}, std::string_view{"\xc0\x80"},
+                                        std::string_view{"\xed\xa0\x80"}, std::string_view{"\xf4\x90\x80\x80"},
+                                        std::string_view{"\xe2\x82"});
+        payload = "failure: " + std::string{malformed} + " tail \xc3\xa9";
+        expected = "failure: ";
+        for (std::size_t index = 0U; index < malformed.size(); ++index) expected += "\xef\xbf\xbd";
+        expected += " tail \xc3\xa9";
+    }
+    SECTION("replacement also respects the byte limit") {
+        expected.assign(kVisualFailureByteCapacity - 4U, 'a');
+        payload = expected + "\xff\xff";
+        expected += "\xef\xbf\xbd";
+    }
+    const auto detail = visual_failure_detail(std::make_exception_ptr(std::runtime_error{payload}), "fallback");
+    CHECK(detail == expected);
+    CHECK(detail.size() <= kVisualFailureByteCapacity);
+    CHECK(visual_failure_detail({}, payload) == expected);
+
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-failure-text"};
+    const auto path = temporary.path() / "trace.jsonl";
+    const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    REQUIRE(descriptor >= 0);
+    services::DiagnosticsClient diagnostics{mmltk::common::io::ScopedFd{descriptor},
+                                           services::DiagnosticsExecutionPolicy::CallerDriven};
+    services::RuntimeDiagnostics runtime{diagnostics.producer()};
+    auto target = runtime.target();
+    report_visual_worker_failure(visual_diagnostic_sink(target), contracts::DiagnosticOwner::Explore, 0, detail, 17U);
+    CHECK(diagnostics.counters().accepted == 1U);
+    CHECK(diagnostics.counters().dropped == 0U);
+    diagnostics.close();
+    CHECK(diagnostics.counters().flushed == 1U);
+    std::ifstream input{path};
+    const auto record = nlohmann::json::parse(input);
+    CHECK(record["event"] == "worker.failure");
+    CHECK(record["sequence"] == 17U);
+    CHECK(record["message"] == expected);
+}
+
+TEST_CASE("Visual diagnostic boundaries capture immutable observations without owning products") {
+    struct Capture final {
+        std::array<VisualDiagnosticFact, 3U> facts{};
+        std::size_t count = 0U;
+        bool enabled = true;
+    } capture;
+    const VisualDiagnosticSink sink{
+        .context = &capture,
+        .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            auto& output = *static_cast<Capture*>(context);
+            if (output.count < output.facts.size()) output.facts[output.count++] = fact;
+        },
+        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; },
+    };
+    VisualSourceObservation source{
+        .frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 8U},
+                  .revision = 12U, .clean_revision = 7U},
+        .snapshot_revision = 30U,
+    };
+    {
+        services::RuntimeDiagnosticSpan span{sink, [&] {
+            return visual_diagnostic_boundary(
+                {.system = contracts::DiagnosticOwner::Presentation,
+                 .operation = VisualDiagnosticOperation::PresentationPumpStarted,
+                 .context = {.selection_generation = 20U, .source = visual_diagnostic_source(source)}},
+                VisualDiagnosticOperation::PresentationPumpCompleted);
+        }};
+        source.frame.revision = 8U;  // Selecting an older completed product is a new observation.
+        ++source.snapshot_revision;
+        span.Finish();
+    }
+    REQUIRE(capture.count == 2U);
+    CHECK(capture.facts[1U].context.source.source_revision == 12U);
+    CHECK(capture.facts[1U].context.source.clean_revision == 7U);
+    CHECK(capture.facts[1U].context.source.source_observation_revision == 30U);
+    CHECK(capture.facts[1U].context.source.source_width == 16U);
+    CHECK(capture.facts[1U].context.span.span_outcome == contracts::DiagnosticSpanOutcome::Success);
+    const auto projected = visual_runtime_diagnostic(capture.facts[1U]);
+    CHECK(projected.owner == contracts::DiagnosticOwner::Presentation);
+    CHECK(projected.event == "presentation.pump.completed");
+    CHECK(projected.context.selection_generation == 20U);
+    const auto completion = capture.facts[1U];
+    source = {};  // Producer reconstruction cannot rewrite a captured completion.
+    std::async(std::launch::async, [sink, completion] { sink(completion); }).get();
+    REQUIRE(capture.count == 3U);
+    CHECK(capture.facts[2U].context.source.source_observation_revision == 30U);
+    CHECK(capture.facts[2U].context.source.source_revision == 12U);
+    capture.enabled = false;
+    bool collected = false;
+    sink.Emit([&] { collected = true; return VisualDiagnosticFact{}; });
+    CHECK_FALSE(collected);
+    CHECK_FALSE(sink.pixel_probes_enabled());
+}
+
+TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retain its GPU owner") {
+    struct Result final {
+        std::array<std::vector<std::uint8_t>, 2U> pixels;
+        std::size_t renders = 0U;
+        std::size_t allocations = 0U;
+        std::size_t copies = 0U;
+        bool operator==(const Result&) const = default;
+    };
+    const auto run = [](const bool enabled) {
+        mmltk::testsupport::ScopedTempDir temporary{"mmltk-explore-lifecycle"};
+        services::DiagnosticsClient diagnostics;
+        if (enabled) diagnostics = services::DiagnosticsClient{temporary.path() / "trace.jsonl"};
+        services::RuntimeDiagnostics runtime{diagnostics.producer()};
+        auto target = runtime.target();
+        CHECK_FALSE(target.pixel_probes_enabled());
+        const auto sink = visual_diagnostic_sink(target);
+        LoadedSettings settings;
+        auto backend = std::make_shared<FakeImageBackend>();
+        auto work = std::make_shared<ExploreWorkProbe>();
+        EventGate events;
+        Result result;
+        {
+            ExploreSystem explore{settings.system(), kDevice, 2U,
+                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                               [work] { return std::make_unique<TestExploreAlgorithm>(
+                                   std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); }, 2U),
+                [&events](ExploreSystem::event_type) { events.Advance(); }, sink};
+            static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
+            REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
+            {
+                const auto product = explore.BorrowFrame();
+                REQUIRE(product.valid());
+                for (std::size_t index = 0U; index < result.pixels.size(); ++index) {
+                    const auto plane = product.plane(index).plane();
+                    const auto row_bytes = plane.descriptor.row_bytes();
+                    result.pixels[index].resize(row_bytes * plane.descriptor.height);
+                    for (std::uint32_t row = 0U; row < plane.descriptor.height; ++row)
+                        std::memcpy(result.pixels[index].data() + row * row_bytes,
+                                    reinterpret_cast<const std::uint8_t*>(plane.data) + row * plane.descriptor.pitch_bytes, row_bytes);
+                }
+            }
+            diagnostics.close(services::DiagnosticsCloseMode::Discard);
+            CHECK_FALSE(target.valid());
+            explore.Shutdown();
+            result.renders = work->renders.load();
+            result.allocations = backend->planes_allocated.load();
+            result.copies = backend->same_copies.load() + backend->peer_copies.load() +
+                            backend->staged_downloads.load() + backend->staged_uploads.load();
+        }
+        CHECK(backend->contexts_created == backend->contexts_destroyed);
+        CHECK(backend->planes_allocated == backend->planes_freed);
+        return result;
+    };
+    const auto disabled = run(false);
+    const auto enabled = run(true);
+    CHECK(disabled == enabled);
 }
 
 TEST_CASE("Presentation control remains available during a native wait") {

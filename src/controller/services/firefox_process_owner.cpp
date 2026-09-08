@@ -199,12 +199,12 @@ class ChildCustody final {
         }
         if (waited < 0 && errno == ECHILD) return Complete({});
         if (diagnostics.valid())
-            diagnostics.write({
-                .owner = RuntimeDiagnosticOwner::FirefoxProcess,
+            diagnostics.Emit([&] { return RuntimeDiagnosticFact{
+                .owner = contracts::DiagnosticOwner::FirefoxProcess,
                 .event = "child.custody_invariant",
                 .sequence = static_cast<std::uint64_t>(pid_),
                 .value = static_cast<std::uint64_t>(static_cast<std::uint32_t>(waited < 0 ? errno : EIO)),
-            });
+            }; });
         std::terminate();
     }
 
@@ -602,10 +602,10 @@ class FirefoxProcessOwner::Implementation final {
             std::scoped_lock lock{mutex_};
             process = custody_.pid();
         }
-        diagnostics_.write({.owner = RuntimeDiagnosticOwner::FirefoxProcess,
+        diagnostics_.Emit([&] { return RuntimeDiagnosticFact{.owner = contracts::DiagnosticOwner::FirefoxProcess,
                             .event = event,
                             .sequence = process > 0 ? static_cast<std::uint64_t>(process) : 0U,
-                            .value = value});
+                            .value = value}; });
     }
 
     [[nodiscard]] bool prepare_log_handoff(SpawnFileActions& actions) noexcept {

@@ -31,6 +31,8 @@ struct NativeAllocation final {
     struct LatestFrame final {
         PresentationSubmittedSource submitted{};
         std::uint64_t presentation_revision = 0U;
+        std::uint64_t transfer_sequence = 0U;
+        contracts::DiagnosticLink diagnostic_link{};
     };
 
     std::unique_ptr<gpu::ExportedImageBuffer> buffer;
@@ -73,6 +75,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         pending_frame_ = PendingFrame{
             .submitted = submitted,
             .reader = std::addressof(source),
+            .diagnostic_link = diagnostics_.valid() ? services::DiagnosticSpanIds::Next() : contracts::DiagnosticLink{},
         };
         EnsureTargetForPending();
     }
@@ -121,6 +124,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     struct PendingFrame final {
         PresentationSubmittedSource submitted{};
         const VisualSourceReader* reader = nullptr;
+        contracts::DiagnosticLink diagnostic_link{};
     };
 
     [[nodiscard]] bool SettleSourceRead() noexcept {
@@ -189,7 +193,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (frame_edge.get() < 0) throw std::runtime_error("presentation frame eventfd creation failed");
         auto frame_signal = native::WorkspaceSurfaceFrameSignal::create();
         if (diagnostics_.valid())
-            diagnostics_({.system = VisualSystemKind::Presentation,
+            diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
                           .operation = VisualDiagnosticOperation::PresentationAllocationCreated,
                           .device = settings_.device,
                           .generation = generation,
@@ -200,7 +204,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                                       .selection_generation = pending_frame_ ? pending_frame_->submitted.selection_generation : 0U,
                                       .frame_revision = pending_frame_ ? pending_frame_->submitted.observation.frame.revision : 0U,
                                       .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Unavailable),
-                                      .outcome = 1U}});
+                                      .outcome = 1U,
+                                      .source = pending_frame_ ? visual_diagnostic_source(pending_frame_->submitted.observation)
+                                                               : contracts::DiagnosticSource{},
+                                      .allocation = {.allocation_generation = generation},
+                                      .link = pending_frame_ ? pending_frame_->diagnostic_link : contracts::DiagnosticLink{}}}; });
         if (!channel_.admit(id, generation, width, height, pitch, allocation->allocation_size(), std::move(descriptor), frame_edge.get(),
                             frame_signal.descriptor(), pending_frame_ ? pending_frame_->submitted.selection_generation : 0U,
                             pending_frame_ ? pending_frame_->submitted.observation.frame.revision : 0U))
@@ -295,8 +303,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
     void AcceptImport(native::WorkspaceSurfaceImportOutcome outcome) {
         if (diagnostics_.valid())
-            diagnostics_(
-                {.system = VisualSystemKind::Presentation,
+            diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
                  .operation = VisualDiagnosticOperation::PresentationImportOutcome,
                  .device = settings_.device,
                  .generation = candidate_ && candidate_->import_id == outcome.id ? candidate_->generation : 0U,
@@ -311,7 +318,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                      .frame_revision = candidate_ && candidate_->import_id == outcome.id ? candidate_->submitted.observation.frame.revision : 0U,
                      .condition = static_cast<std::uint64_t>(outcome.imported ? PresentationCapabilityCondition::Ready
                                                                               : PresentationCapabilityCondition::Unavailable),
-                     .outcome = outcome.imported ? 0U : static_cast<std::uint64_t>(outcome.failure)}});
+                     .outcome = outcome.imported ? 0U : static_cast<std::uint64_t>(outcome.failure),
+                     .source = candidate_ && candidate_->import_id == outcome.id
+                         ? visual_diagnostic_source(candidate_->submitted.observation) : contracts::DiagnosticSource{},
+                     .allocation = {.allocation_generation = candidate_ && candidate_->import_id == outcome.id
+                         ? candidate_->generation : 0U}}}; });
         if (!candidate_ || candidate_->import_id != outcome.id) return;
         if (!outcome.imported) {
             if (outcome.failure == native::workspace_surface_import::FailureCode::Layout &&
@@ -349,11 +360,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (target == nullptr) return {};
         auto stream = reinterpret_cast<cudaStream_t>(stream_.native_handle());
         const auto previous_submitted = target->submitted;
+        AwaitPriorRelease(stream);
         target->submitted = submitted;
-        AwaitPriorRelease(stream, *target);
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationSourceBorrowStarted, *target);
+        services::RuntimeDiagnosticSpan borrow_span{diagnostics_, [&] {
+            return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationSourceBorrowStarted, *target),
+                                              VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
+        }, pending_frame_->diagnostic_link};
         auto source = pending_frame_->reader->borrow();
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationSourceBorrowCompleted, *target, 1U);
+        borrow_span.FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
         if (!visual_product_matches_frame(frame, source)) {
             target->submitted = previous_submitted;
             pending_frame_.reset();
@@ -396,6 +410,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             target->latest = NativeAllocation::LatestFrame{
                 .submitted = submitted,
                 .presentation_revision = presentation_revision,
+                .diagnostic_link = pending_frame_->diagnostic_link,
             };
             ready = OfferLatest(*target, stream);
             source_read_.reset();
@@ -426,7 +441,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     .capability = CapabilityOf(*active_),
                     .timeline_ready = ready,
                     .presentation_revision = presentation_revision,
+                    .transfer_sequence = active_->latest->transfer_sequence,
                 },
+            .diagnostic_link = active_->latest->diagnostic_link,
         };
         pending_frame_.reset();
         return outcome;
@@ -436,10 +453,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (!allocation.timeline || !allocation.latest) throw std::runtime_error("presentation transfer has no completed frame");
         const std::uint64_t transfer_sequence = mmltk::common::types::take_monotonic_identity(allocation.next_transfer_sequence);
         const std::uint64_t ready = native::detail::workspace_timeline_ready(transfer_sequence);
+        allocation.latest->transfer_sequence = transfer_sequence;
         allocation.timeline->SignalReady(stream, ready);
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation);
+        services::RuntimeDiagnosticSpan ready_span{diagnostics_, [&] {
+            return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation),
+                                              VisualDiagnosticOperation::PresentationReadySyncCompleted);
+        }, allocation.latest->diagnostic_link};
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("presentation ready publication failed");
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationReadySyncCompleted, allocation, 1U);
+        ready_span.FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
         const auto& latest = *allocation.latest;
         const auto& frame = latest.submitted.observation.frame;
         native::detail::publish_workspace_frame_signal(allocation.frame_signal.mapping(), ready, transfer_sequence,
@@ -456,51 +477,70 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         } while (written < 0 && errno == EINTR);
         if (written != static_cast<ssize_t>(sizeof(edge))) throw std::runtime_error("presentation frame edge publication failed");
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationFrameEdge, allocation, ready);
+        if (diagnostics_.valid())
+            release_diagnostic_ = AllocationRecord(VisualDiagnosticOperation::PresentationFrameEdge, allocation);
         allocation.timeline->WaitForRelease(stream, ready + 1U);
         release_wait_pending_ = true;
         return ready;
     }
 
-    void AwaitPriorRelease(cudaStream_t stream, const NativeAllocation& allocation) {
+    void AwaitPriorRelease(cudaStream_t stream) {
         if (!release_wait_pending_) return;
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationReleaseWaitStarted, allocation);
+        services::RuntimeDiagnosticSpan release_span{release_diagnostic_ ? diagnostics_ : VisualDiagnosticSink{}, [&] {
+            return visual_diagnostic_boundary(presentation_diagnostic_fact(
+                                                  VisualDiagnosticOperation::PresentationReleaseWaitStarted, *release_diagnostic_, settings_.device),
+                                              VisualDiagnosticOperation::PresentationReleaseWaitCompleted);
+        }, release_diagnostic_ ? release_diagnostic_->link : contracts::DiagnosticLink{}};
         if (cudaStreamSynchronize(stream) != cudaSuccess) throw std::runtime_error("presentation release wait failed");
         release_wait_pending_ = false;
-        DiagnoseAllocation(VisualDiagnosticOperation::PresentationReleaseWaitCompleted, allocation, 1U);
+        release_span.FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
+        release_diagnostic_.reset();
     }
 
     void ReofferLatest(NativeAllocation& allocation) {
         auto stream = reinterpret_cast<cudaStream_t>(stream_.native_handle());
-        AwaitPriorRelease(stream, allocation);
+        AwaitPriorRelease(stream);
         static_cast<void>(OfferLatest(allocation, stream));
     }
 
     void DiagnoseAllocation(const VisualDiagnosticOperation operation, const NativeAllocation& allocation,
                             const std::uint64_t outcome = 0U) const noexcept {
         if (!diagnostics_.valid()) return;
-        diagnostics_(
-            {.system = VisualSystemKind::Presentation,
-             .operation = operation,
-             .device = settings_.device,
-             .generation = allocation.generation,
-             .value = allocation.latest ? allocation.latest->presentation_revision : 0U,
-             .detail = outcome,
-             .context = {.capacity_width = allocation.width,
-                         .capacity_height = allocation.height,
-                         .surface_high = allocation.import_id.high,
-                         .surface_low = allocation.import_id.low,
-                         .selection_generation = allocation.submitted.selection_generation,
-                         .frame_revision = allocation.submitted.observation.frame.revision,
-                         .condition = static_cast<std::uint64_t>(operation == VisualDiagnosticOperation::PresentationRetirement
-                                                                     ? PresentationCapabilityCondition::Unavailable
-                                                                 : allocation.timeline ? PresentationCapabilityCondition::Ready
-                                                                                       : PresentationCapabilityCondition::Admitted),
-                         .outcome = outcome}});
+        diagnostics_(AllocationFact(operation, allocation, outcome));
+    }
+
+    [[nodiscard]] VisualDiagnosticFact AllocationFact(const VisualDiagnosticOperation operation, const NativeAllocation& allocation,
+                                                     const std::uint64_t outcome = 0U) const noexcept {
+        return presentation_diagnostic_fact(operation, AllocationRecord(operation, allocation), settings_.device, outcome);
+    }
+    [[nodiscard]] PresentationDiagnosticRecord AllocationRecord(const VisualDiagnosticOperation operation,
+                                                                 const NativeAllocation& allocation) const noexcept {
+        const bool copying = operation == VisualDiagnosticOperation::PresentationSourceBorrowStarted ||
+                             operation == VisualDiagnosticOperation::PresentationSourceBorrowCompleted ||
+                             operation == VisualDiagnosticOperation::PresentationSourceWaitSubmitted ||
+                             operation == VisualDiagnosticOperation::PresentationSourceCopy;
+        PresentationDiagnosticRecord record{
+            .submitted = allocation.submitted,
+            .publication = {.capability = CapabilityOf(allocation)},
+            .link = copying && pending_frame_ ? pending_frame_->diagnostic_link : contracts::DiagnosticLink{},
+        };
+        if (!copying && allocation.latest) {
+            record.submitted = allocation.latest->submitted;
+            record.link = allocation.latest->diagnostic_link;
+            record.publication.presentation_revision = allocation.latest->presentation_revision;
+            record.publication.transfer_sequence = allocation.latest->transfer_sequence;
+            if (record.publication.transfer_sequence != 0U)
+                record.publication.timeline_ready = native::detail::workspace_timeline_ready(record.publication.transfer_sequence);
+        }
+        if (operation == VisualDiagnosticOperation::PresentationRetirement)
+            record.publication.capability.condition = PresentationCapabilityCondition::Unavailable;
+        return record;
     }
 
     VisualDeviceSettings settings_;
     PresentationNativeConfiguration configuration_;
     VisualDiagnosticSink diagnostics_{};
+    std::optional<PresentationDiagnosticRecord> release_diagnostic_;
     native::WorkspaceSurfaceImportChannel channel_;
     gpu::DeviceContext context_;
     gpu::ImageStream stream_;

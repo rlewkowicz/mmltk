@@ -62,6 +62,7 @@ struct PresentationPublication final {
     PresentationCapability capability{};
     std::uint64_t timeline_ready = 0U;
     std::uint64_t presentation_revision = 0U;
+    std::uint64_t transfer_sequence = 0U;
 
     [[nodiscard]] bool valid() const noexcept {
         return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U &&
@@ -87,6 +88,15 @@ struct PresentationSubmittedSource final {
     [[nodiscard]] bool valid() const noexcept { return observation.valid() && selection_generation != 0U; }
     bool operator==(const PresentationSubmittedSource&) const = default;
 };
+// One immutable operation projection. An unissued copy carries only capability
+// and submission; a physical publication also carries its exact transfer.
+struct PresentationDiagnosticRecord final {
+    PresentationSubmittedSource submitted{};
+    PresentationPublication publication{};
+    contracts::DiagnosticLink link{};
+};
+[[nodiscard]] VisualDiagnosticFact presentation_diagnostic_fact(
+    VisualDiagnosticOperation, const PresentationDiagnosticRecord&, int device, std::uint64_t outcome = 0U) noexcept;
 enum class PresentationNativeProgress : std::uint8_t {
     Waiting,
     Superseded,
@@ -97,6 +107,7 @@ struct PresentationNativeOutcome final {
     PresentationSubmittedSource submitted{};
     PresentationPublication publication{};
     PresentationCapability capability{};
+    contracts::DiagnosticLink diagnostic_link{};
 };
 enum class PresentationShutdownResult : std::uint8_t {
     Stopped,

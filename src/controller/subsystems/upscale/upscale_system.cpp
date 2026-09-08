@@ -197,7 +197,7 @@ class UpscaleSystem::Impl final {
                   processed_clean_revision_ = 0U;
                   AdvanceRevision();
               }
-              report_visual_worker_failure(diagnostics_, VisualSystemKind::Upscale, settings_.device, detail);
+              report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Upscale, settings_.device, detail);
               Publish(event_type{UpscaleFailed{snapshot(), std::move(detail)}});
           }) {
         if (!settings_.valid() || !borrow_source_) throw contracts::InvalidIntentError("Upscale device settings are invalid");
@@ -206,11 +206,11 @@ class UpscaleSystem::Impl final {
         std::scoped_lock admission_lock(mutex_);
         if (warm_admitted_ || warm_attempted_) return;
         warm_admitted_ = true;
-        diagnostics_({
-            .system = VisualSystemKind::Upscale,
+        diagnostics_.Emit([&] { return VisualDiagnosticFact{
+            .system = contracts::DiagnosticOwner::Upscale,
             .operation = VisualDiagnosticOperation::UpscaleWarmAdmissionStarted,
             .device = settings_.device,
-        });
+        }; });
         bool admitted = false;
         try {
             admitted = worker_.SubmitOrdered(
@@ -219,17 +219,15 @@ class UpscaleSystem::Impl final {
                     try {
                         auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                         if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable during warm-up");
-                        diagnostics_({
-                            .system = VisualSystemKind::Upscale,
-                            .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
-                            .device = settings_.device,
-                        });
+                        services::RuntimeDiagnosticSpan warm_span{diagnostics_, [&] {
+                            return visual_diagnostic_boundary(
+                                {.system = contracts::DiagnosticOwner::Upscale,
+                                 .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
+                                 .device = settings_.device},
+                                VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted);
+                        }};
                         model->Warm();
-                        diagnostics_({
-                            .system = VisualSystemKind::Upscale,
-                            .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted,
-                            .device = settings_.device,
-                        });
+                        warm_span.Finish();
                     } catch (...) { failure = visual_failure_detail(std::current_exception(), "Upscale model warm-up failed"); }
                     {
                         std::scoped_lock lock(mutex_);
@@ -238,7 +236,7 @@ class UpscaleSystem::Impl final {
                     }
                     if (failure.empty()) return {};
                     return [this, failure = std::move(failure)]() mutable noexcept {
-                        report_visual_worker_failure(diagnostics_, VisualSystemKind::Upscale, settings_.device, failure);
+                        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Upscale, settings_.device, failure);
                         Publish(event_type{UpscaleFailed{snapshot(), std::move(failure)}});
                     };
                 });
@@ -258,30 +256,40 @@ class UpscaleSystem::Impl final {
             std::scoped_lock admission_lock(mutex_);
             const auto prior = state_;
             const auto demand = ++demand_;
-            diagnostics_({.system = VisualSystemKind::Upscale,
+            contracts::DiagnosticLink admission_link;
+            diagnostics_.Emit([&] {
+                admission_link = services::DiagnosticSpanIds::Next();
+                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                           .operation = VisualDiagnosticOperation::UpscaleRequestAdmitted,
                           .device = settings_.device,
                           .generation = demand,
                           .value = request.source.revision,
-                          .detail = static_cast<std::uint64_t>(request.kernel)});
+                          .detail = static_cast<std::uint64_t>(request.kernel),
+                          .context = {.source = visual_diagnostic_source({.frame = request.source}),
+                                      .demand = {.demand_generation = demand}, .link = admission_link}}; });
             state_.kernel = request.kernel;
             state_.input = request.source;
             state_.busy = true;
             state_.ready = false;
             AdvanceRevision();
-            if (!worker_.SubmitLatest([this, request, target, demand, source_descriptor, source = std::move(source)](
+            if (!worker_.SubmitLatest([this, request, target, demand, source_descriptor, admission_link, source = std::move(source)](
                                           mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                           std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
                     {
                         std::scoped_lock lock(mutex_);
                         if (demand != demand_) return {};
                     }
-                    diagnostics_({.system = VisualSystemKind::Upscale,
+                    contracts::DiagnosticLink worker_link;
+                    diagnostics_.Emit([&] {
+                        worker_link = services::DiagnosticSpanIds::Next(admission_link);
+                        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                                   .operation = VisualDiagnosticOperation::UpscaleWorkerStarted,
                                   .device = settings_.device,
                                   .generation = demand,
                                   .value = request.source.revision,
-                                  .detail = static_cast<std::uint64_t>(request.kernel)});
+                                  .detail = static_cast<std::uint64_t>(request.kernel),
+                                  .context = {.source = visual_diagnostic_source({.frame = request.source}),
+                                              .demand = {.demand_generation = demand}, .link = worker_link}}; });
                     if (processed_ && processed_->source == request.source && processed_->kernel == request.kernel) {
                         std::scoped_lock lock(mutex_);
                         if (demand != demand_ || stop.stop_requested()) return {};
@@ -291,39 +299,40 @@ class UpscaleSystem::Impl final {
                             state_.busy = false;
                             state_.ready = true;
                             AdvanceRevision();
-                            diagnostics_({.system = VisualSystemKind::Upscale,
+                            diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                                           .operation = VisualDiagnosticOperation::UpscaleResultReused,
                                           .device = settings_.device,
                                           .generation = demand,
-                                          .value = state_.frame.revision});
+                                          .value = state_.frame.revision,
+                                          .context = {.source = visual_diagnostic_source({state_.frame, state_.revision}),
+                                                      .demand = {.demand_generation = demand}}}; });
                             return [this] { PublishChanged(); };
                         }
                     }
                     auto document = scale_visual_document(source.document, kUpscaleOutputScale);
                     auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                     if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
-                    diagnostics_({.system = VisualSystemKind::Upscale,
-                                  .operation = VisualDiagnosticOperation::UpscaleCopyStarted,
-                                  .device = settings_.device,
-                                  .generation = demand,
-                                  .value = request.source.revision});
+                    services::RuntimeDiagnosticSpan copy_span{diagnostics_, [&] {
+                        return visual_diagnostic_boundary(
+                            {.system = contracts::DiagnosticOwner::Upscale,
+                             .operation = VisualDiagnosticOperation::UpscaleCopyStarted,
+                             .device = settings_.device,
+                             .generation = demand,
+                             .value = request.source.revision,
+                             .context = {.source = visual_diagnostic_source({.frame = request.source}),
+                                         .demand = {.demand_generation = demand}}},
+                            VisualDiagnosticOperation::CopyCompleted);
+                    }, worker_link};
                     const auto copied_planes = diagnostics_.valid() ? source.pixels.plane_count() : 0U;
                     const auto paths = runtime.CopyInputFrom(
                         std::move(source.pixels), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); });
-                    diagnostics_({
-                        .system = VisualSystemKind::Upscale,
-                        .operation = VisualDiagnosticOperation::CopyCompleted,
-                        .device = settings_.device,
-                        .generation = demand,
-                        .value = request.source.revision,
-                        .copy_path = paths[0U],
-                    });
+                    copy_span.FinishWith([&](auto& fact) { fact.copy_path = paths[0U]; });
                     if (stop.stop_requested()) return {};
                     const auto input = runtime.BorrowInput();
                     if (!input.valid()) throw std::runtime_error("Upscale runtime model is unavailable");
                     if (diagnostics_.valid()) {
                         const auto plane = input.plane(0U).plane();
-                        diagnostics_({.system = VisualSystemKind::Upscale,
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                                       .operation = VisualDiagnosticOperation::UpscaleInputGeometry,
                                       .device = settings_.device,
                                       .generation = demand,
@@ -331,13 +340,13 @@ class UpscaleSystem::Impl final {
                                       .detail = plane.descriptor.pitch_bytes,
                                       .context = {.capacity_width = plane.descriptor.width,
                                                   .capacity_height = plane.descriptor.height,
-                                                  .frame_revision = request.source.revision}});
-                        diagnostics_({.system = VisualSystemKind::Upscale,
+                                                  .frame_revision = request.source.revision}}; });
+                        diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                                       .operation = VisualDiagnosticOperation::UpscaleInputAllocation,
                                       .device = settings_.device,
                                       .generation = demand,
                                       .value = plane.data,
-                                      .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes});
+                                      .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes}; });
                     }
                     const bool reuse_clean =
                         processed_ && processed_->kernel == request.kernel &&
@@ -349,14 +358,13 @@ class UpscaleSystem::Impl final {
                         output_candidate, target.width, target.height,
                         [this, model, &input, request, reuse_clean, demand](const auto output, const auto semantic, const auto stream) {
                             if (diagnostics_.valid())
-                                diagnostics_(
-                                    {.system = VisualSystemKind::Upscale,
+                                diagnostics_.Emit([&] { return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
                                      .operation = VisualDiagnosticOperation::UpscaleOutputAllocation,
                                      .device = settings_.device,
                                      .generation = demand,
                                      .value = output.data,
                                      .detail = output.descriptor.pitch_bytes,
-                                     .context = {.capacity_width = output.descriptor.width, .capacity_height = output.descriptor.height}});
+                                     .context = {.capacity_width = output.descriptor.width, .capacity_height = output.descriptor.height}}; });
                             if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream);
                             model->Semantics(input.plane(1U).plane(), semantic, stream);
                         });
@@ -387,14 +395,14 @@ class UpscaleSystem::Impl final {
                         };
                         AdvanceRevision();
                     }
-                    diagnostics_({
-                        .system = VisualSystemKind::Upscale,
+                    diagnostics_.Emit([&] { return VisualDiagnosticFact{
+                        .system = contracts::DiagnosticOwner::Upscale,
                         .operation = VisualDiagnosticOperation::UpscaleModelSubmitted,
                         .device = settings_.device,
                         .generation = runtime.OutputFacts().revision,
                         .value = static_cast<std::uint64_t>(request.kernel),
                         .detail = demand,
-                    });
+                    }; });
                     return [this] { PublishChanged(); };
                 })) {
                 state_ = prior;
