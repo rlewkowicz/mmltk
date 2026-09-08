@@ -518,15 +518,25 @@ TEST_CASE("failed product growth never exposes mixed planes") {
     CHECK_FALSE(runtime.Borrow().valid());
 }
 
+class CleanSemanticRuntime final {
+   public:
+    explicit CleanSemanticRuntime(const std::size_t output_buffer_count = 2U)
+        : backend(std::make_shared<FakeImageBackend>()),
+          runtime{{
+              .device = 0,
+              .backend = backend,
+              .output_layout = ImageProductLayout::CleanAndSemantic,
+              .output_buffer_count = output_buffer_count,
+          }} {}
+
+    std::shared_ptr<FakeImageBackend> backend;
+    SystemImageRuntime runtime;
+};
+
 TEST_CASE("product candidates preserve exact committed planes until readers release them") {
     using namespace std::chrono_literals;
-    auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{
-        .device = 0,
-        .backend = backend,
-        .output_layout = ImageProductLayout::CleanAndSemantic,
-        .output_buffer_count = 2U,
-    }};
+    CleanSemanticRuntime scenario;
+    auto& runtime = scenario.runtime;
     runtime.Publish(8U, 8U, [](const auto clean, const auto semantic, auto) {
         std::memset(reinterpret_cast<void*>(clean.data), 0x21, clean.descriptor.pitch_bytes * clean.descriptor.height);
         std::memset(reinterpret_cast<void*>(semantic.data), 0x43, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
@@ -600,13 +610,9 @@ TEST_CASE("completed products retain exact pixels and can be selected again") {
 }
 
 TEST_CASE("failed candidate growth retains the committed product and later initializes every plane") {
-    auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{
-        .device = 0,
-        .backend = backend,
-        .output_layout = ImageProductLayout::CleanAndSemantic,
-        .output_buffer_count = 2U,
-    }};
+    CleanSemanticRuntime scenario;
+    auto& backend = scenario.backend;
+    auto& runtime = scenario.runtime;
     runtime.Publish(8U, 8U, [](const auto clean, const auto semantic, auto) {
         std::memset(reinterpret_cast<void*>(clean.data), 0x17, clean.descriptor.pitch_bytes * clean.descriptor.height);
         std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
@@ -685,6 +691,7 @@ TEST_CASE("clean-only candidate preservation excludes invalid semantics and roll
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime runtime{
         {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 4U}};
+    // CLEANUP-IGNORE: This publication establishes rollback/source-watch evidence, unlike the fixture's failed-growth baseline.
     runtime.Publish(8U, 8U, [](auto clean, auto semantic, auto) {
         std::memset(reinterpret_cast<void*>(clean.data), 0x17, clean.descriptor.pitch_bytes * clean.descriptor.height);
         std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);

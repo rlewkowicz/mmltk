@@ -31,6 +31,7 @@ class Operators final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+void configure_verification_session(Operators&, Ort::SessionOptions&, int device, bool enable_cuda_graph, cudaStream_t);
 // Effect-only cold allocation evidence; never used to order or select work.
 std::uint64_t allocation_count() noexcept;
 

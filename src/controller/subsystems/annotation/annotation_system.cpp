@@ -238,6 +238,8 @@ class AnnotationSystem::Impl final {
         if (accepted) worker_.RequestActiveStop();
         return snapshot();
     }
+    // CLEANUP-IGNORE: This sealed Annotation facade tail has domain-specific state and locking despite sharing
+    // conventional shutdown, snapshot, and borrow method shapes with Explore.
     void Shutdown() noexcept { worker_.StopAndWait(); }
     [[nodiscard]] bool stopped() const noexcept { return worker_.stopped(); }
     [[nodiscard]] AnnotationSnapshot snapshot() const {

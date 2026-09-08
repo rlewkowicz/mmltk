@@ -217,6 +217,17 @@ struct GalleryGpuPause final {
     ~GalleryGpuPause() { Release(); }
 };
 
+[[nodiscard]] std::vector<std::uint8_t> copy_product_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product,
+                                                           const std::size_t plane_index) {
+    REQUIRE(product.valid());
+    const auto plane = product.plane(plane_index).plane();
+    std::vector<std::uint8_t> bytes(plane.descriptor.row_bytes() * plane.descriptor.height);
+    REQUIRE(cudaMemcpy2D(bytes.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
+                         plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height,
+                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    return bytes;
+}
+
 class NativeGallery final {
    public:
     GalleryEvidence evidence;
@@ -351,15 +362,16 @@ class NativeGallery final {
             evidence.Wait(observed);
         }
     }
+    void WaitForReadyTiles() {
+        for (;;) {
+            const auto observed = evidence.Epoch();
+            static_cast<void>(algorithm->AdvanceGallery());
+            if (algorithm->HasGalleryTiles()) return;
+            evidence.Wait(observed);
+        }
+    }
     [[nodiscard]] std::vector<std::uint8_t> Pixels(const std::size_t plane_index) {
-        auto product = runtime->Borrow();
-        REQUIRE(product.valid());
-        const auto plane = product.plane(plane_index).plane();
-        std::vector<std::uint8_t> bytes(plane.descriptor.row_bytes() * plane.descriptor.height);
-        REQUIRE(cudaMemcpy2D(bytes.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
-                             plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height,
-                             cudaMemcpyDeviceToHost) == cudaSuccess);
-        return bytes;
+        return copy_product_plane(runtime->Borrow(), plane_index);
     }
 };
 
@@ -445,12 +457,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
-    for (;;) {
-        const auto previous = gallery.evidence.Epoch();
-        static_cast<void>(gallery.algorithm->AdvanceGallery());
-        if (gallery.algorithm->HasGalleryTiles()) break;
-        gallery.evidence.Wait(previous);
-    }
+    gallery.WaitForReadyTiles();
     const auto before_patch = gallery.Pixels(0U);
     const auto before_patch_bytes = gallery.algorithm->StorageFootprint().host_bytes;
     static_cast<void>(gallery.Step(false));
@@ -529,12 +536,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
-    for (;;) {
-        const auto previous = gallery.evidence.Epoch();
-        static_cast<void>(gallery.algorithm->AdvanceGallery());
-        if (gallery.algorithm->HasGalleryTiles()) break;
-        gallery.evidence.Wait(previous);
-    }
+    gallery.WaitForReadyTiles();
     const auto protected_storage = gallery.algorithm->StorageFootprint();
     static_cast<void>(gallery.Step(false));
     const auto candidate_storage = gallery.transaction_storage;
@@ -614,6 +616,8 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     CHECK(gallery.Pixels(0U) == clean);
     gallery.evidence.enabled.store(false);
+    // CLEANUP-IGNORE: This counter anchors semantic-only cache reuse; the earlier counter anchors viewport patch
+    // scheduling and they intentionally assert different operations.
     const auto recorded = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
     gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
     ++gallery.plan.generation;
@@ -875,6 +879,8 @@ TEST_CASE("Native initialization commit reserves useful reads and isolates obsol
     } else {
         REQUIRE_NOTHROW(gallery.Drain());
         if (scenario == 0U) {
+            // CLEANUP-IGNORE: Successful GPU completion evidence differs from the read-failure branch even though
+            // both inspect the same diagnostic collection under its lock.
             std::scoped_lock lock(gallery.evidence.mutex);
             CHECK(std::ranges::count_if(gallery.evidence.facts, [](const auto& fact) {
                       return fact.operation == VisualDiagnosticOperation::GalleryReadStarted && fact.detail == 68U;
@@ -997,6 +1003,8 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
             observed_evidence.facts.push_back(fact);
             ++observed_evidence.epoch;
             observed_evidence.changed.notify_all();
+            // CLEANUP-IGNORE: This guarded diagnostic sink is specific to rollback evidence; the earlier sink records
+            // supersession state and has different wake and failure ownership.
         } catch (...) {}
     };
     std::array<int, 2U> sockets{};
@@ -1009,6 +1017,8 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
                                                        {.acceptance = gate, .diagnostics = diagnostics});
     mmltk::frameworks::gpu::SystemImageRuntime* runtime = nullptr;
     ExploreSystem system{settings,
+                         // CLEANUP-IGNORE: This native rollback fixture captures its runtime for exact product
+                         // inspection; the presentation test constructs a fake runtime with different ownership.
                          {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U},
                          2U,
                          [factory = std::move(factory), &runtime](auto revisions) mutable {
@@ -1043,14 +1053,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     }
     const auto pixels = [&](const std::size_t plane_index) {
         runtime->BindContext();
-        auto product = system.BorrowFrame();
-        REQUIRE(product.valid());
-        const auto plane = product.plane(plane_index).plane();
-        std::vector<std::uint8_t> result(plane.descriptor.row_bytes() * plane.descriptor.height);
-        REQUIRE(cudaMemcpy2D(result.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
-                             plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height,
-                             cudaMemcpyDeviceToHost) == cudaSuccess);
-        return result;
+        return copy_product_plane(system.BorrowFrame(), plane_index);
     };
     const auto prior_clean = pixels(0U);
     const auto prior_semantic = pixels(1U);
@@ -1159,6 +1162,8 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     gallery.demand->store(gallery.plan.generation);
     const auto detail_publications = gallery.publications;
     const auto detail_acquisitions = gallery.acquisitions;
+    // CLEANUP-IGNORE: This no-allocation detail rerender checkpoint is distinct from the gallery initialization
+    // allocation measurement despite using the same scoped counter.
     const auto detail_revision = gallery.runtime->Completed().revision();
     std::size_t host_allocations;
     {
@@ -1221,6 +1226,8 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     CHECK(gallery.Begin().remaining_tiles == 0U);
     CHECK(gallery.Pixels(0U) == clean);
     CHECK(gallery.Pixels(1U) == semantic);
+    // CLEANUP-IGNORE: This background-collision read count proves retained-cache reuse at a separate cancellation
+    // boundary from the semantic-selection scenario.
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
     ++gallery.plan.generation;
@@ -1245,12 +1252,7 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
     NativeGallery gallery{4U};
     gallery.Open(path);
     const auto retained = gallery.Pixels(0U);
-    for (;;) {
-        const auto previous = gallery.evidence.Epoch();
-        static_cast<void>(gallery.algorithm->AdvanceGallery());
-        if (gallery.algorithm->HasGalleryTiles()) break;
-        gallery.evidence.Wait(previous);
-    }
+    gallery.WaitForReadyTiles();
     GalleryGpuPause pause;
     gallery.pause = &pause;
     auto submitted = std::async(std::launch::async, [&] {

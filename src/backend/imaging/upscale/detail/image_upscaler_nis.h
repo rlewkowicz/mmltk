@@ -8,8 +8,10 @@
 
 namespace mmltk::backend::imaging::upscale::image_upscaler_nis {
 
-// CLEANUP-IGNORE: This explicit NIS ABI configuration preserves its vendor-defined field order and types.
+// CLEANUP-IGNORE: Configuration is the vendor-defined NIS ABI; a shared base with Explore's render plan would
+// conflate independent crop, output, and execution contracts.
 struct Configuration final {
+    // CLEANUP-IGNORE: This NIS vendor ABI preserves independently versioned source and crop geometry.
     std::uint32_t source_width = 0U;
     std::uint32_t source_height = 0U;
     std::uint32_t crop_x = 0U;

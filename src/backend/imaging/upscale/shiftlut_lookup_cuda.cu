@@ -51,84 +51,87 @@ __device__ int shifted_pixel(int y, int x, int height, int width, const float* s
            min(width - 1, max(0, x + static_cast<int>(shifts[kChannels + channel])));
 }
 
+struct RotatedThread final {
+    int plane = 0;
+    int batch = 0;
+    int channel = 0;
+    int width = 0;
+    int height = 0;
+    int y = 0;
+    int x = 0;
+};
+
+__device__ bool locate_rotated_thread(const int index, const int height, const int width, RotatedThread& thread) {
+    thread.plane = height * width;
+    if (index >= kRotatedBatch * kChannels * thread.plane) return false;
+    thread.batch = index / (kChannels * thread.plane);
+    thread.channel = index / thread.plane % kChannels;
+    thread.width = thread.batch / kRgbChannels % 2 ? height : width;
+    thread.height = thread.batch / kRgbChannels % 2 ? width : height;
+    thread.y = index % thread.plane / thread.width;
+    thread.x = index % thread.width;
+    return true;
+}
+
 __global__ void record_shifted_decisions(const std::int8_t* source, const float* shifts, std::int8_t* target, int height, int width) {
-    const int plane = height * width;
     const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (index >= kRotatedBatch * kChannels * plane) return;
-    const int batch = index / (kChannels * plane);
-    const int channel = index / plane % kChannels;
-    const int rotated_width = batch / kRgbChannels % 2 ? height : width;
-    const int rotated_height = batch / kRgbChannels % 2 ? width : height;
-    const int pixel = shifted_pixel(index % plane / rotated_width, index % rotated_width, rotated_height, rotated_width, shifts, channel);
-    target[index] = source[(batch * kChannels + channel) * plane + pixel];
+    RotatedThread thread;
+    if (!locate_rotated_thread(index, height, width, thread)) return;
+    const int pixel = shifted_pixel(thread.y, thread.x, thread.height, thread.width, shifts, thread.channel);
+    target[index] = source[(thread.batch * kChannels + thread.channel) * thread.plane + pixel];
 }
 
 __global__ void initial_depthwise(const float* input, const float* tables, std::int8_t* target, int height, int width) {
-    const int plane = height * width;
     const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (index >= kRotatedBatch * kChannels * plane) return;
-    const int batch = index / (kChannels * plane);
-    const int channel = index / plane % kChannels;
-    const int rotation = batch / kRgbChannels;
-    const int rotated_width = rotation % 2 ? height : width;
-    const int rotated_height = rotation % 2 ? width : height;
-    const int y = index % plane / rotated_width;
-    const int x = index % rotated_width;
+    RotatedThread thread;
+    if (!locate_rotated_thread(index, height, width, thread)) return;
+    const int rotation = thread.batch / kRgbChannels;
     float msb = 0;
     float lsb = 0;
     for (int tap = 0; tap < kSpatialTaps; ++tap) {
-        const auto sample = centered(input, batch % kRgbChannels, min(rotated_height - 1, max(0, y + tap / 3 - 1)),
-                                     min(rotated_width - 1, max(0, x + tap % 3 - 1)), height, width, rotation);
+        const auto sample = centered(input, thread.batch % kRgbChannels, min(thread.height - 1, max(0, thread.y + tap / 3 - 1)),
+                                     min(thread.width - 1, max(0, thread.x + tap % 3 - 1)), height, width, rotation);
         constexpr auto high_offset = table_offset(TableFamily::Depthwise);
-        msb = __fadd_rn(msb, lookup<TableFamily::Depthwise>(tables + high_offset, channel, tap, static_cast<int>(high(sample)) + 32));
-        lsb = __fadd_rn(lsb, lookup<TableFamily::Low>(tables, channel, tap, static_cast<int>(low(sample))));
+        msb =
+            __fadd_rn(msb, lookup<TableFamily::Depthwise>(tables + high_offset, thread.channel, tap, static_cast<int>(high(sample)) + 32));
+        lsb = __fadd_rn(lsb, lookup<TableFamily::Low>(tables, thread.channel, tap, static_cast<int>(low(sample))));
     }
-    const auto residual = centered(input, batch % kRgbChannels, y, x, height, width, rotation);
+    const auto residual = centered(input, thread.batch % kRgbChannels, thread.y, thread.x, height, width, rotation);
     const float high_result = rounded_average(msb, 1.0F / 9.0F) + high(residual);
     const float low_result = fminf(3.0F, fmaxf(0.0F, rounded_average(lsb, 1.0F / 9.0F) + low(residual)));
     target[index] = static_cast<std::int8_t>(clamp_high(high_result + low_result));
 }
 
 __global__ void depthwise(const std::int8_t* source, const float* table, std::int8_t* target, int height, int width) {
-    const int plane = height * width;
     const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (index >= kRotatedBatch * kChannels * plane) return;
-    const int batch = index / (kChannels * plane);
-    const int channel = index / plane % kChannels;
-    const int rotated_width = batch / kRgbChannels % 2 ? height : width;
-    const int rotated_height = batch / kRgbChannels % 2 ? width : height;
-    const int y = index % plane / rotated_width;
-    const int x = index % rotated_width;
-    const auto image_offset = (static_cast<std::size_t>(batch) * static_cast<std::size_t>(kChannels) + static_cast<std::size_t>(channel)) *
-                              static_cast<std::size_t>(plane);
+    RotatedThread thread;
+    if (!locate_rotated_thread(index, height, width, thread)) return;
+    const auto image_offset =
+        (static_cast<std::size_t>(thread.batch) * static_cast<std::size_t>(kChannels) + static_cast<std::size_t>(thread.channel)) *
+        static_cast<std::size_t>(thread.plane);
     const auto* image = source + image_offset;
     float sum = 0;
     for (int tap = 0; tap < kSpatialTaps; ++tap) {
-        const int sy = min(rotated_height - 1, max(0, y + tap / 3 - 1));
-        const int sx = min(rotated_width - 1, max(0, x + tap % 3 - 1));
-        sum = __fadd_rn(sum, lookup<TableFamily::Depthwise>(table, channel, tap, static_cast<int>(image[sy * rotated_width + sx]) + 32));
+        const int sy = min(thread.height - 1, max(0, thread.y + tap / 3 - 1));
+        const int sx = min(thread.width - 1, max(0, thread.x + tap % 3 - 1));
+        sum = __fadd_rn(sum,
+                        lookup<TableFamily::Depthwise>(table, thread.channel, tap, static_cast<int>(image[sy * thread.width + sx]) + 32));
     }
     target[index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 9.0F) + static_cast<float>(source[index])));
 }
 
 __global__ void shifted_pointwise(const std::int8_t* source, const float* table, const float* shifts, std::int8_t* target, int height,
                                   int width) {
-    const int plane = height * width;
     const int index = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (index >= kRotatedBatch * kChannels * plane) return;
-    const int batch = index / (kChannels * plane);
-    const int channel = index / plane % kChannels;
-    const int rotated_width = batch / kRgbChannels % 2 ? height : width;
-    const int rotated_height = batch / kRgbChannels % 2 ? width : height;
-    const int y = index % plane / rotated_width;
-    const int x = index % rotated_width;
+    RotatedThread thread;
+    if (!locate_rotated_thread(index, height, width, thread)) return;
     float sum = 0;
     float residual = 0;
     for (int in = 0; in < kChannels; ++in) {
-        const int pixel = shifted_pixel(y, x, rotated_height, rotated_width, shifts, in);
-        const float value = source[(batch * kChannels + in) * plane + pixel];
-        if (in == channel) residual = value;
-        sum = __fadd_rn(sum, lookup<TableFamily::Pointwise>(table, channel, in, static_cast<int>(value) + 32));
+        const int pixel = shifted_pixel(thread.y, thread.x, thread.height, thread.width, shifts, in);
+        const float value = source[(thread.batch * kChannels + in) * thread.plane + pixel];
+        if (in == thread.channel) residual = value;
+        sum = __fadd_rn(sum, lookup<TableFamily::Pointwise>(table, thread.channel, in, static_cast<int>(value) + 32));
     }
     target[index] = static_cast<std::int8_t>(clamp_high(rounded_average(sum, 1.0F / 16.0F) + residual));
 }

@@ -462,15 +462,7 @@ class UpscaleSystem::Impl final {
             contracts::DiagnosticLink admission_link;
             diagnostics_.Emit([&] {
                 admission_link = services::DiagnosticSpanIds::Next();
-                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
-                                            .operation = VisualDiagnosticOperation::UpscaleRequestAdmitted,
-                                            .device = settings_.device,
-                                            .generation = demand,
-                                            .value = request.source.revision,
-                                            .detail = static_cast<std::uint64_t>(request.kernel),
-                                            .context = {.source = visual_diagnostic_source({.frame = request.source}),
-                                                        .demand = {.demand_generation = demand},
-                                                        .link = admission_link}};
+                return RequestDiagnostic(VisualDiagnosticOperation::UpscaleRequestAdmitted, request, demand, admission_link);
             });
             state_.pending = request;
             state_.busy = true;
@@ -489,15 +481,7 @@ class UpscaleSystem::Impl final {
                     contracts::DiagnosticLink worker_link;
                     diagnostics_.Emit([&] {
                         worker_link = services::DiagnosticSpanIds::Next(admission_link);
-                        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
-                                                    .operation = VisualDiagnosticOperation::UpscaleWorkerStarted,
-                                                    .device = settings_.device,
-                                                    .generation = demand,
-                                                    .value = request.source.revision,
-                                                    .detail = static_cast<std::uint64_t>(request.kernel),
-                                                    .context = {.source = visual_diagnostic_source({.frame = request.source}),
-                                                                .demand = {.demand_generation = demand},
-                                                                .link = worker_link}};
+                        return RequestDiagnostic(VisualDiagnosticOperation::UpscaleWorkerStarted, request, demand, worker_link);
                     });
                     try {
                         VisualDocumentRead source;
@@ -561,15 +545,13 @@ class UpscaleSystem::Impl final {
                         if (diagnostics_.valid()) {
                             const auto plane = input.plane(0U).plane();
                             diagnostics_.Emit([&] {
-                                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
-                                                            .operation = VisualDiagnosticOperation::UpscaleInputGeometry,
-                                                            .device = settings_.device,
-                                                            .generation = demand,
-                                                            .value = source_descriptor.pitch_bytes,
-                                                            .detail = plane.descriptor.pitch_bytes,
-                                                            .context = {.capacity_width = plane.descriptor.width,
-                                                                        .capacity_height = plane.descriptor.height,
-                                                                        .frame_revision = request.source.revision}};
+                                auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleInputGeometry, demand);
+                                fact.value = source_descriptor.pitch_bytes;
+                                fact.detail = plane.descriptor.pitch_bytes;
+                                fact.context.capacity_width = plane.descriptor.width;
+                                fact.context.capacity_height = plane.descriptor.height;
+                                fact.context.frame_revision = request.source.revision;
+                                return fact;
                             });
                             diagnostics_.Emit([&] {
                                 return VisualDiagnosticFact{
@@ -602,15 +584,12 @@ class UpscaleSystem::Impl final {
                                                                                                   const auto stream) {
                                             if (diagnostics_.valid())
                                                 diagnostics_.Emit([&] {
-                                                    return VisualDiagnosticFact{
-                                                        .system = contracts::DiagnosticOwner::Upscale,
-                                                        .operation = VisualDiagnosticOperation::UpscaleOutputAllocation,
-                                                        .device = settings_.device,
-                                                        .generation = demand,
-                                                        .value = output.data,
-                                                        .detail = output.descriptor.pitch_bytes,
-                                                        .context = {.capacity_width = output.descriptor.width,
-                                                                    .capacity_height = output.descriptor.height}};
+                                                    auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
+                                                    fact.value = output.data;
+                                                    fact.detail = output.descriptor.pitch_bytes;
+                                                    fact.context.capacity_width = output.descriptor.width;
+                                                    fact.context.capacity_height = output.descriptor.height;
+                                                    return fact;
                                                 });
                                             const auto output_current = [this, demand, stop] {
                                                 std::scoped_lock lock(mutex_);
@@ -767,6 +746,20 @@ class UpscaleSystem::Impl final {
 
    private:
     friend class UpscaleSystem;
+
+    [[nodiscard]] VisualDiagnosticFact Diagnostic(const VisualDiagnosticOperation operation, const std::uint64_t demand) const noexcept {
+        return {.system = contracts::DiagnosticOwner::Upscale, .operation = operation, .device = settings_.device, .generation = demand};
+    }
+    [[nodiscard]] VisualDiagnosticFact RequestDiagnostic(const VisualDiagnosticOperation operation, const UpscaleRequest& request,
+                                                         const std::uint64_t demand, const contracts::DiagnosticLink link) const noexcept {
+        auto fact = Diagnostic(operation, demand);
+        fact.value = request.source.revision;
+        fact.detail = static_cast<std::uint64_t>(request.kernel);
+        fact.context.source = visual_diagnostic_source({.frame = request.source});
+        fact.context.demand.demand_generation = demand;
+        fact.context.link = link;
+        return fact;
+    }
 
     mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate AcquireOutput(
         mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop,

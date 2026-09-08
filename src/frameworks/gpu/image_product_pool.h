@@ -56,6 +56,8 @@ class ImageProductPool final {
         std::uint64_t revision_ = 0U;
         friend class ImageProductPool;
     };
+    // CLEANUP-OFF: Candidate is a move-only reservation with rollback custody; Product is a copyable retained
+    // completion handle. Their conventional special-member surface must not be unified behind a false base.
     class Candidate final {
        public:
         Candidate() noexcept = default;
@@ -76,6 +78,7 @@ class ImageProductPool final {
         std::uint64_t revision_ = 0U;
         friend class ImageProductPool;
     };
+    // CLEANUP-ON
     ImageProductPool(DeviceContext, ImageProductLayout, std::size_t);
     ~ImageProductPool();
     ImageProductPool(const ImageProductPool&) = delete;

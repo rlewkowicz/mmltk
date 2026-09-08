@@ -2386,6 +2386,8 @@ struct BrowserAudit final {
     bool ui_scale_released = false;
     bool ui_scale_restored = false;
     std::set<std::string, std::less<>> ui_scale_pointer_stages;
+    // CLEANUP-IGNORE: Modal usability and following rendered-grid facts are independent end-to-end UI evidence,
+    // not streaming-algorithm control flags.
     bool error_modal_usable = false;
     bool exact_grid = false;
     std::uint64_t exact_grid_revision = 0U;

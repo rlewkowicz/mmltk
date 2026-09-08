@@ -31,6 +31,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -423,21 +424,32 @@ struct ExplorePublicationDemandGate final {
     std::atomic_bool release_timed_out{false};
 };
 
-struct StreamingExploreProbe final {
-    struct Assignment final {
-        std::uint64_t generation = 0U;
-        std::uint32_t compiled_index = 0U;
-        std::uint32_t slot = 0U;
-        bool read_started = false;
-        bool ready = false;
-        bool gpu_pending = false;
-    };
+struct StreamingExploreAssignment final {
+    std::uint64_t generation = 0U;
+    std::uint32_t compiled_index = 0U;
+    std::uint32_t slot = 0U;
+    bool read_started = false;
+    bool ready = false;
+    bool gpu_pending = false;
+};
 
+struct StreamingExplorePublicationState {
+    std::vector<StreamingExploreAssignment> assignments;
+    std::vector<std::uint32_t> visible;
+    std::vector<bool> completed_slots;
+    std::vector<std::uint32_t> priority_slots;
+    std::uint64_t generation = 0U;
+    std::size_t nproc = 1U;
+    std::size_t next_slot = 0U;
+    std::size_t cumulative = 0U;
+};
+
+struct StreamingExploreProbe final : StreamingExplorePublicationState {
     void Release(const std::uint32_t compiled_index) {
         ExploreAlgorithm::GalleryReadySink wake;
         {
             std::scoped_lock lock(mutex);
-            const auto found = std::ranges::find(assignments, compiled_index, &Assignment::compiled_index);
+            const auto found = std::ranges::find(assignments, compiled_index, &StreamingExploreAssignment::compiled_index);
             REQUIRE(found != assignments.end());
             found->ready = true;
             wake = ready_sink;
@@ -459,7 +471,7 @@ struct StreamingExploreProbe final {
     }
     void StartRead(const std::uint32_t compiled_index) {
         std::scoped_lock lock(mutex);
-        const auto found = std::ranges::find(assignments, compiled_index, &Assignment::compiled_index);
+        const auto found = std::ranges::find(assignments, compiled_index, &StreamingExploreAssignment::compiled_index);
         REQUIRE(found != assignments.end());
         REQUIRE_FALSE(found->read_started);
         found->read_started = true;
@@ -504,14 +516,6 @@ struct StreamingExploreProbe final {
     mutable std::mutex mutex;
     std::condition_variable changed;
     ExploreAlgorithm::GalleryReadySink ready_sink;
-    std::vector<Assignment> assignments;
-    std::vector<std::uint32_t> visible;
-    std::vector<bool> completed_slots;
-    std::vector<std::uint32_t> priority_slots;
-    std::uint64_t generation = 0U;
-    std::size_t nproc = 1U;
-    std::size_t next_slot = 0U;
-    std::size_t cumulative = 0U;
     std::size_t publications = 0U;
     std::size_t stale = 0U;
     std::size_t maximum_active = 0U;
@@ -767,16 +771,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     }
 
    private:
-    struct PublicationCheckpoint final {
-        std::vector<StreamingExploreProbe::Assignment> assignments;
-        std::vector<std::uint32_t> visible;
-        std::vector<bool> completed_slots;
-        std::vector<std::uint32_t> priority_slots;
-        std::uint64_t generation = 0U;
-        std::size_t nproc = 1U;
-        std::size_t next_slot = 0U;
-        std::size_t cumulative = 0U;
-    };
+    using PublicationCheckpoint = StreamingExplorePublicationState;
 
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
         probe_->priority_slots.clear();
@@ -1345,7 +1340,9 @@ struct UpscaleActivationProbe final {
     std::atomic_bool hold_warm{false};
     std::promise<void> warm_entered;
     std::promise<void> warm_release;
+    // CLEANUP-IGNORE: This shared future is activation-gate custody, not shell wiring state.
     std::shared_future<void> warm_released = warm_release.get_future().share();
+    // CLEANUP-IGNORE: First-warm completion is a separate one-shot activation observation.
     std::promise<void> first_warm_completed;
 };
 
@@ -1492,6 +1489,25 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
     return {};
 }
 
+void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std::uint64_t>& completed, const bool staged = false) {
+    auto work = [&completed](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        const auto revision = runtime.OutputFacts().revision;
+        return detail::VisualRuntimeOwner::Notification{[&completed, revision] { completed.set_value(revision); }};
+    };
+    if (staged)
+        REQUIRE(owner.SubmitDiscrete(std::move(work), {}, true));
+    else
+        REQUIRE(owner.SubmitOrdered(std::move(work)));
+}
+
+void submit_visual_completion(detail::VisualRuntimeOwner& owner, std::promise<void>& completed) {
+    REQUIRE(owner.SubmitOrdered([&completed](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
+    }));
+}
+
 [[nodiscard]] detail::VisualRuntimeOwner::Work record_visual_work(std::mutex& mutex, std::vector<int>& values, const int value,
                                                                   std::promise<void>* completed = nullptr) {
     return [&mutex, &values, value, completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -1556,8 +1572,11 @@ struct TestPresentationWriterState final {
         std::unique_lock lock(pump_mutex);
         return pump_changed.wait_for(lock, 2s, [&] { return pump_count > prior; });
     }
+    // CLEANUP-IGNORE: This descriptor begins presentation-writer readiness and lifecycle evidence, not fake GPU
+    // synchronization and transfer counters.
     mmltk::common::io::ScopedFd readiness;
-    // CLEANUP-IGNORE: Presentation lifecycle evidence is unrelated to the GPU fake's transfer counters.
+    // CLEANUP-OFF: These presentation lifecycle facts are independent test evidence with distinct assertions, not
+    // a second physical-backend telemetry schema.
     std::atomic<std::uint64_t> timeline{0U};
     std::atomic<std::uint64_t> presentation_revision{0U};
     std::atomic<std::uint64_t> submissions{0U};
@@ -1568,6 +1587,7 @@ struct TestPresentationWriterState final {
     std::atomic<std::uint64_t> retirement_acknowledgement{0U};
     std::atomic<std::uint64_t> constructions{0U};
     std::atomic<std::uint64_t> context_bindings{0U};
+    // CLEANUP-ON
     std::atomic_bool allow_publication{true};
     std::atomic_bool fail_pump{false};
     std::atomic_bool block_pump{false};
@@ -1811,12 +1831,15 @@ class DiagnosticCapture final {
                 },
         };
     }
+    // CLEANUP-OFF: These named trace assertions are independent domain evidence, not physical fake-backend
+    // allocation and transfer counters.
     std::atomic<std::uint64_t> count{0U};
     std::atomic<std::uint64_t> stale_discarded{0U};
     std::atomic<std::uint64_t> reused_revision{0U};
     std::atomic<std::uint64_t> reused_meaning{0U};
     std::atomic<std::uint64_t> reused_observation{0U};
     std::atomic<contracts::DiagnosticOwner> last_system{contracts::DiagnosticOwner::Explore};
+    // CLEANUP-ON
 };
 
 constexpr VisualDeviceSettings kDevice{
@@ -2632,6 +2655,8 @@ TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring com
 
 TEST_CASE("Explore prepared-product failure restores exact borrows or retires failed rollback") {
     const bool rollback_fails = GENERATE(false, true);
+    // CLEANUP-IGNORE: This fixture configures prepared-product and rollback faults; the preceding scenario configures
+    // persistence failure, so their identical admission preamble is not shared behavior.
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
@@ -2669,7 +2694,9 @@ TEST_CASE("Explore prepared-product failure restores exact borrows or retires fa
     }
 }
 
+// CLEANUP-IGNORE: This test begins a lifecycle-stop contract distinct from the preceding rollback transaction.
 TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed product meaning") {
+    // CLEANUP-IGNORE: Stop coverage deliberately creates unfinished lanes but does not configure candidate failure.
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
@@ -3760,6 +3787,8 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     const auto events_before_open = changed_events->load(std::memory_order_acquire);
 
     block_persistence->store(true, std::memory_order_release);
+    // CLEANUP-IGNORE: This Open drives catalog replacement through a blocked persistence boundary; the prior filter
+    // operation tests successful persistence before Stop.
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
     REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
     auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
@@ -4726,6 +4755,8 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
 
 TEST_CASE("Upscale publishes only the newest selected kernel after obsolete device work settles") {
     auto backend = std::make_shared<FakeImageBackend>();
+    // CLEANUP-IGNORE: This source feeds a supersession/commit gate; the cached-selection scenario retains three
+    // completed methods and validates a different ownership path.
     MutableVisualSource source{backend, {16U, 8U}};
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
@@ -4791,6 +4822,8 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
     CHECK(upscale.snapshot().input == source.frame());
 }
 
+// CLEANUP-IGNORE: This cancellation-at-borrow test has a two-window source-custody gate, unlike held-output
+// admission pressure even though both begin with an Upscale fixture.
 TEST_CASE("Superseded Upscale demand releases source custody without copying at both borrow windows") {
     const bool after_borrow = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4840,6 +4873,8 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
 
 TEST_CASE("Upscale completed and failed facts require exact immutable document meaning") {
     auto backend = std::make_shared<FakeImageBackend>();
+    // CLEANUP-IGNORE: This source is mutated to an inconsistent document meaning; the semantic-revision scenario
+    // preserves valid document provenance and tests receiver-copy reuse.
     MutableVisualSource source{backend, {16U, 8U}};
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
@@ -5061,6 +5096,28 @@ class NativeUpscaleSource final {
     mmltk::frameworks::gpu::SystemImageRuntime runtime_;
 };
 
+class NativeUpscaleFailureScenario final {
+   public:
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using Injection = std::function<void(Stage, std::atomic_bool&)>;
+
+    explicit NativeUpscaleFailureScenario(Injection injection)
+        : upscale{kDevice,
+                  make_native_upscale_runtime_factory(
+                      kDevice, [this, injection = std::move(injection)](const Stage reached) { injection(reached, armed); }),
+                  [this](const VisualFrame& frame) { return source.Borrow(frame); },
+                  [this](UpscaleSystem::event_type event) {
+                      if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
+                      events.Advance();
+                  }} {}
+
+    NativeUpscaleSource source;
+    std::atomic_bool armed{true};
+    std::promise<UpscaleFailed> failed;
+    EventGate events;
+    UpscaleSystem upscale;
+};
+
 TEST_CASE("Native Upscale cancellation settles admitted work without recording initialization failure", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
@@ -5116,39 +5173,28 @@ TEST_CASE("Native CUDA failure scope reaches Upscale quarantine or isolated retr
     const auto status = GENERATE(cudaErrorDeviceUninitialized, cudaErrorContained, cudaErrorTensorMemoryLeak, cudaErrorSystemNotReady,
                                  cudaErrorMpsClientTerminated, cudaErrorExternalDevice, cudaErrorMemoryAllocation, cudaErrorInvalidValue,
                                  cudaErrorLaunchOutOfResources);
-    NativeUpscaleSource source;
-    std::atomic_bool armed{true};
-    std::promise<UpscaleFailed> failed;
-    EventGate events;
-    UpscaleSystem upscale{kDevice,
-                          make_native_upscale_runtime_factory(kDevice,
-                                                              [&](Stage reached) {
-                                                                  if (reached == Stage::ContextCreated && armed.exchange(false))
-                                                                      throw CudaError(status, "injected native CUDA scope");
-                                                              }),
-                          [&source](const VisualFrame& frame) { return source.Borrow(frame); },
-                          [&](UpscaleSystem::event_type event) {
-                              if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
-                              events.Advance();
-                          }};
-    static_cast<void>(upscale.Start(test_upscale_request({source.frame})));
-    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
-    static_cast<void>(upscale.Start(test_upscale_request({source.frame, UpscaleKernel::ShiftLut})));
-    auto failure = failed.get_future();
+    NativeUpscaleFailureScenario scenario{[status](const Stage reached, std::atomic_bool& armed) {
+        if (reached == Stage::ContextCreated && armed.exchange(false)) throw CudaError(status, "injected native CUDA scope");
+    }};
+    static_cast<void>(scenario.upscale.Start(test_upscale_request({scenario.source.frame})));
+    REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().ready; }));
+    static_cast<void>(scenario.upscale.Start(test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut})));
+    auto failure = scenario.failed.get_future();
     REQUIRE(failure.wait_for(120s) == std::future_status::ready);
     const auto result = failure.get();
     CHECK((result.kind == UpscaleFailureKind::Physical) == cuda_shared_failure(status));
     if (cuda_shared_failure(status)) {
         CHECK_FALSE(result.snapshot.ready);
-        CHECK_FALSE(upscale.BorrowFrame().valid());
+        CHECK_FALSE(scenario.upscale.BorrowFrame().valid());
         for (const auto& method : result.snapshot.methods)
             CHECK_FALSE(method.available);
     } else {
         CHECK(result.snapshot.ready);
         CHECK(result.snapshot.methods[0U].available);
-        static_cast<void>(upscale.Start(test_upscale_request({source.frame, UpscaleKernel::ShiftLut})));
-        REQUIRE(events.Wait([&] { return upscale.snapshot().kernel == UpscaleKernel::ShiftLut && !upscale.snapshot().busy; }, 120s));
-        CHECK_FALSE(upscale.snapshot().methods[1U].initialization_failed);
+        static_cast<void>(scenario.upscale.Start(test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut})));
+        REQUIRE(scenario.events.Wait(
+            [&] { return scenario.upscale.snapshot().kernel == UpscaleKernel::ShiftLut && !scenario.upscale.snapshot().busy; }, 120s));
+        CHECK_FALSE(scenario.upscale.snapshot().methods[1U].initialization_failed);
     }
 }
 
@@ -5177,19 +5223,17 @@ TEST_CASE("Completed native activation survives same-method withdrawal without r
     const auto completed = counts;
     current = true;
     CHECK_NOTHROW(run_native_upscale(*runtime, method, [&] { return current; }));
-    for (const auto stage :
-         {Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted, Stage::ContextCreated,
-          Stage::BuffersAllocated, Stage::StreamCreated, Stage::EventCreated, Stage::BindingsReady}) {
-        CAPTURE(boundary, stage);
-        CHECK(counts[static_cast<std::size_t>(stage)] == completed[static_cast<std::size_t>(stage)]);
-    }
-    if (method == UpscaleKernel::RealPlksr) {
-        for (const auto stage :
-             {Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted,
-              Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled}) {
+    const auto check_unchanged = [&](const std::initializer_list<Stage> stages) {
+        for (const auto stage : stages) {
             CAPTURE(boundary, stage);
             CHECK(counts[static_cast<std::size_t>(stage)] == completed[static_cast<std::size_t>(stage)]);
         }
+    };
+    check_unchanged({Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted,
+                     Stage::ContextCreated, Stage::BuffersAllocated, Stage::StreamCreated, Stage::EventCreated, Stage::BindingsReady});
+    if (method == UpscaleKernel::RealPlksr) {
+        check_unchanged({Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted,
+                         Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled});
         CHECK(counts[static_cast<std::size_t>(Stage::ContextCreated)] == 2U);
         CHECK(counts[static_cast<std::size_t>(Stage::ReplaySettled)] == 2U);
     }
@@ -5202,34 +5246,22 @@ TEST_CASE("Native method failures are classified at the actual activation comple
     using namespace mmltk::frameworks::gpu;
     const auto boundary =
         GENERATE(Stage::ContextCreated, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::WarmSubmitted, Stage::RuntimeEnqueued);
-    NativeUpscaleSource source;
-    std::atomic_bool armed{true};
-    std::promise<UpscaleFailed> failed;
-    EventGate events;
-    UpscaleSystem upscale{kDevice,
-                          make_native_upscale_runtime_factory(kDevice,
-                                                              [&](Stage reached) {
-                                                                  if (reached == boundary && armed.exchange(false))
-                                                                      throw CudaError(cudaErrorMemoryAllocation,
-                                                                                      "settled activation-boundary allocation failure");
-                                                              }),
-                          [&source](const VisualFrame& frame) { return source.Borrow(frame); },
-                          [&](UpscaleSystem::event_type event) {
-                              if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
-                              events.Advance();
-                          }};
-    const auto request = test_upscale_request({source.frame, UpscaleKernel::ShiftLut});
-    static_cast<void>(upscale.Start(request));
-    auto failure = failed.get_future();
+    NativeUpscaleFailureScenario scenario{[boundary](const Stage reached, std::atomic_bool& armed) {
+        if (reached == boundary && armed.exchange(false))
+            throw CudaError(cudaErrorMemoryAllocation, "settled activation-boundary allocation failure");
+    }};
+    const auto request = test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut});
+    static_cast<void>(scenario.upscale.Start(request));
+    auto failure = scenario.failed.get_future();
     REQUIRE(failure.wait_for(120s) == std::future_status::ready);
     const auto result = failure.get();
     CHECK(result.kind == UpscaleFailureKind::Failed);
     CHECK(result.request == request);
     CHECK(result.snapshot.methods[1U].failed);
     CHECK(result.snapshot.methods[1U].initialization_failed == (boundary == Stage::ContextCreated));
-    static_cast<void>(upscale.Start(request));
-    REQUIRE(events.Wait([&] { return upscale.snapshot().ready && !upscale.snapshot().busy; }, 120s));
-    CHECK_FALSE(upscale.snapshot().methods[1U].initialization_failed);
+    static_cast<void>(scenario.upscale.Start(request));
+    REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().ready && !scenario.upscale.snapshot().busy; }, 120s));
+    CHECK_FALSE(scenario.upscale.snapshot().methods[1U].initialization_failed);
 }
 
 TEST_CASE("Native withdrawal does not erase a concurrently reported method failure", "[upscale_gpu]") {
@@ -6454,20 +6486,9 @@ TEST_CASE("visual producer revisions remain unique across staged runtime reconst
     std::promise<std::uint64_t> first_completed;
     std::promise<std::uint64_t> replacement_completed;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
-        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        const auto revision = runtime.OutputFacts().revision;
-        return detail::VisualRuntimeOwner::Notification{[&first_completed, revision] { first_completed.set_value(revision); }};
-    }));
+    submit_visual_revision(owner, first_completed);
     const auto first_revision = first_completed.get_future().get();
-    REQUIRE(owner.SubmitDiscrete(
-        [&replacement_completed](auto& runtime, std::stop_token) {
-            runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-            const auto revision = runtime.OutputFacts().revision;
-            return detail::VisualRuntimeOwner::Notification{
-                [&replacement_completed, revision] { replacement_completed.set_value(revision); }};
-        },
-        {}, true));
+    submit_visual_revision(owner, replacement_completed, true);
     const auto replacement_revision = replacement_completed.get_future().get();
 
     CHECK(replacement_revision > first_revision);
@@ -6487,11 +6508,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
                                          return successful(std::move(revisions));
                                      },
                                      [&failed](std::exception_ptr) { failed.set_value(); }};
-    REQUIRE(owner.SubmitOrdered([&first_completed](auto& runtime, std::stop_token) {
-        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        const auto revision = runtime.OutputFacts().revision;
-        return detail::VisualRuntimeOwner::Notification{[&first_completed, revision] { first_completed.set_value(revision); }};
-    }));
+    submit_visual_revision(owner, first_completed);
     const auto first_revision = first_completed.get_future().get();
     REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
     REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
@@ -6571,10 +6588,7 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
                                              released.wait();
                                          }
                                      }};
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
-    }));
+    submit_visual_completion(owner, first);
     first.get_future().wait();
     auto prior = owner.Borrow();
     const auto prior_revision = prior.plane(0U).revision();
@@ -6644,10 +6658,7 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
     std::promise<void> next;
     std::atomic<std::uint64_t> promoted = 0U;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
-    }));
+    submit_visual_completion(owner, first);
     first.get_future().wait();
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
@@ -6687,10 +6698,7 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
                                          return factory(std::move(revisions));
                                      },
                                      [](std::exception_ptr) {}};
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        return detail::VisualRuntimeOwner::Notification{[&] { first.set_value(); }};
-    }));
+    submit_visual_completion(owner, first);
     first.get_future().wait();
     auto incumbent = owner.Borrow();
     const auto revision = incumbent.plane(0U).revision();
@@ -7313,6 +7321,8 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
         EventGate events;
         Result result;
         {
+            // CLEANUP-IGNORE: This scoped system measures diagnostic enablement without changing pixels or
+            // allocations; the settings-guard fixture owns different work probes and failure expectations.
             ExploreSystem explore{settings.system(),
                                   kDevice,
                                   2U,

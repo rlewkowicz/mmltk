@@ -1006,11 +1006,7 @@ mod tests {
                 reset,
                 reset,
             );
-            assert_eq!(app.workspace.active(), FeatureId::Train);
-            assert!(app.presentation.viewer.is_none());
-            assert!(app.model.explore.requested_upscale.is_none());
-            assert!(app.model.explore.sent_upscale.is_none());
-            assert!(app.model.presentation_refresh().is_none());
+            assert_viewer_departed(&app);
             let mut stopped = false;
             while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) =
                 receiver.try_recv()
@@ -1506,6 +1502,14 @@ mod tests {
         ));
     }
 
+    fn assert_viewer_departed(app: &App) {
+        assert_eq!(app.workspace.active(), FeatureId::Train);
+        assert!(app.presentation.viewer.is_none());
+        assert!(app.model.explore.requested_upscale.is_none());
+        assert!(app.model.explore.sent_upscale.is_none());
+        assert!(app.model.presentation_refresh().is_none());
+    }
+
     #[test]
     fn mapped_navigation_preserves_current_viewer_and_dispatches_departure_and_reentry() {
         for persist in [false, true] {
@@ -1551,11 +1555,7 @@ mod tests {
             assert_eq!(test_releases(), vec![frame]);
 
             navigate(&mut app, FeatureId::Train);
-            assert_eq!(app.workspace.active(), FeatureId::Train);
-            assert!(app.presentation.viewer.is_none());
-            assert!(app.model.explore.requested_upscale.is_none());
-            assert!(app.model.explore.sent_upscale.is_none());
-            assert!(app.model.presentation_refresh().is_none());
+            assert_viewer_departed(&app);
             assert_eq!(test_releases(), vec![frame, pending]);
             let mut operations = Vec::new();
             while let Ok(record) = receiver.try_recv() {

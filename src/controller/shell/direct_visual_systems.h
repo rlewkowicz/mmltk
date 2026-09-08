@@ -66,8 +66,8 @@ class ApplicationSystemStorage final {
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowExactFrame(const VisualFrame&) const;
     [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
 
-    // CLEANUP-IGNORE: ApplicationSystemStorage explicitly owns its system instances; a transport channel's queues do
-    // not.
+    // CLEANUP-OFF: ApplicationSystemStorage explicitly owns independently typed product systems. Its member sequence
+    // is unrelated to transport-channel queue inventories and cannot use an erased or shared storage base.
     EventSink events_;
     ContinuitySink continuity_;
     std::unique_ptr<SettingsSystem> settings_;
@@ -85,6 +85,7 @@ class ApplicationSystemStorage final {
     std::array<VisualSourceReader, browser::ApplicationSchema<ApplicationSystems>::VisualSourceCount()> source_readers_{};
     std::unique_ptr<PresentationSystem> presentation_;
     ApplicationSystems systems_{};
+    // CLEANUP-ON
 };
 
 [[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&,

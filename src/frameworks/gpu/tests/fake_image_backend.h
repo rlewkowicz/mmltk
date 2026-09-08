@@ -62,6 +62,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::atomic<std::size_t> planes_freed{0U};
     std::atomic<std::size_t> pinned_allocated{0U};
     std::atomic<int> pinned_receiver_device{-1};
+    // CLEANUP-IGNORE: Synchronization and copy-path counters are distinct physical operations, not another allocation inventory.
     std::atomic<std::size_t> synchronized{0U};
     std::atomic<std::size_t> same_copies{0U};
     std::atomic<std::uintptr_t> watched_copy_source{0U};

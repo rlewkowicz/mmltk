@@ -18,11 +18,15 @@ enum class DiagnosticOwner : std::uint8_t {
     Live,
     Presentation,
     AnnotationResource,
+    // CLEANUP-IGNORE: Closing the diagnostic-owner enum before the source schema is a canonical reflected boundary,
+    // not a reusable scalar record shared with kernel ABIs.
 };
 
 // Copies of identities owned elsewhere. None of these facts participates in
 // ordering, resource release, or source matching.
+// CLEANUP-IGNORE: DiagnosticSource is the canonical trace source schema, not a common ABI shared with CUDA records.
 struct DiagnosticSource final {
+    // CLEANUP-IGNORE: Trace source identity scalars cannot share storage with unrelated physical geometry records.
     std::uint64_t source_session = 0U;
     std::uint64_t source_instance = 0U;
     std::uint64_t source_revision = 0U;
@@ -65,9 +69,12 @@ struct DiagnosticPixel final {
     std::uint32_t sample_x = 0U;
     std::uint32_t sample_y = 0U;
     std::uint32_t sample_rgba = 0U;
+    // CLEANUP-IGNORE: Closing the pixel evidence record before the trace envelope is a reflected schema boundary.
 };
+// CLEANUP-IGNORE: DiagnosticContext is the canonical heterogeneous trace envelope, not a kernel ABI.
 struct DiagnosticContext final {
     std::uint64_t capacity_width = 0U;
+    // CLEANUP-IGNORE: Trace capacity fields are not interchangeable with source or crop geometry.
     std::uint64_t capacity_height = 0U;
     std::uint64_t staging_bytes = 0U;
     std::uint64_t cache_bytes = 0U;

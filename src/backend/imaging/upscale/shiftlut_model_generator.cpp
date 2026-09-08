@@ -171,15 +171,7 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
         storage.Allocate();
         lut::Operators operators{1024};
         Ort::SessionOptions options;
-        operators.Register(options);
-        Ort::CUDAProviderOptions cuda;
-        cuda.Update(std::unordered_map<std::string, std::string>{
-            {"device_id", "0"},
-            {"enable_cuda_graph", capture ? "1" : "0"},
-            {"use_tf32", "0"},
-        });
-        cuda.UpdateWithValue("user_compute_stream", storage.Stream());
-        options.AppendExecutionProvider_CUDA_V2(*cuda);
+        lut::configure_verification_session(operators, options, 0, capture, storage.Stream());
         {
             Ort::Session session{environment, path.c_str(), options};
             Ort::MemoryInfo memory{"Cuda", OrtArenaAllocator, 0, OrtMemTypeDefault};

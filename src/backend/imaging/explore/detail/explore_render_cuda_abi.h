@@ -17,13 +17,15 @@ struct ExploreRenderDemand final {
         return latest_generation == nullptr || latest_generation->load(std::memory_order_acquire) == generation;
     }
 };
+// CLEANUP-IGNORE: The lock-free demand assertion precedes an independent fixed kernel input ABI.
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
-// CLEANUP-IGNORE: The card input descriptor is a fixed kernel ABI, not an acceptance-state or host-layout record.
 struct ExploreRenderCardDescriptorAbi final {
+    // CLEANUP-IGNORE: Card erasure and source fields form a fixed input ABI unrelated to the diagnostic envelope.
     mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure{};
-    // CLEANUP-IGNORE: Card source storage begins a distinct input ABI from rendered geometry probe output.
+    // CLEANUP-IGNORE: The card pixel pointer and following dimensions are a fixed CUDA input layout, not trace storage.
     const float* pixels = nullptr;
+    // CLEANUP-IGNORE: This fixed card-input kernel ABI preserves its independently versioned source geometry.
     std::uint32_t source_width = 0U;
     std::uint32_t source_height = 0U;
     std::uint32_t image_x = 0U;
@@ -92,12 +94,14 @@ struct ExploreRenderTargetViewAbi final {
 struct ExploreRenderedCardProbeAbi final {
     // The receiver-owned clean thumbnail is the physical-copy reference.
     // Diagnostic collection never retains a raw compiled-image lane.
+    // CLEANUP-IGNORE: The receiver-owned reference begins a fixed probe ABI, not a host diagnostic record.
     ExploreRenderTargetViewAbi reference{};
+    // CLEANUP-IGNORE: Probe content geometry is not interchangeable with source or crop geometry.
     std::uint32_t content_x = 0U;
     std::uint32_t content_y = 0U;
     std::uint32_t content_width = 0U;
-    // CLEANUP-IGNORE: Probe content height starts output box geometry, not a host descriptor layout.
     std::uint32_t content_height = 0U;
+    // CLEANUP-IGNORE: Probe box geometry is a separate semantic region within the fixed output ABI.
     std::uint32_t box_x = 0U;
     std::uint32_t box_y = 0U;
     std::uint32_t box_width = 0U;
@@ -151,7 +155,6 @@ struct ExploreRenderAtlasViewAbi final {
 struct ExploreRenderDetailViewAbi final {
     mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure{};
     const float* pixels = nullptr;
-    // CLEANUP-IGNORE: The detail kernel ABI owns crop geometry; the atlas ABI owns card-grid geometry.
     std::uint32_t source_width = 0U;
     std::uint32_t source_height = 0U;
     std::uint32_t crop_x = 0U;

@@ -1316,6 +1316,8 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-native-transaction"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 4);
     controller::SettingsSystem settings;
+    // CLEANUP-IGNORE: This transaction fixture uses the same transport selector as cancellation coverage but
+    // establishes different socket, product-observer, and fault-boundary evidence.
     load_explore_transport(settings, root.path() / "gui.json", true);
     std::array<int, 2U> sockets{-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
@@ -1421,6 +1423,8 @@ void test_native_explore_transaction_faults_and_inactive_release() {
         CHECK(settled.frame != incumbent.frame);
     } else {
         CHECK_FALSE(incumbent_artifact.expired());
+        // CLEANUP-IGNORE: These end-to-end rollback assertions intentionally restate the public continuity contract
+        // across a separate compiled-data acceptance boundary.
         CHECK(settled.frame == incumbent.frame);
         CHECK(settled.dataset.identity == incumbent.dataset.identity);
         CHECK(settled.order.visible_indices == incumbent.order.visible_indices);

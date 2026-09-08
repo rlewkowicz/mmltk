@@ -63,6 +63,7 @@ class GalleryStream final {
         const ExploreRenderPlan&, std::span<const std::uint32_t>, std::span<const std::uint32_t>, std::size_t,
         std::shared_ptr<const mmltk::backend::data::CompiledDataset>, std::span<const std::uint32_t>,
         std::span<const mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi>, mmltk::frameworks::gpu::ImagePlaneView,
+        // CLEANUP-IGNORE: The public facade mirrors this declaration tail at its one private pimpl boundary.
         mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     [[nodiscard]] ExploreGalleryPublication Advance();
     [[nodiscard]] bool HasReadyTiles() const;

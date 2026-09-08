@@ -111,8 +111,11 @@ ImageProductPool::Candidate::~Candidate() { Release(); }
 ImageProductPool::Candidate::Candidate(Candidate&& other) noexcept
     : slot_(std::move(other.slot_)),
       baseline_(std::move(other.baseline_)),
+      // CLEANUP-IGNORE: Candidate preservation and revision complete reservation transfer; Product has no rollback baseline.
       preservation_(other.preservation_),
       revision_(std::exchange(other.revision_, 0U)) {}
+// CLEANUP-IGNORE: Candidate move assignment transfers reservation and rollback state; Product move assignment
+// transfers a retained completion and has different release semantics.
 ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& other) noexcept {
     if (this == &other) return *this;
     Release();

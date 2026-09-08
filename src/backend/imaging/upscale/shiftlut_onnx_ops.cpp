@@ -8,6 +8,7 @@
 #include <exception>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mmltk::backend::imaging::upscale::shiftlut {
@@ -154,6 +155,18 @@ Operators::~Operators() = default;
 void Operators::Register(Ort::SessionOptions& options) { options.Add(impl_->domain); }
 cudaError_t Operators::Release() noexcept { return impl_->storage.Release(); }
 cudaError_t Operators::ReadDecisions(std::span<std::int8_t> target) noexcept { return impl_->storage.ReadDecisions(target); }
+void configure_verification_session(Operators& operators, Ort::SessionOptions& options, const int device, const bool enable_cuda_graph,
+                                    const cudaStream_t stream) {
+    operators.Register(options);
+    Ort::CUDAProviderOptions cuda;
+    cuda.Update(std::unordered_map<std::string, std::string>{
+        {"device_id", std::to_string(device)},
+        {"enable_cuda_graph", enable_cuda_graph ? "1" : "0"},
+        {"use_tf32", "0"},
+    });
+    cuda.UpdateWithValue("user_compute_stream", stream);
+    options.AppendExecutionProvider_CUDA_V2(*cuda);
+}
 std::uint64_t allocation_count() noexcept { return allocations.load(std::memory_order_relaxed); }
 
 }  // namespace mmltk::backend::imaging::upscale::shiftlut

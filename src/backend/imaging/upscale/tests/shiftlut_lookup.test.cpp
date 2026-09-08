@@ -177,15 +177,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
     lut::Operators operators;
     Ort::Env environment{ORT_LOGGING_LEVEL_ERROR, "shiftlut_equivalence"};
     Ort::SessionOptions options;
-    operators.Register(options);
-    Ort::CUDAProviderOptions cuda_options;
-    cuda_options.Update(std::unordered_map<std::string, std::string>{
-        {"device_id", "0"},
-        {"enable_cuda_graph", graph ? "1" : "0"},
-        {"use_tf32", "0"},
-    });
-    cuda_options.UpdateWithValue("user_compute_stream", stream.get());
-    options.AppendExecutionProvider_CUDA_V2(*cuda_options);
+    lut::configure_verification_session(operators, options, 0, graph, stream.get());
     const auto model = std::filesystem::path(MMLTK_TEST_SOURCE_ROOT) / "src/backend/imaging/upscale/assets/ShiftLUT_fp32.onnx";
     // Explicitly destroy all ORT bindings/session before the physical owner.
     {

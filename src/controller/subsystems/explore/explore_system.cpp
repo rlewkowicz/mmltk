@@ -39,6 +39,21 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
     };
 }
 
+[[nodiscard]] ExploreRenderPlan make_render_plan(const ExploreSnapshot& requested,
+                                                 const mmltk::backend::models::rfdetr::GpuAugmentationConfig& augmentation_config,
+                                                 const std::uint64_t dataset_identity, const std::uint64_t generation) {
+    return {.viewport = requested.viewport,
+            .overlay = requested.overlay,
+            .mode = requested.mode,
+            .selected_image = requested.selected_image,
+            .focused_image = requested.focused_image,
+            .augmentation_config = augmentation_config,
+            .augmentation = requested.augmentation,
+            .detail = requested.detail,
+            .dataset_identity = dataset_identity,
+            .generation = generation};
+}
+
 [[nodiscard]] bool selection_valid(const ExploreClassSelection& selection, const std::uint32_t class_count) {
     if (selection.mode == ExploreClassSelectionMode::All || selection.mode == ExploreClassSelectionMode::None)
         return selection.classes.empty();
@@ -633,16 +648,7 @@ class ExploreSystem::Impl final {
                                     ? latest_generation_->load(std::memory_order_acquire)
                                     : NextGeneration();
         auto requested = *desired_;
-        ExploreRenderPlan plan{.viewport = requested.viewport,
-                               .overlay = requested.overlay,
-                               .mode = requested.mode,
-                               .selected_image = requested.selected_image,
-                               .focused_image = requested.focused_image,
-                               .augmentation_config = desired_augmentation_config_,
-                               .augmentation = requested.augmentation,
-                               .detail = requested.detail,
-                               .dataset_identity = state_.dataset.identity,
-                               .generation = generation};
+        auto plan = make_render_plan(requested, desired_augmentation_config_, state_.dataset.identity, generation);
         if (!worker_.SubmitLatest([this, plan, requested = std::move(requested), generation, offset, settings = desired_settings_,
                                    persist = desired_persist_](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                                std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
@@ -1253,16 +1259,7 @@ class ExploreSystem::Impl final {
         };
     }
     [[nodiscard]] ExploreRenderPlan Plan(const std::uint64_t generation) const {
-        return {.viewport = state_.viewport,
-                .overlay = state_.overlay,
-                .mode = state_.mode,
-                .selected_image = state_.selected_image,
-                .focused_image = state_.focused_image,
-                .augmentation_config = augmentation_config_,
-                .augmentation = state_.augmentation,
-                .detail = state_.detail,
-                .dataset_identity = state_.dataset.identity,
-                .generation = generation};
+        return make_render_plan(state_, augmentation_config_, state_.dataset.identity, generation);
     }
     [[nodiscard]] static VisualExtent ProductExtent(ExploreAlgorithm& algorithm, const ExploreRenderPlan& plan) {
         return plan.mode == ExploreMode::Gallery ? plan.viewport.extent : algorithm.DetailExtent(plan);

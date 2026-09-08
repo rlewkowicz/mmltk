@@ -123,17 +123,18 @@ struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
     bool cancellation_requested = false;
+    // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
     bool ready = false;
     contracts::AnnotationUiState ui{};
-    // CLEANUP-IGNORE: Annotation retains its own typed private-frame field in the generated snapshot.
     VisualFrame frame{};
-    // CLEANUP-IGNORE: The Annotation snapshot terminator is part of its distinct reflected declaration boundary.
+    // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] AnnotationChanged final {
     AnnotationSnapshot snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] AnnotationFailed final {
     AnnotationSnapshot snapshot{};
+    // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
 
