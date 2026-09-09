@@ -727,7 +727,8 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                         .operation = VisualDiagnosticOperation::AcceptancePlaceholderComplete,
                                         .generation = plan.generation,
-                                        .value = State().visible_indices.size()};
+                                        .value = State().visible_indices.size(),
+                                        .detail = explore_visible_indices_digest(State().visible_indices)};
         });
     }
     auto publication = PublicationFacts(stale_discarded_.exchange(0U, std::memory_order_acq_rel));
@@ -1011,10 +1012,10 @@ void GalleryStream::Impl::CompleteTiles(const bool synchronized) {
             State().visible_indices[lane->destination_slot] == lane->compiled_index &&
             (lane->state == LaneState::GpuComplete || (synchronized && lane->state == LaneState::GpuPending))) {
             State().tile_meanings[lane->destination_slot] = std::move(lane->pending_meaning);
+            observe(lane->destination_slot);
             if (!State().completed_slots[lane->destination_slot]) {
                 State().completed_slots[lane->destination_slot] = true;
                 ++State().cumulative_tiles;
-                observe(lane->destination_slot);
             }
         }
     }
@@ -1168,7 +1169,7 @@ void GalleryStream::Impl::FinishReadLane(const std::size_t lane_index, std::exce
         AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompiledReadCompleted, lane, lane.compiled_index);
         if (acceptance_ && !lane.prefetch && lane.first_row != 0U && acceptance_->ClaimHeldCompletion()) {
             AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompletionHeld, lane, lane.compiled_index);
-            const auto released = acceptance_->AwaitHeldCompletion();
+            const auto released = acceptance_->AwaitHeldCompletion(lane.DemandGeneration());
             if (released == ExploreAcceptanceGate::WaitResult::Proceed)
                 AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompletionReleased, lane, lane.compiled_index);
             else if (acceptance_->ClaimTerminalReport())
@@ -2726,6 +2727,12 @@ void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint
                 static_cast<std::uint32_t>(std::min<std::uint64_t>(facts[2], std::numeric_limits<std::uint32_t>::max()));
             fact.context.staging_bytes = (std::min<std::uint64_t>(facts[3], std::numeric_limits<std::uint32_t>::max()) << 32U) |
                                          (std::min<std::uint64_t>(facts[4], 0xffffU) << 16U) | std::min<std::uint64_t>(facts[5], 0xffffU);
+            fact.context.source = {.source_width = checksum_target.width,
+                                   .source_height = checksum_target.height,
+                                   .content_x = probe.content_x,
+                                   .content_y = probe.content_y,
+                                   .content_width = probe.content_width,
+                                   .content_height = probe.content_height};
             return fact;
         });
         const auto transition_count = (probe.content_y != 0U ? probe.content_width : 0U) +

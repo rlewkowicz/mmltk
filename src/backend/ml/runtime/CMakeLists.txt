@@ -75,6 +75,7 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         analysis_provider.h
+        onnx_environment.h
         tensorrt_runtime.h
         backend_factory.h)
 target_include_directories(mmltk_backend_ml_runtime
@@ -88,6 +89,7 @@ if(BUILD_RFDETR_NATIVE)
         backend_factory.cpp
         backend_onnx.cpp
         backend_tensorrt.cpp
+        onnx_environment.cpp
         runtime_validation.cpp
         tensorrt_runtime.cpp)
     mmltk_register_private_headers(

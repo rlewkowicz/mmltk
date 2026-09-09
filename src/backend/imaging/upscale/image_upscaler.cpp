@@ -655,7 +655,6 @@ struct ImageUpscaler::Resolver final {
         if (!slot.live || slot.service_generation != service_generation || slot.core_generation != core_generation ||
             registered == nullptr || registered != expected)
             return;
-        if (registered->custody.load(std::memory_order_acquire) != Impl::CustodyState::Completed) return;
         slot.live = false;
         slot.core_generation = 0U;
         slot.owner.reset();
@@ -764,20 +763,26 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
     if (slot.handle != handle) throw std::invalid_argument("invalid Upscale method identity");
     enum class ActivationProgress { PreexistingResident, Activating, CompletedResident };
     auto activation = slot.runtime ? ActivationProgress::PreexistingResident : ActivationProgress::Activating;
-    const auto cancel = [&]() {
+    const auto settle = [&](const std::exception_ptr& primary, const bool retire_runtime) {
+        if (slot.runtime && slot.runtime->Settle() != cudaSuccess)
+            throw ImageUpscalerUnsettledFailure{primary, slot.runtime->cleanup_failure()};
         const auto settled = cudaStreamSynchronize(stream);
         if (settled != cudaSuccess)
             throw ImageUpscalerUnsettledFailure{
-                {}, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle cancelled Upscale consumer"))};
+                primary, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle neural Upscale consumer"))};
         if (slot.runtime) {
-            if (activation != ActivationProgress::Activating && slot.runtime->Settle() != cudaSuccess)
-                throw ImageUpscalerUnsettledFailure{{}, slot.runtime->cleanup_failure()};
-            slot.runtime->mark_consumed(stream);
-            if (activation == ActivationProgress::Activating) {
-                if (slot.runtime->Stop() != cudaSuccess) throw ImageUpscalerUnsettledFailure{{}, slot.runtime->cleanup_failure()};
+            try {
+                slot.runtime->mark_consumed(stream);
+            } catch (...) { throw ImageUpscalerUnsettledFailure{primary, std::current_exception()}; }
+            if (retire_runtime) {
+                if (slot.runtime->Stop() != cudaSuccess)
+                    throw ImageUpscalerUnsettledFailure{primary, slot.runtime->cleanup_failure()};
                 slot.runtime.reset();
             }
         }
+    };
+    const auto cancel = [&]() {
+        settle({}, activation == ActivationProgress::Activating);
         return ImageUpscalerOutcome::Cancelled;
     };
     try {
@@ -818,17 +823,7 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
         return ImageUpscalerOutcome::Completed;
     } catch (const ImageUpscalerUnsettledFailure&) { throw; } catch (...) {
         const auto failure = std::current_exception();
-        const auto settled = cudaStreamSynchronize(stream);
-        if (settled != cudaSuccess)
-            throw ImageUpscalerUnsettledFailure{
-                failure, std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(settled, "settle failed neural Upscale method"))};
-        if (slot.runtime) {
-            try {
-                slot.runtime->mark_consumed(stream);
-            } catch (...) { throw ImageUpscalerUnsettledFailure{failure, std::current_exception()}; }
-            if (slot.runtime->Stop() != cudaSuccess) throw ImageUpscalerUnsettledFailure{failure, slot.runtime->cleanup_failure()};
-        }
-        slot.runtime.reset();
+        settle(failure, true);
         if (activation == ActivationProgress::Activating) throw ImageUpscalerInitializationFailure(failure);
         std::rethrow_exception(failure);
     }
@@ -865,13 +860,15 @@ ImageUpscalerClient ImageUpscaler::client() const noexcept {
 ImageUpscalerStatus ImageUpscaler::Stop() noexcept {
     if (owner_ == nullptr || owner_->generation != generation_) return cudaSuccess;
     const bool activated = client_.service_generation_ != 0U;
-    if (activated && !Resolver::seal(client_.service_slot_, client_.service_generation_, client_.core_generation_, owner_))
-        return cudaErrorInvalidResourceHandle;
+    if (activated) {
+        if (!Resolver::seal(client_.service_slot_, client_.service_generation_, client_.core_generation_, owner_))
+            return cudaErrorInvalidResourceHandle;
+        Resolver::remove(client_.service_slot_, client_.service_generation_, client_.core_generation_, owner_);
+        client_ = {};
+    }
     const cudaError_t failure = owner_->Stop();
     if (failure == cudaSuccess) {
-        if (activated) Resolver::remove(client_.service_slot_, client_.service_generation_, client_.core_generation_, owner_);
         owner_.reset();
-        client_ = {};
     }
     return static_cast<ImageUpscalerStatus>(failure);
 }

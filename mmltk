@@ -2468,6 +2468,7 @@ print_test_suites() {
         '  workspace-wayland  Opt-in packaged Wayland/NVIDIA browser hardware suite' \
         '  browser-app  Iced client protocol, state, and transport unit suite' \
         '  cleanup-tool  Cleanup profile configuration and report fixture suite' \
+        '  log-query-tool  Runtime log parser, query, correlation, and output fixture suite' \
         '  core    Core dataset/runtime/compiler Catch2 suite' \
         '  gui     Unavailable in the native Catch2 suite' \
         '  tsan    Unavailable in the native Catch2 suite' \
@@ -2484,6 +2485,37 @@ print_test_suites() {
         '  --env <NAME[=VALUE]>        Forward an additional environment variable' \
         '  --gdb                       Run the selected executable through containerized GDB' \
         '  --gdb-command <command>     Add an ordered GDB command (repeatable)'
+}
+
+run_log_tool() {
+    local tool_mode="$1"
+    shift
+    [[ "${repo_root}" != *:* ]] || die "--logs repository path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; log tooling did not start"
+    local diagnostic_image_id
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "log tooling requires existing image '${build_image_name}'; no image was built or pulled"
+    local log_container_name="${container_name}-logs"
+    local -a diagnostic_args=(
+        run --rm --init --name "${log_container_name}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges
+        --network none --user "${uid}:${gid}"
+        --env PYTHONDONTWRITEBYTECODE=1
+        --env "MMLTK_LOG_HOST_ROOT=${repo_root}"
+        --volume "${repo_root}:/workspace:ro"
+        --workdir /workspace
+        --entrypoint python3
+    )
+    append_wrapper_labels diagnostic_args "logs"
+    if [[ "${tool_mode}" == "test" ]]; then
+        diagnostic_args+=(--tmpfs /tmp:rw,nosuid,nodev,size=32m)
+        diagnostic_args+=("${diagnostic_image_id}" -m unittest discover
+            -s /workspace/tools/tests -p test_log_query.py -v)
+    else
+        diagnostic_args+=("${diagnostic_image_id}" /workspace/tools/log_query.py "$@")
+    fi
+    run_owned_docker_command "${log_container_name}" "${diagnostic_args[@]}"
 }
 
 run_io_diagnostic() {
@@ -2856,6 +2888,20 @@ run_tests() {
         release_mutation_locks
         return 0
     fi
+    if [[ "${suite}" == "log-query-tool" ]]; then
+        (($# == 0)) || die "--test log-query-tool does not accept additional arguments"
+        (( ! test_config_explicit )) ||
+            die "--test log-query-tool does not accept --config"
+        [[ -z "${test_executable}" ]] ||
+            die "--test log-query-tool does not accept --executable"
+        (( ! test_debugger )) ||
+            die "--test log-query-tool does not accept --gdb or --gdb-command"
+        ((${#test_environment[@]} == 0)) ||
+            die "--test log-query-tool does not accept --env"
+        log "running log query tooling fixture tests"
+        run_log_tool test
+        return 0
+    fi
     if [[ "${suite}" == "rfdetr-profile" ]]; then
         if (( test_config_explicit )) && [[ "${test_config}" != "dev" ]]; then
             die "rfdetr-profile requires the instrumented dev configuration"
@@ -3215,6 +3261,14 @@ run_prepared_container_invocation() {
     return "${exit_status}"
 }
 
+# Log expressions and paths pass through verbatim, before the application flag
+# scanner can interpret a query value as an unrelated wrapper operation.
+if [[ "${1:-}" == "--logs" ]]; then
+    invocation_mode="logs"
+    run_log_tool query "${@:2}"
+    exit $?
+fi
+
 gui_mode=0
 build_mode=0
 build_gui_mode=0
@@ -3353,6 +3407,11 @@ if (( ! cleanup_report_mode )); then
         fi
     done
 fi
+
+for arg in "${passthrough_args[@]}"; do
+    [[ "${arg}" != "--logs" ]] ||
+        die "--logs must be the standalone operation; use './mmltk --logs --help'"
+done
 
 parse_test_invocation_args() {
     local -a raw_args=("$@")

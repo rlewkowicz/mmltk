@@ -45,6 +45,9 @@ class RuntimeDiagnosticTarget final {
         } catch (...) {}
     }
     void write(RuntimeDiagnosticFact fact) const noexcept;
+    // Seals diagnostic ingress and reserves one final owner fact without
+    // waiting for queue capacity, immediately before the owner flushes.
+    void write_required(RuntimeDiagnosticFact fact) const noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept;
     [[nodiscard]] bool benchmark_trace_enabled() const noexcept;
     void write_benchmark_trace(std::string_view event, std::string_view json_fields) const noexcept;

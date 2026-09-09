@@ -10,6 +10,7 @@ pub struct ExploreModel {
     pub desired_selection: Option<u32>,
     pub requested_selection: Option<u32>,
     pub desired_navigation: Option<crate::generated::ExploreNavigation>,
+    pub desired_open: bool,
     pub desired_close: bool,
     pub desired_reroll: bool,
     pub desired_augmentation_reroll: bool,

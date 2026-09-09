@@ -14,6 +14,7 @@
 
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
+#include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 
 namespace mmltk::backend::ml::runtime {
@@ -65,11 +66,6 @@ namespace {
     return {shape.extents.data(), shape.rank};
 }
 
-Ort::Env& onnx_environment() {
-    static Ort::Env environment(ORT_LOGGING_LEVEL_WARNING, "mmltk_runtime");
-    return environment;
-}
-
 class OnnxBindingScope final {
    public:
     explicit OnnxBindingScope(Ort::IoBinding& binding) noexcept : binding_(binding) {}
@@ -90,7 +86,9 @@ class OnnxBindingScope final {
 class OnnxRuntimeBackend final : public RuntimeBackend {
    public:
     explicit OnnxRuntimeBackend(RuntimeBackendOptions options)
-        : RuntimeBackend(options.device, options.command_stream), options_(std::move(options)) {
+        : RuntimeBackend(options.device, options.command_stream),
+          environment_(ORT_LOGGING_LEVEL_WARNING, "mmltk_runtime"),
+          options_(std::move(options)) {
         if (options_.model_path.empty()) { throw std::invalid_argument("ONNX runtime model path is empty"); }
         session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         session_options_.SetIntraOpNumThreads(1);
@@ -101,7 +99,7 @@ class OnnxRuntimeBackend final : public RuntimeBackend {
         cuda_options.has_user_compute_stream = 1;
         cuda_options.user_compute_stream = reinterpret_cast<cudaStream_t>(cuda_lane().native_stream());
         session_options_.AppendExecutionProvider_CUDA(cuda_options);
-        session_ = std::make_unique<Ort::Session>(onnx_environment(), options_.model_path.string().c_str(), session_options_);
+        session_ = std::make_unique<Ort::Session>(environment_.get(), options_.model_path.string().c_str(), session_options_);
         binding_ = std::make_unique<Ort::IoBinding>(*session_);
         ReadModelInfo();
         output_values_.reserve(info_.output_count);
@@ -175,6 +173,7 @@ class OnnxRuntimeBackend final : public RuntimeBackend {
         }
     }
 
+    OnnxEnvironment environment_;
     RuntimeBackendOptions options_;
     RuntimeModelInfo info_;
     Ort::SessionOptions session_options_;

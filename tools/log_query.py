@@ -1,0 +1,2182 @@
+#!/usr/bin/env python3
+"""Bounded, read-only queries over runtime logs; invoked through ./mmltk --logs."""
+
+import argparse
+import ast
+from collections import Counter, deque
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+import glob
+import heapq
+import json
+import math
+import os
+from pathlib import Path
+import re
+import signal
+import sys
+
+
+MISSING = object()
+MAX_QUERY_LENGTH = 8192
+MAX_QUERY_TOKENS = 512
+MAX_QUERY_DEPTH = 32
+MAX_LINE_BYTES = 1024 * 1024
+MAX_DISTINCT_KEYS = 10000
+ROTATION_WINDOW_NS = 10000000
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+LEXEME = re.compile(
+    r"""\s*(?:("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
+    r"""|(!=|!~|>=|<=|[():=~<>])|([^\s():=~<>!"']+))"""
+)
+NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
+FIELD_NAME = re.compile(r"@?[A-Za-z_][\w.-]*\Z")
+KEY_VALUE = re.compile(
+    r"""(?:^|\s)([A-Za-z_][\w.-]*)=("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|.*?)"""
+    r"""(?=\s+[A-Za-z_][\w.-]*=|$)"""
+)
+NATIVE = re.compile(
+    r"^(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?"
+    r"(?:Z|[+-]\d\d:\d\d)?) \[(?P<pid>\d+):(?P<tid>\d+)\] "
+    r"\[(?P<logger>[^]]*)\] \[(?P<level>[^]]*)\] (?P<message>.*)$"
+)
+FIREFOX = re.compile(
+    r"^(?:(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?"
+    r"(?: UTC|Z|[+-]\d\d:\d\d)?)\s+)?"
+    r"\[(?P<process>.*?) (?P<pid>\d+): (?P<thread>[^]]+)\]: "
+    r"(?P<level>[VDIWE])/(?P<module>\S+) (?P<message>.*)$"
+)
+FAILURE_WORD = re.compile(
+    r"(?<![a-z])(?:error|fatal|panic|failed|failure|exception|crash|timeout|timed out"
+    r"|segmentation fault|sigsegv|sigabrt|sigbus|aborted)(?![a-z])",
+    re.IGNORECASE,
+)
+LEVEL_NAMES = {
+    "v": "trace", "t": "trace", "d": "debug", "i": "info", "w": "warning",
+    "warn": "warning", "e": "error", "err": "error", "f": "fatal",
+}
+TEST_STATUS = re.compile(r"^\[\s*(RUN|FAILED|OK|SKIPPED)\s*\]\s+(.+)$")
+CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error): (.*)$")
+CONTEXT_LABEL = re.compile(r"(?:^|['\"] and ['\"])(native diagnostics|native runtime log|Firefox diagnostics):\s*")
+ANCHOR_EVENTS = (
+    "browser.server.started", "child.spawned", "child.signaled", "child.exited",
+    "shutdown.requested", "shutdown.firefox_terminal", "shutdown.complete",
+)
+ANCHOR_HINT = re.compile("|".join(re.escape(event) for event in ANCHOR_EVENTS))
+HANDOFF_EVENT = re.compile(r"(?:^|[._])(?:intent|reply|response|message|failed|failure|error)(?:[._]|$)")
+TYPED_ID = re.compile(r"\b([A-Z][A-Za-z0-9]*Id)\((\d+(?:,\s*\d+)*)\)")
+STAGE_SUFFIX = re.compile(
+    r"^(.*?)[._/-](start|started|begin|begun|requested|submitted|opened|acquired|"
+    r"end|ended|stop|stopped|complete|completed|finish|finished|closed|released|"
+    r"retired|destroyed|outcome|success|succeeded|failed|failure|error|"
+    r"cancelled|canceled|aborted|rejected|missing|unavailable|blocked|stalled|pending|discarded)$",
+    re.IGNORECASE,
+)
+START_STAGES = frozenset(("start", "started", "begin", "begun", "requested", "submitted", "opened", "acquired"))
+INCOMPLETE_STAGES = frozenset(("missing", "unavailable", "blocked", "stalled", "pending", "discarded"))
+FAILED_STAGES = frozenset(("failed", "failure", "error", "aborted", "rejected"))
+AMBIENT_IDS = frozenset(("pid", "tid", "process_id", "thread_id", "device_id", "host_id",
+                         "user_id", "test_id", "run_id", "session_id", "parent_process_id"))
+MAX_TRIAGE_STATES = 256
+MAX_TRIAGE_EVENTS = 64
+MAX_TRIAGE_TEXT = 2048
+
+
+def normalized_text(value):
+    return " ".join(value.split()).casefold()
+
+
+def record_text(record):
+    pending = list(reversed(list(record.data.values())))
+    strings = []
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, dict):
+            pending.extend(reversed(list(value.values())))
+        elif isinstance(value, list):
+            pending.extend(reversed(value))
+    return normalized_text(" ".join(strings))
+
+
+class QueryError(ValueError):
+    """Invalid query, unreadable input, or an explicitly bounded resource limit."""
+
+
+def scalar(text, quoted=False):
+    if quoted:
+        return ast.literal_eval(text)
+    if text in ("true", "false", "null"):
+        return {"true": True, "false": False, "null": None}[text]
+    if NUMBER.fullmatch(text):
+        try:
+            value = float(text) if any(character in text for character in ".eE") else int(text)
+        except ValueError as error:
+            raise QueryError("numeric literal exceeds interpreter limits") from error
+        if isinstance(value, float) and not math.isfinite(value):
+            raise QueryError("numeric literals must be finite")
+        return value
+    return text
+
+
+def encoded(value):
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def exact(left, right):
+    # bool is an int subclass; an identity of 1 must never equal true.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return type(left) is type(right) and left == right
+    return left == right
+
+
+@dataclass(frozen=True)
+class Expression:
+    operation: str
+    arguments: tuple
+
+    def matches(self, record):
+        if self.operation == "and":
+            return all(child.matches(record) for child in self.arguments)
+        if self.operation == "or":
+            return any(child.matches(record) for child in self.arguments)
+        if self.operation == "not":
+            return not self.arguments[0].matches(record)
+        if self.operation == "text":
+            needle = self.arguments[0].casefold()
+            return needle in record.raw.casefold() or any(
+                needle in str(record.get(name)).casefold()
+                for name in ("@test", "@tags", "@run", "@archive_id", "@family", "@signal")
+                if record.get(name) is not MISSING
+            )
+        if self.operation == "all":
+            return True
+        if self.operation == "phrase":
+            text = record_text(record)
+            return any(phrase in text for phrase in self.arguments)
+        if self.operation == "words":
+            text = record_text(record)
+            return all(word in text for word in self.arguments)
+        value = record.get(self.arguments[0])
+        if self.operation == "has":
+            return value is not MISSING
+        if value is MISSING:
+            return False
+        expected = self.arguments[1]
+        if self.operation in ("=", "!="):
+            equal = exact(value, expected)
+            return equal if self.operation == "=" else not equal
+        if self.operation == ":":
+            return str(expected).casefold() in str(value).casefold()
+        if self.operation in ("~", "!~"):
+            found = expected.search(str(value)) is not None
+            return found if self.operation == "~" else not found
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if self.operation == ">":
+            return value > expected
+        if self.operation == ">=":
+            return value >= expected
+        if self.operation == "<":
+            return value < expected
+        return value <= expected
+
+
+class QueryParser:
+    """Recursive descent: OR < explicit/implicit AND < NOT < primary."""
+
+    def __init__(self, source):
+        if len(source) > MAX_QUERY_LENGTH:
+            raise QueryError(f"query exceeds {MAX_QUERY_LENGTH} characters")
+        self.tokens = []
+        position = 0
+        while source[position:].strip():
+            match = LEXEME.match(source, position)
+            if match is None:
+                raise QueryError(f"unexpected character at column {position + 1}")
+            quoted, operator, word = match.groups()
+            self.tokens.append((quoted or operator or word, quoted is not None))
+            position = match.end()
+            if len(self.tokens) > MAX_QUERY_TOKENS:
+                raise QueryError(f"query exceeds {MAX_QUERY_TOKENS} tokens")
+        self.index = 0
+
+    def peek(self, value):
+        return (
+            self.index < len(self.tokens)
+            and not self.tokens[self.index][1]
+            and self.tokens[self.index][0].lower() == value
+        )
+
+    def take(self):
+        if self.index == len(self.tokens):
+            raise QueryError("unexpected end of query")
+        token = self.tokens[self.index]
+        self.index += 1
+        return token
+
+    def require(self, value):
+        if not self.peek(value):
+            raise QueryError(f"expected {value!r} at token {self.index + 1}")
+        self.index += 1
+
+    def parse(self):
+        if not self.tokens:
+            return Expression("all", ())
+        expression = self.parse_or(0)
+        if self.index != len(self.tokens):
+            raise QueryError(f"unexpected token {self.tokens[self.index][0]!r}")
+        return expression
+
+    def parse_or(self, depth):
+        parts = [self.parse_and(depth)]
+        while self.peek("or"):
+            self.take()
+            parts.append(self.parse_and(depth))
+        return parts[0] if len(parts) == 1 else Expression("or", tuple(parts))
+
+    def parse_and(self, depth):
+        parts = [self.primary(depth)]
+        while self.index < len(self.tokens) and not self.peek("or") and not self.peek(")"):
+            if self.peek("and"):
+                self.take()
+            parts.append(self.primary(depth))
+        return parts[0] if len(parts) == 1 else Expression("and", tuple(parts))
+
+    def primary(self, depth):
+        if depth > MAX_QUERY_DEPTH:
+            raise QueryError(f"query nesting exceeds {MAX_QUERY_DEPTH}")
+        if self.peek("not"):
+            self.take()
+            return Expression("not", (self.primary(depth + 1),))
+        if self.peek("("):
+            self.take()
+            result = self.parse_or(depth + 1)
+            self.require(")")
+            return result
+        if self.peek("has"):
+            self.take()
+            self.require("(")
+            name, quoted = self.take()
+            if quoted or not FIELD_NAME.fullmatch(name):
+                raise QueryError("has() requires a field name")
+            self.require(")")
+            return Expression("has", (name,))
+        name, quoted = self.take()
+        if not quoted and name.lower() in ("and", "or", ")", "=", ":", "~", "!~", "!=", ">", ">=", "<", "<="):
+            raise QueryError(f"expected a search term or field, received {name!r}")
+        if self.index < len(self.tokens) and not self.tokens[self.index][1]:
+            operator = self.tokens[self.index][0]
+            if operator in ("=", "!=", ":", "~", "!~", ">", ">=", "<", "<="):
+                if quoted or not FIELD_NAME.fullmatch(name):
+                    raise QueryError("comparisons require an unquoted field name")
+                self.take()
+                value, is_quoted = self.take()
+                if not is_quoted and value in ("(", ")", "=", ":", "~", "!~", "!=", ">", ">=", "<", "<="):
+                    raise QueryError("comparison requires a value; quote literal punctuation")
+                expected = scalar(value, is_quoted)
+                if operator in (">", ">=", "<", "<="):
+                    if isinstance(expected, bool) or not isinstance(expected, (int, float)):
+                        raise QueryError(f"{operator} requires a numeric value")
+                if operator in ("~", "!~"):
+                    try:
+                        expected = re.compile(str(expected))
+                    except re.error as error:
+                        raise QueryError(f"invalid regular expression: {error}") from error
+                return Expression(operator, (name, expected))
+        return Expression("all", ()) if name == "*" and not quoted else Expression("text", (scalar(name, True) if quoted else name,))
+
+
+def lookup(data, name):
+    if name in data:
+        return data[name]
+    value = data
+    for part in name.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return MISSING
+        value = value[part]
+    return value
+
+
+def value_from(data, *names):
+    for name in names:
+        value = lookup(data, name)
+        if value is not MISSING and value is not None and value != "":
+            return value
+    return MISSING
+
+
+def timestamp_ns(value):
+    """Preserve nanoseconds and separate timezone-free wall time from UTC."""
+    if not isinstance(value, str):
+        return None
+    text = value.replace(" UTC", "+00:00").replace("Z", "+00:00")
+    fractional = re.search(r"\.(\d+)", text)
+    fraction_ns = int((fractional[1] + "000000000")[:9]) if fractional else 0
+    if fractional:
+        text = text[:fractional.start()] + text[fractional.end():]
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    clock = "wall" if moment.tzinfo is not None else "wall-local"
+    delta = moment.replace(tzinfo=moment.tzinfo or timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return clock, (delta.days * 86400 + delta.seconds) * 1000000000 + fraction_ns
+
+
+def record_time(data, source):
+    for name, clock in (("steady_ns", "steady"), ("monotonic_ns", "steady"),
+                        ("timestamp_ns", "wall"), ("unix_ns", "wall")):
+        value = value_from(data, name, "fields." + name)
+        if type(value) is int:
+            return clock, value
+    for name in ("timestamp", "time", "fields.timestamp"):
+        parsed = timestamp_ns(lookup(data, name))
+        if parsed is not None:
+            return parsed
+    elapsed = value_from(data, "elapsed_ms", "fields.elapsed_ms")
+    if type(elapsed) is int:
+        return "elapsed:" + source, elapsed * 1000000
+    if type(elapsed) is float and math.isfinite(elapsed):
+        return "elapsed:" + source, int(Decimal(str(elapsed)) * 1000000)
+    return "none", None
+
+
+def surface_identity(data):
+    value = value_from(data, "surface", "fields.surface")
+    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{32}", value):
+        return value.lower()
+    high = value_from(data, "surface_high", "fields.surface_high")
+    low = value_from(data, "surface_low", "fields.surface_low")
+    if all(type(part) is int and 0 <= part < 2**64 for part in (high, low)):
+        return f"{high:016x}{low:016x}"
+    return MISSING
+
+
+@dataclass
+class Record:
+    source: str
+    line: int
+    raw: str
+    data: dict
+    format: str
+    parse_error: str = ""
+    metadata: dict = field(default_factory=dict)
+    clock: str = field(init=False)
+    time_ns: int | None = field(init=False)
+
+    def __post_init__(self):
+        self.clock, self.time_ns = record_time(self.data, self.source)
+
+    def get(self, name):
+        if name == "@file":
+            return self.source
+        if name == "@line":
+            return self.line
+        if name == "@text":
+            return self.raw
+        if name == "@format":
+            return self.format
+        if name == "@clock":
+            return self.clock
+        if name == "@time_ns":
+            return MISSING if self.time_ns is None else self.time_ns
+        if name == "@parse_error":
+            return self.parse_error or MISSING
+        if name == "@surface":
+            return surface_identity(self.data)
+        if name == "@event":
+            return value_from(self.data, "fields.event", "fields.name", "event", "name")
+        if name == "@owner":
+            owner = value_from(self.data, "owner", "fields.owner", "component", "system", "module", "logger")
+            event = self.get("@event")
+            return event.split(".", 1)[0] if owner is MISSING and isinstance(event, str) else owner
+        if name == "@level":
+            value = value_from(self.data, "level", "severity", "fields.level")
+            return LEVEL_NAMES.get(str(value).lower(), str(value).lower()) if value is not MISSING else MISSING
+        if name == "@error":
+            code = self.get("@exit_code")
+            if code is not MISSING and code != 0:
+                return True
+            if self.get("@level") in ("error", "critical", "fatal", "panic"):
+                return True
+            # Pixel error=0, failed=false, and similar numeric metrics are not failures.
+            values = (self.get("@event"), value_from(self.data, "message", "fields.message", "detail", "error"))
+            return any(isinstance(value, str) and FAILURE_WORD.search(value) for value in values)
+        if name == "@exit_code":
+            if self.get("@event") in ("child.signaled", "child.exited"):
+                return self.get("value")
+            return self.get("exit_code")
+        if name in ("@signal", "@signal_number"):
+            code = self.get("@exit_code")
+            if self.get("@event") != "child.signaled" or type(code) is not int:
+                return MISSING
+            number = code - 128
+            if number not in signal.valid_signals():
+                return MISSING
+            try:
+                return number if name == "@signal_number" else signal.Signals(number).name
+            except ValueError:
+                return f"SIG{number}"
+        if name == "@terminal":
+            return self.get("@event") in (
+                "child.signaled", "child.exited", "shutdown.complete", "shutdown.firefox_terminal",
+                "catch.test_failed", "catch.test_passed", "catch.test_skipped", "catch.summary",
+                "process.terminal", "build.image", "build.failed",
+            )
+        if name.startswith("@"):
+            return self.metadata.get(name[1:], MISSING)
+        value = lookup(self.data, name)
+        return lookup(self.data, "fields." + name) if value is MISSING and "." not in name else value
+
+
+def reject_json_constant(token):
+    raise ValueError(f"non-finite JSON number: {token}")
+
+
+def finite_json_float(token):
+    value = float(token)
+    if not math.isfinite(value):
+        raise ValueError("JSON number exceeds finite float range")
+    return value
+
+
+JSON_DECODER = json.JSONDecoder(parse_constant=reject_json_constant, parse_float=finite_json_float)
+
+
+def embedded_objects(message):
+    """Extract bounded complete objects, including a JSON-escaped INFO string."""
+    position = 0
+    attempts = 0
+    while position < len(message) and attempts < 32:
+        match = re.search(r'\{|"(?:\\.|[^"\\])*"', message[position:])
+        if match is None:
+            return
+        start = position + match.start()
+        attempts += 1
+        try:
+            value, end = JSON_DECODER.raw_decode(message, start)
+        except (ValueError, RecursionError):
+            position = start + 1
+            continue
+        position = end
+        if isinstance(value, dict):
+            yield start, value
+        elif isinstance(value, str) and "{" in value:
+            inner_start = value.find("{")
+            try:
+                inner, _ = JSON_DECODER.raw_decode(value, inner_start)
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(inner, dict):
+                yield start, inner
+
+
+def transcript_data(text):
+    status = TEST_STATUS.match(text)
+    if status:
+        event = {"RUN": "started", "FAILED": "failed", "OK": "passed", "SKIPPED": "skipped"}[status[1]]
+        return {"event": "catch.test_" + event, "test": status[2],
+                "level": "error" if event == "failed" else "info", "message": text}
+    failure = CATCH_FAILURE.match(text)
+    if failure:
+        return {
+            "event": "catch.assertion_" + failure[3].replace(" ", "_"),
+            "source_file": failure[1], "source_line": int(failure[2]),
+            "level": "error" if failure[3] in ("failed", "fatal error") else "info",
+            "message": failure[4],
+        }
+    if text.startswith("Filters:"):
+        return {"event": "catch.filters", "filters": text.removeprefix("Filters:").strip(), "message": text}
+    if text.startswith(("test cases:", "assertions:")):
+        return {"event": "catch.summary", "message": text}
+    terminal = re.search(r"(?:terminal status:\s*exit|exit(?:ed with)?(?:\s+status|\s+code))\s*[=:]?\s*(\d+)", text)
+    if terminal:
+        return {"event": "process.terminal", "exit_code": int(terminal[1]), "message": text}
+    if text.startswith("mmltk:"):
+        return {"event": "mmltk.message", "owner": "mmltk", "message": text.removeprefix("mmltk:").strip()}
+    if re.search(r"(?:writing image|naming to|exporting (?:image|manifest)|Successfully (?:built|tagged))", text):
+        return {"event": "build.image", "owner": "build", "message": text}
+    if text.startswith(("FAILED:", "ERROR: failed to build", "ninja: build stopped")):
+        return {"event": "build.failed", "owner": "build", "level": "error", "message": text}
+    return None
+
+
+def parse_record(source, line, raw, truncated=False):
+    clean = ANSI.sub("", raw.rstrip("\r\n"))
+    data = {}
+    log_format = "text"
+    message = clean
+    context = CONTEXT_LABEL.search(clean)
+    payload = clean[context.end():] if context else clean
+    match = NATIVE.match(payload) or FIREFOX.match(payload)
+    if match:
+        log_format = "native" if "logger" in match.groupdict() else "firefox"
+        data = {key: value for key, value in match.groupdict().items() if value is not None}
+        for key in ("pid", "tid"):
+            if key in data:
+                data[key] = int(data[key])
+        message = data["message"]
+    error = "line exceeds byte limit; text is truncated" if truncated else ""
+    transcript = transcript_data(clean)
+    if transcript:
+        data.update(transcript)
+        log_format = "transcript"
+    elif "{" in message:
+        try:
+            objects = embedded_objects(message)
+            first = next(objects, None)
+            if first:
+                _, decoded = first
+                if next(objects, None) is not None:
+                    error = error or "multiple JSON payloads on one line; first retained"
+                if source.endswith(".jsonl") and message.lstrip().startswith("{"):
+                    try:
+                        JSON_DECODER.decode(message.strip())
+                    except ValueError:
+                        error = error or "extra or malformed content in JSONL record"
+                data.update(decoded)
+                # Keep the original prefix in raw; a JSON payload is not its own message.
+                if data.get("message") == message and "message" not in decoded:
+                    data.pop("message", None)
+                log_format = "json"
+            elif message.lstrip().startswith("{") or source.endswith(".jsonl"):
+                error = error or "invalid or truncated JSON object"
+        except (ValueError, RecursionError):
+            error = error or "invalid or truncated JSON object"
+    elif source.endswith(".jsonl"):
+        error = error or "expected a JSON object"
+    if log_format not in ("json", "transcript"):
+        data.setdefault("message", message)
+        for key, value in KEY_VALUE.findall(message):
+            try:
+                data[key] = scalar(value, value.startswith(("'", '"')))
+            except (ValueError, SyntaxError):
+                data[key] = value
+    return Record(source, line, clean, data, log_format, error)
+
+
+class TranscriptContext:
+    """Carry only transcript context; copied diagnostics retain their original clocks."""
+
+    def __init__(self):
+        self.test = ""
+        self.tags = []
+        self.context = ""
+        self.active_run = None
+        self.capture = 0
+        self.last_timestamp = None
+
+    def decorate(self, record, metadata, anchors):
+        event = record.get("@event")
+        if event == "catch.filters":
+            self.tags = re.findall(r"\[([^]]+)\]", record.data["filters"])
+        if event in ("catch.test_started", "catch.test_failed", "catch.test_passed", "catch.test_skipped"):
+            self.test = record.data["test"]
+        if event == "catch.test_started":
+            self.active_run = None
+            self.capture += 1
+            self.last_timestamp = None
+        label = CONTEXT_LABEL.search(record.raw)
+        if label:
+            self.context = label[1]
+        if record.raw.startswith("workspace-wayland[") or event in (
+            "catch.test_started", "catch.test_failed", "catch.test_passed", "catch.test_skipped", "process.terminal"
+        ):
+            self.context = ""
+        if record.raw.startswith("workspace-wayland:") and "acceptance deadline armed" in record.raw:
+            self.active_run = None
+            self.capture += 1
+            self.last_timestamp = None
+            self.context = ""
+        anchor = anchors.get((event, record.time_ns)) if record.clock == "steady" and isinstance(event, str) else None
+        if anchor and metadata.get("family") != anchor["family"]:
+            self.active_run = anchor
+        record.metadata.update(metadata)
+        if self.capture and not self.active_run:
+            record.metadata["run"] = str(metadata.get("run", record.source)) + f"#capture-{self.capture}"
+        if self.active_run:
+            record.metadata.update({name: self.active_run[name] for name in ("run", "family")})
+            record.metadata["run_link"] = "shared-event-and-steady-time"
+        if self.test:
+            record.metadata["test"] = self.test
+        if self.tags:
+            record.metadata["tags"] = self.tags
+        if self.context and record.format != "transcript":
+            record.metadata["context_copy"] = self.context
+            if not record.parse_error and re.match(r'^[\w_]+":', record.raw):
+                record.parse_error = "truncated diagnostic context fragment"
+        if record.time_ns is not None and not record.metadata.get("context_copy"):
+            self.last_timestamp = record.clock, record.time_ns
+        if self.last_timestamp:
+            record.metadata["near_clock"], record.metadata["near_time_ns"] = self.last_timestamp
+
+    def parse_line(self, source, line, raw, metadata, anchors, truncated=False):
+        primary = parse_record(source, line, raw, truncated)
+        self.decorate(primary, metadata, anchors)
+        yield primary
+        if primary.format == "transcript" and primary.get("@event").startswith("catch.assertion_"):
+            for part, (column, data) in enumerate(embedded_objects(primary.raw), 1):
+                child = Record(source, line, primary.raw, data, "json", metadata=dict(primary.metadata))
+                child.metadata.update({"part": part, "column": column + 1, "context_copy": "Catch INFO"})
+                self.decorate(child, metadata, anchors)
+                yield child
+
+
+@dataclass(frozen=True)
+class LogFile:
+    path: Path
+    source: str
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    metadata: dict = field(default_factory=dict, compare=False)
+    linked_runs: tuple = field(default=(), compare=False)
+
+    @classmethod
+    def capture(cls, path, root):
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root):
+            raise QueryError(f"log input escapes repository mount: {path}")
+        if not resolved.is_file():
+            raise QueryError(f"not a regular log file: {path}")
+        info = resolved.stat()
+        return cls(resolved, str(resolved.relative_to(root)), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+    def records(self, unchanged=False, anchors=None, line_hint=None):
+        context = TranscriptContext()
+        with self.path.open("rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (info.st_dev, info.st_ino) != (self.device, self.inode) or info.st_size < self.size:
+                raise QueryError(f"log was replaced or truncated during query: {self.source}")
+            if unchanged and (info.st_size, info.st_mtime_ns) != (self.size, self.modified_ns):
+                raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
+            remaining = self.size
+            line = 0
+            while remaining:
+                part = stream.readline(min(remaining, MAX_LINE_BYTES + 1))
+                if not part:
+                    raise QueryError(f"log was truncated during query: {self.source}")
+                remaining -= len(part)
+                line += 1
+                truncated = len(part) > MAX_LINE_BYTES
+                raw = part[:MAX_LINE_BYTES]
+                while truncated and not part.endswith(b"\n") and remaining:
+                    part = stream.readline(min(remaining, MAX_LINE_BYTES))
+                    remaining -= len(part)
+                    if not part:
+                        raise QueryError(f"log was truncated during query: {self.source}")
+                if raw.strip():
+                    decoding_error = ""
+                    try:
+                        text = raw.decode("utf-8")
+                    except UnicodeDecodeError:
+                        text = raw.decode("utf-8", errors="replace")
+                        decoding_error = "invalid UTF-8 bytes replaced"
+                    if line_hint is not None and not line_hint(text) and not (
+                        ANCHOR_HINT.search(text) or TEST_STATUS.match(text)
+                        or text.startswith(("Filters:", "workspace-wayland:"))
+                    ):
+                        continue
+                    metadata = {"mtime_ns": self.modified_ns, "run": self.source, "artifact": Path(self.source).stem,
+                                **self.metadata}
+                    for row in context.parse_line(self.source, line, text, metadata, anchors or {}, truncated):
+                        row.parse_error = row.parse_error or decoding_error
+                        yield row
+            if unchanged:
+                final = os.fstat(stream.fileno())
+                if (final.st_size, final.st_mtime_ns) != (self.size, self.modified_ns):
+                    raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
+
+
+def discover_files(inputs, root, recursive=False, host_root=None):
+    selected = {}
+    for supplied in inputs or ["build/validation"]:
+        pattern = supplied
+        if host_root and (pattern == host_root or pattern.startswith(host_root + "/")):
+            pattern = str(root) + pattern[len(host_root):]
+        if not os.path.isabs(pattern):
+            pattern = str(root / pattern)
+        paths = [Path(path) for path in sorted(glob.glob(pattern, recursive=recursive))]
+        if not paths:
+            raise QueryError(f"input path or glob matched no files: {supplied}")
+        found = False
+        for path in paths:
+            if not path.resolve().is_relative_to(root):
+                raise QueryError(f"log input escapes repository mount: {path}")
+            if path.is_dir():
+                candidates = path.rglob("*") if recursive else path.iterdir()
+                candidates = (item for item in candidates if item.is_file() and item.suffix in (".jsonl", ".log", ".out", ".txt"))
+            else:
+                candidates = (path,)
+            for candidate in candidates:
+                item = LogFile.capture(candidate, root)
+                selected[item.path] = item
+                found = True
+        if not found:
+            raise QueryError(f"input contains no .jsonl, .log, .out, or .txt files: {supplied}")
+    return sorted(selected.values(), key=lambda item: item.source)
+
+
+def artifact_family(path):
+    archived = path.parent.name.endswith(".history")
+    original = path.parent.parent / path.parent.name.removesuffix(".history") if archived else path
+    stem = re.sub(r"-(?:native|firefox)$", "", original.stem)
+    return original.parent / stem, original, archived
+
+
+def family_paths(family, root):
+    host_root = os.environ.get("MMLTK_LOG_HOST_ROOT")
+    if host_root and (family == host_root or family.startswith(host_root + "/")):
+        family = str(root) + family[len(host_root):]
+    supplied = Path(family)
+    if not supplied.is_absolute():
+        supplied = root / ("build/validation" if supplied.parent == Path(".") else "") / supplied
+    if supplied.suffix in (".jsonl", ".log"):
+        supplied = artifact_family(supplied)[0]
+    paths = [Path(str(supplied) + suffix) for suffix in (".jsonl", ".log", "-native.log", "-firefox.log")]
+    return [path for path in paths if path.is_file()]
+
+
+class ArtifactCatalog:
+    """Discover capture siblings and qualify inferred archive pairings explicitly."""
+
+    def __init__(self, options, root):
+        inputs = list(options.paths)
+        for family in options.family:
+            siblings = family_paths(family, root)
+            if not siblings:
+                raise QueryError(f"no artifact family found: {family}")
+            inputs.extend(str(path) for path in siblings)
+        self.files = discover_files(inputs, root, options.recursive, os.environ.get("MMLTK_LOG_HOST_ROOT"))
+        if options.history or options.run:
+            archives = []
+            for source in self.files:
+                family, original, archived = artifact_family(source.path)
+                siblings = family_paths(str(family), root) if archived else [original]
+                for sibling in siblings:
+                    directory = Path(str(sibling) + ".history")
+                    if directory.is_dir():
+                        archives.append(str(directory))
+            if archives:
+                combined = self.files + discover_files(archives, root)
+                self.files = sorted({item.path: item for item in combined}.values(), key=lambda item: item.source)
+        self.anchors = {}
+        self.assign_runs(root)
+        self.selected_runs = set()
+        if options.run:
+            self.selected_runs = {
+                source.metadata["run"] for source in self.files
+                if options.run in (source.metadata["run"], source.metadata.get("archive_id"),
+                                   source.metadata["run"].rsplit("@", 1)[-1])
+            }
+            if not self.selected_runs:
+                raise QueryError(f"no artifact run matched {options.run!r}; use --list-runs --history")
+            selected_families = {
+                source.metadata["family"] for source in self.files if source.metadata["run"] in self.selected_runs
+            }
+            self.files = [
+                source for source in self.files
+                if source.metadata["run"] in self.selected_runs or source.metadata["family"] not in selected_families
+            ]
+
+    def assign_runs(self, root):
+        groups = {}
+        updated = []
+        for source in self.files:
+            family, original, archived = artifact_family(source.path)
+            name = str(family.relative_to(root))
+            identity = source.path.stem if archived else "current"
+            metadata = {"family": name, "run": name + "@" + identity,
+                        "artifact": original.name, "run_link": "artifact-stem"}
+            metadata["role"] = (
+                "trace" if original.suffix == ".jsonl" else
+                "native" if original.stem.endswith("-native") else
+                "firefox" if original.stem.endswith("-firefox") else "transcript"
+            )
+            if archived:
+                metadata["archive_id"] = identity
+                match = re.fullmatch(r"(\d+)-(\d+)", identity)
+                if match:
+                    metadata["rotation_ns"] = int(match[2])
+                    groups.setdefault((name, match[1]), []).append((int(match[2]), len(updated)))
+            updated.append(replace(source, metadata=metadata))
+        for entries in groups.values():
+            batch = []
+            for timestamp, index in sorted(entries):
+                if batch and (timestamp - batch[0][0] > ROTATION_WINDOW_NS
+                              or updated[index].metadata["artifact"] in {updated[item[1]].metadata["artifact"] for item in batch}):
+                    self.assign_batch(updated, batch)
+                    batch = []
+                batch.append((timestamp, index))
+            self.assign_batch(updated, batch)
+        self.files = updated
+
+    @staticmethod
+    def assign_batch(files, batch):
+        canonical = files[batch[0][1]]
+        for _, index in batch:
+            source = files[index]
+            metadata = {**source.metadata, "run": canonical.metadata["run"]}
+            metadata["run_link"] = "rotation-neighbor-within-10ms" if len(batch) > 1 else "unpaired-history"
+            files[index] = replace(source, metadata=metadata)
+
+    def prepare_anchors(self):
+        for source in self.files:
+            if source.path.suffix != ".jsonl":
+                continue
+            for row in source.records(unchanged=True, line_hint=ANCHOR_HINT.search):
+                event = row.get("@event")
+                if row.clock != "steady" or event not in ANCHOR_EVENTS:
+                    continue
+                key = event, row.time_ns
+                previous = self.anchors.get(key)
+                if previous is not None and previous["run"] != source.metadata["run"]:
+                    raise QueryError("ambiguous shared event timestamp across captures; narrow --family/--run")
+                self.anchors[key] = source.metadata
+                if len(self.anchors) > MAX_DISTINCT_KEYS:
+                    raise QueryError("too many capture anchors; narrow --family/--run")
+        # Only standalone transcripts need this pass. Firefox/native siblings already
+        # belong to a capture; no scan of those verbose logs is needed to infer tests.
+        native_families = {item.metadata["family"] for item in self.files if item.path.suffix == ".jsonl"}
+        tests_by_run = {}
+        tags_by_run = {}
+        runs_by_transcript = {}
+        for source in self.files:
+            if source.metadata["family"] in native_families:
+                continue
+            for row in source.records(unchanged=True, anchors=self.anchors, line_hint=ANCHOR_HINT.search):
+                test = row.metadata.get("test")
+                if row.metadata.get("run_link") == "shared-event-and-steady-time":
+                    run = row.metadata["run"]
+                    runs_by_transcript.setdefault(source.source, set()).add(run)
+                    if test:
+                        tests_by_run.setdefault(run, set()).add(test)
+                        tags_by_run.setdefault(run, set()).update(row.metadata.get("tags", []))
+        self.files = [
+            replace(source, linked_runs=tuple(sorted(runs_by_transcript.get(source.source, ()))), metadata={
+                **source.metadata,
+                **({"test": next(iter(tests_by_run[source.metadata["run"]]))}
+                   if len(tests_by_run.get(source.metadata["run"], ())) == 1 else {}),
+                **({"tags": sorted(tags_by_run[source.metadata["run"]])}
+                   if source.metadata["run"] in tags_by_run else {}),
+            })
+            for source in self.files
+        ]
+
+    def list_runs(self, output, limit):
+        grouped = {}
+        for source in self.files:
+            grouped.setdefault(source.metadata["run"], []).append(source)
+        ordered = sorted(grouped.items(), key=lambda item: (max(source.modified_ns for source in item[1]), item[0]))
+        for run, files in ordered[-limit:]:
+            print(f"{run} [{files[0].metadata['run_link']}]", file=output)
+            for source in sorted(files, key=lambda item: item.source):
+                print(f"  {source.source} bytes={source.size} mtime_ns={source.modified_ns}", file=output)
+        print(f"Showing {min(len(grouped), limit)}/{len(grouped)} artifact runs; rotation-neighbor links are inferred.", file=output)
+
+
+class ErrorLookup:
+    """Locate a pasted display message, then bound investigation to its first capture."""
+
+    def __init__(self, text, options):
+        if not text.strip():
+            raise QueryError("--error requires non-empty display text")
+        paragraphs = re.split(r"\n\s*\n", text.strip())
+        self.phrases = tuple(dict.fromkeys((normalized_text(text), normalized_text(": ".join(paragraphs)))))
+        self.words = tuple(dict.fromkeys(re.findall(r"\w+", normalized_text(text))))
+        self.options = options
+        self.focus = None
+        self.matches = 0
+        self.mode = ""
+        self.expression = None
+        self.ends = {}
+        self.focus_estimate = None
+        self.malformed = 0
+        self.artifacts = []
+
+    def hint(self, raw):
+        lowered = raw.casefold()
+        # Unicode escapes can hide literal text; let the JSON decoder decide.
+        return "\\u" in lowered or all(word in lowered for word in self.words)
+
+    @staticmethod
+    def physical_key(record):
+        return (
+            record.metadata.get("role") == "transcript",
+            bool(record.metadata.get("context_copy")),
+            record.metadata.get("mtime_ns", 0), record.source, record.line,
+            record.metadata.get("part", 0),
+        )
+
+    def locate(self, files, query, where, anchors):
+        alternatives = [("exact/display-normalized phrase", Expression("phrase", self.phrases))]
+        if self.words:
+            alternatives.append(("all-words fallback", Expression("words", self.words)))
+        for mode, expression in alternatives:
+            for source in files:
+                for row in source.records(unchanged=True, anchors=anchors,
+                                          line_hint=None if self.options.strict else self.hint):
+                    if mode == "exact/display-normalized phrase" and row.parse_error:
+                        self.malformed += 1
+                    if where.matches(row) and query.matches(row) and expression.matches(row):
+                        self.matches += 1
+                        if self.focus is None or self.physical_key(row) < self.physical_key(self.focus):
+                            self.focus = row
+            if self.focus is not None:
+                self.mode = mode
+                self.expression = Expression("and", (query, expression))
+                return
+
+    def relevant(self, source):
+        return (
+            source.metadata["run"] == self.focus.metadata["run"]
+            or source.source == self.focus.source
+            or self.focus.metadata["run"] in source.linked_runs
+        )
+
+    def calibrate(self, files, anchors):
+        self.artifacts = [source.source for source in files if source.metadata["run"] == self.focus.metadata["run"]]
+        for source in files:
+            if source.metadata["role"] == "transcript" and source.source != self.focus.source:
+                continue
+            for row in source.records(unchanged=True, anchors=anchors):
+                if row.metadata["run"] == self.focus.metadata["run"] and row.time_ns is not None and not row.metadata.get("context_copy"):
+                    key = row.source, row.clock
+                    self.ends[key] = max(self.ends.get(key, row.time_ns), row.time_ns)
+        self.focus_estimate = self.estimate(self.focus, self.focus.clock, self.focus.time_ns)
+
+    def estimate(self, row, clock, timestamp):
+        end = self.ends.get((row.source, clock))
+        if end is None or timestamp is None:
+            return None
+        return row.metadata["mtime_ns"] - (end - timestamp)
+
+    def annotate(self, row, force=False):
+        if row.metadata["run"] != self.focus.metadata["run"]:
+            return False
+        clock = row.clock
+        timestamp = row.time_ns
+        carried = timestamp is None
+        if carried:
+            clock = row.metadata.get("near_clock")
+            timestamp = row.metadata.get("near_time_ns")
+        if clock == self.focus.clock and timestamp is not None and self.focus.time_ns is not None:
+            delta = timestamp - self.focus.time_ns
+            link = "preceding-same-source-timestamp proximity" if carried else "same-clock proximity"
+        else:
+            estimated = self.estimate(row, clock, timestamp)
+            if estimated is not None and self.focus_estimate is not None:
+                delta = estimated - self.focus_estimate
+                link = "file-mtime proximity"
+            elif row.source == self.focus.source and abs(row.line - self.focus.line) <= self.options.context:
+                delta = 0
+                link = "line-neighborhood proximity"
+            elif force:
+                delta = 0
+                link = "matching-message link; clock unaligned"
+            else:
+                return False
+        if not force and abs(delta) > self.options.near_ms * 1000000:
+            return False
+        row.metadata.update({"proximity_ns": delta, "time_link": link})
+        return True
+
+
+def field_names(value, separator=","):
+    names = tuple(item.strip() for item in value.split(separator))
+    if not names or any(not FIELD_NAME.fullmatch(name) for name in names):
+        raise QueryError(f"invalid field list: {value!r}")
+    return names
+
+
+def correlation_key(record, names):
+    parts = []
+    for name in names:
+        value = record.get(name)
+        if value is MISSING or value is None or isinstance(value, (bool, dict, list)):
+            return None
+        if value == 0 or value == "" or isinstance(value, str) and re.fullmatch(r"0+", value):
+            return None
+        parts.append(encoded(value))
+    return tuple(parts)
+
+
+def order_key(record, order):
+    position = record.source, record.line, record.metadata.get("part", 0)
+    if order == "file":
+        return position
+    if order == "capture":
+        return record.metadata.get("mtime_ns", 0), *position
+    if order == "proximity":
+        return record.metadata.get("proximity_ns", 2**63), *position
+    # Cross-clock order is a deterministic grouping, never a claim of causality.
+    rank = {"steady": 0, "wall": 1, "wall-local": 2, "none": 4}.get(record.clock, 3)
+    return rank, record.clock, record.time_ns or 0, *position
+
+
+@dataclass
+class Retained:
+    key: tuple
+    record: Record
+    reason: str
+    tail: bool
+    priority: int = 0
+    distance: int = 0
+
+    def __lt__(self, other):
+        if self.priority != other.priority:
+            return self.priority > other.priority
+        if self.distance != other.distance:
+            return self.distance > other.distance
+        return self.key < other.key if self.tail else self.key > other.key
+
+
+class QueryResult:
+    def __init__(self, options):
+        self.options = options
+        self.scanned = 0
+        self.matches = 0
+        self.related = 0
+        self.proximity = 0
+        self.context = 0
+        self.errors = 0
+        self.malformed = 0
+        self.parse_examples = []
+        self.files = Counter()
+        self.groups = Counter()
+        self.clocks = {}
+        self.retained = []
+        self.terminals = {}
+        self.selected_runs = set()
+        self.lookup = None
+        self.native_tail = []
+
+    def inspect(self, record, permitted=True):
+        self.scanned += 1
+        if record.parse_error:
+            self.malformed += 1
+            if len(self.parse_examples) < 5:
+                self.parse_examples.append(f"{record.source}:{record.line}: {record.parse_error}")
+        if permitted and record.get("@terminal"):
+            run = record.get("@run")
+            code = record.get("@exit_code")
+            key = (run, record.get("@event"), encoded(None if code is MISSING else code))
+            previous = self.terminals.get(key)
+            preference = (bool(record.metadata.get("context_copy")), record.source, record.line)
+            if previous is None or preference < (
+                bool(previous.metadata.get("context_copy")), previous.source, previous.line
+            ):
+                self.terminals[key] = record
+            if len(self.terminals) > MAX_DISTINCT_KEYS:
+                raise QueryError("terminal summary exceeds bounded capacity; narrow inputs")
+        if permitted and self.lookup and record.metadata.get("role") in ("trace", "native"):
+            event = record.get("@event")
+            if isinstance(event, str) and HANDOFF_EVENT.search(event):
+                item = Retained(order_key(record, "capture"), record, "run-tail proximity", True)
+                if len(self.native_tail) < min(5, self.options.top):
+                    heapq.heappush(self.native_tail, item)
+                else:
+                    heapq.heappushpop(self.native_tail, item)
+
+    def include(self, record, reason):
+        if reason == "context":
+            self.context += 1
+        else:
+            self.matches += reason == "query"
+            self.related += reason in ("correlated", "run")
+            self.proximity += reason == "proximity"
+            self.selected_runs.add(record.get("@run"))
+            self.errors += bool(record.get("@error"))
+            self.files[record.source] += 1
+            group = tuple(encoded(None if (value := record.get(name)) is MISSING else value) for name in self.options.group_by)
+            if group not in self.groups and len(self.groups) == MAX_DISTINCT_KEYS:
+                raise QueryError(f"group count exceeds {MAX_DISTINCT_KEYS}; narrow the query or --group-by")
+            self.groups[group] += 1
+            bounds = self.clocks.setdefault(record.clock, [record.time_ns, record.time_ns])
+            if record.time_ns is not None:
+                bounds[0] = min(bounds[0], record.time_ns)
+                bounds[1] = max(bounds[1], record.time_ns)
+        item = Retained(order_key(record, self.options.order), record, reason, self.options.tail)
+        if self.lookup:
+            event = record.get("@event")
+            item.priority = (
+                0 if reason == "query" else
+                1 if record.get("@terminal") or isinstance(event, str) and HANDOFF_EVENT.search(event) else 2
+            )
+            if record.metadata.get("context_copy") or record.metadata.get("role") == "transcript":
+                item.priority += 3
+            item.distance = abs(record.metadata.get("proximity_ns", 2**63))
+        if len(self.retained) < self.options.limit:
+            heapq.heappush(self.retained, item)
+        else:
+            heapq.heappushpop(self.retained, item)
+
+    def rows(self):
+        return sorted(self.retained, key=lambda item: item.key)
+
+
+def execute(files, query, where, options, anchors=None, lookup=None):
+    anchors = anchors or {}
+    run_scope = ("@run",) if options.family or options.history or options.run else ()
+    relationships = tuple(run_scope + field_names(value, "+") for value in options.correlate)
+    seeds = [set() for _ in relationships]
+    seed_runs = set()
+    two_passes = bool(relationships or options.related_run)
+    if two_passes:
+        for source in files:
+            for record in source.records(unchanged=True, anchors=anchors):
+                if where.matches(record) and query.matches(record):
+                    if options.related_run:
+                        seed_runs.add(record.get("@run"))
+                    for names, values in zip(relationships, seeds):
+                        key = correlation_key(record, names)
+                        if key is not None:
+                            values.add(key)
+                            if len(values) > MAX_DISTINCT_KEYS:
+                                raise QueryError(f"correlation seeds exceed {MAX_DISTINCT_KEYS}; narrow --query or --where")
+    result = QueryResult(options)
+    result.lookup = lookup
+    for source in files:
+        before = deque(maxlen=options.context)
+        remaining_context = 0
+        last_included = (0, 0)
+        for record in source.records(unchanged=two_passes or bool(anchors), anchors=anchors):
+            permitted = where.matches(record)
+            result.inspect(record, permitted)
+            reason = ""
+            if permitted:
+                if query.matches(record):
+                    if lookup is None or record.metadata["run"] == lookup.focus.metadata["run"]:
+                        reason = "query"
+                        if lookup:
+                            lookup.annotate(record, force=True)
+                elif any(correlation_key(record, names) in values for names, values in zip(relationships, seeds)):
+                    reason = "correlated"
+                elif lookup and lookup.annotate(record):
+                    reason = "proximity"
+                elif record.get("@run") in seed_runs:
+                    reason = "run"
+            if reason:
+                for previous in before:
+                    position = previous.line, previous.metadata.get("part", 0)
+                    if position > last_included and where.matches(previous):
+                        result.include(previous, "context")
+                        last_included = position
+                result.include(record, reason)
+                last_included = record.line, record.metadata.get("part", 0)
+                remaining_context = options.context
+            elif remaining_context:
+                if permitted:
+                    result.include(record, "context")
+                    last_included = record.line, record.metadata.get("part", 0)
+                remaining_context -= 1
+            before.append(record)
+    return result
+
+
+def physical_position(record):
+    return record.source, record.line, record.metadata.get("part", 0)
+
+
+def triage_snapshot(record):
+    """Bound retained payloads too, not just row counts. Matching uses the full row."""
+    budget = [96]
+    shortened = [False]
+
+    def trim(value, depth=0):
+        if isinstance(value, str):
+            if len(value) > MAX_TRIAGE_TEXT:
+                shortened[0] = True
+                return value[:MAX_TRIAGE_TEXT] + "…"
+            return value
+        if isinstance(value, (dict, list)):
+            if depth >= 4 or budget[0] <= 0:
+                shortened[0] = True
+                return "<triage payload omitted>"
+            items = value.items() if isinstance(value, dict) else enumerate(value)
+            result = {}
+            for name, child in items:
+                if budget[0] <= 0:
+                    shortened[0] = True
+                    break
+                budget[0] -= 1
+                result[name] = trim(child, depth + 1)
+            return result if isinstance(value, dict) else list(result.values())
+        return value
+
+    raw = trim(record.raw)
+    data = trim(record.data)
+    result = replace(record, raw=raw, data=data, metadata=dict(record.metadata))
+    # Retention must not change a clock, even when a verbose payload was shortened.
+    result.clock, result.time_ns = record.clock, record.time_ns
+    if shortened[0]:
+        result.metadata["triage_payload_truncated"] = True
+    return result
+
+
+@dataclass(frozen=True)
+class Identity:
+    run: str
+    names: tuple
+    values: tuple
+
+    def label(self):
+        return "+".join(self.names) + "=" + "+".join(compact(json.loads(value), 80) for value in self.values)
+
+
+def strong_identities(record, explicit=()):
+    """Conservative namespaces; counters and ambient device/process IDs do not fan out."""
+    result = []
+    run = str(record.metadata.get("run", record.source))
+
+    def add(names, values=None):
+        key = values if values is not None else correlation_key(record, names)
+        if key is not None:
+            identity = Identity(run, names, key)
+            if identity not in result:
+                result.append(identity)
+
+    add(("@surface",))
+    for names in explicit:
+        add(names)
+    # Source instance numbers are only meaningful within a source session.
+    add(("source_session", "source_instance"))
+    fields = record.data.get("fields")
+    values = {**record.data, **(fields if isinstance(fields, dict) else {})}
+    for name, value in values.items():
+        if len(result) >= 16:
+            break
+        if name in AMBIENT_IDS or name in ("surface_high", "surface_low"):
+            continue
+        if isinstance(value, str) and len(value) > 128:
+            continue
+        if isinstance(value, str) and TYPED_ID.fullmatch(value):
+            match = TYPED_ID.fullmatch(value)
+            if match[1] == "DeviceId":
+                continue
+            add((match[1],), (encoded(match[1] + "(" + match[2].replace(" ", "") + ")"),))
+        elif name.endswith(("_id", "_identity")):
+            canonical = name.removeprefix("parent_")
+            key = correlation_key(record, (name,))
+            if key is not None:
+                add((canonical,), key)
+        elif name.endswith("_surface") and isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{32}", value):
+            if int(value, 16):
+                add(("@surface",), (encoded(value.lower()),))
+    # Handles also occur in unstructured Firefox messages and Catch context.
+    for match in TYPED_ID.finditer(record.raw[:MAX_TRIAGE_TEXT]):
+        if len(result) >= 16:
+            break
+        if match[1] != "DeviceId":
+            add((match[1],), (encoded(match[1] + "(" + match[2].replace(" ", "") + ")"),))
+    return tuple(result)
+
+
+def event_stage(record):
+    event = record.get("@event")
+    match = STAGE_SUFFIX.fullmatch(event) if isinstance(event, str) else None
+    return (match[1], match[2].lower()) if match else ("", "")
+
+
+def anchor_rank(record, identities=()):
+    family, stage = event_stage(record)
+    event = record.get("@event")
+    outcome = value_from(record.data, "span_outcome", "outcome", "fields.span_outcome", "fields.outcome")
+    if isinstance(outcome, str) and outcome.lower() in FAILED_STAGES:
+        score, why = 110, "failed outcome/span"
+    elif event == "catch.assertion_failed" or isinstance(event, str) and "assertion" in event and record.get("@error"):
+        score, why = 105, "assertion failure"
+    elif record.get("@error"):
+        score, why = (100, "explicit failure") if stage in FAILED_STAGES else (90, "error/terminal candidate")
+    elif stage in INCOMPLETE_STAGES:
+        score, why = (85 if stage in ("missing", "unavailable", "stalled") else 45), "incomplete state"
+    elif record.parse_error:
+        score, why = 35, "parse failure (may be capture damage)"
+    elif record.get("@terminal"):
+        score, why = 20, "terminal evidence (not necessarily failure)"
+    else:
+        return 0, ""
+    if identities:
+        score += 10
+    if record.metadata.get("context_copy"):
+        score -= 25
+    return score, why
+
+
+class TriagePool:
+    """Small, diverse deterministic reservoir; cardinality never follows the input."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.entries = {}
+        self.discarded = 0
+
+    def add(self, record, rank, why, key=None):
+        key = physical_position(record) if key is None else key
+        previous = self.entries.get(key)
+        if previous is not None and previous[0] <= rank:
+            return
+        if previous is None and len(self.entries) == self.limit:
+            worst = max(self.entries, key=lambda item: self.entries[item][0])
+            if self.entries[worst][0] <= rank:
+                self.discarded += 1
+                return
+            del self.entries[worst]
+            self.discarded += 1
+        self.entries[key] = rank, triage_snapshot(record), why
+
+    def rows(self):
+        return sorted(self.entries.values(), key=lambda item: item[0])
+
+
+@dataclass
+class TriageFinding:
+    kind: str
+    score: int
+    message: str
+    record: Record
+    identity: Identity | None = None
+    other: Record | None = None
+
+
+@dataclass
+class StageBalance:
+    first: Record | None = None
+    last_end: Record | None = None
+    pending: int = 0
+    last_start: str = ""
+
+
+class IdentityChain:
+    """Streaming lifecycle ledger for one selected identity, not a whole-run index."""
+
+    def __init__(self, identity, origin, why, hop):
+        self.identity, self.origin, self.why, self.hop = identity, origin, why, hop
+        self.count = 0
+        self.copies = 0
+        self.events = Counter()
+        self.owners = Counter()
+        self.representatives = TriagePool(16)
+        self.states = {}
+        self.last_by_source = {}
+        self.bounds = {}
+        self.gaps = {}
+        self.limited = False
+
+    def observe(self, record, triage):
+        self.count += 1
+        event = record.get("@event")
+        event = str(event) if event is not MISSING else "(text)"
+        owner = record.get("@owner")
+        owner = str(owner) if owner is not MISSING else "(unknown)"
+        for counts, key in ((self.events, event), (self.owners, owner)):
+            if key in counts or len(counts) < MAX_TRIAGE_EVENTS:
+                counts[key] += 1
+            else:
+                self.limited = True
+        score, _ = anchor_rank(record)
+        self.representatives.add(record, (-score, *physical_position(record)), "identity chain",
+                                 (record.source, event))
+        if record.metadata.get("context_copy"):
+            self.copies += 1
+            return
+        previous = self.last_by_source.get(record.source)
+        row = triage_snapshot(record)
+        if previous:
+            if previous.clock == record.clock and record.time_ns is not None and previous.time_ns is not None:
+                delta = record.time_ns - previous.time_ns
+                if delta < 0:
+                    triage.finding("clock-regression", 65, "timestamp decreases in physical source order; no stall inferred",
+                                   row, self.identity, previous)
+                elif delta >= triage.options.triage_gap_ms * 1000000:
+                    current = self.gaps.get(record.source)
+                    if current is None or delta > current[0]:
+                        self.gaps[record.source] = delta, previous, row
+        if len(self.last_by_source) < 32 or record.source in self.last_by_source:
+            self.last_by_source[record.source] = row
+            self.bounds.setdefault(record.source, row)
+        else:
+            self.limited = True
+        family, stage = event_stage(record)
+        if not family or stage in INCOMPLETE_STAGES:
+            if stage in INCOMPLETE_STAGES:
+                triage.finding("incomplete-state", 85, f"explicit {stage} stage; later recovery is possible",
+                               row, self.identity)
+            return
+        # Pair only within the same physical source and exact event family.
+        key = record.source, family
+        if key not in self.states:
+            if len(self.states) == MAX_TRIAGE_EVENTS:
+                self.limited = True
+                return
+            self.states[key] = StageBalance()
+        state = self.states[key]
+        if stage in START_STAGES:
+            if not state.pending:
+                state.first = row
+            # requested -> submitted -> started is progress, not three operations.
+            if not state.pending or state.last_start == stage:
+                state.pending += 1
+            state.last_start = stage
+        else:
+            if state.pending:
+                state.pending -= 1
+                if not state.pending:
+                    state.first = None
+            elif state.last_end and state.last_end.get("@event") == event:
+                triage.finding("duplicate-terminal", 55,
+                               f"repeated {event} without an intervening {family} start in this source; may be idempotent",
+                               row, self.identity, state.last_end)
+            elif not state.last_end:
+                triage.finding("unmatched-end", 20,
+                               f"{family} end has no captured same-source start (partial capture or another source possible)",
+                               row, self.identity)
+            state.last_end = row
+            if stage in FAILED_STAGES and self.identity.names == ("span_id",):
+                triage.finding("failed-span", 100, f"span has explicit {stage} stage", row, self.identity)
+
+    def finish(self, triage):
+        for (_, family), state in self.states.items():
+            if state.pending:
+                triage.finding("missing-counterpart", 70,
+                               f"{family}: {state.pending} start(s) without a captured same-source end/completion; "
+                               "suffix convention only, not a proven product requirement",
+                               state.first, self.identity)
+        for delta, before, after in self.gaps.values():
+            triage.finding("gap", 50,
+                           f"{delta / 1000000:.3f}ms without this identity in the same source/clock; "
+                           "a gap is not proof of a stall", after, self.identity, before)
+        if self.limited:
+            triage.notes.add("Lifecycle event/source capacity reached; absence findings describe only tracked families.")
+
+
+class Triage:
+    """Rank anchors, corral exact chains with bounded passes, and explain evidence."""
+
+    def __init__(self, options, where, anchors, lookup=None):
+        self.options, self.where, self.anchors, self.lookup = options, where, anchors, lookup
+        self.explicit = tuple(field_names(value, "+") for value in options.correlate)
+        self.seed_pool = TriagePool(max(32, options.triage_anchors * 4))
+        self.context_pool = TriagePool(32)
+        self.failure_pool = TriagePool(options.triage_anchors)
+        self.evidence = TriagePool(options.limit)
+        self.selected = []
+        self.identities = {}
+        self.refinements = {}
+        self.findings = {}
+        self.notes = set()
+        self.run = ""
+        self.scanned = self.scoped = self.related = self.malformed = 0
+        self.parse_examples = []
+        self.artifacts = []
+        self.pending = {}
+
+    def records(self, files):
+        for source in files:
+            for row in source.records(unchanged=True, anchors=self.anchors):
+                if self.where.matches(row) and (not self.run or row.metadata["run"] == self.run):
+                    yield row
+
+    def finding(self, kind, score, message, record, identity=None, other=None):
+        key = kind, physical_position(record)
+        value = TriageFinding(kind, score, message, triage_snapshot(record), identity,
+                              triage_snapshot(other) if other else None)
+        rank = lambda item: (-item.score, *physical_position(item.record), item.kind)
+        if key in self.findings:
+            if rank(value) >= rank(self.findings[key]):
+                return
+        elif len(self.findings) >= 64:
+            worst = max(self.findings, key=lambda item: rank(self.findings[item]))
+            if rank(value) >= rank(self.findings[worst]):
+                self.notes.add("Finding inventory capped at 64; lower-ranked observations omitted.")
+                return
+            del self.findings[worst]
+        self.findings[key] = value
+
+    def choose_anchors(self, files, query):
+        explicit = bool(self.options.query.strip() or self.options.errors or self.lookup)
+        for row in self.records(files):
+            self.scanned += 1
+            if row.parse_error:
+                self.malformed += 1
+                if len(self.parse_examples) < 5:
+                    self.parse_examples.append(f"{row.source}:{row.line}: {row.parse_error}")
+            if not query.matches(row):
+                continue
+            identities = strong_identities(row, self.explicit)
+            score, why = anchor_rank(row, identities)
+            if not score and explicit:
+                score, why = 40, "query-selected anchor"
+            if score:
+                self.seed_pool.add(row, (-score, bool(row.metadata.get("context_copy")),
+                                        -row.metadata["mtime_ns"], *physical_position(row)), why,
+                                   (row.metadata["run"], str(row.get("@event")), why))
+            # A bounded open-stage ledger supplies a useful anchor even without errors.
+            family, stage = event_stage(row)
+            if identities and family and not row.metadata.get("context_copy"):
+                key = row.source, identities[0], family
+                if stage in START_STAGES:
+                    if key in self.pending or len(self.pending) < MAX_TRIAGE_STATES:
+                        state = self.pending.setdefault(key, StageBalance(first=triage_snapshot(row)))
+                        state.pending += 1
+                    else:
+                        self.notes.add("Open-stage anchor inventory capped; narrow --where to inspect other identities.")
+                elif stage and stage not in INCOMPLETE_STAGES and key in self.pending:
+                    self.pending[key].pending -= 1
+                    if not self.pending[key].pending:
+                        del self.pending[key]
+        for state in self.pending.values():
+            row = state.first
+            self.seed_pool.add(row, (-30, False, -row.metadata["mtime_ns"], *physical_position(row)),
+                               "unclosed start at capture end (candidate, not proof)",
+                               (row.metadata["run"], str(row.get("@event")), "unclosed"))
+        self.pending.clear()
+        candidates = self.seed_pool.rows()
+        if not candidates:
+            return
+        self.run = (self.lookup.focus if self.lookup else candidates[0][1]).metadata["run"]
+        if self.lookup:
+            focus = triage_snapshot(self.lookup.focus)
+            self.selected.append(((-1000, *physical_position(focus)), focus, "first physical pasted-error match"))
+        for entry in candidates:
+            if len(self.selected) >= self.options.triage_anchors:
+                break
+            if entry[1].metadata["run"] == self.run and all(
+                physical_position(item[1]) != physical_position(entry[1]) for item in self.selected
+            ):
+                self.selected.append(entry)
+                if len(self.selected) >= self.options.triage_anchors:
+                    break
+
+    def nearby(self, row):
+        if self.lookup and self.lookup.annotate(row):
+            return abs(row.metadata["proximity_ns"]), row.metadata["time_link"]
+        best = None
+        for _, anchor, _ in self.selected:
+            if row.source == anchor.source:
+                delta = abs(row.line - anchor.line)
+                if delta <= max(3, self.options.context):
+                    candidate = delta, "same-source line context (not identity)"
+                    best = min(best, candidate) if best else candidate
+            clock, time = row.clock, row.time_ns
+            anchor_clock, anchor_time = anchor.clock, anchor.time_ns
+            carried = time is None or anchor_time is None
+            if time is None:
+                clock, time = row.metadata.get("near_clock"), row.metadata.get("near_time_ns")
+            if anchor_time is None:
+                anchor_clock = anchor.metadata.get("near_clock")
+                anchor_time = anchor.metadata.get("near_time_ns")
+            if clock == anchor_clock and time is not None and anchor_time is not None:
+                delta = abs(time - anchor_time)
+                if delta <= self.options.near_ms * 1000000:
+                    link = "preceding-source timestamp proximity" if carried else "same-clock proximity"
+                    candidate = 10 + delta, link + " (not identity)"
+                    best = min(best, candidate) if best else candidate
+        return best
+
+    def add_identity(self, identity, origin, why, hop):
+        if identity in self.identities:
+            return
+        if len(self.identities) == self.options.triage_identities:
+            self.notes.add("Identity budget reached; additional identities were not expanded.")
+            return
+        self.identities[identity] = IdentityChain(identity, triage_snapshot(origin), why, hop)
+
+    def gather_context(self, files):
+        for _, row, why in self.selected:
+            for identity in strong_identities(row, self.explicit):
+                self.add_identity(identity, row, "anchor: " + why, 0)
+        for row in self.records(files):
+            self.scoped += 1
+            score, why = anchor_rank(row)
+            if score >= 90 or row.get("@terminal"):
+                self.failure_pool.add(row, (-score, bool(row.metadata.get("context_copy")), *physical_position(row)),
+                                      "same-run terminal/failure evidence (not identity)",
+                                      (str(row.get("@event")), why))
+            neighborhood = self.nearby(row)
+            if neighborhood is None:
+                continue
+            distance, link = neighborhood
+            # Prefer eventful physical neighbors; diversify repeated hot-loop messages.
+            event = row.get("@event")
+            detail = value_from(row.data, "detail", "message", "fields.detail", "fields.message")
+            signature = row.source, str(event), str(detail)[:100]
+            rank = (bool(row.metadata.get("context_copy")), event is MISSING, distance, *physical_position(row))
+            self.context_pool.add(row, rank, link, signature)
+        for _, row, why in self.context_pool.rows():
+            for identity in strong_identities(row, self.explicit):
+                self.add_identity(identity, row, "neighbor seed: " + why, 0)
+
+    def add_refinement(self, row, identity):
+        names = []
+        for name in ("sequence", "generation", "slot"):
+            value = row.get(name)
+            if type(value) is int and value >= 0 and (name != "sequence" or value > 0):
+                names.append(name)
+        if len(names) < 2:
+            return
+        key = Identity(self.run, tuple(names), tuple(encoded(row.get(name)) for name in names))
+        if key not in self.refinements:
+            if len(self.refinements) == self.options.triage_identities:
+                self.notes.add("Counter refinement budget reached; additional composites omitted.")
+                return
+            self.refinements[key] = []
+        origins = self.refinements[key]
+        if len(origins) < 4 and all(previous.source != row.source for previous, _ in origins):
+            origins.append((triage_snapshot(row), identity))
+
+    def expand(self, files):
+        for hop in range(self.options.triage_hops):
+            known = set(self.identities)
+            additions = TriagePool(self.options.triage_identities)
+            for row in self.records(files):
+                identities = strong_identities(row, self.explicit)
+                matched = [identity for identity in identities if identity in known]
+                if not matched:
+                    continue
+                self.add_refinement(row, matched[0])
+                for identity in identities:
+                    if identity not in known:
+                        rank = (self.identities[matched[0]].hop, bool(row.metadata.get("context_copy")),
+                                *physical_position(row), identity.label())
+                        additions.add(row, rank, identity, key=identity)
+            for _, row, identity in additions.rows():
+                self.add_identity(identity, row, "co-occurs on an exact identity record (handoff candidate)", hop + 1)
+            if set(self.identities) == known:
+                break
+
+    def counter_neighbor(self, row):
+        # Composites are terminal expansion leaves: never seed another identity hop.
+        for identity, origins in self.refinements.items():
+            values = tuple(encoded(row.get(name)) if row.get(name) is not MISSING else None for name in identity.names)
+            if values != identity.values:
+                continue
+            for origin, strong in origins:
+                line_near = row.source == origin.source and abs(row.line - origin.line) <= 100
+                time_near = (row.clock != "none" and row.clock == origin.clock and row.time_ns is not None
+                             and origin.time_ns is not None
+                             and abs(row.time_ns - origin.time_ns) <= self.options.near_ms * 1000000)
+                if line_near or time_near:
+                    return identity, strong, "line" if line_near else "same-clock"
+        return None
+
+    def retain(self, row, priority, why):
+        self.evidence.add(row, (priority, *order_key(row, self.options.order)), why)
+
+    def analyze(self, files):
+        known = set(self.identities)
+        counter_evidence = TriagePool(4)
+        for row in self.records(files):
+            matched = [identity for identity in strong_identities(row, self.explicit) if identity in known]
+            if matched:
+                self.related += 1
+                for identity in matched:
+                    self.identities[identity].observe(row, self)
+                score, why = anchor_rank(row)
+                if score >= 85:
+                    kind = "failed-span" if why == "failed outcome/span" and any(
+                        item.names == ("span_id",) for item in matched
+                    ) else "explicit-failure" if row.get("@error") else "incomplete-state"
+                    self.finding(kind,
+                                 score, why, row, matched[0])
+                self.retain(row, 4, "exact identity: " + matched[0].label())
+            else:
+                refinement = self.counter_neighbor(row)
+                if refinement:
+                    identity, strong, link = refinement
+                    why = f"counter refinement {identity.label()} + {link} proximity to {strong.label()} (not identity)"
+                    counter_evidence.add(row, (*physical_position(row),), why, (row.source, str(row.get("@event"))))
+        for chain in self.identities.values():
+            chain.finish(self)
+            if chain.hop:
+                self.finding("identity-handoff", 25, chain.why, chain.origin, chain.identity)
+        # Round-robin chain endpoints and distinct stages keep high-volume chains
+        # from consuming the entire sample. Anchors and anomaly evidence win ties.
+        for index, chain in enumerate(self.identities.values()):
+            for row in (*chain.bounds.values(), *chain.last_by_source.values()):
+                self.retain(row, 3 + index / max(1, len(self.identities)), "identity lifecycle endpoint: " + chain.identity.label())
+            for _, row, _ in chain.representatives.rows():
+                self.retain(row, 4 + index / max(1, len(self.identities)), "identity stage: " + chain.identity.label())
+        for finding in sorted(self.findings.values(), key=lambda item: (-item.score, *physical_position(item.record))):
+            if finding.score >= 50:
+                self.retain(finding.record, 1 + (110 - finding.score) / 100, "finding: " + finding.kind)
+                if finding.other:
+                    self.retain(finding.other, 2.8, "finding context: " + finding.kind)
+        for _, row, why in self.context_pool.rows():
+            self.retain(row, 2.7, why)
+        for _, row, why in counter_evidence.rows():
+            self.retain(row, 2.6, why)
+        for _, row, why in self.failure_pool.rows():
+            self.retain(row, 1.8, why)
+        for _, row, why in self.selected:
+            self.retain(row, 0, "anchor: " + why)
+
+    def run_query(self, files, query):
+        self.choose_anchors(files, query)
+        if not self.selected:
+            return self
+        files = [source for source in files if source.metadata["run"] == self.run or self.run in source.linked_runs
+                 or any(entry[1].source == source.source for entry in self.selected)]
+        self.artifacts = [source.source for source in files]
+        self.gather_context(files)
+        self.expand(files)
+        self.analyze(files)
+        if not self.identities:
+            self.notes.add("No non-empty strong identity near the anchors; evidence is context/proximity only.")
+        if self.seed_pool.discarded or self.context_pool.discarded:
+            self.notes.add("Anchor/context samples are bounded and diversified; repeated or lower-ranked rows omitted.")
+        return self
+
+
+def render_triage(result, options, output, diagnostics):
+    report = output if options.format == "summary" else diagnostics
+    print(f"Triage: {result.scanned} records scanned; {len(result.selected)} anchors; "
+          f"{len(result.identities)} identities; {result.related}/{result.scoped} run records in exact chains; "
+          f"showing {len(result.evidence.entries)} evidence rows (limit {options.limit}).", file=report)
+    if result.selected:
+        print("Run: " + compact(result.run, 200), file=report)
+        if result.lookup:
+            print(f"Error lookup: {result.lookup.mode}; {result.lookup.matches} occurrences.", file=report)
+            print("First physical match: " + render_record(
+                Retained((), result.lookup.focus, "first physical pasted error", False), options), file=report)
+        print("Artifacts: " + " | ".join(compact(path, 180) for path in result.artifacts[:options.top]), file=report)
+        print("Anchors (ranked evidence, not causes):", file=report)
+        for _, row, why in result.selected:
+            print("  " + render_record(Retained((), row, why, False), options), file=report)
+    findings = sorted(result.findings.values(), key=lambda item: (-item.score, *physical_position(item.record), item.kind))
+    if findings:
+        print("Highlights:", file=report)
+        for finding in findings[:options.top]:
+            identity = " [" + finding.identity.label() + "]" if finding.identity else ""
+            print(f"  {finding.kind}{identity}: {compact(finding.message, 230)} "
+                  f"@ {compact(finding.record.source, 160)}:{finding.record.line}", file=report)
+        earliest = {}
+        for finding in findings:
+            if finding.score < 65 or finding.kind in ("clock-regression",):
+                continue
+            previous = earliest.get(finding.record.source)
+            if previous is None or finding.record.line < previous.record.line:
+                earliest[finding.record.source] = finding
+        if earliest:
+            print("Earliest divergence candidates per source (physical order; partial-capture hypotheses):", file=report)
+            for source, finding in sorted(earliest.items())[:min(3, options.top)]:
+                print(f"  {compact(source, 160)}:{finding.record.line}: {finding.kind}; not a root-cause conclusion", file=report)
+    else:
+        print("Highlights: no deterministic lifecycle anomaly established in the captured evidence.", file=report)
+    if result.identities:
+        print("Identity lifecycles (same-source order; independent sources are not causally ordered):", file=report)
+        for chain in list(result.identities.values())[:options.top]:
+            owners = ", ".join(name for name, _ in chain.owners.most_common(6))
+            events = ", ".join(f"{name}×{count}" for name, count in chain.events.most_common(8))
+            print(f"  {chain.identity.label()} hop={chain.hop}, rows={chain.count}, copies={chain.copies}; "
+                  f"seed={compact(chain.why, 120)}", file=report)
+            print("    owners: " + compact(owners, 180) + "; events: " + compact(events, 500), file=report)
+        if len(result.identities) > options.top:
+            print(f"  {len(result.identities) - options.top} additional identities analyzed (--top controls display).", file=report)
+    if result.refinements:
+        print("Nearby counter composites (weaker than identity, not transitive): " +
+              " | ".join(identity.label() for identity in list(result.refinements)[:min(5, options.top)]), file=report)
+    if options.format == "summary" and result.evidence.entries:
+        print("Evidence (each row states why it was included):", file=output)
+    for _, row, why in sorted(result.evidence.rows(), key=lambda item: order_key(item[1], options.order)):
+        row.metadata["triage_reason"] = why
+        print(render_record(Retained((), row, why, False), options), file=output)
+    for note in sorted(result.notes):
+        print("Triage limit: " + note, file=diagnostics)
+    if result.malformed:
+        print(f"Warning: {result.malformed} malformed/truncated records; parse damage is not itself a product failure.", file=diagnostics)
+        for example in result.parse_examples:
+            print("  " + compact(example, 250), file=diagnostics)
+    print("Triage is heuristic, not a diagnosis: missing stages may be disabled logs, partial captures, "
+          "or another source. Only recorded same-source clocks support gaps; proximity does not establish causality. "
+          "Copied INFO is excluded from lifecycle balances. Payloads retained by triage are size-bounded.", file=diagnostics)
+
+
+def compact(value, width=180):
+    text = value if isinstance(value, str) else encoded(value)
+    text = text.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
+    text = "".join(character if character.isprintable() else f"\\x{ord(character):02x}" for character in text)
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def projected(record, names):
+    output = {"@file": record.source, "@line": record.line}
+    if record.metadata.get("part"):
+        output["@part"] = record.metadata["part"]
+    output.update({name: None if (value := record.get(name)) is MISSING else value for name in names})
+    return output
+
+
+def render_record(item, options):
+    record = item.record
+    if options.format == "jsonl":
+        if options.fields:
+            output = projected(record, options.fields)
+            output["@match"] = item.reason
+        else:
+            output = {
+                "_log": {
+                    "file": record.source, "line": record.line, "format": record.format,
+                    "clock": record.clock, "time_ns": record.time_ns, "match": item.reason,
+                    "parse_error": record.parse_error or None,
+                    **record.metadata,
+                },
+                "data": record.data, "text": record.raw,
+            }
+        return encoded(output)
+    if options.fields:
+        cells = projected(record, options.fields)
+        return " ".join(f"{name}={compact(value)}" for name, value in cells.items()) + f" [{item.reason}]"
+    clock = "elapsed" if record.clock.startswith("elapsed:") else record.clock
+    timestamp = (
+        f"{record.time_ns / 1000000:.3f}ms" if clock == "elapsed" else
+        str(record.time_ns) if record.time_ns is not None else "-"
+    )
+    event = record.get("@event")
+    owner = record.get("@owner")
+    level = record.get("@level")
+    label = " ".join(str(value) for value in (owner, level, event) if value is not MISSING)
+    detail = value_from(record.data, "message", "fields.message", "detail")
+    if detail is MISSING and event is MISSING:
+        detail = record.raw
+    facts = []
+    for name in ("trace_id", "span_id", "@surface", "source_session", "source_instance",
+                 "source_revision", "frame_revision", "presentation_revision", "allocation_generation"):
+        if correlation_key(record, (name,)) is not None:
+            facts.append(f"{name}={compact(record.get(name), 70)}")
+    for name in ("@signal", "@exit_code", "@test", "buffer"):
+        if name == "@test" and options.error is not None:
+            continue
+        value = record.get(name)
+        if value is not MISSING:
+            facts.append(f"{name}={compact(value, 90)}")
+    if isinstance(event, str) and HANDOFF_EVENT.search(event):
+        for name in ("sequence", "value"):
+            value = record.get(name)
+            if value is not MISSING:
+                facts.append(f"{name}={compact(value, 70)}")
+    for name in ("strong_count", "settled"):
+        value = record.get(name)
+        if value is not MISSING:
+            facts.append(f"{name}={compact(value, 70)}")
+    if record.metadata.get("context_copy"):
+        facts.append("context-copy")
+    if "proximity_ns" in record.metadata:
+        facts.append(f"delta_ms={record.metadata['proximity_ns'] / 1000000:+.3f} ({record.metadata['time_link']})")
+    suffix = (" " + compact(detail)) if detail is not MISSING and detail != "" else ""
+    if facts:
+        suffix += " " + " ".join(facts)
+    return f"{compact(clock, 70)}:{timestamp} {compact(record.source, 150)}:{record.line} [{item.reason}] {compact(label)}{suffix}"
+
+
+def render(result, options, output, diagnostics):
+    total = result.matches + result.related + result.proximity + result.context
+    status = (
+        f"Scanned {result.scanned} records; {result.matches} matched, {result.related} correlated, "
+        f"{result.proximity} proximity, {result.context} context; {result.errors} failure candidates; "
+        f"showing {len(result.retained)}/{total}."
+    )
+    if result.lookup:
+        lookup = result.lookup
+        report = output if options.format == "summary" else diagnostics
+        print(f"Error lookup: {lookup.mode}; {lookup.matches} occurrences; focused on first physical capture by file mtime.", file=report)
+        print("First physical match: " + render_record(Retained((), lookup.focus, "query", False), options), file=report)
+        print(f"Run: {lookup.focus.metadata['run']} [{lookup.focus.metadata['run_link']}]", file=report)
+        if lookup.focus.metadata.get("test"):
+            print(f"Test: {lookup.focus.metadata['test']}", file=report)
+        if lookup.artifacts:
+            print("Artifacts:", file=report)
+            for source in lookup.artifacts[:options.top]:
+                print("  " + source, file=report)
+    if options.format == "summary":
+        print(status, file=output)
+        if result.groups:
+            print("Groups (" + ", ".join(options.group_by) + "):", file=output)
+            for group, count in sorted(result.groups.items(), key=lambda item: (-item[1], item[0]))[:options.top]:
+                print(f"  {count:>7}  " + " | ".join(compact(json.loads(value), 110) for value in group), file=output)
+        for clock, (start, end) in sorted(result.clocks.items()):
+            detail = f"{start}..{end} ns" if start is not None else "no comparable timestamp"
+            print(f"Clock {compact(clock)}: {detail}", file=output)
+        if result.retained:
+            print("Records:", file=output)
+    else:
+        print(status, file=diagnostics)
+    for item in result.rows():
+        print(render_record(item, options), file=output)
+    if options.format == "summary":
+        terminals = [row for key, row in result.terminals.items() if key[0] in result.selected_runs]
+        if terminals:
+            print("Terminals in matched runs (independent of --limit):", file=output)
+            for row in sorted(terminals, key=lambda item: order_key(item, "capture"))[-options.top:]:
+                print("  " + render_record(Retained((), row, "terminal", False), options), file=output)
+        elif result.lookup:
+            print("Terminal evidence: no terminal record was captured in this matched run.", file=output)
+        if result.native_tail:
+            print("Latest native intent/reply evidence in this run (source order; cross-clock proximity only):", file=output)
+            for item in sorted(result.native_tail, key=lambda item: item.key):
+                print("  " + render_record(item, options), file=output)
+    if result.malformed:
+        print(f"Warning: {result.malformed} malformed/truncated records (retained as searchable text):", file=diagnostics)
+        for example in result.parse_examples:
+            print("  " + compact(example, 300), file=diagnostics)
+    if options.order == "proximity":
+        print("Cross-clock neighborhoods use file mtime aligned to each source's last timestamp; proximity is not causality.", file=diagnostics)
+    elif len(result.clocks) > 1:
+        print("Clock domains are grouped separately; their timestamps do not establish cross-domain order.", file=diagnostics)
+
+
+HELP = """\
+Examples:
+  ./mmltk --logs --family latest-wayland-test --triage
+  ./mmltk --logs build/validation/final-wayland-acceptance.log \\
+      --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
+  ./mmltk --logs --errors
+  ./mmltk --logs -q 'onnx OR "CUDA error"'
+  ./mmltk --logs -q '@event:shutdown AND NOT @event:started' --format timeline
+  ./mmltk --logs -q 'trace_id=42' --correlate trace_id --tail --limit 80
+  ./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
+  ./mmltk --logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
+  ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
+  ./mmltk --logs --family latest-wayland-test --errors --related-run --tail
+  ./mmltk --logs --family latest-wayland-test --history --list-runs
+  ./mmltk --logs --family latest-wayland-test --run 57-131007497132582 -q SIGSEGV
+  ./mmltk --logs build/validation/viewer-copy-ownership-trace.log \\
+      --family latest-wayland-test --history -q 'buffer="BufferId(21,1)"' --context 2
+  ./mmltk --logs --error 'Presentation unavailable
+
+  Explore requires a measured non-empty gallery.'
+
+Grammar (quote the entire expression for the shell):
+  expr      := expr OR expr | expr [AND] expr | NOT expr | '(' expr ')'
+  primary   := text | '*' | has(field) | field operator value
+  operator  := = != : ~ !~ > >= < <=
+AND binds tighter than OR; NOT binds tightest. Adjacent terms imply AND.
+Bare/quoted text and ':' are case-insensitive literal substring searches.
+'='/'!=' compare exact typed values; ordering compares numbers; '~'/'!~' use
+Python regex (case-sensitive; use (?i) for insensitive). Missing fields do
+not satisfy comparisons, including '!='; NOT includes them. has() tests
+presence including null/zero. Quote strings containing spaces or punctuation.
+
+Fields:
+  JSON paths (fields.name), event/trace_id/etc. (unqualified names also look
+  inside fields), plus @file, @line, @text, @format, @clock, @time_ns,
+  @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
+  @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
+  @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link.
+  @event resolves wrapped fields.event/name before event/name.
+  @surface joins native uint64 surface_high/low and Firefox 32-hex surfaces.
+  @error marks failure candidates from levels/event/message text; it is a
+  search aid, not a diagnosis. Numeric error=0 metrics do not mark failures.
+  child.signaled value=139 decodes to SIGSEGV (11); 143 to SIGTERM (15).
+  Signals describe the observed termination, not whether shutdown was intended.
+  Bare terms search test/tag/run/signal metadata as well as original text.
+  Catch INFO copies retain their original timestamps and are labeled context-copy.
+
+Inputs and ordering:
+  Paths/globs are repository-relative or absolute within the repository.
+  Directories select .jsonl/.log/.out/.txt; --recursive includes histories.
+  Explicit files can have any suffix. Repeated paths are deduplicated.
+  The default is build/validation, without recursive archived captures.
+  Time ordering groups steady, UTC wall, timezone-free wall, per-file elapsed,
+  and untimed records separately; ties use file/line. No clock offset is guessed.
+  --order capture sorts files by captured mtime then preserves their line order;
+  mtime is artifact recency, not an event timestamp or proof of causality.
+  Use one capture at a time: IDs and monotonic times can repeat across runs.
+  Files are read up to their captured byte size; correlation requires unchanged
+  files over two passes. There is no follow mode, persistent index, or network.
+
+Artifact families:
+  --family STEM selects STEM.jsonl / STEM.log / STEM-native.log / STEM-firefox.log
+  under build/validation (or supply a repository path). --history adds rotated
+  siblings; --run selects an exact archive ID or 'current'. Adjacent rotations
+  with the same PID within 10ms are grouped and explicitly labeled inferred.
+  Shared (event, steady_ns) anchors link transcript captures to native runs and
+  propagate known test/tag metadata. Missing anchors leave transcripts separate.
+  --related-run includes other records from a matched run; named correlations
+  are automatically scoped to the run in family/history mode. Summary output
+  includes terminal events from matched runs independently of the sample limit.
+
+Pasted errors:
+  --error TEXT searches exact whitespace-normalized phrases first, accepting a
+  colon when a displayed title and body were separated by a blank line. Only
+  when no phrase matches does it try all words, reporting that fallback.
+  It includes histories, prefers physical logs over copied transcript context,
+  and focuses the earliest matching capture by file mtime, then file/line.
+  The original event timestamp and clock are always retained.
+  Nearby records default to +/-1000ms (--near-ms). Same-clock differences are
+  direct; cross-clock estimates align file mtime to each source's last timestamp.
+  Untimed rows may borrow a preceding timestamp for proximity only. Every such
+  estimate is labeled; file timestamps are not proof of causal order.
+  Output prioritizes the error and nearby intent/reply/message/terminal records.
+  --limit bounds the timeline sample; terminal summaries have at most --top rows
+  and native run-tail evidence has at most min(5, --top) rows.
+
+Automatic triage:
+  --triage selects a run using ranked failure/assertion/error/terminal/parse
+  anchors, or an unmatched start when no explicit failure is available. --query
+  narrows anchors; --where constrains every pass. --error keeps its first-physical
+  phrase lookup and proximity behavior. Nothing in triage includes the whole run.
+  Defaults: 4 anchors, 12 identities, 2 expansion hops, 20 evidence rows. Tune
+  --triage-anchors, --triage-identities, --triage-hops, --limit, and --top.
+  At most 32 diversified neighboring records seed identities, using 3 lines (or
+  --context if larger) and --near-ms. Every row states its inclusion reason.
+  Exact identities are run-qualified surface/typed handles, nonempty *_id or
+  *_identity fields, and source_session+source_instance. parent_*_id joins its
+  corresponding *_id namespace. Device/process/thread/user/session IDs and
+  bare counters are excluded as ambient; --correlate explicitly opts fields in.
+  Identities co-occurring on a matched row can seed the next hop. Counter
+  sequence/generation/slot composites need two fields plus same-clock proximity
+  or 100 same-source lines; zero slots are valid. They never seed further hops.
+  Lifecycle balances use exact event prefixes and generic start/end suffixes
+  (requested/submitted/started -> completed/failed/outcome, opened -> closed,
+  acquired -> released, etc.). These conventions are hypotheses, not product
+  requirements. Missing/blocked/stalled stages, failed textual span outcomes,
+  duplicate ends, unclosed starts, identity handoffs, and the largest same-source
+  clock gaps (--triage-gap-ms, default 1000) are highlighted with evidence.
+  Sources are never causally ordered from proximity. Copied INFO does not
+  participate in lifecycle balances. Numeric outcome enums are not guessed.
+  Memory is bounded: 256 open anchor families, 64 findings, 64 event/family
+  values per identity, 32 sources per identity, and size-bounded retained
+  payloads (96 fields, depth 4, 2048 characters per string). Capacity limits are
+  reported. Triage uses bounded streaming passes, no all-run index or network.
+  --related-run/--tail/--list-runs cannot combine with --triage. JSONL writes
+  only evidence rows to stdout, summaries to stderr; @triage_reason records why.
+"""
+
+
+def bounded_integer(minimum, maximum):
+    def parse(value):
+        number = int(value)
+        if not minimum <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"expected {minimum}..{maximum}")
+        return number
+    return parse
+
+
+def argument_parser():
+    parser = argparse.ArgumentParser(
+        prog="./mmltk --logs", description=__doc__,
+        epilog=HELP, formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    parser.add_argument("paths", nargs="*", help="files, directories, or quoted globs (default: build/validation)")
+    parser.add_argument("-q", "--query", default="", help="select records using the expression grammar")
+    parser.add_argument("--where", default="", help="filter all records, including correlated/context rows")
+    parser.add_argument("--errors", action="store_true", help="AND @error=true with --query")
+    parser.add_argument("--error", metavar="TEXT", help="paste displayed error text; locate first physical capture and nearby events")
+    parser.add_argument("--triage", action="store_true", help="automatically rank failures, expand bounded identity chains, and highlight lifecycle evidence")
+    parser.add_argument("--triage-anchors", type=bounded_integer(1, 12), default=4, metavar="N",
+                        help="maximum ranked triage anchors (default: 4)")
+    parser.add_argument("--triage-identities", type=bounded_integer(1, 64), default=12, metavar="N",
+                        help="maximum automatic identities across all expansion hops (default: 12)")
+    parser.add_argument("--triage-hops", type=bounded_integer(0, 3), default=2, metavar="N",
+                        help="identity co-occurrence expansion hops after nearby seeds (default: 2)")
+    parser.add_argument("--triage-gap-ms", type=bounded_integer(1, 600000), default=1000, metavar="MS",
+                        help="highlight comparable same-source clock gaps at least this long (default: 1000)")
+    parser.add_argument("--near-ms", type=bounded_integer(0, 600000), default=1000,
+                        help="pasted-error neighborhood radius in milliseconds (default: 1000)")
+    parser.add_argument("--correlate", action="append", default=[], metavar="FIELD[+FIELD...]",
+                        help="include records sharing a seed identity; repeat for OR, + for composite identities")
+    parser.add_argument("--context", type=bounded_integer(0, 100), default=0,
+                        help="include up to N nonblank records before/after each match in the same file")
+    parser.add_argument("--format", choices=("summary", "timeline", "jsonl"), default="summary")
+    parser.add_argument("--fields", help="comma-separated output field projection; provenance is always retained")
+    parser.add_argument("--group-by", default="@owner,@event", help="comma-separated summary grouping fields")
+    parser.add_argument("--top", type=bounded_integer(1, 100), default=10, help="maximum summary groups (default: 10)")
+    parser.add_argument("--limit", type=bounded_integer(1, 10000), default=20,
+                        help="maximum timeline sample records; counts cover all matches (default: 20)")
+    parser.add_argument("--order", choices=("time", "file", "capture", "proximity"))
+    parser.add_argument("--tail", action="store_true", help="retain the last N records, displayed in ascending order")
+    parser.add_argument("--recursive", action="store_true", help="descend directories, including archived runs")
+    parser.add_argument("--family", action="append", default=[], metavar="STEM",
+                        help="discover runtime/native/Firefox artifact siblings; repeatable")
+    parser.add_argument("--history", action="store_true", help="include selected files' rotated .history siblings")
+    parser.add_argument("--run", help="select an archive ID, full run identity, or current; implies --history")
+    parser.add_argument("--list-runs", action="store_true", help="list discovered run IDs and files without parsing records")
+    parser.add_argument("--related-run", action="store_true", help="include the rest of each run containing a query match")
+    parser.add_argument("--strict", action="store_true", help="exit 2 if any input record is malformed/truncated")
+    return parser
+
+
+def main(argv=None, *, root=None, output=None, diagnostics=None):
+    parser = argument_parser()
+    options = parser.parse_args(argv)
+    output = output or sys.stdout
+    diagnostics = diagnostics or sys.stderr
+    try:
+        query = QueryParser(options.query).parse()
+        where = QueryParser(options.where).parse()
+        if options.errors:
+            query = Expression("and", (query, Expression("=", ("@error", True))))
+        if options.triage and (options.related_run or options.tail or options.list_runs):
+            raise QueryError("--triage cannot combine with --related-run, --tail, or --list-runs; its evidence is bounded automatically")
+        if options.correlate and not (options.query.strip() or options.errors or options.triage):
+            raise QueryError("--correlate requires an explicit --query or --errors seed")
+        options.fields = field_names(options.fields) if options.fields else ()
+        options.group_by = field_names(options.group_by)
+        options.order = options.order or ("proximity" if options.error is not None else "time")
+        if options.order == "proximity" and options.error is None:
+            raise QueryError("--order proximity requires --error")
+        if options.error is not None:
+            options.history = True
+        for relationship in options.correlate:
+            field_names(relationship, "+")
+        repository = (root or Path(__file__).resolve().parent.parent).resolve()
+        catalog = ArtifactCatalog(options, repository)
+        if options.list_runs:
+            catalog.list_runs(output, options.limit)
+            return 0
+        if options.family or options.history or options.run or options.related_run or options.triage:
+            catalog.prepare_anchors()
+        if catalog.selected_runs:
+            scope = Expression("or", tuple(Expression("=", ("@run", run)) for run in sorted(catalog.selected_runs)))
+            where = Expression("and", (where, scope))
+        lookup = None
+        files = catalog.files
+        if options.error is not None:
+            lookup = ErrorLookup(options.error, options)
+            lookup.locate(files, query, where, catalog.anchors)
+            if lookup.focus is None:
+                print(f"No exact/display-normalized phrase or all-words matches in {len(files)} files.", file=output)
+                if options.strict and lookup.malformed:
+                    print(f"Strict lookup scan observed {lookup.malformed} malformed/truncated records.", file=diagnostics)
+                    return 2
+                return 1
+            files = [source for source in files if lookup.relevant(source)]
+            lookup.calibrate(files, catalog.anchors)
+            lookup.annotate(lookup.focus, force=True)
+            query = lookup.expression
+            where = Expression("and", (where, Expression("=", ("@run", lookup.focus.metadata["run"]))))
+        if options.triage:
+            triage = Triage(options, where, catalog.anchors, lookup).run_query(files, query)
+            render_triage(triage, options, output, diagnostics)
+            if options.strict and (triage.malformed or lookup and lookup.malformed):
+                return 2
+            return 0 if triage.selected else 1
+        result = execute(files, query, where, options, catalog.anchors, lookup)
+        render(result, options, output, diagnostics)
+        if options.strict and lookup and lookup.malformed:
+            if lookup.malformed != result.malformed:
+                print(f"Strict lookup scan observed {lookup.malformed} malformed/truncated records across all inputs.", file=diagnostics)
+            return 2
+        if options.strict and result.malformed:
+            return 2
+        return 0 if result.matches + result.related else 1
+    except BrokenPipeError:
+        raise
+    except (QueryError, OSError, SyntaxError, InvalidOperation) as error:
+        print(f"mmltk logs: {error}", file=diagnostics)
+        return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # Avoid a second exception when Python flushes a pipe closed by its reader.
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        sys.exit(0)

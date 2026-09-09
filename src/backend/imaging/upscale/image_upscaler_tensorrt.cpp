@@ -127,8 +127,11 @@ class TensorRtImageUpscalerRuntime final
     friend class TiledImageUpscalerRuntimeAdapter<TensorRtImageUpscalerRuntime, ImageUpscalerBackend::TensorRt>;
 
     [[nodiscard]] cudaError_t SettleBackend() noexcept {
-        for (TensorRtTileLane& lane : lanes_)
-            cleanup_.Record(settle_upscaler_stream(lane.stream, lane.graph), "settle TensorRT lane");
+        // Activation is sequential. The newest initialized lane is the only
+        // lane that can still own thread-local capture, which must end before
+        // CUDA permits synchronization of any earlier lane.
+        for (auto lane = lanes_.rbegin(); lane != lanes_.rend(); ++lane)
+            cleanup_.Record(settle_upscaler_stream(lane->stream, lane->graph), "settle TensorRT lane");
         return cleanup_.status();
     }
 

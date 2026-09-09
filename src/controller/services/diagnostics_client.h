@@ -89,6 +89,7 @@ class DiagnosticsProducer final {
 
        private:
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
+        [[nodiscard]] DiagnosticSubmitResult submit_terminal_encoded(DiagnosticRecord record) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult try_submit_encoded(DiagnosticRecord record) const noexcept {
             return submit(record, false, false);
         }

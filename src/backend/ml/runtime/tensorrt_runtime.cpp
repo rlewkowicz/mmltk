@@ -104,6 +104,12 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
         if (reported) std::rethrow_exception(reported);
         throw std::runtime_error(std::string(operation));
     }
+    [[nodiscard]] bool cancellation_failure_only() const noexcept {
+        std::scoped_lock lock(mutex_);
+        return !overflow_ &&
+               std::ranges::all_of(std::span{errors_}.first(static_cast<std::size_t>(count_)),
+                                   [](const auto code) { return code == nvinfer1::ErrorCode::kFAILED_EXECUTION; });
+    }
 
    private:
     nvinfer1::ILogger& logger_;
@@ -360,19 +366,26 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
             if (sink_) { sink_("[trt:build] phase finish " + phase); }
         } catch (...) { return; }
     }
+    [[nodiscard]] bool cancelled() const noexcept { return cancelled_.load(std::memory_order_acquire); }
 
    private:
-    [[nodiscard]] bool should_continue() const noexcept {
+    [[nodiscard]] bool should_continue() noexcept {
         if (!continue_build_) { return true; }
         try {
-            return continue_build_();
-        } catch (...) { return false; }
+            const bool proceed = continue_build_();
+            if (!proceed) cancelled_.store(true, std::memory_order_release);
+            return proceed;
+        } catch (...) {
+            cancelled_.store(true, std::memory_order_release);
+            return false;
+        }
     }
 
     std::function<void(std::string_view)> sink_;
     std::function<bool()> continue_build_;
     std::mutex mutex_;
     std::unordered_map<std::string, std::int32_t> phase_steps_;
+    std::atomic_bool cancelled_{false};
 };
 
 [[nodiscard]] std::string parser_errors(const nvonnxparser::IParser& parser) {
@@ -488,9 +501,16 @@ struct TensorRtEngine::Impl {
         emit("[trt:build] building serialized engine");
         if (!admitted()) return;
         serialized.reset(builder->buildSerializedNetwork(*network, *config));
+        const auto cuda_status = cudaPeekAtLastError();
+        if (progress.cancelled() && cuda_status == cudaSuccess && errors.cancellation_failure_only()) {
+            errors.clear();
+            cancelled = true;
+            serialized.reset();
+            return;
+        }
         // Inspect reported failures before cancellation: an OOM/context loss
         // concurrent with withdrawal is not a successful cancellation.
-        if (errors.getNbErrors() != 0 || errors.hasOverflowed() || cudaPeekAtLastError() != cudaSuccess)
+        if (errors.getNbErrors() != 0 || errors.hasOverflowed() || cuda_status != cudaSuccess)
             errors.Check(false, options.context + " build TensorRT engine");
         if (!admitted()) return;
         if (serialized == nullptr) { throw std::runtime_error(options.context + " TensorRT buildSerializedNetwork failed"); }

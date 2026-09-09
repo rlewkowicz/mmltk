@@ -87,32 +87,21 @@ impl App {
                     .explore
                     .gridwidth
                     .clamp(1, 99) as u32;
-                let Some(viewport) = self.workspace.explore_measured_viewport(columns, 0, 0) else {
-                    self.model.error = Some(UiError::presentation(
-                        "Explore requires a measured non-empty gallery.",
-                    ));
-                    return Task::none();
-                };
                 if !settings.exploresource.available {
                     self.model.error = Some(UiError::invalid(
                         "The selected Explore dataset has no compiled artifact path.",
                     ));
                     return Task::none();
                 }
-                let compiled_source = settings.exploresource.compiledsource.clone();
-                let submitted = self.submit_intent(
-                    ApplicationIntentEndpoint::ExploreOpen,
-                    move |correlation| {
-                        crate::generated::encode_explore_Open(
-                            correlation,
-                            ExploreOpen {
-                                viewport,
-                                compiledsource: compiled_source,
-                            },
-                        )
-                    },
+                self.integration.observe_explore_open_layout(
+                    self.workspace
+                        .explore_measured_viewport(columns, 0, 0)
+                        .is_some(),
+                    self.model.explore.snapshot.as_ref(),
+                    columns,
                 );
-                self.integration.observe_explore_open_submission(submitted);
+                self.model.explore.desired_open = true;
+                self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::StopRequested => {
                 if self.model.explore_stop_available() {
@@ -363,6 +352,7 @@ impl App {
             self.abandon_explore_edit(ApplicationIntentEndpoint::ExploreUpdateOverlay);
             return;
         }
+        self.dispatch_explore_open();
         if !self.model.has_explore_pending()
             && self.model.explore.desired_close
             && self.submit_intent(
@@ -461,12 +451,51 @@ impl App {
         self.dispatch_viewer_desired();
     }
 
+    fn dispatch_explore_open(&mut self) {
+        if !self.model.explore.desired_open
+            || self.settings.has_local_edits()
+            || self.settings_unsettled()
+            || !self.model.explore_open_available()
+        {
+            return;
+        }
+        let Some(settings) = self.model.settings_snapshot.as_ref() else {
+            return;
+        };
+        let columns = settings
+            .settingsstate
+            .workflows
+            .explore
+            .gridwidth
+            .clamp(1, 99) as u32;
+        let Some(viewport) = self.workspace.explore_measured_viewport(columns, 0, 0) else {
+            self.integration.observe_explore_open_layout(
+                false,
+                self.model.explore.snapshot.as_ref(),
+                columns,
+            );
+            return;
+        };
+        let compiled_source = settings.exploresource.compiledsource.clone();
+        let submitted =
+            self.submit_intent(ApplicationIntentEndpoint::ExploreOpen, move |correlation| {
+                crate::generated::encode_explore_Open(
+                    correlation,
+                    ExploreOpen {
+                        viewport,
+                        compiledsource: compiled_source,
+                    },
+                )
+            });
+        self.integration.observe_explore_open_submission(submitted);
+        if submitted {
+            self.model.explore.desired_open = false;
+        }
+    }
+
     pub(super) fn dispatch_viewer_desired(&mut self) {
         if self.presentation.stop_requested {
-            if self
-                .model
-                .has_pending(ApplicationIntentEndpoint::UpscaleStop)
-            {
+            if self.model.has_upscale_pending() {
                 return;
             }
             if !self.submit_intent(
@@ -476,10 +505,9 @@ impl App {
                 return;
             }
             self.presentation.stop_requested = false;
+            return;
         }
-        if !self
-            .model
-            .has_pending(ApplicationIntentEndpoint::UpscaleStart)
+        if !self.model.has_upscale_pending()
             && let Some(request) = self.model.explore.requested_upscale.clone()
             && self.model.explore.sent_upscale.as_ref() != Some(&request)
         {

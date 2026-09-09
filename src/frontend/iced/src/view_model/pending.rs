@@ -206,6 +206,10 @@ impl ApplicationModel {
         self.has_system_pending(crate::generated::ApplicationSystem::Explore)
     }
 
+    pub(crate) fn has_upscale_pending(&self) -> bool {
+        self.has_system_pending(crate::generated::ApplicationSystem::Upscale)
+    }
+
     pub(super) fn has_annotation_pending(&self) -> bool {
         self.has_system_pending(crate::generated::ApplicationSystem::Annotation)
     }

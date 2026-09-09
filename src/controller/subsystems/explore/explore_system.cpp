@@ -1169,6 +1169,17 @@ class ExploreSystem::Impl final {
                         return RestoreCommittedProduct(algorithm);
                     }
                     DiagnoseFrame(frame, generation);
+                    diagnostics_.Emit([&] {
+                        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                                    .operation = VisualDiagnosticOperation::TileBatchPublished,
+                                                    .device = settings_.device,
+                                                    .generation = published.generation,
+                                                    .value = published.cumulative_tiles,
+                                                    .detail = published.reused_tiles,
+                                                    .context = {.capacity_width = extent.width,
+                                                                .capacity_height = extent.height,
+                                                                .staging_bytes = published.active_pinned_bytes}};
+                    });
                     return notification;
                 } catch (...) {
                     if (mmltk::frameworks::gpu::is_image_execution_failure(std::current_exception())) throw;

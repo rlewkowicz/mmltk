@@ -180,7 +180,9 @@ bool ApplicationShell::shutdown() noexcept {
     const bool systems_joined = join_systems();
     const bool resources_closed = browser_closed && systems_joined;
     healthy_ = resources_closed;
-    emit_shutdown_event(resources_closed ? "shutdown.complete" : "shutdown.incomplete");
+    runtime_diagnostics_.target().write_required(
+        {.owner = contracts::DiagnosticOwner::BrowserRuntime,
+         .event = resources_closed ? std::string_view{"shutdown.complete"} : std::string_view{"shutdown.incomplete"}});
     diagnostics_client_.close(services::DiagnosticsCloseMode::Flush);
     diagnostics_client_.wait_closed();
     healthy_ = diagnostics_client_.terminal() != services::DiagnosticsTerminal::Failed && healthy_;

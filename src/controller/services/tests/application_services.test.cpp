@@ -451,7 +451,15 @@ TEST_CASE("runtime trace overflow never waits for a stalled background writer", 
     for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity + 2U; ++index)
         runtime.target().write({.event = "capacity", .sequence = index});
     CHECK(diagnostics.counters().dropped >= 2U);
+    auto required = std::async(std::launch::async, [target = runtime.target()] {
+        target.write_required({.event = "shutdown.complete"});
+    });
+    const auto required_ready = required.wait_for(std::chrono::seconds{2});
+    if (required_ready != std::future_status::ready) diagnostics.close(DiagnosticsCloseMode::Discard);
+    REQUIRE(required_ready == std::future_status::ready);
+    required.get();
     diagnostics.close(DiagnosticsCloseMode::Discard);
+    require_one_terminal_wake(diagnostics);
     CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
 }
 
@@ -612,6 +620,7 @@ TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]")
     const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     REQUIRE(descriptor >= 0);
     DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
+    RuntimeDiagnostics runtime{diagnostics.producer()};
     const auto operation = diagnostics.producer().acquire();
     CHECK(operation.submit({"not-json"}) == DiagnosticSubmitResult::InvalidJson);
     CHECK(operation.submit({"[]"}) == DiagnosticSubmitResult::InvalidJson);
@@ -623,11 +632,17 @@ TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]")
         CHECK(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
     }
     CHECK(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Capacity);
-    CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity);
-    diagnostics.close(DiagnosticsCloseMode::Discard);
-    CHECK(diagnostics.counters().dropped >= DiagnosticsClient::kQueueCapacity);
+    runtime.target().write_required({.event = "shutdown.complete"});
+    CHECK(diagnostics.counters().accepted == DiagnosticsClient::kQueueCapacity + 1U);
+    CHECK(operation.submit({"{\"index\":3}"}) == DiagnosticSubmitResult::Disabled);
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    CHECK(diagnostics.counters().flushed == DiagnosticsClient::kQueueCapacity + 1U);
     CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
     require_one_terminal_wake(diagnostics);
+    std::ifstream input{path};
+    std::string last;
+    for (std::string line; std::getline(input, line);) last = std::move(line);
+    CHECK(last.contains(R"("event":"shutdown.complete")"));
 }
 
 TEST_CASE("diagnostics close interrupts a stalled output descriptor", "[gui][services]") {

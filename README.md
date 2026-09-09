@@ -338,6 +338,85 @@ MMLTK_FIREFOX_LOG_FILE=.mmltk-data/logs/firefox.log \
 The native trace starts a new capture; preserve earlier logs before reusing a
 path. `MMLTK_GUI_TRACE_FILE` is the supported native trace variable.
 
+Query captured JSONL, native, and Firefox logs through the read-only wrapper:
+
+```bash
+./mmltk --logs --errors --tail
+./mmltk --logs -q 'onnx OR "CUDA error"' --context 2
+./mmltk --logs -q 'trace_id=42' --correlate trace_id --format timeline --limit 80
+./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
+./mmltk --logs .mmltk-data/logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
+./mmltk --logs --help
+```
+
+Paste a displayed error directly, including its title and blank line:
+
+```bash
+./mmltk --logs --error 'Presentation unavailable
+
+Explore requires a measured non-empty gallery.'
+```
+
+Pasted lookup searches full whitespace-normalized phrases before an explicitly
+reported all-words fallback, including the colon used between a displayed title
+and body in logs. It searches histories, prefers physical records over copied
+Catch context, and focuses the first matching capture by file modification time.
+The report retains the original file, line, event timestamp, and clock, with
+nearby records bounded by `--near-ms` (1,000 milliseconds by default). Same-clock
+differences use their recorded times. Cross-clock proximity aligns each file's
+last recorded timestamp to its modification time; untimed rows can use the
+preceding timestamp for proximity only. These estimates are labeled and do not
+establish causality.
+
+Discover an artifact family or choose a historical capture:
+
+```bash
+./mmltk --logs --family latest-wayland-test --history --list-runs
+./mmltk --logs --family latest-wayland-test --run 57-132614959357615 --errors
+./mmltk --logs build/validation/viewer-copy-ownership-trace.log \
+  --family latest-wayland-test --history \
+  -q 'buffer="BufferId(21,1)" AND detail=arc_extract AND strong_count>1' --tail
+```
+
+Native, Firefox, and trace histories use independently sampled rotation IDs.
+The tool groups consecutive same-PID rotations within 10 milliseconds and
+labels those sibling associations as inferred. Identical event/steady-time
+anchors link transcript segments to native captures and propagate known test
+names/tags. Queries accept `@run`, `@archive_id`, `@test`, and `@tags`; bare
+searches also examine these fields. `--related-run` includes other records in
+matching captures. Family/history correlations are scoped to the run.
+Summaries include terminal events independently of the sample limit.
+`child.signaled` values 139 and 143 decode to `SIGSEGV` and `SIGTERM`; a signal
+alone does not establish whether termination was expected.
+
+The default input is `build/validation`; directories include log files directly
+inside them, and `--recursive` explicitly includes archived captures. Inputs
+are paths or quoted globs within the repository. The existing build image runs
+the tool without builds, GPU access, network, or writable repository mounts.
+Queries support boolean expressions, nested fields, exact values, numeric
+comparisons, literal substrings, and regexes. `--where` filters all output,
+including correlation results. Repeat `--correlate FIELD` for alternative
+identities, or use `--correlate source_session+source_instance` for a composite
+identity. Correlation joins only the original matches and excludes empty/zero
+identities; it does not expand transitively.
+
+`@surface` normalizes native high/low fields and Firefox's hexadecimal surface
+identity. Keep each query scoped to one capture because IDs can repeat between
+runs. Ordinary timelines group steady, UTC wall, timezone-free wall, per-file
+elapsed, and untimed records separately. `--tail`
+selects the last records in that grouped ordering, or in file order with
+`--order file`. `--order capture` uses artifact modification time followed by
+physical line order. `--format jsonl` preserves parsed data and file/line provenance
+for further tooling. Summary counts cover every selected record while the
+timeline sample retains at most `--limit` records (20 by default, up to 10,000).
+Terminal summaries contain at most `--top` rows; the separate native intent/reply
+tail contains at most five. Group and
+correlation cardinality are capped at 10,000; narrow the query if either limit
+is reached. Malformed or oversized records remain searchable with an explicit
+warning; `--strict` returns status 2 for these inputs. Status 1 means no matches,
+and status 2 also reports invalid queries or unreadable/changing inputs. Run
+the focused fixture suite with `./mmltk --test log-query-tool`.
+
 Inspect a compiled file's Linux storage and GPU capabilities without reading
 its contents or running a benchmark:
 

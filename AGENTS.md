@@ -76,6 +76,71 @@ and `--env` options for diagnostic configurations, debugger sessions, and gated
 test instrumentation.
 
 ## Crashes, Logging, and Debugging
+```
+Examples:
+  ./mmltk --logs --errors
+  ./mmltk --logs -q 'onnx OR "CUDA error"'
+  ./mmltk --logs -q '@event:shutdown AND NOT @event:started' --format timeline
+  ./mmltk --logs -q 'trace_id=42' --correlate trace_id --tail --limit 80
+  ./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
+  ./mmltk --logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
+  ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
+  ./mmltk --logs --family latest-wayland-test --errors --related-run --tail
+  ./mmltk --logs --family latest-wayland-test --history --list-runs
+  ./mmltk --logs --family latest-wayland-test --run 57-131007497132582 -q SIGSEGV
+  ./mmltk --logs build/validation/viewer-copy-ownership-trace.log \\
+      --family latest-wayland-test --history -q 'buffer="BufferId(21,1)"' --context 2
+
+Grammar (quote the entire expression for the shell):
+  expr      := expr OR expr | expr [AND] expr | NOT expr | '(' expr ')'
+  primary   := text | '*' | has(field) | field operator value
+  operator  := = != : ~ !~ > >= < <=
+AND binds tighter than OR; NOT binds tightest. Adjacent terms imply AND.
+Bare/quoted text and ':' are case-insensitive literal substring searches.
+'='/'!=' compare exact typed values; ordering compares numbers; '~'/'!~' use
+Python regex (case-sensitive; use (?i) for insensitive). Missing fields do
+not satisfy comparisons, including '!='; NOT includes them. has() tests
+presence including null/zero. Quote strings containing spaces or punctuation.
+
+Fields:
+  JSON paths (fields.name), event/trace_id/etc. (unqualified names also look
+  inside fields), plus @file, @line, @text, @format, @clock, @time_ns,
+  @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
+  @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
+  @terminal, @exit_code, @signal, @signal_number.
+  @event resolves wrapped fields.event/name before event/name.
+  @surface joins native uint64 surface_high/low and Firefox 32-hex surfaces.
+  @error marks failure candidates from levels/event/message text; it is a
+  search aid, not a diagnosis. Numeric error=0 metrics do not mark failures.
+  child.signaled value=139 decodes to SIGSEGV (11); 143 to SIGTERM (15).
+  Signals describe the observed termination, not whether shutdown was intended.
+  Bare terms search test/tag/run/signal metadata as well as original text.
+  Catch INFO copies retain their original timestamps and are labeled context-copy.
+
+Inputs and ordering:
+  Paths/globs are repository-relative or absolute within the repository.
+  Directories select .jsonl/.log/.out/.txt; --recursive includes histories.
+  Explicit files can have any suffix. Repeated paths are deduplicated.
+  The default is build/validation, without recursive archived captures.
+  Time ordering groups steady, UTC wall, timezone-free wall, per-file elapsed,
+  and untimed records separately; ties use file/line. No clock offset is guessed.
+  --order capture sorts files by captured mtime then preserves their line order;
+  mtime is artifact recency, not an event timestamp or proof of causality.
+  Use one capture at a time: IDs and monotonic times can repeat across runs.
+  Files are read up to their captured byte size; correlation requires unchanged
+  files over two passes. There is no follow mode, persistent index, or network.
+
+Artifact families:
+  --family STEM selects STEM.jsonl / STEM.log / STEM-native.log / STEM-firefox.log
+  under build/validation (or supply a repository path). --history adds rotated
+  siblings; --run selects an exact archive ID or 'current'. Adjacent rotations
+  with the same PID within 10ms are grouped and explicitly labeled inferred.
+  Shared (event, steady_ns) anchors link transcript captures to native runs and
+  propagate known test/tag metadata. Missing anchors leave transcripts separate.
+  --related-run includes other records from a matched run; named correlations
+  are automatically scoped to the run in family/history mode. Summary output
+  includes terminal events from matched runs independently of the sample limit.
+```
 
 Provide granular opt-in JSONL logging with maximum useful troubleshooting
 detail. Disabled logging must avoid collecting and formatting diagnostic data.
@@ -114,6 +179,9 @@ implementation naturally forms one coherent cutover.
 
 ### Executing an action plan
 
+- At the start of execution, record the current commit as the plan baseline in
+  session state. The final whole-plan framework audit uses this immutable
+  baseline; do not write it into `actionplan.md`.
 - Phase ordering is sequencing guidance. Work may be pulled forward when it
   forms a complete, architecturally aligned cutover. Reviewers evaluate the
   implemented review set against all applicable requirements.
@@ -129,7 +197,7 @@ implementation naturally forms one coherent cutover.
   reviewer for follow-up review. Final Validation follows its separate
   main-agent workflow below.
 - The main agent handles Final Validation in this order: tidy, build, cleanup,
-  tidy, build, tests, with the single cleanup review before the final build.
+  tidy, cleanup review, build, tests, and the whole-plan framework audit below.
   The main agent handles small evidence-driven follow-up fixes. Large missing
   implementation remains delegated work.
 - Update `actionplan.md` atomically after each completed phase. Update only the
@@ -284,10 +352,10 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
   Final Validation, never a prerequisite for starting validation.
 - The governing stage order is one full tidy pass, one full build, every
   applicable cleanup profile, a second full tidy pass, the cleanup review and
-  any remediation, one final full build, then focused tests and acceptance
-  coverage. Do not start cleanup before the initial tidy and build succeed, do
-  not run cleanup after the final build, and do not start tests before that
-  final build succeeds.
+  any remediation, one final full build, focused tests and acceptance
+  coverage, then the whole-plan framework audit. Do not start cleanup before
+  the initial tidy and build succeed, do not run cleanup after the final build,
+  and do not start tests before that final build succeeds.
 - Begin Final Validation with the repository-configured full
   `./mmltk --tidy` suite and resolve every genuine finding. Run the selected
   full build after tidy is clean. Do not begin cleanup or use a cleanup report
@@ -327,8 +395,9 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
   reviewer or issue a second workflow-agnostic verifier prompt. After
   remediation, rerun every applicable cleanup profile and then the full tidy
   suite before asking that same reviewer to check the remediated review set.
-  This cleanup audit is the only review-agent requirement during Final
-  Validation.
+  This is the only cleanup review engagement during Final Validation. The
+  separate whole-plan framework audit occurs only after the final build and all
+  focused tests and acceptance coverage pass.
 - After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
   commit all outstanding tracked cleanup, tidy, and remediation changes with
   the exact message `post cleanup`; keep `actionplan.md` uncommitted.
@@ -336,9 +405,116 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
   build succeeds, run the required focused tests and acceptance coverage in the
   sequence required by the plan. Do not insert another cleanup or tidy stage
   between this final build and the tests.
-- The main agent handles Final Validation. After the cleanup reviewer returns
-  `COMPLETE`, do not run another review after the `post cleanup` checkpoint,
-  final build, focused tests, or acceptance coverage.
+- After all required tests and acceptance coverage pass, run the whole-plan
+  framework audit below. Do not run another cleanup review after the
+  `post cleanup` checkpoint.
+
+### Post-validation whole-plan framework audit
+
+Run this audit exactly once after the final build and every required focused
+test and acceptance case pass. It is not a phase review, does not create
+numbered phases or subphases, and does not replace the earlier cleanup
+correctness audit.
+
+Spawn exactly one fresh astra max reviewer with no inherited conversation
+context. Give it the repository path, the plan baseline recorded at the start
+of execution, the current `HEAD`, the complete working-tree diff, and the
+workflow-agnostic prompt below. The authoritative review set is every tracked
+change from the plan baseline through the current working tree, including
+phase commits, cleanup commits, validation fixes, build wiring, generated
+source definitions, tests, and instructions changed while executing the plan.
+The reviewer reads `AGENTS.md`, `CONTRACT.md`, and `actionplan.md` itself. It
+must not edit implementation, requirements, contracts, instructions, or the
+governing plan.
+
+The audit looks across the whole plan for repeated concepts and overlapping
+changes that only become visible atomically: cohesive ownership boundaries,
+module-quality acyclic dependency surfaces without introducing C++ modules,
+canonical reflected schemas, C++/generated-Rust boundary simplification,
+physical RAII safety, bounded concurrency, allocation and transfer reduction,
+algorithmic complexity, and meaningful reusable classes, factories, helpers,
+or templates. It rejects facades, pass-through layers, speculative
+abstractions, reflection over execution state, and indirection without a
+demonstrated ownership, reuse, safety, performance, or blast-radius benefit.
+
+If the result is `NOT COMPLETE`, the reviewer writes or replaces
+`remediationplan.md` as its only mutation. The main agent reviews that plan for
+scope and architectural alignment, assigns it to exactly one astra medium
+executor, and returns the resulting changes to the same reviewer. Follow-ups
+remain one review engagement; do not spawn another whole-plan reviewer or
+reissue the initial prompt. After remediation, rerun every applicable cleanup
+profile and the full tidy suite before follow-up review. Once the same reviewer
+returns `COMPLETE`, rerun the selected full build and every focused test and
+acceptance case affected by remediation. Do not recursively run another
+whole-plan framework audit.
+
+Use this prompt verbatim, replacing `<REPOSITORY>`, `<PLAN BASELINE>`,
+`<CURRENT HEAD>`, and `<REVIEW SET>` with concrete values:
+
+> Work as a fresh standalone whole-plan architecture reviewer in
+> `<REPOSITORY>`. Do not rely on or request prior conversation context. Read
+> `AGENTS.md`, `CONTRACT.md`, and `actionplan.md` completely before acting.
+> Audit `<REVIEW SET>`, containing every tracked change from plan baseline
+> `<PLAN BASELINE>` through current commit `<CURRENT HEAD>` and the complete
+> working tree. Inspect every changed artifact and relevant unchanged caller,
+> callee, dependency, configuration, build rule, generated boundary, test, and
+> persisted form. Confirm and report the exact changed-file count.
+>
+> Find patterns that are only visible across the complete plan: repeated
+> concepts, cross-file change clusters, misplaced ownership, hidden coupling,
+> duplicated vocabulary, and boundaries whose edit blast radius exceeds their
+> product responsibility. Treat each affected C++ boundary as if it required
+> C++20-module-quality dependency hygiene, but do not introduce modules. Model
+> include, link, schema, generation, concept, and ownership dependencies as a
+> directed acyclic graph. Identify cycles, reverse dependencies,
+> transitive-include reliance, include-order requirements, incomplete ordinary
+> headers, implementation leakage, and declarations that would not survive
+> isolated compilation.
+>
+> Require a focused ordinary class, sealed owner, factory, helper, reusable
+> template, or canonical C++26-reflected declaration only when it consolidates
+> a demonstrated shared concept, repeated behavior, or authoritative fact.
+> Prefer compile-time structural projection with no runtime lookup or storage
+> cost. Keep product policy, resource ownership, and control flow in cohesive
+> ordinary systems with direct APIs. Seek measurable reductions in future
+> cross-file edits, allocation, CPU/GPU transfer, blocking, memory churn, and
+> algorithmic complexity. Reject facades, passthrough coordinators, one-method
+> wrappers, speculative abstractions, parallel registries, reflection over
+> resource or execution state, preprocessor-heavy mirrored schemas, hidden
+> control flow, and indirection without a demonstrated reuse, ownership,
+> safety, performance, or blast-radius benefit.
+>
+> Audit the C++ to generated-Rust boundary for one canonical native vocabulary,
+> exhaustive reflected projection and dispatch, stable field identity, schema
+> validation, and removal of handwritten member-wise or string-keyed mirrors.
+> Keep visual copy, component state, layout, styling, theme, navigation, and
+> interaction behavior owned by Rust and Iced. Treat observability, tracing,
+> logging, and correlation as effect-only diagnostics unless the plan states a
+> product requirement. Diagnostic identities never become ordering,
+> cache-validity, acknowledgement, or resource-lifetime state.
+>
+> Preserve every observable behavior, failure path, integration outcome,
+> persisted format, resource-lifetime guarantee, concurrency property, test
+> case, widget identity, styling fact, and user-facing function. Reconstruct
+> substantial moved, deleted, or replaced behavior through its callers,
+> callees, tests, and persisted forms. Reject any simplification that silently
+> loses capability. Account for the successful cleanup, build, focused-test,
+> and acceptance evidence, but independently challenge architecture,
+> performance, modularity, and cross-boundary maintainability.
+>
+> Return one consolidated report with a dependency-DAG and ownership
+> assessment, exact locations, demonstrated impact, and the minimum cohesive
+> correction for every finding. Say `COMPLETE` only when no material
+> whole-plan framework correction remains. Optional ideas do not block
+> completion.
+>
+> If the result is `NOT COMPLETE`, write or replace `remediationplan.md` with
+> an executable remediation plan before returning. This is your only permitted
+> mutation. Include the authoritative review set, consolidated findings,
+> concrete phases, important files, exact actions and locations, architectural
+> constraints, and post-cleanup concerns. Do not add a validation or commit
+> phase, do not edit `actionplan.md`, and do not modify implementation,
+> requirements, contracts, or instructions.
 
 ### Workflow-agnostic verifier prompt
 

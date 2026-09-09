@@ -339,9 +339,8 @@ struct ExploreRenderGate final {
 };
 
 struct ExploreFinalizationGate final {
-    explicit ExploreFinalizationGate(const std::size_t target) : target_call(target) {}
-    std::size_t target_call;
-    std::atomic<std::size_t> calls{0U};
+    void Arm() noexcept { armed.store(true, std::memory_order_release); }
+    std::atomic_bool armed{false};
     std::promise<void> entered;
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
@@ -907,8 +906,7 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
             .shuffle_seed = candidate == nullptr ? 0U : candidate->order.shuffle_seed,
         };
         if (candidate != nullptr) {
-            if (finalization_gate_ &&
-                finalization_gate_->calls.fetch_add(1U, std::memory_order_acq_rel) == finalization_gate_->target_call) {
+            if (finalization_gate_ && finalization_gate_->armed.exchange(false, std::memory_order_acq_rel)) {
                 finalization_gate_->entered.set_value();
                 finalization_gate_->released.wait();
             }
@@ -1941,8 +1939,11 @@ class ExploreScenario final {
     [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
 
     void OpenAndWait(const ExploreViewport viewport, const std::string_view compiled_source = "/test") {
-        static_cast<void>(explore_.Open({.viewport = viewport, .compiled_source = std::string{compiled_source}}));
-        REQUIRE(Wait([this] { return explore_.snapshot().ready; }));
+        const auto admitted = explore_.Open({.viewport = viewport, .compiled_source = std::string{compiled_source}});
+        REQUIRE(Wait([this, admitted] {
+            const auto current = explore_.snapshot();
+            return current.ready && !current.busy && current.revision > admitted.revision;
+        }));
     }
 
     [[nodiscard]] bool Wait(std::function<bool()> predicate) { return events_.Wait(std::move(predicate)); }
@@ -2859,7 +2860,9 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         CHECK(restored.order.visible_indices == committed.order.visible_indices);
         CHECK((rejection == Rejection::Cancelled) == restored.failure.empty());
         CHECK(scenario.failure_count() == (rejection == Rejection::Cancelled ? 0U : 1U));
-        REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
+        REQUIRE(scenario.probe().Wait([&] {
+            return scenario.probe().rollbacks != 0U && scenario.probe().assignments.size() == 2U;
+        }));
         {
             std::scoped_lock lock(scenario.probe().mutex);
             CHECK(scenario.probe().aborted_assignments >= 2U);
@@ -2912,6 +2915,7 @@ TEST_CASE("Explore callback admission failure quiesces its runtime and permits a
         std::scoped_lock lock(scenario.probe().mutex);
         scenario.probe().fail_callback_admission = false;
     }
+    scenario.backend().FailAfter(FakeImageBackend::FailurePoint::None);
     static_cast<void>(explore.Open({.viewport = {.extent = {4U, 4U}, .row_count = 1U, .columns = 1U}, .compiled_source = "/stream"}));
     REQUIRE(scenario.Wait([&] { return explore.snapshot().ready && explore.snapshot().failure.empty(); }));
 }
@@ -3495,7 +3499,7 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
     SECTION("cancelled open") {
         LoadedSettings settings;
         auto backend = std::make_shared<FakeImageBackend>();
-        auto gate = std::make_shared<ExploreFinalizationGate>(2U);
+        auto gate = std::make_shared<ExploreFinalizationGate>();
         auto entered = gate->entered.get_future();
         ExploreScenario scenario{settings, backend, [gate] {
                                      return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
@@ -3505,6 +3509,7 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
         scenario.OpenAndWait({.extent = {64U, 64U}});
         const auto before = select_explore_subset(settings, scenario, 0U);
 
+        gate->Arm();
         const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
         static_cast<void>(explore.Stop());
@@ -3740,13 +3745,14 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
-    auto gate = std::make_shared<ExploreFinalizationGate>(0U);
+    auto gate = std::make_shared<ExploreFinalizationGate>();
     auto entered = gate->entered.get_future();
     ExploreScenario scenario{settings, backend, [commits, gate] {
                                  return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
                                                                                commits, gate);
                              }};
     auto& explore = scenario.system();
+    gate->Arm();
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     const auto stopping = explore.Stop();
@@ -4368,7 +4374,7 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
 TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
-    auto gate = std::make_shared<ExploreFinalizationGate>(1U);
+    auto gate = std::make_shared<ExploreFinalizationGate>();
     auto entered = gate->entered.get_future();
     LoadedSettings settings;
     ExploreScenario scenario{settings, backend, [observed_nproc, gate] {
@@ -4380,6 +4386,7 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     scenario.OpenAndWait({.extent = {32U, 32U}});
     const auto before = explore.snapshot();
     const auto settings_revision = settings.system().snapshot().revision;
+    gate->Arm();
     static_cast<void>(explore.UpdateFilter({
         .filter = {.minimum_instances = 1U},
         .overlay = {.show_boxes = false, .show_masks = true},
@@ -4958,7 +4965,8 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
         runtime->BeginWork();
         auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
         REQUIRE(model != nullptr);
-        CUdeviceptr previous_input = 0U, previous_output = 0U;
+        CUdeviceptr previous_input = 0U;
+        std::array<CUdeviceptr, 2U> output_slots{};
         std::size_t warm_tensors = 0U, warm_models = 0U;
         for (std::size_t iteration = 0U; iteration < (reference_run ? 6U : 12U); ++iteration) {
             const auto pattern = iteration % 2U;
@@ -5005,8 +5013,10 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
             {
                 const auto output = runtime->Borrow();
                 const auto plane = output.plane(0U).plane();
-                if (previous_output != 0U) CHECK(plane.data == previous_output);
-                previous_output = plane.data;
+                const auto slot = iteration % output_slots.size();
+                if (output_slots[slot] != 0U) CHECK(plane.data == output_slots[slot]);
+                output_slots[slot] = plane.data;
+                if (output_slots[1U] != 0U) CHECK(output_slots[0U] != output_slots[1U]);
                 CHECK(plane.descriptor.pitch_bytes % 16U == 0U);
             }
             const auto returned = readback.Borrow();
@@ -5129,6 +5139,7 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
     const bool basic = stage == Stage::BasicAllocationAdmitted || stage == Stage::BasicLaunchAdmitted;
     const bool neural_warm = (stage >= Stage::WarmInputSubmitted && stage <= Stage::ReplaySettled) || stage == Stage::CacheLockAdmitted;
     const auto method = basic ? UpscaleKernel::Default : neural_warm ? UpscaleKernel::RealPlksr : UpscaleKernel::ShiftLut;
+    CAPTURE(static_cast<std::uint32_t>(stage), stop, static_cast<std::uint32_t>(method));
     NativeUpscaleSource source;
     std::promise<void> admitted, release;
     auto released = release.get_future().share();
@@ -5349,11 +5360,17 @@ TEST_CASE("TensorRT build progress accepts cancellation without an initializatio
         // the vendor progress monitor while buildSerializedNetwork is active.
         return ++observations < 2U;
     };
-    TensorRtEngine engine{
-        mmltk::common::system::runtime_paths::repository_root() / "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx",
-        std::move(options)};
-    CHECK(engine.cancelled());
-    CHECK(engine.native_engine_handle() == 0U);
+    std::optional<TensorRtEngine> engine;
+    try {
+        engine.emplace(mmltk::common::system::runtime_paths::repository_root() /
+                           "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx",
+                       std::move(options));
+    } catch (const TensorRtOperationError& failure) {
+        FAIL("TensorRT cancellation reported operation error code " << failure.code());
+    }
+    REQUIRE(engine);
+    CHECK(engine->cancelled());
+    CHECK(engine->native_engine_handle() == 0U);
     if (during_build) CHECK(observations.load() >= 2U);
 }
 
@@ -5367,6 +5384,7 @@ TEST_CASE("Installed neural activation owns every submitted stage through settle
                  Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled);
     const auto method = GENERATE(UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
     const auto occurrence = GENERATE(1U, 2U, 3U, 4U);
+    CAPTURE(static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(method), occurrence);
     if (method == UpscaleKernel::ShiftLut && (stage == Stage::WarmInputSubmitted || stage > Stage::WarmSubmitted)) return;
     const auto maximum = method == UpscaleKernel::ShiftLut ? ((stage == Stage::EventCreated || stage == Stage::WarmSubmitted)       ? 3U
                                                               : (stage == Stage::BuffersAllocated || stage == Stage::StreamCreated) ? 2U
@@ -5491,7 +5509,17 @@ TEST_CASE("Native Basic settled allocation and launch failures permit neural wor
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     const bool allocation_failure = GENERATE(false, true);
     using namespace mmltk::frameworks::gpu;
-    auto runtime = make_native_upscale_runtime_factory(kDevice)(std::make_shared<ImageProductRevisionSequence>());
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    const Stage failure_stage = allocation_failure ? Stage::BasicAllocationAdmitted : Stage::BasicLaunchAdmitted;
+    std::atomic_uint32_t stage_occurrence = 0U;
+    std::atomic_bool injected = false;
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](const Stage stage) {
+        if (stage == failure_stage && stage_occurrence.fetch_add(1U, std::memory_order_relaxed) == 1U) {
+            injected.store(true, std::memory_order_relaxed);
+            throw CudaError(allocation_failure ? cudaErrorMemoryAllocation : cudaErrorInvalidPitchValue,
+                            "injected settled Basic operation failure");
+        }
+    })(std::make_shared<ImageProductRevisionSequence>());
     runtime->BeginWork();
     auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
     REQUIRE(model != nullptr);
@@ -5501,32 +5529,23 @@ TEST_CASE("Native Basic settled allocation and launch failures permit neural wor
     });
     {
         const auto input = runtime->BorrowInput();
-        const auto publish = [&](const UpscaleKernel method, const bool invalid_pitch) {
+        const auto publish = [&](const UpscaleKernel method) {
             runtime->Publish(32U, 32U, [&](auto output, auto semantic, auto stream) {
                 auto source = input.plane(0U).plane();
-                if (invalid_pitch) {
-                    if (allocation_failure) {
-                        // Valid arithmetic, physically impossible scratch capacity.
-                        // Allocation fails before any kernel can read this descriptor.
-                        source.descriptor.width = 1U << 18U;
-                        source.descriptor.height = 1U << 17U;
-                    } else {
-                        output.descriptor.pitch_bytes = 0U;
-                    }
-                }
                 model->Run(method, source, output, stream);
                 model->Semantics({}, semantic, stream);
             });
         };
         try {
-            publish(UpscaleKernel::Default, true);
+            publish(UpscaleKernel::Default);
             FAIL("Basic accepted the failing allocation or launch");
         } catch (const CudaError& failure) {
             CHECK(failure.status() == (allocation_failure ? cudaErrorMemoryAllocation : cudaErrorInvalidPitchValue));
             CHECK_FALSE(failure.shared_failure());
         }
-        CHECK_NOTHROW(publish(UpscaleKernel::ShiftLut, false));
-        CHECK_NOTHROW(publish(UpscaleKernel::Default, false));
+        CHECK(injected.load(std::memory_order_relaxed));
+        CHECK_NOTHROW(publish(UpscaleKernel::ShiftLut));
+        CHECK_NOTHROW(publish(UpscaleKernel::Default));
     }
     // The local error must not poison the aggregate's checked release.
     CHECK(runtime->Retire().safe_to_destroy);
@@ -5878,12 +5897,12 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     REQUIRE(extents->targets.size() == 2U);
     CHECK(extents->sources[1U].data == input_address);
     CHECK(extents->targets[1U].data != output_address);
-    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water + 2U);
+    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water + 4U);
 
     present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
     CHECK((presentation.snapshot().completed.extent == VisualExtent{128U, 64U}));
     CHECK((presentation.snapshot().capability.extent == VisualExtent{320U, 160U}));
-    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water + 2U);
+    CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water + 4U);
     CHECK(backend->same_copies.load(std::memory_order_acquire) == copies_at_high_water + 3U);
     CHECK(backend->staged_downloads.load(std::memory_order_acquire) == 0U);
     CHECK(backend->staged_uploads.load(std::memory_order_acquire) == 0U);

@@ -12,7 +12,7 @@ namespace mmltk::frameworks::gpu {
 class ImageFailure : public std::runtime_error {
    public:
     ImageFailure(std::exception_ptr primary, std::exception_ptr secondary = {})
-        : std::runtime_error(Message(primary)), primary_(std::move(primary)), secondary_(std::move(secondary)) {}
+        : std::runtime_error(Message(primary ? primary : secondary)), primary_(std::move(primary)), secondary_(std::move(secondary)) {}
     [[nodiscard]] const std::exception_ptr& primary() const noexcept { return primary_; }
     [[nodiscard]] const std::exception_ptr& secondary() const noexcept { return secondary_; }
 

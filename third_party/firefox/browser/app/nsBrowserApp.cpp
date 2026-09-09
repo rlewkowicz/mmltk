@@ -14,6 +14,9 @@
 #  include <unistd.h>
 #  include <fcntl.h>
 #endif
+#if defined(XP_LINUX)
+#  include <sys/prctl.h>
+#endif
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -174,11 +177,26 @@ static void ReserveDefaultFileDescriptors() {
 }
 #endif
 
+#if defined(XP_LINUX)
+static bool DisableSystemCrashReports() {
+  const rlimit noCoreDump = {.rlim_cur = 0, .rlim_max = 0};
+  return setrlimit(RLIMIT_CORE, &noCoreDump) == 0 &&
+         prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) == 0;
+}
+#endif
+
 static void ExpandFileDescriptorTable() {
   mozilla::UniqueFileHandle fdTableExpander(fcntl(0, F_DUPFD, 256));
 }
 
 int main(int argc, char* argv[], char* envp[]) {
+#if defined(XP_LINUX)
+  if (!DisableSystemCrashReports()) {
+    Output("Could not disable system crash reporting.\n");
+    return 255;
+  }
+#endif
+
 #if defined(XP_UNIX)
   ReserveDefaultFileDescriptors();
 #endif

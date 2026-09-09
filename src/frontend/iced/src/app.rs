@@ -632,7 +632,7 @@ mod tests {
             viewer_identity: None,
             fit_revision: 0,
         });
-        presented.present_native_frame(FrameReady {
+        let retained = FrameReady {
             high: 1,
             low: 2,
             layer: 0,
@@ -642,9 +642,16 @@ mod tests {
             presentation_revision: 4,
             content_width: 640,
             content_height: 480,
-        });
+        };
+        presented.present_native_frame(retained);
         assert!(presented.connection.is_none());
-        assert!(presented.presentation.surface().is_none());
+        assert_eq!(
+            presented
+                .presentation
+                .surface()
+                .and_then(|surface| surface.frame),
+            Some(retained)
+        );
 
         let (mut intent, task) = boot();
         drop(task);
@@ -1485,6 +1492,55 @@ mod tests {
             app.workspace.explore_dispatchable_viewport(),
             Some(expected)
         );
+    }
+
+    #[test]
+    fn explore_open_waits_for_gallery_measurement_then_submits_once() {
+        let (mut app, task) = boot();
+        drop(task);
+        install_default_bootstrap(&mut app);
+        app.model.window_width = 640;
+        app.model.window_height = 480;
+        let settings = app.model.settings_snapshot.as_mut().unwrap();
+        settings.exploresource.compiledsource = "./compiled/train.bin".into();
+        settings.exploresource.available = true;
+        app.settings.install(settings);
+        let (sender, _receiver) = futures_channel::mpsc::channel(4);
+        app.connection = Some(Connection::new(sender));
+        assert!(app.model.explore_open_available());
+
+        drop(app.on_explore(crate::view::explore::Outcome::OpenRequested));
+
+        assert!(app.model.explore.desired_open);
+        assert_eq!(app.model.pending_count(), 0);
+        assert!(app.model.error.is_none());
+
+        let columns = authoritative_explore_columns(&app);
+        assert!(app.workspace.explore_measure_gallery(
+            601.0,
+            420.0,
+            gallery_capacity(601, 420),
+            columns,
+        ));
+        let measured = ExploreViewportUpdate {
+            viewport: app
+                .workspace
+                .explore_measured_viewport(columns, 0, 0)
+                .unwrap(),
+            focusedcompiledindex: None,
+        };
+        drop(app.request_explore_viewport(measured.clone()));
+
+        assert!(!app.model.explore.desired_open);
+        assert_eq!(
+            app.model.pending_endpoint(1),
+            Some(crate::generated::ENDPOINT_Explore_Open)
+        );
+        assert_eq!(app.model.pending_count(), 1);
+        assert!(app.model.error.is_none());
+
+        drop(app.request_explore_viewport(measured));
+        assert_eq!(app.model.pending_count(), 1);
     }
 
     #[test]

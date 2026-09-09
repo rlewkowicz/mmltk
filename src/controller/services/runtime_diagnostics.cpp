@@ -287,7 +287,7 @@ struct RuntimeDiagnosticTarget::State final {
 
     [[nodiscard]] bool enabled() const noexcept { return producer.enabled(); }
 
-    void write(RuntimeDiagnosticFact fact) const noexcept;
+    void write(RuntimeDiagnosticFact fact, bool required = false) const noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept;
     void write_benchmark_trace(std::string_view event, std::string_view json_fields) const noexcept;
 
@@ -300,6 +300,10 @@ bool RuntimeDiagnosticTarget::pixel_probes_enabled() const noexcept { return val
 
 void RuntimeDiagnosticTarget::write(const RuntimeDiagnosticFact fact) const noexcept {
     if (state_) state_->write(fact);
+}
+
+void RuntimeDiagnosticTarget::write_required(const RuntimeDiagnosticFact fact) const noexcept {
+    if (state_) state_->write(fact, true);
 }
 
 void RuntimeDiagnosticTarget::write_browser_event(const std::string_view event,
@@ -338,7 +342,7 @@ void RuntimeDiagnostics::SubmitBenchmarkTrace(void* const context, const std::st
     if (context != nullptr) static_cast<RuntimeDiagnostics*>(context)->write_benchmark_trace(event, json_fields);
 }
 
-void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact) const noexcept {
+void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact, const bool required) const noexcept {
     const DiagnosticsProducer::Operation operation = producer.acquire();
     if (!operation.enabled()) return;
     const std::string_view owner = owner_name(fact.owner);
@@ -349,7 +353,9 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact) con
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         std::array<char, DiagnosticsClient::kRecordCapacity> record;
         BoundedJsonWriter writer{record};
-        if (writer.runtime_event(fact, steady_ns)) static_cast<void>(operation.try_submit_encoded({.json = writer.view()}));
+        if (writer.runtime_event(fact, steady_ns))
+            static_cast<void>(required ? operation.submit_terminal_encoded({.json = writer.view()})
+                                       : operation.try_submit_encoded({.json = writer.view()}));
     } catch (...) {}
 }
 

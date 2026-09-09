@@ -38,6 +38,22 @@ struct Update {
     redraw: bool,
 }
 
+fn queued_redraw(surface: Surface) -> Task<Message> {
+    crate::presentation_surface::trace_surface("redraw_queued", surface);
+    let mut first_poll = true;
+    Task::perform(
+        std::future::poll_fn(move |context| {
+            if std::mem::take(&mut first_poll) {
+                context.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(())
+            }
+        }),
+        move |()| Message::Redraw(surface),
+    )
+}
+
 impl Controller {
     pub(super) fn suspend_viewer(&mut self, model: &ApplicationModel, route: FeatureId) {
         self.stop_requested |= model.has_pending(ApplicationIntentEndpoint::UpscaleStop);
@@ -195,19 +211,7 @@ impl Controller {
     pub(super) fn redraw(&self, previous: Option<Surface>) -> Task<Message> {
         match self.surface() {
             Some(surface) if self.surface() != previous && surface.frame.is_none() => {
-                crate::presentation_surface::trace_surface("redraw_queued", surface);
-                let mut first_poll = true;
-                Task::perform(
-                    std::future::poll_fn(move |context| {
-                        if std::mem::take(&mut first_poll) {
-                            context.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        } else {
-                            std::task::Poll::Ready(())
-                        }
-                    }),
-                    move |()| Message::Redraw(surface),
-                )
+                queued_redraw(surface)
             }
             _ if self.surface() != previous
                 || self
@@ -283,6 +287,10 @@ impl App {
         }
     }
     pub(super) fn on_presentation(&mut self, message: Message) -> Task<crate::message::Message> {
+        let capture_completed = matches!(
+            &message,
+            Message::Surface(crate::presentation_surface::Notification::Completed(_))
+        );
         let update = self.presentation.update(message, &self.model);
         if let Some((frame, surface)) = update.native {
             self.integration.observe_native_frame(frame, surface);
@@ -297,7 +305,12 @@ impl App {
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
         }
-        if update.redraw {
+        if capture_completed {
+            self.presentation
+                .surface()
+                .map_or_else(Task::none, queued_redraw)
+                .map(crate::message::Message::Presentation)
+        } else if update.redraw {
             iced::window::request_redraw()
         } else {
             Task::none()
@@ -739,6 +752,7 @@ mod tests {
             })));
             let mut stops = 0;
             let mut starts = 0;
+            let mut stop_correlation = None;
             while let Ok(record) = receiver.try_recv() {
                 if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
                     if intent.endpoint_id
@@ -747,10 +761,24 @@ mod tests {
                         )
                     {
                         stops += 1;
+                        stop_correlation = Some(intent.correlation);
                     } else if intent.endpoint_id
                         == crate::generated::application_intent_endpoint_stable_id(
                             ApplicationIntentEndpoint::UpscaleStart,
                         )
+                    {
+                        starts += 1;
+                    }
+                }
+            }
+            if let Some(correlation) = stop_correlation {
+                settle_upscale_stop(&mut app, correlation);
+                while let Ok(record) = receiver.try_recv() {
+                    if let crate::transport_connection::OutboundRecord::Intent(intent) = record
+                        && intent.endpoint_id
+                            == crate::generated::application_intent_endpoint_stable_id(
+                                ApplicationIntentEndpoint::UpscaleStart,
+                            )
                     {
                         starts += 1;
                     }
@@ -794,32 +822,42 @@ mod tests {
         let (sender, mut receiver) = futures_channel::mpsc::channel(32);
         app.connection = Some(Connection::new(sender));
         app.reconcile_presentation(false);
-        app.reconcile_presentation(false);
-        let requested = app.model.explore.requested_upscale.as_ref().unwrap();
+        let requested = app.model.explore.requested_upscale.clone().unwrap();
         assert_eq!(requested.kernel, crate::generated::UpscaleKernel::Default);
         assert_eq!(app.presentation.viewer.unwrap().1, 1);
-        let mut operations = Vec::new();
-        while let Ok(record) = receiver.try_recv() {
-            if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
-                for endpoint in [
-                    ApplicationIntentEndpoint::UpscaleStop,
-                    ApplicationIntentEndpoint::UpscaleStart,
-                ] {
-                    if intent.endpoint_id
-                        == crate::generated::application_intent_endpoint_stable_id(endpoint)
-                    {
-                        operations.push(endpoint);
-                    }
-                }
-            }
-        }
+        assert!(app.model.explore.sent_upscale.is_none());
+        let crate::transport_connection::OutboundRecord::Intent(stop) =
+            receiver.try_recv().expect("expected replacement Stop")
+        else {
+            panic!("expected replacement Stop intent");
+        };
         assert_eq!(
-            operations,
-            vec![
-                ApplicationIntentEndpoint::UpscaleStop,
-                ApplicationIntentEndpoint::UpscaleStart
-            ]
+            stop.endpoint_id,
+            crate::generated::application_intent_endpoint_stable_id(
+                ApplicationIntentEndpoint::UpscaleStop
+            )
         );
+        settle_upscale_stop(&mut app, stop.correlation);
+        assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
+        let start = loop {
+            let crate::transport_connection::OutboundRecord::Intent(intent) =
+                receiver.try_recv().expect("expected replacement Basic")
+            else {
+                continue;
+            };
+            if intent.endpoint_id
+                == crate::generated::application_intent_endpoint_stable_id(
+                    ApplicationIntentEndpoint::UpscaleStart,
+                )
+            {
+                break intent;
+            }
+        };
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, requested).record
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -855,6 +893,165 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn viewer_dispatch_queues_latest_while_native_upscale_is_busy() {
+        let (mut app, _) = viewer_app();
+        app.reconcile_viewer();
+        let basic = app.model.explore.requested_upscale.clone().unwrap();
+        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+        app.connection = Some(Connection::new(sender));
+        app.dispatch_viewer_desired();
+        let crate::transport_connection::OutboundRecord::Intent(start) =
+            receiver.try_recv().expect("expected automatic Basic")
+        else {
+            panic!("expected automatic Basic intent");
+        };
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
+        );
+
+        let mut busy = app.model.upscale_snapshot.clone().unwrap();
+        busy.revision += 1;
+        busy.busy = true;
+        busy.pending = Some(basic.clone());
+        app.reduce_reply(IntentReply {
+            correlation: start.correlation,
+            result: Ok(
+                crate::application_codec::IntoApplicationValue::into_application_value(
+                    busy.clone(),
+                ),
+            ),
+        });
+
+        let shift_lut = crate::generated::UpscaleRequest {
+            kernel: crate::generated::UpscaleKernel::ShiftLut,
+            ..basic.clone()
+        };
+        app.model.request_upscale(shift_lut.clone());
+        app.dispatch_viewer_desired();
+        let crate::transport_connection::OutboundRecord::Intent(shift_start) = receiver
+            .try_recv()
+            .expect("expected ShiftLUT while native work remains busy")
+        else {
+            panic!("expected ShiftLUT intent");
+        };
+        assert_eq!(
+            shift_start,
+            crate::generated::encode_upscale_Start(shift_start.correlation, shift_lut.clone())
+                .record
+        );
+
+        let latest = crate::generated::UpscaleRequest {
+            kernel: crate::generated::UpscaleKernel::RealPlksr,
+            ..basic
+        };
+        app.model.request_upscale(latest.clone());
+        app.dispatch_viewer_desired();
+        assert!(receiver.try_recv().is_err());
+
+        busy.revision += 1;
+        busy.pending = Some(shift_lut);
+        app.reduce_reply(IntentReply {
+            correlation: shift_start.correlation,
+            result: Ok(
+                crate::application_codec::IntoApplicationValue::into_application_value(busy),
+            ),
+        });
+        let crate::transport_connection::OutboundRecord::Intent(start) =
+            receiver.try_recv().expect("expected latest method")
+        else {
+            panic!("expected latest method intent");
+        };
+        assert_eq!(latest.kernel, crate::generated::UpscaleKernel::RealPlksr);
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, latest).record
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn viewer_stop_waits_for_the_inflight_start_without_reporting_busy() {
+        let (mut app, _) = viewer_app();
+        app.reconcile_viewer();
+        let basic = app.model.explore.requested_upscale.clone().unwrap();
+        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+        app.connection = Some(Connection::new(sender));
+        app.dispatch_viewer_desired();
+        let crate::transport_connection::OutboundRecord::Intent(start) =
+            receiver.try_recv().expect("expected automatic Basic")
+        else {
+            panic!("expected automatic Basic intent");
+        };
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
+        );
+
+        app.abandon_viewer();
+        assert!(app.presentation.stop_requested);
+        assert!(app.model.error.is_none());
+        assert!(receiver.try_recv().is_err());
+
+        let mut busy = app.model.upscale_snapshot.clone().unwrap();
+        busy.revision += 1;
+        busy.busy = true;
+        busy.pending = Some(basic);
+        app.reduce_reply(IntentReply {
+            correlation: start.correlation,
+            result: Ok(
+                crate::application_codec::IntoApplicationValue::into_application_value(
+                    busy.clone(),
+                ),
+            ),
+        });
+        let stop = loop {
+            let crate::transport_connection::OutboundRecord::Intent(intent) =
+                receiver.try_recv().expect("expected deferred Stop")
+            else {
+                continue;
+            };
+            if intent.endpoint_id
+                == crate::generated::application_intent_endpoint_stable_id(
+                    ApplicationIntentEndpoint::UpscaleStop,
+                )
+            {
+                break intent;
+            }
+        };
+        assert!(!app.presentation.stop_requested);
+        assert!(app.model.error.is_none());
+
+        app.dispatch_viewer_desired();
+        assert!(app.model.error.is_none());
+        assert!(receiver.try_recv().is_err());
+        settle_upscale_stop(&mut app, stop.correlation);
+        assert!(app.model.error.is_none());
+        let latest = app.model.explore.requested_upscale.clone().unwrap();
+        let start = loop {
+            let crate::transport_connection::OutboundRecord::Intent(intent) = receiver
+                .try_recv()
+                .expect("expected restart after Stop settled")
+            else {
+                continue;
+            };
+            if intent.endpoint_id
+                == crate::generated::application_intent_endpoint_stable_id(
+                    ApplicationIntentEndpoint::UpscaleStart,
+                )
+            {
+                break intent;
+            }
+        };
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, latest).record
+        );
+        assert!(app.model.error.is_none());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1007,16 +1204,25 @@ mod tests {
                 reset,
             );
             assert_viewer_departed(&app);
+            let mut stop_correlation = None;
             let mut stopped = false;
             while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) =
                 receiver.try_recv()
             {
-                stopped |= intent.endpoint_id
+                if intent.endpoint_id
                     == crate::generated::application_intent_endpoint_stable_id(
                         ApplicationIntentEndpoint::UpscaleStop,
-                    );
+                    )
+                {
+                    stopped = true;
+                    stop_correlation = Some(intent.correlation);
+                }
             }
             assert!(stopped);
+            settle_upscale_stop(
+                &mut app,
+                stop_correlation.expect("expected authoritative route Stop"),
+            );
             navigate(&mut app, FeatureId::Explore);
             let request = app.model.explore.requested_upscale.as_ref().unwrap();
             assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
@@ -1507,7 +1713,14 @@ mod tests {
         assert!(app.presentation.viewer.is_none());
         assert!(app.model.explore.requested_upscale.is_none());
         assert!(app.model.explore.sent_upscale.is_none());
-        assert!(app.model.presentation_refresh().is_none());
+        assert!(app.model.foreground_visual().is_none());
+    }
+
+    fn settle_upscale_stop(app: &mut App, correlation: u64) {
+        app.reduce_reply(IntentReply {
+            correlation,
+            result: Ok(crate::application_codec::IntoApplicationValue::into_application_value(())),
+        });
     }
 
     #[test]
@@ -1558,6 +1771,7 @@ mod tests {
             assert_viewer_departed(&app);
             assert_eq!(test_releases(), vec![frame, pending]);
             let mut operations = Vec::new();
+            let mut stop_correlation = None;
             while let Ok(record) = receiver.try_recv() {
                 if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
                     operations.push(intent.endpoint_id);
@@ -1570,6 +1784,7 @@ mod tests {
                             intent,
                             crate::generated::encode_upscale_Stop(intent.correlation).record
                         );
+                        stop_correlation = Some(intent.correlation);
                     }
                 }
             }
@@ -1586,8 +1801,12 @@ mod tests {
                     .collect::<Vec<_>>()
             );
 
-            // No Settings or Presentation event arrives before reentry. Native
-            // completion already describes this same Explore source.
+            settle_upscale_stop(
+                &mut app,
+                stop_correlation.expect("expected mapped navigation Stop"),
+            );
+            // After native Stop settles, no Settings or Presentation event is
+            // needed to reenter this same Explore source.
             navigate(&mut app, FeatureId::Explore);
             let basic = app.model.explore.requested_upscale.clone().unwrap();
             assert_eq!(basic.kernel, crate::generated::UpscaleKernel::Default);

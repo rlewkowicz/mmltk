@@ -45,11 +45,14 @@ struct DiagnosticsClient::State final {
     mmltk::common::io::ScopedFd terminal_wake;
     const DiagnosticsExecutionPolicy policy;
     std::array<Record, kQueueCapacity> records{};
+    Record terminal_record{};
     std::mutex mutex;
     std::condition_variable drained;
     std::size_t head = 0U;
     std::size_t size = 0U;
     bool write_active = false;
+    bool terminal_active = false;
+    bool terminal_pending = false;
     bool closing = false;
     bool discard = false;
     bool failed = false;
@@ -105,14 +108,17 @@ void DiagnosticsClient::State::signal_locked() noexcept {
     }
 }
 void DiagnosticsClient::State::discard_locked() noexcept {
-    dropped.fetch_add(size, std::memory_order_relaxed);
+    dropped.fetch_add(size + static_cast<std::size_t>(terminal_pending), std::memory_order_relaxed);
     head = 0U;
     size = 0U;
     write_active = false;
+    terminal_active = false;
+    terminal_pending = false;
 }
 bool DiagnosticsClient::State::flush_locked() noexcept {
-    while (size != 0U) {
-        const Record& record = records[head];
+    while (size != 0U || terminal_pending) {
+        const bool terminal_record_active = size == 0U;
+        const Record& record = terminal_record_active ? terminal_record : records[head];
         const bool wrote = mmltk::common::io::try_write_all_noexcept(descriptor.get(), {record.bytes.data(), record.size}) &&
                            mmltk::common::io::try_write_all_noexcept(descriptor.get(), "\n");
         if (!wrote) {
@@ -124,8 +130,12 @@ bool DiagnosticsClient::State::flush_locked() noexcept {
             drained.notify_all();
             return false;
         }
-        head = (head + 1U) % kQueueCapacity;
-        --size;
+        if (terminal_record_active)
+            terminal_pending = false;
+        else {
+            head = (head + 1U) % kQueueCapacity;
+            --size;
+        }
         flushed.fetch_add(1U, std::memory_order_relaxed);
     }
     drained.notify_all();
@@ -204,12 +214,13 @@ void DiagnosticsClient::State::run() noexcept {
                 publish_terminal_locked();
                 return;
             }
-            if (!write_active && size != 0U) {
+            if (!write_active && (size != 0U || terminal_pending)) {
                 write_active = true;
+                terminal_active = size == 0U;
                 output_offset = 0U;
             }
             if (write_active) {
-                active = &records[head];
+                active = terminal_active ? &terminal_record : &records[head];
             } else if (closing || failed) {
                 finish_writer_locked();
                 publish_terminal_locked();
@@ -237,8 +248,13 @@ void DiagnosticsClient::State::run() noexcept {
             if (output_offset != active->size + 1U) continue;
 
             std::lock_guard lock(mutex);
-            head = (head + 1U) % kQueueCapacity;
-            --size;
+            if (terminal_active) {
+                terminal_pending = false;
+                terminal_active = false;
+            } else {
+                head = (head + 1U) % kQueueCapacity;
+                --size;
+            }
             write_active = false;
             flushed.fetch_add(1U, std::memory_order_relaxed);
             drained.notify_all();
@@ -248,7 +264,7 @@ void DiagnosticsClient::State::run() noexcept {
                 publish_terminal_locked();
                 return;
             }
-            if (closing && size == 0U) {
+            if (closing && size == 0U && !terminal_pending) {
                 finish_writer_locked();
                 publish_terminal_locked();
                 return;
@@ -382,9 +398,9 @@ void DiagnosticsClient::flush() noexcept {
         return;
     }
     std::unique_lock lock(state_->mutex);
-    if (state_->closing || state_->failed || state_->size == 0U) return;
+    if (state_->closing || state_->failed || (state_->size == 0U && !state_->terminal_pending)) return;
     state_->signal_locked();
-    state_->drained.wait(lock, [&] { return state_->size == 0U || state_->failed; });
+    state_->drained.wait(lock, [&] { return (state_->size == 0U && !state_->terminal_pending) || state_->failed; });
 }
 void DiagnosticsClient::close(const DiagnosticsCloseMode mode) noexcept {
     if (state_ != nullptr) state_->close(mode);
@@ -442,6 +458,27 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRe
     target.size = record.json.size();
     ++state_->size;
     state_->accepted.fetch_add(1U, std::memory_order_relaxed);
+    if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter) state_->signal_locked();
+    return DiagnosticSubmitResult::Accepted;
+}
+
+DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(const DiagnosticRecord record) const noexcept {
+    if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
+    if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
+        state_->dropped.fetch_add(1U, std::memory_order_relaxed);
+        return DiagnosticSubmitResult::RecordTooLarge;
+    }
+    std::lock_guard lock(state_->mutex);
+    if (state_->closing || state_->failed || state_->descriptor.get() < 0) return DiagnosticSubmitResult::Closed;
+    if (state_->terminal_pending) {
+        state_->dropped.fetch_add(1U, std::memory_order_relaxed);
+        return DiagnosticSubmitResult::Capacity;
+    }
+    std::memcpy(state_->terminal_record.bytes.data(), record.json.data(), record.json.size());
+    state_->terminal_record.size = record.json.size();
+    state_->terminal_pending = true;
+    state_->accepted.fetch_add(1U, std::memory_order_relaxed);
+    state_->enabled.store(false, std::memory_order_release);
     if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter) state_->signal_locked();
     return DiagnosticSubmitResult::Accepted;
 }

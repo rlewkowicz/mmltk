@@ -903,23 +903,36 @@ pub extern "C" fn wgpu_server_buffer_map_blocking(
     size: wgt::BufferAddress,
     map_mode: wgc::device::HostMap,
 ) -> BufferMapAsyncStatus {
-    let status_passback = Arc::new(OnceLock::new());
+    let (status_sender, status_receiver) = mpsc::sync_channel(1);
     let op = wgc::resource::BufferMapOperation {
         host: map_mode,
-        callback: Some(Box::new({
-            let status_passback = Arc::clone(&status_passback);
-            move |status| {
-                status_passback.set(status).unwrap();
+        callback: Some(Box::new(move |status| {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback\",\"buffer\":\"{buffer_id:?}\"}}"
+            ));
+            if status_sender.send(status).is_ok() {
+                mmltk_workspace_channel::write_diagnostic(format_args!(
+                    "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_sent\",\"buffer\":\"{buffer_id:?}\"}}"
+                ));
             }
         })),
     };
 
+    mmltk_workspace_channel::write_diagnostic(format_args!(
+        "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"admission\",\"buffer\":\"{buffer_id:?}\"}}"
+    ));
     let submission_index;
     match global.buffer_map_async(buffer_id, offset, Some(size), op) {
         Ok(i) => {
             submission_index = i;
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"admitted\",\"buffer\":\"{buffer_id:?}\",\"submission\":\"{submission_index:?}\"}}"
+            ));
         }
         Err(err) => {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"rejected\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{err:?}\"}}"
+            ));
             return BufferMapAsyncStatus::from(Err(err));
         }
     }
@@ -928,14 +941,35 @@ pub extern "C" fn wgpu_server_buffer_map_blocking(
         submission_index: Some(submission_index),
         timeout: Some(Duration::from_secs(60)),
     };
+    mmltk_workspace_channel::write_diagnostic(format_args!(
+        "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_started\",\"buffer\":\"{buffer_id:?}\"}}"
+    ));
     if let Err(err) = global.device_poll(device_id, poll_type) {
+        mmltk_workspace_channel::write_diagnostic(format_args!(
+            "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_failed\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{err:?}\"}}"
+        ));
         return BufferMapAsyncStatus::from(Err(err));
     }
+    mmltk_workspace_channel::write_diagnostic(format_args!(
+        "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_completed\",\"buffer\":\"{buffer_id:?}\"}}"
+    ));
 
-    let status_oncelock = Arc::into_inner(status_passback).unwrap();
+    mmltk_workspace_channel::write_diagnostic(format_args!(
+        "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_wait\",\"buffer\":\"{buffer_id:?}\"}}"
+    ));
+    let status_result = match status_receiver.recv_timeout(Duration::from_secs(60)) {
+        Ok(status) => status,
+        Err(error) => {
+            mmltk_workspace_channel::write_diagnostic(format_args!(
+                "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_wait_failed\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{error}\"}}"
+            ));
+            return BufferMapAsyncStatus::Error;
+        }
+    };
 
-    let status_result = status_oncelock.into_inner().unwrap();
-
+    mmltk_workspace_channel::write_diagnostic(format_args!(
+        "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"settled\",\"buffer\":\"{buffer_id:?}\"}}"
+    ));
     BufferMapAsyncStatus::from(status_result)
 }
 

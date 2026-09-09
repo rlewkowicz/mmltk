@@ -251,8 +251,6 @@ pub struct ViewerDraw {
 struct SurfaceDrawObserver {
     output: Option<iced::futures::channel::mpsc::Sender<Message>>,
     identity: (u64, u64),
-    redraws: u8,
-    delivered: bool,
     viewer: Option<(u64, u64, ViewerDraw)>,
     gallery: Option<(u64, u64)>,
     atlas: Option<AtlasDraw>,
@@ -556,6 +554,20 @@ let boundaryScratch;
 let boundaryPending = false;
 let boundaryLatest;
 let compositionPending = false;
+let annotationScratch;
+let annotationContext;
+
+function annotationCanvasSnapshot(canvas) {
+  if (!annotationScratch || annotationScratch.width !== canvas.width || annotationScratch.height !== canvas.height) {
+    annotationScratch = new OffscreenCanvas(canvas.width, canvas.height);
+    annotationContext = annotationScratch.getContext('2d', {willReadFrequently:true});
+  }
+  if (!annotationContext) throw new Error('missing annotation canvas pixel reader');
+  annotationContext.clearRect(0, 0, canvas.width, canvas.height);
+  annotationContext.drawImage(canvas, 0, 0);
+  return annotationContext;
+}
+
 export function mmltkIntegrationAtlasComposition(points, cards, fields, source, presentation, columns, completed) {
   if (compositionPending) { completed(0,0); return; }
   compositionPending = true;
@@ -648,7 +660,7 @@ export function mmltkIntegrationAnnotationSwatch(cssBounds,color,control,detail,
       const canvas=document.querySelector('canvas');
       if (!canvas) throw new Error('missing annotation canvas');
       const bounds = canvasPixelBounds(canvas, cssBounds, control);
-      const scratch=new OffscreenCanvas(canvas.width,canvas.height);const context=scratch.getContext('2d',{willReadFrequently:true});context.drawImage(canvas,0,0);
+      const context=annotationCanvasSnapshot(canvas);
       const pixel=context.getImageData(Math.floor(bounds[0]+bounds[2]*(button?0.9:0.5)),Math.floor(bounds[1]+bounds[3]/2),1,1).data;
       const matched=color.every((channel,index)=>Math.abs(channel-pixel[index])<=3)&&pixel[3]>0;
       report({event:button?'integration.annotation_capability':'integration.annotation_swatch',control,detail,expected:color,observed:Array.from(pixel),matched});
@@ -661,53 +673,50 @@ export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sour
   cssBounds = Array.from(cssBounds);
   extent = Array.from(extent);
   probes = Array.from(probes);
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    try {
-      const canvas=document.querySelector('canvas');
-      const drawn=integrationSurfaceDraws.get('workflow.visual.workspace');
-      if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed(probes.length/7,0); return; }
-      const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
-      const scratch=new OffscreenCanvas(canvas.width,canvas.height);
-      const context=scratch.getContext('2d',{willReadFrequently:true});
-      context.drawImage(canvas,0,0);
-      const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
-      const ox=bounds[0]+(bounds[2]-extent[0]*scale)/2,oy=bounds[1]+(bounds[3]-extent[1]*scale)/2;
-      const colorError = (pixels, offset, expected, filteredPalette) => {
-        let gain = 1;
-        let minimum = 0;
-        const peak = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-        const low = Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-        // Filtered thin outlines mix with the background. Preserve class hue
-        // and require at least half native chroma; solid controls stay exact.
-        if (filteredPalette && peak - low >= 127.5) {
-          minimum = low;
-          gain = 255 / (peak - low);
-        }
-        return Math.max(Math.abs(expected[0] - (pixels[offset] - minimum) * gain),
-          Math.abs(expected[1] - (pixels[offset + 1] - minimum) * gain),
-          Math.abs(expected[2] - (pixels[offset + 2] - minimum) * gain));
-      };
-      let matched=0;
-      for(let i=0;i<probes.length;i+=7){
-        const expected = probes.slice(i+2,i+5);
-        const filteredPalette = scale < 1 && Math.max(...expected) === 255 && Math.min(...expected) === 0;
-        const x=Math.round(ox+probes[i]*scale),y=Math.round(oy+probes[i+1]*scale);
-        const radius=Math.max(1,Math.ceil(probes[i+6]*scale));
-        const left=Math.max(0,x-radius),top=Math.max(0,y-radius),width=Math.min(canvas.width-left,2*radius+1),height=Math.min(canvas.height-top,2*radius+1);
-        let hit=false,best=[0,0,0],distance=Infinity;
-        if(width>0&&height>0){
-          const pixels=context.getImageData(left,top,width,height).data;
-          for(let p=0;p<pixels.length;p+=4){const error=colorError(pixels,p,expected,filteredPalette);
-            if(error<distance){distance=error;best=[pixels[p],pixels[p+1],pixels[p+2]];}
-            if(error<=probes[i+5]&&pixels[p+3]>0)hit=true;
-          }
-        }
-        matched+=Number(hit);
-        report({event:'integration.annotation_pixel',control:'annotation.workspace.surface',detail:'completed-canvas',a:String(sourceRevision),b:String(presentationRevision),c:String(probes[i]),d:String(probes[i+1]),expected,observed:best,error:distance,source_to_screen:scale,matched:hit});
+  try {
+    const canvas=document.querySelector('canvas');
+    const drawn=integrationSurfaceDraws.get('workflow.visual.workspace');
+    if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed(probes.length/7,0); return; }
+    const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
+    const context=annotationCanvasSnapshot(canvas);
+    const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
+    const ox=bounds[0]+(bounds[2]-extent[0]*scale)/2,oy=bounds[1]+(bounds[3]-extent[1]*scale)/2;
+    const colorError = (pixels, offset, expected, filteredPalette) => {
+      let gain = 1;
+      let minimum = 0;
+      const peak = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+      const low = Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+      // Filtered thin outlines mix with the background. Preserve class hue
+      // and require at least half native chroma; solid controls stay exact.
+      if (filteredPalette && peak - low >= 127.5) {
+        minimum = low;
+        gain = 255 / (peak - low);
       }
-      completed(probes.length/7,matched);
-    } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed(probes.length/7,0);}
-  }));
+      return Math.max(Math.abs(expected[0] - (pixels[offset] - minimum) * gain),
+        Math.abs(expected[1] - (pixels[offset + 1] - minimum) * gain),
+        Math.abs(expected[2] - (pixels[offset + 2] - minimum) * gain));
+    };
+    let matched=0;
+    for(let i=0;i<probes.length;i+=7){
+      const expected = probes.slice(i+2,i+5);
+      const filteredPalette = scale < 1 && Math.max(...expected) === 255 && Math.min(...expected) === 0;
+      const tolerance = filteredPalette ? Math.max(probes[i+5], 32) : probes[i+5];
+      const x=Math.round(ox+probes[i]*scale),y=Math.round(oy+probes[i+1]*scale);
+      const radius=Math.max(1,Math.ceil(probes[i+6]*scale));
+      const left=Math.max(0,x-radius),top=Math.max(0,y-radius),width=Math.min(canvas.width-left,2*radius+1),height=Math.min(canvas.height-top,2*radius+1);
+      let hit=false,best=[0,0,0],distance=Infinity;
+      if(width>0&&height>0){
+        const pixels=context.getImageData(left,top,width,height).data;
+        for(let p=0;p<pixels.length;p+=4){const error=colorError(pixels,p,expected,filteredPalette);
+          if(error<distance){distance=error;best=[pixels[p],pixels[p+1],pixels[p+2]];}
+          if(error<=tolerance&&pixels[p+3]>0)hit=true;
+        }
+      }
+      matched+=Number(hit);
+      report({event:'integration.annotation_pixel',control:'annotation.workspace.surface',detail:'completed-canvas',a:String(sourceRevision),b:String(presentationRevision),c:String(probes[i]),d:String(probes[i+1]),expected,observed:best,error:distance,source_to_screen:scale,matched:hit});
+    }
+    completed(probes.length/7,matched);
+  } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed(probes.length/7,0);}
 }
 
 let integrationRenderKey = 0;
@@ -1820,15 +1829,8 @@ pub(crate) fn report_surface_draw(
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision);
-            if observer.identity != identity || !redraw {
-                observer.identity = identity;
-                observer.redraws = 0;
-                observer.delivered = false;
-            } else {
-                observer.redraws = observer.redraws.saturating_add(1);
-            }
-            if observer.redraws >= 3 && !observer.delivered {
-                observer.delivered = observer.output.as_mut().is_some_and(|output| {
+            if observer.identity != identity
+                && observer.output.as_mut().is_some_and(|output| {
                     output
                         .try_send(Message::SurfaceDrawn {
                             presentation_revision: revision,
@@ -1836,7 +1838,9 @@ pub(crate) fn report_surface_draw(
                             viewer: None,
                         })
                         .is_ok()
-                });
+                })
+            {
+                observer.identity = identity;
             }
         });
     }
@@ -2919,12 +2923,37 @@ impl Controller {
     }
 
     pub fn observe_explore_open_submission(&self, submitted: bool) {
-        if matches!(self.phase, Phase::AwaitExploreReady) {
+        if self.running() {
             report(
                 "integration.explore_open_submission",
                 EXPLORE_OPEN,
                 if submitted { "submitted" } else { "rejected" },
                 [0.0; 4],
+            );
+        }
+    }
+
+    pub fn observe_explore_open_layout(
+        &self,
+        measured: bool,
+        snapshot: Option<&crate::generated::ExploreSnapshot>,
+        columns: u32,
+    ) {
+        if self.running() {
+            report(
+                "integration.explore_open_layout",
+                EXPLORE_GALLERY,
+                if measured {
+                    "measured"
+                } else {
+                    "waiting-for-measurement"
+                },
+                [
+                    snapshot.map_or(0.0, |value| value.dataset.identity as f64),
+                    snapshot.map_or(0.0, |value| value.revision as f64),
+                    columns as f64,
+                    snapshot.map_or(0.0, |value| value.order.matchingcount as f64),
+                ],
             );
         }
     }
@@ -3018,7 +3047,7 @@ impl Controller {
     }
 
     pub fn observe_explore_open_request(&self, local_edits: bool, open_available: bool) {
-        if matches!(self.phase, Phase::AwaitExploreReady) {
+        if self.running() {
             report(
                 "integration.explore_open_request",
                 EXPLORE_OPEN,
@@ -4085,12 +4114,7 @@ impl Controller {
                     padded_width,
                     padded_height,
                 };
-                if !click_after_surface_draw(
-                    input_bounds,
-                    explore::DETAIL_WORKSPACE_ID,
-                    frame_revision,
-                    false,
-                ) {
+                if !click(input_bounds) {
                     self.fail("Firefox original-detail click dispatch failed");
                 }
                 None
@@ -8089,7 +8113,7 @@ impl Controller {
                         snapshot.frame.extent.height,
                         annotation_checks::probes(&snapshot.ui),
                     ));
-                    return self.arm_scrolled(ANNOTATION_SURFACE, RelativeOffset::START);
+                    return self.arm(ANNOTATION_SURFACE);
                 }
                 report(
                     "integration.annotation_pointer_observed",

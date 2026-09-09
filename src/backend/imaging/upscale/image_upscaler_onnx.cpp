@@ -22,6 +22,7 @@ module;
 #include "detail/shiftlut_onnx_ops.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
+#include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/image_failure.h"
@@ -43,11 +44,6 @@ namespace {
 constexpr std::array<std::int64_t, 4U> kInputShape{1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent};
 constexpr std::array<std::int64_t, 4U> kOutputShape{1, 3, kImageUpscalerOutputExtent, kImageUpscalerOutputExtent};
 
-[[nodiscard]] Ort::Env& upscaler_ort_environment() {
-    static Ort::Env environment(ORT_LOGGING_LEVEL_ERROR, "mmltk_backend_imaging_upscale");
-    return environment;
-}
-
 void validate_shape(const std::vector<std::int64_t>& actual, const std::array<std::int64_t, 4U>& expected, const std::string& context) {
     if (actual.size() != expected.size()) { throw std::runtime_error(context + " must be a rank-four NCHW tensor"); }
     for (std::size_t axis = 0U; axis < actual.size(); ++axis) {
@@ -64,6 +60,7 @@ class OnnxImageUpscalerRuntime final
     OnnxImageUpscalerRuntime(const ImageUpscalerDescriptor& descriptor, const std::filesystem::path& model_path, const int device_id,
                              const ImageUpscalerExecutionCheckpoint& checkpoint)
         : TiledImageUpscalerRuntimeAdapter(descriptor, device_id, checkpoint),
+          environment_(ORT_LOGGING_LEVEL_ERROR, "mmltk_backend_imaging_upscale"),
           model_path_(model_path),
           input_elements_(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U)),
           output_elements_(checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U)) {}
@@ -167,7 +164,7 @@ class OnnxImageUpscalerRuntime final
         });
         cuda_options.UpdateWithValue("user_compute_stream", stream_);
         options.AppendExecutionProvider_CUDA_V2(*cuda_options);
-        session_ = std::make_unique<Ort::Session>(upscaler_ort_environment(), model_path_.string().c_str(), options);
+        session_ = std::make_unique<Ort::Session>(environment_.get(), model_path_.string().c_str(), options);
     }
 
     void bind_tensors() {
@@ -409,6 +406,7 @@ class OnnxImageUpscalerRuntime final
         return true;
     }
 
+    mmltk::backend::ml::runtime::OnnxEnvironment environment_;
     std::filesystem::path model_path_;
     UpscalerCleanup cleanup_;
     std::size_t input_elements_ = 0U;
@@ -436,8 +434,6 @@ class OnnxImageUpscalerRuntime final
 std::shared_ptr<ImageUpscalerRuntime> make_onnx_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
                                                                  const std::filesystem::path& model_path, const int device_id,
                                                                  const ImageUpscalerExecutionCheckpoint& checkpoint) {
-    // The environment must precede every ORT object, including member RunOptions.
-    static_cast<void>(upscaler_ort_environment());
     return std::make_shared<OnnxImageUpscalerRuntime>(descriptor, model_path, device_id, checkpoint);
 }
 
