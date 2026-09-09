@@ -1169,7 +1169,8 @@ void GalleryStream::Impl::FinishReadLane(const std::size_t lane_index, std::exce
         AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompiledReadCompleted, lane, lane.compiled_index);
         if (acceptance_ && !lane.prefetch && lane.first_row != 0U && acceptance_->ClaimHeldCompletion()) {
             AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompletionHeld, lane, lane.compiled_index);
-            const auto released = acceptance_->AwaitHeldCompletion(lane.DemandGeneration());
+            const auto released = acceptance_->AwaitHeldCompletion(lane.DemandGeneration(), lane.destination_slot, lane.compiled_index,
+                                                                   lane.pinned.capacity_bytes());
             if (released == ExploreAcceptanceGate::WaitResult::Proceed)
                 AcceptanceDiagnostic(VisualDiagnosticOperation::AcceptanceCompletionReleased, lane, lane.compiled_index);
             else if (acceptance_->ClaimTerminalReport())

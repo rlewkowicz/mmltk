@@ -356,6 +356,19 @@ class ExploreAcceptanceGate final {
         Proceed,
         Stale,
     };
+    enum class ControlEvent : std::uint8_t {
+        InitialWait = 0x80U,
+        HeldWait = 0x81U,
+        HeldProceed = 0x82U,
+        HeldStale = 0x83U,
+    };
+    struct ControlObservation final {
+        ControlEvent event = ControlEvent::InitialWait;
+        std::uint64_t generation = 0U;
+        std::uint64_t slot = 0U;
+        std::uint64_t compiled_index = 0U;
+        std::uint64_t staging_bytes = 0U;
+    };
 
     explicit ExploreAcceptanceGate(int command_descriptor);
     ~ExploreAcceptanceGate();
@@ -363,7 +376,8 @@ class ExploreAcceptanceGate final {
     ExploreAcceptanceGate& operator=(const ExploreAcceptanceGate&) = delete;
     void AdvanceGeneration(std::uint64_t generation) noexcept;
     [[nodiscard]] WaitResult AwaitInitialRelease(std::uint64_t generation);
-    [[nodiscard]] WaitResult AwaitHeldCompletion(std::uint64_t generation);
+    [[nodiscard]] WaitResult AwaitHeldCompletion(std::uint64_t generation, std::uint64_t slot, std::uint64_t compiled_index,
+                                                 std::uint64_t staging_bytes);
     [[nodiscard]] bool ClaimHeldCompletion();
     [[nodiscard]] bool ClaimTerminalReport();
     void Stop() noexcept;

@@ -1,0 +1,13 @@
+# syntax=docker/dockerfile:1
+
+FROM mmltk_runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends weston wayland-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MMLTK_IMAGE_FINGERPRINT=unlabeled
+ARG MMLTK_RUNTIME_IDENTITY
+LABEL com.mmltk.input-fingerprint="${MMLTK_IMAGE_FINGERPRINT}" \
+      com.mmltk.runtime-identity="${MMLTK_RUNTIME_IDENTITY}"

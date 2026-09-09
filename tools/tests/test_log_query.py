@@ -626,6 +626,60 @@ class FileQueryTests(unittest.TestCase):
         self.assertNotIn("57-3000060000.log", output)
         self.assertIn("file-mtime proximity", output)
 
+    def test_triage_pasted_error_context_survives_noisy_historical_identity_chain(self):
+        pasted = self.pasted_error_fixture()
+        path = self.root / "build/validation/presentation-firefox.log.history/57-2000060000.log"
+        original = path.read_text(encoding="utf-8")
+        old = [
+            {"event": "render.failed", "dataset_identity": 7, "surface": f"{index + 1:032x}",
+             "elapsed_ms": 500 + index}
+            for index in range(100)
+        ]
+        path.write_text("".join(json.dumps(row) + "\n" for row in old) + original +
+                        '{"event":"render.presented","dataset_identity":7,"elapsed_ms":19480}\n',
+                        encoding="utf-8")
+        os.utime(path, ns=(1700000019500000000, 1700000019500000000))
+        status, output, diagnostics = self.run_query("--error", pasted, "--triage", "--limit", "12")
+        self.assertEqual(status, 0, diagnostics)
+        for event in ("Gallery(Measured", "Detail(CloseRequested)", "Dataset(OpenRequested)", "integration.failed"):
+            self.assertIn(event, output)
+        self.assertIn("anchor-failure", output)
+
+    def test_triage_recognizes_generic_terminal_suffix_without_guessing_numeric_outcome(self):
+        self.write("input.jsonl", [
+            {"event": "new.subsystem.terminal", "sequence": 2, "outcome": 4},
+        ])
+        status, output, _ = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0)
+        self.assertIn("terminal evidence (not necessarily failure)", output)
+        self.assertIn("outcome=4", output)
+        self.assertNotIn("anchor-failure", output)
+        self.assertIn("not a process/test exit", output)
+
+    def test_triage_terminal_summary_survives_failure_volume_and_preserves_unknown_fields(self):
+        self.write("input.jsonl", [
+            {"event": "new.stage.terminal", "sequence": 2, "packed_bits": 4096, "outcome": 0},
+            *({"event": f"failure.{index}.failed", "request_id": index + 1} for index in range(30)),
+        ])
+        status, output, _ = self.run_query("input.jsonl", "--triage", "--limit", "1")
+        self.assertEqual(status, 0)
+        self.assertIn("new.stage.terminal", output)
+        self.assertIn("packed_bits=4096", output)
+        self.assertIn("stage terminals need not mean run completion", output)
+        self.write("status.jsonl", [{"event": "opaque", "terminal": True, "status": "failed"}])
+        self.assertIn("anchor-failure", self.run_query("status.jsonl", "--triage")[1])
+
+    def test_triage_untrusted_field_names_cannot_escape_size_or_terminal_output_bounds(self):
+        hostile = {"event": "operation.terminal", "evil\u001b[31m_id": "data", "x" * 10000: "payload"}
+        self.write("input.jsonl", [hostile])
+        status, output, _ = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0)
+        self.assertNotIn("\u001b", output)
+        self.assertFalse(logs.strong_identities(record(hostile)))
+        _, rows, _ = self.exported("input.jsonl", "--triage")
+        self.assertTrue(rows[0]["_log"]["triage_payload_truncated"])
+        self.assertTrue(all(len(key) <= logs.MAX_TRIAGE_TEXT + 1 for key in rows[0]["data"]))
+
     def test_triage_handles_unmatched_start_duplicate_end_and_failed_span(self):
         self.write("input.jsonl", [
             {"event": "work.started", "span_id": 1, "steady_ns": 10},
@@ -652,6 +706,74 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertNotIn("missing-counterpart", output)
         self.assertNotIn("duplicate-terminal", output)
+        status, output, _ = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 1)
+        self.assertNotIn("unclosed start", output)
+
+    def test_triage_secondary_handle_and_identity_handoff_do_not_fake_missing_completion(self):
+        self.write("input.jsonl", [
+            {"event": "claim.requested", "surface_high": 1, "surface_low": 2,
+             "texture_id": "TextureId(3,1)"},
+            {"event": "claim.outcome", "surface_high": 1, "surface_low": 2},
+            {"event": "job.requested", "request_id": 1, "span_id": 2},
+            {"event": "job.completed", "request_id": 1},
+            {"event": "probe.failed", "surface_high": 1, "surface_low": 2, "request_id": 1},
+        ])
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage", "--top", "20")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertNotIn("missing-counterpart", output)
+        self.assertIn("handoff/instrumentation mismatch possible", output)
+        self.assertIn("source-order input.jsonl:", output)
+
+    def test_triage_prefers_explicit_divergence_over_earlier_unclosed_start(self):
+        self.write("input.jsonl", [
+            {"event": "background.started", "request_id": 1},
+            {"event": "probe.missing", "request_id": 1},
+            {"event": "probe.failed", "request_id": 1},
+        ])
+        status, output, _ = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0)
+        candidate = output.split("Earliest divergence candidates", 1)[1].splitlines()[1]
+        self.assertIn("input.jsonl:2: incomplete-state", candidate)
+
+    def test_triage_groups_repeated_anomalies_without_losing_counts_or_context(self):
+        self.write("input.jsonl", [
+            *({"event": "draw.missing", "request_id": 1} for _ in range(100)),
+            {"event": "probe.failed", "request_id": 1},
+        ])
+        status, output, _ = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0)
+        highlights = output.split("Highlights:", 1)[1].split("Earliest divergence", 1)[0]
+        self.assertEqual(highlights.count("incomplete-state"), 1)
+        self.assertIn("100 observations", highlights)
+
+    def test_triage_first_catch_info_context_recognizes_singular_plural_and_inline_json(self):
+        for count in ("1 message", "2 messages"):
+            with self.subTest(count=count):
+                self.write("context.log",
+                    "[ RUN ] copying_test\n"
+                    f"/workspace/test.cpp:4: failed: false with {count}: 'native diagnostics: "
+                    '{"event":"job.completed","span_id":7}\n'
+                    '{"event":"job.completed","span_id":7}\n')
+                status, output, _ = self.run_query("context.log", "--triage")
+                self.assertEqual(status, 0)
+                self.assertIn("copies=2", output)
+                self.assertNotIn("duplicate-terminal", output)
+
+    def test_triage_zero_hops_still_includes_bounded_counter_refinement(self):
+        self.write("input.jsonl", [
+            {"event": "probe.failed", "request_id": 1, "generation": 4, "slot": 0, "steady_ns": 10},
+            *({"event": "noise"} for _ in range(5)),
+            {"event": "counter.evidence", "generation": 4, "slot": 0, "steady_ns": 20},
+            {"event": "wrong.generation", "generation": 5, "slot": 0, "steady_ns": 21},
+            {"event": "wrong.type", "generation": "4", "slot": 0, "steady_ns": 22},
+            {"event": "bare.sequence", "sequence": 4, "steady_ns": 23},
+        ])
+        _, rows, _ = self.exported("input.jsonl", "--triage", "--triage-hops", "0", "--near-ms", "0")
+        by_event = {row["data"].get("event"): row for row in rows}
+        self.assertIn("counter refinement", by_event["counter.evidence"]["_log"]["match"])
+        for event in ("wrong.generation", "wrong.type", "bare.sequence"):
+            self.assertNotIn(event, by_event)
 
     def test_triage_incomplete_end_is_an_anchor_without_claiming_failure(self):
         self.write("input.jsonl", [{"event": "upload.started", "request_id": 7}])
@@ -755,6 +877,7 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("parse damage is not itself a product failure", diagnostics)
         self.assertNotIn("failed-span", output)
         self.assertEqual(self.run_query("broken.jsonl", "--triage", "--strict")[0], 2)
+        self.assertEqual(self.run_query("broken.jsonl", "--triage", "--strict", "--where", "span_id=4")[0], 2)
 
 
 if __name__ == "__main__":

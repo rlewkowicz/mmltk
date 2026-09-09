@@ -3019,7 +3019,10 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and both output slots 
     auto overlay = explore.snapshot().overlay;
     overlay.show_masks = !overlay.show_masks;
     static_cast<void>(explore.UpdateOverlay(overlay));
-    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > first_revision; }));
+    REQUIRE(events.Wait([&] {
+        const auto current = explore.snapshot();
+        return current.frame.revision > first_revision && current.overlay == overlay;
+    }));
     REQUIRE(physical);
     const auto outputs = physical->OutputStorageFootprint();
     CHECK(outputs.device_bytes == 4U * 32U * 32U * 4U);
@@ -3038,7 +3041,10 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and both output slots 
     const auto before_disabled = explore.snapshot().frame.revision;
     overlay.show_masks = !overlay.show_masks;
     static_cast<void>(explore.UpdateOverlay(overlay));
-    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > before_disabled; }));
+    REQUIRE(events.Wait([&] {
+        const auto current = explore.snapshot();
+        return current.frame.revision > before_disabled && current.overlay == overlay;
+    }));
     CHECK(calls->load() == collected);
 }
 

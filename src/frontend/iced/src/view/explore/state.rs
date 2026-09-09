@@ -194,8 +194,10 @@ pub struct State {
 
 impl State {
     pub fn rebase(&mut self, snapshot: Option<&ExploreSnapshot>, bootstrap: bool) {
-        let identity = snapshot.map_or(0, |snapshot| snapshot.dataset.identity);
-        if identity != self.dataset_identity {
+        if let Some(identity) = snapshot
+            .map(|snapshot| snapshot.dataset.identity)
+            .filter(|identity| *identity != 0 && *identity != self.dataset_identity)
+        {
             self.dataset_identity = identity;
             self.measured_gallery = None;
             self.clear_viewport_admission();
@@ -1040,6 +1042,20 @@ mod tests {
         snapshot.frame.revision += 1;
         state.rebase(Some(&snapshot), false);
         assert!(!state.measure_gallery(400.0, 200.0, capacity(400, 200), 4));
+    }
+
+    #[test]
+    fn measured_geometry_survives_transient_dataset_unavailability() {
+        let mut snapshot = explore_snapshot();
+        snapshot.dataset.identity = 17;
+        let mut state = State::default();
+        state.rebase(Some(&snapshot), false);
+        assert!(state.measure_gallery(400.0, 200.0, capacity(400, 200), 4));
+        state.rebase(None, false);
+        assert!(state.measured_viewport(4, 0, 100).is_some());
+        snapshot.dataset.identity = 0;
+        state.rebase(Some(&snapshot), false);
+        assert!(state.measured_viewport(4, 0, 100).is_some());
     }
 
     #[test]

@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${repo_root}/tools/runtime_package.sh"
 image_name="${MMLTK_IMAGE:-mmltk}"
+wayland_validation_image_name="${image_name}-wayland-validation"
 build_image_name="${MMLTK_BUILD_IMAGE:-mmltk-build:latest}"
 toolchain_base_image_name="${MMLTK_TOOLCHAIN_BASE_IMAGE:-mmltk-toolchain-base:latest}"
 gcc16_image_name="${MMLTK_GCC_IMAGE:-mmltk-gcc16:latest}"
@@ -235,6 +236,7 @@ runtime_lock_acquired=0
 runtime_lock_fd=-1
 stale_container_cleanup_done=0
 active_docker_pid=0
+active_headless_compositor=0
 shutdown_docker_pid=0
 cleanup_docker_pid=0
 shutdown_signal_count=0
@@ -511,6 +513,12 @@ exit_from_signal() {
     local runtime_signal=TERM
     if [[ "${signal_name}" == "INT" ]]; then
         runtime_signal=INT
+    fi
+    if (( active_headless_compositor )); then
+        # Give the session owner time to retire its children and flush artifacts
+        # before the existing forced container cleanup handles any remainder.
+        timeout --foreground --signal=KILL 15s \
+            docker stop --time 12 "${test_run_container_name}" >/dev/null 2>&1 || true
     fi
     shutdown_gui_runtime_in_container "${runtime_signal}" 100 || true
     terminate_active_docker_exec "${signal_name}"
@@ -2466,6 +2474,8 @@ print_test_suites() {
         '  transport  Isolated browser physical transport and attachment suite' \
         '  browser-runtime  Isolated Firefox process-owner and shell shutdown suite' \
         '  workspace-wayland  Opt-in packaged Wayland/NVIDIA browser hardware suite' \
+        '  headless-compositor  Verify the NVIDIA headless Wayland compositor and protocols' \
+        '  headless-compositor-tool  Headless session ownership and failure-handling fixture suite' \
         '  browser-app  Iced client protocol, state, and transport unit suite' \
         '  cleanup-tool  Cleanup profile configuration and report fixture suite' \
         '  log-query-tool  Runtime log parser, query, correlation, and output fixture suite' \
@@ -2483,6 +2493,7 @@ print_test_suites() {
         '  --executable <target>       Build and run one executable owned by the suite' \
         '  --config <release|dev>      Select the containerized CMake graph' \
         '  --env <NAME[=VALUE]>        Forward an additional environment variable' \
+        '  --headless-compositor      Run workspace-wayland in a private NVIDIA GL Weston session' \
         '  --gdb                       Run the selected executable through containerized GDB' \
         '  --gdb-command <command>     Add an ordered GDB command (repeatable)'
 }
@@ -2729,6 +2740,11 @@ run_test_executable() {
 prepare_workspace_wayland_test_mounts() {
     bind_mount_specs=()
     append_bind_mount /dev /dev rw
+    if (( test_headless_compositor )); then
+        gui_platform="wayland"
+        gui_wayland_socket_container_path="${gui_runtime_dir_container}/wayland-mmltk"
+        return
+    fi
     resolve_wayland_gui_session
     append_bind_mount "${gui_wayland_socket_host_path}" "${gui_wayland_socket_container_path}" rw
     if [[ -n "${gui_dbus_socket_host_path}" ]]; then
@@ -2737,6 +2753,46 @@ prepare_workspace_wayland_test_mounts() {
     if [[ -d /run/dbus ]]; then
         append_bind_mount /run/dbus /run/dbus rw
     fi
+}
+
+ensure_wayland_validation_image() {
+    local runtime_identity runtime_alias fingerprint
+    runtime_identity="$(docker image inspect "${image_name}" --format '{{.Id}}')" ||
+        die "headless compositor requires the packaged runtime image; run ./mmltk --build first"
+    runtime_alias="$(content_derived_local_image_alias wayland-runtime "${runtime_identity}")"
+    fingerprint="$({
+        printf '%s\n' wayland-validation "${runtime_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.wayland-validation"
+    } | sha256sum | cut -d' ' -f1)"
+    cached_buildx_image default - "${wayland_validation_image_name}" \
+        "${repo_root}/docker/Dockerfile.wayland-validation" wayland-validation \
+        "${fingerprint}" "${repo_root}" \
+        --build-context "mmltk_runtime=docker-image://${runtime_alias}" \
+        --build-arg "MMLTK_RUNTIME_IDENTITY=${runtime_identity}"
+    verify_content_derived_local_image_alias "${runtime_alias}" "${runtime_identity}"
+    verify_image_label "${wayland_validation_image_name}" runtime-identity "${runtime_identity}"
+}
+
+run_headless_compositor_tool_tests() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable"
+    local diagnostic_image_id
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "headless compositor tooling requires existing image '${build_image_name}'"
+    local diagnostic_container="${container_name}-headless-tool"
+    local -a diagnostic_args=(
+        run --rm --init --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges
+        --network none --user "${uid}:${gid}"
+        --env PYTHONDONTWRITEBYTECODE=1
+        --volume "${repo_root}:/workspace:ro"
+        --tmpfs /tmp:rw,nosuid,nodev,size=32m
+        --workdir /workspace --entrypoint /bin/bash
+    )
+    append_wrapper_labels diagnostic_args headless-compositor-tool
+    diagnostic_args+=("${diagnostic_image_id}" -c
+        'bash -n /workspace/mmltk && python3 -m unittest discover -s /workspace/tools/tests -p test_headless_compositor.py -v')
+    run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
 }
 
 run_workspace_wayland_test_executable() {
@@ -2748,7 +2804,8 @@ run_workspace_wayland_test_executable() {
     prepare_owned_dirs \
         "${cache_root}/container-home" \
         "${cache_root}/tests/rfdetr" \
-        "${repo_root}/.mmltk-data/logs"
+        "${repo_root}/.mmltk-data/logs" \
+        "${repo_root}/build/validation"
     prepare_workspace_wayland_test_mounts
     build_common_group_args
     local -a docker_args=(
@@ -2809,20 +2866,37 @@ run_workspace_wayland_test_executable() {
     if [[ -n "${MMLTK_FIREFOX_LOG_FILE:-}" ]]; then
         docker_args+=(--env "MMLTK_FIREFOX_LOG_FILE=$(rewrite_host_path "${MMLTK_FIREFOX_LOG_FILE}")")
     fi
+    if (( test_headless_compositor )) && [[ -n "${MMLTK_TEST_TIMEOUT_SECONDS:-}" ]]; then
+        docker_args+=(--env "MMLTK_TEST_TIMEOUT_SECONDS=${MMLTK_TEST_TIMEOUT_SECONDS}")
+    fi
     append_explicit_test_environment docker_args
     docker_args+=("${common_group_args[@]}")
     local bind_mount_spec
     for bind_mount_spec in "${bind_mount_specs[@]}"; do
         docker_args+=(--volume "${bind_mount_spec}")
     done
-    docker_args+=(--entrypoint "${executable}" "${image_name}")
+    if (( test_headless_compositor )); then
+        docker_args+=(
+            --entrypoint /usr/bin/python3 "${wayland_validation_image_name}"
+            /workspace/tools/headless_compositor.py -- "${executable}"
+        )
+    else
+        docker_args+=(--entrypoint "${executable}" "${image_name}")
+    fi
     docker_args+=("$@")
-    run_owned_docker_command "${test_run_container_name}" "${docker_args[@]}"
+    local test_status=0
+    active_headless_compositor="${test_headless_compositor}"
+    run_owned_docker_command "${test_run_container_name}" "${docker_args[@]}" || test_status=$?
+    active_headless_compositor=0
+    return "${test_status}"
 }
 
 run_tests() {
     local suite="$1"
     shift
+    if (( test_headless_compositor )) && [[ "${suite}" != "workspace-wayland" ]]; then
+        die "--headless-compositor is only valid with --test workspace-wayland"
+    fi
 
     if [[ "${suite}" == "list" || "${suite}" == "help" || "${suite}" == "-h" || "${suite}" == "--help" ]]; then
         (($# == 0)) || die "--test ${suite} does not accept additional arguments"
@@ -2834,6 +2908,27 @@ run_tests() {
             die "--test ${suite} is unavailable in the native Catch2 test graph"
             ;;
     esac
+    if [[ "${suite}" == "headless-compositor" || "${suite}" == "headless-compositor-tool" ]]; then
+        (($# == 0)) || die "--test ${suite} does not accept additional arguments"
+        (( ! test_config_explicit )) || die "--test ${suite} does not accept --config"
+        [[ -z "${test_executable}" ]] || die "--test ${suite} does not accept --executable"
+        (( ! test_debugger )) || die "--test ${suite} does not accept --gdb or --gdb-command"
+        ((${#test_environment[@]} == 0)) || die "--test ${suite} does not accept --env"
+        if [[ "${suite}" == "headless-compositor-tool" ]]; then
+            run_headless_compositor_tool_tests
+        else
+            acquire_mutation_locks
+            ensure_docker
+            prepare_cache_layout
+            ensure_wayland_validation_image
+            test_headless_compositor=1
+            local compositor_status=0
+            run_workspace_wayland_test_executable /usr/bin/true || compositor_status=$?
+            release_mutation_locks
+            return "${compositor_status}"
+        fi
+        return
+    fi
     if [[ "${suite}" == "browser-app" ]]; then
         [[ "${test_config}" == "release" ]] ||
             die "--test browser-app owns its GUI graph and does not accept --config"
@@ -3100,6 +3195,9 @@ run_tests() {
              --repo-root /workspace --build-dir \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}\""
 
     if (( workspace_wayland_suite )); then
+        if (( test_headless_compositor )); then
+            ensure_wayland_validation_image
+        fi
         local workspace_wayland_inventory=""
         local -a workspace_wayland_expected_cases=(
             workspace_wayland_product_sigint
@@ -3296,6 +3394,7 @@ test_executable=""
 test_debugger=0
 test_debugger_commands=()
 test_environment=()
+test_headless_compositor=0
 passthrough_args=()
 for arg in "$@"; do
     if [[ "${arg}" == "--gui" ]]; then
@@ -3449,6 +3548,10 @@ parse_test_invocation_args() {
                 ;;
             --gdb)
                 test_debugger=1
+                ((index += 1))
+                ;;
+            --headless-compositor)
+                test_headless_compositor=1
                 ((index += 1))
                 ;;
             --gdb-command)

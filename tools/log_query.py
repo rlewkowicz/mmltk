@@ -58,7 +58,10 @@ LEVEL_NAMES = {
 }
 TEST_STATUS = re.compile(r"^\[\s*(RUN|FAILED|OK|SKIPPED)\s*\]\s+(.+)$")
 CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error): (.*)$")
-CONTEXT_LABEL = re.compile(r"(?:^|['\"] and ['\"])(native diagnostics|native runtime log|Firefox diagnostics):\s*")
+CONTEXT_LABEL = re.compile(
+    r"(?:^['\"]?|['\"] and ['\"]|\bwith \d+ messages?:\s*['\"])"
+    r"(native diagnostics|native runtime log|Firefox diagnostics):\s*"
+)
 ANCHOR_EVENTS = (
     "browser.server.started", "child.spawned", "child.signaled", "child.exited",
     "shutdown.requested", "shutdown.firefox_terminal", "shutdown.complete",
@@ -69,7 +72,7 @@ TYPED_ID = re.compile(r"\b([A-Z][A-Za-z0-9]*Id)\((\d+(?:,\s*\d+)*)\)")
 STAGE_SUFFIX = re.compile(
     r"^(.*?)[._/-](start|started|begin|begun|requested|submitted|opened|acquired|"
     r"end|ended|stop|stopped|complete|completed|finish|finished|closed|released|"
-    r"retired|destroyed|outcome|success|succeeded|failed|failure|error|"
+    r"retired|destroyed|outcome|terminal|success|succeeded|failed|failure|error|"
     r"cancelled|canceled|aborted|rejected|missing|unavailable|blocked|stalled|pending|discarded)$",
     re.IGNORECASE,
 )
@@ -1204,7 +1207,7 @@ def triage_snapshot(record):
                     shortened[0] = True
                     break
                 budget[0] -= 1
-                result[name] = trim(child, depth + 1)
+                result[trim(name) if isinstance(name, str) else name] = trim(child, depth + 1)
             return result if isinstance(value, dict) else list(result.values())
         return value
 
@@ -1225,7 +1228,7 @@ class Identity:
     values: tuple
 
     def label(self):
-        return "+".join(self.names) + "=" + "+".join(compact(json.loads(value), 80) for value in self.values)
+        return compact("+".join(self.names), 128) + "=" + "+".join(compact(json.loads(value), 80) for value in self.values)
 
 
 def strong_identities(record, explicit=()):
@@ -1235,7 +1238,9 @@ def strong_identities(record, explicit=()):
 
     def add(names, values=None):
         key = values if values is not None else correlation_key(record, names)
-        if key is not None:
+        if key is not None and all(
+            not isinstance(value := json.loads(part), str) or bool(value.strip()) for part in key
+        ):
             identity = Identity(run, names, key)
             if identity not in result:
                 result.append(identity)
@@ -1250,6 +1255,8 @@ def strong_identities(record, explicit=()):
     for name, value in values.items():
         if len(result) >= 16:
             break
+        if len(name) > 128 or not FIELD_NAME.fullmatch(name):
+            continue
         if name in AMBIENT_IDS or name in ("surface_high", "surface_low"):
             continue
         if isinstance(value, str) and len(value) > 128:
@@ -1282,11 +1289,18 @@ def event_stage(record):
     return (match[1], match[2].lower()) if match else ("", "")
 
 
+def triage_terminal(record):
+    return record.get("@terminal") or record.get("terminal") is True or event_stage(record)[1] == "terminal"
+
+
 def anchor_rank(record, identities=()):
     family, stage = event_stage(record)
     event = record.get("@event")
-    outcome = value_from(record.data, "span_outcome", "outcome", "fields.span_outcome", "fields.outcome")
-    if isinstance(outcome, str) and outcome.lower() in FAILED_STAGES:
+    failed_outcome = any(
+        isinstance(value := record.get(name), str) and value.lower() in FAILED_STAGES
+        for name in ("span_outcome", "outcome", "status", "result")
+    )
+    if failed_outcome or record.get("failed") is True:
         score, why = 110, "failed outcome/span"
     elif event == "catch.assertion_failed" or isinstance(event, str) and "assertion" in event and record.get("@error"):
         score, why = 105, "assertion failure"
@@ -1296,7 +1310,7 @@ def anchor_rank(record, identities=()):
         score, why = (85 if stage in ("missing", "unavailable", "stalled") else 45), "incomplete state"
     elif record.parse_error:
         score, why = 35, "parse failure (may be capture damage)"
-    elif record.get("@terminal"):
+    elif triage_terminal(record):
         score, why = 20, "terminal evidence (not necessarily failure)"
     else:
         return 0, ""
@@ -1341,6 +1355,8 @@ class TriageFinding:
     record: Record
     identity: Identity | None = None
     other: Record | None = None
+    observations: int = 1
+    last_position: tuple | None = None
 
 
 @dataclass
@@ -1349,6 +1365,22 @@ class StageBalance:
     last_end: Record | None = None
     pending: int = 0
     last_start: str = ""
+
+    def begin(self, record, stage):
+        if not self.pending:
+            self.first = triage_snapshot(record)
+        # requested -> submitted -> started is progress, not three operations.
+        if not self.pending or self.last_start == stage:
+            self.pending += 1
+        self.last_start = stage
+
+
+def lifecycle_identity(identities):
+    """Prefer the operation/resource owner, not a handle mentioned beside it."""
+    priority = {"span_id": 0, "request_id": 1, "@surface": 2, "trace_id": 4}
+    return min(identities, key=lambda item: (
+        priority.get(item.names[0], 5 if item.names[0].endswith("Id") else 3), item.names
+    )) if identities else None
 
 
 class IdentityChain:
@@ -1367,7 +1399,7 @@ class IdentityChain:
         self.gaps = {}
         self.limited = False
 
-    def observe(self, record, triage):
+    def observe(self, record, triage, balance=True):
         self.count += 1
         event = record.get("@event")
         event = str(event) if event is not MISSING else "(text)"
@@ -1387,6 +1419,10 @@ class IdentityChain:
         previous = self.last_by_source.get(record.source)
         row = triage_snapshot(record)
         if previous:
+            if previous.get("@owner") is not MISSING and record.get("@owner") is not MISSING \
+                    and previous.get("@owner") != record.get("@owner"):
+                triage.finding("owner-handoff", 25, "same identity appears under another owner; handoff candidate, not proof",
+                               row, self.identity, previous)
             if previous.clock == record.clock and record.time_ns is not None and previous.time_ns is not None:
                 delta = record.time_ns - previous.time_ns
                 if delta < 0:
@@ -1401,6 +1437,8 @@ class IdentityChain:
             self.bounds.setdefault(record.source, row)
         else:
             self.limited = True
+        if not balance:
+            return
         family, stage = event_stage(record)
         if not family or stage in INCOMPLETE_STAGES:
             if stage in INCOMPLETE_STAGES:
@@ -1416,12 +1454,7 @@ class IdentityChain:
             self.states[key] = StageBalance()
         state = self.states[key]
         if stage in START_STAGES:
-            if not state.pending:
-                state.first = row
-            # requested -> submitted -> started is progress, not three operations.
-            if not state.pending or state.last_start == stage:
-                state.pending += 1
-            state.last_start = stage
+            state.begin(row, stage)
         else:
             if state.pending:
                 state.pending -= 1
@@ -1440,12 +1473,18 @@ class IdentityChain:
                 triage.finding("failed-span", 100, f"span has explicit {stage} stage", row, self.identity)
 
     def finish(self, triage):
-        for (_, family), state in self.states.items():
+        for (source, family), state in self.states.items():
             if state.pending:
-                triage.finding("missing-counterpart", 70,
-                               f"{family}: {state.pending} start(s) without a captured same-source end/completion; "
-                               "suffix convention only, not a proven product requirement",
-                               state.first, self.identity)
+                other = triage.observed_ends.get((source, family))
+                if other and other.line >= state.first.line:
+                    triage.finding("identity-handoff", 45,
+                                   f"{family}: an end exists on a related record with another primary identity; "
+                                   "handoff/instrumentation mismatch possible", state.first, self.identity, other)
+                else:
+                    triage.finding("missing-counterpart", 70,
+                                   f"{family}: {state.pending} start(s) without a captured same-source end/completion; "
+                                   "suffix convention only, not a proven product requirement",
+                                   state.first, self.identity)
         for delta, before, after in self.gaps.values():
             triage.finding("gap", 50,
                            f"{delta / 1000000:.3f}ms without this identity in the same source/clock; "
@@ -1463,6 +1502,8 @@ class Triage:
         self.seed_pool = TriagePool(max(32, options.triage_anchors * 4))
         self.context_pool = TriagePool(32)
         self.failure_pool = TriagePool(options.triage_anchors)
+        self.terminal_pool = TriagePool(4)
+        self.source_tails = TriagePool(4)
         self.evidence = TriagePool(options.limit)
         self.selected = []
         self.identities = {}
@@ -1474,38 +1515,55 @@ class Triage:
         self.parse_examples = []
         self.artifacts = []
         self.pending = {}
+        self.observed_ends = {}
 
-    def records(self, files):
+    def records(self, files, apply_where=True):
         for source in files:
             for row in source.records(unchanged=True, anchors=self.anchors):
-                if self.where.matches(row) and (not self.run or row.metadata["run"] == self.run):
+                if (not apply_where or self.where.matches(row)) and (not self.run or row.metadata["run"] == self.run):
                     yield row
 
     def finding(self, kind, score, message, record, identity=None, other=None):
-        key = kind, physical_position(record)
+        if identity is not None:
+            score -= min(15, self.identities[identity].hop * 5)
+        if self.lookup and self.nearby(record) is None:
+            score -= 25
+        position = physical_position(record)
+        anchor = self.findings.get(("anchor-failure", position))
+        if kind == "explicit-failure" and anchor is not None:
+            if anchor.identity is None:
+                anchor.identity = identity
+            return
+        repeated_kind = kind in ("incomplete-state", "explicit-failure", "unmatched-end", "duplicate-terminal",
+                                 "owner-handoff", "clock-regression")
+        key = (kind, record.source, str(record.get("@event")), identity) if repeated_kind else (kind, position)
         value = TriageFinding(kind, score, message, triage_snapshot(record), identity,
-                              triage_snapshot(other) if other else None)
+                              triage_snapshot(other) if other else None, last_position=position)
         rank = lambda item: (-item.score, *physical_position(item.record), item.kind)
         if key in self.findings:
-            if rank(value) >= rank(self.findings[key]):
+            previous = self.findings[key]
+            count = previous.observations + (previous.last_position != position)
+            if rank(value) >= rank(previous):
+                previous.observations, previous.last_position = count, position
                 return
+            value.observations = count
         elif len(self.findings) >= 64:
+            self.notes.add("Finding inventory capped at 64; lower-ranked observations omitted.")
             worst = max(self.findings, key=lambda item: rank(self.findings[item]))
             if rank(value) >= rank(self.findings[worst]):
-                self.notes.add("Finding inventory capped at 64; lower-ranked observations omitted.")
                 return
             del self.findings[worst]
         self.findings[key] = value
 
     def choose_anchors(self, files, query):
         explicit = bool(self.options.query.strip() or self.options.errors or self.lookup)
-        for row in self.records(files):
+        for row in self.records(files, apply_where=False):
             self.scanned += 1
             if row.parse_error:
                 self.malformed += 1
                 if len(self.parse_examples) < 5:
                     self.parse_examples.append(f"{row.source}:{row.line}: {row.parse_error}")
-            if not query.matches(row):
+            if not self.where.matches(row) or not query.matches(row):
                 continue
             identities = strong_identities(row, self.explicit)
             score, why = anchor_rank(row, identities)
@@ -1518,11 +1576,11 @@ class Triage:
             # A bounded open-stage ledger supplies a useful anchor even without errors.
             family, stage = event_stage(row)
             if identities and family and not row.metadata.get("context_copy"):
-                key = row.source, identities[0], family
+                key = row.source, lifecycle_identity(identities), family
                 if stage in START_STAGES:
                     if key in self.pending or len(self.pending) < MAX_TRIAGE_STATES:
-                        state = self.pending.setdefault(key, StageBalance(first=triage_snapshot(row)))
-                        state.pending += 1
+                        state = self.pending.setdefault(key, StageBalance())
+                        state.begin(row, stage)
                     else:
                         self.notes.add("Open-stage anchor inventory capped; narrow --where to inspect other identities.")
                 elif stage and stage not in INCOMPLETE_STAGES and key in self.pending:
@@ -1542,6 +1600,7 @@ class Triage:
         if self.lookup:
             focus = triage_snapshot(self.lookup.focus)
             self.selected.append(((-1000, *physical_position(focus)), focus, "first physical pasted-error match"))
+            return
         for entry in candidates:
             if len(self.selected) >= self.options.triage_anchors:
                 break
@@ -1588,12 +1647,21 @@ class Triage:
 
     def gather_context(self, files):
         for _, row, why in self.selected:
+            if row.get("@error") or why == "failed outcome/span":
+                self.finding("anchor-failure", 115, why, row)
             for identity in strong_identities(row, self.explicit):
                 self.add_identity(identity, row, "anchor: " + why, 0)
         for row in self.records(files):
             self.scoped += 1
             score, why = anchor_rank(row)
-            if score >= 90 or row.get("@terminal"):
+            self.source_tails.add(row, (row.source, -row.line, -row.metadata.get("part", 0)),
+                                  "captured source end (not a terminal unless logged)", row.source)
+            if triage_terminal(row):
+                self.terminal_pool.add(row, (bool(row.metadata.get("context_copy")), *physical_position(row)),
+                                       "process/test terminal evidence" if row.get("@terminal") else
+                                       "generic terminal stage (not a process/test exit; numeric outcomes uninterpreted)",
+                                       (str(row.get("@event")), str(row.get("@exit_code"))))
+            if score >= 90 or triage_terminal(row):
                 self.failure_pool.add(row, (-score, bool(row.metadata.get("context_copy")), *physical_position(row)),
                                       "same-run terminal/failure evidence (not identity)",
                                       (str(row.get("@event")), why))
@@ -1605,7 +1673,10 @@ class Triage:
             event = row.get("@event")
             detail = value_from(row.data, "detail", "message", "fields.detail", "fields.message")
             signature = row.source, str(event), str(detail)[:100]
-            rank = (bool(row.metadata.get("context_copy")), event is MISSING, distance, *physical_position(row))
+            conversational = isinstance(event, str) and HANDOFF_EVENT.search(event)
+            rank = (bool(row.metadata.get("context_copy")),
+                    self.lookup is not None and row.source != self.lookup.focus.source, event is MISSING,
+                    not bool(conversational), distance, *physical_position(row))
             self.context_pool.add(row, rank, link, signature)
         for _, row, why in self.context_pool.rows():
             for identity in strong_identities(row, self.explicit):
@@ -1630,7 +1701,8 @@ class Triage:
             origins.append((triage_snapshot(row), identity))
 
     def expand(self, files):
-        for hop in range(self.options.triage_hops):
+        # Even zero identity hops still discovers nearby counter refinements.
+        for hop in range(max(1, self.options.triage_hops)):
             known = set(self.identities)
             additions = TriagePool(self.options.triage_identities)
             for row in self.records(files):
@@ -1639,9 +1711,13 @@ class Triage:
                 if not matched:
                     continue
                 self.add_refinement(row, matched[0])
+                if hop >= self.options.triage_hops:
+                    continue
                 for identity in identities:
                     if identity not in known:
-                        rank = (self.identities[matched[0]].hop, bool(row.metadata.get("context_copy")),
+                        neighborhood = self.nearby(row)
+                        distance = neighborhood[0] if neighborhood else 2**63
+                        rank = (self.identities[matched[0]].hop, bool(row.metadata.get("context_copy")), distance,
                                 *physical_position(row), identity.label())
                         additions.add(row, rank, identity, key=identity)
             for _, row, identity in additions.rows():
@@ -1671,31 +1747,42 @@ class Triage:
         known = set(self.identities)
         counter_evidence = TriagePool(4)
         for row in self.records(files):
-            matched = [identity for identity in strong_identities(row, self.explicit) if identity in known]
+            identities = strong_identities(row, self.explicit)
+            matched = [identity for identity in identities if identity in known]
             if matched:
                 self.related += 1
+                family, stage = event_stage(row)
+                if family and stage not in START_STAGES and stage not in INCOMPLETE_STAGES \
+                        and not row.metadata.get("context_copy"):
+                    key = row.source, family
+                    if key in self.observed_ends or len(self.observed_ends) < MAX_TRIAGE_STATES:
+                        self.observed_ends[key] = triage_snapshot(row)
+                    else:
+                        self.notes.add("Related end-stage inventory capped; counterpart absence may be incomplete.")
+                primary = lifecycle_identity(identities)
                 for identity in matched:
-                    self.identities[identity].observe(row, self)
+                    self.identities[identity].observe(row, self, balance=identity == primary)
                 score, why = anchor_rank(row)
                 if score >= 85:
                     kind = "failed-span" if why == "failed outcome/span" and any(
                         item.names == ("span_id",) for item in matched
-                    ) else "explicit-failure" if row.get("@error") else "incomplete-state"
-                    self.finding(kind,
-                                 score, why, row, matched[0])
+                    ) else "explicit-failure" if row.get("@error") or why == "failed outcome/span" else "incomplete-state"
+                    self.finding(kind, score, why, row,
+                                 next((item for item in matched if item.names == ("span_id",)), matched[0])
+                                 if kind == "failed-span" else matched[0])
                 self.retain(row, 4, "exact identity: " + matched[0].label())
             else:
                 refinement = self.counter_neighbor(row)
                 if refinement:
                     identity, strong, link = refinement
                     why = f"counter refinement {identity.label()} + {link} proximity to {strong.label()} (not identity)"
-                    counter_evidence.add(row, (*physical_position(row),), why, (row.source, str(row.get("@event"))))
+                    counter_evidence.add(row, physical_position(row), why, (row.source, str(row.get("@event"))))
         for chain in self.identities.values():
             chain.finish(self)
             if chain.hop:
                 self.finding("identity-handoff", 25, chain.why, chain.origin, chain.identity)
-        # Round-robin chain endpoints and distinct stages keep high-volume chains
-        # from consuming the entire sample. Anchors and anomaly evidence win ties.
+        # Prefer lifecycle endpoints and distinct stages to repeated hot-loop rows.
+        # Anchors and anomaly evidence win ties.
         for index, chain in enumerate(self.identities.values()):
             for row in (*chain.bounds.values(), *chain.last_by_source.values()):
                 self.retain(row, 3 + index / max(1, len(self.identities)), "identity lifecycle endpoint: " + chain.identity.label())
@@ -1706,12 +1793,23 @@ class Triage:
                 self.retain(finding.record, 1 + (110 - finding.score) / 100, "finding: " + finding.kind)
                 if finding.other:
                     self.retain(finding.other, 2.8, "finding context: " + finding.kind)
+        context_slots = 0
+        anchor_positions = {physical_position(entry[1]) for entry in self.selected}
         for _, row, why in self.context_pool.rows():
-            self.retain(row, 2.7, why)
+            # Reserve useful context even when old failures on a shared dataset
+            # identity would otherwise consume the evidence budget.
+            redundant = physical_position(row) in anchor_positions or triage_terminal(row)
+            context_budget = min(12, max(1, 2 * self.options.limit // 3)) if self.lookup \
+                else min(6, max(1, self.options.limit // 3))
+            priority = 0.8 if not redundant and context_slots < context_budget else 2.7
+            context_slots += not redundant
+            self.retain(row, priority, why)
         for _, row, why in counter_evidence.rows():
             self.retain(row, 2.6, why)
         for _, row, why in self.failure_pool.rows():
             self.retain(row, 1.8, why)
+        for _, row, why in self.terminal_pool.rows():
+            self.retain(row, 0.7, why)
         for _, row, why in self.selected:
             self.retain(row, 0, "anchor: " + why)
 
@@ -1752,14 +1850,20 @@ def render_triage(result, options, output, diagnostics):
         print("Highlights:", file=report)
         for finding in findings[:options.top]:
             identity = " [" + finding.identity.label() + "]" if finding.identity else ""
+            repeated = f" ({finding.observations} observations)" if finding.observations > 1 else ""
             print(f"  {finding.kind}{identity}: {compact(finding.message, 230)} "
-                  f"@ {compact(finding.record.source, 160)}:{finding.record.line}", file=report)
+                  f"@ {compact(finding.record.source, 160)}:{finding.record.line}{repeated}", file=report)
         earliest = {}
         for finding in findings:
             if finding.score < 65 or finding.kind in ("clock-regression",):
                 continue
             previous = earliest.get(finding.record.source)
-            if previous is None or finding.record.line < previous.record.line:
+            # Explicit observed divergence outranks absence inferred from suffixes.
+            rank = lambda item: (
+                result.lookup is not None and result.nearby(item.record) is None,
+                item.kind == "missing-counterpart", item.record.line,
+            )
+            if previous is None or rank(finding) < rank(previous):
                 earliest[finding.record.source] = finding
         if earliest:
             print("Earliest divergence candidates per source (physical order; partial-capture hypotheses):", file=report)
@@ -1775,8 +1879,23 @@ def render_triage(result, options, output, diagnostics):
             print(f"  {chain.identity.label()} hop={chain.hop}, rows={chain.count}, copies={chain.copies}; "
                   f"seed={compact(chain.why, 120)}", file=report)
             print("    owners: " + compact(owners, 180) + "; events: " + compact(events, 500), file=report)
+            ordered = {}
+            for _, row, _ in chain.representatives.rows():
+                ordered.setdefault(row.source, []).append(row)
+            for source, rows in sorted(ordered.items())[:2]:
+                sequence = sorted(rows, key=physical_position)[:7]
+                stages = " -> ".join(f"{row.line}:{row.get('@event')}" for row in sequence)
+                print("    source-order " + compact(source, 130) + ": " + compact(stages, 520) +
+                      " (distinct-stage sample)", file=report)
         if len(result.identities) > options.top:
             print(f"  {len(result.identities) - options.top} additional identities analyzed (--top controls display).", file=report)
+    if result.selected:
+        print("Terminal evidence in this run (stage terminals need not mean run completion; independent row budget):", file=report)
+        terminal_rows = result.terminal_pool.rows()
+        if not terminal_rows:
+            print("  No terminal record captured; source ends alone do not establish success, failure, or timeout.", file=report)
+        for _, row, why in (terminal_rows or result.source_tails.rows())[:min(4, options.top)]:
+            print("  " + render_record(Retained((), row, why, False), options), file=report)
     if result.refinements:
         print("Nearby counter composites (weaker than identity, not transitive): " +
               " | ".join(identity.label() for identity in list(result.refinements)[:min(5, options.top)]), file=report)
@@ -1859,6 +1978,25 @@ def render_record(item, options):
             value = record.get(name)
             if value is not MISSING:
                 facts.append(f"{name}={compact(value, 70)}")
+    if options.triage:
+        for name in ("generation", "slot", "boundary", "status", "code", "outcome", "span_outcome"):
+            value = record.get(name)
+            if value is not MISSING:
+                facts.append(f"{name}={compact(value, 70)}")
+        if triage_terminal(record):
+            # Unknown terminal schemas stay visible; numeric enum meanings are not guessed.
+            fields = record.data.get("fields")
+            values = fields if isinstance(fields, dict) else record.data
+            emitted = 0
+            for name, value in values.items():
+                if name in ("event", "name", "owner", "level", "timestamp", "steady_ns", "elapsed_ms",
+                            "status", "code", "outcome", "span_outcome") \
+                        or value in (None, "", 0, False) or not isinstance(value, (str, int, float, bool)):
+                    continue
+                facts.append(f"{compact(name, 70)}={compact(value, 70)}")
+                emitted += 1
+                if emitted == 6:
+                    break
     for name in ("strong_count", "settled"):
         value = record.get(name)
         if value is not MISSING:
@@ -1966,7 +2104,8 @@ Fields:
   inside fields), plus @file, @line, @text, @format, @clock, @time_ns,
   @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
   @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
-  @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link.
+  @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link,
+  @triage_reason, @triage_payload_truncated.
   @event resolves wrapped fields.event/name before event/name.
   @surface joins native uint64 surface_high/low and Firefox 32-hex surfaces.
   @error marks failure candidates from levels/event/message text; it is a
@@ -2020,7 +2159,8 @@ Automatic triage:
   anchors, or an unmatched start when no explicit failure is available. --query
   narrows anchors; --where constrains every pass. --error keeps its first-physical
   phrase lookup and proximity behavior. Nothing in triage includes the whole run.
-  Defaults: 4 anchors, 12 identities, 2 expansion hops, 20 evidence rows. Tune
+  Defaults: 4 anchors, 12 identities, 2 expansion hops, 20 evidence rows,
+  5 summary entries per section. Tune
   --triage-anchors, --triage-identities, --triage-hops, --limit, and --top.
   At most 32 diversified neighboring records seed identities, using 3 lines (or
   --context if larger) and --near-ms. Every row states its inclusion reason.
@@ -2031,7 +2171,9 @@ Automatic triage:
   Identities co-occurring on a matched row can seed the next hop. Counter
   sequence/generation/slot composites need two fields plus same-clock proximity
   or 100 same-source lines; zero slots are valid. They never seed further hops.
-  Lifecycle balances use exact event prefixes and generic start/end suffixes
+  Lifecycle balances use each row's most-specific operation/resource identity
+  (span, request, surface, then other IDs; not secondary handles), exact event
+  prefixes and generic start/end suffixes
   (requested/submitted/started -> completed/failed/outcome, opened -> closed,
   acquired -> released, etc.). These conventions are hypotheses, not product
   requirements. Missing/blocked/stalled stages, failed textual span outcomes,
@@ -2039,6 +2181,9 @@ Automatic triage:
   clock gaps (--triage-gap-ms, default 1000) are highlighted with evidence.
   Sources are never causally ordered from proximity. Copied INFO does not
   participate in lifecycle balances. Numeric outcome enums are not guessed.
+  Up to 4 generic *.terminal/terminal=true or known process/test terminal
+  records are reported independently of --limit. Without terminals, captured
+  source ends are shown without claiming success/failure/timeout.
   Memory is bounded: 256 open anchor families, 64 findings, 64 event/family
   values per identity, 32 sources per identity, and size-bounded retained
   payloads (96 fields, depth 4, 2048 characters per string). Capacity limits are
@@ -2086,7 +2231,8 @@ def argument_parser():
     parser.add_argument("--format", choices=("summary", "timeline", "jsonl"), default="summary")
     parser.add_argument("--fields", help="comma-separated output field projection; provenance is always retained")
     parser.add_argument("--group-by", default="@owner,@event", help="comma-separated summary grouping fields")
-    parser.add_argument("--top", type=bounded_integer(1, 100), default=10, help="maximum summary groups (default: 10)")
+    parser.add_argument("--top", type=bounded_integer(1, 100),
+                        help="maximum summary entries per section (default: 5 for triage, 10 otherwise)")
     parser.add_argument("--limit", type=bounded_integer(1, 10000), default=20,
                         help="maximum timeline sample records; counts cover all matches (default: 20)")
     parser.add_argument("--order", choices=("time", "file", "capture", "proximity"))
@@ -2118,6 +2264,7 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
             raise QueryError("--correlate requires an explicit --query or --errors seed")
         options.fields = field_names(options.fields) if options.fields else ()
         options.group_by = field_names(options.group_by)
+        options.top = options.top or (5 if options.triage else 10)
         options.order = options.order or ("proximity" if options.error is not None else "time")
         if options.order == "proximity" and options.error is None:
             raise QueryError("--order proximity requires --error")

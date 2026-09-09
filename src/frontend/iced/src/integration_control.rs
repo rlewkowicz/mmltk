@@ -478,6 +478,7 @@ function releaseIntegrationSurfaceClick(record) {
 
 let initialAtlasWithoutInput = false;
 let initialAtlasInputCount = 0;
+let initialAtlasCompleted = false;
 for (const type of ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown']) {
   window.addEventListener(type, () => {
     if (!initialAtlasWithoutInput) return;
@@ -490,11 +491,12 @@ for (const type of ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus',
 
 function report(record) {
   record.elapsed_ms = performance.now();
-  if (record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
+  if (!initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
     initialAtlasWithoutInput = true;
     initialAtlasInputCount = 0;
   } else if (record.event === 'integration.initial_atlas_complete') {
     initialAtlasWithoutInput = false;
+    initialAtlasCompleted = true;
   }
   const line = JSON.stringify(record);
   if (typeof globalThis.dump === 'function') globalThis.dump(`${line}\n`);
@@ -1991,6 +1993,32 @@ fn sampleable_presentation(
         })
 }
 
+fn fully_drawn_gallery(
+    model: &ApplicationModel,
+    frame: Option<crate::presentation_surface::FrameReady>,
+    snapshot: &crate::generated::ExploreSnapshot,
+    drawn: Option<(u64, u64)>,
+) -> Option<SampleablePresentation> {
+    if !snapshot.ready
+        || snapshot.busy
+        || snapshot.mode != crate::generated::ExploreMode::Gallery
+        || snapshot.gallery.generation == 0
+        || snapshot.gallery.slots.is_empty()
+        || snapshot.gallery.slots.len() != snapshot.order.visibleindices.len()
+        || snapshot.gallery.slots.iter().any(|ready| !*ready)
+    {
+        return None;
+    }
+    let sampleable = sampleable_presentation(
+        model,
+        frame,
+        crate::generated::PresentationSourceKind::Explore,
+        snapshot.frame.revision,
+    )?;
+    (drawn == Some((sampleable.presentation_revision, sampleable.source_revision)))
+        .then_some(sampleable)
+}
+
 #[cfg(target_arch = "wasm32")]
 fn click(bounds: Rectangle) -> bool {
     click_js(
@@ -2204,6 +2232,8 @@ enum Phase {
     ExplorePolicyOverlayVisible(u64),
     AwaitExplorePolicyOverlay(u64),
     AwaitExploreOverlayAll(u64),
+    AwaitExploreOverlaySubset(u64),
+    AwaitExploreOverlayRestored(u64),
     ExploreAugmentationToggle {
         revision: u64,
         frame_revision: u64,
@@ -2638,6 +2668,7 @@ pub struct Controller {
     ui_scale_first: Option<f32>,
     input_scale: f32,
     explore_snapshot_revision: u64,
+    reopen_wait_revision: u64,
     oversized_capacity: Option<crate::generated::VisualExtent>,
     scroll_placeholder_reported: bool,
     selection_grid: Option<(u32, u32, u32, u64, u64)>,
@@ -2834,6 +2865,7 @@ impl Controller {
             ui_scale_first: None,
             input_scale: 1.0,
             explore_snapshot_revision: 0,
+            reopen_wait_revision: 0,
             oversized_capacity: None,
             scroll_placeholder_reported: false,
             selection_grid: None,
@@ -3320,6 +3352,23 @@ impl Controller {
                 presentation_revision,
                 source_revision,
             } => {
+                if let Phase::AwaitExploreDatasetReopen {
+                    revision,
+                    frame_revision,
+                } = &self.phase
+                {
+                    report(
+                        "integration.explore_reopen_draw",
+                        EXPLORE_GALLERY,
+                        "physical-gallery-draw",
+                        [
+                            *revision as f64,
+                            *frame_revision as f64,
+                            source_revision as f64,
+                            presentation_revision as f64,
+                        ],
+                    );
+                }
                 self.gallery_drawn = Some((presentation_revision, source_revision));
                 return None;
             }
@@ -6130,6 +6179,42 @@ impl Controller {
                 {
                     return Task::none();
                 }
+                self.phase = Phase::AwaitExploreOverlaySubset(snapshot.revision);
+                return Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Explore(explore::Message::Details(
+                        explore::details::Message::ClassToggled(0),
+                    )),
+                ));
+            }
+            Phase::AwaitExploreOverlaySubset(revision) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.revision <= revision
+                    || snapshot.busy
+                    || snapshot.overlay.classselection.mode
+                        != crate::generated::ExploreClassSelectionMode::Subset
+                {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitExploreOverlayRestored(snapshot.revision);
+                return Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Explore(explore::Message::Details(
+                        explore::details::Message::AllClasses,
+                    )),
+                ));
+            }
+            Phase::AwaitExploreOverlayRestored(revision) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.revision <= revision
+                    || snapshot.busy
+                    || snapshot.overlay.classselection.mode
+                        != crate::generated::ExploreClassSelectionMode::All
+                {
+                    return Task::none();
+                }
                 self.phase = Phase::ExploreAugmentationToggle {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -6144,12 +6229,16 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.revision <= revision || snapshot.busy || !snapshot.augmentation.enabled
-                {
+                if snapshot.revision <= revision || !snapshot.augmentation.enabled {
                     return Task::none();
                 }
-                if snapshot.augmentation.seed != 0 || snapshot.frame.revision <= frame_revision {
+                if snapshot.augmentation.seed != 0 {
                     self.fail("augmentation enable changed its seed or did not publish a new rendered frame");
+                    return Task::none();
+                }
+                if snapshot.frame.revision <= frame_revision
+                    || fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none()
+                {
                     return Task::none();
                 }
                 report(
@@ -6177,12 +6266,12 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.revision <= revision || snapshot.busy || snapshot.augmentation.seed != 1
-                {
+                if snapshot.revision <= revision || snapshot.augmentation.seed != 1 {
                     return Task::none();
                 }
-                if snapshot.frame.revision <= frame_revision {
-                    self.fail("augmentation reroll did not publish a new rendered frame");
+                if snapshot.frame.revision <= frame_revision
+                    || fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none()
+                {
                     return Task::none();
                 }
                 report(
@@ -7446,6 +7535,65 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
+                if snapshot.revision > self.reopen_wait_revision {
+                    let expected_columns = self.selection_grid.map(|selection| selection.0);
+                    let sampleable = sampleable_presentation(
+                        model,
+                        frame,
+                        crate::generated::PresentationSourceKind::Explore,
+                        snapshot.frame.revision,
+                    );
+                    let blocker = if !snapshot.ready {
+                        "snapshot-not-ready"
+                    } else if snapshot.busy {
+                        "snapshot-busy"
+                    } else if snapshot.revision <= revision {
+                        "snapshot-revision"
+                    } else if snapshot.frame.revision <= frame_revision {
+                        "frame-revision"
+                    } else if snapshot.gallery.generation == 0 {
+                        "gallery-generation"
+                    } else if snapshot.gallery.slots.len() != snapshot.order.visibleindices.len() {
+                        "slot-cardinality"
+                    } else if snapshot.gallery.slots.iter().any(|ready| !*ready) {
+                        "slot-readiness"
+                    } else if expected_columns.is_none() {
+                        "selection-grid"
+                    } else if expected_columns != Some(snapshot.viewport.columns)
+                        || snapshot.viewport.rowcount <= 1
+                    {
+                        "viewport"
+                    } else if sampleable.is_none() {
+                        "sampleable-presentation"
+                    } else if self.gallery_drawn.is_none_or(|(presentation, source)| {
+                        source != snapshot.frame.revision
+                            || model
+                                .presentation
+                                .as_ref()
+                                .is_none_or(|current| current.presentationrevision != presentation)
+                    }) {
+                        "physical-gallery-draw"
+                    } else {
+                        "ready"
+                    };
+                    report(
+                        "integration.explore_reopen_wait",
+                        EXPLORE_OPEN,
+                        blocker,
+                        [
+                            snapshot.revision as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.gallery.generation as f64,
+                            snapshot
+                                .gallery
+                                .slots
+                                .iter()
+                                .filter(|ready| **ready)
+                                .count() as f64,
+                        ],
+                    );
+                    self.reopen_wait_revision = snapshot.revision;
+                }
                 if !snapshot.ready
                     || snapshot.busy
                     || snapshot.revision <= revision
@@ -7500,7 +7648,7 @@ impl Controller {
                     [
                         snapshot.revision as f64,
                         snapshot.frame.revision as f64,
-                        snapshot.viewport.firstrow as f64,
+                        snapshot.gallery.generation as f64,
                         snapshot.order.visibleindices.len() as f64,
                     ],
                 );

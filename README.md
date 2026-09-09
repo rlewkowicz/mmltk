@@ -349,6 +349,49 @@ Query captured JSONL, native, and Firefox logs through the read-only wrapper:
 ./mmltk --logs --help
 ```
 
+Start an automatic investigation without constructing identity queries:
+
+```bash
+./mmltk --logs --family latest-wayland-test --triage
+./mmltk --logs build/validation/final-wayland-acceptance.log \
+  --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
+./mmltk --logs --family latest-wayland-test --run 57-132614959357615 \
+  --triage --error 'Presentation unavailable
+
+Explore requires a measured non-empty gallery.'
+```
+
+Triage ranks failure, assertion, terminal, damaged-record, and incomplete-stage
+anchors, focuses one artifact run, and follows nearby nonempty strong identities.
+Each evidence row explains whether it came from an anchor, exact identity,
+nearby context, a weaker counter composite, or a lifecycle finding. The default
+budgets are four anchors, twelve identities, two co-occurrence hops, twenty
+evidence rows, and five entries per summary section; tune `--triage-anchors`, `--triage-identities`, `--triage-hops`,
+`--limit`, and `--top`. It never includes the whole run; `--related-run` and
+`--tail` are rejected in triage mode.
+
+Identity summaries include owners, event counts, and distinct stages in
+same-source order. Generic event suffixes identify possible unclosed starts,
+duplicate endings, failed textual span outcomes, missing/blocked/stalled stages,
+and identity/owner handoffs. Gaps require comparable recorded timestamps in the
+same physical source (`--triage-gap-ms`, default 1,000). Explicit divergence
+outranks missing-counterpart hypotheses; these are leads, not root-cause claims.
+Incomplete captures, disabled diagnostics, or different-source completions can
+explain an absent counterpart. Copied Catch INFO does not inflate lifecycle
+balances. Numeric outcome enums are not guessed. Up to four terminal records
+are reported independently of the evidence-row budget; when none exist,
+captured source ends are shown without implying a timeout or successful exit.
+
+Surface IDs, typed handles such as `BufferId(21,1)`, and named `*_id`/`*_identity`
+values are scoped to the run. Ambient device/process/thread IDs are excluded;
+`--correlate FIELD` explicitly opts another identity into triage. Sequence,
+generation, and slot values only join as two-or-more-field composites near an
+exact chain record; they never expand into further identities. `--where` filters
+every pass. Event inventories, findings, and retained payload sizes are capped
+with explicit limitation notices. JSONL mode emits only bounded evidence rows
+to stdout and the triage report to stderr. See `--help` for exact conventions
+and limits.
+
 Paste a displayed error directly, including its title and blank line:
 
 ```bash

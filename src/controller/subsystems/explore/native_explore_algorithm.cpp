@@ -146,16 +146,26 @@ class ExploreAcceptanceGate::Impl final {
         return terminal_ && !std::exchange(terminal_reported_, true);
     }
 
-    [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation) {
-        const std::uint8_t waiting = 0x81U;
-        if (::send(command_.get(), &waiting, sizeof(waiting), MSG_NOSIGNAL) != sizeof(waiting)) {
+    [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot,
+                                                const std::uint64_t compiled_index, const std::uint64_t staging_bytes) {
+        ControlObservation observation{.event = ControlEvent::HeldWait,
+                                       .generation = generation,
+                                       .slot = slot,
+                                       .compiled_index = compiled_index,
+                                       .staging_bytes = staging_bytes};
+        if (!SendControlObservation(observation)) {
             Terminal();
             return WaitResult::Stale;
         }
+        const auto finish = [this, &observation](const WaitResult result) {
+            observation.event = result == WaitResult::Proceed ? ControlEvent::HeldProceed : ControlEvent::HeldStale;
+            static_cast<void>(SendControlObservation(observation));
+            return result;
+        };
         for (;;) {
             std::unique_lock lock(mutex_);
             changed_.wait(lock, [this, generation] { return terminal_ || generation != current_generation_ || !reader_; });
-            if (terminal_ || generation != current_generation_) return WaitResult::Stale;
+            if (terminal_ || generation != current_generation_) return finish(WaitResult::Stale);
             reader_ = true;
             const auto generation_epoch = generation_epoch_;
             lock.unlock();
@@ -164,19 +174,20 @@ class ExploreAcceptanceGate::Impl final {
             if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) {
                 reader_ = false;
                 changed_.notify_all();
-                return WaitResult::Stale;
+                return finish(WaitResult::Stale);
             }
             lock.unlock();
             const auto command = ReadCommand();
             lock.lock();
             reader_ = false;
             changed_.notify_all();
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) return WaitResult::Stale;
+            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_)
+                return finish(WaitResult::Stale);
             if (command.generation_changed) continue;
-            if (command.value == 4U) return WaitResult::Proceed;
+            if (command.value == 4U) return finish(WaitResult::Proceed);
             terminal_ = true;
             changed_.notify_all();
-            return WaitResult::Stale;
+            return finish(WaitResult::Stale);
         }
     }
 
@@ -191,6 +202,14 @@ class ExploreAcceptanceGate::Impl final {
         std::uint8_t value = 0U;
         bool generation_changed = false;
     };
+
+    [[nodiscard]] bool SendControlObservation(const ControlObservation& observation) const noexcept {
+        ssize_t written = -1;
+        do {
+            written = ::send(command_.get(), &observation, sizeof(observation), MSG_NOSIGNAL);
+        } while (written < 0 && errno == EINTR);
+        return written == static_cast<ssize_t>(sizeof(observation));
+    }
 
     [[nodiscard]] CommandRead ReadCommand() noexcept {
         std::array<pollfd, 3U> descriptors{{
@@ -246,8 +265,9 @@ void ExploreAcceptanceGate::AdvanceGeneration(const std::uint64_t generation) no
 auto ExploreAcceptanceGate::AwaitInitialRelease(const std::uint64_t generation) -> WaitResult {
     return impl_->AwaitInitialRelease(generation);
 }
-auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation) -> WaitResult {
-    return impl_->AwaitHeldCompletion(generation);
+auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot,
+                                                const std::uint64_t compiled_index, const std::uint64_t staging_bytes) -> WaitResult {
+    return impl_->AwaitHeldCompletion(generation, slot, compiled_index, staging_bytes);
 }
 bool ExploreAcceptanceGate::ClaimHeldCompletion() { return impl_->ClaimHeldCompletion(); }
 bool ExploreAcceptanceGate::ClaimTerminalReport() { return impl_->ClaimTerminalReport(); }

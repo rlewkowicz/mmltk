@@ -72,13 +72,17 @@ pub(super) fn update(
             row_fraction,
             request,
         } => {
+            // The retained gallery scrollable remains laid out beneath detail
+            // mode. Record its physical offset even while native viewport
+            // mutation is unavailable so reopening cannot pair an old native
+            // row with a different on-screen scroll position.
+            state.record_gallery_scroll(first_row);
+            state.record_gallery_fraction(row_fraction);
             if !snapshot.is_some_and(|value| {
                 value.ready && value.mode == crate::generated::ExploreMode::Gallery
             }) {
                 return Ok(None);
             }
-            state.record_gallery_scroll(first_row);
-            state.record_gallery_fraction(row_fraction);
             let Some(request) = request else {
                 state.clear_viewport_admission();
                 return Ok(None);
@@ -639,6 +643,46 @@ mod tests {
             .unwrap();
         assert_eq!(recovered.viewport.firstrow, 5);
         assert_eq!(recovered.viewport.extent.width % 4, 0);
+    }
+
+    #[test]
+    fn retained_gallery_records_physical_scroll_while_detail_is_active() {
+        let mut snapshot = explore_snapshot();
+        snapshot.ready = true;
+        snapshot.mode = crate::generated::ExploreMode::Detail;
+        snapshot.order.matchingcount = 127;
+        snapshot.viewport.firstrow = 33;
+        let mut state = state::State::default();
+        assert!(state.measure_gallery(
+            900.0,
+            900.0,
+            crate::generated::VisualExtent {
+                width: 1920,
+                height: 1080,
+            },
+            3,
+        ));
+        state.record_gallery_scroll(33);
+
+        assert!(
+            update(
+                &mut state,
+                Some(&snapshot),
+                &mut SettingsModel::default(),
+                Message::Scrolled {
+                    first_row: 0,
+                    row_fraction: 0.0,
+                    request: None,
+                },
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        let reopened = state
+            .measured_layout_request(Some(&snapshot), 3, snapshot.order.matchingcount)
+            .unwrap();
+        assert_eq!(reopened.viewport.firstrow, 0);
     }
 
     #[test]
