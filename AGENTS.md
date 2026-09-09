@@ -42,6 +42,44 @@ toolchains. Do not invoke Docker directly or assume host-relative paths. Route
 every build, test, sanitizer, debugger, profiler, and containerized diagnostic
 through `./mmltk`; add and use missing wrapper capabilities.
 
+## Documentation
+
+During `actionplan.md` execution, after Final Validation completes and all
+preceding changes are committed, spawn exactly one fresh astra max subagent to
+audit and update the complete documentation set against the current codebase.
+It verifies commands, paths, formats, behavior, ownership, and cross-links from
+authoritative source and tooling, edits documentation only, and reports the
+result. The main agent reviews the documentation diff for accuracy, scope, and
+organization, then commits it.
+
+Keep each document within its audience and purpose:
+
+- `README.md` is the user-facing introduction: entry points, quick starts,
+  repository narrative, caveats, developer commentary, and 1000-foot
+  overviews. Preserve the developer's voice, humor, and interjections while
+  correcting spelling and formatting. Move detailed reference and architecture
+  material into `docs/`.
+- `CONTRACT.md` defines high-level technical architecture: major application
+  ownership, cross-repository flow, broad constraints, and critical component
+  handoffs. Exclude implementation symbols, call sequences, and detailed code
+  mechanics.
+- `AGENTS.md` is a terse agent navigation and policy guide. Include critical
+  tooling, logging, optimization, repository organization, code direction,
+  workflow rules, and gotchas. Describe repository, tool, and command outcomes;
+  exclude system-specific implementation outcomes and architecture.
+- `docs/` is the technical wiki. Maintain `docs/README.md` as its index and
+  group pages by reader task: getting started and reference; architecture and
+  frameworks; data and backend systems; engineering processes, validation, and
+  operations. Put detailed commands, formats, code explanations, diagrams, and
+  procedures here. Give each fact one authoritative home and link to it instead
+  of duplicating it.
+
+The documentation agent chooses and evolves the smallest coherent hierarchy
+for the actual material. It updates stale facts, names, links, and examples;
+adds missing index entries; removes obsolete duplication; and preserves
+important nuance. It does not manufacture architecture or infer behavior from
+old prose when source, generated artifacts, or wrapper help can establish it.
+
 ## Building
 
 First-party C++ uses GCC 16.2 and C++26 reflection. CUDA uses NVCC 13.4,
@@ -65,25 +103,7 @@ wiring and regenerate through `./mmltk`.
 Examples:
 
 ```bash
-  ./mmltk --logs --family latest-wayland-test --triage
-  ./mmltk --logs build/validation/latest-wayland-test-firefox.log --triage
-  ./mmltk --logs build/validation/final-wayland-acceptance.log \
-      --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
-  ./mmltk --logs --errors
-  ./mmltk --logs -q 'onnx OR "CUDA error"'
-  ./mmltk --logs -q '@event:shutdown AND NOT @event:started' --format timeline
-  ./mmltk --logs -q 'trace_id=42' --correlate trace_id --tail --limit 80
-  ./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
-  ./mmltk --logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
-  ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
-  ./mmltk --logs --family latest-wayland-test --errors --related-run --tail
-  ./mmltk --logs --family latest-wayland-test --history --list-runs
-  ./mmltk --logs --family latest-wayland-test --run 57-131007497132582 -q SIGSEGV
-  ./mmltk --logs build/validation/viewer-copy-ownership-trace.log \
-      --family latest-wayland-test --history -q 'buffer="BufferId(21,1)"' --context 2
-  ./mmltk --logs --error 'Presentation unavailable
-
-  Explore requires a measured non-empty gallery.'
+  ./mmltk --logs --help
 ```
 
 Provide granular opt-in JSONL logging with maximum useful troubleshooting

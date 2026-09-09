@@ -433,6 +433,7 @@ struct SurfaceAudit final {
         std::uint64_t browser_width = 0U;
         std::uint64_t browser_height = 0U;
         unsigned native_stage = 0U;
+        // CLEANUP-IGNORE: Firefox import lifecycle state is distinct from the browser-controller outcome flags.
         unsigned firefox_stage = 0U;
         bool import_failed = false;
         bool firefox_import_failed = false;
@@ -1666,6 +1667,7 @@ struct NativeAudit final {
     std::size_t partial_placeholder_ordinal = 0U;
     std::size_t partial_first_patch_ordinal = 0U;
     std::uint64_t partial_first_tile_count = 0U;
+    // CLEANUP-IGNORE: Acceptance scheduling and hold-custody fields are not the reflected diagnostic envelope schema.
     std::size_t explore_max_pinned = 0U;
     std::size_t ordinal = 0U;
     std::size_t peer_open_count = 0U;
@@ -1687,6 +1689,7 @@ struct NativeAudit final {
     std::map<std::uint64_t, std::size_t> last_patch_ordinals;
     std::map<std::uint64_t, std::size_t> first_publication_ordinals;
     std::map<std::uint64_t, std::size_t> last_publication_ordinals;
+    // CLEANUP-IGNORE: Tile, augmentation, and frame evidence have distinct identities from placeholder/patch inventories.
     std::map<std::uint64_t, std::uint64_t> first_published_tiles;
     std::map<std::uint64_t, std::map<std::uint64_t, std::uint64_t>> first_patched_slots;
     std::map<std::uint64_t, std::uint64_t> published_tiles;
@@ -1952,6 +1955,17 @@ struct NativeAudit final {
         } else {
             reject_causal_evidence("padded card evidence capacity");
         }
+    }
+
+    void consume_explore_evidence(const char* const event, const std::uint64_t value, const std::uint64_t detail = 0U,
+                                  const std::uint64_t staging_bytes = 0U) {
+        consume({{"kind", "gui_runtime"},
+                 {"owner", "explore"},
+                 {"event", event},
+                 {"sequence", 2U},
+                 {"value", value},
+                 {"detail", detail},
+                 {"staging_bytes", staging_bytes}});
     }
 
     void consume(const nlohmann::json& record) {
@@ -4967,6 +4981,15 @@ constexpr std::array browser_surface_events{"firefox.workspace.admitted",
                                             "iced.surface.retired",
                                             "firefox.workspace.retired"};
 
+void record_receiver_withdrawal(SurfaceAudit& audit) {
+    for (std::size_t index = 0U; index < 6U; ++index)
+        audit.browser(browser_surface_record(browser_surface_events[index]));
+    audit.browser(browser_surface_record("iced.surface.pending_discarded"));
+    audit.browser(browser_surface_record("firefox.workspace.withdrawal"));
+    audit.browser(browser_surface_record("iced.surface.retired"));
+    audit.browser(browser_surface_record("firefox.workspace.retired"));
+}
+
 TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]") {
     for (const char* field :
          {"sequence", "selection_generation", "frame_revision", "capacity_width", "capacity_height", "condition", "outcome"}) {
@@ -5053,12 +5076,7 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     for (std::size_t index = 0U; index < 4U; ++index)
         audit.native(native_surface_record(native_surface_events[index]));
     audit.native(native_surface_record("presentation.retirement"));
-    for (std::size_t index = 0U; index < 6U; ++index)
-        audit.browser(browser_surface_record(browser_surface_events[index]));
-    audit.browser(browser_surface_record("iced.surface.pending_discarded"));
-    audit.browser(browser_surface_record("firefox.workspace.withdrawal"));
-    audit.browser(browser_surface_record("iced.surface.retired"));
-    audit.browser(browser_surface_record("firefox.workspace.retired"));
+    record_receiver_withdrawal(audit);
     CHECK(audit.joined_failure().empty());
 
     SurfaceAudit dropped_candidate_retirement;
@@ -5069,12 +5087,7 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     replacement["sequence"] = 8U;
     replacement["allocation_generation"] = 8U;
     dropped_candidate_retirement.native(replacement);
-    for (std::size_t index = 0U; index < 6U; ++index)
-        dropped_candidate_retirement.browser(browser_surface_record(browser_surface_events[index]));
-    dropped_candidate_retirement.browser(browser_surface_record("iced.surface.pending_discarded"));
-    dropped_candidate_retirement.browser(browser_surface_record("firefox.workspace.withdrawal"));
-    dropped_candidate_retirement.browser(browser_surface_record("iced.surface.retired"));
-    dropped_candidate_retirement.browser(browser_surface_record("firefox.workspace.retired"));
+    record_receiver_withdrawal(dropped_candidate_retirement);
     CHECK(dropped_candidate_retirement.joined_failure().empty());
 
     for (const bool observed_native_outcome : {false, true}) {
@@ -5100,37 +5113,19 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
 
 TEST_CASE("incremental Explore audit joins exact inventories across dropped diagnostics", "[workspace][audit]") {
     NativeAudit audit;
-    const auto consume = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
-        audit.consume({{"kind", "gui_runtime"},
-                       {"owner", "explore"},
-                       {"event", event},
-                       {"sequence", 2U},
-                       {"value", value},
-                       {"detail", detail},
-                       {"staging_bytes", 4096U}});
-    };
-    consume("acceptance.placeholder.slot", 0U, 10U);
-    consume("acceptance.placeholder.slot", 1U, 11U);
-    consume("acceptance.placeholder.complete", 2U, 19U);
-    consume("acceptance.slot.patched", 0U, 10U);
-    consume("tile.batch.published", 1U);
+    audit.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U, 4096U);
+    audit.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U, 4096U);
+    audit.consume_explore_evidence("acceptance.placeholder.complete", 2U, 19U, 4096U);
+    audit.consume_explore_evidence("acceptance.slot.patched", 0U, 10U, 4096U);
+    audit.consume_explore_evidence("tile.batch.published", 1U, 0U, 4096U);
     CHECK(audit.explore_placeholder);
     CHECK(audit.partial_generation == 2U);
     CHECK(audit.acceptance_first_patch_exact);
 
     NativeAudit joined_after_publication;
-    const auto consume_joined = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
-        joined_after_publication.consume({{"kind", "gui_runtime"},
-                                          {"owner", "explore"},
-                                          {"event", event},
-                                          {"sequence", 2U},
-                                          {"value", value},
-                                          {"detail", detail},
-                                          {"staging_bytes", 4096U}});
-    };
-    consume_joined("acceptance.placeholder.complete", 2U, 19U);
-    consume_joined("acceptance.slot.patched", 0U, 10U);
-    consume_joined("tile.batch.published", 1U);
+    joined_after_publication.consume_explore_evidence("acceptance.placeholder.complete", 2U, 19U, 4096U);
+    joined_after_publication.consume_explore_evidence("acceptance.slot.patched", 0U, 10U, 4096U);
+    joined_after_publication.consume_explore_evidence("tile.batch.published", 1U, 0U, 4096U);
     CHECK_FALSE(joined_after_publication.acceptance_first_patch_exact);
     joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}}, 0U, 0U, {});
     CHECK(joined_after_publication.partial_generation == 2U);
@@ -5140,17 +5135,13 @@ TEST_CASE("incremental Explore audit joins exact inventories across dropped diag
     for (const auto missing : {"none", "placeholder", "patch", "count", "frame", "identity", "conflict"}) {
         INFO("missing native inventory evidence: " << missing);
         NativeAudit material;
-        const auto consume_material = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
-            material.consume(
-                {{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", event}, {"sequence", 2U}, {"value", value}, {"detail", detail}});
-        };
         const std::string_view omitted{missing};
-        if (omitted != "placeholder") consume_material("placeholder.published", 2U);
-        if (omitted == "conflict") consume_material("acceptance.placeholder.slot", 1U, 12U);
-        consume_material("acceptance.slot.patched", 0U, 10U);
-        if (omitted != "patch") consume_material("acceptance.slot.patched", 1U, omitted == "identity" ? 12U : 11U);
-        consume_material("tile.batch.published", omitted == "count" ? 1U : 2U);
-        if (omitted != "frame") consume_material("explore.frame.published", 7U);
+        if (omitted != "placeholder") material.consume_explore_evidence("placeholder.published", 2U);
+        if (omitted == "conflict") material.consume_explore_evidence("acceptance.placeholder.slot", 1U, 12U);
+        material.consume_explore_evidence("acceptance.slot.patched", 0U, 10U);
+        if (omitted != "patch") material.consume_explore_evidence("acceptance.slot.patched", 1U, omitted == "identity" ? 12U : 11U);
+        material.consume_explore_evidence("tile.batch.published", omitted == "count" ? 1U : 2U);
+        if (omitted != "frame") material.consume_explore_evidence("explore.frame.published", 7U);
         material.join_gallery_publication(3U, rendered_slots, 7U, 10U, {});
         material.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
         CHECK_FALSE(material.final_generations_for(rendered_slots, 3U, 7U).has_value());
@@ -5168,19 +5159,15 @@ TEST_CASE("incremental Explore audit joins exact inventories across dropped diag
     }
 
     NativeAudit initial;
-    const auto consume_initial = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
-        initial.consume(
-            {{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", event}, {"sequence", 2U}, {"value", value}, {"detail", detail}});
-    };
-    consume_initial("placeholder.published", 0U);
-    consume_initial("acceptance.placeholder.slot", 0U, 10U);
-    consume_initial("acceptance.slot.patched", 0U, 10U);
-    consume_initial("explore.frame.published", 7U);
-    consume_initial("tile.batch.published", 1U);
+    initial.consume_explore_evidence("placeholder.published", 0U);
+    initial.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U);
+    initial.consume_explore_evidence("acceptance.slot.patched", 0U, 10U);
+    initial.consume_explore_evidence("explore.frame.published", 7U);
+    initial.consume_explore_evidence("tile.batch.published", 1U);
     initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
     CHECK_FALSE(initial.acceptance_first_patch_exact);
     CHECK_FALSE(initial.placeholder_cardinalities.contains(2U));
-    consume_initial("acceptance.placeholder.slot", 1U, 11U);
+    initial.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U);
     initial.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
     CHECK_FALSE(initial.acceptance_first_patch_exact);
     initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
@@ -5209,17 +5196,13 @@ TEST_CASE("incremental Explore audit joins exact inventories across dropped diag
          {"none", "bitmap", "wrong-ready", "extra-ready", "patch", "identity", "frame", "observation", "physical", "late-patch"}) {
         INFO("missing partial publication evidence: " << missing);
         NativeAudit partial;
-        const auto consume_partial = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
-            partial.consume(
-                {{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", event}, {"sequence", 2U}, {"value", value}, {"detail", detail}});
-        };
-        consume_partial("placeholder.published", 0U);
+        partial.consume_explore_evidence("placeholder.published", 0U);
         for (std::uint64_t slot = 0U; slot < 3U; ++slot)
-            consume_partial("acceptance.placeholder.slot", slot, slot + 10U);
-        consume_partial("acceptance.placeholder.complete", 3U);
+            partial.consume_explore_evidence("acceptance.placeholder.slot", slot, slot + 10U);
+        partial.consume_explore_evidence("acceptance.placeholder.complete", 3U);
         if (missing != "patch" && missing != "late-patch")
-            consume_partial("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
-        consume_partial("explore.frame.published", 8U);
+            partial.consume_explore_evidence("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
+        partial.consume_explore_evidence("explore.frame.published", 8U);
         if (missing != "physical")
             partial.consume({{"kind", "gui_runtime"},
                              {"owner", "presentation"},
@@ -5229,7 +5212,7 @@ TEST_CASE("incremental Explore audit joins exact inventories across dropped diag
                              {"source_observation_revision", 11U},
                              {"source_revision", 8U},
                              {"frame_revision", 8U}});
-        if (missing == "late-patch") consume_partial("acceptance.slot.patched", 1U, 11U);
+        if (missing == "late-patch") partial.consume_explore_evidence("acceptance.slot.patched", 1U, 11U);
 
         BrowserAudit browser;
         nlohmann::json snapshot{{"gallery_generation", 2U},
@@ -5247,8 +5230,8 @@ TEST_CASE("incremental Explore audit joins exact inventories across dropped diag
             CHECK(partial.partial_generation == 2U);
             CHECK(partial.partial_first_tile_count == 1U);
             CHECK(partial.first_patched_slots.at(2U) == std::map<std::uint64_t, std::uint64_t>{{1U, 11U}});
-            consume_partial("acceptance.slot.patched", 2U, 12U);
-            consume_partial("tile.batch.published", 2U);
+            partial.consume_explore_evidence("acceptance.slot.patched", 2U, 12U);
+            partial.consume_explore_evidence("tile.batch.published", 2U);
             CHECK(partial.explore_ready_batch);
             CHECK_FALSE(partial.explore_tile_regressed);
         } else {

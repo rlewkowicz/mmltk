@@ -4375,6 +4375,7 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
     CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
 }
 
+// CLEANUP-IGNORE: Finalization-gate cancellation and viewport execution configure distinct algorithm seams.
 TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);

@@ -946,28 +946,15 @@ mod tests {
 
     #[test]
     fn viewer_dispatch_queues_latest_while_native_upscale_is_busy() {
-        let (mut app, _) = viewer_app();
-        app.reconcile_viewer();
-        let basic = app.model.explore.requested_upscale.clone().unwrap();
-        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-        app.connection = Some(Connection::new(sender));
-        app.dispatch_viewer_desired();
-        let crate::transport_connection::OutboundRecord::Intent(start) =
-            receiver.try_recv().expect("expected automatic Basic")
-        else {
-            panic!("expected automatic Basic intent");
-        };
-        assert_eq!(
-            start,
-            crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
-        );
+        let (mut app, basic, start_correlation, mut receiver) =
+            dispatch_automatic_basic();
 
         let mut busy = app.model.upscale_snapshot.clone().unwrap();
         busy.revision += 1;
         busy.busy = true;
         busy.pending = Some(basic.clone());
         app.reduce_reply(IntentReply {
-            correlation: start.correlation,
+            correlation: start_correlation,
             result: Ok(
                 crate::application_codec::IntoApplicationValue::into_application_value(
                     busy.clone(),
@@ -1024,21 +1011,8 @@ mod tests {
 
     #[test]
     fn viewer_stop_waits_for_the_inflight_start_without_reporting_busy() {
-        let (mut app, _) = viewer_app();
-        app.reconcile_viewer();
-        let basic = app.model.explore.requested_upscale.clone().unwrap();
-        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-        app.connection = Some(Connection::new(sender));
-        app.dispatch_viewer_desired();
-        let crate::transport_connection::OutboundRecord::Intent(start) =
-            receiver.try_recv().expect("expected automatic Basic")
-        else {
-            panic!("expected automatic Basic intent");
-        };
-        assert_eq!(
-            start,
-            crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
-        );
+        let (mut app, basic, start_correlation, mut receiver) =
+            dispatch_automatic_basic();
 
         app.abandon_viewer();
         assert!(app.presentation.stop_requested);
@@ -1050,7 +1024,7 @@ mod tests {
         busy.busy = true;
         busy.pending = Some(basic);
         app.reduce_reply(IntentReply {
-            correlation: start.correlation,
+            correlation: start_correlation,
             result: Ok(
                 crate::application_codec::IntoApplicationValue::into_application_value(
                     busy.clone(),
@@ -1334,6 +1308,30 @@ mod tests {
             content_height: 480,
         };
         (app, frame)
+    }
+
+    fn dispatch_automatic_basic() -> (
+        App,
+        crate::generated::UpscaleRequest,
+        u64,
+        futures_channel::mpsc::Receiver<crate::transport_connection::OutboundRecord>,
+    ) {
+        let (mut app, _) = viewer_app();
+        app.reconcile_viewer();
+        let basic = app.model.explore.requested_upscale.clone().unwrap();
+        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
+        app.connection = Some(Connection::new(sender));
+        app.dispatch_viewer_desired();
+        let crate::transport_connection::OutboundRecord::Intent(start) =
+            receiver.try_recv().expect("expected automatic Basic")
+        else {
+            panic!("expected automatic Basic intent");
+        };
+        assert_eq!(
+            start,
+            crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
+        );
+        (app, basic, start.correlation, receiver)
     }
 
     #[test]
