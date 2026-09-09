@@ -946,8 +946,7 @@ mod tests {
 
     #[test]
     fn viewer_dispatch_queues_latest_while_native_upscale_is_busy() {
-        let (mut app, basic, start_correlation, mut receiver) =
-            dispatch_automatic_basic();
+        let (mut app, basic, start_correlation, mut receiver) = dispatch_automatic_basic();
 
         let mut busy = app.model.upscale_snapshot.clone().unwrap();
         busy.revision += 1;
@@ -1011,8 +1010,7 @@ mod tests {
 
     #[test]
     fn viewer_stop_waits_for_the_inflight_start_without_reporting_busy() {
-        let (mut app, basic, start_correlation, mut receiver) =
-            dispatch_automatic_basic();
+        let (mut app, basic, start_correlation, mut receiver) = dispatch_automatic_basic();
 
         app.abandon_viewer();
         assert!(app.presentation.stop_requested);
