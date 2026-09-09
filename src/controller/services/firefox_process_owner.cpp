@@ -45,7 +45,8 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
 }
 
 [[nodiscard]] std::vector<std::string> firefox_environment(const std::filesystem::path& runtime_root,
-                                                           const std::filesystem::path& workspace_import_socket) {
+                                                           const std::filesystem::path& workspace_import_socket,
+                                                           const bool integration, const bool integration_high_dpi) {
     static constexpr std::array<std::string_view, 12U> kOverridden{"DISPLAY",
                                                                    "GDK_BACKEND",
                                                                    "LD_LIBRARY_PATH",
@@ -78,14 +79,12 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
         "pref(\"toolkit.shutdown.fastShutdownStage\", 0);\n"
         "pref(\"dom.allow_scripts_to_close_windows\", true);\n"
         "pref(\"dom.ipc.processPrelaunch.enabled\", false);\n";
-    const char* integration = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
-    if (integration && std::string_view{integration} == "1") {
+    if (integration) {
         default_preferences +=
             "pref(\"full-screen-api.allow-trusted-requests-only\", false);\n"
             "pref(\"permissions.fullscreen.allowed\", true);\n"
             "pref(\"full-screen-api.warning.timeout\", 0);\n";
-        const char* dpi = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI");
-        default_preferences += dpi && std::string_view{dpi} == "1.5" ? "pref(\"layout.css.devPixelsPerPx\", \"1.5\");\n"
+        default_preferences += integration_high_dpi ? "pref(\"layout.css.devPixelsPerPx\", \"1.5\");\n"
                                                                      : "pref(\"layout.css.devPixelsPerPx\", \"1\");\n";
     }
     result.emplace_back("MOZ_DEFAULT_PREFS=" + std::move(default_preferences));
@@ -260,7 +259,9 @@ class FirefoxProcessOwner::Implementation final {
           log_file_(std::move(config.log_file)),
           observations_(observations),
           diagnostics_(diagnostics),
-          stop_grace_(config.stop_grace) {}
+          stop_grace_(config.stop_grace),
+          integration_(config.integration),
+          integration_high_dpi_(config.integration_high_dpi) {}
 
     ~Implementation() noexcept {
         request_stop();
@@ -291,7 +292,7 @@ class FirefoxProcessOwner::Implementation final {
                                 "--height",
                                 std::to_string(kInitialFirefoxWindowHeight),
                                 page_url_};
-            environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_);
+            environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
             environment.reserve(environment_storage.size() + 1U);
             for (auto& entry : environment_storage)
                 environment.push_back(entry.data());
@@ -641,6 +642,8 @@ class FirefoxProcessOwner::Implementation final {
     const FirefoxProcessObservationTarget observations_;
     const RuntimeDiagnosticTarget diagnostics_;
     const std::chrono::milliseconds stop_grace_;
+    const bool integration_;
+    const bool integration_high_dpi_;
     mutable std::mutex mutex_;
     std::filesystem::path profile_;
     ChildCustody custody_;

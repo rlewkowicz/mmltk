@@ -27,6 +27,7 @@ use wgt::error::{ErrorType, WebGpuError};
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::fmt::Write;
 
 #[allow(unused_imports)]
 use std::mem;
@@ -431,6 +432,10 @@ impl Drop for Global {
 
 #[no_mangle]
 pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr) -> *mut Global {
+    mmltk_workspace_channel::initialize_diagnostics();
+    MMLTK_WORKSPACE_ACCEPTANCE_TRACE.get_or_init(|| {
+        std::env::var("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION").as_deref() == Ok("1")
+    });
     log::info!("Initializing WGPU server");
     let backends = wgt::Backends::VULKAN;
 
@@ -907,30 +912,30 @@ pub extern "C" fn wgpu_server_buffer_map_blocking(
     let op = wgc::resource::BufferMapOperation {
         host: map_mode,
         callback: Some(Box::new(move |status| {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback\",\"buffer\":\"{buffer_id:?}\"}}"
             ));
             if status_sender.send(status).is_ok() {
-                mmltk_workspace_channel::write_diagnostic(format_args!(
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                     "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_sent\",\"buffer\":\"{buffer_id:?}\"}}"
                 ));
             }
         })),
     };
 
-    mmltk_workspace_channel::write_diagnostic(format_args!(
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"admission\",\"buffer\":\"{buffer_id:?}\"}}"
     ));
     let submission_index;
     match global.buffer_map_async(buffer_id, offset, Some(size), op) {
         Ok(i) => {
             submission_index = i;
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"admitted\",\"buffer\":\"{buffer_id:?}\",\"submission\":\"{submission_index:?}\"}}"
             ));
         }
         Err(err) => {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"rejected\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{err:?}\"}}"
             ));
             return BufferMapAsyncStatus::from(Err(err));
@@ -941,33 +946,33 @@ pub extern "C" fn wgpu_server_buffer_map_blocking(
         submission_index: Some(submission_index),
         timeout: Some(Duration::from_secs(60)),
     };
-    mmltk_workspace_channel::write_diagnostic(format_args!(
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_started\",\"buffer\":\"{buffer_id:?}\"}}"
     ));
     if let Err(err) = global.device_poll(device_id, poll_type) {
-        mmltk_workspace_channel::write_diagnostic(format_args!(
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_failed\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{err:?}\"}}"
         ));
         return BufferMapAsyncStatus::from(Err(err));
     }
-    mmltk_workspace_channel::write_diagnostic(format_args!(
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"poll_completed\",\"buffer\":\"{buffer_id:?}\"}}"
     ));
 
-    mmltk_workspace_channel::write_diagnostic(format_args!(
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_wait\",\"buffer\":\"{buffer_id:?}\"}}"
     ));
     let status_result = match status_receiver.recv_timeout(Duration::from_secs(60)) {
         Ok(status) => status,
         Err(error) => {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"callback_wait_failed\",\"buffer\":\"{buffer_id:?}\",\"error\":\"{error}\"}}"
             ));
             return BufferMapAsyncStatus::Error;
         }
     };
 
-    mmltk_workspace_channel::write_diagnostic(format_args!(
+    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.webgpu.blocking_map\",\"detail\":\"settled\",\"buffer\":\"{buffer_id:?}\"}}"
     ));
     BufferMapAsyncStatus::from(status_result)
@@ -2020,11 +2025,10 @@ impl MmltkWorkspaceMailboxes {
     }
 }
 
+static MMLTK_WORKSPACE_ACCEPTANCE_TRACE: OnceLock<bool> = OnceLock::new();
+
 fn mmltk_workspace_acceptance_trace_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION").as_deref() == Ok("1")
-    })
+    MMLTK_WORKSPACE_ACCEPTANCE_TRACE.get().copied().unwrap_or(false)
 }
 
 impl MmltkWorkspaceFrameSnapshot {
@@ -2380,7 +2384,7 @@ fn submit_mmltk_workspace_transfer(
         if let Some(identity) = visible_identity {
             let retry_required = entry.mailboxes.note_capacity_exhausted(identity);
             if mmltk_workspace_acceptance_trace_enabled() {
-                mmltk_workspace_channel::write_diagnostic(format_args!(
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                     "{{\"event\":\"firefox.workspace.frame_deferred\",\"surface\":\"{}\",\"detail\":\"{}\",\"layer\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{}}}",
                     entry.surface_id,
                     if retry_required { "newest_pending" } else { "already_presented" },
@@ -2420,7 +2424,7 @@ fn submit_mmltk_workspace_transfer(
         )
     };
     if mmltk_workspace_acceptance_trace_enabled() {
-        mmltk_workspace_channel::write_diagnostic(format_args!(
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.workspace.frame_forwarded\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{}}}",
             entry.surface_id,
             identity.layer,
@@ -2879,7 +2883,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                     let retry_required =
                                         entry.mailboxes.take_retry_after_release(identity);
                                     if mmltk_workspace_acceptance_trace_enabled() {
-                                        mmltk_workspace_channel::write_diagnostic(format_args!(
+                                        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                                             "{{\"event\":\"firefox.workspace.slot_released\",\"surface\":\"{}\",\"detail\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{}}}",
                                             surface_id,
                                             if retry_required { "retry_newer" } else { "settled" },
@@ -3024,7 +3028,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
             if edges != 0 {
                 let snapshot = entry.frame_signal.read();
                 if mmltk_workspace_acceptance_trace_enabled() {
-                    mmltk_workspace_channel::write_diagnostic(format_args!(
+                    mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                         "{{\"event\":\"firefox.workspace.frame_edge\",\"surface\":\"{}\",\"edges\":{},\"snapshot\":\"{:?}\"}}",
                         entry.surface_id, edges, snapshot
                     ));
@@ -3533,12 +3537,12 @@ impl MmltkWorkspacePixels {
                       frame: Option<(MmltkWorkspaceFrameIdentity, usize, MmltkWorkspaceFrameSnapshot)>) {
         if !mmltk_workspace_acceptance_trace_enabled() { return; }
         if let Some((identity, index, snapshot)) = frame {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\",\"layer\":{},\"slot\":{},\"presentation_revision\":{},\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{}}}",
                 identity.layer, index % MMLTK_WORKSPACE_MAILBOX_SLOTS, identity.presentation_revision,
                 snapshot.transfer_sequence, identity.session, identity.sequence));
         } else {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\"}}"));
         }
     }
@@ -3604,7 +3608,7 @@ impl MmltkWorkspacePixels {
         let samples = unsafe { std::slice::from_raw_parts(
             (self.mapped + receipt.copy_index * Self::SLOT_BYTES) as *const u32, Self::SAMPLES * 2) };
         for (index, rgba) in samples.iter().enumerate() {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.pixel\",\"boundary\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"sample_index\":{},\"sample_x\":{},\"sample_y\":{},\"sample_rgba\":{}}}",
                 if index < Self::SAMPLES { "import" } else { "mailbox" }, surface,
                 identity.layer, slot, identity.session, identity.sequence, identity.presentation_revision,
@@ -3978,7 +3982,7 @@ impl Global {
         id: mmltk_workspace_channel::SurfaceId,
     ) -> Result<OwnedFd, MmltkWorkspaceImportError> {
         if mmltk_workspace_channel::workspace_diagnostics_enabled() {
-            mmltk_workspace_channel::write_diagnostic(format_args!(
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.claim_requested\",\"surface\":\"{id}\",\"device_id\":\"{device_id:?}\",\"texture_id\":\"{texture_id:?}\",\"width\":{},\"height\":{}}}",
                 desc.size.width, desc.size.height
             ));
@@ -4827,7 +4831,7 @@ impl Global {
                         Ok(timeline) => mmltk_workspace_channel::send_ready(workspace_id, timeline),
                         Err(error) => {
                             if mmltk_workspace_channel::workspace_diagnostics_enabled() {
-                                mmltk_workspace_channel::write_diagnostic(format_args!(
+                                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                                     "{{\"event\":\"firefox.workspace.texture_creation_failed\",\"surface\":\"{workspace_id}\",\"code\":{},\"stride\":{},\"size\":{}}}",
                                     error.code, error.stride, error.size
                                 ));

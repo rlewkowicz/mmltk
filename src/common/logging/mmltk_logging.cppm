@@ -25,6 +25,10 @@ struct LoggingConfig {
     std::optional<spdlog::level::level_enum> level;
     std::optional<std::filesystem::path> log_file;
     std::optional<std::filesystem::path> log_dir;
+
+    [[nodiscard]] bool enabled() const noexcept {
+        return level ? *level != spdlog::level::off : log_file.has_value() || log_dir.has_value();
+    }
 };
 
 [[nodiscard]] LoggingConfig default_config(std::string app_name);
@@ -60,7 +64,7 @@ template <typename Emit>
 inline void log_if_enabled(const spdlog::level::level_enum candidate, Emit&& emit) {
     if (!enabled(candidate)) { return; }
     auto current = root_logger();
-    std::invoke(std::forward<Emit>(emit), *current);
+    if (current != nullptr) { std::invoke(std::forward<Emit>(emit), *current); }
 }
 
 template <typename Emit>
@@ -68,7 +72,7 @@ template <typename Emit>
 inline void log_if_enabled(const std::string_view name, const spdlog::level::level_enum candidate, Emit&& emit) {
     if (!enabled(candidate)) { return; }
     auto current = logger(name);
-    std::invoke(std::forward<Emit>(emit), *current);
+    if (current != nullptr) { std::invoke(std::forward<Emit>(emit), *current); }
 }
 
 template <typename Emit>

@@ -27,6 +27,11 @@ namespace {
 using domain::AnnotationEditorFacts;
 using domain::AnnotationSceneContent;
 
+[[nodiscard]] bool annotation_diagnostics_enabled() noexcept {
+    static const bool enabled = std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS") != nullptr;
+    return enabled;
+}
+
 inline constexpr std::size_t kHistoryCapacity = 32U;
 
 enum class AnnotationPointerAction : std::uint8_t {
@@ -1063,7 +1068,7 @@ class AnnotationDocument::Impl final {
         return Result(reduce_open(state_, std::move(content)), "open");
     }
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer& pointer) {
-        if (std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS")) {
+        if (diagnostics_enabled_) {
             std::fprintf(stderr,
                          "{\"event\":\"annotation.pointer\",\"interaction_id\":%llu,\"sequence\":%llu,\"phase\":%u,\"target\":%d,\"x\":%."
                          "3f,\"y\":%.3f,\"radius\":%u}\n",
@@ -1165,7 +1170,7 @@ class AnnotationDocument::Impl final {
         }
         state_.ui.can_undo = !state_.undo.empty();
         state_.ui.can_redo = !state_.redo.empty();
-        if (std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS")) {
+        if (diagnostics_enabled_) {
             std::fprintf(stderr,
                          "{\"event\":\"annotation.document\",\"operation\":\"%.*s\",\"outcome\":%u,\"tool\":%u,\"document_revision\":%llu,"
                          "\"interaction_revision\":%llu,\"selected\":%d,\"reason\":\"%.*s\"}\n",
@@ -1183,6 +1188,7 @@ class AnnotationDocument::Impl final {
                 .detail = std::string{"Annotation "} + std::string{operation} + ": " + std::string{state_.rejection}};
     }
 
+    const bool diagnostics_enabled_ = annotation_diagnostics_enabled();
     DocumentState state_;
     std::uint64_t next_save_generation_ = 1U;
 };

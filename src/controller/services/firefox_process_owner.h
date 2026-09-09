@@ -20,6 +20,8 @@ struct FirefoxProcessConfig final {
     std::filesystem::path executable;
     std::string page_url;
     std::filesystem::path log_file{};
+    bool integration = false;
+    bool integration_high_dpi = false;
     std::chrono::milliseconds stop_grace{std::chrono::seconds{5}};
 };
 

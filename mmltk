@@ -43,12 +43,26 @@ release_frontend_dist_dir="${cmake_cache_root}/release/frontend/iced/dist"
 uid="$(id -u)"
 gid="$(id -g)"
 
+gui_diagnostics_quiet=0
+for wrapper_argument in "$@"; do
+    if [[ "${wrapper_argument}" == "--gui" ]]; then gui_diagnostics_quiet=1; fi
+done
+wrapper_log_level="${MMLTK_LOG_LEVEL:-}"
+if [[ -n "${MMLTK_GUI_TRACE_FILE:-}${MMLTK_ANNOTATION_DIAGNOSTICS:-}" || "${MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION:-}" == "1" ]] ||
+    [[ "${wrapper_log_level,,}" != "off" && -n "${wrapper_log_level}${MMLTK_LOG_FILE:-}${MMLTK_LOG_DIR:-}" ]]; then
+    gui_diagnostics_quiet=0
+fi
+
 log() {
     printf 'mmltk: %s\n' "$*" >&2
 }
 
+error() {
+    printf 'mmltk: %s\n' "$*" >&2
+}
+
 die() {
-    log "$*"
+    error "$*"
     exit 1
 }
 
@@ -210,10 +224,10 @@ resolve_real_user() {
     fi
 
     if [[ -z "${target_user}" ]]; then
-        log "warning: running as root, no real user found (set MMLTK_USER to override)"
+        error "warning: running as root, no real user found (set MMLTK_USER to override)"
         return 0
     fi
-    log "running as root, resolved container user to ${target_user} (${uid}:${gid})"
+    if (( ! gui_diagnostics_quiet )); then log "running as root, resolved container user to ${target_user} (${uid}:${gid})"; fi
 }
 resolve_real_user
 
@@ -398,7 +412,7 @@ cleanup_owned_container() {
             cleanup_status=0
         fi
         if (( cleanup_status != 0 )); then
-            log "container cleanup did not complete within its bounded deadline"
+            error "container cleanup did not complete within its bounded deadline"
             if (( exit_status == 0 )); then
                 exit_status=1
             fi
@@ -565,7 +579,7 @@ ensure_docker() {
         return 0
     fi
 
-    log "docker daemon is unavailable; attempting a best-effort start"
+    if (( ! gui_diagnostics_quiet )); then log "docker daemon is unavailable; attempting a best-effort start"; fi
     best_effort_start_docker || true
     if docker_server_ready; then
         cleanup_stale_wrapper_containers
@@ -703,7 +717,7 @@ cleanup_stale_wrapper_containers() {
         if [[ -n "${live_start}" && "${live_start}" == "${owner_start}" ]]; then
             continue
         fi
-        log "removing orphaned wrapper container ${candidate_id}"
+        if (( ! gui_diagnostics_quiet )); then log "removing orphaned wrapper container ${candidate_id}"; fi
         docker rm -f "${candidate_id}" >/dev/null 2>&1 || true
     done
 }
@@ -714,7 +728,7 @@ ensure_buildx_builder() {
 
     local inspect_output=""
     if ! inspect_output="$(docker buildx inspect "${buildx_builder_name}" 2>/dev/null)"; then
-        log "creating checkout-scoped Buildx builder '${buildx_builder_name}'"
+        if (( ! gui_diagnostics_quiet )); then log "creating checkout-scoped Buildx builder '${buildx_builder_name}'"; fi
         local create_output=""
         if ! create_output="$(docker buildx create \
             --name "${buildx_builder_name}" \
@@ -799,7 +813,7 @@ cached_buildx_image() {
             || [[ "$(<"${fingerprint_file}")" != "${fingerprint}" ]]; then
             printf '%s\n' "${fingerprint}" >"${fingerprint_file}"
         fi
-        if [[ "${cache_name}" == runtime ]]; then log "runtime image is current"; fi
+        if [[ "${cache_name}" == runtime ]] && (( ! gui_diagnostics_quiet )); then log "runtime image is current"; fi
         trace_build_event "${trace_event}" cache_hit
         return 0
     fi
@@ -825,9 +839,9 @@ cached_buildx_image() {
     local -a target_args=()
     if [[ "${target}" != "-" ]]; then
         target_args+=(--target "${target}")
-        log "building cached image '${tag}' from target '${target}'"
+        if (( ! gui_diagnostics_quiet )); then log "building cached image '${tag}' from target '${target}'"; fi
     else
-        log "building cached image '${tag}'"
+        if (( ! gui_diagnostics_quiet )); then log "building cached image '${tag}'"; fi
     fi
     trace_build_event "${trace_event}" cache_miss
     local build_status=0
@@ -845,7 +859,7 @@ cached_buildx_image() {
         :
     else
         build_status=$?
-        log "failed to build cached image '${tag}' (exit ${build_status})"
+        error "failed to build cached image '${tag}' (exit ${build_status})"
         return "${build_status}"
     fi
     docker image inspect "${tag}" >/dev/null 2>&1 || die "image '${tag}' was not loaded"
@@ -1194,7 +1208,7 @@ ensure_analysis_image() {
         analysis_image_id="$(docker image inspect "${analysis_image_name}" --format '{{.Id}}')"
     fi
     if [[ "${analysis_image_id}" != "${build_image_id}" ]]; then
-        log "tagging source-free toolchain as analysis image '${analysis_image_name}'"
+        if (( ! gui_diagnostics_quiet )); then log "tagging source-free toolchain as analysis image '${analysis_image_name}'"; fi
         docker tag "${build_image_name}" "${analysis_image_name}"
     fi
 }
@@ -1213,8 +1227,8 @@ prepare_tidy_logging() {
     export MMLTK_TIDY_LOG_FILE="${tidy_log_file}"
     export MMLTK_TIDY_TEE_STARTED=1
     exec > >(tee -a "${tidy_log_file}") 2>&1
-    log "writing tidy log to ${tidy_log_file}"
-    log "tail with: tail -f ${tidy_log_file}"
+    if (( ! gui_diagnostics_quiet )); then log "writing tidy log to ${tidy_log_file}"; fi
+    if (( ! gui_diagnostics_quiet )); then log "tail with: tail -f ${tidy_log_file}"; fi
 }
 
 container_exists() {
@@ -1300,21 +1314,21 @@ infer_gui_environment_from_target_processes() {
             value="$(env_value_from_text "${env_text}" XDG_RUNTIME_DIR)"
             if [[ -n "${value}" ]]; then
                 XDG_RUNTIME_DIR="${value}"
-                log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+                if (( ! gui_diagnostics_quiet )); then log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"; fi
             fi
         fi
         if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
             value="$(env_value_from_text "${env_text}" WAYLAND_DISPLAY)"
             if [[ -n "${value}" ]]; then
                 WAYLAND_DISPLAY="${value}"
-                log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+                if (( ! gui_diagnostics_quiet )); then log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"; fi
             fi
         fi
         if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
             value="$(env_value_from_text "${env_text}" DBUS_SESSION_BUS_ADDRESS)"
             if [[ -n "${value}" ]]; then
                 DBUS_SESSION_BUS_ADDRESS="${value}"
-                log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+                if (( ! gui_diagnostics_quiet )); then log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"; fi
             fi
         fi
 
@@ -1333,7 +1347,7 @@ infer_gui_common_environment() {
         runtime_dir="$(default_xdg_runtime_dir)" || true
         if [[ -n "${runtime_dir}" ]]; then
             XDG_RUNTIME_DIR="${runtime_dir}"
-            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"; fi
         fi
     fi
 
@@ -1341,7 +1355,7 @@ infer_gui_common_environment() {
         local dbus_socket_path="${XDG_RUNTIME_DIR}/bus"
         if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
             DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket_path}"
-            log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"; fi
         fi
     fi
 }
@@ -1372,10 +1386,10 @@ infer_gui_wayland_environment() {
         runtime_dir="$(default_xdg_runtime_dir)" || true
         if [[ -n "${runtime_dir}" ]]; then
             XDG_RUNTIME_DIR="${runtime_dir}"
-            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"; fi
         elif [[ "${WAYLAND_DISPLAY:-}" == /* ]]; then
             XDG_RUNTIME_DIR="${WAYLAND_DISPLAY%/*}"
-            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"; fi
         fi
     fi
 
@@ -1387,10 +1401,10 @@ infer_gui_wayland_environment() {
 
         if [[ -n "${display_name}" ]]; then
             WAYLAND_DISPLAY="${display_name}"
-            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY} from ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY} from ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"; fi
         else
             WAYLAND_DISPLAY="wayland-0"
-            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+            if (( ! gui_diagnostics_quiet )); then log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"; fi
         fi
     fi
 }
@@ -1422,7 +1436,7 @@ resolve_gui_dbus_forwarding() {
             gui_dbus_socket_host_path="${dbus_socket_path}"
             gui_dbus_socket_container_path="${gui_runtime_dir_container}/$(basename "${dbus_socket_path}")"
         else
-            log "warning: DBUS session bus socket '${dbus_socket_path}' is unavailable; skipping DBUS session bus forwarding"
+            error "warning: DBUS session bus socket '${dbus_socket_path}' is unavailable; skipping DBUS session bus forwarding"
         fi
     fi
 }
@@ -1731,7 +1745,7 @@ ensure_container() {
 
     desired_runtime_label="$(desired_container_runtime_label)"
     if container_exists && [[ "$(container_runtime_label)" != "${desired_runtime_label}" ]]; then
-        log "recreating ${container_name} for updated runtime configuration"
+        if (( ! gui_diagnostics_quiet )); then log "recreating ${container_name} for updated runtime configuration"; fi
         docker rm -f "${container_name}" >/dev/null 2>&1 || true
     fi
 
@@ -1747,7 +1761,7 @@ ensure_container() {
     fi
 
     if ! container_running; then
-        log "recreating ${container_name} because it did not stay running"
+        if (( ! gui_diagnostics_quiet )); then log "recreating ${container_name} because it did not stay running"; fi
         docker rm -f "${container_name}" >/dev/null 2>&1 || true
         local -a run_args=()
         build_run_args
@@ -1765,7 +1779,7 @@ terminate_existing_gui_instances() {
     if docker exec -u 0 "${container_name}" /bin/sh -lc '
         pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1
     ' >/dev/null 2>&1; then
-        log "terminating existing GUI runtime before starting a new one"
+        if (( ! gui_diagnostics_quiet )); then log "terminating existing GUI runtime before starting a new one"; fi
     fi
 
     shutdown_gui_runtime_in_container TERM 100 || true
@@ -1802,8 +1816,6 @@ build_exec_env_args() {
     fi
     if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
         exec_env_args+=(-e "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
-    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
-        exec_env_args+=(-e "MMLTK_LOG_DIR=/host${repo_root}/.mmltk-data/logs")
     fi
     if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
         exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
@@ -2071,14 +2083,14 @@ prepare_firefox_build_input() {
     else
         mv -f -- "${next_fingerprint}" "${firefox_build_input_file}"
         chown "${uid}:${gid}" "${firefox_build_input_file}" 2>/dev/null || true
-        log "Firefox build inputs changed"
+        if (( ! gui_diagnostics_quiet )); then log "Firefox build inputs changed"; fi
     fi
 
     if [[ "${completed_fingerprint}" == "${legacy_fingerprint}" ]] \
         && firefox_runtime_cache_complete; then
         cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
         chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
-        log "adopted the completed Firefox runtime into the isolated build definition"
+        if (( ! gui_diagnostics_quiet )); then log "adopted the completed Firefox runtime into the isolated build definition"; fi
     fi
 
     local legacy_runtime_stamp=
@@ -2092,13 +2104,13 @@ prepare_firefox_build_input() {
         if [[ -z "${newer_source}" ]]; then
             cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
             chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
-            log "adopted the completed Firefox runtime into fingerprinted build state"
+            if (( ! gui_diagnostics_quiet )); then log "adopted the completed Firefox runtime into fingerprinted build state"; fi
         fi
     fi
 }
 
 run_release_ninja() {
-    log "building the unified Release Ninja graph with ${build_jobs} workers on CPUs ${build_cpu_list}"
+    if (( ! gui_diagnostics_quiet )); then log "building the unified Release Ninja graph with ${build_jobs} workers on CPUs ${build_cpu_list}"; fi
     run_toolchain_command \
         'set -euo pipefail
          capture_compiler_cache_stats() {
@@ -2145,7 +2157,7 @@ run_protocol_generation() {
     prepare_cache_layout
     ensure_build_image
     prepare_firefox_build_input
-    log "generating Protocol-13 cross-language bindings and fixtures"
+    if (( ! gui_diagnostics_quiet )); then log "generating Protocol-13 cross-language bindings and fixtures"; fi
     run_owned_toolchain_command "${release_build_container_name}-protocol-generation" \
         'set -euo pipefail
          cargo fetch --locked \
@@ -2170,7 +2182,7 @@ run_application_bindings_generation() {
     ensure_docker
     prepare_cache_layout
     ensure_build_image
-    log "generating typed application bindings"
+    if (( ! gui_diagnostics_quiet )); then log "generating typed application bindings"; fi
     run_owned_toolchain_command "${release_build_container_name}-application-bindings-generation" \
         'set -euo pipefail
          /workspace/tools/configure_cmake_graph.sh \
@@ -2192,7 +2204,7 @@ run_shiftlut_export() {
     ensure_docker
     prepare_cache_layout
     ensure_build_image
-    log "ShiftLUT ${shiftlut_operation}"
+    if (( ! gui_diagnostics_quiet )); then log "ShiftLUT ${shiftlut_operation}"; fi
     run_owned_toolchain_command "${release_build_container_name}-shiftlut-export" \
         'set -euo pipefail
          build="${MMLTK_CONTAINER_CACHE_ROOT}/cmake/shiftlut-export"
@@ -2375,7 +2387,7 @@ stage_release_and_runtime() {
     if runtime_package_complete "${release_stage_root}" \
         && [[ -f "${release_stage_root}/.mmltk-package-fingerprint" ]] \
         && [[ "$(<"${release_stage_root}/.mmltk-package-fingerprint")" == "${package_fingerprint}" ]]; then
-        log "staged release is current"
+        if (( ! gui_diagnostics_quiet )); then log "staged release is current"; fi
         trace_build_event package cache_hit
         build_configured_runtime_image "${release_stage_root}"
         return
@@ -2384,7 +2396,7 @@ stage_release_and_runtime() {
     trace_build_event package cache_miss
     local next_stage="${release_stage_root}.next"
     export MMLTK_PACKAGE_FINGERPRINT="${package_fingerprint}"
-    log "installing release into ${next_stage}"
+    if (( ! gui_diagnostics_quiet )); then log "installing release into ${next_stage}"; fi
     run_owned_toolchain_command "${package_build_container_name}" \
         'set -euo pipefail
          next_stage="${MMLTK_CONTAINER_RELEASE_STAGE_ROOT}.next"
@@ -2416,7 +2428,7 @@ wait_for_parallel_builds() {
             remaining=$((remaining - 1))
         else
             exit_status=$?
-            log "parallel build job failed with exit status ${exit_status}; stopping its peer"
+            error "parallel build job failed with exit status ${exit_status}; stopping its peer"
             terminate_active_builds
             return "${exit_status}"
         fi
@@ -2431,7 +2443,7 @@ run_gui_build() {
     ensure_docker
     prepare_cache_layout
     ensure_build_image
-    log "building iced Release bundle into ${gui_frontend_dist_dir}"
+    if (( ! gui_diagnostics_quiet )); then log "building iced Release bundle into ${gui_frontend_dist_dir}"; fi
     run_owned_toolchain_command "${gui_build_container_name}" \
         'set -euo pipefail
          cargo fetch --locked \
@@ -2457,7 +2469,7 @@ run_gui_lock_update() {
     ensure_docker
     prepare_cache_layout
     ensure_build_image
-    log "updating iced dependency lock for the native browser test graph"
+    if (( ! gui_diagnostics_quiet )); then log "updating iced dependency lock for the native browser test graph"; fi
     run_owned_toolchain_command "${gui_build_container_name}" \
         'set -euo pipefail
          cargo fetch \
@@ -2541,7 +2553,7 @@ run_io_diagnostic() {
     local diagnostic_image_id
     diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
         die "diagnostic requires existing image '${build_image_name}'; no image was built or pulled"
-    log "read-only I/O capability report in ${build_image_name}; no dataset reads or benchmarks"
+    if (( ! gui_diagnostics_quiet )); then log "read-only I/O capability report in ${build_image_name}; no dataset reads or benchmarks"; fi
     local -a diagnostic_args=(
         run --rm --init
         --read-only --cap-drop ALL --security-opt no-new-privileges
@@ -2595,7 +2607,7 @@ run_nvidia_payload_diagnostic() {
     docker_server_ready || die "docker daemon is unavailable; diagnostic did not start"
     diagnostic_image_id="$(docker image inspect "${diagnostic_image}" --format '{{.Id}}' 2>/dev/null)" ||
         die "diagnostic requires existing image '${diagnostic_image}'; no image was built or pulled"
-    log "read-only NVIDIA header inventory in ${diagnostic_image}"
+    if (( ! gui_diagnostics_quiet )); then log "read-only NVIDIA header inventory in ${diagnostic_image}"; fi
     docker run --rm --init --read-only --cap-drop ALL --security-opt no-new-privileges \
         --network none --user "${uid}:${gid}" \
         --env PYTHONDONTWRITEBYTECODE=1 \
@@ -2630,7 +2642,7 @@ run_cleanup_report() {
     ensure_build_image
     local selector
     for selector in "${selectors[@]}"; do
-        log "generating ${selector#--} cleanup report"
+        if (( ! gui_diagnostics_quiet )); then log "generating ${selector#--} cleanup report"; fi
         run_owned_toolchain_command "${cleanup_report_container_name}" \
             "set -euo pipefail
              node /workspace/tools/generate_cleanup_json.mjs ${selector}"
@@ -2703,8 +2715,6 @@ run_test_executable() {
     fi
     if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
         docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
-    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
-        docker_args+=(--env MMLTK_LOG_DIR=/workspace/.mmltk-data/logs)
     fi
     if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
         docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
@@ -2954,7 +2964,7 @@ run_tests() {
         done
         local browser_test_configuration
         printf -v browser_test_configuration '%q' "-DMMLTK_ICED_TEST_ARGUMENTS=${browser_test_arguments}"
-        log "running iced browser application tests"
+        if (( ! gui_diagnostics_quiet )); then log "running iced browser application tests"; fi
         run_owned_toolchain_command "${test_run_container_name}" \
             'set -euo pipefail
              /workspace/tools/configure_cmake_graph.sh \
@@ -2980,7 +2990,7 @@ run_tests() {
         ensure_docker
         prepare_cache_layout
         ensure_build_image
-        log "running cleanup tooling fixture tests"
+        if (( ! gui_diagnostics_quiet )); then log "running cleanup tooling fixture tests"; fi
         run_owned_toolchain_command "${test_run_container_name}" \
             'set -euo pipefail
              node --test /workspace/tools/tests/generate_cleanup_json.test.mjs'
@@ -2997,7 +3007,7 @@ run_tests() {
             die "--test log-query-tool does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) ||
             die "--test log-query-tool does not accept --env"
-        log "running log query tooling fixture tests"
+        if (( ! gui_diagnostics_quiet )); then log "running log query tooling fixture tests"; fi
         run_log_tool test
         return 0
     fi
@@ -3183,7 +3193,7 @@ run_tests() {
         local inventory_target_list="${all_native_test_targets[*]}"
         test_inventory_audit="python3 /workspace/tools/audit_test_inventory.py --compile-database \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}/compile_commands.json\" --repo-root /workspace --expected-targets \"${inventory_target_list}\""
     fi
-    log "building cached ${suite} test graph with ${build_jobs} workers"
+    if (( ! gui_diagnostics_quiet )); then log "building cached ${suite} test graph with ${build_jobs} workers"; fi
     run_owned_toolchain_command "${test_build_container_name}" \
         "set -euo pipefail
          /workspace/tools/configure_cmake_graph.sh \
@@ -3208,7 +3218,7 @@ run_tests() {
             workspace_wayland_product_window_close
             workspace_wayland_product_peer_loss
         )
-        log "enumerating ${executables[0]} hardware cases"
+        if (( ! gui_diagnostics_quiet )); then log "enumerating ${executables[0]} hardware cases"; fi
         if ! workspace_wayland_inventory="$(
             run_workspace_wayland_test_executable \
                 "${container_cache_root}/cmake/${build_directory}/${executables[0]}" \
@@ -3225,7 +3235,7 @@ run_tests() {
                 die "workspace-wayland executable is missing expected hardware case '${workspace_wayland_case}'"
             }
         done
-        log "running ${executables[0]}"
+        if (( ! gui_diagnostics_quiet )); then log "running ${executables[0]}"; fi
         local workspace_wayland_status=0
         if run_workspace_wayland_test_executable \
                 "${container_cache_root}/cmake/${build_directory}/${executables[0]}" \
@@ -3241,7 +3251,7 @@ run_tests() {
     local first_failure=0
     local executable
     for executable in "${executables[@]}"; do
-        log "running ${executable}"
+        if (( ! gui_diagnostics_quiet )); then log "running ${executable}"; fi
         local exit_status=0
         local -a executable_args=("${suite_args[@]}")
         if run_test_executable "${container_cache_root}/cmake/${build_directory}/${executable}" "${executable_args[@]}"; then
@@ -3334,7 +3344,7 @@ prepare_container_invocation() {
 
     if (( gui_mode )); then
         container_command=(/opt/mmltk/bin/mmltk-browser-host "${rewritten_args[@]}")
-        log "using packaged browser host and GUI bundle"
+        if (( ! gui_diagnostics_quiet )); then log "using packaged browser host and GUI bundle"; fi
     else
         container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
     fi

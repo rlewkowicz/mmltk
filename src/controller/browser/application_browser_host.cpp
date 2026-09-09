@@ -331,7 +331,7 @@ transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const no
         .opened = &Impl::Opened,
         .record = &Impl::Record,
         .closed = &Impl::Closed,
-        .diagnostic = &Impl::Diagnostic,
+        .diagnostic = impl_->diagnostics.valid() ? &Impl::Diagnostic : nullptr,
     };
 }
 

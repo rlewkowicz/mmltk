@@ -63,8 +63,10 @@ impl App {
             crate::view::explore::Outcome::OpenRequested => {
                 let local_edits = self.settings.has_local_edits();
                 let open_available = self.model.explore_open_available();
-                self.integration
-                    .observe_explore_open_request(local_edits, open_available);
+                if let Some(integration) = self.integration.as_mut() {
+                    integration
+                        .observe_explore_open_request(local_edits, open_available);
+                }
                 if local_edits || !open_available {
                     self.model.error = Some(UiError::busy(
                         "Explore is unavailable or already changing state.",
@@ -81,25 +83,27 @@ impl App {
                         Some(UiError::invalid("Explore settings are not installed yet."));
                     return Task::none();
                 };
-                let columns = settings
-                    .settingsstate
-                    .workflows
-                    .explore
-                    .gridwidth
-                    .clamp(1, 99) as u32;
                 if !settings.exploresource.available {
                     self.model.error = Some(UiError::invalid(
                         "The selected Explore dataset has no compiled artifact path.",
                     ));
                     return Task::none();
                 }
-                self.integration.observe_explore_open_layout(
-                    self.workspace
-                        .explore_measured_viewport(columns, 0, 0)
-                        .is_some(),
-                    self.model.explore.snapshot.as_ref(),
-                    columns,
-                );
+                if let Some(integration) = self.integration.as_mut() {
+                    let columns = settings
+                        .settingsstate
+                        .workflows
+                        .explore
+                        .gridwidth
+                        .clamp(1, 99) as u32;
+                    integration.observe_explore_open_layout(
+                        self.workspace
+                            .explore_measured_viewport(columns, 0, 0)
+                            .is_some(),
+                        self.model.explore.snapshot.as_ref(),
+                        columns,
+                    );
+                }
                 self.model.explore.desired_open = true;
                 self.dispatch_explore_desired();
             }
@@ -145,7 +149,9 @@ impl App {
                     ));
                     return Task::none();
                 };
-                self.integration.observe_upscale_request(kernel);
+                if let Some(integration) = self.integration.as_mut() {
+                    integration.observe_upscale_request(kernel);
+                }
                 self.model
                     .request_upscale(crate::generated::UpscaleRequest {
                         source,
@@ -168,12 +174,14 @@ impl App {
             crate::view::explore::Outcome::FilterEdited(request) => {
                 let local_edits = self.settings.has_local_edits();
                 let mutation_available = self.model.explore_mutation_available();
-                self.integration.observe_explore_filter_request(
-                    &request,
-                    self.model.explore.snapshot.as_ref(),
-                    local_edits,
-                    mutation_available,
-                );
+                if let Some(integration) = self.integration.as_mut() {
+                    integration.observe_explore_filter_request(
+                        &request,
+                        self.model.explore.snapshot.as_ref(),
+                        local_edits,
+                        mutation_available,
+                    );
+                }
                 if local_edits || !mutation_available {
                     self.model.error = Some(UiError::busy(
                         "Explore filters are unavailable or already changing.",
@@ -383,8 +391,10 @@ impl App {
                 ApplicationIntentEndpoint::ExploreUpdateFilter,
                 |correlation| crate::generated::encode_explore_UpdateFilter(correlation, request),
             );
-            self.integration
-                .observe_explore_filter_submission(submitted);
+            if let Some(integration) = self.integration.as_mut() {
+                integration
+                    .observe_explore_filter_submission(submitted);
+            }
             if submitted {
                 self.model.explore.desired_filter = None;
                 self.model.explore.desired_overlay = None;
@@ -469,11 +479,13 @@ impl App {
             .gridwidth
             .clamp(1, 99) as u32;
         let Some(viewport) = self.workspace.explore_measured_viewport(columns, 0, 0) else {
-            self.integration.observe_explore_open_layout(
-                false,
-                self.model.explore.snapshot.as_ref(),
-                columns,
-            );
+            if let Some(integration) = self.integration.as_mut() {
+                integration.observe_explore_open_layout(
+                    false,
+                    self.model.explore.snapshot.as_ref(),
+                    columns,
+                );
+            }
             return;
         };
         let compiled_source = settings.exploresource.compiledsource.clone();
@@ -487,7 +499,9 @@ impl App {
                     },
                 )
             });
-        self.integration.observe_explore_open_submission(submitted);
+        if let Some(integration) = self.integration.as_mut() {
+            integration.observe_explore_open_submission(submitted);
+        }
         if submitted {
             self.model.explore.desired_open = false;
         }

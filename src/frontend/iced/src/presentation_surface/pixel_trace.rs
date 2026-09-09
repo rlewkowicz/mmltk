@@ -1,22 +1,16 @@
 use super::{Surface, wgpu};
 use std::sync::{Arc, Mutex};
 
+thread_local! {
+    static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn initialize(enabled: bool) {
+    ENABLED.with(|flag| flag.set(enabled));
+}
+
 pub(crate) fn enabled() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        thread_local! {
-            static ENABLED: bool = web_sys::window()
-                .and_then(|window| window.location().search().ok())
-                .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-                .and_then(|params| params.get("mmltk_pixel_trace"))
-                .is_some_and(|value| value == "1");
-        }
-        ENABLED.with(|enabled| *enabled)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        false
-    }
+    ENABLED.with(std::cell::Cell::get)
 }
 
 // One active mapping and one newest owned image. No external mailbox borrow

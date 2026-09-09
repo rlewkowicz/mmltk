@@ -34,11 +34,13 @@ impl App {
                 let authoritative_route = authoritative.settingsstate.currentview;
                 self.settings.reset(&authoritative);
                 self.rebase_page(authoritative_route);
-                self.integration.observe_authoritative_route(
-                    "settings.reply",
-                    authoritative_route,
-                    self.workspace.active(),
-                );
+                if let Some(integration) = self.integration.as_mut() {
+                    integration.observe_authoritative_route(
+                        "settings.reply",
+                        authoritative_route,
+                        self.workspace.active(),
+                    );
+                }
             } else {
                 self.settings.settle_failure(None);
                 self.model.error = Some(UiError::protocol(
@@ -54,11 +56,13 @@ impl App {
             let authoritative_route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
             self.rebase_page(authoritative_route);
-            self.integration.observe_authoritative_route(
-                "settings.reply",
-                authoritative_route,
-                self.workspace.active(),
-            );
+            if let Some(integration) = self.integration.as_mut() {
+                integration.observe_authoritative_route(
+                    "settings.reply",
+                    authoritative_route,
+                    self.workspace.active(),
+                );
+            }
         }
     }
 

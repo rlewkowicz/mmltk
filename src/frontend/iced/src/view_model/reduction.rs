@@ -586,7 +586,8 @@ pub(super) fn merge_explore_snapshot(
     target: &mut Option<crate::generated::ExploreSnapshot>,
     incoming: crate::generated::ExploreSnapshot,
 ) -> Result<Observation, UiError> {
-    if let Some(installed) = target.as_ref()
+    if crate::integration_control::reporting_enabled()
+        && let Some(installed) = target.as_ref()
         && installed.revision == incoming.revision
         && installed != &incoming
     {

@@ -10,6 +10,9 @@ use iced::futures::{SinkExt, StreamExt};
 pub struct TransportConfig {
     pub websocket_url: String,
     pub integration: bool,
+    pub surface_trace: bool,
+    pub pixel_trace: bool,
+    pub integration_pixel_fixture: bool,
     pub integration_window_close: bool,
     pub integration_dataset_source: String,
     pub integration_compiled_directory: String,
@@ -24,15 +27,20 @@ impl TransportConfig {
             .and_then(|window| window.location().search().ok())
             .unwrap_or_default();
         let params = web_sys::UrlSearchParams::new_with_str(&search).ok();
+        let flag = |name| {
+            params.as_ref().and_then(|params| params.get(name)).is_some_and(|value| value == "1")
+        };
+        let integration = flag("mmltk_integration");
+        let surface_trace = flag("mmltk_surface_trace");
         Self {
             websocket_url: params
                 .as_ref()
                 .and_then(|params| params.get("mmltk_ws_url"))
                 .unwrap_or_default(),
-            integration: params
-                .as_ref()
-                .and_then(|params| params.get("mmltk_integration"))
-                .is_some_and(|value| value == "1"),
+            integration,
+            surface_trace,
+            pixel_trace: surface_trace && flag("mmltk_pixel_trace"),
+            integration_pixel_fixture: integration && flag("mmltk_integration_pixel_fixture"),
             integration_window_close: params
                 .as_ref()
                 .and_then(|params| params.get("mmltk_integration_window_close"))
@@ -61,6 +69,9 @@ impl TransportConfig {
         Self {
             websocket_url: String::new(),
             integration: false,
+            surface_trace: false,
+            pixel_trace: false,
+            integration_pixel_fixture: false,
             integration_window_close: false,
             integration_dataset_source: String::new(),
             integration_compiled_directory: String::new(),

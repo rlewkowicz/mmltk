@@ -10,16 +10,18 @@ use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::closure::Closure;
 
+thread_local! {
+    static SURFACE_TRACE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn initialize_diagnostics(surface_trace: bool, pixel_trace: bool) {
+    SURFACE_TRACE_ENABLED.with(|flag| flag.set(surface_trace));
+    pixel_trace::initialize(surface_trace && pixel_trace);
+}
+
 #[cfg(target_arch = "wasm32")]
 fn surface_trace_enabled() -> bool {
-    thread_local! {
-        static ENABLED: bool = web_sys::window()
-            .and_then(|window| window.location().search().ok())
-            .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-            .and_then(|params| params.get("mmltk_surface_trace"))
-            .is_some_and(|value| value == "1");
-    }
-    ENABLED.with(|enabled| *enabled)
+    SURFACE_TRACE_ENABLED.with(std::cell::Cell::get)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -832,6 +834,9 @@ impl ViewportOwner {
     }
 
     fn begin_integration_redraw(&mut self, surface: Surface) -> bool {
+        if !surface.integration {
+            return false;
+        }
         if !crate::integration_control::repeated_redraws_enabled() {
             self.integration_redraw_remaining = 0;
             return false;
@@ -1878,12 +1883,12 @@ impl SurfaceRenderer {
         if control_id == crate::view::explore::DETAIL_WORKSPACE_ID {
             record_drawn_detail(draw.surface, draw.surface.content_region());
         }
-        let prior_draw = imported
-            .drawn_revision
-            .swap(frame.presentation_revision, Ordering::AcqRel);
-        let draw_count = imported.draw_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let redraw = prior_draw == frame.presentation_revision;
         if draw.surface.integration {
+            let prior_draw = imported
+                .drawn_revision
+                .swap(frame.presentation_revision, Ordering::AcqRel);
+            let draw_count = imported.draw_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let redraw = prior_draw == frame.presentation_revision;
             crate::integration_control::report_surface_draw(
                 control_id,
                 frame.presentation_revision,

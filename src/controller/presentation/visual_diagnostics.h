@@ -235,6 +235,7 @@ struct VisualDiagnosticSink final {
 // The shell owns the target until after every visual worker is joined. Test
 // sinks retain their direct typed injection, including dynamic disablement.
 [[nodiscard]] inline VisualDiagnosticSink visual_diagnostic_sink(services::RuntimeDiagnosticTarget& target) noexcept {
+    if (!target.valid()) return {};
     return {
         .context = &target,
         .write =

@@ -1013,12 +1013,15 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
             request.input_path = std::filesystem::absolute(request.input_path).lexically_normal();
             request.output_path = std::filesystem::absolute(request.output_path).lexically_normal();
             const auto checkpoint = rfdetr::normalize_checkpoint_to_native(request.input_path, request.output_path);
-            logging::info("rfdetr.cli", [&](auto& current) {
-                current.info(
-                    "rfdetr.normalize-weights: wrote {} tensors for "
-                    "preset={} to {}",
-                    checkpoint.tensor_count(), checkpoint.metadata.preset_name, request.output_path.string());
-            });
+            if (logging::enabled(spdlog::level::info)) {
+                logging::info("rfdetr.cli", [&](auto& current) {
+                    current.info("rfdetr.normalize-weights: wrote {} tensors for preset={} to {}", checkpoint.tensor_count(),
+                                 checkpoint.metadata.preset_name, request.output_path.string());
+                });
+            } else {
+                std::printf("rfdetr.normalize-weights: wrote %zu tensors for preset=%s to %s\n", checkpoint.tensor_count(),
+                            checkpoint.metadata.preset_name.c_str(), request.output_path.c_str());
+            }
             return 0;
         }
     }
@@ -1055,7 +1058,11 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int, ch
     try {
         return dispatch_command(*descriptor, command_arguments, help_requested);
     } catch (const reflection::ParseError& error) { std::fprintf(stderr, "%s\n", error.what()); } catch (const std::exception& error) {
-        logging::error("rfdetr.cli", [&](auto& current) { current.error("mmltk rfdetr error: {}", error.what()); });
+        if (logging::enabled(spdlog::level::err)) {
+            logging::error("rfdetr.cli", [&](auto& current) { current.error("mmltk rfdetr error: {}", error.what()); });
+        } else {
+            std::fprintf(stderr, "mmltk rfdetr error: %s\n", error.what());
+        }
     }
     return 1;
 }

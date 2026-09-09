@@ -33,19 +33,23 @@ pub struct App {
     workspace: crate::view::router::Router,
     settings: crate::view::settings::Component,
     diagnostics: crate::view::diagnostics::Component,
-    integration: crate::integration_control::Controller,
+    integration: Option<crate::integration_control::Controller>,
 }
 
 pub fn boot() -> (App, Task<Message>) {
     let config = TransportConfig::from_page();
-    let integration = crate::integration_control::Controller::new(
-        config.integration,
-        config.integration_window_close,
-        config.integration_dataset_source.clone(),
-        config.integration_compiled_directory.clone(),
-        config.integration_resolution.clone(),
-        config.integration_viewer_scenario.clone(),
-    );
+    crate::presentation_surface::initialize_diagnostics(config.surface_trace, config.pixel_trace);
+    crate::integration_control::initialize_reporting(config.integration, config.integration_pixel_fixture);
+    let integration = config.integration.then(|| {
+        crate::integration_control::Controller::new(
+            true,
+            config.integration_window_close,
+            config.integration_dataset_source.clone(),
+            config.integration_compiled_directory.clone(),
+            config.integration_resolution.clone(),
+            config.integration_viewer_scenario.clone(),
+        )
+    });
     (
         App {
             config,
@@ -82,7 +86,9 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         crate::presentation_surface::subscription()
             .map(presentation::Message::Surface)
             .map(Message::Presentation),
-        app.integration.subscription().map(Message::Integration),
+        app.integration.as_ref().map_or_else(Subscription::none, |integration| {
+            integration.subscription().map(Message::Integration)
+        }),
         if app.workspace.active() == crate::generated::FeatureId::Annotate
             && !app.settings.state().open
         {
@@ -107,8 +113,10 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             result,
         } => task = app.on_explore_writable(peer_generation, result),
         Message::Workspace(message) => {
-            app.integration
-                .observe_workspace_message(&message, app.workspace.active());
+            if let Some(integration) = app.integration.as_ref() {
+                integration
+                    .observe_workspace_message(&message, app.workspace.active());
+            }
             task = app.on_workspace(message);
         }
         Message::FileDialog(message) => app.on_file_dialog(message),
@@ -116,7 +124,9 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Error(message) => task = app.on_error(message),
         Message::Diagnostics(message) => app.diagnostics.update(message),
         Message::Integration(message) => {
-            if let Some(message) = app.integration.update(message) {
+            if let Some(integration) = app.integration.as_mut()
+                && let Some(message) = integration.update(message)
+            {
                 task = app.on_workspace(crate::view::router::Message::Train(message));
             }
         }
@@ -130,14 +140,18 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
     Task::batch([
         task,
         presentation_task,
-        app.integration.advance(
-            &app.model,
-            app.settings.state(),
-            app.settings.applied_scale(),
-            &app.workspace,
-            app.workspace.active(),
-            frame,
-        ),
+        if let Some(integration) = app.integration.as_mut() {
+            integration.advance(
+                &app.model,
+                app.settings.state(),
+                app.settings.applied_scale(),
+                &app.workspace,
+                app.workspace.active(),
+                frame,
+            )
+        } else {
+            Task::none()
+        },
     ])
 }
 #[cfg(test)]

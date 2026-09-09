@@ -41,7 +41,11 @@ namespace {
 
 void report_cli_error(const std::string_view message) noexcept {
     try {
-        logging::error([&](auto& current) { current.error("{}", message); });
+        if (logging::enabled(spdlog::level::err)) {
+            logging::error([&](auto& current) { current.error("{}", message); });
+        } else {
+            std::fprintf(stderr, "%.*s\n", static_cast<int>(message.size()), message.data());
+        }
     } catch (...) { std::fprintf(stderr, "%.*s\n", static_cast<int>(message.size()), message.data()); }
 }
 
@@ -151,8 +155,12 @@ void run_compile(const data::CompilerConfig& config) {
     data::DatasetCompiler::compile(plan, 0U, &telemetry);
     bar.close();
     const auto finished = std::chrono::steady_clock::now();
-    logging::info(
-        [&](auto& current) { current.info("compile: done in {:.1f} seconds", std::chrono::duration<double>(finished - started).count()); });
+    const double seconds = std::chrono::duration<double>(finished - started).count();
+    if (logging::enabled(spdlog::level::info)) {
+        logging::info([&](auto& current) { current.info("compile: done in {:.1f} seconds", seconds); });
+    } else {
+        std::printf("compile: done in %.1f seconds\n", seconds);
+    }
 }
 
 void run_info(const std::string& compiled_path) {

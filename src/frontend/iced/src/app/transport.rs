@@ -136,11 +136,13 @@ impl App {
             .is_some_and(|snapshot| Some(snapshot.revision) > settings_revision_before);
         self.settle_explore_reply(filter_admission_revision, filter_failed);
         if context == Some(ApplicationIntentEndpoint::ExploreUpdateFilter) {
-            self.integration.observe_explore_filter_settlement(
-                "intent-reply",
-                self.model.explore.snapshot.as_ref(),
-                self.model.explore_mutation_available(),
-            );
+            if let Some(integration) = self.integration.as_mut() {
+                integration.observe_explore_filter_settlement(
+                    "intent-reply",
+                    self.model.explore.snapshot.as_ref(),
+                    self.model.explore_mutation_available(),
+                );
+            }
         }
         if context.is_some_and(|endpoint| {
             matches!(
@@ -195,19 +197,23 @@ impl App {
             let authoritative_route = authoritative.settingsstate.currentview;
             self.settings.install(authoritative);
             self.rebase_page(authoritative_route);
-            self.integration.observe_authoritative_route(
-                "settings.event",
-                authoritative_route,
-                self.workspace.active(),
-            );
+            if let Some(integration) = self.integration.as_mut() {
+                integration.observe_authoritative_route(
+                    "settings.event",
+                    authoritative_route,
+                    self.workspace.active(),
+                );
+            }
         }
         if reconcile_explore {
             self.settle_explore_event(explore_failed);
-            self.integration.observe_explore_filter_settlement(
-                "system-event",
-                self.model.explore.snapshot.as_ref(),
-                self.model.explore_mutation_available(),
-            );
+            if let Some(integration) = self.integration.as_mut() {
+                integration.observe_explore_filter_settlement(
+                    "system-event",
+                    self.model.explore.snapshot.as_ref(),
+                    self.model.explore_mutation_available(),
+                );
+            }
         }
         self.reconcile_presentation(false);
     }

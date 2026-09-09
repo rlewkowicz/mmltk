@@ -4,6 +4,7 @@ module;
 #include <spdlog/spdlog.h>
 
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
@@ -32,7 +33,7 @@ std::mutex g_mutex;
 std::shared_ptr<spdlog::logger> g_root_logger;
 std::vector<spdlog::sink_ptr> g_sinks;
 std::string g_app_name;
-spdlog::level::level_enum g_level = spdlog::level::info;
+std::atomic<spdlog::level::level_enum> g_level{spdlog::level::off};
 
 bool is_known_level_name(std::string_view value) {
     const std::string lowered = mmltk::common::types::to_lower(value);
@@ -97,13 +98,19 @@ spdlog::level::level_enum default_runtime_level() {
     return spdlog::level::info;
 }
 
-LoggingConfig lazy_process_config() { return config_from_env("mmltk"); }
+void install_logger_locked(const LoggingConfig& config) {
+    const spdlog::level::level_enum runtime_level =
+        config.enabled() ? config.level.value_or(default_runtime_level()) : spdlog::level::off;
 
-void install_logger_locked(LoggingConfig config) {
-    const spdlog::level::level_enum runtime_level = config.level.value_or(default_runtime_level());
+    g_level.store(spdlog::level::off, std::memory_order_relaxed);
+    if (g_root_logger != nullptr) {
+        spdlog::shutdown();
+        spdlog::drop_all();
+    }
+    g_root_logger.reset();
+    g_sinks.clear();
+    if (runtime_level == spdlog::level::off) { return; }
 
-    spdlog::shutdown();
-    spdlog::drop_all();
     spdlog::set_pattern(kDefaultPattern);
     spdlog::set_level(runtime_level);
     spdlog::flush_on(spdlog::level::warn);
@@ -111,7 +118,6 @@ void install_logger_locked(LoggingConfig config) {
     const std::filesystem::path log_path = resolve_log_file_path(config);
     ensure_parent_directory(log_path);
 
-    g_sinks.clear();
     g_sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
     g_sinks.push_back(
         std::make_shared<spdlog::sinks::rotating_file_sink_mt>(log_path.string(), kLogRotationBytes, kLogRotationFiles, true));
@@ -122,7 +128,7 @@ void install_logger_locked(LoggingConfig config) {
     root->flush_on(spdlog::level::warn);
     spdlog::set_default_logger(root);
 
-    g_app_name = std::move(config.app_name);
+    g_app_name = config.app_name;
     g_level = runtime_level;
     g_root_logger = std::move(root);
 }
@@ -132,7 +138,6 @@ void install_logger_locked(LoggingConfig config) {
 LoggingConfig default_config(std::string app_name) {
     LoggingConfig config;
     config.app_name = std::move(app_name);
-    config.level = default_runtime_level();
     return config;
 }
 
@@ -194,16 +199,15 @@ LoggingConfig merge(LoggingConfig config, const CliOverrides& overrides) {
 }
 
 void initialize(const LoggingConfig& config) {
-    if (config.app_name.empty()) { throw std::runtime_error("logging initialization requires a non-empty app name"); }
+    if (config.enabled() && config.app_name.empty()) {
+        throw std::runtime_error("logging initialization requires a non-empty app name");
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
-    LoggingConfig mutable_config = config;
-    if (!mutable_config.level.has_value()) { mutable_config.level = default_runtime_level(); }
-    install_logger_locked(std::move(mutable_config));
+    install_logger_locked(config);
 }
 
 std::shared_ptr<spdlog::logger> root_logger() {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_root_logger == nullptr) { install_logger_locked(lazy_process_config()); }
     return g_root_logger;
 }
 
@@ -211,25 +215,22 @@ std::shared_ptr<spdlog::logger> logger(std::string_view name) {
     if (name.empty()) { return root_logger(); }
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_root_logger == nullptr) { install_logger_locked(lazy_process_config()); }
+    if (g_root_logger == nullptr) { return nullptr; }
     if (name == g_app_name) { return g_root_logger; }
 
     if (auto existing = spdlog::get(std::string(name)); existing != nullptr) { return existing; }
 
     auto named = std::make_shared<spdlog::logger>(std::string(name), g_sinks.begin(), g_sinks.end());
     spdlog::initialize_logger(named);
-    named->set_level(g_level);
+    named->set_level(g_level.load(std::memory_order_relaxed));
     named->flush_on(spdlog::level::warn);
     return named;
 }
 
-spdlog::level::level_enum level() {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_root_logger == nullptr) { return default_runtime_level(); }
-    return g_level;
-}
+spdlog::level::level_enum level() { return g_level.load(std::memory_order_relaxed); }
 
 void flush() {
+    if (level() == spdlog::level::off) { return; }
     if (auto current = root_logger(); current != nullptr) { current->flush(); }
     spdlog::apply_all([](const std::shared_ptr<spdlog::logger>& current) {
         if (current != nullptr) { current->flush(); }
@@ -238,7 +239,12 @@ void flush() {
 
 void set_level(spdlog::level::level_enum new_level) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_root_logger == nullptr) { install_logger_locked(lazy_process_config()); }
+    if (g_root_logger == nullptr) {
+        auto config = config_from_env(g_app_name.empty() ? "mmltk" : g_app_name);
+        config.level = new_level;
+        install_logger_locked(config);
+        return;
+    }
     g_level = new_level;
     spdlog::set_level(new_level);
     spdlog::apply_all([new_level](const std::shared_ptr<spdlog::logger>& current) {

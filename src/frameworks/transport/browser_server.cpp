@@ -243,6 +243,7 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
     }
 
     void flush_worker_diagnostics() noexcept {
+        if (callbacks.diagnostic == nullptr) return;
         if (const auto count = pending_invalid.exchange(0U, std::memory_order_acq_rel); count != 0U)
             trace(BrowserServerEvent::InvalidMessage, count);
         if (const auto count = pending_transient_dropped.exchange(0U, std::memory_order_acq_rel); count != 0U)
@@ -337,28 +338,30 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
             return critical ? BrowserRecordPush::ClosePeer : BrowserRecordPush::Dropped;
         const std::size_t bytes = record.bytes.size();
         if (bytes == 0U || bytes > maximum_output_bytes) {
-            pending_invalid.fetch_add(1U, std::memory_order_relaxed);
+            if (callbacks.diagnostic != nullptr) pending_invalid.fetch_add(1U, std::memory_order_relaxed);
             if (critical) {
-                pending_critical_closed.fetch_add(1U, std::memory_order_relaxed);
+                if (callbacks.diagnostic != nullptr) pending_critical_closed.fetch_add(1U, std::memory_order_relaxed);
                 close_requested.store(true, std::memory_order_release);
                 static_cast<void>(request_wake_locked());
                 return BrowserRecordPush::ClosePeer;
             }
-            pending_transient_dropped.fetch_add(1U, std::memory_order_relaxed);
-            static_cast<void>(request_wake_locked());
+            if (callbacks.diagnostic != nullptr) {
+                pending_transient_dropped.fetch_add(1U, std::memory_order_relaxed);
+                static_cast<void>(request_wake_locked());
+            }
             return BrowserRecordPush::Dropped;
         }
         if (!request_wake_locked()) return critical ? BrowserRecordPush::ClosePeer : BrowserRecordPush::Dropped;
         const BrowserRecordPush result = output.push(std::move(record));
         switch (result) {
             case BrowserRecordPush::Enqueued:
-                pending_enqueued.fetch_add(1U, std::memory_order_relaxed);
+                if (callbacks.diagnostic != nullptr) pending_enqueued.fetch_add(1U, std::memory_order_relaxed);
                 break;
             case BrowserRecordPush::Dropped:
-                pending_transient_dropped.fetch_add(1U, std::memory_order_relaxed);
+                if (callbacks.diagnostic != nullptr) pending_transient_dropped.fetch_add(1U, std::memory_order_relaxed);
                 break;
             case BrowserRecordPush::ClosePeer:
-                pending_critical_closed.fetch_add(1U, std::memory_order_relaxed);
+                if (callbacks.diagnostic != nullptr) pending_critical_closed.fetch_add(1U, std::memory_order_relaxed);
                 close_requested.store(true, std::memory_order_release);
                 break;
         }

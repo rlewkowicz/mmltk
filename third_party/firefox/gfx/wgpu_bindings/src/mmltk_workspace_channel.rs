@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
-use std::fmt;
+use std::fmt::{self, Write};
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -30,25 +30,33 @@ fn diagnostics_enabled_for(value: Option<&OsStr>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
 
+static DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+static PIXEL_PROBES_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(super) fn initialize_diagnostics() {
+    let diagnostics = *DIAGNOSTICS_ENABLED.get_or_init(|| {
+        let value = std::env::var_os("MMLTK_GUI_TRACE_FILE");
+        diagnostics_enabled_for(value.as_deref())
+    });
+    PIXEL_PROBES_ENABLED.get_or_init(|| {
+        diagnostics && std::env::var_os("MMLTK_GUI_PIXEL_TRACE").is_some_and(|value| value == "1")
+    });
+}
+
 pub(super) fn workspace_diagnostics_enabled() -> bool {
-    let value = std::env::var_os("MMLTK_GUI_TRACE_FILE");
-    diagnostics_enabled_for(value.as_deref())
+    DIAGNOSTICS_ENABLED.get().copied().unwrap_or(false)
 }
 
 pub(super) fn workspace_pixel_probes_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        workspace_diagnostics_enabled()
-            && std::env::var_os("MMLTK_GUI_PIXEL_TRACE").is_some_and(|value| value == "1")
-    })
+    PIXEL_PROBES_ENABLED.get().copied().unwrap_or(false)
 }
 
-pub(super) fn write_diagnostic(arguments: fmt::Arguments<'_>) {
+pub(super) fn write_diagnostic(format: impl FnOnce(&mut String) -> fmt::Result) {
     if !workspace_diagnostics_enabled() {
         return;
     }
     let mut line = String::new();
-    if fmt::write(&mut line, arguments).is_err() {
+    if format(&mut line).is_err() {
         return;
     }
     line.push('\n');
@@ -70,7 +78,7 @@ pub(super) fn write_diagnostic(arguments: fmt::Arguments<'_>) {
 }
 
 pub fn trace_state(event: &str, id: SurfaceId, detail: &str) {
-    write_diagnostic(format_args!(
+    write_diagnostic(|line| write!(line,
         "{{\"event\":\"firefox.workspace.{event}\",\"surface\":\"{id}\",\"detail\":\"{detail}\"}}"
     ));
 }
@@ -402,20 +410,22 @@ impl Channel {
             return;
         }
         self.terminal = terminal;
-        let terminal_name = match terminal {
-            ChannelTerminal::Open => "open",
-            ChannelTerminal::OrderlyBridgeClose => "orderly_bridge_close",
-            ChannelTerminal::PeerHup => "peer_hup",
-            ChannelTerminal::ProtocolFailure => "protocol_failure",
-        };
-        write_diagnostic(format_args!(
-            "{{\"event\":\"firefox.workspace.channel_terminal\",\"terminal\":\"{terminal_name}\",\"admitted\":{},\"claimed\":{},\"live\":{},\"released\":{},\"withdrawn\":{}}}",
-            self.admitted.len(),
-            self.claimed.len(),
-            self.live.len(),
-            self.released.len(),
-            self.withdrawn.len()
-        ));
+        write_diagnostic(|line| {
+            let terminal_name = match terminal {
+                ChannelTerminal::Open => "open",
+                ChannelTerminal::OrderlyBridgeClose => "orderly_bridge_close",
+                ChannelTerminal::PeerHup => "peer_hup",
+                ChannelTerminal::ProtocolFailure => "protocol_failure",
+            };
+            write!(line,
+                "{{\"event\":\"firefox.workspace.channel_terminal\",\"terminal\":\"{terminal_name}\",\"admitted\":{},\"claimed\":{},\"live\":{},\"released\":{},\"withdrawn\":{}}}",
+                self.admitted.len(),
+                self.claimed.len(),
+                self.live.len(),
+                self.released.len(),
+                self.withdrawn.len()
+            )
+        });
         self.pending.clear();
         self.admitted.clear();
         self.seen.clear();
@@ -455,13 +465,15 @@ impl Channel {
 
     #[track_caller]
     fn fail(&mut self) {
-        let caller = std::panic::Location::caller();
-        write_diagnostic(format_args!(
-            "{{\"event\":\"firefox.workspace.protocol_failure_source\",\"file\":\"{}\",\"line\":{},\"column\":{}}}",
-            caller.file(),
-            caller.line(),
-            caller.column()
-        ));
+        if workspace_diagnostics_enabled() {
+            let caller = std::panic::Location::caller();
+            write_diagnostic(|line| write!(line,
+                "{{\"event\":\"firefox.workspace.protocol_failure_source\",\"file\":\"{}\",\"line\":{},\"column\":{}}}",
+                caller.file(),
+                caller.line(),
+                caller.column()
+            ));
+        }
         self.observe_close(ChannelCloseObservation::Protocol);
     }
 
@@ -497,14 +509,14 @@ impl Channel {
         // mechanism.
         self.drain();
         let Some(admission) = self.admitted.get(&id) else {
-            write_diagnostic(format_args!(
+            write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"missing\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
                 self.admitted.len(), self.claimed.len(), self.live.len()
             ));
             return None;
         };
         if admission.width != width || admission.height != height {
-            write_diagnostic(format_args!(
+            write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"mismatch\",\"width\":{width},\"height\":{height},\"admitted_width\":{},\"admitted_height\":{}}}",
                 admission.width, admission.height
             ));
@@ -512,7 +524,7 @@ impl Channel {
         }
         let admission = self.admitted.remove(&id)?;
         self.claimed.insert(id);
-        write_diagnostic(format_args!(
+        write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
             self.admitted.len(), self.claimed.len(), self.live.len()
         ));
@@ -637,7 +649,7 @@ impl Channel {
                             frame_signal: Some(frame_signal),
                         },
                     );
-                    write_diagnostic(format_args!(
+                    write_diagnostic(|line| write!(line,
                         "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
                         record.width, record.height, self.admitted.len(), self.claimed.len(), self.live.len()
                     ));
@@ -1007,7 +1019,7 @@ pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
 pub fn send_failed(id: SurfaceId, code: u32, stride: u64, size: u64) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
-            write_diagnostic(format_args!(
+            write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}"
             ));
             channel.send_outcome(OPCODE_FAILED, id, code, stride, size, None);

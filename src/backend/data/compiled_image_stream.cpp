@@ -12,6 +12,8 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unistd.h>
+#include "src/common/io/noexcept_io.h"
 
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
@@ -371,15 +373,20 @@ CompiledImageStream::~CompiledImageStream() {
         const auto failure = std::current_exception();
         retention_->state = std::move(impl_);
         try {
-            mmltk::common::logging::critical([&](spdlog::logger& log) {
-                try {
-                    std::rethrow_exception(failure);
-                } catch (const std::exception& error) {
-                    log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}", retention_->state->config.device,
-                                 error.what());
-                } catch (...) { log.critical("compiled image stream retained unsafe CUDA resources after an unknown failure"); }
-            });
+            if (mmltk::common::logging::enabled(spdlog::level::critical)) {
+                mmltk::common::logging::critical([&](spdlog::logger& log) {
+                    try {
+                        std::rethrow_exception(failure);
+                    } catch (const std::exception& error) {
+                        log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}", retention_->state->config.device,
+                                     error.what());
+                    } catch (...) { log.critical("compiled image stream retained unsafe CUDA resources after an unknown failure"); }
+                });
+                return;
+            }
         } catch (...) {}
+        mmltk::common::io::write_all_noexcept(STDERR_FILENO,
+            "fatal: compiled image stream retained unsafe CUDA resources\n");
     }
 }
 void CompiledImageStream::close() {

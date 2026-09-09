@@ -114,11 +114,13 @@ void require(const bool condition, const std::string_view message) {
 
 void log_target_builder_destruction_failure(const std::string_view operation, const std::string_view detail) noexcept {
     try {
-        mmltk::common::logging::error([&](auto& logger) { logger.error("fatal: {}: {}", operation, detail); });
-    } catch (...) {
-        constexpr std::string_view fallback = "fatal target-builder destruction failure\n";
-        mmltk::common::io::write_all_noexcept(STDERR_FILENO, fallback);
-    }
+        if (mmltk::common::logging::enabled(spdlog::level::err)) {
+            mmltk::common::logging::error([&](auto& logger) { logger.error("fatal: {}: {}", operation, detail); });
+            return;
+        }
+    } catch (...) {}
+    constexpr std::string_view fallback = "fatal target-builder destruction failure\n";
+    mmltk::common::io::write_all_noexcept(STDERR_FILENO, fallback);
 }
 
 torch_cuda::TorchCudaStream require_copy_stream(const TargetScratch& scratch) {

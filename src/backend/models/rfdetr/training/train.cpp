@@ -3,6 +3,8 @@
 #include "src/backend/models/rfdetr/training/train.h"
 
 #include <cuda_runtime.h>
+#include <format>
+#include <print>
 
 #include "archive_utils.h"
 #include "detection_ops.h"
@@ -2909,22 +2911,24 @@ void print_training_summary(const TrainRequest& options, const TrainRunResult& r
     const auto val_loss = result.history.empty() ? std::optional<double>{} : result.history.back().val_loss;
     const double val_bbox_ap = result.history.empty() ? 0.0 : result.history.back().val_summary.bbox.ap;
     const std::string val_mask_ap = result.history.empty() ? "null" : formatted_mask_ap(result.history.back().val_summary);
+    std::string summary;
     if (val_loss.has_value()) {
-        mmltk::common::logging::info([&](auto& logger) {
-            logger.info(
-                "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_loss={:.6f} "
-                "val_bbox_ap={:.4f} val_mask_ap={} best={} checkpoint={}",
-                source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss,
-                *val_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
-        });
+        summary = std::format(
+            "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_loss={:.6f} "
+            "val_bbox_ap={:.4f} val_mask_ap={} best={} checkpoint={}",
+            source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss,
+            *val_loss, val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
     } else {
-        mmltk::common::logging::info([&](auto& logger) {
-            logger.info(
-                "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_bbox_ap={:.4f} "
-                "val_mask_ap={} best={} checkpoint={}",
-                source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss,
-                val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
-        });
+        summary = std::format(
+            "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_bbox_ap={:.4f} "
+            "val_mask_ap={} best={} checkpoint={}",
+            source_label, result.artifacts.config.preset_name, cli_enum_spelling(options.optimizer), result.last_epoch + 1, train_loss,
+            val_bbox_ap, val_mask_ap, best_path, checkpoint_path);
+    }
+    if (mmltk::common::logging::enabled(spdlog::level::info)) {
+        mmltk::common::logging::info([&](auto& logger) { logger.info("{}", summary); });
+    } else {
+        std::println("{}", summary);
     }
 }
 

@@ -10,7 +10,21 @@ use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
 use iced::{Rectangle, Task, Vector};
 
 thread_local! {
+    static PIXEL_FIXTURE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static REPORTING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static COMPLETION_WITHOUT_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn initialize_reporting(enabled: bool, pixel_fixture: bool) {
+    PIXEL_FIXTURE_ENABLED.with(|flag| flag.set(enabled && pixel_fixture));
+    #[cfg(target_arch = "wasm32")]
+    initialize_js(enabled);
+    REPORTING_ENABLED.with(|flag| flag.set(enabled));
+    COMPLETION_WITHOUT_INPUT.with(|flag| flag.set(false));
+}
+
+pub(crate) fn reporting_enabled() -> bool {
+    REPORTING_ENABLED.with(std::cell::Cell::get)
 }
 
 pub(crate) fn repeated_redraws_enabled() -> bool {
@@ -413,6 +427,49 @@ fn sidebar_control_visible(pane: Rectangle, target: Rectangle) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let integrationState;
+
+export function mmltkIntegrationInitialize(enabled) {
+  if (!enabled) {
+    if (integrationState) {
+      for (const type of integrationState.inputTypes) {
+        window.removeEventListener(type, integrationState.onInput, true);
+      }
+      integrationState = undefined;
+    }
+    return;
+  }
+  if (integrationState) return;
+  integrationState = {
+    integrationSurfaceDraws: new Map(),
+    integrationPendingSurfaceClick: undefined,
+    initialAtlasWithoutInput: false,
+    initialAtlasInputCount: 0,
+    initialAtlasCompleted: false,
+    boundaryScratch: undefined,
+    boundaryPending: false,
+    boundaryLatest: undefined,
+    compositionPending: false,
+    annotationScratch: undefined,
+    annotationContext: undefined,
+    integrationRenderKey: 0,
+    integrationFullscreenSettled: false,
+    integrationAnnotationPointerEnd: null,
+    inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown'],
+    onInput: undefined,
+  };
+  integrationState.onInput = (event) => {
+    if (!integrationState.initialAtlasWithoutInput) return;
+    integrationState.initialAtlasInputCount++;
+    report({event: 'integration.failure', control: 'explore.gallery.workspace',
+      detail: `input during initial atlas completion: ${event.type}`,
+      a: String(integrationState.initialAtlasInputCount), b: '0', c: '0', d: '0'});
+  };
+  for (const type of integrationState.inputTypes) {
+    window.addEventListener(type, integrationState.onInput, true);
+  }
+}
+
 function integrationPointer(rect, x, y, type, buttons) {
   const event = new PointerEvent(type, {
     bubbles: true,
@@ -434,9 +491,6 @@ function integrationPointer(rect, x, y, type, buttons) {
   return event;
 }
 
-const integrationSurfaceDraws = new Map();
-let integrationPendingSurfaceClick;
-
 function matchesIntegrationSurfaceClick(pending, drawn) {
   return drawn && (pending.allowNewer ? drawn.sourceRevision >= pending.sourceRevision :
     drawn.sourceRevision === pending.sourceRevision);
@@ -444,9 +498,9 @@ function matchesIntegrationSurfaceClick(pending, drawn) {
 
 function dispatchIntegrationSurfaceClick(pending) {
   queueMicrotask(() => {
-    const drawn = integrationSurfaceDraws.get(pending.control);
+    const drawn = integrationState.integrationSurfaceDraws.get(pending.control);
     if (!matchesIntegrationSurfaceClick(pending, drawn)) {
-      integrationPendingSurfaceClick = pending;
+      integrationState.integrationPendingSurfaceClick = pending;
       return;
     }
     const canvas = document.querySelector('canvas');
@@ -469,34 +523,22 @@ function releaseIntegrationSurfaceClick(record) {
   const sourceRevision = Number(record.b);
   if (!Number.isSafeInteger(sourceRevision) || sourceRevision <= 0) return;
   const drawn = {sourceRevision, presentationRevision: Number(record.a)};
-  integrationSurfaceDraws.set(record.control, drawn);
-  const pending = integrationPendingSurfaceClick;
+  integrationState.integrationSurfaceDraws.set(record.control, drawn);
+  const pending = integrationState.integrationPendingSurfaceClick;
   if (!pending || pending.control !== record.control || !matchesIntegrationSurfaceClick(pending, drawn)) return;
-  integrationPendingSurfaceClick = undefined;
+  integrationState.integrationPendingSurfaceClick = undefined;
   dispatchIntegrationSurfaceClick(pending);
 }
 
-let initialAtlasWithoutInput = false;
-let initialAtlasInputCount = 0;
-let initialAtlasCompleted = false;
-for (const type of ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown']) {
-  window.addEventListener(type, () => {
-    if (!initialAtlasWithoutInput) return;
-    initialAtlasInputCount++;
-    report({event: 'integration.failure', control: 'explore.gallery.workspace',
-      detail: `input during initial atlas completion: ${type}`,
-      a: String(initialAtlasInputCount), b: '0', c: '0', d: '0'});
-  }, true);
-}
-
 function report(record) {
+  if (!integrationState) return;
   record.elapsed_ms = performance.now();
-  if (!initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
-    initialAtlasWithoutInput = true;
-    initialAtlasInputCount = 0;
+  if (!integrationState.initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
+    integrationState.initialAtlasWithoutInput = true;
+    integrationState.initialAtlasInputCount = 0;
   } else if (record.event === 'integration.initial_atlas_complete') {
-    initialAtlasWithoutInput = false;
-    initialAtlasCompleted = true;
+    integrationState.initialAtlasWithoutInput = false;
+    integrationState.initialAtlasCompleted = true;
   }
   const line = JSON.stringify(record);
   if (typeof globalThis.dump === 'function') globalThis.dump(`${line}\n`);
@@ -505,6 +547,7 @@ function report(record) {
 }
 
 export function mmltkIntegrationReport(event, control, detail, a, b, c, d) {
+  if (!integrationState) return;
   report({event, control, detail, a: String(a), b: String(b), c: String(c), d: String(d)});
 }
 
@@ -517,9 +560,9 @@ export function mmltkIntegrationAtlasPixels(rectangles, sourceRevision, presenta
     try {
       const canvas = document.querySelector('canvas');
       if (!canvas) throw new Error('missing WebGPU canvas');
-      const drawn = integrationSurfaceDraws.get('explore.gallery.workspace');
+      const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
       if (!drawn || drawn.sourceRevision !== sourceRevision ||
-          drawn.presentationRevision !== presentationRevision || initialAtlasInputCount !== 0) {
+          drawn.presentationRevision !== presentationRevision || integrationState.initialAtlasInputCount !== 0) {
         completed(0, 0);
         return;
       }
@@ -552,39 +595,32 @@ export function mmltkIntegrationAtlasPixels(rectangles, sourceRevision, presenta
   });
 }
 
-let boundaryScratch;
-let boundaryPending = false;
-let boundaryLatest;
-let compositionPending = false;
-let annotationScratch;
-let annotationContext;
-
 function annotationCanvasSnapshot(canvas) {
-  if (!annotationScratch || annotationScratch.width !== canvas.width || annotationScratch.height !== canvas.height) {
-    annotationScratch = new OffscreenCanvas(canvas.width, canvas.height);
-    annotationContext = annotationScratch.getContext('2d', {willReadFrequently:true});
+  if (!integrationState.annotationScratch || integrationState.annotationScratch.width !== canvas.width || integrationState.annotationScratch.height !== canvas.height) {
+    integrationState.annotationScratch = new OffscreenCanvas(canvas.width, canvas.height);
+    integrationState.annotationContext = integrationState.annotationScratch.getContext('2d', {willReadFrequently:true});
   }
-  if (!annotationContext) throw new Error('missing annotation canvas pixel reader');
-  annotationContext.clearRect(0, 0, canvas.width, canvas.height);
-  annotationContext.drawImage(canvas, 0, 0);
-  return annotationContext;
+  if (!integrationState.annotationContext) throw new Error('missing annotation canvas pixel reader');
+  integrationState.annotationContext.clearRect(0, 0, canvas.width, canvas.height);
+  integrationState.annotationContext.drawImage(canvas, 0, 0);
+  return integrationState.annotationContext;
 }
 
 export function mmltkIntegrationAtlasComposition(points, cards, fields, source, presentation, columns, completed) {
-  if (compositionPending) { completed(0,0); return; }
-  compositionPending = true;
+  if (integrationState.compositionPending) { completed(0,0); return; }
+  integrationState.compositionPending = true;
   points = points.slice();
   cards = Array.from(cards);
   requestAnimationFrame(() => {
     let matched = 0;
     let emitted = 0;
     try {
-      const drawn = integrationSurfaceDraws.get('explore.gallery.workspace');
+      const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
       if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
       const canvas = document.querySelector('canvas');
       if (!canvas) return;
-      boundaryScratch ??= new OffscreenCanvas(1,1);
-      const context = boundaryScratch.getContext('2d', {willReadFrequently:true});
+      integrationState.boundaryScratch ??= new OffscreenCanvas(1,1);
+      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
       if (!context) return;
       const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 10) {
@@ -601,24 +637,24 @@ export function mmltkIntegrationAtlasComposition(points, cards, fields, source, 
           matched:valid});
       }
       report({event:'integration.atlas_composition_complete',...identity,columns,cards,emitted});
-    } finally { compositionPending = false; completed(cards.length*4,matched); }
+    } finally { integrationState.compositionPending = false; completed(cards.length*4,matched); }
   });
 }
 export function mmltkIntegrationBoundaryPixels(points, fields, control, source, presentation) {
   const request = {points:points.slice(),fields,control,source,presentation};
-  if (boundaryPending) { boundaryLatest = request; return; }
+  if (integrationState.boundaryPending) { integrationState.boundaryLatest = request; return; }
   runBoundaryPixels(request);
 }
 function runBoundaryPixels({points,fields,control,source,presentation}) {
-  boundaryPending = true;
+  integrationState.boundaryPending = true;
   requestAnimationFrame(() => {
     try {
-      const drawn = integrationSurfaceDraws.get(control);
+      const drawn = integrationState.integrationSurfaceDraws.get(control);
       if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
       const canvas = document.querySelector('canvas');
       if (!canvas) return;
-      boundaryScratch ??= new OffscreenCanvas(1, 1);
-      const context = boundaryScratch.getContext('2d', {willReadFrequently:true});
+      integrationState.boundaryScratch ??= new OffscreenCanvas(1, 1);
+      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
       if (!context) return;
       const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 5) {
@@ -631,9 +667,9 @@ function runBoundaryPixels({points,fields,control,source,presentation}) {
           sample_rgba:(rgba[0]|rgba[1]<<8|rgba[2]<<16|rgba[3]<<24)>>>0});
       }
     } finally {
-      boundaryPending = false;
-      const next = boundaryLatest;
-      boundaryLatest = undefined;
+      integrationState.boundaryPending = false;
+      const next = integrationState.boundaryLatest;
+      integrationState.boundaryLatest = undefined;
       if (next) runBoundaryPixels(next);
     }
   });
@@ -677,7 +713,7 @@ export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sour
   probes = Array.from(probes);
   try {
     const canvas=document.querySelector('canvas');
-    const drawn=integrationSurfaceDraws.get('workflow.visual.workspace');
+    const drawn=integrationState.integrationSurfaceDraws.get('workflow.visual.workspace');
     if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed(probes.length/7,0); return; }
     const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
     const context=annotationCanvasSnapshot(canvas);
@@ -724,14 +760,13 @@ export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sour
   } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed(probes.length/7,0);}
 }
 
-let integrationRenderKey = 0;
 export function mmltkIntegrationUpscalePixels(imagePixels, buttonCss, source, presentation, completed) {
   imagePixels = Array.from(imagePixels);
   buttonCss = Array.from(buttonCss);
   requestAnimationFrame(() => requestAnimationFrame(() => {
     try {
       const canvas = document.querySelector('canvas');
-      const drawn = integrationSurfaceDraws.get('explore.detail.workspace');
+      const drawn = integrationState.integrationSurfaceDraws.get('explore.detail.workspace');
       if (!canvas || !drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) {
         completed(0, 0); return;
       }
@@ -765,7 +800,7 @@ export function mmltkIntegrationUpscalePixels(imagePixels, buttonCss, source, pr
 
 export function mmltkIntegrationRenderedStyle(control, semantic, red, green, blue, alpha, width, height) {
   requestAnimationFrame(() => {
-    const renderKey = ++integrationRenderKey;
+    const renderKey = ++integrationState.integrationRenderKey;
     report({
       event: 'integration.rendered_style',
       control,
@@ -808,12 +843,11 @@ function integrationClick(canvas, rect, x, y) {
     });
 }
 
-let integrationFullscreenSettled = false;
 export function mmltkIntegrationFullscreen(enabled) {
-  integrationFullscreenSettled = false;
+  integrationState.integrationFullscreenSettled = false;
   const request = enabled ? document.documentElement.requestFullscreen() : document.exitFullscreen();
   request.then(() => {
-    integrationFullscreenSettled = true;
+    integrationState.integrationFullscreenSettled = true;
     window.dispatchEvent(new Event('resize'));
     const canvas = document.querySelector('canvas');
     if (canvas) {
@@ -837,7 +871,7 @@ export function mmltkIntegrationFullscreen(enabled) {
     a: '0', b: '0', c: '0', d: '0'}));
 }
 export function mmltkIntegrationFullscreenSettled(enabled) {
-  return integrationFullscreenSettled && !!document.fullscreenElement === enabled;
+  return integrationState.integrationFullscreenSettled && !!document.fullscreenElement === enabled;
 }
 
 export function mmltkIntegrationClick(x, y) {
@@ -853,10 +887,10 @@ export function mmltkIntegrationClickAfterSurfaceDraw(x, y, control, sourceRevis
       typeof control !== 'string' || control.length === 0 ||
       !Number.isSafeInteger(sourceRevision) || sourceRevision <= 0) return 0;
   const pending = {x, y, control, sourceRevision, allowNewer};
-  if (matchesIntegrationSurfaceClick(pending, integrationSurfaceDraws.get(control))) {
+  if (matchesIntegrationSurfaceClick(pending, integrationState.integrationSurfaceDraws.get(control))) {
     dispatchIntegrationSurfaceClick(pending);
   } else {
-    integrationPendingSurfaceClick = pending;
+    integrationState.integrationPendingSurfaceClick = pending;
   }
   return 1;
 }
@@ -1072,10 +1106,9 @@ export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
   return 1;
 }
 
-let integrationAnnotationPointerEnd = null;
 export function mmltkIntegrationAnnotationRelease() {
-  const end=integrationAnnotationPointerEnd;
-  if(end){end.canvas.dispatchEvent(integrationPointer(end.rect,end.x,end.y,'pointerup',0));integrationAnnotationPointerEnd=null;}
+  const end=integrationState.integrationAnnotationPointerEnd;
+  if(end){end.canvas.dispatchEvent(integrationPointer(end.rect,end.x,end.y,'pointerup',0));integrationState.integrationAnnotationPointerEnd=null;}
 }
 export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, startY, endX, endY, hold) {
   const canvas = document.querySelector('canvas');
@@ -1089,7 +1122,7 @@ export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, s
     canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointermove', 0));
     canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointerdown', 1));
     canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointermove', 1));
-    if(hold) integrationAnnotationPointerEnd={canvas,rect,x:x1,y:y1};
+    if(hold) integrationState.integrationAnnotationPointerEnd={canvas,rect,x:x1,y:y1};
     else canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointerup', 0));
   });
   return 1;
@@ -1101,6 +1134,8 @@ export function mmltkIntegrationWindowClose() {
 }
 "#)]
 extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationInitialize)]
+    fn initialize_js(enabled: bool);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationBoundaryPixels)]
     fn boundary_pixels_js(
         points: &[f32],
@@ -1462,21 +1497,7 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
 }
 
 fn pixel_fixture_enabled() -> bool {
-    #[cfg(target_arch = "wasm32")]
-    {
-        thread_local! {
-            static FIXTURE: bool = web_sys::window()
-                .and_then(|window| window.location().search().ok())
-                .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
-                .and_then(|params| params.get("mmltk_integration_pixel_fixture"))
-                .is_some_and(|value| value == "1");
-        }
-        FIXTURE.with(|enabled| *enabled)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        false
-    }
+    PIXEL_FIXTURE_ENABLED.with(std::cell::Cell::get)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1551,6 +1572,9 @@ fn sample_upscale_pixels(_image: Rectangle, _button: Rectangle, _source: u64, _p
 
 #[cfg(target_arch = "wasm32")]
 fn report(event: &str, control: &str, detail: &str, values: [f64; 4]) {
+    if !reporting_enabled() {
+        return;
+    }
     report_js(
         event, control, detail, values[0], values[1], values[2], values[3],
     );
@@ -4649,6 +4673,9 @@ impl Controller {
     }
 
     fn report_phase_progress(&mut self) {
+        if matches!(self.phase, Phase::Disabled) {
+            return;
+        }
         if self.reported_phase.as_ref() == Some(&self.phase) {
             return;
         }
