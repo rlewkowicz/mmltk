@@ -425,11 +425,6 @@ class GalleryStream::Impl final {
         explore::ExploreRenderTargetView checksum_target{};
         explore::ExploreRenderedCardProbe probe{};
         std::uint64_t seed = 0U;
-        std::size_t selected_annotations = 0U;
-        std::size_t hidden_annotations = 0U;
-        std::size_t selected_rle = 0U;
-        std::uint16_t selected_class_identity = 0U;
-        std::uint16_t hidden_class_identity = 0U;
         bool augmented = false;
         bool card = false;
         bool probe_annotation = false;
@@ -588,7 +583,10 @@ void GalleryStream::Impl::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) 
 void GalleryStream::Impl::StopIngress() noexcept {
     desired_generation_.store(0U, std::memory_order_release);
     image_stream_.cancel_reads();
-    if (acceptance_) acceptance_->Stop();
+    // Runtime retirement also occurs while a staged replacement is promoted.
+    // Invalidate this gallery's waiters without terminalizing the acceptance
+    // gate shared by the reusable runtime factory and its replacement.
+    if (acceptance_) acceptance_->AdvanceGeneration(0U);
     {
         std::scoped_lock lock(lanes_mutex_);
         ready_sink_ = {};
@@ -2480,32 +2478,6 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
                                            const std::uint32_t width, const std::uint32_t height) try {
     if (!diagnostics_.pixel_probes_enabled() || probes_disabled_) return;
     if (acceptance_) acceptance_->CheckProbe();
-    if (probes_pending_.load(std::memory_order_acquire) || probe_count_ == probes_.size() || !InitializeProbes()) return;
-    EnsureBuffer(storage_.buffers_.semantic_count_device_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
-                 "Explore rendered diagnostic device allocation failed");
-    EnsureBuffer(storage_.buffers_.semantic_count_pinned_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
-                 "Explore rendered diagnostic staging allocation failed");
-    auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    auto count_target = Target(semantic);
-    auto checksum_target = Target(clean);
-    if (width != 0U || height != 0U) {
-        if (width == 0U || height == 0U || x >= count_target.width || y >= count_target.height || width > count_target.width - x ||
-            height > count_target.height - y)
-            throw std::logic_error("Explore rendered diagnostic region is invalid");
-        count_target.data += static_cast<std::size_t>(y) * count_target.pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        checksum_target.data += static_cast<std::size_t>(y) * checksum_target.pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        count_target.width = width;
-        count_target.height = height;
-        checksum_target.width = width;
-        checksum_target.height = height;
-    }
-    auto* const device_facts = static_cast<std::uint64_t*>(storage_.buffers_.semantic_count_device_.data()) + probe_count_ * kProbeFacts;
-    EnsureCuda(cudaMemsetAsync(device_facts, 0, kProbeFacts * sizeof(std::uint64_t), cuda_stream),
-               "Explore rendered diagnostic clear failed");
-    if (explore::count_explore_nonzero_alpha(count_target, device_facts, stream) != explore::kExploreStorageSuccess)
-        throw std::runtime_error("Explore semantic diagnostic count failed");
-    if (explore::checksum_explore_pixels(checksum_target, device_facts + 1U, stream) != explore::kExploreStorageSuccess)
-        throw std::runtime_error("Explore image diagnostic checksum failed");
     std::optional<explore::ExploreRenderCardDescriptor> card;
     if (card_index)
         card = load_payload<explore::ExploreRenderCardDescriptor>(
@@ -2533,6 +2505,44 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
             if (hidden_class_identity == 0U) hidden_class_identity = static_cast<std::uint16_t>(annotation.class_id + 1U);
         }
     }
+    if (card) {
+        diagnostics_.Emit([&] {
+            auto fact = Diagnostic(VisualDiagnosticOperation::ExploreOverlaySelectionProbe, generation);
+            fact.value = selected_annotations;
+            fact.detail = compiled_index;
+            fact.context.capacity_width = static_cast<std::uint32_t>(hidden_annotations);
+            fact.context.capacity_height = static_cast<std::uint32_t>(selected_rle);
+            fact.context.staging_bytes =
+                (slot << 32U) | (static_cast<std::uint64_t>(selected_class_identity) << 16U) | hidden_class_identity;
+            return fact;
+        });
+    }
+    if (probes_pending_.load(std::memory_order_acquire) || probe_count_ == probes_.size() || !InitializeProbes()) return;
+    EnsureBuffer(storage_.buffers_.semantic_count_device_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
+                 "Explore rendered diagnostic device allocation failed");
+    EnsureBuffer(storage_.buffers_.semantic_count_pinned_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
+                 "Explore rendered diagnostic staging allocation failed");
+    auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    auto count_target = Target(semantic);
+    auto checksum_target = Target(clean);
+    if (width != 0U || height != 0U) {
+        if (width == 0U || height == 0U || x >= count_target.width || y >= count_target.height || width > count_target.width - x ||
+            height > count_target.height - y)
+            throw std::logic_error("Explore rendered diagnostic region is invalid");
+        count_target.data += static_cast<std::size_t>(y) * count_target.pitch_bytes + static_cast<std::size_t>(x) * 4U;
+        checksum_target.data += static_cast<std::size_t>(y) * checksum_target.pitch_bytes + static_cast<std::size_t>(x) * 4U;
+        count_target.width = width;
+        count_target.height = height;
+        checksum_target.width = width;
+        checksum_target.height = height;
+    }
+    auto* const device_facts = static_cast<std::uint64_t*>(storage_.buffers_.semantic_count_device_.data()) + probe_count_ * kProbeFacts;
+    EnsureCuda(cudaMemsetAsync(device_facts, 0, kProbeFacts * sizeof(std::uint64_t), cuda_stream),
+               "Explore rendered diagnostic clear failed");
+    if (explore::count_explore_nonzero_alpha(count_target, device_facts, stream) != explore::kExploreStorageSuccess)
+        throw std::runtime_error("Explore semantic diagnostic count failed");
+    if (explore::checksum_explore_pixels(checksum_target, device_facts + 1U, stream) != explore::kExploreStorageSuccess)
+        throw std::runtime_error("Explore image diagnostic checksum failed");
     const auto letterbox = State().store->letterbox(compiled_index);
     const auto scale_coordinate = [](const std::uint32_t coordinate, const std::uint32_t destination, const std::uint32_t source) {
         return static_cast<std::uint32_t>((static_cast<std::uint64_t>(coordinate) * destination) / source);
@@ -2600,11 +2610,6 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
                                .checksum_target = checksum_target,
                                .probe = probe,
                                .seed = State().plan.augmentation.seed,
-                               .selected_annotations = selected_annotations,
-                               .hidden_annotations = hidden_annotations,
-                               .selected_rle = selected_rle,
-                               .selected_class_identity = selected_class_identity,
-                               .hidden_class_identity = hidden_class_identity,
                                .augmented = State().plan.augmentation.enabled,
                                .card = card.has_value(),
                                .probe_annotation = probe_annotation.has_value()};
@@ -2671,8 +2676,7 @@ void GalleryStream::Impl::CollectProbes() noexcept {
 }
 
 void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint64_t* facts) const noexcept {
-    const auto& [generation, slot, compiled_index, count_target, checksum_target, probe, seed, selected_annotations, hidden_annotations,
-                 selected_rle, selected_class_identity, hidden_class_identity, augmented, card, probe_annotation] = record;
+    const auto& [generation, slot, compiled_index, count_target, checksum_target, probe, seed, augmented, card, probe_annotation] = record;
     diagnostics_.Emit([&] {
         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                     .operation = VisualDiagnosticOperation::ExploreSemanticPixels,
@@ -2705,15 +2709,6 @@ void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint
         fact.context.capacity_width = checksum_target.width;
         fact.context.capacity_height = checksum_target.height;
         fact.context.staging_bytes = packed_content;
-        return fact;
-    });
-    diagnostics_.Emit([&] {
-        auto fact = Diagnostic(VisualDiagnosticOperation::ExploreOverlaySelectionProbe, generation);
-        fact.value = selected_annotations;
-        fact.detail = compiled_index;
-        fact.context.capacity_width = static_cast<std::uint32_t>(hidden_annotations);
-        fact.context.capacity_height = static_cast<std::uint32_t>(selected_rle);
-        fact.context.staging_bytes = (slot << 32U) | (static_cast<std::uint64_t>(selected_class_identity) << 16U) | hidden_class_identity;
         return fact;
     });
     if (probe_annotation) {

@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string_view>
 
 #include "src/common/io/scoped_fd.h"
@@ -90,6 +91,9 @@ class DiagnosticsProducer final {
        private:
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit_terminal_encoded(DiagnosticRecord record) const noexcept;
+        using EncodedBatchWriter = bool (*)(void*, std::size_t, std::span<char>, std::size_t&) noexcept;
+        [[nodiscard]] DiagnosticSubmitResult try_submit_encoded_batch(std::size_t count, void* context,
+                                                                      EncodedBatchWriter writer) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult try_submit_encoded(DiagnosticRecord record) const noexcept {
             return submit(record, false, false);
         }

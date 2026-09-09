@@ -702,7 +702,10 @@ export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sour
     for(let i=0;i<probes.length;i+=7){
       const expected = probes.slice(i+2,i+5);
       const filteredPalette = scale < 1 && Math.max(...expected) === 255 && Math.min(...expected) === 0;
-      const tolerance = filteredPalette ? Math.max(probes[i+5], 32) : probes[i+5];
+      // A one-source-pixel outline clipped by the image boundary can retain
+      // strong class hue while downsampling mixes more of the underlying
+      // image than an interior two-sided outline.
+      const tolerance = filteredPalette ? Math.max(probes[i+5], 48) : probes[i+5];
       const x=Math.round(ox+probes[i]*scale),y=Math.round(oy+probes[i+1]*scale);
       const radius=Math.max(1,Math.ceil(probes[i+6]*scale));
       const left=Math.max(0,x-radius),top=Math.max(0,y-radius),width=Math.min(canvas.width-left,2*radius+1),height=Math.min(canvas.height-top,2*radius+1);
@@ -1556,6 +1559,15 @@ fn report(event: &str, control: &str, detail: &str, values: [f64; 4]) {
 #[cfg(not(target_arch = "wasm32"))]
 fn report(_event: &str, _control: &str, _detail: &str, _values: [f64; 4]) {}
 
+pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str) {
+    report(
+        "integration.snapshot_conflict",
+        family,
+        fields,
+        [revision as f64, 0.0, 0.0, 0.0],
+    );
+}
+
 #[cfg(target_arch = "wasm32")]
 fn report_rendered_control_style(
     control: &str,
@@ -1654,20 +1666,21 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
     );
     let new_draw = SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
-        let identity = (
-            frame.content_sequence,
-            visibility,
-            clip.y - image.y,
-            image.y + image.height - clip.y - clip.height,
-        );
-        if observer.atlas.as_ref() != Some(&draw)
+        let same_rendered_draw = observer.atlas.as_ref().is_some_and(|previous| {
+            previous.surface == draw.surface
+                && previous.bounds == draw.bounds
+                && previous.image == draw.image
+                && previous.clip == draw.clip
+                && previous.snapshot.overlay == draw.snapshot.overlay
+        });
+        if !same_rendered_draw
             && observer.output.as_mut().is_some_and(|output| {
                 output
                     .try_send(Message::AtlasDrawn {
                         source_revision: frame.content_sequence,
                         visibility,
-                        clipped_top: identity.2,
-                        clipped_bottom: identity.3,
+                        clipped_top: clip.y - image.y,
+                        clipped_bottom: image.y + image.height - clip.y - clip.height,
                         row_extent: image.width / snapshot.viewport.columns.max(1) as f32 / scale,
                         receipt: draw.clone(),
                     })
@@ -2041,6 +2054,17 @@ fn click_after_surface_draw(
         source_revision as f64,
         allow_newer,
     ) == 1
+}
+
+fn gallery_slot_bounds(bounds: Rectangle, columns: u32, slot: u32, clipped_top: f32) -> Rectangle {
+    let columns = columns.max(1);
+    let card_extent = bounds.width / columns as f32;
+    Rectangle {
+        x: bounds.x + (slot % columns) as f32 * card_extent,
+        y: bounds.y - clipped_top + (slot / columns) as f32 * card_extent,
+        width: card_extent,
+        height: card_extent,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2418,6 +2442,64 @@ enum Phase {
     Failed,
 }
 
+impl Phase {
+    fn deadline_class(&self) -> &'static str {
+        match self {
+            Self::AwaitBootstrap => "startup",
+            Self::AwaitCompileProgress
+            | Self::CompileProgress
+            | Self::CompileActionWithProgress
+            | Self::AwaitCompileCompletion
+            | Self::AwaitExploreReady
+            | Self::AwaitExploreInitialPatch { .. }
+            | Self::AwaitExploreExactGrid(_)
+            | Self::AwaitExploreExactGridPatch { .. }
+            | Self::AwaitExplorePolicyOrder(_)
+            | Self::AwaitExplorePolicyRange(_)
+            | Self::AwaitExplorePolicyOverlay(_)
+            | Self::AwaitExploreOverlayAll(_)
+            | Self::AwaitExploreOverlaySubset(_)
+            | Self::AwaitExploreOverlayRestored(_)
+            | Self::AwaitExploreAugmentationToggle { .. }
+            | Self::AwaitExploreAugmentationReroll { .. }
+            | Self::AwaitExploreReshuffle { .. }
+            | Self::AwaitGalleryPatch { .. }
+            | Self::GallerySweep
+            | Self::AwaitGallerySweep
+            | Self::GalleryLaterReady
+            | Self::AwaitGalleryScroll(_)
+            | Self::AwaitDetail(_)
+            | Self::AwaitDetailOriginal { .. }
+            | Self::AwaitDetailFit
+            | Self::AwaitAtlasColumns
+            | Self::AwaitAtlasEmpty
+            | Self::AwaitAtlasRestored
+            | Self::AwaitAtlasWindow(_)
+            | Self::AwaitAtlasRows { .. }
+            | Self::AwaitAtlasScroll(_)
+            | Self::AwaitAtlasOverlay(_)
+            | Self::AwaitViewerOverlay(_)
+            | Self::AwaitNext(_)
+            | Self::AwaitPrevious(_)
+            | Self::AwaitDetailClose
+            | Self::AwaitExploreDatasetReopen { .. }
+            | Self::AwaitDetailAgain
+            | Self::AwaitAnnotation
+            | Self::AwaitAnnotationFrame(_)
+            | Self::AwaitPointer(_)
+            | Self::CopyCapabilityWait
+            | Self::CopyProductWait
+            | Self::CopyAwaitOutput
+            | Self::ViewerAwaitDisconnect
+            | Self::ViewerReconnect
+            | Self::StartUpscale { .. }
+            | Self::AwaitUpscale { .. }
+            | Self::Complete => "work",
+            _ => "interaction",
+        }
+    }
+}
+
 fn region_id(page: FeatureId, index: usize) -> &'static str {
     let composition = crate::view::workflow::Composition::new(page, 0.0);
     composition.stable_id(composition.audit_regions()[index])
@@ -2594,6 +2676,7 @@ fn report_advanced_field(control: &str, detail: &str, bounds: Rectangle) {
 
 pub struct Controller {
     phase: Phase,
+    reported_phase: Option<Phase>,
     location_pending: bool,
     window_close: bool,
     dataset_source: String,
@@ -2791,6 +2874,7 @@ impl Controller {
             } else {
                 Phase::Disabled
             },
+            reported_phase: None,
             location_pending: false,
             window_close,
             dataset_source,
@@ -4303,12 +4387,24 @@ impl Controller {
                 None
             }
             Phase::GalleryReselect => {
-                let Some((_, _, _, _, revision)) = self.selection_grid else {
+                let Some((columns, _, slot, _, revision)) = self.selection_grid else {
                     self.fail("reopened Explore selection has no source revision");
                     return None;
                 };
+                let selected = gallery_slot_bounds(input_bounds, columns, slot, self.atlas_clip.0);
+                report(
+                    "integration.explore_pointer_scheduled",
+                    EXPLORE_GALLERY,
+                    "reopened-grid-slot",
+                    [
+                        revision as f64,
+                        slot as f64,
+                        f64::from(selected.center_x()),
+                        f64::from(selected.center_y()),
+                    ],
+                );
                 self.phase = Phase::AwaitDetailAgain;
-                if !click_after_surface_draw(input_bounds, EXPLORE_GALLERY, revision, false) {
+                if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, false) {
                     self.fail("Firefox reopened-gallery click dispatch failed");
                 }
                 None
@@ -4478,14 +4574,8 @@ impl Controller {
                 let resolved = (rows / 2)
                     .saturating_mul(columns)
                     .saturating_add(columns / 2);
-                let card_extent = bounds.width / columns.max(1) as f32;
-                let selected = Rectangle {
-                    x: bounds.x + (expected_slot % columns) as f32 * card_extent,
-                    y: bounds.y - self.atlas_clip.0
-                        + (expected_slot / columns) as f32 * card_extent,
-                    width: card_extent,
-                    height: card_extent,
-                };
+                let selected =
+                    gallery_slot_bounds(bounds, columns, expected_slot, self.atlas_clip.0);
                 let pointer_x = selected.x + selected.width * 0.5;
                 let pointer_y = selected.y + selected.height * 0.5;
                 report(
@@ -4558,6 +4648,19 @@ impl Controller {
         }
     }
 
+    fn report_phase_progress(&mut self) {
+        if self.reported_phase.as_ref() == Some(&self.phase) {
+            return;
+        }
+        report(
+            "integration.phase_progress",
+            self.phase.deadline_class(),
+            &format!("{:?}", self.phase),
+            [0.0; 4],
+        );
+        self.reported_phase = Some(self.phase.clone());
+    }
+
     pub fn advance(
         &mut self,
         model: &ApplicationModel,
@@ -4567,6 +4670,7 @@ impl Controller {
         active: FeatureId,
         frame: Option<crate::presentation_surface::FrameReady>,
     ) -> Task<RootMessage> {
+        self.report_phase_progress();
         if !self.running() {
             return Task::none();
         }
@@ -5987,11 +6091,10 @@ impl Controller {
                     || initial_overlays_pending
                     || snapshot.busy
                     || sampleable.is_none()
-                    || (initial_patch
-                        && sampleable.is_some_and(|sample| {
-                            self.gallery_drawn
-                                != Some((sample.presentation_revision, sample.source_revision))
-                        }))
+                    || sampleable.is_some_and(|sample| {
+                        self.gallery_drawn
+                            != Some((sample.presentation_revision, sample.source_revision))
+                    })
                 {
                     return Task::none();
                 }
@@ -7536,7 +7639,6 @@ impl Controller {
                     return Task::none();
                 };
                 if snapshot.revision > self.reopen_wait_revision {
-                    let expected_columns = self.selection_grid.map(|selection| selection.0);
                     let sampleable = sampleable_presentation(
                         model,
                         frame,
@@ -7557,11 +7659,9 @@ impl Controller {
                         "slot-cardinality"
                     } else if snapshot.gallery.slots.iter().any(|ready| !*ready) {
                         "slot-readiness"
-                    } else if expected_columns.is_none() {
+                    } else if self.selection_grid.is_none() {
                         "selection-grid"
-                    } else if expected_columns != Some(snapshot.viewport.columns)
-                        || snapshot.viewport.rowcount <= 1
-                    {
+                    } else if snapshot.viewport.columns == 0 || snapshot.viewport.rowcount == 0 {
                         "viewport"
                     } else if sampleable.is_none() {
                         "sampleable-presentation"
@@ -7604,11 +7704,11 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                let Some((columns, _, _, _, _)) = self.selection_grid else {
+                let Some(_) = self.selection_grid else {
                     self.fail("Explore selection grid is unavailable after reopen");
                     return Task::none();
                 };
-                if snapshot.viewport.columns != columns || snapshot.viewport.rowcount <= 1 {
+                if snapshot.viewport.columns == 0 || snapshot.viewport.rowcount == 0 {
                     return Task::none();
                 }
                 if sampleable_presentation(
@@ -7652,6 +7752,7 @@ impl Controller {
                         snapshot.order.visibleindices.len() as f64,
                     ],
                 );
+                let columns = snapshot.viewport.columns;
                 let slot = (snapshot.viewport.rowcount / 2)
                     .saturating_mul(columns)
                     .saturating_add(columns / 2) as usize;
@@ -8414,6 +8515,7 @@ impl Controller {
                     ],
                 );
                 self.phase = Phase::Complete;
+                self.report_phase_progress();
                 if self.window_close {
                     #[cfg(target_arch = "wasm32")]
                     if window_close_js() != 1 {
@@ -8430,6 +8532,35 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integration_phases_assign_bounded_progress_deadline_classes() {
+        assert_eq!(Phase::AwaitBootstrap.deadline_class(), "startup");
+        assert_eq!(Phase::AwaitCompileCompletion.deadline_class(), "work");
+        assert_eq!(
+            Phase::AwaitExploreDatasetReopen {
+                revision: 1,
+                frame_revision: 1,
+            }
+            .deadline_class(),
+            "work"
+        );
+        assert_eq!(
+            Phase::AwaitUpscale {
+                kernel: 0,
+                source_width: 1,
+                source_height: 1,
+                upscale_revision: 1,
+                upscale_frame_revision: 1,
+                presentation_revision: 1,
+            }
+            .deadline_class(),
+            "work"
+        );
+        assert_eq!(Phase::AwaitPointer(1).deadline_class(), "work");
+        assert_eq!(Phase::Complete.deadline_class(), "work");
+        assert_eq!(Phase::AwaitSettings.deadline_class(), "interaction");
+    }
 
     #[test]
     fn annotation_compact_scale_obeys_native_bounds_at_packaged_dpi_widths() {

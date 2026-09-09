@@ -240,7 +240,7 @@ def main():
         "cpuset_memory_nodes": read_text("/sys/fs/cgroup/cpuset.mems.effective"),
         "nice_limits": dict(zip(("soft", "hard"), resource.getrlimit(resource.RLIMIT_NICE))),
         "host_transfer_observation": {
-            "inventory": "docs/explore-streaming-review.md, Phase 3D host-boundary inventory",
+            "inventory": "docs/gpu-execution.md, Device and NUMA placement",
             "allocation_trace": "MMLTK_NUMA_TRANSFER_TRACE_FILE: context, node, capacity, registration, source/receiver route",
             "matcher_trace": "MMLTK_MATCHER_TRACE_FILE: exact active cost DMA and packed assignment upload counters",
             "gdr_trace": "MMLTK_GDR_TRACE_FILE: actual mapping backend and consumer lifetime",

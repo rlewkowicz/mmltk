@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import resource
+import select
 import signal
 import sys
 import tempfile
@@ -44,6 +46,18 @@ while True:
 
 
 class HardwareContractTests(unittest.TestCase):
+    def test_wrapper_disables_os_core_reporting_for_fixture_children(self):
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_CORE), (1, 1))
+
+    def test_fatal_signal_preserves_status_without_an_os_core_dump(self):
+        pid = os.posix_spawn(
+            sys.executable, (sys.executable, "-c", "import os; os.abort()"), os.environ,
+        )
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(os.WIFSIGNALED(status))
+        self.assertEqual(os.WTERMSIG(status), signal.SIGABRT)
+        self.assertFalse(os.WCOREDUMP(status))
+
     def test_requires_nvidia_vendor_and_modifier_support(self):
         self.assertEqual(runner.hardware_renderer(HARDWARE_LOG)["GL vendor"], "NVIDIA Corporation")
         for log in (
@@ -177,6 +191,53 @@ signal.pause()
         self.assertEqual(await self.run_command(code, timeout=0.1), 1)
         self.assertEqual(self.children[-1].returncode, -signal.SIGKILL)
         self.assertIn("headless.cleanup.escalated", [event["event"] for event in self.events()])
+
+    async def test_exited_leader_does_not_abandon_stubborn_descendant(self):
+        await self.check_exited_leader_descendant(stubborn=True)
+
+    async def test_exited_leader_allows_descendant_to_finish_on_term(self):
+        await self.check_exited_leader_descendant(stubborn=False)
+
+    async def check_exited_leader_descendant(self, *, stubborn):
+        pid_file = self.artifacts / "descendant.pid"
+        code = f"""
+import os, signal
+from pathlib import Path
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    signal.signal(signal.SIGTERM, {"signal.SIG_IGN" if stubborn else "lambda *_: os._exit(0)"})
+    os.write(write_fd, b"ready")
+    os.close(write_fd)
+    signal.pause()
+    os._exit(0)
+os.close(write_fd)
+os.read(read_fd, 5)
+os.close(read_fd)
+Path({str(pid_file)!r}).write_text(str(pid))
+"""
+        try:
+            result = await self.run_command(code)
+            self.assertEqual(result, int(stubborn))
+            self.assertEqual("headless.cleanup.escalated" in
+                             [event["event"] for event in self.events()], stubborn)
+            pid = int(pid_file.read_text())
+            try:
+                descriptor = os.pidfd_open(pid)
+            except ProcessLookupError:
+                return
+            try:
+                self.assertTrue(select.select([descriptor], [], [], 0)[0],
+                                "descendant is still running")
+            finally:
+                os.close(descriptor)
+        finally:
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     async def test_missing_command_cleans_started_compositor(self):
         self.assertEqual(await runner.run_session(

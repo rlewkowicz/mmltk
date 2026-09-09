@@ -14,6 +14,7 @@ pub(super) struct Controller {
     // is not evidence that the incumbent's delayed receipt is obsolete.
     incumbent: Option<Surface>,
     pending: Option<Surface>,
+    pending_rejected: bool,
     retained: Option<Surface>,
     failed: bool,
     viewer: Option<(u64, u32)>,
@@ -159,6 +160,7 @@ impl Controller {
     #[cfg(test)]
     pub(super) fn set_test_surface(&mut self, surface: Surface) {
         self.pending = surface.frame.map(|_| surface);
+        self.pending_rejected = false;
         self.surface = Some(Surface {
             frame: None,
             ..surface
@@ -191,7 +193,19 @@ impl Controller {
             }
             Message::Surface(crate::presentation_surface::Notification::Completed(frame)) => {
                 crate::presentation_surface::complete_capture(frame);
+                if self.pending.and_then(|surface| surface.frame) == Some(frame) {
+                    self.pending_rejected = false;
+                }
                 update.redraw = true;
+            }
+            Message::Surface(crate::presentation_surface::Notification::CaptureRejected(frame)) => {
+                if self.pending.and_then(|surface| surface.frame) == Some(frame) {
+                    crate::presentation_surface::trace_surface(
+                        "capture_rejection_received",
+                        self.pending.expect("matching rejected publication"),
+                    );
+                    self.pending_rejected = true;
+                }
             }
             Message::Surface(crate::presentation_surface::Notification::Drawn) => {
                 update.redraw = true;
@@ -530,6 +544,7 @@ impl Controller {
             frame: Some(frame),
             ..surface
         });
+        self.pending_rejected = false;
         if completed {
             self.incumbent = Some(surface);
         }
@@ -543,6 +558,7 @@ impl Controller {
     }
 
     fn retire_pending(&mut self) {
+        self.pending_rejected = false;
         if let Some(frame) = self.pending.take().and_then(|surface| surface.frame) {
             crate::presentation_surface::retire_publication(frame);
             crate::presentation_surface::discard_capture(frame);
@@ -602,24 +618,57 @@ impl Controller {
         }
         // A future physical publication may be awaiting its control snapshot.
         // Neither that ordering nor a later domain snapshot alone abandons it.
-        if frame.presentation_revision > snapshot.presentationrevision {
-            return Ok(());
-        }
-        if decision == crate::view_model::PresentationReconciliation::Superseded || !completed {
-            self.retire_pending();
-        } else if decision == crate::view_model::PresentationReconciliation::Matching {
-            crate::presentation_surface::gallery::confirm(
-                frame,
-                &snapshot.completed,
-                model.explore.snapshot.as_ref(),
-            );
-            crate::presentation_surface::reconcile_completed(frame, model);
-            if let Some(retained) = crate::presentation_surface::retained_surface()
-                .filter(|surface| surface.frame == Some(frame))
-            {
-                self.retained = Some(retained);
-                self.pending = None;
+        if frame.presentation_revision <= snapshot.presentationrevision {
+            if decision == crate::view_model::PresentationReconciliation::Superseded || !completed {
+                self.retire_pending();
+            } else if decision == crate::view_model::PresentationReconciliation::Matching {
+                crate::presentation_surface::gallery::confirm(
+                    frame,
+                    &snapshot.completed,
+                    model.explore.snapshot.as_ref(),
+                );
+                crate::presentation_surface::reconcile_completed(frame, model);
+                if let Some(retained) = crate::presentation_surface::retained_surface()
+                    .filter(|surface| surface.frame == Some(frame))
+                {
+                    self.retained = Some(retained);
+                    self.pending = None;
+                    self.pending_rejected = false;
+                }
             }
+        }
+        if self.pending_rejected && crate::presentation_surface::gallery::awaiting_display(frame) {
+            // Matching metadata may have arrived after the rejected draw.
+            self.pending_rejected = false;
+        }
+        let selection_superseded = !completed
+            && snapshot.selected.instance != 0
+            && snapshot.selected.kind != PresentationSourceKind::None
+            && frame.content_session
+                != crate::generated::presentation_source_session(snapshot.selected.kind);
+        if (self.pending_rejected || selection_superseded)
+            && self
+                .pending
+                .zip(self.surface)
+                .is_some_and(|(pending, surface)| {
+                    surface.generation > pending.generation
+                        && (surface.high != pending.high || surface.low != pending.low)
+                })
+        {
+            // An uncapturable incumbent must not hide an admitted replacement.
+            // A publication from an abandoned source selection will never receive
+            // matching completion metadata. Active copies keep CaptureBorrow.
+            if let Some(pending) = self.pending {
+                crate::presentation_surface::trace_surface(
+                    if selection_superseded {
+                        "selection_superseded_publication_retired"
+                    } else {
+                        "rejected_publication_retired"
+                    },
+                    pending,
+                );
+            }
+            self.retire_pending();
         }
         Ok(())
     }
@@ -1318,42 +1367,120 @@ mod tests {
 
     #[test]
     fn unpublished_successor_cannot_hide_or_reject_the_incumbent_capture() {
-        for receipt_first in [false, true] {
-            let (mut app, frame) = viewer_app();
-            let incumbent = app.presentation.surface().unwrap();
-            if receipt_first {
-                app.present_native_frame(frame);
-            }
-            let snapshot = app.model.presentation.as_mut().unwrap();
-            snapshot.capability.surfacelow += 1;
-            snapshot.capability.generation += 1;
-            snapshot.capability.extent.width *= 2;
-            snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
-            app.sync_surface();
-            if !receipt_first {
-                app.present_native_frame(frame);
-            }
-            let capture_surface = app.presentation.surface().unwrap();
-            assert_eq!(
-                capture_surface,
-                Surface {
-                    frame: Some(frame),
-                    ..incumbent
+        for rejected in [false, true] {
+            for receipt_first in [false, true] {
+                let (mut app, frame) = viewer_app();
+                let incumbent = app.presentation.surface().unwrap();
+                if receipt_first {
+                    app.present_native_frame(frame);
+                    if rejected {
+                        drop(app.on_presentation(Message::Surface(
+                            crate::presentation_surface::Notification::CaptureRejected(frame),
+                        )));
+                        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+                        assert!(test_releases().is_empty());
+                    }
                 }
-            );
-            assert_ne!(capture_surface.low, app.presentation.surface.unwrap().low);
-            assert!(test_releases().is_empty());
-            let capture = crate::presentation_surface::test_capture_borrow(frame);
-            app.sync_surface();
-            assert_eq!(app.presentation.surface(), Some(capture_surface));
-            assert!(test_releases().is_empty());
-            drop(capture);
-            drop(app.on_presentation(Message::Surface(
-                crate::presentation_surface::Notification::Completed(frame),
-            )));
-            assert_eq!(test_releases(), vec![frame]);
-            app.presentation.discard();
-            assert_eq!(test_releases(), vec![frame]);
+                let snapshot = app.model.presentation.as_mut().unwrap();
+                snapshot.capability.surfacelow += 1;
+                snapshot.capability.generation += 1;
+                snapshot.capability.extent.width *= 2;
+                snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
+                app.sync_surface();
+                if !receipt_first {
+                    app.present_native_frame(frame);
+                    // A stale outcome cannot retire the current receipt.
+                    drop(app.on_presentation(Message::Surface(
+                        crate::presentation_surface::Notification::CaptureRejected(FrameReady {
+                            slot: 1,
+                            ..frame
+                        }),
+                    )));
+                    assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+                    if rejected {
+                        drop(app.on_presentation(Message::Surface(
+                            crate::presentation_surface::Notification::CaptureRejected(frame),
+                        )));
+                    }
+                }
+                if rejected {
+                    assert_eq!(app.presentation.surface(), app.presentation.surface);
+                    assert_ne!(app.presentation.surface().unwrap().low, incumbent.low);
+                    assert!(app.presentation.surface().unwrap().frame.is_none());
+                    assert_eq!(test_releases(), vec![frame]);
+                    app.present_native_frame(frame);
+                    assert!(app.presentation.surface().unwrap().frame.is_none());
+                } else {
+                    let capture_surface = app.presentation.surface().unwrap();
+                    assert_eq!(
+                        capture_surface,
+                        Surface {
+                            frame: Some(frame),
+                            ..incumbent
+                        }
+                    );
+                    assert_ne!(capture_surface.low, app.presentation.surface.unwrap().low);
+                    assert!(test_releases().is_empty());
+                    let capture = crate::presentation_surface::test_capture_borrow(frame);
+                    app.sync_surface();
+                    assert_eq!(app.presentation.surface(), Some(capture_surface));
+                    assert!(test_releases().is_empty());
+                    drop(capture);
+                }
+                drop(app.on_presentation(Message::Surface(
+                    crate::presentation_surface::Notification::Completed(frame),
+                )));
+                assert_eq!(test_releases(), vec![frame]);
+                app.presentation.discard();
+                assert_eq!(test_releases(), vec![frame]);
+            }
+        }
+        for completed in [false, true] {
+            for selected_successor in [false, true] {
+                let (mut app, frame) = viewer_app();
+                let pending = FrameReady {
+                    presentation_revision: frame.presentation_revision + 1,
+                    content_sequence: frame.content_sequence + 1,
+                    ..frame
+                };
+                app.present_native_frame(pending);
+                if completed {
+                    let snapshot = app.model.presentation.as_mut().unwrap();
+                    snapshot.presentationrevision = pending.presentation_revision;
+                    snapshot.completed.revision = pending.content_sequence;
+                    app.model.explore.snapshot.as_mut().unwrap().frame = snapshot.completed.clone();
+                }
+                let snapshot = app.model.presentation.as_mut().unwrap();
+                if selected_successor {
+                    snapshot.selected = crate::view_model::test_support::visual_frame(
+                        PresentationSourceKind::Upscale,
+                        4,
+                    )
+                    .source;
+                }
+                // Selecting another source alone does not abandon physical custody.
+                app.reconcile_surface_frame();
+                assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
+                assert!(test_releases().is_empty());
+                let capture = crate::presentation_surface::test_capture_borrow(pending);
+                let snapshot = app.model.presentation.as_mut().unwrap();
+                snapshot.capability.surfacelow += 1;
+                snapshot.capability.generation += 1;
+                snapshot.capability.extent.width *= 2;
+                snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
+                app.sync_surface();
+                if !completed && selected_successor {
+                    assert_eq!(app.presentation.surface(), app.presentation.surface);
+                    assert!(app.presentation.surface().unwrap().frame.is_none());
+                } else {
+                    assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
+                }
+                // Retirement cannot return an active physical copy early.
+                assert!(test_releases().is_empty());
+                drop(capture);
+                app.presentation.discard();
+                assert_eq!(test_releases(), vec![pending]);
+            }
         }
     }
 

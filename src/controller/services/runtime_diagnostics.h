@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -45,6 +46,7 @@ class RuntimeDiagnosticTarget final {
         } catch (...) {}
     }
     void write(RuntimeDiagnosticFact fact) const noexcept;
+    void write_batch(std::span<const RuntimeDiagnosticFact> facts) const noexcept;
     // Seals diagnostic ingress and reserves one final owner fact without
     // waiting for queue capacity, immediately before the owner flushes.
     void write_required(RuntimeDiagnosticFact fact) const noexcept;

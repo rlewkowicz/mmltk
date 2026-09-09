@@ -515,14 +515,15 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     [](void* context) {
                         auto& self = *static_cast<NativePresentationWriter*>(context);
                         const auto* samples = static_cast<const std::uint32_t*>(self.pixel_samples_->data());
+                        std::array<VisualDiagnosticFact, 25U> facts;
                         for (std::size_t index = 0U; index < self.pixel_coordinates_.size(); ++index) {
-                            auto fact = self.pixel_fact_;
-                            fact.context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
-                                                  .sample_x = self.pixel_coordinates_[index][0],
-                                                  .sample_y = self.pixel_coordinates_[index][1],
-                                                  .sample_rgba = samples[index]};
-                            self.diagnostics_(fact);
+                            facts[index] = self.pixel_fact_;
+                            facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
+                                                          .sample_x = self.pixel_coordinates_[index][0],
+                                                          .sample_y = self.pixel_coordinates_[index][1],
+                                                          .sample_rgba = samples[index]};
                         }
+                        self.diagnostics_.WriteBatch(facts);
                     },
                     this) != cudaSuccess)
                 pixel_probe_failed_ = true;

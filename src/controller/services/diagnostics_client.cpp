@@ -483,4 +483,36 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(c
     return DiagnosticSubmitResult::Accepted;
 }
 
+DiagnosticSubmitResult DiagnosticsProducer::Operation::try_submit_encoded_batch(const std::size_t count, void* const context,
+                                                                                 const EncodedBatchWriter writer) const noexcept {
+    if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
+    if (count == 0U) return DiagnosticSubmitResult::Accepted;
+    if (writer == nullptr || count > DiagnosticsClient::kQueueCapacity) {
+        state_->dropped.fetch_add(count, std::memory_order_relaxed);
+        return DiagnosticSubmitResult::RecordTooLarge;
+    }
+    // One short ownership interval makes a correlated batch all-or-none. It
+    // never waits for diagnostic capacity or performs file I/O.
+    std::lock_guard lock(state_->mutex);
+    if (state_->closing || state_->failed || state_->descriptor.get() < 0) return DiagnosticSubmitResult::Closed;
+    if (count > DiagnosticsClient::kQueueCapacity - state_->size) {
+        state_->dropped.fetch_add(count, std::memory_order_relaxed);
+        return DiagnosticSubmitResult::Capacity;
+    }
+    for (std::size_t index = 0U; index < count; ++index) {
+        auto& target = state_->records[(state_->head + state_->size + index) % DiagnosticsClient::kQueueCapacity];
+        std::size_t encoded_size = 0U;
+        if (!writer(context, index, target.bytes, encoded_size) || encoded_size == 0U ||
+            encoded_size > DiagnosticsClient::kRecordCapacity) {
+            state_->dropped.fetch_add(count, std::memory_order_relaxed);
+            return DiagnosticSubmitResult::RecordTooLarge;
+        }
+        target.size = encoded_size;
+    }
+    state_->size += count;
+    state_->accepted.fetch_add(count, std::memory_order_relaxed);
+    if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter) state_->signal_locked();
+    return DiagnosticSubmitResult::Accepted;
+}
+
 }  // namespace mmltk::controller::services

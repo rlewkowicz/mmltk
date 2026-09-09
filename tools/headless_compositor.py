@@ -71,6 +71,41 @@ def exit_status(returncode):
     return returncode if returncode >= 0 else 128 - returncode
 
 
+async def wait_for_pidfd(descriptor):
+    loop = asyncio.get_running_loop()
+    exited = loop.create_future()
+
+    def ready():
+        loop.remove_reader(descriptor)
+        if not exited.done():
+            exited.set_result(None)
+
+    loop.add_reader(descriptor, ready)
+    try:
+        await exited
+    finally:
+        loop.remove_reader(descriptor)
+
+
+def group_pidfds(group, resources):
+    """Pin the current live members, including children whose leader exited."""
+    descriptors = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        with contextlib.suppress(ProcessLookupError, FileNotFoundError):
+            if os.getpgid(pid) != group:
+                continue
+            # A zombie has released its resources; the container init reaps it.
+            if (entry / "stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                continue
+            descriptor = os.pidfd_open(pid)
+            resources.callback(os.close, descriptor)
+            descriptors.append(descriptor)
+    return descriptors
+
+
 class HeadlessSession:
     def __init__(self, artifacts, environment, timeout):
         self.artifacts = artifacts
@@ -168,21 +203,47 @@ class HeadlessSession:
                 self.event("test.exited", child_pid=process.pid, returncode=code)
                 return exit_status(code)
 
+    async def stop_group(self, process):
+        clean = True
+        # A fresh snapshot after TERM also catches descendants created during a
+        # parent's shutdown handler. PID descriptors wait on exit without polling.
+        for number in (signal.SIGTERM, signal.SIGKILL):
+            with contextlib.ExitStack() as resources:
+                descriptors = group_pidfds(process.pid, resources)
+                if number == signal.SIGKILL and not descriptors:
+                    break
+                if number == signal.SIGKILL:
+                    clean = False
+                    self.event("cleanup.escalated", child_pid=process.pid)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, number)
+                try:
+                    await asyncio.wait_for(asyncio.gather(
+                        process.wait(),
+                        *(wait_for_pidfd(descriptor) for descriptor in descriptors),
+                    ), SHUTDOWN_TIMEOUT)
+                except asyncio.TimeoutError:
+                    if number == signal.SIGKILL:
+                        self.event("cleanup.failed", child_pid=process.pid,
+                                   message="process group did not exit after SIGKILL")
+                    clean = False
+        return clean
+
     async def close(self):
         clean = True
         for process in reversed(self.children):
             was_running = process.returncode is None
-            # Retire the owned process group even when its leader exited.
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
             try:
-                await asyncio.wait_for(process.wait(), SHUTDOWN_TIMEOUT)
-            except asyncio.TimeoutError:
+                clean = await self.stop_group(process) and clean
+            except OSError as error:
                 clean = False
+                self.event("cleanup.failed", child_pid=process.pid, message=str(error))
+                # A failed procfs inspection must not strand the remaining owners.
                 self.event("cleanup.escalated", child_pid=process.pid)
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(process.wait(), SHUTDOWN_TIMEOUT)
             if process is self.compositor:
                 self.event("compositor.exited", returncode=process.returncode,
                            shutdown_requested=was_running)

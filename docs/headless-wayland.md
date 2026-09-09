@@ -1,5 +1,7 @@
 # Headless Wayland hardware validation
 
+[Validation](validation.md) · [Logging](logging.md) · [Build prerequisites](build.md)
+
 Run the existing packaged Firefox/NVIDIA acceptance suite with a private
 GPU-rendered Weston output:
 
@@ -41,8 +43,18 @@ Startup waits up to 30 seconds for Weston's `systemd-notify.so` READY datagram,
 then up to 10 seconds for the protocol roundtrip. The acceptance executable
 retains its existing per-case deadlines; optionally set
 `MMLTK_TEST_TIMEOUT_SECONDS` to add a deadline for the complete executable.
-Owned processes receive TERM at shutdown and KILL after a five-second grace period. Compositor
-loss, failed preflight and unclean shutdown fail the wrapper.
+Owned process groups receive TERM at shutdown and KILL after a five-second
+grace period. Linux process descriptors wait for surviving descendants even
+when their group leader has exited. A second bounded wait follows KILL;
+compositor loss, failed preflight and unclean shutdown fail the wrapper.
+
+Headless containers inherit a one-byte soft and hard core limit. Linux uses
+that exact value to suppress piped OS core handlers as well as ordinary core
+files; a zero limit alone does not suppress piped handlers such as
+systemd-coredump. This policy applies to the compositor, probe, acceptance
+command and their descendants without changing the host's core configuration.
+Firefox also retains its application-owned crash-reporter disable setting.
+See the [Linux core-handler implementation](https://github.com/torvalds/linux/blob/master/fs/coredump.c).
 
 NVIDIA's driver must support the surfaceless EGL platform, DMA-BUF imports and
 modifiers exposed by Weston. The runner forces the NVIDIA EGL vendor and GL

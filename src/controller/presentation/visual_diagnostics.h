@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <exception>
 #include <meta>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -202,6 +203,7 @@ MMLTK_REFLECT_ENUM(VisualDiagnosticOperation)
 struct VisualDiagnosticSink final {
     void* context = nullptr;
     void (*write)(void*, VisualDiagnosticFact) noexcept = nullptr;
+    void (*write_batch)(void*, std::span<const VisualDiagnosticFact>) noexcept = nullptr;
     bool (*enabled)(void*) noexcept = nullptr;
     bool pixel_probes = false;
 
@@ -209,6 +211,14 @@ struct VisualDiagnosticSink final {
     [[nodiscard]] bool pixel_probes_enabled() const noexcept { return pixel_probes && valid(); }
     void operator()(const VisualDiagnosticFact fact) const noexcept {
         if (valid()) write(context, fact);
+    }
+    void WriteBatch(const std::span<const VisualDiagnosticFact> facts) const noexcept {
+        if (!valid()) return;
+        if (write_batch != nullptr) {
+            write_batch(context, facts);
+            return;
+        }
+        for (const auto& fact : facts) write(context, fact);
     }
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
@@ -229,6 +239,18 @@ struct VisualDiagnosticSink final {
         .write =
             [](void* context, VisualDiagnosticFact fact) noexcept {
                 static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact));
+            },
+        .write_batch =
+            [](void* context, const std::span<const VisualDiagnosticFact> facts) noexcept {
+                constexpr std::size_t capacity = 25U;
+                auto& runtime_target = *static_cast<services::RuntimeDiagnosticTarget*>(context);
+                if (facts.size() > capacity) {
+                    for (const auto& fact : facts) runtime_target.write(visual_runtime_diagnostic(fact));
+                    return;
+                }
+                std::array<services::RuntimeDiagnosticFact, capacity> runtime_facts;
+                std::ranges::transform(facts, runtime_facts.begin(), visual_runtime_diagnostic);
+                runtime_target.write_batch({runtime_facts.data(), facts.size()});
             },
         .enabled = [](void* context) noexcept { return static_cast<services::RuntimeDiagnosticTarget*>(context)->valid(); },
         .pixel_probes = target.pixel_probes_enabled(),

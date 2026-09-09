@@ -427,6 +427,7 @@ pub fn subscription() -> iced::Subscription<Notification> {
 pub enum Notification {
     Native(FrameReady),
     Completed(FrameReady),
+    CaptureRejected(FrameReady),
     Drawn,
 }
 
@@ -447,6 +448,10 @@ fn notify_surface(notification: Notification) {
                     mailbox.complete(frame);
                     trace_frame("completion_enqueued", frame);
                 }
+                Notification::CaptureRejected(frame) => {
+                    mailbox.rejected = Some(frame);
+                    trace_frame("capture_rejection_enqueued", frame);
+                }
                 Notification::Drawn => mailbox.drawn = true,
                 Notification::Native(_) => {
                     unreachable!("native frames arrive through their mailbox")
@@ -463,6 +468,7 @@ fn notify_surface(_notification: Notification) {}
 #[derive(Default)]
 struct FrameMailbox {
     completed: Option<FrameReady>,
+    rejected: Option<FrameReady>,
     drawn: bool,
     frames: [Option<FrameReady>; 3],
     next_layer: usize,
@@ -482,6 +488,7 @@ impl FrameMailbox {
         self.completed
             .take()
             .map(Notification::Completed)
+            .or_else(|| self.rejected.take().map(Notification::CaptureRejected))
             .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
             .or_else(|| self.pop().map(Notification::Native))
     }
@@ -2164,6 +2171,7 @@ impl Imported {
                 None,
                 None,
             );
+            notify_surface(Notification::CaptureRejected(frame));
             return;
         }
         if frame.content_width == 0
@@ -3057,8 +3065,12 @@ mod tests {
         mailbox.complete(old);
         mailbox.complete(newest);
         mailbox.complete(old);
+        mailbox.rejected = Some(old);
         assert!(
             matches!(mailbox.next_notification(), Some(Notification::Completed(frame)) if frame == newest)
+        );
+        assert!(
+            matches!(mailbox.next_notification(), Some(Notification::CaptureRejected(frame)) if frame == old)
         );
         assert!(
             matches!(mailbox.next_notification(), Some(Notification::Native(frame)) if frame == newest)

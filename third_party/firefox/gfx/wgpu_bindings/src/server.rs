@@ -4497,10 +4497,12 @@ impl Global {
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
             .fd(admission.descriptor());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(admission.size)
             .memory_type_index(memory_type)
-            .push_next(&mut import_info);
+            .push_next(&mut import_info)
+            .push_next(&mut dedicated);
         let memory = unsafe { device.allocate_memory(&allocate_info, None) }.map_err(|error| {
             log::error!(
                 "mmltk workspace import could not allocate imported memory; step=allocate_memory, \

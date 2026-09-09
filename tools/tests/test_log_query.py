@@ -1,7 +1,8 @@
 """Required parser, bounded selection, and log format behavior for ./mmltk --logs."""
 
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
+from itertools import permutations
 import json
 import os
 from pathlib import Path
@@ -67,6 +68,14 @@ class ParserTests(unittest.TestCase):
 
 
 class LogFormatTests(unittest.TestCase):
+    def test_complete_jsonl_decodes_each_payload_once(self):
+        data = {"event": "sample", "fields": {"nested": list(range(100))}}
+        with patch.object(logs.JSON_DECODER, "raw_decode", wraps=logs.JSON_DECODER.raw_decode) as decoded:
+            row = record(data)
+        self.assertEqual(row.data, data)
+        self.assertFalse(row.parse_error)
+        self.assertEqual(decoded.call_count, 1)
+
     def test_runtime_and_wrapped_json_keep_original_vocabulary(self):
         row = record({
             "event": "browser.telemetry",
@@ -198,6 +207,149 @@ class LogFormatTests(unittest.TestCase):
         self.assertIs(terminal.get("@signal"), logs.MISSING)
 
 
+class TriageSelectionTests(unittest.TestCase):
+    def setUp(self):
+        options = logs.argument_parser().parse_args(["--triage", "--triage-identities", "64"])
+        self.triage = logs.Triage(options, logs.Expression("all", ()), {})
+        self.triage.run = "capture"
+
+    def row(self, data, line=1, source="input.jsonl"):
+        row = record(data, source, line)
+        row.metadata.update({"run": "capture", "mtime_ns": 1})
+        return row
+
+    def test_reservoir_equal_ranks_preserve_insertion_priority_after_updates(self):
+        pool = logs.TriagePool(2)
+        row = self.row({"event": "sample"})
+        for key, rank in (("a", 3), ("b", 3), ("a", 1), ("b", 1), ("c", 0), ("late", 1)):
+            pool.add(row, (rank,), key, key)
+        self.assertEqual(list(pool.entries), ["b", "c"])
+        self.assertEqual(pool.discarded, 2)
+        for rank in range(-1, -1001, -1):
+            pool.add(row, (rank,), "improved", "b")
+            self.assertLessEqual(len(pool._heap), 2 * pool.limit)
+        self.assertEqual([why for _, _, why in pool.rows()], ["improved", "c"])
+        self.assertEqual(pool.discarded, 2)
+
+    def test_saturated_reservoir_has_logarithmic_comparison_budget(self):
+        class CountedRank(int):
+            comparisons = 0
+
+            def __eq__(self, other):
+                type(self).comparisons += 1
+                return super().__eq__(other)
+
+        capacity, total = 256, 4096
+        pool = logs.TriagePool(capacity)
+        row = self.row({"event": "sample"})
+        for index in range(total):
+            pool.add(row, (CountedRank(total - index),), "sample", index)
+        comparisons = CountedRank.comparisons
+        self.assertLess(comparisons, total * 4 * capacity.bit_length())
+        self.assertEqual([int(rank[0]) for rank, _, _ in pool.rows()], list(range(1, capacity + 1)))
+        self.assertEqual(pool.discarded, total - capacity)
+        self.assertLessEqual(len(pool._heap), 2 * capacity)
+
+    def test_counter_lookup_reads_each_field_once_at_identity_capacity(self):
+        for index in range(64):
+            origin = self.row({"generation": index + 1, "slot": 0}, source=f"{index}.jsonl")
+            strong = logs.Identity("capture", ("request_id",), (str(index + 1),))
+            self.triage.add_refinement(origin, strong)
+        row = self.row({"generation": 64, "slot": 0}, source="63.jsonl")
+        with patch.object(row, "get", wraps=row.get) as fields:
+            neighbor = self.triage.counter_neighbor(row)
+        self.assertEqual(neighbor[0].values, ("64", "0"))
+        self.assertEqual(neighbor[1], strong)
+        self.assertEqual(neighbor[2], "line")
+        self.assertLessEqual(fields.call_count, 3)
+
+    def test_counter_lookup_preserves_first_matching_schema_and_origin(self):
+        strong = logs.Identity("capture", ("request_id",), ("1",))
+        schemas = ({"generation": 4, "slot": 0}, {"sequence": 7, "generation": 4},
+                   {"sequence": 7, "generation": 4, "slot": 0}, {"sequence": 7, "slot": 0})
+        for index, data in enumerate(schemas):
+            self.triage.add_refinement(self.row(data, line=index + 1), strong)
+        row = self.row(schemas[2], line=20)
+        self.assertEqual(self.triage.counter_neighbor(row)[0].names, ("generation", "slot"))
+        self.assertIsNone(self.triage.counter_neighbor(self.row(schemas[2], line=1000)))
+        self.assertIsNone(self.triage.counter_neighbor(self.row({"generation": "4", "slot": False})))
+
+    def test_automatic_anchor_search_is_logarithmic_and_returns_two_neighbors(self):
+        class CountedTimes(list):
+            reads = 0
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return super().__getitem__(index)
+
+        group = logs.AutoAnchorGroup()
+        for index in range(logs.MAX_AUTO_ANCHORS):
+            group.add(index, self.row({"steady_ns": index}, line=index + 1))
+        group.finish()
+        group.times["steady"] = times = CountedTimes(group.times["steady"])
+        self.assertEqual(group.nearest(self.row({"steady_ns": 64})), (63, 64))
+        self.assertLessEqual(times.reads, logs.MAX_AUTO_ANCHORS.bit_length() + 2)
+        self.assertEqual(group.nearest(self.row({}, source="another.log")), (0,))
+
+    def pixel_row(self, boundary, transfer=1, rgba=10, line=1):
+        data = {
+            "surface": "00000000000000010000000000000002", "presentation_revision": 1,
+            "sample_index": 0, "sample_x": 4, "sample_y": 5, "sample_rgba": rgba,
+            "transfer_sequence": transfer, "boundary": boundary,
+            "event": "presentation.pixel" if boundary == "native" else
+                     "iced.surface.pixel" if boundary == "owned" else "firefox.workspace.pixel",
+        }
+        return self.row(data, line)
+
+    def test_pixel_edges_keep_the_same_evidence_for_every_arrival_order(self):
+        for order in permutations(("native", "import", "mailbox", "owned")):
+            with self.subTest(order=order):
+                self.triage.pixel_samples.clear()
+                self.triage.pixel_divergences.clear()
+                self.triage.findings.clear()
+                for line, boundary in enumerate(order, 1):
+                    row = self.pixel_row(boundary, rgba=10 if boundary == "native" else 11, line=line)
+                    self.triage.observe_pixel_chain(row, emit=True)
+                finding, = self.triage.findings.values()
+                self.assertEqual(finding.kind, "pixel-chain-divergence")
+                self.assertIn("native -> import", finding.message)
+                self.assertEqual(finding.record.get("boundary"), "import")
+                self.assertEqual(finding.other.get("boundary"), "native")
+
+    def test_pixel_owner_mutation_wins_before_cross_stage_comparison(self):
+        self.triage.observe_pixel_chain(self.pixel_row("native"), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("native", rgba=11, line=2), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("import", rgba=12, line=3), emit=True)
+        finding, = self.triage.findings.values()
+        self.assertEqual(finding.kind, "pixel-owner-mutation")
+        self.assertEqual((finding.other.line, finding.record.line), (1, 2))
+
+    def test_pixel_transfer_comparisons_are_linear_in_samples(self):
+        class CountedStages(dict):
+            operations = 0
+
+            def get(self, key, default=None):
+                self.operations += 1
+                return super().get(key, default)
+
+            def __iter__(self):
+                for key in super().__iter__():
+                    self.operations += 1
+                    yield key
+
+        first = self.pixel_row("owned")
+        self.triage.observe_pixel_chain(first, emit=True)
+        chain, = self.triage.pixel_samples.values()
+        chain.stages = stages = CountedStages(chain.stages)
+        transfers = 256
+        for transfer in range(1, transfers + 1):
+            for boundary in ("native", "import", "mailbox"):
+                self.triage.observe_pixel_chain(self.pixel_row(boundary, transfer), emit=True)
+        self.assertLessEqual(stages.operations, transfers * 3 * 7)
+        self.assertEqual(chain.mailbox_count, transfers)
+        self.assertFalse(self.triage.findings)
+
+
 class FileQueryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -221,6 +373,206 @@ class FileQueryTests(unittest.TestCase):
         status, output, diagnostics = self.run_query(*arguments, "--format", "jsonl")
         return status, [json.loads(line) for line in output.splitlines()], diagnostics
 
+    def automatic_fixture(self, progress=0):
+        self.write("build/validation/auto.jsonl", [
+            {"event": "explore.frame.published", "owner": "explore", "source_session": 1,
+             "source_instance": 1, "source_revision": 7, "steady_ns": 100},
+            {"event": "presentation.frame.edge", "owner": "presentation", "presentation_revision": 11,
+             "source_session": 1, "source_instance": 1, "source_revision": 7, "steady_ns": 110},
+            {"event": "presentation.pixel", "presentation_revision": 11, "steady_ns": 111},
+        ])
+        self.write("build/validation/auto-firefox.log", [
+            *({"event": "integration.phase_progress", "control": "work", "detail": f"AwaitPhase{index}",
+               "elapsed_ms": index, "a": 0, "b": 0, "c": 0, "d": 0} for index in range(progress)),
+            {"event": "integration.explore_state", "control": "explore.gallery", "a": 19, "elapsed_ms": 1000},
+            {"event": "integration.explore_reopen_wait", "control": "explore.open", "detail": "physical-gallery-draw",
+             "a": 19, "b": 7, "c": 3, "d": 4, "elapsed_ms": 1001},
+            {"event": "integration.explore_reopen_draw", "control": "explore.gallery", "detail": "physical-gallery-draw",
+             "a": 12, "b": 6, "c": 7, "d": 11, "elapsed_ms": 1002},
+        ])
+        return ("--family", "auto", "--run", "current", "-q",
+                'event=integration.phase_progress OR event=integration.explore_reopen_wait '
+                'OR event=integration.explore_reopen_draw OR event=integration.explore_reopened')
+
+    def test_automatic_timeline_interleaves_exact_frame_snapshot_and_publication(self):
+        arguments = self.automatic_fixture()
+        status, output, diagnostics = self.run_query(*arguments, "--format", "timeline",
+                                                      "--fields", "event,control,a,b,c,d,detail")
+        self.assertEqual(status, 0, diagnostics)
+        lines = output.splitlines()
+        self.assertEqual(sum("[query]" in line for line in lines), 2)
+        self.assertEqual(sum("[auto:" in line for line in lines), 3)
+        self.assertLess(output.index("explore.frame.published"), output.index("integration.explore_reopen_wait"))
+        self.assertLess(output.index("presentation.frame.edge"), output.index("integration.explore_reopen_draw"))
+        self.assertIn("explore.frame=7", output)
+        self.assertIn("explore.snapshot=19", output)
+        self.assertIn("presentation_revision=11", output)
+        self.assertNotIn("presentation.pixel", output)
+        self.assertIn("cross-clock times remain unaligned", diagnostics)
+
+    def test_automatic_machine_formats_require_opt_in_and_preserve_query_rows(self):
+        arguments = self.automatic_fixture()
+        baseline = self.exported(*arguments)
+        self.assertEqual(self.exported(*arguments, "--no-auto-correlate"), baseline)
+        self.assertEqual(len(baseline[1]), 2)
+        status, rows, diagnostics = self.exported(*arguments, "--auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual([row for row in rows if row["_log"]["match"] == "query"], baseline[1])
+        automatic = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertEqual(len(automatic), 3)
+        self.assertTrue(all(row["_log"]["auto_reason"] and row["_log"]["auto_anchor"] for row in automatic))
+        _, projected, _ = self.exported(*arguments, "--auto-correlate", "--fields", "event")
+        self.assertTrue(all(row.get("@auto_reason") and row.get("@auto_anchor")
+                            for row in projected if row["@match"] == "auto"))
+        _, output, _ = self.run_query(*arguments)
+        self.assertNotIn("[auto:", output)
+        _, output, _ = self.run_query(*arguments, "--format", "timeline", "--no-auto-correlate")
+        self.assertNotIn("[auto:", output)
+
+    def test_automatic_recent_highlight_keeps_final_reopen_visible_after_phase_volume(self):
+        arguments = self.automatic_fixture(progress=201)
+        status, output, diagnostics = self.run_query(*arguments, "--format", "timeline", "--limit", "350",
+                                                      "--fields", "event,control,a,b,c,d,detail")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertTrue(output.startswith("Recent query matches"))
+        first_timeline = output.index("@file=")
+        self.assertIn("integration.explore_reopen_wait", output[:first_timeline])
+        self.assertIn("integration.explore_reopen_draw", output[:first_timeline])
+        self.assertNotIn("integration.explore_reopened", output)
+        self.assertEqual(output.count("[query]"), 203)
+        self.assertIn("explore.frame.published", output[first_timeline:])
+        self.assertIn("presentation.frame.edge", output[first_timeline:])
+        self.assertIn("75 query anchors outside", diagnostics)
+        status, rows, _ = self.exported(*arguments, "--auto-correlate", "--limit", "350")
+        self.assertEqual(status, 0)
+        selected = [row for row in rows if row["_log"]["match"] == "query"]
+        self.assertEqual(len(selected), 203)
+        self.assertEqual([row["data"]["elapsed_ms"] for row in selected], [*range(201), 1001, 1002])
+        _, limited, _ = self.run_query(*arguments, "--format", "timeline", "--limit", "20", "--fields", "event")
+        self.assertEqual(limited.count("[query]"), 20)
+        summary = limited.split("@file=", 1)[0]
+        self.assertIn("integration.explore_reopen_wait", summary)
+        self.assertIn("integration.explore_reopen_draw", summary)
+        self.write("plain.log", "".join(f"ordinary message {index}\n" for index in range(30)))
+        status, plain, diagnostics = self.run_query("plain.log", "-q", "ordinary", "--format", "timeline", "--limit", "2")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("ordinary message 29", plain.split("[query]", 1)[0])
+        self.assertEqual(plain.count("[query]"), 2)
+
+    def test_automatic_scopes_reject_zero_generic_counter_conflicts_and_transitive_links(self):
+        surface = "00000000000000010000000000000002"
+        self.write("input.jsonl", [
+            {"event": "seed", "request_id": 1, "source_session": 1, "source_instance": 1,
+             "source_revision": 7, "surface": surface, "presentation_revision": 11, "a": 8, "b": 9},
+            {"event": "frame.published", "request_id": 1, "trace_id": 55},
+            {"event": "application.transitive", "trace_id": 55},
+            {"event": "application.other_source", "request_id": 1, "source_session": 2, "source_instance": 1},
+            {"event": "application.other_instance", "request_id": 1, "source_session": 1, "source_instance": 2},
+            {"event": "application.other_frame", "request_id": 1, "source_revision": 8},
+            {"event": "application.other_publication", "surface": surface, "presentation_revision": 12},
+            {"event": "application.numeric_collision", "a": 8, "b": 9, "value": 7, "generation": 1},
+            {"event": "application.empty", "request_id": 0, "span_id": False, "trace_id": "000", "operation_id": " "},
+            {"event": "application.empty_strings", "request_id": " 0 ", "trace_id": "0000-0000"},
+            {"event": "application.wrong_type", "request_id": "1"},
+            {"event": "frame.pixel", "request_id": 1},
+        ])
+        _, rows, _ = self.exported("input.jsonl", "-q", "event=seed", "--auto-correlate")
+        self.assertEqual({row["data"]["event"] for row in rows}, {"seed", "frame.published"})
+        self.assertEqual(self.run_query("input.jsonl", "--auto-correlate")[0], 2)
+
+    def test_automatic_ambiguous_projected_source_revisions_do_not_join(self):
+        arguments = self.automatic_fixture()
+        self.write("build/validation/auto-native.log", [
+            {"event": "explore.frame.published", "owner": "explore", "source_session": 1,
+             "source_instance": 2, "source_revision": 7, "steady_ns": 101},
+        ])
+        _, rows, _ = self.exported(*arguments, "--auto-correlate")
+        self.assertNotIn("explore.frame.published", {row["data"]["event"] for row in rows})
+        self.assertIn("integration.explore_state", {row["data"]["event"] for row in rows})
+        self.write("build/validation/auto-native.log", [
+            {"event": "native.seed", "owner": "explore", "source_session": 1,
+             "source_instance": 2, "source_revision": 7, "steady_ns": 101},
+        ])
+        with_seed = (*arguments[:-1], arguments[-1] + " OR event=native.seed")
+        _, rows, _ = self.exported(*with_seed, "--auto-correlate")
+        self.assertNotIn("explore.frame.published", {row["data"]["event"] for row in rows})
+
+    def test_automatic_control_proximity_is_labeled_and_bounded(self):
+        self.write("input.jsonl", [
+            {"event": "application.snapshot", "control": "explore.open", "steady_ns": 100000000},
+            {"event": "seed", "control": "explore.open", "steady_ns": 200000000},
+            {"event": "application.too_late", "control": "explore.open", "steady_ns": 1000000000},
+            {"event": "application.other_control", "control": "annotation.open", "steady_ns": 200000001},
+            {"event": "application.generic_control", "control": "work", "steady_ns": 200000001},
+        ])
+        _, rows, _ = self.exported("input.jsonl", "-q", "event=seed", "--auto-correlate")
+        self.assertEqual({row["data"]["event"] for row in rows}, {"seed", "application.snapshot"})
+        automatic, = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertIn("time proximity", automatic["_log"]["auto_reason"])
+        _, rows, _ = self.exported("input.jsonl", "-q", "event=seed", "--auto-correlate", "--near-ms", "50")
+        self.assertEqual(len(rows), 1)
+
+    def test_automatic_bounds_diversity_global_capacity_and_existing_match_limit(self):
+        self.write("input.jsonl", [
+            row for index in range(80) for row in (
+                {"event": "seed", "request_id": index + 1, "steady_ns": index * 100},
+                *({"event": event, "request_id": index + 1, "steady_ns": index * 100 + offset}
+                  for offset, event in enumerate(("frame.published", "application.snapshot", "application.ready",
+                                                   "application.completed", "frame.published"), 1)),
+            )
+        ])
+        arguments = ("input.jsonl", "-q", "event=seed", "--auto-correlate", "--limit", "150")
+        status, rows, diagnostics = self.exported(*arguments)
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(self.exported(*arguments)[1], rows)
+        automatic = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertEqual(len(automatic), logs.MAX_AUTO_RELATED)
+        self.assertEqual(sum(row["_log"]["match"] == "query" for row in rows), 80)
+        by_anchor = logs.Counter(logs.encoded(row["_log"]["auto_anchor"]) for row in automatic)
+        by_identity = logs.Counter(row["_log"]["auto_reason"] for row in automatic)
+        self.assertLessEqual(max(by_anchor.values()), logs.MAX_AUTO_PER_ANCHOR)
+        self.assertLessEqual(max(by_identity.values()), logs.MAX_AUTO_PER_IDENTITY)
+        _, limited, _ = self.exported("input.jsonl", "-q", "event=seed", "--auto-correlate", "--limit", "2")
+        self.assertEqual(len(limited), 2)
+        self.assertTrue(all(row["_log"]["match"] == "query" for row in limited))
+        self.write("weak.jsonl", [
+            row for index in range(20) for row in (
+                {"event": "seed", "phase_id": index + 1, "steady_ns": index * 100},
+                {"event": "application.snapshot", "phase_id": index + 1, "steady_ns": index * 100 + 1},
+            )
+        ])
+        _, weak, _ = self.exported("weak.jsonl", "-q", "event=seed", "--auto-correlate", "--limit", "100")
+        self.assertEqual(sum(row["_log"]["match"] == "auto" for row in weak), logs.MAX_AUTO_WEAK)
+
+    def test_automatic_respects_where_runs_and_explicit_correlation(self):
+        arguments = self.automatic_fixture()
+        self.write("build/validation/auto.jsonl.history/57-1000.jsonl", [
+            {"event": "explore.frame.published", "owner": "explore", "source_revision": 7},
+        ])
+        _, rows, _ = self.exported(*arguments, "--auto-correlate", "--where", "NOT event=presentation.frame.edge")
+        self.assertEqual({row["_log"]["run"] for row in rows}, {"build/validation/auto@current"})
+        self.assertNotIn("presentation.frame.edge", {row["data"]["event"] for row in rows})
+        self.write("explicit.jsonl", [{"event": "seed", "request_id": 1}, {"event": "arbitrary", "request_id": 1}])
+        explicit = ("explicit.jsonl", "-q", "event=seed", "--correlate", "request_id", "--format", "timeline")
+        self.assertEqual(self.run_query(*explicit), self.run_query(*explicit, "--no-auto-correlate"))
+        self.assertIn("[correlated]", self.run_query(*explicit)[1])
+
+    def test_automatic_payloads_and_scan_count_stay_bounded(self):
+        self.write("input.jsonl", [
+            {"event": "seed", "request_id": 1},
+            {"event": "application.snapshot", "request_id": 1, "detail": "x" * 20000},
+        ])
+        original = logs.LogFile.records
+        with patch.object(logs.LogFile, "records", autospec=True, side_effect=original) as scans:
+            status, rows, diagnostics = self.exported("input.jsonl", "-q", "event=seed", "--auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(scans.call_count, 2)
+        automatic, = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertTrue(automatic["_log"]["auto_payload_truncated"])
+        self.assertNotIn("triage_payload_truncated", automatic["_log"])
+        self.assertLessEqual(len(automatic["text"]), logs.MAX_TRIAGE_TEXT + 1)
+        self.assertLessEqual(len(automatic["data"]["detail"]), logs.MAX_TRIAGE_TEXT + 1)
+
     def test_discovery_deduplicates_paths_and_excludes_histories_by_default(self):
         self.write("capture/trace.jsonl", [{"event": "one"}])
         self.write("capture/native.log", "plain\n")
@@ -232,6 +584,40 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(len(recursive), 3)
         mapped = logs.discover_files(["/host/repo/capture/*.log"], self.root, host_root="/host/repo")
         self.assertEqual([item.source for item in mapped], ["capture/native.log"])
+
+    def test_discovery_captures_each_repeated_path_only_once(self):
+        self.write("capture/trace.jsonl", [{"event": "one"}])
+        self.write("capture/native.log", "plain\n")
+        with patch.object(logs.LogFile, "capture", wraps=logs.LogFile.capture) as captured:
+            files = logs.discover_files(["capture", "capture", "capture/*", "capture/trace.jsonl"], self.root)
+        self.assertEqual(len(files), 2)
+        self.assertEqual(captured.call_count, 2)
+
+    def test_directory_discovery_streams_entries_and_releases_handles(self):
+        for index in range(3):
+            self.write(f"capture/{index}.log", "")
+        produced = []
+        closed = []
+        original = logs.os.scandir
+
+        @contextmanager
+        def scanned(directory):
+            try:
+                with original(directory) as entries:
+                    def counted():
+                        for entry in entries:
+                            produced.append(entry.name)
+                            yield entry
+                    yield counted()
+            finally:
+                closed.append(True)
+
+        with patch.object(logs.os, "scandir", scanned):
+            candidates = logs.directory_logs(self.root / "capture")
+            self.assertEqual(next(candidates).suffix, ".log")
+            self.assertEqual(len(produced), 1)
+            candidates.close()
+        self.assertEqual(closed, [True])
 
     def test_empty_missing_and_outside_inputs_fail_clearly(self):
         (self.root / "empty").mkdir()
@@ -335,6 +721,24 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual([item["_log"]["match"] for item in rows],
                          ["context", "query", "context", "query", "context"])
 
+    def test_dense_context_considers_buffered_rows_only_once(self):
+        class CountedContext(logs.deque):
+            visited = 0
+
+            def __iter__(self):
+                type(self).visited += len(self)
+                return super().__iter__()
+
+        count = 512
+        self.write("input.log", "match\n" * count)
+        with patch.object(logs, "deque", CountedContext):
+            status, rows, diagnostics = self.exported("input.log", "-q", "match", "--context", "100", "--limit", "1")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(len(rows), 1)
+        self.assertIn(f"{count} matched", diagnostics)
+        self.assertIn("0 context", diagnostics)
+        self.assertLessEqual(CountedContext.visited, count)
+
     def test_projection_preserves_provenance_and_uint64(self):
         self.write("input.jsonl", [{"event": "one", "trace_id": 18446744073709551615}])
         _, rows, _ = self.exported("input.jsonl", "--fields", "event,trace_id,absent")
@@ -414,6 +818,27 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("session@57-1000000000", listing)
         self.assertIn("session@current", listing)
         self.assertIn("links are inferred", listing)
+
+    def test_history_catalog_enumerates_each_archive_directory_once(self):
+        for suffix in (".jsonl", "-native.log", "-firefox.log"):
+            current = self.write("build/validation/capture" + suffix, "")
+            for index in range(12):
+                self.write(f"{current.relative_to(self.root)}.history/57-{index * 20000000}{current.suffix}", "")
+        counts = logs.Counter()
+        original = logs.directory_logs
+
+        def counted(directory, *arguments):
+            counts[directory] += 1
+            return original(directory, *arguments)
+
+        options = logs.argument_parser().parse_args([
+            "build/validation/capture.jsonl.history/*.jsonl", "--history", "--triage",
+        ])
+        with patch.object(logs, "directory_logs", counted):
+            catalog = logs.ArtifactCatalog(options, self.root)
+        self.assertEqual(len(catalog.files), 36)
+        self.assertEqual(len(counts), 3)
+        self.assertEqual(set(counts.values()), {1})
 
     def test_shared_event_anchors_link_transcript_and_propagate_test_tags(self):
         self.family_fixture()
@@ -527,6 +952,32 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("all-words fallback; 2 occurrences", output)
 
+    def test_pasted_error_selection_scans_once_with_exact_fallback_and_unicode(self):
+        self.write("input.jsonl",
+                   '{"message":"blue red"}\n{"message":"red blue"}\n'
+                   '{"message":"\\u0072ed \\u0062lue"}\n{"broken":\n')
+        files = logs.discover_files(["input.jsonl"], self.root)
+        query = logs.Expression("all", ())
+        original = logs.LogFile.records
+        for strict in (False, True):
+            options = logs.argument_parser().parse_args(["--strict"] if strict else [])
+            for text, mode, count, line in (
+                ("red blue", "exact/display-normalized phrase", 2, 2),
+                ("red, blue", "all-words fallback", 3, 1),
+                ("unseen message", "", 0, None),
+                ("!!!", "", 0, None),
+            ):
+                with self.subTest(strict=strict, text=text):
+                    lookup = logs.ErrorLookup(text, options)
+                    with patch.object(logs.LogFile, "records", autospec=True, side_effect=original) as scans, \
+                            patch.object(logs, "record_text", wraps=logs.record_text) as normalized:
+                        lookup.locate(files, query, query, {})
+                    self.assertEqual(scans.call_count, 1)
+                    self.assertLessEqual(normalized.call_count, 4)
+                    self.assertEqual((lookup.mode, lookup.matches), (mode, count))
+                    self.assertEqual(lookup.focus.line if lookup.focus else None, line)
+                    self.assertEqual(lookup.malformed, int(strict or text == "!!!"))
+
     def test_error_neighborhood_respects_radius_and_machine_output_bounds(self):
         pasted = self.pasted_error_fixture()
         status, rows, _ = self.exported("--error", pasted, "--near-ms", "50", "--limit", "5")
@@ -610,6 +1061,92 @@ class FileQueryTests(unittest.TestCase):
         self.assertTrue(any(row["data"].get("event") == "renderer.probe_failed" for row in rows))
         self.assertTrue(any(row["data"].get("event") == "catch.assertion_failed" for row in rows))
         self.assertEqual({row["_log"]["run"] for row in rows}, {"build/validation/triage@current"})
+
+    def test_triage_single_file_discovers_current_siblings_without_expanding_explicit_queries(self):
+        self.write("build/validation/capture-firefox.log", [
+            {"event": "renderer.probe_failed", "request_id": 7},
+        ])
+        self.write("build/validation/capture.jsonl", [
+            {"event": "task.started", "request_id": 7},
+            {"event": "child.signaled", "value": 139},
+        ])
+        self.write("build/validation/capture-native.log", [
+            {"event": "acceptance.failed", "request_id": 7},
+        ])
+        path = "build/validation/capture-firefox.log"
+        status, rows, diagnostics = self.exported(path, "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        events = {row["data"].get("event"): row for row in rows}
+        self.assertTrue({"renderer.probe_failed", "task.started", "child.signaled", "acceptance.failed"} <= events.keys())
+        self.assertEqual(events["task.started"]["_log"]["discovery"], "current artifact sibling")
+        self.assertNotIn("discovery", events["renderer.probe_failed"]["_log"])
+        self.assertIn("[auto: current artifact sibling]", diagnostics)
+        _, explicit, _ = self.exported(path)
+        self.assertEqual([row["data"]["event"] for row in explicit], ["renderer.probe_failed"])
+        with patch.object(logs, "MAX_DISTINCT_KEYS", 1):
+            status, _, diagnostics = self.run_query(path, "--triage")
+            self.assertEqual(status, 2)
+            self.assertIn("automatic artifact discovery exceeds file budget", diagnostics)
+
+    def test_triage_single_archive_discovers_only_its_rotation_batch_without_current_files(self):
+        for base, suffix, timestamp, event in (
+            ("capture", ".jsonl", 1000000, "task.started"),
+            ("capture-native", ".log", 1000100, "acceptance.failed"),
+            ("capture-firefox", ".log", 1000200, "renderer.probe_failed"),
+            ("capture", ".jsonl", 1000300, "unrelated.failed"),
+            ("capture-native", ".log", 1000400, "unrelated.failed"),
+            ("capture-firefox", ".log", 1000500, "unrelated.failed"),
+        ):
+            self.write(f"build/validation/{base}{suffix}.history/57-{timestamp}{suffix}", [
+                {"event": event, "request_id": 7, **({"failed": True} if event == "unrelated.failed" else {})},
+            ])
+        path = "build/validation/capture-firefox.log.history/57-1000200.log"
+        status, rows, diagnostics = self.exported(path, "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual({row["_log"]["run"] for row in rows}, {"build/validation/capture@57-1000000"})
+        self.assertEqual({row["data"]["event"] for row in rows},
+                         {"task.started", "acceptance.failed", "renderer.probe_failed"})
+        self.assertIn("[auto: adjacent rotation (inferred)]", diagnostics)
+        self.assertIn("[rotation-neighbor-within-10ms]", diagnostics)
+        self.assertNotIn("1000300", diagnostics)
+        self.write("build/validation/capture.jsonl", [{"event": "current.failed", "failed": True}])
+        self.assertEqual(self.exported(path, "--triage")[1], rows)
+
+    def test_triage_named_archives_match_exact_names_and_reject_external_history(self):
+        path = "build/validation/capture-firefox.log.history/investigation.log"
+        self.write(path, [{"event": "renderer.failed", "request_id": 7}])
+        self.write("build/validation/capture.jsonl.history/investigation.jsonl", [
+            {"event": "task.started", "request_id": 7},
+        ])
+        self.write("build/validation/capture.jsonl.history/other.jsonl", [
+            {"event": "unrelated.failed", "failed": True},
+        ])
+        status, rows, diagnostics = self.exported(path, "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual({row["data"]["event"] for row in rows}, {"renderer.failed", "task.started"})
+        self.assertIn("[auto: matching archive name]", diagnostics)
+        with tempfile.TemporaryDirectory() as external:
+            (self.root / "build/validation/capture-native.log.history").symlink_to(external, target_is_directory=True)
+            status, _, diagnostics = self.run_query(path, "--triage")
+            self.assertEqual(status, 2)
+            self.assertIn("escapes repository mount", diagnostics)
+
+    def test_triage_ranks_explicit_failure_above_error_related_events_without_changing_errors_filter(self):
+        self.write("input.jsonl", [
+            {"event": "ui.error_modal", "trace_id": 7},
+            {"event": "worker.failed"},
+        ])
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage", "--triage-anchors", "1")
+        self.assertEqual(status, 0, diagnostics)
+        anchors = output.split("Anchors (ranked evidence, not causes):", 1)[1].split("Highlights:", 1)[0]
+        self.assertIn("worker.failed", anchors)
+        self.assertNotIn("ui.error_modal", anchors)
+        _, rows, _ = self.exported("input.jsonl", "--errors")
+        self.assertEqual({row["data"]["event"] for row in rows}, {"ui.error_modal", "worker.failed"})
+        _, output, _ = self.run_query("input.jsonl", "--triage", "-q", "event=ui.error_modal",
+                                      "--where", "event=ui.error_modal")
+        self.assertIn("failure-related event (not an explicit failure)", output)
+        self.assertNotIn("anchor-failure", output)
 
     def test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors(self):
         pasted = self.pasted_error_fixture()
@@ -725,6 +1262,31 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("handoff/instrumentation mismatch possible", output)
         self.assertIn("source-order input.jsonl:", output)
 
+    def test_triage_unrelated_completion_is_not_an_identity_handoff(self):
+        cases = (
+            [
+                {"event": "job.started", "request_id": 1},
+                {"event": "job.completed", "request_id": 2},
+            ],
+            [
+                {"event": "job.started", "span_id": 1, "trace_id": 7},
+                {"event": "job.completed", "span_id": 2, "trace_id": 7},
+            ],
+            [
+                {"event": "job.started", "request_id": 1},
+                {"event": "job.started", "request_id": 1},
+                {"event": "job.completed", "request_id": 1},
+            ],
+        )
+        for rows in cases:
+            with self.subTest(rows=rows):
+                self.write("input.jsonl", rows)
+                status, output, diagnostics = self.run_query("input.jsonl", "--triage", "-q", "*", "--top", "20")
+                self.assertEqual(status, 0, diagnostics)
+                self.assertIn("missing-counterpart", output)
+                self.assertIn("job: 1 start(s)", output)
+                self.assertNotIn("identity-handoff", output)
+
     def test_triage_prefers_explicit_divergence_over_earlier_unclosed_start(self):
         self.write("input.jsonl", [
             {"event": "background.started", "request_id": 1},
@@ -735,6 +1297,42 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0)
         candidate = output.split("Earliest divergence candidates", 1)[1].splitlines()[1]
         self.assertIn("input.jsonl:2: incomplete-state", candidate)
+
+    def test_triage_highlights_first_deterministic_pixel_chain_divergence(self):
+        surface = "00000000000000010000000000000002"
+        common = {
+            "presentation_revision": 7, "transfer_sequence": 3,
+            "sample_index": 4, "sample_x": 8, "sample_y": 9,
+        }
+        self.write("input.jsonl", [
+            {"event": "presentation.pixel", "surface_high": 1, "surface_low": 2,
+             **common, "sample_rgba": 10},
+            {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "import",
+             **common, "sample_rgba": 11},
+            {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "mailbox",
+             **common, "sample_rgba": 11},
+            {"event": "iced.surface.pixel", "surface": surface,
+             **common, "sample_rgba": 11},
+        ])
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage", "--top", "20")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("pixel-chain-divergence", output)
+        self.assertIn("native -> import sample differs", output)
+        self.assertIn("presentation_revision=7 sample_index=4", output)
+
+        self.write("input.jsonl", [
+            {"event": "presentation.pixel", "surface_high": 1, "surface_low": 2,
+             **common, "sample_rgba": 10},
+            {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "import",
+             **common, "sample_rgba": 10},
+            {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "mailbox",
+             **common, "sample_rgba": 10},
+            {"event": "iced.surface.pixel", "surface": surface,
+             **common, "sample_rgba": 10},
+        ])
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 1, diagnostics)
+        self.assertNotIn("pixel-chain-divergence", output)
 
     def test_triage_groups_repeated_anomalies_without_losing_counts_or_context(self):
         self.write("input.jsonl", [

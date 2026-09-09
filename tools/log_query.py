@@ -3,6 +3,7 @@
 
 import argparse
 import ast
+from bisect import bisect_left
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ MAX_QUERY_DEPTH = 32
 MAX_LINE_BYTES = 1024 * 1024
 MAX_DISTINCT_KEYS = 10000
 ROTATION_WINDOW_NS = 10000000
+ROTATION_NAME = re.compile(r"(\d+)-(\d+)\Z")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LEXEME = re.compile(
     r"""\s*(?:("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')"""
@@ -81,9 +83,36 @@ INCOMPLETE_STAGES = frozenset(("missing", "unavailable", "blocked", "stalled", "
 FAILED_STAGES = frozenset(("failed", "failure", "error", "aborted", "rejected"))
 AMBIENT_IDS = frozenset(("pid", "tid", "process_id", "thread_id", "device_id", "host_id",
                          "user_id", "test_id", "run_id", "session_id", "parent_process_id"))
+REFINEMENT_FIELDS = ("sequence", "generation", "slot")
 MAX_TRIAGE_STATES = 256
 MAX_TRIAGE_EVENTS = 64
 MAX_TRIAGE_TEXT = 2048
+MAX_TRIAGE_PIXEL_SAMPLES = 16384
+MAX_AUTO_ANCHORS = 128
+MAX_AUTO_RELATED = 48
+MAX_AUTO_WEAK = 8
+MAX_AUTO_PER_ANCHOR = 3
+MAX_AUTO_PER_IDENTITY = 2
+AUTO_SOURCE_DOMAINS = frozenset(("explore", "annotation", "upscale", "live"))
+AUTO_FIELDS = (
+    "source_session", "source_instance", "source_revision", "frame_revision",
+    "source_observation_revision", "snapshot_revision", "observation_revision",
+    "presentation_revision", "allocation_generation", "transfer_sequence", "timeline_ready",
+    "trace_id", "span_id", "parent_span_id", "request_id", "operation_id",
+    "dataset_identity", "gallery_identity", "gallery_generation", "phase", "phase_id", "control",
+)
+# The integration reporter is a distinct external format: these event-specific
+# f64 slots are translated once, never treated as generic numeric identities.
+AUTO_INTEGRATION_FIELDS = {
+    "integration.explore_reopen_wait": ("explore", {"a": "snapshot_revision", "b": "source_revision"}),
+    "integration.explore_reopen_draw": ("explore", {"c": "source_revision", "d": "presentation_revision"}),
+    "integration.explore_reopened": ("explore", {"a": "snapshot_revision", "b": "source_revision"}),
+    "integration.explore_state": ("explore", {"a": "snapshot_revision"}),
+    "integration.explore_frame": ("explore", {"a": "source_revision"}),
+    "integration.annotation_ready": ("annotation", {"a": "source_revision"}),
+}
+AUTO_NOISE = re.compile(r"(?:^|[._])(?:pixel|probe|slot|sample|tick|heartbeat|metric|poll)(?:[._]|$)")
+AUTO_LIFECYCLE_STAGES = START_STAGES | FAILED_STAGES | INCOMPLETE_STAGES
 
 
 def normalized_text(value):
@@ -529,17 +558,23 @@ def parse_record(source, line, raw, truncated=False):
         log_format = "transcript"
     elif "{" in message:
         try:
-            objects = embedded_objects(message)
-            first = next(objects, None)
+            objects = None
+            first = None
+            malformed_jsonl = False
+            if source.endswith(".jsonl") and message.lstrip().startswith("{"):
+                try:
+                    first = 0, JSON_DECODER.decode(message.strip())
+                except ValueError:
+                    malformed_jsonl = True
+            if first is None:
+                objects = embedded_objects(message)
+                first = next(objects, None)
             if first:
                 _, decoded = first
-                if next(objects, None) is not None:
+                if objects is not None and next(objects, None) is not None:
                     error = error or "multiple JSON payloads on one line; first retained"
-                if source.endswith(".jsonl") and message.lstrip().startswith("{"):
-                    try:
-                        JSON_DECODER.decode(message.strip())
-                    except ValueError:
-                        error = error or "extra or malformed content in JSONL record"
+                if malformed_jsonl:
+                    error = error or "extra or malformed content in JSONL record"
                 data.update(decoded)
                 # Keep the original prefix in raw; a JSON payload is not its own message.
                 if data.get("message") == message and "message" not in decoded:
@@ -651,6 +686,9 @@ class LogFile:
 
     def records(self, unchanged=False, anchors=None, line_hint=None):
         context = TranscriptContext()
+        metadata = {"mtime_ns": self.modified_ns, "run": self.source, "artifact": Path(self.source).stem,
+                    **self.metadata}
+        anchors = anchors or {}
         with self.path.open("rb") as stream:
             info = os.fstat(stream.fileno())
             if (info.st_dev, info.st_ino) != (self.device, self.inode) or info.st_size < self.size:
@@ -684,9 +722,7 @@ class LogFile:
                         or text.startswith(("Filters:", "workspace-wayland:"))
                     ):
                         continue
-                    metadata = {"mtime_ns": self.modified_ns, "run": self.source, "artifact": Path(self.source).stem,
-                                **self.metadata}
-                    for row in context.parse_line(self.source, line, text, metadata, anchors or {}, truncated):
+                    for row in context.parse_line(self.source, line, text, metadata, anchors, truncated):
                         row.parse_error = row.parse_error or decoding_error
                         yield row
             if unchanged:
@@ -695,30 +731,60 @@ class LogFile:
                     raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
 
 
+def directory_logs(directory, suffixes=(".jsonl", ".log", ".out", ".txt")):
+    """Stream names and reuse directory-entry stat data even in large histories."""
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.name.endswith(suffixes) and entry.is_file():
+                path = Path(entry.path)
+                if path.suffix in suffixes:
+                    yield path
+
+
 def discover_files(inputs, root, recursive=False, host_root=None):
     selected = {}
+    patterns = set()
+    directories = {}
+    candidates_seen = set()
     for supplied in inputs or ["build/validation"]:
         pattern = supplied
         if host_root and (pattern == host_root or pattern.startswith(host_root + "/")):
             pattern = str(root) + pattern[len(host_root):]
         if not os.path.isabs(pattern):
             pattern = str(root / pattern)
+        if pattern in patterns:
+            continue
+        patterns.add(pattern)
         paths = [Path(path) for path in sorted(glob.glob(pattern, recursive=recursive))]
         if not paths:
             raise QueryError(f"input path or glob matched no files: {supplied}")
         found = False
         for path in paths:
-            if not path.resolve().is_relative_to(root):
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
                 raise QueryError(f"log input escapes repository mount: {path}")
             if path.is_dir():
-                candidates = path.rglob("*") if recursive else path.iterdir()
-                candidates = (item for item in candidates if item.is_file() and item.suffix in (".jsonl", ".log", ".out", ".txt"))
+                if resolved in directories:
+                    found |= directories[resolved]
+                    continue
+                directory_found = False
+                candidates = (
+                    (item for item in path.rglob("*") if item.suffix in (".jsonl", ".log", ".out", ".txt") and item.is_file())
+                    if recursive else directory_logs(path)
+                )
             else:
+                directory_found = None
                 candidates = (path,)
             for candidate in candidates:
-                item = LogFile.capture(candidate, root)
-                selected[item.path] = item
+                if candidate not in candidates_seen:
+                    item = LogFile.capture(candidate, root)
+                    selected[item.path] = item
+                    candidates_seen.add(candidate)
                 found = True
+                if directory_found is not None:
+                    directory_found = True
+            if directory_found is not None:
+                directories[resolved] = directory_found
         if not found:
             raise QueryError(f"input contains no .jsonl, .log, .out, or .txt files: {supplied}")
     return sorted(selected.values(), key=lambda item: item.source)
@@ -731,7 +797,7 @@ def artifact_family(path):
     return original.parent / stem, original, archived
 
 
-def family_paths(family, root):
+def family_paths(family, root, existing=True):
     host_root = os.environ.get("MMLTK_LOG_HOST_ROOT")
     if host_root and (family == host_root or family.startswith(host_root + "/")):
         family = str(root) + family[len(host_root):]
@@ -741,7 +807,12 @@ def family_paths(family, root):
     if supplied.suffix in (".jsonl", ".log"):
         supplied = artifact_family(supplied)[0]
     paths = [Path(str(supplied) + suffix) for suffix in (".jsonl", ".log", "-native.log", "-firefox.log")]
-    return [path for path in paths if path.is_file()]
+    return [path for path in paths if not existing or path.is_file()]
+
+
+def rotation_identity(identity):
+    match = ROTATION_NAME.fullmatch(identity)
+    return (match[1], int(match[2])) if match else None
 
 
 class ArtifactCatalog:
@@ -755,20 +826,35 @@ class ArtifactCatalog:
                 raise QueryError(f"no artifact family found: {family}")
             inputs.extend(str(path) for path in siblings)
         self.files = discover_files(inputs, root, options.recursive, os.environ.get("MMLTK_LOG_HOST_ROOT"))
+        complete_histories = set()
         if options.history or options.run:
-            archives = []
+            archives = set()
+            families = set()
             for source in self.files:
                 family, original, archived = artifact_family(source.path)
+                if archived:
+                    if family in families:
+                        continue
+                    families.add(family)
                 siblings = family_paths(str(family), root) if archived else [original]
                 for sibling in siblings:
                     directory = Path(str(sibling) + ".history")
-                    if directory.is_dir():
-                        archives.append(str(directory))
+                    if directory not in archives and directory.is_dir():
+                        archives.add(directory)
             if archives:
-                combined = self.files + discover_files(archives, root)
+                combined = self.files + discover_files([str(path) for path in sorted(archives)], root)
                 self.files = sorted({item.path: item for item in combined}.values(), key=lambda item: item.source)
+                complete_histories = {path.resolve() for path in archives}
+        original_paths = {source.path for source in self.files}
+        if options.triage:
+            self.discover_siblings(root, complete_histories)
         self.anchors = {}
         self.assign_runs(root)
+        original_runs = {source.metadata["run"] for source in self.files if source.path in original_paths}
+        # Nearby filenames are candidates until the ordinary rotation grouping
+        # confirms they share a requested capture. Never pull in an adjacent run.
+        self.files = [source for source in self.files
+                      if source.path in original_paths or source.metadata["run"] in original_runs]
         self.selected_runs = set()
         if options.run:
             self.selected_runs = {
@@ -786,6 +872,56 @@ class ArtifactCatalog:
                 if source.metadata["run"] in self.selected_runs or source.metadata["family"] not in selected_families
             ]
 
+    def discover_siblings(self, root, complete_histories):
+        """Scan each relevant history directory once; match only requested neighborhoods."""
+        requests = {}
+        selected = {source.path: source for source in self.files}
+        original_count = len(selected)
+
+        def add(path, why):
+            resolved = path.resolve()
+            if resolved not in selected:
+                if len(selected) - original_count >= MAX_DISTINCT_KEYS:
+                    raise QueryError("automatic artifact discovery exceeds file budget; narrow the input paths")
+                captured = LogFile.capture(path, root)
+                selected[resolved] = replace(captured, metadata={"discovery": why})
+
+        for source in self.files:
+            family, original, archived = artifact_family(source.path)
+            if original.suffix not in (".jsonl", ".log", ".out", ".txt"):
+                continue
+            request = requests.setdefault(family, {"current": False, "rotations": {}, "names": set()})
+            if not archived:
+                request["current"] = True
+            elif rotation := rotation_identity(source.path.stem):
+                pid, timestamp = rotation
+                request["rotations"].setdefault(pid, set()).add(timestamp)
+            else:
+                request["names"].add(source.path.stem)
+        for family, request in sorted(requests.items()):
+            rotations = {pid: sorted(times) for pid, times in request["rotations"].items()}
+            for original in family_paths(str(family), root, existing=False):
+                if request["current"] and original.is_file():
+                    add(original, "current artifact sibling")
+                directory = Path(str(original) + ".history")
+                if (rotations or request["names"]) and directory.is_dir():
+                    resolved = directory.resolve()
+                    if not resolved.is_relative_to(root):
+                        raise QueryError(f"log input escapes repository mount: {directory}")
+                    if resolved in complete_histories:
+                        continue
+                    for path in directory_logs(directory, (original.suffix,)):
+                        if path.stem in request["names"]:
+                            add(path, "matching archive name")
+                        elif rotation := rotation_identity(path.stem):
+                            pid, timestamp = rotation
+                            times = rotations.get(pid, ())
+                            index = bisect_left(times, timestamp)
+                            if any(abs(times[candidate] - timestamp) <= ROTATION_WINDOW_NS
+                                   for candidate in (index - 1, index) if 0 <= candidate < len(times)):
+                                add(path, "adjacent rotation (inferred)")
+        self.files = sorted(selected.values(), key=lambda source: source.source)
+
     def assign_runs(self, root):
         groups = {}
         updated = []
@@ -793,7 +929,7 @@ class ArtifactCatalog:
             family, original, archived = artifact_family(source.path)
             name = str(family.relative_to(root))
             identity = source.path.stem if archived else "current"
-            metadata = {"family": name, "run": name + "@" + identity,
+            metadata = {**source.metadata, "family": name, "run": name + "@" + identity,
                         "artifact": original.name, "run_link": "artifact-stem"}
             metadata["role"] = (
                 "trace" if original.suffix == ".jsonl" else
@@ -802,19 +938,23 @@ class ArtifactCatalog:
             )
             if archived:
                 metadata["archive_id"] = identity
-                match = re.fullmatch(r"(\d+)-(\d+)", identity)
-                if match:
-                    metadata["rotation_ns"] = int(match[2])
-                    groups.setdefault((name, match[1]), []).append((int(match[2]), len(updated)))
+                if rotation := rotation_identity(identity):
+                    pid, timestamp = rotation
+                    metadata["rotation_ns"] = timestamp
+                    groups.setdefault((name, pid), []).append((timestamp, len(updated)))
             updated.append(replace(source, metadata=metadata))
         for entries in groups.values():
             batch = []
+            artifacts = set()
             for timestamp, index in sorted(entries):
+                artifact = updated[index].metadata["artifact"]
                 if batch and (timestamp - batch[0][0] > ROTATION_WINDOW_NS
-                              or updated[index].metadata["artifact"] in {updated[item[1]].metadata["artifact"] for item in batch}):
+                              or artifact in artifacts):
                     self.assign_batch(updated, batch)
                     batch = []
+                    artifacts.clear()
                 batch.append((timestamp, index))
+                artifacts.add(artifact)
             self.assign_batch(updated, batch)
         self.files = updated
 
@@ -874,8 +1014,9 @@ class ArtifactCatalog:
         grouped = {}
         for source in self.files:
             grouped.setdefault(source.metadata["run"], []).append(source)
-        ordered = sorted(grouped.items(), key=lambda item: (max(source.modified_ns for source in item[1]), item[0]))
-        for run, files in ordered[-limit:]:
+        ordered = heapq.nlargest(limit, grouped.items(),
+                                 key=lambda item: (max(source.modified_ns for source in item[1]), item[0]))
+        for run, files in reversed(ordered):
             print(f"{run} [{files[0].metadata['run_link']}]", file=output)
             for source in sorted(files, key=lambda item: item.source):
                 print(f"  {source.source} bytes={source.size} mtime_ns={source.modified_ns}", file=output)
@@ -916,23 +1057,36 @@ class ErrorLookup:
         )
 
     def locate(self, files, query, where, anchors):
-        alternatives = [("exact/display-normalized phrase", Expression("phrase", self.phrases))]
-        if self.words:
-            alternatives.append(("all-words fallback", Expression("words", self.words)))
-        for mode, expression in alternatives:
-            for source in files:
-                for row in source.records(unchanged=True, anchors=anchors,
-                                          line_hint=None if self.options.strict else self.hint):
-                    if mode == "exact/display-normalized phrase" and row.parse_error:
-                        self.malformed += 1
-                    if where.matches(row) and query.matches(row) and expression.matches(row):
-                        self.matches += 1
-                        if self.focus is None or self.physical_key(row) < self.physical_key(self.focus):
-                            self.focus = row
-            if self.focus is not None:
-                self.mode = mode
-                self.expression = Expression("and", (query, expression))
-                return
+        word_focus = None
+        word_matches = 0
+        phrase_key = word_key = None
+        for source in files:
+            for row in source.records(unchanged=True, anchors=anchors,
+                                      line_hint=None if self.options.strict else self.hint):
+                self.malformed += bool(row.parse_error)
+                if not where.matches(row) or not query.matches(row):
+                    continue
+                text = record_text(row)
+                if any(phrase in text for phrase in self.phrases):
+                    self.matches += 1
+                    key = self.physical_key(row)
+                    if phrase_key is None or key < phrase_key:
+                        self.focus, phrase_key = row, key
+                elif self.focus is None and self.words and all(word in text for word in self.words):
+                    word_matches += 1
+                    key = self.physical_key(row)
+                    if word_key is None or key < word_key:
+                        word_focus, word_key = row, key
+        if self.focus is not None:
+            self.mode = "exact/display-normalized phrase"
+            expression = Expression("phrase", self.phrases)
+        elif word_focus is not None:
+            self.mode = "all-words fallback"
+            self.focus, self.matches = word_focus, word_matches
+            expression = Expression("words", self.words)
+        else:
+            return
+        self.expression = Expression("and", (query, expression))
 
     def relevant(self, source):
         return (
@@ -1057,6 +1211,8 @@ class QueryResult:
         self.selected_runs = set()
         self.lookup = None
         self.native_tail = []
+        self.automatic = None
+        self.recent_query = ([], []) if auto_correlate_enabled(options) else None
 
     def inspect(self, record, permitted=True):
         self.scanned += 1
@@ -1086,6 +1242,16 @@ class QueryResult:
                     heapq.heappushpop(self.native_tail, item)
 
     def include(self, record, reason):
+        if (reason == "query" and self.recent_query is not None
+                and not record.metadata.get("context_copy") and not record.parse_error):
+            recent = self.recent_query[int(auto_specific_query(record))]
+            key = order_key(record, "capture")
+            if len(recent) < 3 or key > recent[0].key:
+                item = Retained(key, triage_snapshot(record), "query", True)
+                if len(recent) < 3:
+                    heapq.heappush(recent, item)
+                else:
+                    heapq.heapreplace(recent, item)
         if reason == "context":
             self.context += 1
         else:
@@ -1119,7 +1285,21 @@ class QueryResult:
             heapq.heappushpop(self.retained, item)
 
     def rows(self):
-        return sorted(self.retained, key=lambda item: item.key)
+        rows = sorted(self.retained, key=lambda item: item.key)
+        return self.automatic.interleave(rows) if self.automatic else rows
+
+
+def auto_correlate_enabled(options):
+    return (
+        options.auto_correlate is not False
+        and (options.auto_correlate is True or options.format == "timeline")
+        and bool(options.query.strip() or options.errors)
+        and not (options.correlate or options.related_run or options.error is not None or options.triage)
+    )
+
+
+def auto_specific_query(record):
+    return not str(record.get("@event")).endswith(("progress", "phase_advanced"))
 
 
 def execute(files, query, where, options, anchors=None, lookup=None):
@@ -1143,6 +1323,7 @@ def execute(files, query, where, options, anchors=None, lookup=None):
                                 raise QueryError(f"correlation seeds exceed {MAX_DISTINCT_KEYS}; narrow --query or --where")
     result = QueryResult(options)
     result.lookup = lookup
+    automatic = auto_correlate_enabled(options)
     for source in files:
         before = deque(maxlen=options.context)
         remaining_context = 0
@@ -1169,6 +1350,9 @@ def execute(files, query, where, options, anchors=None, lookup=None):
                     if position > last_included and where.matches(previous):
                         result.include(previous, "context")
                         last_included = position
+                # Every buffered row has now been considered for preceding context.
+                # Clearing also avoids revisiting O(context) old rows at every match.
+                before.clear()
                 result.include(record, reason)
                 last_included = record.line, record.metadata.get("part", 0)
                 remaining_context = options.context
@@ -1178,6 +1362,9 @@ def execute(files, query, where, options, anchors=None, lookup=None):
                     last_included = record.line, record.metadata.get("part", 0)
                 remaining_context -= 1
             before.append(record)
+    if automatic:
+        result.automatic = AutoCorrelation(result)
+        result.automatic.collect(files, query, where, anchors)
     return result
 
 
@@ -1296,6 +1483,7 @@ def triage_terminal(record):
 def anchor_rank(record, identities=()):
     family, stage = event_stage(record)
     event = record.get("@event")
+    exit_code = record.get("@exit_code")
     failed_outcome = any(
         isinstance(value := record.get(name), str) and value.lower() in FAILED_STAGES
         for name in ("span_outcome", "outcome", "status", "result")
@@ -1304,8 +1492,15 @@ def anchor_rank(record, identities=()):
         score, why = 110, "failed outcome/span"
     elif event == "catch.assertion_failed" or isinstance(event, str) and "assertion" in event and record.get("@error"):
         score, why = 105, "assertion failure"
+    elif stage in FAILED_STAGES or record.get("@level") in ("error", "critical", "fatal", "panic"):
+        score, why = 100, "explicit failure"
+    elif (type(exit_code) is int and exit_code != 0) or any(
+        isinstance(value := record.get(name), str) and FAILURE_WORD.search(value)
+        for name in ("message", "detail", "error")
+    ):
+        score, why = 90, "error/terminal candidate"
     elif record.get("@error"):
-        score, why = (100, "explicit failure") if stage in FAILED_STAGES else (90, "error/terminal candidate")
+        score, why = 50, "failure-related event (not an explicit failure)"
     elif stage in INCOMPLETE_STAGES:
         score, why = (85 if stage in ("missing", "unavailable", "stalled") else 45), "incomplete state"
     elif record.parse_error:
@@ -1321,6 +1516,17 @@ def anchor_rank(record, identities=()):
     return score, why
 
 
+@dataclass(frozen=True)
+class PoolRank:
+    rank: tuple
+    insertion: int
+    key: object
+
+    def __lt__(self, other):
+        # max(dict, key=rank) previously evicted the earliest inserted equal rank.
+        return self.rank > other.rank if self.rank != other.rank else self.insertion < other.insertion
+
+
 class TriagePool:
     """Small, diverse deterministic reservoir; cardinality never follows the input."""
 
@@ -1328,6 +1534,9 @@ class TriagePool:
         self.limit = limit
         self.entries = {}
         self.discarded = 0
+        self._ranks = {}
+        self._heap = []
+        self._insertion = 0
 
     def add(self, record, rank, why, key=None):
         key = physical_position(record) if key is None else key
@@ -1335,16 +1544,307 @@ class TriagePool:
         if previous is not None and previous[0] <= rank:
             return
         if previous is None and len(self.entries) == self.limit:
-            worst = max(self.entries, key=lambda item: self.entries[item][0])
-            if self.entries[worst][0] <= rank:
+            while self._ranks.get(self._heap[0].key) is not self._heap[0]:
+                heapq.heappop(self._heap)
+            worst = self._heap[0]
+            if worst.rank <= rank:
                 self.discarded += 1
                 return
-            del self.entries[worst]
+            heapq.heappop(self._heap)
+            del self.entries[worst.key]
+            del self._ranks[worst.key]
             self.discarded += 1
+        insertion = self._ranks[key].insertion if previous is not None else self._insertion
+        self._insertion += previous is None
+        ranked = PoolRank(rank, insertion, key)
+        self._ranks[key] = ranked
+        heapq.heappush(self._heap, ranked)
+        # Stale ranks carry no record payload; compact to keep churn bounded too.
+        # Each rebuild pays for at least limit preceding rank improvements.
+        if len(self._heap) > 2 * self.limit:
+            self._heap = list(self._ranks.values())
+            heapq.heapify(self._heap)
         self.entries[key] = rank, triage_snapshot(record), why
 
     def rows(self):
         return sorted(self.entries.values(), key=lambda item: item[0])
+
+
+def auto_value(value):
+    if type(value) is int and value > 0:
+        return encoded(value)
+    if (isinstance(value, str) and len(value) <= 128 and value.strip()
+            and not re.fullmatch(r"0+(?:[.:-]0+)*", value.strip())):
+        return encoded(value)
+    return None
+
+
+def auto_facts(record):
+    event = record.get("@event")
+    facts = {name: value for name in AUTO_FIELDS if (value := auto_value(record.get(name))) is not None}
+    surface = auto_value(record.get("@surface"))
+    if surface:
+        facts["@surface"] = surface
+    owner = record.get("@owner")
+    domain = owner if isinstance(owner, str) and owner in AUTO_SOURCE_DOMAINS else ""
+    if event == "iced.gallery.source":
+        domain = "explore"
+    if isinstance(event, str) and event in AUTO_INTEGRATION_FIELDS:
+        domain, fields = AUTO_INTEGRATION_FIELDS[event]
+        for external, native in fields.items():
+            value = record.get(external)
+            # The external report uses f64; ambiguous large values are not identities.
+            if type(value) in (int, float) and 0 < value <= 2**53 and int(value) == value:
+                facts.setdefault(native, encoded(int(value)))
+    if event in ("integration.phase_progress", "integration.phase_advanced"):
+        if phase := auto_value(record.get("detail")):
+            facts.setdefault("phase", phase)
+    if domain:
+        facts["domain"] = domain
+    if revision := facts.get("source_revision", facts.get("frame_revision")):
+        facts["frame"] = revision
+    if revision := facts.get("source_observation_revision", facts.get("snapshot_revision")):
+        facts["snapshot"] = revision
+    run = str(record.metadata.get("run", record.source))
+    identities = []
+
+    def add(priority, names, values=None):
+        values = tuple(facts.get(name) for name in names) if values is None else values
+        if all(value is not None for value in values):
+            identities.append((priority, Identity(run, names, values)))
+
+    for field in ("frame", "snapshot"):
+        add(0, ("source_session", "source_instance", field))
+        if domain and field in facts:
+            add(1, (domain + "." + field,), (facts[field],))
+    for field in ("presentation_revision", "allocation_generation", "transfer_sequence", "timeline_ready"):
+        add(0, ("@surface", field))
+    for field in ("span_id", "request_id", "operation_id", "presentation_revision"):
+        add(2, (field,))
+    if "parent_span_id" in facts:
+        add(2, ("span_id",), (facts["parent_span_id"],))
+    for field in ("trace_id", "@surface", "dataset_identity", "gallery_identity"):
+        add(3, (field,))
+    add(1, ("dataset_identity", "gallery_generation"))
+    if domain and "observation_revision" in facts:
+        add(1, (domain + ".observation_revision",), (facts["observation_revision"],))
+    for field in ("phase", "phase_id"):
+        add(4, (field,))
+    control = record.get("control")
+    if isinstance(control, str) and re.search(r"[./]", control):
+        add(5, ("control",))
+    return facts, tuple(dict.fromkeys(identities))
+
+
+def auto_event_rank(record):
+    event = record.get("@event")
+    if not isinstance(event, str) or AUTO_NOISE.search(event):
+        return None
+    if event in AUTO_INTEGRATION_FIELDS or event == "iced.gallery.source":
+        return 1
+    parts = event.split(".")
+    if "snapshot" in parts or parts[-1] in ("published", "publication"):
+        return 0
+    if parts[-1] in ("state", "source", "observation", "edge"):
+        return 1
+    stage = event_stage(record)[1]
+    if parts[0] == "application" or stage in AUTO_LIFECYCLE_STAGES or parts[-1] in (
+        "ready", "started", "completed", "complete", "failed", "failure",
+        "created", "imported", "retired", "released", "exited", "signaled", "terminal",
+    ):
+        return 2
+    if event == "integration.phase_advanced":
+        return 3
+    return None
+
+
+class AutoAnchorGroup:
+    """At most two nearest anchors per identity; no per-record anchor sweep."""
+
+    def __init__(self):
+        self.first = None
+        self.times = {}
+        self.lines = {}
+
+    def add(self, index, row):
+        if self.first is None:
+            self.first = index
+        if row.time_ns is not None:
+            self.times.setdefault(row.clock, []).append((row.time_ns, index))
+        self.lines.setdefault(row.source, []).append((row.line, index))
+
+    def finish(self):
+        for entries in (*self.times.values(), *self.lines.values()):
+            entries.sort()
+
+    def nearest(self, row):
+        entries = self.times.get(row.clock) if row.time_ns is not None else None
+        point = row.time_ns
+        if not entries:
+            entries, point = self.lines.get(row.source), row.line
+        if not entries:
+            return (self.first,)
+        index = bisect_left(entries, (point, -1))
+        return tuple(entries[candidate][1] for candidate in (index - 1, index)
+                     if 0 <= candidate < len(entries))
+
+
+class AutoCorrelation:
+    """One direct, bounded enrichment pass over retained exact-query anchors."""
+
+    def __init__(self, result):
+        self.options = result.options
+        self.limit = min(MAX_AUTO_RELATED, max(0, self.options.limit - len(result.retained)))
+        matches = [item for item in result.retained if item.reason == "query"
+                   and not item.record.metadata.get("context_copy") and not item.record.parse_error]
+        specific = [item for item in matches if auto_specific_query(item.record)]
+        recency = lambda item: order_key(item.record, "capture")
+        preferred = heapq.nlargest(MAX_AUTO_ANCHORS, specific, key=recency)
+        positions = {physical_position(item.record) for item in preferred}
+        remaining = MAX_AUTO_ANCHORS - len(preferred)
+        if remaining:
+            preferred.extend(heapq.nlargest(
+                remaining, (item for item in matches if physical_position(item.record) not in positions), key=recency,
+            ))
+        recent = result.recent_query
+        self.recent = sorted(recent[1] or recent[0], key=lambda item: item.key)
+        self.highlight_recent = result.matches > 20 or result.matches > len(matches)
+        self.omitted_anchors = max(0, len(matches) - len(preferred))
+        self.seeds = sorted(preferred, key=lambda item: item.key)
+        self.facts = []
+        self.groups = {}
+        self.pools = [TriagePool(MAX_AUTO_PER_ANCHOR) for _ in self.seeds]
+        self.related = {}
+        self.count = 0
+        self.bridge_sources = {}
+        self.ambiguous = set()
+        self.existing = {physical_position(item.record) for item in result.retained}
+        if not self.limit:
+            return
+        for index, item in enumerate(self.seeds):
+            facts, identities = auto_facts(item.record)
+            self.facts.append(facts)
+            for priority, identity in identities:
+                self.observe_bridge(priority, identity, facts)
+                if identity not in self.groups:
+                    self.groups[identity] = AutoAnchorGroup()
+                self.groups[identity].add(index, item.record)
+        for group in self.groups.values():
+            group.finish()
+
+    def observe_bridge(self, priority, identity, facts):
+        if priority == 1 and len(identity.names) == 1 and "domain" in facts:
+            source_identity = facts.get("source_session"), facts.get("source_instance")
+            if all(source_identity):
+                previous = self.bridge_sources.setdefault(identity, source_identity)
+                if previous != source_identity:
+                    self.ambiguous.add(identity)
+
+    def link(self, row, facts, priority, identity, index):
+        seed = self.seeds[index].record
+        original = self.facts[index]
+        # A coarse surface/trace/dataset match must not override contradictory
+        # recorded source, frame, publication, allocation, or dataset identities.
+        for name in ("domain", "@surface", "source_session", "source_instance", "frame",
+                     "presentation_revision", "allocation_generation", "dataset_identity", "gallery_identity"):
+            if name in facts and name in original and facts[name] != original[name]:
+                return None
+        comparable = row.clock == seed.clock and row.time_ns is not None and seed.time_ns is not None
+        distance = abs(row.time_ns - seed.time_ns) if comparable else 2**63
+        weak = priority >= 4
+        if weak:
+            if comparable:
+                if distance > min(250, self.options.near_ms) * 1000000:
+                    return None
+                why = identity.label() + " + time proximity"
+            elif row.source == seed.source and abs(row.line - seed.line) <= 8:
+                distance = abs(row.line - seed.line)
+                why = identity.label() + " + line proximity"
+            else:
+                return None
+        else:
+            why = identity.label()
+        return (weak, priority, distance, index), why
+
+    def collect(self, files, query, where, anchors):
+        if not self.limit or not self.groups:
+            return
+        runs = {seed.record.metadata["run"] for seed in self.seeds}
+        sources = {seed.record.source for seed in self.seeds}
+        for source in files:
+            if source.source not in sources and source.metadata["run"] not in runs and not runs.intersection(source.linked_runs):
+                continue
+            for row in source.records(unchanged=True, anchors=anchors):
+                if (row.metadata["run"] not in runs or row.metadata.get("context_copy") or row.parse_error
+                        or physical_position(row) in self.existing or not where.matches(row) or query.matches(row)):
+                    continue
+                event_rank = auto_event_rank(row)
+                if event_rank is None:
+                    continue
+                facts, identities = auto_facts(row)
+                best = None
+                for priority, identity in identities:
+                    group = self.groups.get(identity)
+                    if group is None:
+                        continue
+                    self.observe_bridge(priority, identity, facts)
+                    for index in group.nearest(row):
+                        linked = self.link(row, facts, priority, identity, index)
+                        if linked is not None and (best is None or linked[0] < best[0]):
+                            best = *linked, identity, index
+                if best is None:
+                    continue
+                rank, why, identity, index = best
+                self.pools[index].add(row, (rank[0], event_rank, *rank[1:], *physical_position(row)),
+                                      (identity, why), str(row.get("@event")))
+        candidates = sorted((rank, index, row, identity, why)
+                            for index, pool in enumerate(self.pools)
+                            for rank, row, (identity, why) in pool.rows())
+        identities = Counter()
+        weak_count = 0
+        for rank, index, row, identity, why in candidates:
+            if self.count == self.limit:
+                break
+            if identity in self.ambiguous or identities[identity] == MAX_AUTO_PER_IDENTITY:
+                continue
+            if rank[0] and weak_count == MAX_AUTO_WEAK:
+                continue
+            weak_count += bool(rank[0])
+            identities[identity] += 1
+            seed = self.seeds[index].record
+            row.metadata.update({"auto_reason": compact(why, 150),
+                                 "auto_anchor": {"file": seed.source, "line": seed.line,
+                                                 "part": seed.metadata.get("part", 0)}})
+            if row.metadata.pop("triage_payload_truncated", False):
+                row.metadata["auto_payload_truncated"] = True
+            after = (row.clock == seed.clock and row.time_ns is not None and seed.time_ns is not None
+                     and row.time_ns > seed.time_ns)
+            self.related.setdefault(physical_position(seed), ([], []))[int(after)].append(
+                Retained(order_key(row, self.options.order), row, "auto", self.options.tail),
+            )
+            self.count += 1
+
+    def interleave(self, rows):
+        result = []
+        for item in rows:
+            before, after = self.related.get(physical_position(item.record), ((), ()))
+            result.extend(sorted(before, key=lambda row: row.key))
+            result.append(item)
+            result.extend(sorted(after, key=lambda row: row.key))
+        return result
+
+    def highlight(self, output):
+        if not self.recent or not self.highlight_recent:
+            return
+        print("Recent query matches (timeline follows):", file=output)
+        for item in self.recent:
+            row = item.record
+            facts = [f"{name}={compact(value, 70)}" for name in
+                     ("control", "a", "b", "c", "d", "source_revision", "presentation_revision", "detail", "message")
+                     if (value := row.get(name)) is not MISSING and value not in ("", None)]
+            event = row.get("@event")
+            print("  " + compact("(text)" if event is MISSING else event, 80) + " " + compact(" ".join(facts), 240) +
+                  f" @ {compact(row.source, 100)}:{row.line}", file=output)
 
 
 @dataclass
@@ -1373,6 +1873,13 @@ class StageBalance:
         if not self.pending or self.last_start == stage:
             self.pending += 1
         self.last_start = stage
+
+
+@dataclass
+class PixelChainSample:
+    stages: dict = field(default_factory=dict)
+    mailbox_count: int = 0
+    mailbox: tuple | None = None
 
 
 def lifecycle_identity(identities):
@@ -1475,10 +1982,21 @@ class IdentityChain:
     def finish(self, triage):
         for (source, family), state in self.states.items():
             if state.pending:
-                other = triage.observed_ends.get((source, family))
-                if other and other.line >= state.first.line:
+                counterparts = []
+                for shared in strong_identities(state.first, triage.explicit):
+                    other = triage.observed_ends.get((source, family, shared))
+                    if other is None or other.line < state.first.line:
+                        continue
+                    end_identities = strong_identities(other, triage.explicit)
+                    if lifecycle_identity(end_identities) == self.identity:
+                        continue  # Already reflected in this identity's balance.
+                    if any(identity.names == self.identity.names and identity != self.identity for identity in end_identities):
+                        continue  # A different span/request/resource is not a handoff.
+                    counterparts.append(other)
+                if counterparts:
+                    other = min(counterparts, key=physical_position)
                     triage.finding("identity-handoff", 45,
-                                   f"{family}: an end exists on a related record with another primary identity; "
+                                   f"{family}: an end shares a recorded identity but has another primary identity; "
                                    "handoff/instrumentation mismatch possible", state.first, self.identity, other)
                 else:
                     triage.finding("missing-counterpart", 70,
@@ -1508,14 +2026,18 @@ class Triage:
         self.selected = []
         self.identities = {}
         self.refinements = {}
+        self.refinement_groups = {}
         self.findings = {}
         self.notes = set()
         self.run = ""
         self.scanned = self.scoped = self.related = self.malformed = 0
         self.parse_examples = []
         self.artifacts = []
+        self.artifact_discovery = {}
         self.pending = {}
         self.observed_ends = {}
+        self.pixel_samples = {}
+        self.pixel_divergences = set()
 
     def records(self, files, apply_where=True):
         for source in files:
@@ -1537,23 +2059,108 @@ class Triage:
         repeated_kind = kind in ("incomplete-state", "explicit-failure", "unmatched-end", "duplicate-terminal",
                                  "owner-handoff", "clock-regression")
         key = (kind, record.source, str(record.get("@event")), identity) if repeated_kind else (kind, position)
-        value = TriageFinding(kind, score, message, triage_snapshot(record), identity,
-                              triage_snapshot(other) if other else None, last_position=position)
         rank = lambda item: (-item.score, *physical_position(item.record), item.kind)
+        new_rank = (-score, *position, kind)
+        count = 1
         if key in self.findings:
             previous = self.findings[key]
             count = previous.observations + (previous.last_position != position)
-            if rank(value) >= rank(previous):
+            if new_rank >= rank(previous):
                 previous.observations, previous.last_position = count, position
                 return
-            value.observations = count
         elif len(self.findings) >= 64:
             self.notes.add("Finding inventory capped at 64; lower-ranked observations omitted.")
             worst = max(self.findings, key=lambda item: rank(self.findings[item]))
-            if rank(value) >= rank(self.findings[worst]):
+            if new_rank >= rank(self.findings[worst]):
                 return
             del self.findings[worst]
-        self.findings[key] = value
+        self.findings[key] = TriageFinding(kind, score, message, triage_snapshot(record), identity,
+                                          triage_snapshot(other) if other else None,
+                                          observations=count, last_position=position)
+
+    @staticmethod
+    def pixel_sample(record):
+        event = record.get("@event")
+        boundary = record.get("boundary")
+        if event == "presentation.pixel":
+            stage = ("native", record.get("transfer_sequence"))
+        elif event == "firefox.workspace.pixel" and boundary in ("import", "mailbox"):
+            stage = (boundary, record.get("transfer_sequence"))
+        elif event == "iced.surface.pixel":
+            stage = ("owned", None)
+        else:
+            return None
+        surface = record.get("@surface")
+        revision = record.get("presentation_revision")
+        index = record.get("sample_index")
+        sample = tuple(record.get(name) for name in ("sample_x", "sample_y", "sample_rgba"))
+        if (not isinstance(surface, str) or type(revision) is not int or revision <= 0 or
+                type(index) is not int or not 0 <= index < 25 or
+                any(type(value) is not int for value in sample) or
+                (stage[0] != "owned" and (type(stage[1]) is not int or stage[1] <= 0))):
+            return None
+        run = str(record.metadata.get("run", record.source))
+        return (run, surface, revision, index), stage, sample
+
+    def pixel_divergence(self, kind, message, record, other, publication, emit):
+        if publication in self.pixel_divergences:
+            return
+        self.pixel_divergences.add(publication)
+        if emit:
+            self.finding(kind, 115, message, record, other=other)
+        else:
+            self.seed_pool.add(
+                record, (-120, False, -record.metadata["mtime_ns"], *physical_position(record)),
+                "deterministic pixel-chain divergence", ("pixel-chain", *publication),
+            )
+
+    def observe_pixel_chain(self, record, emit):
+        parsed = self.pixel_sample(record)
+        if parsed is None:
+            return
+        key, stage, sample = parsed
+        publication = key[:3]
+        if key not in self.pixel_samples:
+            if len(self.pixel_samples) == MAX_TRIAGE_PIXEL_SAMPLES:
+                self.notes.add("Pixel-chain sample capacity reached; additional publications were not compared.")
+                return
+            self.pixel_samples[key] = PixelChainSample()
+        chain = self.pixel_samples[key]
+        stages = chain.stages
+        previous = stages.get(stage)
+        if previous is not None and previous[0] != sample:
+            self.pixel_divergence(
+                "pixel-owner-mutation",
+                f"{stage[0]} sample changed within surface={key[1]} presentation_revision={key[2]} "
+                f"sample_index={key[3]}: {previous[0]} != {sample}",
+                record, previous[1], publication, emit,
+            )
+        else:
+            if previous is None and stage[0] == "mailbox":
+                chain.mailbox_count += 1
+                chain.mailbox = stage
+            stages[stage] = sample, triage_snapshot(record)
+
+        def compare(left, right):
+            before, after = stages.get(left), stages.get(right)
+            if before is None or after is None or before[0] == after[0]:
+                return
+            self.pixel_divergence(
+                "pixel-chain-divergence",
+                f"{left[0]} -> {right[0]} sample differs for surface={key[1]} "
+                f"presentation_revision={key[2]} sample_index={key[3]}: {before[0]} != {after[0]}",
+                after[1], before[1], publication, emit,
+            )
+
+        # Only edges adjacent to this stage can have changed. Rechecking every
+        # transfer makes repeated transfers of one publication quadratic.
+        name, transfer = stage
+        if name in ("native", "import"):
+            compare(("native", transfer), ("import", transfer))
+        if name in ("import", "mailbox"):
+            compare(("import", transfer), ("mailbox", transfer))
+        if chain.mailbox_count == 1 and name in ("mailbox", "owned"):
+            compare(chain.mailbox, ("owned", None))
 
     def choose_anchors(self, files, query):
         explicit = bool(self.options.query.strip() or self.options.errors or self.lookup)
@@ -1565,6 +2172,7 @@ class Triage:
                     self.parse_examples.append(f"{row.source}:{row.line}: {row.parse_error}")
             if not self.where.matches(row) or not query.matches(row):
                 continue
+            self.observe_pixel_chain(row, emit=False)
             identities = strong_identities(row, self.explicit)
             score, why = anchor_rank(row, identities)
             if not score and explicit:
@@ -1594,6 +2202,8 @@ class Triage:
                                (row.metadata["run"], str(row.get("@event")), "unclosed"))
         self.pending.clear()
         candidates = self.seed_pool.rows()
+        self.pixel_samples.clear()
+        self.pixel_divergences.clear()
         if not candidates:
             return
         self.run = (self.lookup.focus if self.lookup else candidates[0][1]).metadata["run"]
@@ -1647,7 +2257,7 @@ class Triage:
 
     def gather_context(self, files):
         for _, row, why in self.selected:
-            if row.get("@error") or why == "failed outcome/span":
+            if anchor_rank(row)[0] >= 85 and (row.get("@error") or why == "failed outcome/span"):
                 self.finding("anchor-failure", 115, why, row)
             for identity in strong_identities(row, self.explicit):
                 self.add_identity(identity, row, "anchor: " + why, 0)
@@ -1684,7 +2294,7 @@ class Triage:
 
     def add_refinement(self, row, identity):
         names = []
-        for name in ("sequence", "generation", "slot"):
+        for name in REFINEMENT_FIELDS:
             value = row.get(name)
             if type(value) is int and value >= 0 and (name != "sequence" or value > 0):
                 names.append(name)
@@ -1696,11 +2306,16 @@ class Triage:
                 self.notes.add("Counter refinement budget reached; additional composites omitted.")
                 return
             self.refinements[key] = []
+            self.refinement_groups.setdefault(key.names, {})[key.values] = (
+                len(self.refinements), key, self.refinements[key],
+            )
         origins = self.refinements[key]
         if len(origins) < 4 and all(previous.source != row.source for previous, _ in origins):
             origins.append((triage_snapshot(row), identity))
 
     def expand(self, files):
+        if not self.identities:
+            return
         # Even zero identity hops still discovers nearby counter refinements.
         for hop in range(max(1, self.options.triage_hops)):
             known = set(self.identities)
@@ -1713,24 +2328,33 @@ class Triage:
                 self.add_refinement(row, matched[0])
                 if hop >= self.options.triage_hops:
                     continue
-                for identity in identities:
-                    if identity not in known:
-                        neighborhood = self.nearby(row)
-                        distance = neighborhood[0] if neighborhood else 2**63
-                        rank = (self.identities[matched[0]].hop, bool(row.metadata.get("context_copy")), distance,
-                                *physical_position(row), identity.label())
-                        additions.add(row, rank, identity, key=identity)
+                unknown = [identity for identity in identities if identity not in known]
+                if not unknown:
+                    continue
+                neighborhood = self.nearby(row)
+                distance = neighborhood[0] if neighborhood else 2**63
+                rank = (self.identities[matched[0]].hop, bool(row.metadata.get("context_copy")), distance,
+                        *physical_position(row))
+                for identity in unknown:
+                    additions.add(row, (*rank, identity.label()), identity, key=identity)
             for _, row, identity in additions.rows():
                 self.add_identity(identity, row, "co-occurs on an exact identity record (handoff candidate)", hop + 1)
-            if set(self.identities) == known:
+            if len(self.identities) == len(known):
                 break
 
     def counter_neighbor(self, row):
         # Composites are terminal expansion leaves: never seed another identity hop.
-        for identity, origins in self.refinements.items():
-            values = tuple(encoded(row.get(name)) if row.get(name) is not MISSING else None for name in identity.names)
-            if values != identity.values:
-                continue
+        if not self.refinement_groups:
+            return None
+        values = {name: encoded(value) if (value := row.get(name)) is not MISSING else None
+                  for name in REFINEMENT_FIELDS}
+        matches = []
+        # There are only four possible two-or-three-field counter schemas.
+        for names, group in self.refinement_groups.items():
+            candidate = group.get(tuple(values[name] for name in names))
+            if candidate is not None:
+                matches.append(candidate)
+        for _, identity, origins in sorted(matches):
             for origin, strong in origins:
                 line_near = row.source == origin.source and abs(row.line - origin.line) <= 100
                 time_near = (row.clock != "none" and row.clock == origin.clock and row.time_ns is not None
@@ -1747,6 +2371,7 @@ class Triage:
         known = set(self.identities)
         counter_evidence = TriagePool(4)
         for row in self.records(files):
+            self.observe_pixel_chain(row, emit=True)
             identities = strong_identities(row, self.explicit)
             matched = [identity for identity in identities if identity in known]
             if matched:
@@ -1754,11 +2379,13 @@ class Triage:
                 family, stage = event_stage(row)
                 if family and stage not in START_STAGES and stage not in INCOMPLETE_STAGES \
                         and not row.metadata.get("context_copy"):
-                    key = row.source, family
-                    if key in self.observed_ends or len(self.observed_ends) < MAX_TRIAGE_STATES:
-                        self.observed_ends[key] = triage_snapshot(row)
-                    else:
-                        self.notes.add("Related end-stage inventory capped; counterpart absence may be incomplete.")
+                    snapshot = triage_snapshot(row)
+                    for identity in matched:
+                        key = row.source, family, identity
+                        if key in self.observed_ends or len(self.observed_ends) < MAX_TRIAGE_STATES:
+                            self.observed_ends[key] = snapshot
+                        else:
+                            self.notes.add("Related end-stage inventory capped; counterpart absence may be incomplete.")
                 primary = lifecycle_identity(identities)
                 for identity in matched:
                     self.identities[identity].observe(row, self, balance=identity == primary)
@@ -1820,6 +2447,7 @@ class Triage:
         files = [source for source in files if source.metadata["run"] == self.run or self.run in source.linked_runs
                  or any(entry[1].source == source.source for entry in self.selected)]
         self.artifacts = [source.source for source in files]
+        self.artifact_discovery = {source.source: source.metadata.get("discovery", "") for source in files}
         self.gather_context(files)
         self.expand(files)
         self.analyze(files)
@@ -1836,12 +2464,15 @@ def render_triage(result, options, output, diagnostics):
           f"{len(result.identities)} identities; {result.related}/{result.scoped} run records in exact chains; "
           f"showing {len(result.evidence.entries)} evidence rows (limit {options.limit}).", file=report)
     if result.selected:
-        print("Run: " + compact(result.run, 200), file=report)
+        link = result.selected[0][1].metadata.get("run_link", "")
+        print("Run: " + compact(result.run, 200) + (f" [{compact(link)}]" if link else ""), file=report)
         if result.lookup:
             print(f"Error lookup: {result.lookup.mode}; {result.lookup.matches} occurrences.", file=report)
             print("First physical match: " + render_record(
                 Retained((), result.lookup.focus, "first physical pasted error", False), options), file=report)
-        print("Artifacts: " + " | ".join(compact(path, 180) for path in result.artifacts[:options.top]), file=report)
+        print("Artifacts: " + " | ".join(
+            compact(path, 180) + (" [auto: " + result.artifact_discovery[path] + "]" if result.artifact_discovery[path] else "")
+            for path in result.artifacts[:options.top]), file=report)
         print("Anchors (ranked evidence, not causes):", file=report)
         for _, row, why in result.selected:
             print("  " + render_record(Retained((), row, why, False), options), file=report)
@@ -1901,7 +2532,7 @@ def render_triage(result, options, output, diagnostics):
               " | ".join(identity.label() for identity in list(result.refinements)[:min(5, options.top)]), file=report)
     if options.format == "summary" and result.evidence.entries:
         print("Evidence (each row states why it was included):", file=output)
-    for _, row, why in sorted(result.evidence.rows(), key=lambda item: order_key(item[1], options.order)):
+    for _, row, why in sorted(result.evidence.entries.values(), key=lambda item: order_key(item[1], options.order)):
         row.metadata["triage_reason"] = why
         print(render_record(Retained((), row, why, False), options), file=output)
     for note in sorted(result.notes):
@@ -1936,6 +2567,9 @@ def render_record(item, options):
         if options.fields:
             output = projected(record, options.fields)
             output["@match"] = item.reason
+            if item.reason == "auto":
+                output.update({"@auto_reason": record.metadata["auto_reason"],
+                               "@auto_anchor": record.metadata["auto_anchor"]})
         else:
             output = {
                 "_log": {
@@ -1947,9 +2581,10 @@ def render_record(item, options):
                 "data": record.data, "text": record.raw,
             }
         return encoded(output)
+    reason = "auto: " + record.metadata["auto_reason"] if item.reason == "auto" else item.reason
     if options.fields:
         cells = projected(record, options.fields)
-        return " ".join(f"{name}={compact(value)}" for name, value in cells.items()) + f" [{item.reason}]"
+        return " ".join(f"{name}={compact(value)}" for name, value in cells.items()) + f" [{reason}]"
     clock = "elapsed" if record.clock.startswith("elapsed:") else record.clock
     timestamp = (
         f"{record.time_ns / 1000000:.3f}ms" if clock == "elapsed" else
@@ -2008,15 +2643,17 @@ def render_record(item, options):
     suffix = (" " + compact(detail)) if detail is not MISSING and detail != "" else ""
     if facts:
         suffix += " " + " ".join(facts)
-    return f"{compact(clock, 70)}:{timestamp} {compact(record.source, 150)}:{record.line} [{item.reason}] {compact(label)}{suffix}"
+    return f"{compact(clock, 70)}:{timestamp} {compact(record.source, 150)}:{record.line} [{reason}] {compact(label)}{suffix}"
 
 
 def render(result, options, output, diagnostics):
-    total = result.matches + result.related + result.proximity + result.context
+    automatic = result.automatic.count if result.automatic else 0
+    rows = result.rows()
+    total = result.matches + result.related + result.proximity + result.context + automatic
     status = (
         f"Scanned {result.scanned} records; {result.matches} matched, {result.related} correlated, "
         f"{result.proximity} proximity, {result.context} context; {result.errors} failure candidates; "
-        f"showing {len(result.retained)}/{total}."
+        f"{str(automatic) + ' automatic; ' if automatic else ''}showing {len(rows)}/{total}."
     )
     if result.lookup:
         lookup = result.lookup
@@ -2034,7 +2671,8 @@ def render(result, options, output, diagnostics):
         print(status, file=output)
         if result.groups:
             print("Groups (" + ", ".join(options.group_by) + "):", file=output)
-            for group, count in sorted(result.groups.items(), key=lambda item: (-item[1], item[0]))[:options.top]:
+            for group, count in heapq.nsmallest(options.top, result.groups.items(),
+                                                key=lambda item: (-item[1], item[0])):
                 print(f"  {count:>7}  " + " | ".join(compact(json.loads(value), 110) for value in group), file=output)
         for clock, (start, end) in sorted(result.clocks.items()):
             detail = f"{start}..{end} ns" if start is not None else "no comparable timestamp"
@@ -2043,13 +2681,27 @@ def render(result, options, output, diagnostics):
             print("Records:", file=output)
     else:
         print(status, file=diagnostics)
-    for item in result.rows():
+    if result.automatic:
+        if options.format == "timeline":
+            result.automatic.highlight(output)
+        if automatic or result.automatic.omitted_anchors:
+            print(f"Auto correlation: {automatic} related rows; at most {MAX_AUTO_PER_ANCHOR}/anchor, "
+                  f"{MAX_AUTO_PER_IDENTITY}/identity, {MAX_AUTO_RELATED} total, within --limit. "
+                  "Rows are grouped beside exact query anchors; cross-clock times remain unaligned. "
+                  "Use --no-auto-correlate for the original query timeline.", file=diagnostics)
+        if result.automatic.omitted_anchors:
+            print(f"Auto correlation: {result.automatic.omitted_anchors} query anchors outside the "
+                  f"{MAX_AUTO_ANCHORS}-anchor budget; recent specific matches take priority.", file=diagnostics)
+    for item in rows:
         print(render_record(item, options), file=output)
     if options.format == "summary":
-        terminals = [row for key, row in result.terminals.items() if key[0] in result.selected_runs]
+        terminals = heapq.nlargest(
+            options.top, (row for key, row in result.terminals.items() if key[0] in result.selected_runs),
+            key=lambda item: order_key(item, "capture"),
+        )
         if terminals:
             print("Terminals in matched runs (independent of --limit):", file=output)
-            for row in sorted(terminals, key=lambda item: order_key(item, "capture"))[-options.top:]:
+            for row in reversed(terminals):
                 print("  " + render_record(Retained((), row, "terminal", False), options), file=output)
         elif result.lookup:
             print("Terminal evidence: no terminal record was captured in this matched run.", file=output)
@@ -2070,6 +2722,7 @@ def render(result, options, output, diagnostics):
 HELP = """\
 Examples:
   ./mmltk --logs --family latest-wayland-test --triage
+  ./mmltk --logs build/validation/latest-wayland-test-firefox.log --triage
   ./mmltk --logs build/validation/final-wayland-acceptance.log \\
       --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
   ./mmltk --logs --errors
@@ -2105,7 +2758,7 @@ Fields:
   @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
   @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
   @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link,
-  @triage_reason, @triage_payload_truncated.
+  @triage_reason, @triage_payload_truncated, @discovery.
   @event resolves wrapped fields.event/name before event/name.
   @surface joins native uint64 surface_high/low and Firefox 32-hex surfaces.
   @error marks failure candidates from levels/event/message text; it is a
@@ -2139,6 +2792,36 @@ Artifact families:
   are automatically scoped to the run in family/history mode. Summary output
   includes terminal events from matched runs independently of the sample limit.
 
+Automatic timeline correlation:
+  Human --format timeline queries with --query/--errors add a small set of
+  direct frame/publication/snapshot/lifecycle matches beside exact query rows.
+  --no-auto-correlate restores the original timeline. JSONL and summary formats
+  require explicit --auto-correlate; --correlate, --related-run, --error, and
+  --triage keep their existing selection behavior without this extra pass.
+  Original matches and ordering are preserved; automatic rows use spare --limit
+  capacity only. Broad/truncated timelines start with three recent specific query
+  matches, including matches beyond the retained sample. Recency uses captured
+  file mtime and physical source order; it never aligns independent clocks.
+  Up to 128 retained query anchors prefer recent specific events over progress
+  chatter. Limits are 3 diverse events per anchor, 2 rows per joining identity,
+  and 48 related rows total. Added rows never become new correlation seeds.
+  Source/session/revision, surface/publication/allocation/transfer, trace/span,
+  dataset/gallery, and scoped observation identities must be nonempty and agree
+  where both records state them. Bare counters, pixel/probe/slot loops, context
+  copies, malformed rows, and ambiguous source revisions do not auto-expand.
+  Known integration report slots have event-specific projections, such as
+  explore_reopen_wait.b -> Explore source revision and explore_reopen_draw.c/d
+  -> source/presentation revision. Generic a/b/c/d numbers never join.
+  Phase/control matches additionally need at most 250ms (--near-ms can narrow
+  it), or eight same-source lines with unaligned clocks, and are labeled weaker
+  proximity, capped at eight rows globally. Cross-clock grouping by an exact
+  identity never aligns clocks.
+  Every added row shows [auto: reason]. Explicit JSONL opt-in uses match=auto
+  and auto_reason/auto_anchor metadata (also included with --fields). Retained
+  automatic payloads use the triage size bounds; auto_payload_truncated flags
+  any shortening. --where constrains all added rows. One extra streaming pass
+  uses bounded per-identity nearest-anchor indexes, without an all-run index.
+
 Pasted errors:
   --error TEXT searches exact whitespace-normalized phrases first, accepting a
   colon when a displayed title and body were separated by a blank line. Only
@@ -2159,6 +2842,10 @@ Automatic triage:
   anchors, or an unmatched start when no explicit failure is available. --query
   narrows anchors; --where constrains every pass. --error keeps its first-physical
   phrase lookup and proximity behavior. Nothing in triage includes the whole run.
+  A single file discovers same-family current siblings, or only the matching
+  archive batch (even without current files). Auto additions carry @discovery;
+  rotation links are inferred. Ordinary path queries do not auto-expand inputs.
+  Explicit failures outrank error-related event names; --errors remains broad.
   Defaults: 4 anchors, 12 identities, 2 expansion hops, 20 evidence rows,
   5 summary entries per section. Tune
   --triage-anchors, --triage-identities, --triage-hops, --limit, and --top.
@@ -2179,13 +2866,16 @@ Automatic triage:
   requirements. Missing/blocked/stalled stages, failed textual span outcomes,
   duplicate ends, unclosed starts, identity handoffs, and the largest same-source
   clock gaps (--triage-gap-ms, default 1000) are highlighted with evidence.
+  Handoff candidates require a shared identity and no conflicting operation ID;
+  unrelated endings or already-balanced endpoints cannot satisfy missing stages.
   Sources are never causally ordered from proximity. Copied INFO does not
   participate in lifecycle balances. Numeric outcome enums are not guessed.
   Up to 4 generic *.terminal/terminal=true or known process/test terminal
   records are reported independently of --limit. Without terminals, captured
   source ends are shown without claiming success/failure/timeout.
   Memory is bounded: 256 open anchor families, 64 findings, 64 event/family
-  values per identity, 32 sources per identity, and size-bounded retained
+  values per identity, 32 sources per identity, 10000 auto-added artifact files,
+  and size-bounded retained
   payloads (96 fields, depth 4, 2048 characters per string). Capacity limits are
   reported. Triage uses bounded streaming passes, no all-run index or network.
   --related-run/--tail/--list-runs cannot combine with --triage. JSONL writes
@@ -2226,6 +2916,12 @@ def argument_parser():
                         help="pasted-error neighborhood radius in milliseconds (default: 1000)")
     parser.add_argument("--correlate", action="append", default=[], metavar="FIELD[+FIELD...]",
                         help="include records sharing a seed identity; repeat for OR, + for composite identities")
+    automatic = parser.add_mutually_exclusive_group()
+    automatic.add_argument("--auto-correlate", action="store_true", dest="auto_correlate",
+                           help="opt in to bounded automatic related evidence, including for JSONL")
+    automatic.add_argument("--no-auto-correlate", action="store_false", dest="auto_correlate",
+                           help="disable automatic evidence and recent-match highlights in human timelines")
+    parser.set_defaults(auto_correlate=None)
     parser.add_argument("--context", type=bounded_integer(0, 100), default=0,
                         help="include up to N nonblank records before/after each match in the same file")
     parser.add_argument("--format", choices=("summary", "timeline", "jsonl"), default="summary")
@@ -2262,6 +2958,9 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
             raise QueryError("--triage cannot combine with --related-run, --tail, or --list-runs; its evidence is bounded automatically")
         if options.correlate and not (options.query.strip() or options.errors or options.triage):
             raise QueryError("--correlate requires an explicit --query or --errors seed")
+        if options.auto_correlate is True and not auto_correlate_enabled(options):
+            raise QueryError("--auto-correlate requires --query or --errors and cannot combine with "
+                             "--correlate, --related-run, --error, or --triage")
         options.fields = field_names(options.fields) if options.fields else ()
         options.group_by = field_names(options.group_by)
         options.top = options.top or (5 if options.triage else 10)

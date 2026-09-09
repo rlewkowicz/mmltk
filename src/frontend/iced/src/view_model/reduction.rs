@@ -586,6 +586,47 @@ pub(super) fn merge_explore_snapshot(
     target: &mut Option<crate::generated::ExploreSnapshot>,
     incoming: crate::generated::ExploreSnapshot,
 ) -> Result<Observation, UiError> {
+    if let Some(installed) = target.as_ref()
+        && installed.revision == incoming.revision
+        && installed != &incoming
+    {
+        let mut fields = Vec::new();
+        macro_rules! differing {
+            ($field:ident) => {
+                if installed.$field != incoming.$field {
+                    fields.push(stringify!($field));
+                }
+            };
+        }
+        differing!(busy);
+        differing!(cancellationrequested);
+        differing!(ready);
+        differing!(failure);
+        differing!(failurekind);
+        differing!(nproc);
+        differing!(maximumatlasextent);
+        differing!(dataset);
+        differing!(order);
+        differing!(gallery);
+        differing!(viewport);
+        differing!(viewportresult);
+        differing!(filter);
+        differing!(overlay);
+        differing!(augmentation);
+        differing!(detail);
+        differing!(mode);
+        differing!(selectedimage);
+        differing!(focusedimage);
+        differing!(frame);
+        differing!(document);
+        differing!(scene);
+        differing!(labels);
+        crate::integration_control::report_snapshot_conflict(
+            "Explore",
+            incoming.revision,
+            &fields.join(","),
+        );
+    }
     merge_observation(target, incoming, |value| value.revision, "Explore")
 }
 

@@ -288,6 +288,7 @@ struct RuntimeDiagnosticTarget::State final {
     [[nodiscard]] bool enabled() const noexcept { return producer.enabled(); }
 
     void write(RuntimeDiagnosticFact fact, bool required = false) const noexcept;
+    void write_batch(std::span<const RuntimeDiagnosticFact> facts) const noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) const noexcept;
     void write_benchmark_trace(std::string_view event, std::string_view json_fields) const noexcept;
 
@@ -300,6 +301,10 @@ bool RuntimeDiagnosticTarget::pixel_probes_enabled() const noexcept { return val
 
 void RuntimeDiagnosticTarget::write(const RuntimeDiagnosticFact fact) const noexcept {
     if (state_) state_->write(fact);
+}
+
+void RuntimeDiagnosticTarget::write_batch(const std::span<const RuntimeDiagnosticFact> facts) const noexcept {
+    if (state_) state_->write_batch(facts);
 }
 
 void RuntimeDiagnosticTarget::write_required(const RuntimeDiagnosticFact fact) const noexcept {
@@ -356,6 +361,37 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact, con
         if (writer.runtime_event(fact, steady_ns))
             static_cast<void>(required ? operation.submit_terminal_encoded({.json = writer.view()})
                                        : operation.try_submit_encoded({.json = writer.view()}));
+    } catch (...) {}
+}
+
+void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDiagnosticFact> facts) const noexcept {
+    const DiagnosticsProducer::Operation operation = producer.acquire();
+    if (!operation.enabled() || facts.empty()) return;
+    for (const auto& fact : facts) {
+        const std::string_view owner = owner_name(fact.owner);
+        if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant)) ||
+            fact.message.size() > 1024U)
+            return;
+    }
+    try {
+        struct BatchContext final {
+            std::span<const RuntimeDiagnosticFact> facts;
+            std::int64_t steady_ns;
+        };
+        BatchContext context{
+            .facts = facts,
+            .steady_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+        };
+        static_cast<void>(operation.try_submit_encoded_batch(
+            facts.size(), &context,
+            [](void* const opaque, const std::size_t index, const std::span<char> destination, std::size_t& size) noexcept {
+                const auto& batch = *static_cast<const BatchContext*>(opaque);
+                BoundedJsonWriter writer{destination};
+                if (!writer.runtime_event(batch.facts[index], batch.steady_ns)) return false;
+                size = writer.view().size();
+                return true;
+            }));
     } catch (...) {}
 }
 

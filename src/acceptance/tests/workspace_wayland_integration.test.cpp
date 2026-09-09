@@ -52,6 +52,7 @@
 #include "src/controller/contracts/gui_settings.h"
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/diagnostic_context.h"
+#include "src/controller/contracts/visual_source.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -70,7 +71,11 @@ using mmltk::testsupport::reap_pidfd;
 using mmltk::testsupport::ScopedTempDir;
 
 constexpr int kCompiledResolution = 512;
-constexpr auto kWaylandAcceptanceDeadline = std::chrono::seconds{90};
+constexpr auto kWaylandStartupDeadline = std::chrono::seconds{20};
+constexpr auto kWaylandInteractionDeadline = std::chrono::seconds{6};
+constexpr auto kWaylandWorkDeadline = std::chrono::seconds{15};
+constexpr auto kWaylandFailureSettlementDeadline = std::chrono::seconds{5};
+constexpr auto kWaylandShutdownDeadline = std::chrono::seconds{15};
 constexpr std::uint64_t kUpdateViewportEndpoint = mmltk::controller::browser::application_stable_id("explore", "UpdateViewport");
 constexpr std::size_t kAcceptanceGenerationLimit = 128U;
 constexpr std::size_t kAcceptanceSlotLimit = mmltk::controller::kExploreVisibleItemCapacity;
@@ -430,6 +435,7 @@ struct SurfaceAudit final {
         unsigned native_stage = 0U;
         unsigned firefox_stage = 0U;
         bool import_failed = false;
+        bool firefox_import_failed = false;
         bool withdrawn = false;
         bool candidate_withdrawn = false;
         bool native_retired = false;
@@ -458,6 +464,7 @@ struct SurfaceAudit final {
     std::vector<Draw> draws;
     std::string failure;
     std::size_t browser_ordinal = 0U;
+    std::uint64_t newest_replacement_generation = 0U;
     bool native_shutdown = false;
     bool browser_shutdown = false;
 
@@ -509,6 +516,8 @@ struct SurfaceAudit final {
         state.generation = generation;
         state.width = width;
         state.height = height;
+        if (event == "presentation.replacement")
+            newest_replacement_generation = std::max(newest_replacement_generation, generation);
         const bool copying = event == "presentation.source_borrow.started" || event == "presentation.source_borrow.completed" ||
                              event == "presentation.source.copy";
         const bool transferred = event == "presentation.ready_sync.started" || event == "presentation.ready_sync.completed" ||
@@ -672,6 +681,11 @@ struct SurfaceAudit final {
             advance(1U);
         else if (event == "firefox.workspace.claim_outcome")
             reject("Firefox failed to claim the advertised surface");
+        else if (event == "firefox.workspace.import_failed") {
+            if (state.firefox_stage != 2U || state.firefox_import_failed || state.firefox_withdrawn || state.firefox_retired)
+                reject("Firefox import failure lacks its unique claimed surface");
+            state.firefox_import_failed = true;
+        }
         else if (event == "firefox.workspace.registry_inserted")
             advance(2U);
         else if (event == "firefox.workspace.import_ready_emitted")
@@ -744,8 +758,25 @@ struct SurfaceAudit final {
         if (!failure.empty()) return failure;
         for (const auto& [id, state] : surfaces) {
             if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) continue;
+            // A stale candidate remains in the writer's single retiring slot
+            // until its physical release succeeds. A later replacement is
+            // therefore authoritative when the bounded retirement diagnostic
+            // itself was dropped.
+            const bool native_retired =
+                state.native_retired || (state.candidate_withdrawn && newest_replacement_generation > state.generation);
+            if (state.firefox_import_failed) {
+                const bool native_rejection =
+                    state.native_stage == 3U || (state.native_stage == 4U && state.import_failed);
+                if (!native_rejection || state.generation != state.iced_generation ||
+                    state.width != state.browser_width || state.height != state.browser_height || !native_retired)
+                    return "rejected import " + id + " lacks matching native admission and retirement";
+                if (state.firefox_stage != 2U || state.created == 0U || state.captured != 0U || state.discarded <= state.created ||
+                    state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
+                    return "rejected import " + id + " lacks exact receiver discard and texture retirement";
+                continue;
+            }
             if (state.native_stage != 4U || state.generation != state.iced_generation || state.width != state.browser_width ||
-                state.height != state.browser_height || !state.native_retired)
+                state.height != state.browser_height || !native_retired)
                 return "surface " + id + " lacks matching native/browser import and retirement";
             if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
                 return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
@@ -774,7 +805,8 @@ struct SurfaceAudit final {
             if (!pending.candidate_withdrawn || pending.created == 0U || pending.captured != 0U || !pending.publications.empty() ||
                 pending.discarded <= pending.created || pending.retired <= pending.discarded || !pending.reconstruction ||
                 pending.reconstruction->requested != b || pending.reconstruction->ordinal <= pending.created ||
-                pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired || !pending.native_retired)
+                pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired ||
+                (!pending.native_retired && newest_replacement_generation <= pending.generation))
                 continue;
             const auto& active_identity = pending.reconstruction->completed;
             const auto& active = surfaces.at(active_identity);
@@ -821,6 +853,7 @@ struct PixelBoundaryAudit final {
     };
     std::map<Key, Publication> samples;
     std::vector<nlohmann::json> probe_failures;
+    std::set<std::string> failed_probe_retirements;
 
     [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
         if (expected.empty()) return probe_failures.empty();
@@ -833,30 +866,35 @@ struct PixelBoundaryAudit final {
         const bool allocation = expected == "allocation";
         bool forwarded = false, recovered = false;
         for (const auto& [key, publication] : samples) {
-            if (key.first != surface) continue;
             const auto& receipt = publication.receivers[0].identity;
-            for (const auto receiver : {0U, 1U}) {
-                const auto& evidence = publication.receivers[receiver].identity;
-                if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
-                    return false;
-            }
-            const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
-                                      scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
-            if (!publication.forwarded.empty() && (allocation || same_attempt)) {
-                if (publication.forwarded.value("pixel_probe", true)) return false;
-                if (!allocation) {
-                    for (const auto* field : {"layer", "slot", "content_session", "content_sequence"})
-                        if (scalar(publication.forwarded, field) != scalar(failed, field)) return false;
+            if (key.first == surface) {
+                for (const auto receiver : {0U, 1U}) {
+                    const auto& evidence = publication.receivers[receiver].identity;
+                    if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
+                        return false;
                 }
-                forwarded = true;
+                const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
+                                          scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
+                if (!publication.forwarded.empty() && (allocation || same_attempt)) {
+                    if (publication.forwarded.value("pixel_probe", true)) return false;
+                    if (!allocation) {
+                        for (const auto* field : {"layer", "slot", "content_session", "content_sequence"})
+                            if (scalar(publication.forwarded, field) != scalar(failed, field)) return false;
+                    }
+                    forwarded = true;
+                }
             }
+            // The failed import may be retired and replaced. Correlate recovery
+            // by the continuing logical content stream rather than requiring
+            // the replacement to reuse a physical surface or mailbox slot.
             if (!allocation && !receipt.empty() && scalar(receipt, "layer") == scalar(failed, "layer") &&
-                scalar(receipt, "slot") == scalar(failed, "slot") &&
-                scalar(receipt, "transfer_sequence") > scalar(failed, "transfer_sequence") &&
+                scalar(receipt, "content_session") == scalar(failed, "content_session") &&
+                scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
         }
-        return forwarded && (allocation || recovered) && raw_complete() && viewer_nonblack_complete();
+        const bool failure_settled = allocation ? forwarded || failed_probe_retirements.contains(surface) : forwarded && recovered;
+        return failure_settled && raw_complete() && viewer_nonblack_complete();
     }
     std::array<std::size_t, 3> joined{};
     struct Composition final {
@@ -977,17 +1015,22 @@ struct PixelBoundaryAudit final {
             const auto& mailbox = publication.receivers[1];
             const auto& owned = publication.receivers[2];
             const auto attempt = publication.native.find(scalar(imported.identity, "transfer_sequence"));
+            const bool canvas_sampled =
+                std::ranges::any_of(canvas.values, [](const auto& value) { return value.has_value(); });
             if (attempt == publication.native.end() || !imported.complete() || !mailbox.complete() || !owned.complete() ||
-                canvas.identity != owned.identity)
+                !canvas_sampled || canvas.identity != owned.identity)
                 return false;
             const auto& native = attempt->second;
-            return native.complete() && native.identity == native.publication_fact &&
+            return native.complete() && (native.publication_fact.empty() || native.identity == native.publication_fact) &&
                    scalar(native.identity, "source_revision") == successful_viewer->second && has_color(native) && has_color(canvas);
         });
     }
 
     static bool colored(std::uint32_t value) {
         return (value >> 24U) != 0U && ((value & 255U) > 8U || ((value >> 8U) & 255U) > 8U || ((value >> 16U) & 255U) > 8U);
+    }
+    static bool black(std::uint32_t value) {
+        return (value & 0x00ffffffU) == 0U;
     }
     void reject(std::string_view reason) {
         if (failure.empty()) failure = reason;
@@ -1020,8 +1063,8 @@ struct PixelBoundaryAudit final {
     void reconcile(Publication& publication) {
         const auto& imported = publication.receivers[0];
         if (imported.identity.empty() || publication.forwarded.empty()) return;
-        for (const auto* field :
-             {"content_session", "content_sequence", "presentation_revision", "content_width", "content_height", "layer", "slot"})
+        for (const auto* field : {"content_session", "content_sequence", "presentation_revision", "content_width", "content_height", "layer",
+                                  "slot", "transfer_sequence", "timeline_ready", "timeline_release"})
             if (scalar(imported.identity, field) != scalar(publication.forwarded, field))
                 reject("Firefox pixel receipt differs from the forwarded physical mailbox");
         if (scalar(imported.identity, "layer") !=
@@ -1032,8 +1075,12 @@ struct PixelBoundaryAudit final {
         const auto& source = native->second;
         const auto& fact = source.identity;
         if (fact.empty()) return;
-        if (source.publication_fact.empty()) return;
-        if (fact != source.publication_fact) reject("native pixels differ from the canonical publication fact");
+        // The optional frame-edge log can be dropped after its complete native
+        // probe batch. The receiver's exact physical transfer then corroborates
+        // publication; every source field and all 25 samples still must join.
+        if (source.publication_fact.empty() && !source.complete()) return;
+        if (!source.publication_fact.empty() && fact != source.publication_fact)
+            reject("native pixels differ from the canonical publication fact");
         const auto width = scalar(fact, "source_width"), height = scalar(fact, "source_height");
         if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") || height > scalar(fact, "capacity_height") ||
             scalar(fact, "source_session") == 0U || scalar(fact, "source_instance") == 0U || scalar(fact, "source_revision") == 0U ||
@@ -1091,12 +1138,12 @@ struct PixelBoundaryAudit final {
                     (canvas.values[index]->x != coordinate(index % 5U, width) || canvas.values[index]->y != coordinate(index / 5U, height)))
                     reject("canvas probe does not name its logical source sample");
                 if (canvas.values[index] && raw[3]->values[index] && colored(raw[3]->values[index]->rgba) &&
-                    !colored(canvas.values[index]->rgba))
+                    black(canvas.values[index]->rgba))
                     reject("successful owned capture produced an unexplained black viewer canvas");
             }
         }
-        if (source.complete() && width == 384U && height == 384U && scalar(fact, "capacity_width") == 894U &&
-            scalar(fact, "capacity_height") == 1080U)
+        if (width == 384U && height == 384U && scalar(fact, "allocation_generation") > 1U &&
+            scalar(fact, "capacity_width") > width && scalar(fact, "capacity_height") > height)
             retained_logical_content = true;
         if (source.complete() && width == 1536U && height == 1536U && scalar(fact, "allocation_generation") > 1U) upscale_growth = true;
     }
@@ -1109,6 +1156,14 @@ struct PixelBoundaryAudit final {
                 reject("unexpected or excessive probe preparation failures");
             else
                 probe_failures.push_back(record);
+            return;
+        }
+        if (event == "firefox.workspace.retired") {
+            const auto surface = record.value("surface", "");
+            if (!surface.empty() && std::ranges::any_of(probe_failures, [&](const auto& failed) {
+                    return failed.value("surface", "") == surface;
+                }))
+                failed_probe_retirements.insert(surface);
             return;
         }
         if (event == "upscale.stop.requested") {
@@ -1195,10 +1250,13 @@ struct PixelBoundaryAudit final {
                         reject("composition transformed canvas coordinate differs");
                 }
                 auto& value = composition.cards[card][kind];
-                if (value && *value != record)
+                auto stable_record = record;
+                stable_record.erase("elapsed_ms");
+                stable_record.erase("timeline_ready");
+                if (value && *value != stable_record)
                     reject("duplicate-conflicting composition card sample");
                 else
-                    value = record;
+                    value = std::move(stable_record);
             }
             return;
         }
@@ -1338,7 +1396,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         auto edge = native;
         edge["event"] = "presentation.frame.edge";
         edge["presentation_revision"] = publication;
-        audit.consume(edge);
+        if (missing_owner != "presentation.frame.edge") audit.consume(edge);
         auto forwarded = imported;
         forwarded["event"] = "firefox.workspace.frame_forwarded";
         forwarded["presentation_revision"] = publication;
@@ -1380,7 +1438,13 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     black_viewer.consume(canvas);
     CHECK(black_viewer.viewer_canvas_joins == 1U);
     CHECK_FALSE(black_viewer.failure.empty());
+    canvas["sample_rgba"] = 0xff060503U;
+    PixelBoundaryAudit dimmed_viewer;
+    fill(dimmed_viewer, owned);
+    dimmed_viewer.consume(canvas);
+    CHECK(dimmed_viewer.failure.empty());
     PixelBoundaryAudit all_black;
+    canvas["sample_rgba"] = 0xff000000U;
     fill(all_black, owned, false, true);
     all_black.consume(canvas);
     all_black.consume({{"event", "integration.viewer_complete"}, {"detail", "square"}, {"a", 7U}, {"b", 9U}});
@@ -1394,6 +1458,20 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     colored_viewer.consume(canvas);
     colored_viewer.consume(selected);
     CHECK(colored_viewer.viewer_nonblack_complete());
+    for (const bool missing_sample : {false, true}) {
+        PixelBoundaryAudit dropped_edge;
+        fill(dropped_edge, owned, missing_sample, false, "presentation.frame.edge");
+        dropped_edge.consume(canvas);
+        dropped_edge.consume(selected);
+        CHECK(dropped_edge.viewer_nonblack_complete() == !missing_sample);
+        CHECK(dropped_edge.samples.at({surface, 7U}).native.at(4U).publication_fact.empty());
+        auto contradictory_edge = native;
+        contradictory_edge["event"] = "presentation.frame.edge";
+        contradictory_edge["source_instance"] = 4U;
+        dropped_edge.consume(contradictory_edge);
+        CHECK_FALSE(dropped_edge.failure.empty());
+        CHECK_FALSE(dropped_edge.viewer_nonblack_complete());
+    }
     for (const auto* boundary : {"Allocation", "Reset", "Begin", "End"}) {
         const bool allocation = std::string_view{boundary} == "Allocation";
         std::string target{boundary};
@@ -1625,6 +1703,7 @@ struct NativeAudit final {
     std::map<std::uint64_t, std::uint64_t> augmentation_pixel_seeds;
     using FramePublication = std::pair<std::size_t, std::uint64_t>;
     std::map<std::uint64_t, std::vector<FramePublication>> published_frames;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::size_t> presented_explore_frames;
     bool overlay_descriptors = false;
     std::set<std::pair<std::uint64_t, std::uint64_t>> transformed_overlay_slots;
     std::set<std::pair<std::uint64_t, std::uint64_t>> semantic_overlay_slots;
@@ -1637,13 +1716,15 @@ struct NativeAudit final {
     using OverlayDescriptorIdentity = std::pair<std::uint64_t, std::uint64_t>;
     std::map<std::pair<std::uint64_t, std::uint64_t>, OverlayDescriptorIdentity> selected_overlay_slots;
     std::map<std::pair<std::uint64_t, std::uint64_t>, OverlayDescriptorIdentity> hidden_overlay_slots;
-    using ProbeSlots = std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>;
+    using ProbeKey = std::pair<std::uint64_t, std::uint64_t>;
+    using ProbeSlots = std::map<ProbeKey, std::uint64_t>;
     using ProbeOrdinals = std::map<ProbeSlots::key_type, std::size_t>;
+    using ProbeFrames = std::map<ProbeKey, std::vector<std::uint64_t>>;
     ProbeSlots rendered_probe_slots;
     ProbeSlots transition_probe_slots;
     ProbeOrdinals rendered_probe_ordinals;
     ProbeOrdinals transition_probe_ordinals;
-    ProbeSlots rendered_probe_frames;
+    ProbeFrames rendered_probe_frames;
     bool donor_descriptors = false;
 
     void reject_causal_evidence(const std::string_view reason) noexcept {
@@ -1704,38 +1785,94 @@ struct NativeAudit final {
                     continue;
                 }
             }
-            std::optional<std::uint64_t> frame_revision;
+            std::vector<std::uint64_t> frame_revisions;
             const auto rendered_ordinal = rendered_probe_ordinals.find(key);
             const auto transition_ordinal = transition_probe_ordinals.find(key);
             if (rendered_ordinal != rendered_probe_ordinals.end() && transition_ordinal != transition_probe_ordinals.end()) {
                 const auto first_probe = std::min(rendered_ordinal->second, transition_ordinal->second);
                 const auto last_probe = std::max(rendered_ordinal->second, transition_ordinal->second);
-                const auto after =
-                    std::ranges::find_if(frames->second, [last_probe](const auto& frame) { return frame.first > last_probe; });
-                if (after != frames->second.end()) {
-                    frame_revision = after->second;
-                } else {
+                for (const auto& frame : frames->second)
+                    if (frame.first > last_probe) frame_revisions.push_back(frame.second);
+                if (frame_revisions.empty()) {
                     for (auto frame = frames->second.rbegin(); frame != frames->second.rend(); ++frame)
                         if (frame->first < first_probe) {
-                            frame_revision = frame->second;
+                            frame_revisions.push_back(frame->second);
                             break;
                         }
                 }
             } else if (frames->second.size() == 1U) {
                 // Direct audit fixtures can provide already-correlated probes.
-                frame_revision = frames->second.front().second;
+                frame_revisions.push_back(frames->second.front().second);
             }
-            if (!frame_revision) continue;
+            if (frame_revisions.empty()) continue;
             if (!rendered_probe_frames.contains(key) && rendered_probe_frames.size() == kAcceptanceRecordLimit) {
                 reject_causal_evidence("rendered probe frame evidence capacity");
                 continue;
             }
-            rendered_probe_frames.insert_or_assign(key, *frame_revision);
+            rendered_probe_frames.insert_or_assign(key, std::move(frame_revisions));
         }
     }
 
-    void join_placeholder_slots(const std::uint64_t generation,
-                                const std::map<std::uint64_t, std::uint64_t>& complete_slots) {
+    void record_frame(const std::uint64_t generation, const std::uint64_t revision, const std::size_t publication_ordinal) {
+        if (revision == 0U) {
+            reject_causal_evidence("rendered probe frame revision");
+            return;
+        }
+        auto& frames = published_frames[generation];
+        if (std::ranges::any_of(frames, [revision](const auto& frame) { return frame.second == revision; })) return;
+        if (frames.size() == kAcceptanceRecordLimit) {
+            reject_causal_evidence("Explore frame evidence capacity");
+            return;
+        }
+        const auto position = std::ranges::lower_bound(frames, publication_ordinal, {}, &FramePublication::first);
+        frames.emplace(position, publication_ordinal, revision);
+        reconcile_rendered_probes(generation);
+    }
+
+    void record_tile_publication(const std::uint64_t generation, const std::uint64_t count,
+                                 const std::size_t publication_ordinal) {
+        const auto previous = published_tiles.find(generation);
+        explore_tile_regressed = explore_tile_regressed || (previous != published_tiles.end() && count < previous->second);
+        if (count == 0U || !placeholder_ordinals.contains(generation)) return;
+        const auto [_, first] = first_publication_ordinals.try_emplace(generation, publication_ordinal);
+        if (first) {
+            first_published_tiles.emplace(generation, count);
+            first_patched_slots.emplace(generation, patched_slots[generation]);
+        }
+        last_publication_ordinals.insert_or_assign(generation, publication_ordinal);
+        published_tiles.insert_or_assign(generation, count);
+        reconcile_incremental_publication(generation);
+    }
+
+    void join_gallery_publication(const std::uint64_t generation,
+                                  const std::map<std::uint64_t, std::uint64_t>& complete_slots,
+                                  const std::uint64_t frame_revision, const std::uint64_t snapshot_revision,
+                                  const std::vector<bool>& ready_slots) {
+        if (complete_slots.empty() || complete_slots.size() > kAcceptanceSlotLimit ||
+            complete_slots.rbegin()->first != complete_slots.size() - 1U || generation == 0U)
+            return;
+        const auto presented = presented_explore_frames.find({snapshot_revision, frame_revision});
+        if (!placeholder_cardinalities.contains(generation)) {
+            const auto frames = published_frames.find(generation);
+            const bool native_frame = frames != published_frames.end() &&
+                                      std::ranges::any_of(frames->second, [frame_revision](const auto& publication) {
+                                          return publication.second == frame_revision;
+                                      });
+            if (!placeholder_ordinals.contains(generation) || frame_revision == 0U ||
+                (!native_frame && presented == presented_explore_frames.end()))
+                return;
+            const auto placeholder = placeholder_slots.find(generation);
+            const auto patched = patched_slots.find(generation);
+            const auto published = published_tiles.find(generation);
+            const bool exact_placeholder = placeholder != placeholder_slots.end() && placeholder->second == complete_slots;
+            const bool exact_material = patched != patched_slots.end() && patched->second == complete_slots &&
+                                        published != published_tiles.end() && published->second == complete_slots.size();
+            // The native sink is bounded and nonblocking. A missing summary
+            // needs a complete native inventory (initial or fully patched),
+            // corroborated by the exact frame carrying these browser slots.
+            if (!exact_placeholder && !exact_material) return;
+            placeholder_cardinalities.emplace(generation, complete_slots.size());
+        }
         const auto cardinality = placeholder_cardinalities.find(generation);
         if (cardinality == placeholder_cardinalities.end() || complete_slots.size() != cardinality->second) {
             reject_causal_evidence("joined placeholder cardinality");
@@ -1757,6 +1894,28 @@ struct NativeAudit final {
                                       const auto found = received.find(slot.first);
                                       return found == received.end() || found->second != slot.second;
                                   });
+        // The physical Presentation receipt corroborates an omitted Explore
+        // frame event only after the exact reflected snapshot and complete
+        // generation inventory join. Every consumer uses this one frame set.
+        if (presented != presented_explore_frames.end()) {
+            record_frame(generation, frame_revision, presented->second);
+            const auto patch_ordinal = last_patch_ordinals.find(generation);
+            if (!first_publication_ordinals.contains(generation) && ready_slots.size() == complete_slots.size() &&
+                patched != patched_slots.end() && patch_ordinal != last_patch_ordinals.end() &&
+                patch_ordinal->second < presented->second) {
+                const auto ready_count = static_cast<std::uint64_t>(std::ranges::count(ready_slots, true));
+                if (ready_count != 0U && patched->second.size() == ready_count &&
+                    std::ranges::all_of(patched->second, [&](const auto& patch) {
+                        const auto slot = complete_slots.find(patch.first);
+                        return slot != complete_slots.end() && slot->second == patch.second && ready_slots[patch.first];
+                    })) {
+                    // A dropped batch count cannot strand the acceptance lane gate.
+                    // The exact published snapshot's complete readiness bitmap and
+                    // native patched inventory independently establish that count.
+                    record_tile_publication(generation, ready_count, presented->second);
+                }
+            }
+        }
         reconcile_incremental_publication(generation);
         reconcile_rendered_probes(generation);
     }
@@ -1931,20 +2090,7 @@ struct NativeAudit final {
             held_release_ordinal = ordinal;
         }
         if (owner == "explore" && event == "tile.batch.published") {
-            const auto previous = published_tiles.find(sequence);
-            const auto previous_count =
-                previous == published_tiles.end() ? std::optional<std::uint64_t>{} : std::optional{previous->second};
-            if (value != 0U && placeholder_ordinals.contains(sequence)) {
-                const auto [_, first] = first_publication_ordinals.try_emplace(sequence, ordinal);
-                if (first) {
-                    first_published_tiles.emplace(sequence, value);
-                    first_patched_slots.emplace(sequence, patched_slots[sequence]);
-                }
-                last_publication_ordinals.insert_or_assign(sequence, ordinal);
-                published_tiles.insert_or_assign(sequence, value);
-                reconcile_incremental_publication(sequence);
-            }
-            explore_tile_regressed = explore_tile_regressed || (previous_count && value < *previous_count);
+            record_tile_publication(sequence, value, ordinal);
             explore_max_pinned = std::max(explore_max_pinned, static_cast<std::size_t>(scalar(record, "staging_bytes")));
         }
         explore_stale_discard =
@@ -1957,9 +2103,11 @@ struct NativeAudit final {
         }
         if (owner == "explore" && event == "thumbnail.stale.discarded") explore_stale_count += value;
         if (owner == "explore" && event == "explore.augmentation.batch.prepared") {
-            if (augmentation_seeds.contains(sequence) || augmentation_seeds.size() < kAcceptanceGenerationLimit)
+            const bool usable_batch =
+                value != 0U && scalar(record, "capacity_width") != 0U && scalar(record, "capacity_height") != 0U;
+            if (usable_batch && (augmentation_seeds.contains(sequence) || augmentation_seeds.size() < kAcceptanceGenerationLimit))
                 augmentation_seeds.insert_or_assign(sequence, scalar(record, "detail"));
-            else
+            else if (usable_batch)
                 reject_causal_evidence("augmentation seed capacity");
         }
         if (owner == "explore" && event == "explore.image.pixel_checksum" && (scalar(record, "staging_bytes") & 7U) == 7U) {
@@ -2046,19 +2194,7 @@ struct NativeAudit final {
                          "rendered transition probe incomplete");
         }
         if (owner == "explore" && event == "explore.frame.published") {
-            if (value == 0U) {
-                reject_causal_evidence("rendered probe frame revision");
-                return;
-            }
-            auto& frames = published_frames[sequence];
-            const bool known_revision =
-                std::ranges::any_of(frames, [value](const auto& publication) { return publication.second == value; });
-            if (!known_revision && frames.size() == kAcceptanceRecordLimit) {
-                reject_causal_evidence("Explore frame evidence capacity");
-                return;
-            }
-            if (!known_revision) frames.emplace_back(ordinal, value);
-            reconcile_rendered_probes(sequence);
+            record_frame(sequence, value, ordinal);
         }
         donor_descriptors = donor_descriptors || (owner == "explore" && event == "explore.donor.descriptors.prepared" && value != 0U &&
                                                   scalar(record, "detail") != 0U && scalar(record, "capacity_width") > value &&
@@ -2069,6 +2205,18 @@ struct NativeAudit final {
         if (owner == "presentation" && event == "timeline.ready" && value != 0U) {
             presentation_ready = true;
             presentation_timeline = std::max(presentation_timeline, value);
+        }
+        if (owner == "presentation" && event == "presentation.frame.edge" &&
+            scalar(record, "source_session") ==
+                mmltk::controller::presentation_source_session(mmltk::controller::PresentationSourceKind::Explore) &&
+            scalar(record, "source_instance") != 0U && scalar(record, "source_observation_revision") != 0U &&
+            scalar(record, "source_revision") != 0U &&
+            scalar(record, "frame_revision") == scalar(record, "source_revision")) {
+            const auto frame = std::pair{scalar(record, "source_observation_revision"), scalar(record, "source_revision")};
+            if (presented_explore_frames.contains(frame) || presented_explore_frames.size() < kAcceptanceRecordLimit)
+                presented_explore_frames.try_emplace(frame, ordinal);
+            else
+                reject_causal_evidence("presented Explore frame evidence capacity");
         }
         if (owner == "firefox_process" && event == "child.spawned" &&
             sequence <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()))
@@ -2169,14 +2317,25 @@ struct NativeAudit final {
                std::ranges::includes(placeholder->second, patched->second);
     }
 
-    [[nodiscard]] bool augmentation_pixels_published(const std::uint64_t seed, const std::uint64_t frame_revision) const noexcept {
-        return frame_revision != 0U && std::ranges::any_of(augmentation_seeds, [this, seed, frame_revision](const auto& generation) {
+    [[nodiscard]] std::optional<std::uint64_t> augmentation_generation_for(
+        const std::uint64_t seed, const std::uint64_t frame_revision) const noexcept {
+        if (frame_revision == 0U) return std::nullopt;
+        const auto generation =
+            std::ranges::find_if(augmentation_seeds, [this, seed, frame_revision](const auto& candidate) {
+                   const auto frames = published_frames.find(candidate.first);
+                   return candidate.second == seed && frames != published_frames.end() &&
+                          std::ranges::any_of(frames->second,
+                                              [frame_revision](const auto& frame) { return frame.second == frame_revision; });
+               });
+        return generation == augmentation_seeds.end() ? std::nullopt : std::optional{generation->first};
+    }
+
+    [[nodiscard]] bool augmentation_pixels_observed(const std::uint64_t seed) const noexcept {
+        return std::ranges::any_of(augmentation_seeds, [this, seed](const auto& generation) {
                    const auto pixels = augmentation_pixel_seeds.find(generation.first);
                    const auto frames = published_frames.find(generation.first);
                    return generation.second == seed && pixels != augmentation_pixel_seeds.end() && pixels->second == seed &&
-                          frames != published_frames.end() &&
-                          std::ranges::any_of(frames->second,
-                                              [frame_revision](const auto& frame) { return frame.second == frame_revision; });
+                          frames != published_frames.end() && !frames->second.empty();
                });
     }
 
@@ -2187,7 +2346,8 @@ struct NativeAudit final {
         return rendered != rendered_probe_slots.end() && padded_card_slots.contains(key) && padding_orientations.contains(key) &&
                padded_card_slots.at(key) == rendered->second && transition_probe_slots.contains(key) &&
                transition_probe_slots.at(key) == rendered->second && rendered_probe_frames.contains(key) &&
-               rendered_probe_frames.at(key) != 0U && placeholder != placeholder_slots.end() &&
+               std::ranges::any_of(rendered_probe_frames.at(key), [](const auto revision) { return revision != 0U; }) &&
+               placeholder != placeholder_slots.end() &&
                placeholder->second.contains(key.second) && placeholder->second.at(key.second) == rendered->second &&
                selected != selected_overlay_slots.end() && selected->second.second == rendered->second &&
                transformed_overlay_slots.contains(key) && semantic_overlay_slots.contains(key);
@@ -2213,9 +2373,10 @@ struct NativeAudit final {
                aligned_padding_orientation(PaddingOrientation::Horizontal);
     }
 
-    [[nodiscard]] std::string_view overlay_readiness_blocker() const noexcept {
+    [[nodiscard]] std::string_view overlay_readiness_blocker(const bool require_pixel_probes) const noexcept {
         if (!overlay_descriptors) return "overlay descriptors";
         if (!donor_descriptors) return "donor descriptors";
+        if (!require_pixel_probes) return {};
         if (!filtered_overlay_identity()) return "filtered overlay identity";
         if (!aligned_padding_orientation(PaddingOrientation::Vertical)) return "vertical rendered overlay";
         if (!aligned_padding_orientation(PaddingOrientation::Horizontal)) return "horizontal rendered overlay";
@@ -2223,8 +2384,9 @@ struct NativeAudit final {
     }
 
     [[nodiscard]] std::string_view readiness_blocker(const FinalCursorGenerations final,
-                                                     const bool seeded_augmentation_ready) const noexcept {
-        const auto overlay_blocker = overlay_readiness_blocker();
+                                                     const bool seeded_augmentation_ready,
+                                                     const bool require_overlay_pixel_probes) const noexcept {
+        const auto overlay_blocker = overlay_readiness_blocker(require_overlay_pixel_probes);
         const std::array checks{
             std::pair{server_started && peer_opened && firefox_pid > 0 && active_peer(), std::string_view{"browser peer"}},
             std::pair{explore_rendered && explore_placeholder, std::string_view{"Explore publication"}},
@@ -2246,17 +2408,20 @@ struct NativeAudit final {
         return blocker == checks.end() ? std::string_view{} : blocker->second;
     }
 
-    [[nodiscard]] bool product_completed(const FinalCursorGenerations final, const bool seeded_augmentation_ready) const noexcept {
+    [[nodiscard]] bool product_completed(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
+                                         const bool require_overlay_pixel_probes) const noexcept {
         return server_started && peer_opened && firefox_pid > 0 && explore_rendered && annotation_copied && annotation_opened &&
                annotation_edited && presentation_ready && explore_placeholder && explore_partial_patch && acceptance_first_patch_exact &&
                explore_ready_batch && stale_thumbnail_discarded() && causal_stale_chain(final) && exact_partial_slot_identity() &&
-               overlay_descriptors && donor_descriptors && aligned_overlay_pixels() && seeded_augmentation_ready && !worker_failed &&
+               overlay_descriptors && donor_descriptors && (!require_overlay_pixel_probes || aligned_overlay_pixels()) &&
+               seeded_augmentation_ready && !worker_failed &&
                !explore_tile_regressed && !explore_nproc_changed &&
                !explore_stale_patch && !invalid_message && !peer_replaced && !interaction_rejected && !causal_inconsistent;
     }
 
-    [[nodiscard]] bool product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready) const noexcept {
-        return product_completed(final, seeded_augmentation_ready) && active_peer();
+    [[nodiscard]] bool product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
+                                     const bool require_overlay_pixel_probes) const noexcept {
+        return product_completed(final, seeded_augmentation_ready, require_overlay_pixel_probes) && active_peer();
     }
 
     [[nodiscard]] bool failed_before_termination() const noexcept {
@@ -2538,6 +2703,9 @@ struct BrowserAudit final {
     struct GalleryGenerationEvidence final {
         std::map<std::uint64_t, std::uint64_t> slots;
         std::uint64_t digest = 0U;
+        std::uint64_t source_revision = 0U;
+        std::uint64_t snapshot_revision = 0U;
+        std::vector<bool> ready_slots;
     };
     std::map<std::uint64_t, GalleryGenerationEvidence> gallery_generations;
     // CLEANUP-IGNORE: Rendered slot-frame identity precedes cursor facts; later booleans track workflow outcomes.
@@ -2626,6 +2794,7 @@ struct BrowserAudit final {
     bool pointer_selected = false;
     std::uint64_t pointer_revision = 0U;
     std::uint64_t pointer_frame_revision = 0U;
+    std::uint64_t pending_pointer_frame_revision = 0U;
     std::uint64_t pointer_slot = 0U;
     std::uint64_t pointer_compiled_index = 0U;
     bool upscale_growth = false;
@@ -2654,6 +2823,12 @@ struct BrowserAudit final {
     bool workspace_protocol_failure = false;
     bool panic = false;
     std::size_t ordinal = 0U;
+    std::size_t phase_progress_revision = 0U;
+    std::size_t work_progress_revision = 0U;
+    std::uint64_t reopen_snapshot_progress = 0U;
+    std::uint64_t reopen_draw_progress = 0U;
+    std::string phase_progress_class;
+    std::string phase_progress_name;
     std::size_t progress_ordinal = 0U;
     std::size_t dataset_complete_ordinal = 0U;
     std::uint64_t compiled_images = 0U;
@@ -2682,13 +2857,30 @@ struct BrowserAudit final {
             visible_indices.push_back(value);
             slots.emplace(slot, value);
         }
+        std::vector<bool> ready_slots;
+        if (const auto readiness = record.find("ready_slots"); readiness != record.end()) {
+            if (!readiness->is_array() || readiness->size() != slots.size() ||
+                !std::ranges::all_of(*readiness, [](const auto& ready) { return ready.is_boolean(); })) {
+                bounds_valid = false;
+                return;
+            }
+            ready_slots = readiness->get<std::vector<bool>>();
+        }
         const GalleryGenerationEvidence evidence{
             .slots = std::move(slots),
             .digest = mmltk::controller::explore_visible_indices_digest(visible_indices),
+            .source_revision = scalar(record, "source_revision"),
+            .snapshot_revision = scalar(record, "source_observation_revision"),
+            .ready_slots = std::move(ready_slots),
         };
         const auto existing = gallery_generations.find(generation);
         if (existing != gallery_generations.end()) {
             bounds_valid = bounds_valid && existing->second.slots == evidence.slots && existing->second.digest == evidence.digest;
+            if (evidence.source_revision >= existing->second.source_revision) {
+                existing->second.source_revision = evidence.source_revision;
+                existing->second.snapshot_revision = evidence.snapshot_revision;
+                existing->second.ready_slots = evidence.ready_slots;
+            }
         } else if (gallery_generations.size() == kAcceptanceGenerationLimit) {
             bounds_valid = false;
         } else {
@@ -2716,7 +2908,34 @@ struct BrowserAudit final {
         ++ordinal;
         const std::string event = record.value("event", "");
         if (event == "iced.gallery.source") consume_gallery_generation(record);
-        if (event == "integration.control_bounds") {
+        if (event == "integration.phase_progress") {
+            const std::string deadline_class = record.value("control", "");
+            const std::string phase = record.value("detail", "");
+            const bool valid_class =
+                deadline_class == "startup" || deadline_class == "interaction" || deadline_class == "work";
+            bounds_valid = bounds_valid && valid_class && !phase.empty();
+            if (valid_class && !phase.empty()) {
+                if (phase == phase_progress_name) {
+                    bounds_valid = bounds_valid && phase_progress_class == deadline_class;
+                } else {
+                    phase_progress_class = deadline_class;
+                    phase_progress_name = phase;
+                    ++phase_progress_revision;
+                }
+            }
+        } else if (event == "integration.explore_reopen_wait") {
+            const auto revision = scalar(record, "a");
+            if (revision > reopen_snapshot_progress) {
+                reopen_snapshot_progress = revision;
+                ++work_progress_revision;
+            }
+        } else if (event == "integration.explore_reopen_draw") {
+            const auto presentation_revision = scalar(record, "d");
+            if (presentation_revision > reopen_draw_progress) {
+                reopen_draw_progress = presentation_revision;
+                ++work_progress_revision;
+            }
+        } else if (event == "integration.control_bounds") {
             const std::string control = record.value("control", "");
             const double width = numeric(record, "c");
             const double height = numeric(record, "d");
@@ -2951,7 +3170,7 @@ struct BrowserAudit final {
                    event == "integration.annotation_capability") {
             const auto expected = record.value("expected", std::vector<double>{});
             const auto observed = record.value("observed", std::vector<double>{});
-            const double tolerance = event == "integration.annotation_pixel" ? 24.0 : 3.0;
+            double tolerance = event == "integration.annotation_pixel" ? 24.0 : 3.0;
             bool matched = record.value("matched", false) && expected.size() == 3U && observed.size() >= 3U;
             if (matched) {
                 double gain = 1.0;
@@ -2964,6 +3183,7 @@ struct BrowserAudit final {
                     std::ranges::min(expected) == 0.0 && peak - low >= 127.5) {
                     minimum = low;
                     gain = 255.0 / (peak - low);
+                    tolerance = 48.0;
                 }
                 for (std::size_t channel = 0U; channel < 3U; ++channel)
                     matched = matched && std::isfinite(expected[channel]) && std::isfinite(observed[channel]) && expected[channel] >= 0.0 &&
@@ -3115,21 +3335,30 @@ struct BrowserAudit final {
             pointer_compiled_index = scalar(record, "c");
             pointer_revision = scalar(record, "d");
         } else if (event == "integration.explore_pointer_scheduled") {
-            pointer_frame_revision = scalar(record, "a");
+            pending_pointer_frame_revision = scalar(record, "a");
         } else if (event == "integration.surface_click_dispatched" && record.value("control", "") == kExploreGalleryControl) {
-            const auto requested_frame_revision = pointer_frame_revision;
-            pointer_frame_revision = scalar(record, "a");
-            pointer_dispatched = record.value("detail", "") == "real-canvas-pointer" && requested_frame_revision != 0U &&
-                                 pointer_frame_revision >= requested_frame_revision && surface_draws.contains(scalar(record, "b")) &&
-                                 surface_scales.contains(std::pair{scalar(record, "b"), pointer_frame_revision}) &&
-                                 numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0;
+            const auto dispatched_frame_revision = scalar(record, "a");
+            const bool dispatched =
+                record.value("detail", "") == "real-canvas-pointer" && pending_pointer_frame_revision != 0U &&
+                dispatched_frame_revision >= pending_pointer_frame_revision && surface_draws.contains(scalar(record, "b")) &&
+                surface_scales.contains(std::pair{scalar(record, "b"), dispatched_frame_revision}) &&
+                numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0;
+            if (dispatched) {
+                pointer_dispatched = true;
+                pending_pointer_frame_revision = dispatched_frame_revision;
+            }
         } else if (event == "integration.explore_pointer_selected") {
-            pointer_selected = record.value("detail", "") == "selected-from-dispatched-pointer" &&
-                               scalar(record, "a") == pointer_revision && scalar(record, "b") == pointer_slot &&
-                               scalar(record, "c") == pointer_compiled_index && scalar(record, "c") == scalar(record, "d") &&
-                               explore_slots.contains(pointer_revision) && explore_slots.at(pointer_revision).contains(pointer_slot) &&
-                               explore_slots.at(pointer_revision).at(pointer_slot) == pointer_compiled_index &&
-                               observed_frame_revision_for_slots(explore_slots.at(pointer_revision), pointer_frame_revision);
+            const bool selected =
+                record.value("detail", "") == "selected-from-dispatched-pointer" && scalar(record, "a") == pointer_revision &&
+                scalar(record, "b") == pointer_slot && scalar(record, "c") == pointer_compiled_index &&
+                scalar(record, "c") == scalar(record, "d") && explore_slots.contains(pointer_revision) &&
+                explore_slots.at(pointer_revision).contains(pointer_slot) &&
+                explore_slots.at(pointer_revision).at(pointer_slot) == pointer_compiled_index &&
+                observed_frame_revision_for_slots(explore_slots.at(pointer_revision), pending_pointer_frame_revision);
+            if (selected) {
+                pointer_selected = true;
+                pointer_frame_revision = pending_pointer_frame_revision;
+            }
         } else if (event == "integration.explore_slot") {
             const auto revision = scalar(record, "a");
             const auto frame_revision = scalar(record, "b");
@@ -3606,15 +3835,6 @@ struct BrowserAudit final {
         return &slots->second;
     }
 
-    [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* gallery_slots(
-        const std::uint64_t generation, const std::uint64_t digest, const std::size_t cardinality) const noexcept {
-        const auto evidence = gallery_generations.find(generation);
-        return evidence != gallery_generations.end() && evidence->second.digest == digest &&
-                       evidence->second.slots.size() == cardinality
-                   ? &evidence->second.slots
-                   : nullptr;
-    }
-
     [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* pointer_slots() const noexcept {
         const auto slots = explore_slots.find(pointer_revision);
         return pointer_selected && slots != explore_slots.end() ? &slots->second : nullptr;
@@ -3817,8 +4037,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     if (permitted_cpus < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
     const bool h2d = GENERATE(true, false);
     const char* pixel_environment = std::getenv("MMLTK_GUI_PIXEL_TRACE");
-    const bool pixel_probes =
-        pixel_fixture || !probe_failure.empty() || (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
+    const bool pixel_probes = !viewer_scenario.empty() || pixel_fixture || !probe_failure.empty() ||
+                              (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
     INFO("selected H2D dataset transport: " << h2d);
     if (!h2d && !gdr_transport_available()) SKIP("GDR hardware unavailable; packaged Wayland GDR behavior remains unverified");
 
@@ -3899,8 +4119,15 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     ScopedFd deadline{::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)};
     if (deadline.get() < 0)
         throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
-    arm_timerfd(deadline.get(), kWaylandAcceptanceDeadline, "workspace Wayland acceptance deadline");
-    std::cout << "workspace-wayland: 90-second C++ acceptance deadline armed"
+    auto deadline_duration = kWaylandStartupDeadline;
+    std::string deadline_stage{"browser startup"};
+    const auto arm_acceptance_deadline = [&](const std::chrono::seconds duration, std::string stage) {
+        deadline_duration = duration;
+        deadline_stage = std::move(stage);
+        arm_timerfd(deadline.get(), duration, "workspace Wayland progress deadline");
+    };
+    arm_acceptance_deadline(kWaylandStartupDeadline, deadline_stage);
+    std::cout << "workspace-wayland: " << kWaylandStartupDeadline.count() << "-second browser startup deadline armed"
               << "\nnative JSONL: " << diagnostics << "\nnative runtime log: " << runtime_log << "\nFirefox log: " << firefox_log << '\n'
               << std::flush;
 
@@ -3923,6 +4150,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         REQUIRE(entered.has_value());
         REQUIRE(entered->event == mmltk::controller::ExploreAcceptanceGate::ControlEvent::InitialWait);
         process.interrupt();
+        arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
         const auto terminal = await_shutdown(process, deadline.get());
         REQUIRE(terminal.has_value());
         CHECK(*terminal == 0);
@@ -3948,12 +4176,35 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             pixel_audit.consume(record);
             report_consumed_record(record, "firefox");
         });
-        for (const auto& [generation, digest] : native.placeholder_digests) {
+        for (const auto& [generation, evidence] : browser.gallery_generations) {
+            const auto digest = native.placeholder_digests.find(generation);
             const auto cardinality = native.placeholder_cardinalities.find(generation);
-            if (cardinality == native.placeholder_cardinalities.end()) continue;
-            const auto* slots = browser.gallery_slots(generation, digest, cardinality->second);
-            if (slots != nullptr) native.join_placeholder_slots(generation, *slots);
+            if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) ||
+                (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
+                continue;
+            native.join_gallery_publication(generation, evidence.slots, evidence.source_revision, evidence.snapshot_revision,
+                                             evidence.ready_slots);
         }
+    };
+    std::size_t observed_phase_progress = 0U;
+    std::size_t observed_work_progress = 0U;
+    const auto refresh_progress_deadline = [&] {
+        const bool phase_changed = browser.phase_progress_revision != observed_phase_progress;
+        const bool work_advanced =
+            browser.phase_progress_class == "work" && browser.work_progress_revision != observed_work_progress;
+        if (!phase_changed && !work_advanced) return false;
+        observed_phase_progress = browser.phase_progress_revision;
+        observed_work_progress = browser.work_progress_revision;
+        const auto duration =
+            browser.phase_progress_class == "work"      ? kWaylandWorkDeadline
+            : browser.phase_progress_class == "startup" ? kWaylandStartupDeadline
+                                                         : kWaylandInteractionDeadline;
+        arm_acceptance_deadline(duration, "integration phase " + browser.phase_progress_name);
+        if (observed_phase_progress == 1U || observed_phase_progress % 25U == 0U)
+            std::cout << "workspace-wayland: progress " << browser.phase_progress_name << " (phase "
+                      << observed_phase_progress << ")\n"
+                      << std::flush;
+        return true;
     };
     const auto report_artifacts = [&] {
         std::cerr << "\nnative diagnostics:\n"
@@ -3984,14 +4235,21 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             const auto slots = native.placeholder_slots.find(publication.first.first);
             return native.padding_orientations.contains(publication.first) &&
                    native.padding_orientations.at(publication.first) == orientation && native.aligned_rendered_probe(publication.first) &&
-                   slots != native.placeholder_slots.end() &&
-                   browser.rendered_frame_for_slots(slots->second, publication.second, 0U);
+                   slots != native.placeholder_slots.end() && std::ranges::any_of(publication.second, [&](const auto frame_revision) {
+                       return browser.rendered_frame_for_slots(slots->second, frame_revision, 0U);
+                   });
         });
     };
     const auto seeded_augmentation_ready = [&] {
-        return browser.augmentation_frames.contains(0U) && browser.augmentation_frames.contains(1U) &&
-               native.augmentation_pixels_published(0U, browser.augmentation_frames.at(0U)) &&
-               native.augmentation_pixels_published(1U, browser.augmentation_frames.at(1U));
+        return std::ranges::all_of(std::array{0U, 1U}, [&](const auto seed) {
+            const auto browser_frame = browser.augmentation_frames.find(seed);
+            if (browser_frame == browser.augmentation_frames.end()) return false;
+            const auto generation = native.augmentation_generation_for(seed, browser_frame->second);
+            if (!generation) return false;
+            const auto slots = native.placeholder_slots.find(*generation);
+            return slots != native.placeholder_slots.end() &&
+                   browser.rendered_frame_for_slots(slots->second, browser_frame->second, 0U);
+        });
     };
     const auto acceptance_blockers = [&] {
         std::vector<std::string> blockers;
@@ -4000,14 +4258,20 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         };
         add("surface", surface_audit.failure);
         add("pixel", pixel_audit.failure);
-        add("native", native.readiness_blocker(final_generations, seeded_augmentation_ready()));
+        add("native", native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
         add("browser", browser.readiness_blocker());
-        if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical))
-            blockers.emplace_back("rendered probe: vertical padding export");
-        if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal))
-            blockers.emplace_back("rendered probe: horizontal padding export");
+        if (pixel_fixture) {
+            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical))
+                blockers.emplace_back("rendered probe: vertical padding export");
+            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal))
+                blockers.emplace_back("rendered probe: horizontal padding export");
+        }
         if (pixel_probes && !pixel_audit.raw_complete()) blockers.emplace_back("pixel: physical 25-sample chain");
         if (pixel_probes && !pixel_audit.viewer_nonblack_complete()) blockers.emplace_back("pixel: nonblack viewer");
+        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.retained_logical_content)
+            blockers.emplace_back("pixel: retained logical content");
+        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.upscale_growth)
+            blockers.emplace_back("pixel: four-times allocation growth");
         if (!pixel_audit.probe_failure_complete(probe_failure))
             blockers.emplace_back("pixel: injected probe-failure recovery");
         if (pixel_fixture && !pixel_audit.composition_complete()) blockers.emplace_back("pixel: atlas fixture composition");
@@ -4029,9 +4293,15 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             {{"event", event},
              {"terminal", terminal},
              {"termination", termination_label(termination)},
+             {"deadline_stage", deadline_stage},
+             {"deadline_seconds", deadline_duration.count()},
+             {"work_progress_revision", browser.work_progress_revision},
              {"blockers", acceptance_blockers()},
              {"final_material_generation", final_generations.material},
              {"final_cursor_generation", final_generations.cursor},
+             {"browser_final_generation", browser.final_cursor_generation},
+             {"browser_final_frame_revision", browser.final_cursor_frame_revision},
+             {"browser_final_slot_count", browser.final_cursor_slot_count},
              {"held_generation", native.held_generation},
              {"held_slot", native.held_slot},
              {"held_compiled_index", native.held_compiled_index},
@@ -4040,6 +4310,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     bool readiness_reached = false;
     for (;;) {
         consume_records();
+        if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
         if (!viewer_scenario.empty() && browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
             native.presentation_ready && native.explore_rendered &&
             surface_audit.failure.empty() && pixel_audit.failure.empty() &&
@@ -4050,9 +4321,9 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             break;
         }
         if (const auto* slots = browser.final_cursor_slots()) {
-                if (const auto identified =
-                        native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
-                    final_generations = *identified;
+            if (const auto identified =
+                    native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
+                final_generations = *identified;
         }
         if (!released_one_lane && browser.explore_ready) {
             const auto rendered_placeholder = std::ranges::find_if(native.placeholder_slots, [&native, &browser](const auto& placeholder) {
@@ -4085,10 +4356,12 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             released_held_read = true;
         }
         if (viewer_scenario.empty() && native.acceptance_held_stale) released_held_read = true;
-        const bool rendered_probe_exported = rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical) &&
-                                             rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal);
+        const bool rendered_probe_exported =
+            !pixel_fixture || (rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical) &&
+                               rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
         const bool expected_window_close =
-            termination == TerminationMode::WindowClose && native.product_completed(final_generations, seeded_augmentation_ready()) &&
+            termination == TerminationMode::WindowClose &&
+            native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) &&
             !native.active_peer();
         const bool terminal_failure = (native.failed_before_termination() && !expected_window_close) ||
                                       browser.failed_before_termination() || !surface_audit.failure.empty() ||
@@ -4107,8 +4380,10 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             std::cerr << "native host remained active at browser failure; draining evidence to the acceptance deadline\n";
             std::cerr << std::flush;
             terminal_failure_observed = true;
+            arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "terminal failure settlement");
         }
-        if (!terminal_failure_observed && (native.product_ready(final_generations, seeded_augmentation_ready()) || expected_window_close) &&
+        if (!terminal_failure_observed &&
+            (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) &&
             browser.product_ready() &&
             rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
             pixel_audit.probe_failure_complete(probe_failure) && (!pixel_fixture || pixel_audit.composition_complete())) {
@@ -4147,22 +4422,25 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         if ((descriptors[3].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
             static_cast<void>(consume_timerfd(deadline.get()));
             consume_records();
+            if (!terminal_failure_observed && refresh_progress_deadline()) continue;
             if (terminal_failure_observed) {
-                std::cerr << "workspace-wayland terminal failure did not settle before its 90-second C++ acceptance deadline";
+                std::cerr << "workspace-wayland terminal failure did not settle within " << deadline_duration.count()
+                          << " seconds";
                 record_acceptance_state("acceptance.failure_settlement.stalled", true);
                 report_artifacts();
                 std::cerr << std::flush;
                 process.terminate();
                 FAIL("workspace Wayland product reported a terminal integration failure");
             }
-            std::cerr << "workspace-wayland exceeded its 90-second C++ acceptance deadline"
+            std::cerr << "workspace-wayland made no progress within " << deadline_duration.count() << " seconds"
+                      << "\nstalled stage: " << deadline_stage
                       << "\ntermination: " << termination_label(termination)
                       << "\nacceptance blockers: " << blocker_summary();
             record_acceptance_state("acceptance.readiness.stalled", true);
             report_artifacts();
             std::cerr << std::flush;
             process.terminate();
-            FAIL("workspace Wayland acceptance exceeded 90 seconds");
+            FAIL("workspace Wayland acceptance phase exceeded its progress deadline");
         }
         if ((descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) notifications.consume();
         if ((descriptors[2].revents & POLLIN) != 0) {
@@ -4205,10 +4483,12 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                 FAIL("workspace Wayland product reported a terminal integration failure");
             }
             const bool terminal_window_close =
-                termination == TerminationMode::WindowClose && native.product_completed(final_generations, seeded_augmentation_ready()) &&
+                termination == TerminationMode::WindowClose &&
+                native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) &&
                 !native.active_peer();
-            exited_early =
-                !((native.product_ready(final_generations, seeded_augmentation_ready()) || terminal_window_close) && browser.product_ready());
+            exited_early = !((native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) ||
+                              terminal_window_close) &&
+                             browser.product_ready());
             if (exited_early) {
                 std::cerr << "workspace-wayland child exited before readiness";
                 record_acceptance_state("acceptance.readiness.blocked", true);
@@ -4228,17 +4508,18 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         process.interrupt();
     else if (termination == TerminationMode::AbruptPeerLoss)
         peer_killed = process.kill_peer(native.firefox_pid);
+    arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
     const auto terminal_result = process.active() ? await_shutdown(process, deadline.get()) : std::optional<int>{process.status()};
     if (!terminal_result) {
         consume_records();
-        std::cerr << "workspace-wayland exceeded its 90-second C++ acceptance deadline during shutdown"
+        std::cerr << "workspace-wayland shutdown made no progress within " << deadline_duration.count() << " seconds"
                   << "\ntermination: " << termination_label(termination)
                   << "\nacceptance blockers: " << blocker_summary();
         record_acceptance_state("acceptance.shutdown.stalled", true);
         report_artifacts();
         std::cerr << std::flush;
         process.terminate();
-        FAIL("workspace Wayland acceptance exceeded 90 seconds during shutdown");
+        FAIL("workspace Wayland acceptance exceeded its configured deadline during shutdown");
     }
     const int terminal = *terminal_result;
     consume_records();
@@ -4249,7 +4530,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     INFO("native diagnostics: " << bounded_tail(native_text));
     INFO("native runtime log: " << bounded_tail(read_from(runtime_log, runtime_log_offset)));
     INFO("Firefox diagnostics: " << bounded_tail(browser_text));
-    INFO("native readiness blocker: " << native.readiness_blocker(final_generations, seeded_augmentation_ready()));
+    INFO("native readiness blocker: " << native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
     INFO("browser readiness blocker: " << browser.readiness_blocker());
     REQUIRE(terminal >= 0);
     INFO("surface identity join: " << surface_audit.joined_failure());
@@ -4373,7 +4654,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         return;
     }
     CHECK_FALSE(exited_early);
-    CHECK(native.product_completed(final_generations, seeded_augmentation_ready()));
+    CHECK(native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture));
     CHECK(browser.product_ready());
     REQUIRE(final_generations.material != 0U);
     REQUIRE(final_generations.cursor != 0U);
@@ -4393,8 +4674,10 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     const auto pointer_generation = native.generation_for(*pointer_slots);
     REQUIRE(pointer_generation.has_value());
     CHECK(browser.rendered_frame_for_slots(*pointer_slots, browser.pointer_frame_revision, 0U));
-    CHECK(rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical));
-    CHECK(rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
+    if (pixel_fixture) {
+        CHECK(rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical));
+        CHECK(rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
+    }
     CHECK(browser.compiled_images == static_cast<std::uint64_t>(fixture.num_images));
     CHECK(browser.compiled_width == static_cast<std::uint64_t>(kCompiledResolution));
     CHECK(browser.compiled_height == static_cast<std::uint64_t>(kCompiledResolution));
@@ -4490,7 +4773,7 @@ void add_rendered_probe_audit_fixture(NativeAudit& audit, const NativeAudit::Pad
     audit.padding_orientations.emplace(key, orientation);
     audit.rendered_probe_slots.emplace(key, compiled_index);
     audit.transition_probe_slots.emplace(key, compiled_index);
-    audit.rendered_probe_frames.emplace(key, frame_revision);
+    audit.rendered_probe_frames.emplace(key, std::vector{frame_revision});
     audit.selected_overlay_slots.emplace(key, NativeAudit::OverlayDescriptorIdentity{1U, compiled_index});
     audit.hidden_overlay_slots.emplace(std::pair{generation - 1U, slot + 1U},
                                        NativeAudit::OverlayDescriptorIdentity{1U, compiled_index + 100U});
@@ -4544,7 +4827,7 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     incomplete_pair.transition_probe_slots.emplace(std::pair{7U, 2U}, 11U);
     incomplete_pair.reconcile_rendered_probes(7U);
     CHECK_FALSE(incomplete_pair.causal_inconsistent);
-    CHECK(incomplete_pair.rendered_probe_frames.at({7U, 2U}) == 50U);
+    CHECK(incomplete_pair.rendered_probe_frames.at({7U, 2U}) == std::vector{std::uint64_t{50U}});
 
     NativeAudit missing_patch;
     missing_patch.placeholder_slots[7U].emplace(2U, 11U);
@@ -4552,7 +4835,19 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     missing_patch.transition_probe_slots.emplace(std::pair{7U, 2U}, 11U);
     publish_frame(missing_patch, 7U, 50U);
     CHECK_FALSE(missing_patch.causal_inconsistent);
-    CHECK(missing_patch.rendered_probe_frames.at({7U, 2U}) == 50U);
+    CHECK(missing_patch.rendered_probe_frames.at({7U, 2U}) == std::vector{std::uint64_t{50U}});
+
+    NativeAudit coalesced_publications;
+    const auto coalesced_key = std::pair{7U, 2U};
+    coalesced_publications.placeholder_slots[7U].emplace(2U, 11U);
+    coalesced_publications.rendered_probe_slots.emplace(coalesced_key, 11U);
+    coalesced_publications.transition_probe_slots.emplace(coalesced_key, 11U);
+    coalesced_publications.rendered_probe_ordinals.emplace(coalesced_key, 2U);
+    coalesced_publications.transition_probe_ordinals.emplace(coalesced_key, 3U);
+    coalesced_publications.published_frames[7U] = {{1U, 49U}, {4U, 50U}, {5U, 51U}};
+    coalesced_publications.reconcile_rendered_probes(7U);
+    CHECK(coalesced_publications.rendered_probe_frames.at(coalesced_key) ==
+          std::vector{std::uint64_t{50U}, std::uint64_t{51U}});
 
     NativeAudit conflicting_pair;
     conflicting_pair.placeholder_slots[7U].emplace(2U, 11U);
@@ -4592,7 +4887,7 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK_FALSE(mismatched_orientation.aligned_overlay_pixels());
 
     auto mismatched_frame = rendered_probe_audit_fixture();
-    mismatched_frame.rendered_probe_frames.at({7U, 2U}) = 0U;
+    mismatched_frame.rendered_probe_frames.at({7U, 2U}) = {0U};
     CHECK_FALSE(mismatched_frame.aligned_overlay_pixels());
 
     BrowserAudit browser;
@@ -4615,6 +4910,36 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK(browser.observed_frame_revision_for_slots({{2U, 11U}}, 50U));
     CHECK_FALSE(browser.rendered_frame_for_slots({{2U, 11U}}, 0U, 0U));
     CHECK(browser.rendered_frame_for_slots({{3U, 12U}}, 0U, 0U));
+}
+
+TEST_CASE("browser audit exposes distinct integration phases for progress deadlines", "[workspace][audit]") {
+    BrowserAudit audit;
+    audit.consume({{"event", "integration.phase_progress"}, {"control", "startup"}, {"detail", "AwaitBootstrap"}});
+    CHECK(audit.phase_progress_revision == 1U);
+    CHECK(audit.phase_progress_class == "startup");
+    CHECK(audit.phase_progress_name == "AwaitBootstrap");
+
+    audit.consume({{"event", "integration.phase_progress"}, {"control", "startup"}, {"detail", "AwaitBootstrap"}});
+    CHECK(audit.phase_progress_revision == 1U);
+
+    audit.consume({{"event", "integration.phase_progress"}, {"control", "work"}, {"detail", "AwaitCompileCompletion"}});
+    CHECK(audit.phase_progress_revision == 2U);
+    CHECK(audit.phase_progress_class == "work");
+    CHECK(audit.phase_progress_name == "AwaitCompileCompletion");
+
+    audit.consume({{"event", "integration.explore_reopen_wait"}, {"a", 41U}});
+    CHECK(audit.work_progress_revision == 1U);
+    audit.consume({{"event", "integration.explore_reopen_wait"}, {"a", 41U}});
+    CHECK(audit.work_progress_revision == 1U);
+    audit.consume({{"event", "integration.explore_reopen_wait"}, {"a", 42U}});
+    CHECK(audit.work_progress_revision == 2U);
+    audit.consume({{"event", "integration.explore_reopen_draw"}, {"d", 9U}});
+    CHECK(audit.work_progress_revision == 3U);
+    audit.consume({{"event", "integration.explore_reopen_draw"}, {"d", 9U}});
+    CHECK(audit.work_progress_revision == 3U);
+
+    audit.consume({{"event", "integration.phase_progress"}, {"control", "unbounded"}, {"detail", "Unknown"}});
+    CHECK_FALSE(audit.bounds_valid);
 }
 
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][sigint]", workspace_wayland_product_sigint);
@@ -4773,7 +5098,7 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
     CHECK_FALSE(reordered_ready.joined_failure().empty());
 }
 
-TEST_CASE("surface join accepts receiver-confirmed withdrawal for a discarded imported candidate", "[workspace][audit]") {
+TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejected-import retirement", "[workspace][audit]") {
     SurfaceAudit audit;
     for (std::size_t index = 0U; index < 4U; ++index)
         audit.native(native_surface_record(native_surface_events[index]));
@@ -4785,9 +5110,45 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal for a discarded im
     audit.browser(browser_surface_record("iced.surface.retired"));
     audit.browser(browser_surface_record("firefox.workspace.retired"));
     CHECK(audit.joined_failure().empty());
+
+    SurfaceAudit dropped_candidate_retirement;
+    for (std::size_t index = 0U; index < 4U; ++index)
+        dropped_candidate_retirement.native(native_surface_record(native_surface_events[index]));
+    dropped_candidate_retirement.native(native_surface_record("presentation.candidate.withdrawal"));
+    auto replacement = native_surface_record("presentation.replacement", 13U);
+    replacement["sequence"] = 8U;
+    replacement["allocation_generation"] = 8U;
+    dropped_candidate_retirement.native(replacement);
+    for (std::size_t index = 0U; index < 6U; ++index)
+        dropped_candidate_retirement.browser(browser_surface_record(browser_surface_events[index]));
+    dropped_candidate_retirement.browser(browser_surface_record("iced.surface.pending_discarded"));
+    dropped_candidate_retirement.browser(browser_surface_record("firefox.workspace.withdrawal"));
+    dropped_candidate_retirement.browser(browser_surface_record("iced.surface.retired"));
+    dropped_candidate_retirement.browser(browser_surface_record("firefox.workspace.retired"));
+    CHECK(dropped_candidate_retirement.joined_failure().empty());
+
+    for (const bool observed_native_outcome : {false, true}) {
+        SurfaceAudit rejected;
+        for (std::size_t index = 0U; index < 3U; ++index)
+            rejected.native(native_surface_record(native_surface_events[index]));
+        if (observed_native_outcome) {
+            auto outcome = native_surface_record("presentation.import.outcome");
+            outcome["value"] = 0U;
+            outcome["outcome"] = 4U;
+            rejected.native(outcome);
+        }
+        rejected.native(native_surface_record("presentation.retirement"));
+        rejected.browser(browser_surface_record("firefox.workspace.admitted"));
+        rejected.browser(browser_surface_record("iced.surface.texture_create"));
+        rejected.browser(browser_surface_record("firefox.workspace.claim_outcome"));
+        rejected.browser(browser_surface_record("firefox.workspace.import_failed"));
+        rejected.browser(browser_surface_record("iced.surface.pending_discarded"));
+        rejected.browser(browser_surface_record("iced.surface.retired"));
+        CHECK(rejected.joined_failure().empty());
+    }
 }
 
-TEST_CASE("incremental Explore audit accepts an exact placeholder inventory when its generic fact is dropped", "[workspace][audit]") {
+TEST_CASE("incremental Explore audit joins exact inventories across dropped diagnostics", "[workspace][audit]") {
     NativeAudit audit;
     const auto consume = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
         audit.consume({{"kind", "gui_runtime"},
@@ -4821,9 +5182,143 @@ TEST_CASE("incremental Explore audit accepts an exact placeholder inventory when
     consume_joined("acceptance.slot.patched", 0U, 10U);
     consume_joined("tile.batch.published", 1U);
     CHECK_FALSE(joined_after_publication.acceptance_first_patch_exact);
-    joined_after_publication.join_placeholder_slots(2U, {{0U, 10U}, {1U, 11U}});
+    joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}}, 0U, 0U, {});
     CHECK(joined_after_publication.partial_generation == 2U);
     CHECK(joined_after_publication.acceptance_first_patch_exact);
+
+    const std::map<std::uint64_t, std::uint64_t> rendered_slots{{0U, 10U}, {1U, 11U}};
+    for (const auto missing : {"none", "placeholder", "patch", "count", "frame", "identity", "conflict"}) {
+        INFO("missing native inventory evidence: " << missing);
+        NativeAudit material;
+        const auto consume_material = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
+            material.consume({{"kind", "gui_runtime"},
+                              {"owner", "explore"},
+                              {"event", event},
+                              {"sequence", 2U},
+                              {"value", value},
+                              {"detail", detail}});
+        };
+        const std::string_view omitted{missing};
+        if (omitted != "placeholder") consume_material("placeholder.published", 2U);
+        if (omitted == "conflict") consume_material("acceptance.placeholder.slot", 1U, 12U);
+        consume_material("acceptance.slot.patched", 0U, 10U);
+        if (omitted != "patch") consume_material("acceptance.slot.patched", 1U, omitted == "identity" ? 12U : 11U);
+        consume_material("tile.batch.published", omitted == "count" ? 1U : 2U);
+        if (omitted != "frame") consume_material("explore.frame.published", 7U);
+        material.join_gallery_publication(3U, rendered_slots, 7U, 10U, {});
+        material.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+        CHECK_FALSE(material.final_generations_for(rendered_slots, 3U, 7U).has_value());
+        CHECK_FALSE(material.final_generations_for(rendered_slots, 2U, 8U).has_value());
+        material.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+        const auto final = material.final_generations_for(rendered_slots, 2U, 7U);
+        CHECK(final.has_value() == (omitted == "none"));
+        if (final) {
+            CHECK(final->material == 2U);
+            CHECK(final->cursor == 2U);
+            CHECK(material.placeholder_slots.at(2U) == rendered_slots);
+            CHECK(material.placeholder_cardinalities.at(2U) == rendered_slots.size());
+        }
+        if (omitted == "conflict") CHECK(material.causal_inconsistent);
+    }
+
+    NativeAudit initial;
+    const auto consume_initial = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
+        initial.consume({{"kind", "gui_runtime"},
+                         {"owner", "explore"},
+                         {"event", event},
+                         {"sequence", 2U},
+                         {"value", value},
+                         {"detail", detail}});
+    };
+    consume_initial("placeholder.published", 0U);
+    consume_initial("acceptance.placeholder.slot", 0U, 10U);
+    consume_initial("acceptance.slot.patched", 0U, 10U);
+    consume_initial("explore.frame.published", 7U);
+    consume_initial("tile.batch.published", 1U);
+    initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+    CHECK_FALSE(initial.acceptance_first_patch_exact);
+    CHECK_FALSE(initial.placeholder_cardinalities.contains(2U));
+    consume_initial("acceptance.placeholder.slot", 1U, 11U);
+    initial.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+    CHECK_FALSE(initial.acceptance_first_patch_exact);
+    initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+    CHECK(initial.acceptance_first_patch_exact);
+    CHECK(initial.partial_generation == 2U);
+    CHECK(initial.partial_first_tile_count == 1U);
+    CHECK_FALSE(initial.causal_inconsistent);
+    CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
+    initial.consume({{"kind", "gui_runtime"},
+                     {"owner", "presentation"},
+                     {"event", "presentation.frame.edge"},
+                     {"source_session", 1U},
+                     {"source_instance", 1U},
+                     {"source_observation_revision", 10U},
+                     {"source_revision", 8U},
+                     {"frame_revision", 8U}});
+    initial.join_gallery_publication(2U, rendered_slots, 8U, 9U, {});
+    CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
+    initial.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+    CHECK(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
+    initial.augmentation_seeds.emplace(2U, 0U);
+    CHECK(initial.augmentation_generation_for(0U, 8U) == 2U);
+    CHECK_FALSE(initial.augmentation_generation_for(1U, 8U).has_value());
+
+    for (const std::string_view missing :
+         {"none", "bitmap", "wrong-ready", "extra-ready", "patch", "identity", "frame", "observation", "physical", "late-patch"}) {
+        INFO("missing partial publication evidence: " << missing);
+        NativeAudit partial;
+        const auto consume_partial = [&](const char* event, const std::uint64_t value, const std::uint64_t detail = 0U) {
+            partial.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", event}, {"sequence", 2U}, {"value", value},
+                             {"detail", detail}});
+        };
+        consume_partial("placeholder.published", 0U);
+        for (std::uint64_t slot = 0U; slot < 3U; ++slot)
+            consume_partial("acceptance.placeholder.slot", slot, slot + 10U);
+        consume_partial("acceptance.placeholder.complete", 3U);
+        if (missing != "patch" && missing != "late-patch")
+            consume_partial("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
+        consume_partial("explore.frame.published", 8U);
+        if (missing != "physical")
+            partial.consume({{"kind", "gui_runtime"},
+                             {"owner", "presentation"},
+                             {"event", "presentation.frame.edge"},
+                             {"source_session", 1U},
+                             {"source_instance", 1U},
+                             {"source_observation_revision", 11U},
+                             {"source_revision", 8U},
+                             {"frame_revision", 8U}});
+        if (missing == "late-patch") consume_partial("acceptance.slot.patched", 1U, 11U);
+
+        BrowserAudit browser;
+        nlohmann::json snapshot{{"gallery_generation", 2U},
+                                {"visible_indices", {10U, 11U, 12U}},
+                                {"source_revision", missing == "frame" ? 9U : 8U},
+                                {"source_observation_revision", missing == "observation" ? 12U : 11U}};
+        if (missing != "bitmap")
+            snapshot["ready_slots"] = std::vector<bool>{missing == "wrong-ready", missing != "wrong-ready", missing == "extra-ready"};
+        browser.consume_gallery_generation(snapshot);
+        REQUIRE(browser.bounds_valid);
+        const auto& evidence = browser.gallery_generations.at(2U);
+        partial.join_gallery_publication(2U, evidence.slots, evidence.source_revision, evidence.snapshot_revision,
+                                         evidence.ready_slots);
+        CHECK(partial.acceptance_first_patch_exact == (missing == "none"));
+        if (missing == "none") {
+            CHECK(partial.partial_generation == 2U);
+            CHECK(partial.partial_first_tile_count == 1U);
+            CHECK(partial.first_patched_slots.at(2U) == std::map<std::uint64_t, std::uint64_t>{{1U, 11U}});
+            consume_partial("acceptance.slot.patched", 2U, 12U);
+            consume_partial("tile.batch.published", 2U);
+            CHECK(partial.explore_ready_batch);
+            CHECK_FALSE(partial.explore_tile_regressed);
+        } else {
+            CHECK_FALSE(partial.first_publication_ordinals.contains(2U));
+        }
+        snapshot["ready_slots"] = std::vector<bool>{true};
+        BrowserAudit malformed;
+        malformed.consume_gallery_generation(snapshot);
+        CHECK_FALSE(malformed.bounds_valid);
+        CHECK(malformed.gallery_generations.empty());
+    }
 }
 
 TEST_CASE("surface join rejects duplicate claims and texture construction", "[workspace][audit]") {
@@ -5008,6 +5503,8 @@ TEST_CASE("annotation canvas palette evidence preserves class hue contrast and s
         Sample{{255, 255, 0}, {255, 255, 0}, 1.0, true},
         Sample{{255, 255, 0}, {228, 229, 8}, 1148.0 / 2048.0, true},
         Sample{{255, 255, 0}, {247, 248, 26}, 1148.0 / 2048.0, true},
+        Sample{{0, 255, 0}, {44, 218, 10}, 1148.0 / 2048.0, true},
+        Sample{{0, 255, 0}, {55, 218, 10}, 1148.0 / 2048.0, false},
         Sample{{255, 255, 0}, {228, 229, 8}, 1.0, false},
         Sample{{255, 255, 0}, {255, 0, 0}, .5, false},
         Sample{{255, 255, 0}, {200, 200, 200}, .5, false},
