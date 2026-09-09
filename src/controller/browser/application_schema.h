@@ -1076,6 +1076,11 @@ struct ReflectedEndpoint final {
     static constexpr std::string_view name = std::meta::identifier_of(Method);
     static constexpr std::uint64_t stable_id = application_stable_id(SystemCell::name, name);
     static constexpr bool interaction = application_schema_detail::is_interaction_method<Method>();
+    static constexpr bool replaceable = [] consteval {
+        if constexpr (interaction)
+            return application_schema_detail::annotation_value<Method, contracts::reflection::direct::InteractionEndpoint>().replaceable;
+        return false;
+    }();
     static_assert(signature::request_by_value && signature::result_by_value, "annotated endpoint request and result must be values");
     static_assert(application_schema_detail::runtime_boundary_projectable<request_type>(),
                   "annotated endpoint request contains an unsupported or unreflected reachable type");
@@ -1496,6 +1501,12 @@ template <class Composition>
             if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
         };
         sink.append_number(kBrowserProtocolVersion);
+        sink.append("compact-positional-interactions");
+        application_schema_detail::append_type<Bootstrap>(sink, seen_types);
+        application_schema_detail::append_type<InputProgress>(sink, seen_types);
+        application_schema_detail::append_type<InteractionRejected>(sink, seen_types);
+        sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
+        sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
         sink.append("visual-source-projections");
         application_schema_detail::append_type<VisualSourceObservation>(sink, seen_types);
         application_schema_detail::append_type<VisualCleanContentIdentity>(sink, seen_types);
@@ -1556,6 +1567,7 @@ template <class Composition>
             const std::string endpoint_source = "endpoint " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name);
             reserve_identity(Endpoint::stable_id, endpoint_source);
             sink.append(Endpoint::interaction ? "interaction" : "intent");
+            if constexpr (Endpoint::interaction) sink.append_number(Endpoint::replaceable);
             sink.append(Endpoint::system_cell::name);
             sink.append(Endpoint::name);
             sink.append_number(Endpoint::stable_id);

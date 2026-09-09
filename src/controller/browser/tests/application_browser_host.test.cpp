@@ -106,11 +106,14 @@ enum class OpenPressure : std::uint8_t {
     Transient,
     Critical,
     LatestState,
+    Progress,
 };
 
 struct HostCallbackContext final {
     transport::BrowserServer::Callbacks host;
     ApplicationBrowserHost* owner = nullptr;
+    transport::BrowserServer* server = nullptr;
+    std::uint64_t epoch = 0U;
     OpenPressure pressure = OpenPressure::None;
     std::mutex mutex;
     std::condition_variable changed;
@@ -118,8 +121,9 @@ struct HostCallbackContext final {
 
     static void Opened(void* opaque) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
+        ++self.epoch;
         self.host.opened(self.host.context.get());
-        if (self.pressure == OpenPressure::None) return;
+        if (self.pressure == OpenPressure::None || self.pressure == OpenPressure::Progress) return;
         const auto delivery = self.pressure == OpenPressure::LatestState ? contracts::reflection::EventDelivery::LatestState
                               : self.pressure == OpenPressure::Critical  ? contracts::reflection::EventDelivery::Critical
                                                                          : contracts::reflection::EventDelivery::Transient;
@@ -132,6 +136,18 @@ struct HostCallbackContext final {
                 .value = wire::Value(wire::Value::Object{{"revision", wire::Value(static_cast<std::uint64_t>(index + 1U))}}),
             });
         }
+    }
+
+    static void Activated(void* opaque) noexcept {
+        auto& self = *static_cast<HostCallbackContext*>(opaque);
+        if (self.host.activated) self.host.activated(self.host.context.get());
+        if (self.pressure != OpenPressure::Progress) return;
+        wire::ByteBuffer bytes;
+        if (!encode_server_record(ServerRecord{InputProgress{.progress = {.epoch = self.epoch, .consumed_sequence = 0U}}}, bytes)) {
+            self.server->close_peer();
+            return;
+        }
+        static_cast<void>(self.server->publish({.bytes = std::move(bytes), .priority = transport::BrowserRecordPriority::Progress}));
     }
 
     static bool Record(void* opaque, const std::span<const std::byte> bytes) noexcept {
@@ -171,10 +187,12 @@ class RunningHost final {
               auto context = std::make_shared<HostCallbackContext>();
               context->host = host.callbacks();
               context->owner = &host;
+              context->server = &server;
               context->pressure = pressure;
               const transport::BrowserServer::Callbacks callbacks{
                   .context = context,
                   .opened = &HostCallbackContext::Opened,
+                  .activated = &HostCallbackContext::Activated,
                   .record = &HostCallbackContext::Record,
                   .closed = &HostCallbackContext::Closed,
                   .diagnostic = &HostCallbackContext::Diagnostic,
@@ -468,21 +486,27 @@ class LoopbackWebSocket final {
 }
 
 [[nodiscard]] Interaction explore_viewport_interaction() {
-    const auto value = mmltk::frameworks::serialization::reflected_value(ExploreViewportUpdate{});
-    REQUIRE(value);
-    return {
-        .endpoint_id = application_stable_id("explore", "UpdateViewport"),
-        .value = *value,
-    };
+    wire::ByteBuffer bytes(128U);
+    mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
+    REQUIRE(mmltk::frameworks::serialization::encode_compact(writer, ExploreViewportUpdate{}));
+    bytes.resize(writer.size());
+    return {.endpoint_id = application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)};
 }
 
 TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
-    RunningHost server{OpenPressure::None};
+    RunningHost server{OpenPressure::Progress};
     REQUIRE_FALSE(server.websocket().empty());
     LoopbackWebSocket peer{server.websocket()};
     auto first = peer.receive();
     REQUIRE(first);
-    CHECK(std::holds_alternative<Bootstrap>(decode(*first)));
+    REQUIRE(std::holds_alternative<Bootstrap>(decode(*first)));
+    CHECK(std::get<Bootstrap>(decode(*first)).input_epoch != 0U);
+
+    const auto progress_frame = peer.receive();
+    REQUIRE(progress_frame);
+    const auto progress = decode(*progress_frame);
+    REQUIRE(std::holds_alternative<InputProgress>(progress));
+    CHECK(std::get<InputProgress>(progress).progress.epoch == std::get<Bootstrap>(decode(*first)).input_epoch);
 
     const auto endpoint = settings_reset_endpoint();
     REQUIRE(endpoint != 0U);
@@ -500,9 +524,19 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     REQUIRE(std::holds_alternative<IntentReply>(reply));
     CHECK(std::get<IntentReply>(reply).correlation == 7U);
     CHECK(std::get<IntentReply>(reply).error.has_value());
+    LoopbackWebSocket replacement{server.websocket()};
+    const auto replacement_first = replacement.receive();
+    REQUIRE(replacement_first);
+    const auto bootstrap = decode(*replacement_first);
+    REQUIRE(std::holds_alternative<Bootstrap>(bootstrap));
+    CHECK(std::get<Bootstrap>(bootstrap).input_epoch > std::get<Bootstrap>(decode(*first)).input_epoch);
+    const auto replacement_progress = replacement.receive();
+    REQUIRE(replacement_progress);
+    REQUIRE(std::holds_alternative<InputProgress>(decode(*replacement_progress)));
+    CHECK(std::get<InputProgress>(decode(*replacement_progress)).progress.epoch == std::get<Bootstrap>(bootstrap).input_epoch);
 }
 
-TEST_CASE("direct host closes a real peer on malformed Protocol-13 input") {
+TEST_CASE("direct host closes a real peer on malformed Protocol-14 input") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
@@ -520,6 +554,12 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
     wire::ByteBuffer interaction;
     REQUIRE(encode_client_record(ClientRecord{explore_viewport_interaction()}, interaction));
     peer.send_binary(interaction);
+    const auto rejected_frame = peer.receive();
+    REQUIRE(rejected_frame);
+    const auto rejected = decode(*rejected_frame);
+    REQUIRE(std::holds_alternative<InteractionRejected>(rejected));
+    CHECK(std::get<InteractionRejected>(rejected).endpoint_id == application_stable_id("explore", "UpdateViewport"));
+    CHECK(std::get<InteractionRejected>(rejected).error.category == contracts::ApplicationErrorCategory::Unavailable);
 
     wire::ByteBuffer later_intent;
     REQUIRE(encode_client_record(ClientRecord{Intent{
@@ -574,7 +614,7 @@ TEST_CASE("direct host closes a real peer when an interaction endpoint is unknow
     REQUIRE(peer.receive());
     wire::ByteBuffer interaction;
     REQUIRE(encode_client_record(
-        ClientRecord{Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = wire::Value(wire::Value::Object{})}},
+        ClientRecord{Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}}},
         interaction));
     peer.send_binary(interaction);
     const auto terminal = peer.receive();

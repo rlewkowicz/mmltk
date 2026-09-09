@@ -29,6 +29,7 @@ struct IntentEndpoint final {
 };
 
 struct InteractionEndpoint final {
+    bool replaceable = false;
     constexpr bool operator==(const InteractionEndpoint&) const noexcept = default;
 };
 

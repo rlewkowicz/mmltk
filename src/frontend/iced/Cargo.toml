@@ -18,14 +18,13 @@ ciborium-io = "0.2.2"
 ciborium-ll = "0.2.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-net = { version = "0.6", default-features = false, features = ["websocket"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 iced = { path = "../../../third_party/iced", default-features = false, features = ["advanced", "fira-sans", "web-colors", "wgpu-bare"] }
 iced-fluent-theme = { path = "../../../third_party/iced-fluent-theme" }
 iced_aw = { path = "../../../third_party/iced_aw", default-features = false, features = ["number_input", "selection_list"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["CustomEvent", "CustomEventInit", "Event", "EventTarget", "Location", "Navigator", "UrlSearchParams", "Window", "console"] }
+web-sys = { version = "0.3", features = ["CustomEvent", "CustomEventInit", "Event", "EventTarget", "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Location", "Navigator", "UrlSearchParams", "Window", "console"] }
 wgpu = { version = "29", default-features = false, features = ["webgpu"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

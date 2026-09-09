@@ -602,6 +602,26 @@ std::expected<std::string, DecodeError> Reader::read_object_key(const std::size_
     return std::move(*key);
 }
 
+std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::size_t depth) {
+    auto head = item_head(depth);
+    if (!head) return std::unexpected(head.error());
+    if (head->major != 2U) return std::unexpected(error(ErrorCode::TypeMismatch));
+    auto count = size_argument(head->additional);
+    if (!count) return std::unexpected(count.error());
+    if (*count > input_.size() - offset_) return std::unexpected(error(ErrorCode::UnexpectedEof));
+    if (offset_ > limits_.max_bytes || *count > limits_.max_bytes - offset_) return std::unexpected(error(ErrorCode::LimitExceeded));
+    ByteSegments result;
+    if (offset_ < input_.first.size()) {
+        const auto first_count = std::min(*count, input_.first.size() - offset_);
+        result.first = input_.first.subspan(offset_, first_count);
+        result.second = input_.second.first(*count - first_count);
+    } else {
+        result.first = input_.second.subspan(offset_ - input_.first.size(), *count);
+    }
+    offset_ += *count;
+    return result;
+}
+
 std::expected<void, DecodeError> Reader::expect_text_item(const std::size_t depth, const std::string_view expected) {
     auto head = item_head(depth);
     if (!head) return std::unexpected(head.error());

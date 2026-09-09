@@ -238,6 +238,7 @@ class Reader {
     [[nodiscard]] std::expected<Value, DecodeError> read_value_item(std::size_t depth);
     [[nodiscard]] std::expected<FlatValue, DecodeError> read_flat_item(std::size_t depth);
     [[nodiscard]] std::expected<std::size_t, DecodeError> begin_array_item(std::size_t depth);
+    [[nodiscard]] std::expected<ByteSegments, DecodeError> borrow_bytes_item(std::size_t depth);
     [[nodiscard]] std::expected<std::size_t, DecodeError> begin_object_item(std::size_t depth);
     [[nodiscard]] std::expected<std::string, DecodeError> read_object_key(std::size_t depth);
     // Allocation-free exact text projection for fixed protocol keys and

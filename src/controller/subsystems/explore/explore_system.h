@@ -301,7 +301,7 @@ class ExploreSystem final {
                   VisualDiagnosticSink = {});
     ~ExploreSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ExploreSnapshot Open(ExploreOpen);
-    [[= contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(ExploreViewportUpdate);
+    [[= contracts::reflection::direct::InteractionEndpoint{true}]] void UpdateViewport(ExploreViewportUpdate);
     // CLEANUP-IGNORE: Interaction-generation observation is not part of the later reflected intent sequence.
     [[nodiscard]] std::uint64_t LastInteractionGeneration() const;
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ExploreSnapshot UpdateFilter(ExploreFilterUpdate);

@@ -795,9 +795,10 @@ mod tests {
                 })
                 .collect();
             app.retire_peer(UiError::transport("bootstrap identity test"));
-            let (sender, mut receiver) = futures_channel::mpsc::channel(64);
-            drop(app.on_transport(TransportEvent::Connected(Connection::new(sender))));
+            let (sender, mut receiver) = Connection::test_channel();
+            drop(app.on_transport(TransportEvent::Connected(sender)));
             drop(app.on_transport(TransportEvent::Bootstrap(Bootstrap {
+            input_epoch: 1,
                 schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
                 snapshots,
             })));
@@ -805,7 +806,7 @@ mod tests {
             let mut starts = 0;
             let mut stop_correlation = None;
             while let Ok(record) = receiver.try_recv() {
-                if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
+                if let crate::transport_connection::CapturedRecord::Intent(intent) = record {
                     if intent.endpoint_id
                         == crate::generated::application_intent_endpoint_stable_id(
                             ApplicationIntentEndpoint::UpscaleStop,
@@ -825,7 +826,7 @@ mod tests {
             if let Some(correlation) = stop_correlation {
                 settle_upscale_stop(&mut app, correlation);
                 while let Ok(record) = receiver.try_recv() {
-                    if let crate::transport_connection::OutboundRecord::Intent(intent) = record
+                    if let crate::transport_connection::CapturedRecord::Intent(intent) = record
                         && intent.endpoint_id
                             == crate::generated::application_intent_endpoint_stable_id(
                                 ApplicationIntentEndpoint::UpscaleStart,
@@ -870,14 +871,14 @@ mod tests {
         snapshot.revision += 1;
         snapshot.frame.revision += 1;
         snapshot.frame.cleanrevision += 1;
-        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-        app.connection = Some(Connection::new(sender));
+        let (sender, mut receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         app.reconcile_presentation(false);
         let requested = app.model.explore.requested_upscale.clone().unwrap();
         assert_eq!(requested.kernel, crate::generated::UpscaleKernel::Default);
         assert_eq!(app.presentation.viewer.unwrap().1, 1);
         assert!(app.model.explore.sent_upscale.is_none());
-        let crate::transport_connection::OutboundRecord::Intent(stop) =
+        let crate::transport_connection::CapturedRecord::Intent(stop) =
             receiver.try_recv().expect("expected replacement Stop")
         else {
             panic!("expected replacement Stop intent");
@@ -891,7 +892,7 @@ mod tests {
         settle_upscale_stop(&mut app, stop.correlation);
         assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
         let start = loop {
-            let crate::transport_connection::OutboundRecord::Intent(intent) =
+            let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().expect("expected replacement Basic")
             else {
                 continue;
@@ -969,7 +970,7 @@ mod tests {
         };
         app.model.request_upscale(shift_lut.clone());
         app.dispatch_viewer_desired();
-        let crate::transport_connection::OutboundRecord::Intent(shift_start) = receiver
+        let crate::transport_connection::CapturedRecord::Intent(shift_start) = receiver
             .try_recv()
             .expect("expected ShiftLUT while native work remains busy")
         else {
@@ -997,7 +998,7 @@ mod tests {
                 crate::application_codec::IntoApplicationValue::into_application_value(busy),
             ),
         });
-        let crate::transport_connection::OutboundRecord::Intent(start) =
+        let crate::transport_connection::CapturedRecord::Intent(start) =
             receiver.try_recv().expect("expected latest method")
         else {
             panic!("expected latest method intent");
@@ -1032,7 +1033,7 @@ mod tests {
             ),
         });
         let stop = loop {
-            let crate::transport_connection::OutboundRecord::Intent(intent) =
+            let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().expect("expected deferred Stop")
             else {
                 continue;
@@ -1055,7 +1056,7 @@ mod tests {
         assert!(app.model.error.is_none());
         let latest = app.model.explore.requested_upscale.clone().unwrap();
         let start = loop {
-            let crate::transport_connection::OutboundRecord::Intent(intent) = receiver
+            let crate::transport_connection::CapturedRecord::Intent(intent) = receiver
                 .try_recv()
                 .expect("expected restart after Stop settled")
             else {
@@ -1096,8 +1097,8 @@ mod tests {
                     .clone(),
             });
             app.model.explore.sent_upscale = app.model.explore.requested_upscale.clone();
-            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-            app.connection = Some(Connection::new(sender));
+            let (sender, mut receiver) = Connection::test_channel();
+            app.connection = Some(sender);
             app.model
                 .settings_snapshot
                 .as_mut()
@@ -1115,6 +1116,7 @@ mod tests {
                     app.reconcile_presentation(false);
                 } else {
                     app.reduce_event(SystemEvent {
+                        state_revision: revised.revision,
                         delivery: crate::generated::EventDelivery::LatestState,
                         event: crate::generated::ApplicationEvent::ExploreExploreChanged(
                             crate::generated::ExploreChanged {
@@ -1130,7 +1132,7 @@ mod tests {
             assert_eq!(app.presentation.viewer, Some((revised.dataset.identity, 0)));
             assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
             let mut dispatched = false;
-            while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) =
+            while let Ok(crate::transport_connection::CapturedRecord::Intent(intent)) =
                 receiver.try_recv()
             {
                 if intent.endpoint_id
@@ -1177,6 +1179,7 @@ mod tests {
             completed.methods[1].completed = Some(requested);
             completed.methods[1].frame = completed.frame.clone();
             app.reduce_event(SystemEvent {
+                state_revision: completed.revision,
                 delivery: crate::generated::EventDelivery::LatestState,
                 event: crate::generated::ApplicationEvent::UpscaleUpscaleChanged(
                     crate::generated::UpscaleChanged {
@@ -1193,6 +1196,7 @@ mod tests {
             presentation.capability.generation += 1;
             presentation.capability.extent = completed.frame.extent.clone();
             app.reduce_event(SystemEvent {
+                state_revision: presentation.revision,
                 delivery: crate::generated::EventDelivery::LatestState,
                 event: crate::generated::ApplicationEvent::PresentationPresentationCompleted(
                     crate::generated::PresentationCompleted {
@@ -1209,8 +1213,8 @@ mod tests {
         for reset in [false, true] {
             let (mut app, _) = viewer_app();
             app.reconcile_viewer();
-            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-            app.connection = Some(Connection::new(sender));
+            let (sender, mut receiver) = Connection::test_channel();
+            app.connection = Some(sender);
             app.model
                 .settings_snapshot
                 .as_mut()
@@ -1229,7 +1233,7 @@ mod tests {
             assert_viewer_departed(&app);
             let mut stop_correlation = None;
             let mut stopped = false;
-            while let Ok(crate::transport_connection::OutboundRecord::Intent(intent)) =
+            while let Ok(crate::transport_connection::CapturedRecord::Intent(intent)) =
                 receiver.try_recv()
             {
                 if intent.endpoint_id
@@ -1314,15 +1318,15 @@ mod tests {
         App,
         crate::generated::UpscaleRequest,
         u64,
-        futures_channel::mpsc::Receiver<crate::transport_connection::OutboundRecord>,
+        crate::transport_connection::Capture,
     ) {
         let (mut app, _) = viewer_app();
         app.reconcile_viewer();
         let basic = app.model.explore.requested_upscale.clone().unwrap();
-        let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-        app.connection = Some(Connection::new(sender));
+        let (sender, mut receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         app.dispatch_viewer_desired();
-        let crate::transport_connection::OutboundRecord::Intent(start) =
+        let crate::transport_connection::CapturedRecord::Intent(start) =
             receiver.try_recv().expect("expected automatic Basic")
         else {
             panic!("expected automatic Basic intent");
@@ -1499,8 +1503,8 @@ mod tests {
                 }
                 app.retire_peer(UiError::transport("capture continuity"));
                 assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-                let (sender, _receiver) = futures_channel::mpsc::channel(4);
-                drop(app.on_transport(TransportEvent::Connected(Connection::new(sender))));
+                let (sender, _receiver) = Connection::test_channel();
+                drop(app.on_transport(TransportEvent::Connected(sender)));
                 assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
                 app.model.presentation = control;
                 app.model.explore.snapshot = explore;
@@ -1570,8 +1574,8 @@ mod tests {
             crate::presentation_surface::drawn_detail(),
             Some((completed, completed.content_region()))
         );
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         assert!(app.copy_viewer_to_annotation());
         assert_eq!(test_releases(), vec![frame]);
     }
@@ -1741,6 +1745,7 @@ mod tests {
         let mut snapshot = app.model.presentation.clone().unwrap();
         snapshot.revision += 1;
         app.reduce_event(SystemEvent {
+            state_revision: 0,
             delivery: crate::generated::EventDelivery::Critical,
             event: crate::generated::ApplicationEvent::PresentationPresentationFailed(
                 crate::generated::PresentationFailed {
@@ -1764,8 +1769,8 @@ mod tests {
         app.present_native_frame(frame);
         assert!(app.presentation.surface().unwrap().frame.is_none());
         assert_eq!(test_releases(), vec![frame, pending]);
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         assert!(app.copy_viewer_to_annotation());
     }
 
@@ -1806,8 +1811,8 @@ mod tests {
                 }
                 2 => app.retire_peer(UiError::transport("peer closed")),
                 _ => {
-                    let (sender, _receiver) = futures_channel::mpsc::channel(4);
-                    drop(app.on_transport(TransportEvent::Connected(Connection::new(sender))));
+                    let (sender, _receiver) = Connection::test_channel();
+                    drop(app.on_transport(TransportEvent::Connected(sender)));
                 }
             }
             if operation < 2 {
@@ -1877,8 +1882,8 @@ mod tests {
                 ..frame
             };
             app.present_native_frame(pending);
-            let (sender, mut receiver) = futures_channel::mpsc::channel(32);
-            app.connection = Some(Connection::new(sender));
+            let (sender, mut receiver) = Connection::test_channel();
+            app.connection = Some(sender);
 
             navigate(&mut app, FeatureId::Explore);
             assert_eq!(app.presentation.viewer, viewer);
@@ -1898,7 +1903,7 @@ mod tests {
             let mut operations = Vec::new();
             let mut stop_correlation = None;
             while let Ok(record) = receiver.try_recv() {
-                if let crate::transport_connection::OutboundRecord::Intent(intent) = record {
+                if let crate::transport_connection::CapturedRecord::Intent(intent) = record {
                     operations.push(intent.endpoint_id);
                     if intent.endpoint_id
                         == crate::generated::application_intent_endpoint_stable_id(
@@ -1940,7 +1945,7 @@ mod tests {
             assert_eq!(app.presentation.viewer, viewer);
             assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&basic));
             navigate(&mut app, FeatureId::Explore);
-            let crate::transport_connection::OutboundRecord::Intent(intent) =
+            let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().unwrap()
             else {
                 panic!("expected automatic Basic");
@@ -1958,8 +1963,8 @@ mod tests {
     fn annotation_page_open_and_viewer_copy_have_distinct_source_contracts() {
         let (mut app, frame) = viewer_app();
         let before = app.model.annotation.snapshot.clone();
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         assert!(!app.copy_viewer_to_annotation());
         assert_eq!(app.model.annotation.snapshot, before);
         app.workspace.select(FeatureId::Annotate);
@@ -1969,8 +1974,8 @@ mod tests {
         drop(app);
 
         let (mut app, _) = viewer_app();
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         app.presentation.pending = Some(Surface {
             frame: Some(frame),
             ..app.presentation.surface.unwrap()
@@ -1983,8 +1988,8 @@ mod tests {
     fn unavailable_and_stale_annotation_sources_leave_the_document_unchanged() {
         for condition in 0..5 {
             let (mut app, frame) = viewer_app();
-            let (sender, _receiver) = futures_channel::mpsc::channel(4);
-            app.connection = Some(Connection::new(sender));
+            let (sender, _receiver) = Connection::test_channel();
+            app.connection = Some(sender);
             let before = app.model.annotation.snapshot.clone();
             record_draw(&app, frame, [0, 0, 640, 480]);
             match condition {
@@ -2054,13 +2059,13 @@ mod tests {
             frame: Some(frame),
             ..app.presentation.surface.unwrap()
         });
-        let (sender, mut receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, mut receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         record_draw(&app, frame, [0, 0, 2560, 1920]);
         assert!(!app.copy_viewer_to_annotation());
         record_draw(&app, frame, [40, 80, 2000, 1200]);
         assert!(app.copy_viewer_to_annotation());
-        let crate::transport_connection::OutboundRecord::Intent(intent) =
+        let crate::transport_connection::CapturedRecord::Intent(intent) =
             receiver.try_recv().unwrap()
         else {
             panic!("expected Annotation Open");

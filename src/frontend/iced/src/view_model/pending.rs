@@ -378,7 +378,7 @@ mod tests {
         let mut model = bootstrapped();
         for endpoint_id in [
             crate::generated::ENDPOINT_Explore_UpdateViewport,
-            crate::generated::ENDPOINT_Annotation_Pointer,
+            crate::generated::ENDPOINT_Annotation_Input,
             u64::MAX,
         ] {
             let result =

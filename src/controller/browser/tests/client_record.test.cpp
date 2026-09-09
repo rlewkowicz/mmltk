@@ -100,6 +100,10 @@ class FixtureAnnotationSystem final {
                                                            1024U}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot snapshot() const {
         return {};
     }
+    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void Input(mmltk::controller::AnnotationInputBatch batch) {
+        input = std::move(batch);
+    }
+    mmltk::controller::AnnotationInputBatch input;
     std::vector<std::size_t> alternatives;
 };
 
@@ -111,7 +115,7 @@ struct FixtureApplicationSystems final {
 };
 
 [[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
-    std::ifstream input(MMLTK_PROTOCOL_V13_CLIENT_FIXTURE_PATH);
+    std::ifstream input(MMLTK_PROTOCOL_V14_CLIENT_FIXTURE_PATH);
     REQUIRE(input.good());
     const auto nibble = [](const char value) -> unsigned char {
         if (value >= '0' && value <= '9') return static_cast<unsigned char>(value - '0');
@@ -168,16 +172,17 @@ TEST_CASE("browser client records are one complete canonical CBOR item", "[contr
     CHECK_FALSE(decode_client_record(wire::ByteSegments{.first = encoded, .second = {}}));
 }
 
-TEST_CASE("Rust Protocol-13 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
-    STATIC_REQUIRE(kBrowserProtocolVersion == 13U);
+TEST_CASE("Rust Protocol-14 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
+    STATIC_REQUIRE(kBrowserProtocolVersion == 14U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
-    REQUIRE(fixtures.size() == 5U + annotation_alternatives);
+    REQUIRE(fixtures.size() == 6U + annotation_alternatives);
     const auto& dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open");
     const auto& model_dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open.model_artifact");
     const auto& settings_fixture = fixture_named(fixtures, "Intent:settings.Update");
     const auto& interaction_fixture = fixture_named(fixtures, "Interaction:explore.UpdateViewport");
     const auto& observation_fixture = fixture_named(fixtures, "RendererObservation");
+    const auto& batch_fixture = fixture_named(fixtures, "Interaction:annotation.Input");
 
     const Intent intent = decode_intent_fixture(dialog_fixture);
     CHECK(intent.correlation == 17U);
@@ -231,21 +236,26 @@ TEST_CASE("Rust Protocol-13 client fixtures are accepted by native codec", "[con
     const Interaction& interaction = std::get<Interaction>(*interaction_record);
     CHECK(interaction.endpoint_id == application_stable_id("explore", "UpdateViewport"));
     ExploreViewportUpdate decoded_interaction{};
-    REQUIRE(mmltk::frameworks::serialization::decode_into(decoded_interaction, interaction.value));
+    REQUIRE(mmltk::frameworks::serialization::decode_compact_into(decoded_interaction, {.first = interaction.value}, {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
     CHECK(decoded_interaction.viewport.first_row == 0U);
     CHECK(decoded_interaction.viewport.row_count == 1U);
     CHECK(decoded_interaction.viewport.columns == 1U);
     CHECK_FALSE(decoded_interaction.focused_compiled_index);
+    const auto batch_view = decode_interaction_view(batch_fixture.bytes);
+    REQUIRE(batch_view);
+    CHECK(dispatch_interaction(systems, *batch_view).disposition == InteractionDispatchDisposition::Accepted);
+    REQUIRE(annotation.input.samples.size() == 3U);
+    CHECK(annotation.input.epoch == 7U);
+    CHECK(annotation.input.sequence == 1U);
+    CHECK(annotation.input.samples.front().phase == contracts::AnnotationPointerPhase::Begin);
+    CHECK(annotation.input.samples.back().phase == contracts::AnnotationPointerPhase::End);
     const auto accepted_interaction = dispatch_interaction(systems, interaction);
     CHECK(accepted_interaction.disposition == InteractionDispatchDisposition::Accepted);
     CHECK_FALSE(accepted_interaction.error.has_value());
     CHECK(explore.latest.extent.width == 0U);
     CHECK(explore.latest.extent.height == 0U);
 
-    const auto malformed_interaction = dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id,
-                                                                                 .value = wire::Value(wire::Value::Object{
-                                                                                     {"viewport", wire::Value(std::string{"invalid"})},
-                                                                                 })});
+    const auto malformed_interaction = dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id, .value = {std::byte{0xf6}}});
     CHECK(malformed_interaction.disposition == InteractionDispatchDisposition::ProtocolInvalid);
 
     systems.explore = nullptr;
@@ -337,7 +347,7 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
     REQUIRE(decoded);
     CHECK(*decoded == event);
     const wire::Value payload(std::string(kMaxOutputValueBytes, 'x'));
-    const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U},
+    const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U,
                                              .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
     REQUIRE(encode_server_record(bootstrap, encoded));
     CHECK(encoded.size() > kMaxOutputValueBytes * 2U);
@@ -350,7 +360,7 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
     const ServerRecord oversized =
         SystemEvent{.system_id = 1U, .event_id = 2U, .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x'))};
     CHECK_FALSE(encode_server_record(oversized, encoded));
-    const ClientRecord oversized_input = Interaction{.endpoint_id = 2U, .value = std::get<SystemEvent>(event).value};
+    const ClientRecord oversized_input = Interaction{.endpoint_id = 2U, .value = wire::ByteBuffer(kMaxIntentValueBytes + 1U)};
     CHECK_FALSE(encode_client_record(oversized_input, encoded));
 }
 
@@ -397,11 +407,11 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
     REQUIRE(accepted.result);
 }
 
-TEST_CASE("Bootstrap uses the compact protocol-13 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
+TEST_CASE("Bootstrap uses the compact protocol-14 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
     STATIC_REQUIRE(kMaxRecordWireBytes >=
                    mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);
-    STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<Bootstrap>>() == 933U);
+    STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<Bootstrap>>() == 954U);
     STATIC_REQUIRE(kMaxOutputValueBytes == 8388608U);
     STATIC_REQUIRE(kMaxRecordWireBytes == 33554432U);
     STATIC_REQUIRE(kMaxIntentValueBytes == 65536U);
@@ -413,22 +423,35 @@ TEST_CASE("Bootstrap uses the compact protocol-13 fingerprint and bounded snapsh
 
     const ServerRecord bootstrap = Bootstrap{
         .schema_fingerprint = {11U, 13U},
+        .input_epoch = 1U,
         .snapshots = {},
     };
     wire::ByteBuffer encoded;
     REQUIRE(encode_server_record(bootstrap, encoded));
     REQUIRE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
 
+    auto zero_epoch = std::get<Bootstrap>(bootstrap);
+    zero_epoch.input_epoch = 0U;
+    CHECK_FALSE(encode_server_record(ServerRecord{zero_epoch}, encoded));
+    for (const ServerRecord& record : std::array<ServerRecord, 2U>{
+             InputProgress{.progress = {.epoch = 7U, .consumed_sequence = 2U}},
+             InteractionRejected{.endpoint_id = 1U, .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
+        REQUIRE(encode_server_record(record, encoded));
+        const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
+        REQUIRE(decoded);
+        CHECK(*decoded == record);
+    }
     std::vector<SystemSnapshot> too_many_snapshots;
     too_many_snapshots.reserve(kMaxSnapshotCount + 1U);
     for (std::size_t index = 0U; index <= kMaxSnapshotCount; ++index)
         too_many_snapshots.push_back({.system_id = index + 1U, .value = wire::Value{}});
-    CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{.snapshots = std::move(too_many_snapshots)}}, encoded));
+    CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = std::move(too_many_snapshots)}}, encoded));
 
     CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{
+                                         .schema_fingerprint = {11U, 13U}, .input_epoch = 1U,
                                          .snapshots = {{
                                              .system_id = 1U,
-                                             .value = wire::Value(std::string(kMaxIntentValueBytes + 1U, 'x')),
+                                             .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x')),
                                          }},
                                      }},
                                      encoded));

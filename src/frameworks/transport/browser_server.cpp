@@ -270,12 +270,14 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
                 close_peer_on_owner();
                 return;
             }
+            const auto accepted_size = bytes.size();
+            output.recycle(std::move(*record));
             if (status == Socket::BACKPRESSURE) {
                 backpressured = true;
-                trace(BrowserServerEvent::WriteBackpressured, bytes.size());
+                trace(BrowserServerEvent::WriteBackpressured, accepted_size);
                 return;
             }
-            trace(BrowserServerEvent::WriteAccepted, bytes.size());
+            trace(BrowserServerEvent::WriteAccepted, accepted_size);
         }
     }
 
@@ -330,7 +332,7 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
     }
 
     [[nodiscard]] BrowserRecordPush publish(BrowserOutputRecord record) noexcept {
-        const bool critical = record.priority == BrowserRecordPriority::Critical;
+        const bool critical = record.priority != BrowserRecordPriority::Transient;
         const bool owner = on_owner_thread();
         std::scoped_lock lock(lifecycle_mutex);
         if (!accepting_wakes || wake_loop == nullptr || !output_epoch.admits(owner) || stop_requested.load(std::memory_order_acquire) ||
@@ -468,6 +470,10 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
                      owner->finish_output_epoch(generation);
                      owner->trace(BrowserServerEvent::PeerOpened, generation);
                      owner->drain();
+                     if (owner->active_peer(peer) && owner->callbacks.activated) {
+                         owner->callbacks.activated(owner->callbacks.context.get());
+                         owner->drain();
+                     }
                  },
              .message =
                  [weak](Socket* peer, const std::string_view message, const uWS::OpCode opcode) noexcept {
@@ -487,7 +493,10 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
                      }
                      const auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(message.data()), message.size()};
                      owner->trace(BrowserServerEvent::BinaryReceived, message.size());
-                     if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) owner->close_peer_on_owner();
+                     if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) {
+                         owner->notify_peer_closed(peer);
+                         peer->end(1002, "invalid application protocol record");
+                     }
                  },
              .drain =
                  [weak](Socket* peer) noexcept {
@@ -590,6 +599,7 @@ bool BrowserServer::close() noexcept {
 void BrowserServer::close_peer() noexcept { impl_->request_peer_close(); }
 
 BrowserRecordPush BrowserServer::publish(BrowserOutputRecord record) noexcept { return impl_->publish(std::move(record)); }
+mmltk::frameworks::serialization::wire::ByteBuffer BrowserServer::acquire_progress_storage() { return impl_->output.acquire_progress_storage(); }
 
 bool BrowserServer::running() const noexcept { return impl_->running.load(std::memory_order_acquire); }
 

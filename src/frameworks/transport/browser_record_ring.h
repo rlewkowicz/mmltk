@@ -15,6 +15,7 @@ inline constexpr std::size_t kBrowserRecordRingCapacity = 64U;
 enum class BrowserRecordPriority : std::uint8_t {
     Transient,
     Critical,
+    Progress,
 };
 
 enum class BrowserRecordPush : std::uint8_t {
@@ -41,12 +42,16 @@ class BrowserRecordRing final {
     [[nodiscard]] BrowserRecordPush push(BrowserOutputRecord record);
     [[nodiscard]] std::optional<BrowserOutputRecord> pop();
     void clear() noexcept;
+    [[nodiscard]] mmltk::frameworks::serialization::wire::ByteBuffer acquire_progress_storage();
+    void recycle(BrowserOutputRecord);
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
 
    private:
     mutable std::mutex mutex_;
     std::array<std::optional<BrowserOutputRecord>, kBrowserRecordRingCapacity> records_{};
+    std::optional<BrowserOutputRecord> progress_;
+    mmltk::frameworks::serialization::wire::ByteBuffer progress_storage_;
     std::size_t read_ = 0U;
     std::size_t write_ = 0U;
     std::size_t size_ = 0U;

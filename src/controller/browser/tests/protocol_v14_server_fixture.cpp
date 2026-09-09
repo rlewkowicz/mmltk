@@ -77,7 +77,7 @@ int main(const int argument_count, char* const* const arguments) {
         .target = services::FileDialogTarget{services::SettingsFieldTarget{dialog_id}},
         .result =
             services::FileDialogSelected{
-                .path = "/tmp/protocol-v13-fixture",
+                .path = "/tmp/protocol-v14-fixture",
             },
     };
     auto cancelled_reply = mmltk::frameworks::serialization::reflected_value(FileDialogSnapshot{
@@ -90,7 +90,8 @@ int main(const int argument_count, char* const* const arguments) {
     });
     auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
     if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
-    const std::array<ServerRecord, 4U> records{
+    bootstrap.input_epoch = 1U;
+    const std::array<ServerRecord, 6U> records{
         std::move(bootstrap),
         IntentReply{
             .correlation = 17U,
@@ -108,6 +109,9 @@ int main(const int argument_count, char* const* const arguments) {
             .delivery = contracts::reflection::EventDelivery::Critical,
             .value = std::move(*event),
         },
+        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U}},
+        InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
+                            .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
     };
     std::ofstream output(arguments[1], std::ios::binary | std::ios::trunc);
     if (!output) return EXIT_FAILURE;

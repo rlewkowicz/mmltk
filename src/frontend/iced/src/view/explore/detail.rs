@@ -105,6 +105,7 @@ pub(super) fn view<'a>(
         |surface| {
             crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
+                local: None,
                     surface,
                     publish: None,
                     placement: crate::presentation_surface::Placement::Contain,

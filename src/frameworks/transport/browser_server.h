@@ -33,6 +33,8 @@ class BrowserServer final {
     struct Callbacks final {
         std::shared_ptr<void> context;
         void (*opened)(void*) noexcept = nullptr;
+        // Bootstrap has been accepted by the socket and worker output admission is open.
+        void (*activated)(void*) noexcept = nullptr;
         bool (*record)(void*, std::span<const std::byte>) noexcept = nullptr;
         void (*closed)(void*) noexcept = nullptr;
         void (*diagnostic)(void*, BrowserServerEvent, std::size_t) noexcept = nullptr;
@@ -70,6 +72,7 @@ class BrowserServer final {
     // May be called by system workers. Transient records are best effort.
     // Critical capacity failure schedules closure of the current peer.
     [[nodiscard]] BrowserRecordPush publish(BrowserOutputRecord record) noexcept;
+    [[nodiscard]] mmltk::frameworks::serialization::wire::ByteBuffer acquire_progress_storage();
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] bool connected() const noexcept;

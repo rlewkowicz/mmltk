@@ -8,6 +8,7 @@
 #include <inplace_vector>
 #include <meta>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -63,6 +64,27 @@ template <class Type>
     }
     return result;
 }
+
+template <class T>
+struct IsByteSequence : std::false_type {};
+template <class Allocator>
+struct IsByteSequence<std::vector<std::byte, Allocator>> : std::true_type {};
+template <class Allocator>
+struct IsByteSequence<std::vector<std::uint8_t, Allocator>> : std::true_type {};
+template <std::size_t Count>
+struct IsByteSequence<std::array<std::byte, Count>> : std::true_type {};
+template <std::size_t Count>
+struct IsByteSequence<std::array<std::uint8_t, Count>> : std::true_type {};
+template <std::size_t Count>
+struct IsByteSequence<std::array<char, Count>> : std::true_type {};
+template <class Byte, std::size_t Count>
+    requires(std::is_same_v<std::remove_const_t<Byte>, std::byte>)
+struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
+template <class Byte, std::size_t Count>
+    requires(std::is_same_v<std::remove_const_t<Byte>, std::uint8_t>)
+struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
+template <class T>
+inline constexpr bool kByteSequence = IsByteSequence<RemoveCvRef<T>>::value;
 
 // Boundary owners specialize this semantics-free policy for types that are
 // opaque leaves to reflected field traversal and require both byte and item
@@ -290,12 +312,12 @@ template <std::meta::info Member>
     });
     constexpr bool numeric = std::is_arithmetic_v<MemberType> && !std::is_same_v<MemberType, bool>;
     constexpr bool dynamic_value = kBoundedDynamicLeaf<MemberType>;
-    constexpr bool minimum_byte_bounded = std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path>;
+    constexpr bool minimum_byte_bounded = std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
     constexpr bool byte_bounded = minimum_byte_bounded || dynamic_value;
     constexpr bool item_bounded = (requires(const MemberType& value) {
                                       typename MemberType::value_type;
                                       value.size();
-                                  } && !byte_bounded) || dynamic_value;
+                                  } && (!byte_bounded || kByteSequence<MemberType>)) || dynamic_value;
     const FieldConstraint policy = policy_of<Member>();
     const bool fixed_sequence_capacity = fixed_sequence_capacity_is_valid<MemberType>(policy.maximum_items);
     return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U &&
@@ -582,7 +604,11 @@ template <class Value>
 template <class Value>
 [[nodiscard]] constexpr std::optional<Violation> field_value_violation(const Value& value, const FieldConstraint& constraint) noexcept {
     using V = RemoveCvRef<Value>;
-    if constexpr (requires {
+    if constexpr (kByteSequence<V>) {
+        if (value.size() < constraint.minimum_bytes) return Violation::TooFewBytes;
+        if (constraint.maximum_bytes != 0U && value.size() > constraint.maximum_bytes) return Violation::TooManyBytes;
+        return satisfies_item_count(value, constraint) ? std::nullopt : std::optional{Violation::TooManyItems};
+    } else if constexpr (requires {
                       typename V::value_type;
                       value.size();
                   } && !std::is_same_v<V, std::string> && !std::is_same_v<V, std::filesystem::path>) {
@@ -828,6 +854,8 @@ template <class Declaration, class Owner>
     constexpr FieldConstraint policy = policy_of_member<Declaration::pointer>();
     if constexpr (kBoundedDynamicLeaf<MemberType>) {
         return policy.maximum_bytes != 0U && policy.maximum_items != 0U;
+    } else if constexpr (kByteSequence<MemberType> && !requires { std::tuple_size<MemberType>::value; }) {
+        return policy.maximum_bytes != 0U;
     } else if constexpr (std::is_floating_point_v<MemberType>) {
         return policy.finite;
     } else if constexpr (std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path>) {

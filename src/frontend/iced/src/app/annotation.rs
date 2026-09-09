@@ -6,6 +6,7 @@ impl App {
         outcome: crate::view::annotation::Outcome,
     ) -> Task<Message> {
         match outcome {
+            crate::view::annotation::Outcome::InputFailed(error) => { self.retire_peer(UiError::transport(error.to_string())); }
             crate::view::annotation::Outcome::ShortcutRequested(shortcut) => {
                 return iced::widget::operation::is_focused(
                     crate::generated::constraint_uiannotationbrushradius()
@@ -145,32 +146,13 @@ impl App {
         &mut self,
         pointer: crate::generated::AnnotationPointer,
     ) {
-        if self.config.integration {
-            crate::integration_control::report_annotation_gesture(
-                "sending",
-                [
-                    pointer.interactionid as f64,
-                    pointer.sequence as f64,
-                    if pointer.phase == crate::generated::AnnotationPointerPhase::Begin {
-                        1.0
-                    } else if pointer.phase == crate::generated::AnnotationPointerPhase::Update {
-                        2.0
-                    } else if pointer.phase == crate::generated::AnnotationPointerPhase::End {
-                        3.0
-                    } else {
-                        4.0
-                    },
-                    0.0,
-                ],
-            );
-        }
         let Some(connection) = self.connection.as_mut() else {
             self.retire_peer(UiError::transport(
                 "annotation pointer transport is unavailable",
             ));
             return;
         };
-        let result = connection.send_annotation_pointer(pointer);
+        let result = connection.send_annotation_pointer(pointer, self.model.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch));
         if let Err(error) = result {
             self.retire_peer(UiError::transport(error.to_string()));
         }

@@ -20,6 +20,18 @@ TEST_CASE("browser output ring has exactly sixty-four FIFO records", "[framework
     CHECK(ring.push(record()) == BrowserRecordPush::Dropped);
     CHECK(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::ClosePeer);
 
+    auto progress = record(BrowserRecordPriority::Progress);
+    progress.bytes.reserve(128U);
+    REQUIRE(ring.push(progress) == BrowserRecordPush::Enqueued);
+    progress.bytes[0] = std::byte{0x02};
+    REQUIRE(ring.push(std::move(progress)) == BrowserRecordPush::Enqueued);
+    CHECK(ring.size() == kBrowserRecordRingCapacity + 1U);
+    auto consumed = ring.pop();
+    REQUIRE(consumed);
+    CHECK(consumed->priority == BrowserRecordPriority::Progress);
+    CHECK(consumed->bytes.front() == std::byte{0x02});
+    ring.recycle(std::move(*consumed));
+    CHECK(ring.acquire_progress_storage().capacity() >= 128U);
     for (std::size_t index = 0U; index < kBrowserRecordRingCapacity; ++index)
         REQUIRE(ring.pop());
     CHECK(ring.empty());

@@ -1184,12 +1184,13 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
                                      std::shared_ptr<std::vector<std::uint64_t>> order = {},
                                      std::shared_ptr<std::atomic_bool> save_applied = {},
                                      std::shared_ptr<MutationCommitProbe> mutation = {},
-                                     std::shared_ptr<std::promise<void>> peer_closed = {})
+                                     std::shared_ptr<std::promise<void>> peer_closed = {},
+                                     std::shared_ptr<MutationCommitProbe> pointer_gate = {})
         : document_revision_(std::move(document_revision)),
           order_(std::move(order)),
           save_applied_(std::move(save_applied)),
           mutation_(std::move(mutation)),
-          peer_closed_(std::move(peer_closed)) {}
+          peer_closed_(std::move(peer_closed)), pointer_gate_(std::move(pointer_gate)) {}
     AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
                                    VisualRegion) override {
         state_.scene.document = contracts::WorkspaceResource::From("direct://test-annotation", 1U);
@@ -1210,6 +1211,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         state_.scene.document.revision = state_.document_revision;
         document_revision_->store(pointer.sequence, std::memory_order_release);
         if (order_) order_->push_back(pointer.sequence);
+        if (pointer_gate_ && pointer.sequence == 1U) { pointer_gate_->committed.set_value(); pointer_gate_->released.wait(); }
         return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
     }
     void PeerClosed() noexcept override {
@@ -1245,6 +1247,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
     std::shared_ptr<std::atomic_bool> save_applied_;
     std::shared_ptr<MutationCommitProbe> mutation_;
     std::shared_ptr<std::promise<void>> peer_closed_;
+    std::shared_ptr<MutationCommitProbe> pointer_gate_;
     contracts::AnnotationUiState state_;
 };
 
@@ -3150,11 +3153,13 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     auto annotation_order = std::make_shared<std::vector<std::uint64_t>>();
     auto save_applied = std::make_shared<std::atomic_bool>(false);
     auto save_failures = std::make_shared<std::atomic_uint64_t>(0U);
+    auto pointer_gate = std::make_shared<MutationCommitProbe>();
+    auto pointer_entered = pointer_gate->committed.get_future();
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [document_revision, annotation_order, save_applied] {
+                                               [document_revision, annotation_order, save_applied, pointer_gate] {
                                                    return std::make_unique<TestAnnotationAlgorithm>(document_revision, annotation_order,
-                                                                                                    save_applied);
+                                                                                                    save_applied, nullptr, nullptr, pointer_gate);
                                                }),
                                 borrow_exactly_from(explore), [&annotation_events, save_failures](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event))
@@ -3178,27 +3183,28 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                         .point = {2.0F, 3.0F},
                     }),
                     contracts::InvalidIntentError);
-    annotation.Pointer({
-        .phase = contracts::AnnotationPointerPhase::Begin,
-        .interaction_id = 1U,
-        .sequence = 1U,
-        .target = {.object = 0U},
-        .point = {2.0F, 3.0F},
+    std::atomic_uint64_t consumed{0U};
+    annotation.SetInputPeer(7U, [&](AnnotationInputProgress progress) {
+        if (progress.epoch == 7U) consumed.store(progress.consumed_sequence, std::memory_order_release);
+        annotation_events.Advance();
     });
-    annotation.Pointer({
-        .phase = contracts::AnnotationPointerPhase::Update,
-        .interaction_id = 1U,
-        .sequence = 2U,
-        .target = {.object = 0U},
-        .point = {7.0F, 8.0F},
-    });
-    annotation.Pointer({
-        .phase = contracts::AnnotationPointerPhase::End,
-        .interaction_id = 1U,
-        .sequence = 3U,
-        .target = {.object = 0U},
-        .point = {9.0F, 10.0F},
-    });
+    const auto input_document = annotation.snapshot().input_document_epoch;
+    AnnotationInputBatch first{.epoch = 7U, .document_epoch = input_document, .sequence = 1U,
+        .samples = {{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .target = {.object = 0U}, .point = {2.0F, 3.0F}},
+                    {.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .target = {.object = 0U}, .point = {7.0F, 8.0F}}}};
+    const auto release_pointer = [](MutationCommitProbe* gate) noexcept { try { gate->release.set_value(); } catch (...) {} };
+    const std::unique_ptr<MutationCommitProbe, decltype(release_pointer)> release_on_exit{pointer_gate.get(), release_pointer};
+    annotation.Input(first);
+    REQUIRE(pointer_entered.wait_for(2s) == std::future_status::ready);
+    AnnotationInputBatch second{.epoch = 7U, .document_epoch = input_document, .sequence = 2U,
+        .samples = {{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 3U, .target = {.object = 0U}, .point = {9.0F, 10.0F}}}};
+    annotation.Input(second);
+    auto excess = second;
+    excess.sequence = 3U;
+    CHECK_THROWS_AS(annotation.Input(excess), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(annotation.Input(first), contracts::InvalidIntentError);
+    pointer_gate->release.set_value();
+    REQUIRE(annotation_events.Wait([&] { return consumed.load(std::memory_order_acquire) == 2U; }));
     static_cast<void>(annotation.Edit({
         .edit = {.value = AnnotationUndoEdit{}},
     }));
@@ -3209,8 +3215,15 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     save_applied->store(true, std::memory_order_release);
     const auto save_admitted = annotation.Save({.destination = "/test/saved.json"});
     REQUIRE(annotation_events.Wait([&] { return !annotation.snapshot().busy && annotation.snapshot().revision > save_admitted.revision; }));
+    annotation.SetInputPeer(8U, {});
+    CHECK_THROWS_AS(annotation.Input(second), contracts::InvalidIntentError);
+    annotation.SetInputPeer(9U, {});
     explore.Shutdown();
     CHECK(annotation.BorrowFrame().valid());
+    annotation.Shutdown();
+    excess.epoch = 9U;
+    excess.sequence = 1U;
+    CHECK_THROWS_AS(annotation.Input(excess), contracts::UnavailableError);
 }
 
 TEST_CASE("Explore installs and atomically persists typed live filter preferences") {

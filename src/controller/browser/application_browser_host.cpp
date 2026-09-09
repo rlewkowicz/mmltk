@@ -1,6 +1,8 @@
 #include "src/controller/browser/application_browser_host.h"
 
 #include <atomic>
+#include <mutex>
+#include <limits>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -13,6 +15,7 @@ namespace mmltk::controller::browser {
 namespace {
 
 namespace transport = mmltk::frameworks::transport;
+inline constexpr auto kInputProgressWireCapacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<std::variant<InputProgress>>();
 
 [[nodiscard]] constexpr transport::BrowserRecordPriority priority(const contracts::reflection::EventDelivery delivery) noexcept {
     return delivery != contracts::reflection::EventDelivery::Transient ? transport::BrowserRecordPriority::Critical
@@ -63,9 +66,16 @@ struct ApplicationBrowserHost::Impl final {
 
     [[nodiscard]] bool publish_record(const ServerRecord& record, const transport::BrowserRecordPriority record_priority) noexcept {
         try {
-            wire::ByteBuffer encoded;
-            encoded.reserve(kMaxIntentValueBytes);
-            const auto encoding = encode_server_record(record, encoded);
+            auto encoded = record_priority == transport::BrowserRecordPriority::Progress ? server->acquire_progress_storage() : wire::ByteBuffer{};
+            encoded.reserve(record_priority == transport::BrowserRecordPriority::Progress ? kInputProgressWireCapacity : kMaxIntentValueBytes);
+            const auto encoding = [&]() -> std::expected<void, RecordCodecError> {
+                if (record_priority != transport::BrowserRecordPriority::Progress) return encode_server_record(record, encoded);
+                encoded.resize(kInputProgressWireCapacity);
+                mmltk::frameworks::serialization::FixedCborEncoder writer(encoded);
+                if (!mmltk::frameworks::serialization::encode_fixed(writer, record)) return std::unexpected(RecordCodecError{writer.error()});
+                encoded.resize(writer.size());
+                return {};
+            }();
             if (!encoding) {
                 diagnostics.Emit([&] {
                     return services::RuntimeDiagnosticFact{
@@ -75,7 +85,7 @@ struct ApplicationBrowserHost::Impl final {
                         .detail = static_cast<std::uint64_t>(record_priority),
                     };
                 });
-                if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
+                if (record_priority != transport::BrowserRecordPriority::Transient) continuity_lost();
                 return false;
             }
             const auto* state = std::get_if<SystemEvent>(&record);
@@ -102,7 +112,7 @@ struct ApplicationBrowserHost::Impl final {
             }
             return accepted;
         } catch (...) {
-            if (record_priority == transport::BrowserRecordPriority::Critical) continuity_lost();
+            if (record_priority != transport::BrowserRecordPriority::Transient) continuity_lost();
             if (diagnostics.valid()) {
                 const auto error = map_current_exception();
                 diagnostics.Emit([&] {
@@ -123,11 +133,37 @@ struct ApplicationBrowserHost::Impl final {
         try {
             auto* installed = systems.load(std::memory_order_acquire);
             if (admission.load(std::memory_order_acquire) && installed != nullptr) {
-                (void)publish_record(materialize_bootstrap(*installed), transport::BrowserRecordPriority::Critical);
+                std::uint64_t epoch;
+                {
+                    std::scoped_lock lock(input_mutex);
+                    if (input_epoch == std::numeric_limits<std::uint64_t>::max()) throw contracts::UnavailableError("input epoch exhausted");
+                    epoch = ++input_epoch;
+                    consumed_sequence = 0U;
+                    input_active = true;
+                    auto bootstrap = materialize_bootstrap(*installed);
+                    bootstrap.input_epoch = epoch;
+                    (void)publish_record(bootstrap, transport::BrowserRecordPriority::Critical);
+                }
                 return;
             }
         } catch (...) {}
         continuity_lost();
+    }
+
+    void activated() noexcept {
+        auto* installed = systems.load(std::memory_order_acquire);
+        if (!admission.load(std::memory_order_acquire) || !installed) return;
+        std::uint64_t epoch;
+        { std::scoped_lock lock(input_mutex); epoch = input_epoch; }
+        try {
+                if (installed->annotation) installed->annotation->SetInputPeer(epoch, [this](AnnotationInputProgress value) {
+                    std::scoped_lock progress_lock(input_mutex);
+                    if (value.epoch != input_epoch || !input_active) return;
+                    consumed_sequence = value.consumed_sequence;
+                    InputProgress progress{.progress = std::move(value)};
+                    (void)publish_record(progress, progress.progress.rejection ? transport::BrowserRecordPriority::Critical : transport::BrowserRecordPriority::Progress);
+                });
+        } catch (...) { continuity_lost(); }
     }
 
     [[nodiscard]] bool record(const std::span<const std::byte> bytes) noexcept {
@@ -144,6 +180,10 @@ struct ApplicationBrowserHost::Impl final {
             return false;
         }
         try {
+            if (is_interaction_record(bytes)) {
+                auto view = decode_interaction_view(bytes);
+                return view && interaction(*installed, *view);
+            }
             auto decoded = decode_client_record({.first = bytes});
             if (!decoded) {
                 diagnostics.Emit([&] {
@@ -197,41 +237,7 @@ struct ApplicationBrowserHost::Impl final {
                         }
                         return published;
                     } else if constexpr (std::same_as<Type, Interaction>) {
-                        const auto result = dispatch_interaction(*installed, std::move(value));
-                        if (result.disposition == InteractionDispatchDisposition::ProtocolInvalid) {
-                            diagnostics.Emit([&] {
-                                return services::RuntimeDiagnosticFact{
-                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                    .event = "browser.interaction.protocol_invalid",
-                                    .sequence = result.endpoint_id,
-                                };
-                            });
-                            return false;
-                        }
-                        if (result.disposition == InteractionDispatchDisposition::ApplicationRejected && result.error.has_value()) {
-                            const auto& error = result.error.value();
-                            diagnostics.Emit([&] {
-                                return services::RuntimeDiagnosticFact{
-                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                    .event = "browser.interaction.rejected",
-                                    .participant = result.endpoint_name,
-                                    .sequence = result.endpoint_id,
-                                    .value = static_cast<std::uint64_t>(error.category),
-                                    .message = error.detail,
-                                };
-                            });
-                        } else if (result.disposition == InteractionDispatchDisposition::Accepted) {
-                            diagnostics.Emit([&] {
-                                return services::RuntimeDiagnosticFact{
-                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                    .event = "browser.interaction.accepted",
-                                    .participant = result.endpoint_name,
-                                    .sequence = result.endpoint_id,
-                                    .value = result.generation,
-                                };
-                            });
-                        }
-                        return true;
+                        return interaction(*installed, InteractionView{.endpoint_id = value.endpoint_id, .value = {.first = value.value}});
                     } else {
                         auto* presentation = installed->presentation;
                         if (presentation == nullptr) {
@@ -278,6 +284,52 @@ struct ApplicationBrowserHost::Impl final {
         }
     }
 
+    bool interaction(ApplicationSystems& installed, InteractionView value) noexcept {
+        const auto result = dispatch_interaction(installed, value);
+        if (result.disposition == InteractionDispatchDisposition::ProtocolInvalid) {
+            diagnostics.Emit([&] {
+                return services::RuntimeDiagnosticFact{
+                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                    .event = "browser.interaction.protocol_invalid",
+                    .sequence = result.endpoint_id,
+                };
+            });
+            return false;
+        }
+        if (result.disposition == InteractionDispatchDisposition::ApplicationRejected && result.error.has_value()) {
+            const auto& error = result.error.value();
+            if (result.endpoint_id == application_stable_id("annotation", "Input")) {
+                std::scoped_lock lock(input_mutex);
+                (void)publish_record(InputProgress{.progress = {.epoch = input_epoch, .consumed_sequence = consumed_sequence}, .error = error},
+                                     transport::BrowserRecordPriority::Critical);
+            } else {
+                (void)publish_record(InteractionRejected{.endpoint_id = result.endpoint_id, .error = error},
+                                     transport::BrowserRecordPriority::Critical);
+            }
+            diagnostics.Emit([&] {
+                return services::RuntimeDiagnosticFact{
+                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                    .event = "browser.interaction.rejected",
+                    .participant = result.endpoint_name,
+                    .sequence = result.endpoint_id,
+                    .value = static_cast<std::uint64_t>(error.category),
+                    .message = error.detail,
+                };
+            });
+        } else if (result.disposition == InteractionDispatchDisposition::Accepted) {
+            diagnostics.Emit([&] {
+                return services::RuntimeDiagnosticFact{
+                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                    .event = "browser.interaction.accepted",
+                    .participant = result.endpoint_name,
+                    .sequence = result.endpoint_id,
+                    .value = result.generation,
+                };
+            });
+        }
+        return true;
+    }
+
     void publish(SystemEvent event) noexcept {
         if (!admission.load(std::memory_order_acquire)) return;
         const auto record_priority = priority(event.delivery);
@@ -294,10 +346,12 @@ struct ApplicationBrowserHost::Impl final {
     }
 
     static void Opened(void* context) noexcept { static_cast<Impl*>(context)->opened(); }
+    static void Activated(void* context) noexcept { static_cast<Impl*>(context)->activated(); }
     static bool Record(void* context, const std::span<const std::byte> bytes) noexcept {
         return static_cast<Impl*>(context)->record(bytes);
     }
     void closed() noexcept {
+        { std::scoped_lock lock(input_mutex); input_active = false; }
         if (!admission.load(std::memory_order_acquire)) return;
         auto* installed = systems.load(std::memory_order_acquire);
         if (installed != nullptr && installed->annotation != nullptr) installed->annotation->PeerClosed();
@@ -314,6 +368,10 @@ struct ApplicationBrowserHost::Impl final {
         });
     }
 
+    std::mutex input_mutex;
+    std::uint64_t input_epoch = 0U;
+    std::uint64_t consumed_sequence = 0U;
+    bool input_active = false;
     transport::BrowserServer* server = nullptr;
     services::RuntimeDiagnosticTarget diagnostics;
     std::atomic<ApplicationSystems*> systems = nullptr;
@@ -329,6 +387,7 @@ transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const no
     return {
         .context = impl_,
         .opened = &Impl::Opened,
+        .activated = &Impl::Activated,
         .record = &Impl::Record,
         .closed = &Impl::Closed,
         .diagnostic = impl_->diagnostics.valid() ? &Impl::Diagnostic : nullptr,

@@ -142,9 +142,11 @@ MMLTK_REFLECT_FIELDS(CounterSnapshot)
 MMLTK_REFLECT_FIELDS(CounterChanged)
 
 [[nodiscard]] Interaction counter_interaction(const std::uint64_t endpoint_id, const std::int32_t amount) {
-    const auto value = mmltk::frameworks::serialization::reflected_value(Increment{.amount = amount});
-    REQUIRE(value);
-    return {.endpoint_id = endpoint_id, .value = *value};
+    wire::ByteBuffer bytes(64U);
+    mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
+    REQUIRE(mmltk::frameworks::serialization::encode_compact(writer, Increment{.amount = amount}));
+    bytes.resize(writer.size());
+    return {.endpoint_id = endpoint_id, .value = std::move(bytes)};
 }
 
 enum class DiscoveryMode : std::uint8_t {
@@ -557,14 +559,11 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
     CHECK(counter.snapshot().value == 9);
 
     const auto unknown = dispatch_interaction(
-        systems, Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = wire::Value(wire::Value::Object{})});
+        systems, Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}});
     CHECK(unknown.disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK_FALSE(unknown.error.has_value());
 
-    const auto malformed = dispatch_interaction(systems, Interaction{.endpoint_id = interaction_id,
-                                                                     .value = wire::Value(wire::Value::Object{
-                                                                         {"amount", wire::Value(std::string{"invalid"})},
-                                                                     })});
+    const auto malformed = dispatch_interaction(systems, Interaction{.endpoint_id = interaction_id, .value = {std::byte{0xf6}}});
     CHECK(malformed.disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK_FALSE(malformed.error.has_value());
 
@@ -736,7 +735,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
     STATIC_REQUIRE(application_schema_detail::annotation_count<^^CounterChanged, contracts::reflection::Event>() == 1U);
 }
 
-TEST_CASE("protocol-13 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
+TEST_CASE("protocol-14 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
     const auto first = application_schema_fingerprint<TestSettingsSystems>();
     const auto second = application_schema_fingerprint<TestSettingsSystems>();
     const auto changed = application_schema_fingerprint<ChangedTestSettingsSystems>();
@@ -1172,11 +1171,12 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
     }
 }
 
-TEST_CASE("protocol-13 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
+TEST_CASE("protocol-14 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
     CounterSystem counter;
     TestSettingsSystem settings;
     const auto bootstrap = materialize_bootstrap(TestSettingsSystems{.settings = &settings, .counter = &counter});
-    CHECK(bootstrap.protocol_version == 13U);
+    CHECK(bootstrap.protocol_version == 14U);
+    CHECK(bootstrap.input_epoch == 0U); // The physical host installs the peer identity before encoding.
     CHECK(bootstrap.schema_fingerprint == application_schema_fingerprint<TestSettingsSystems>().words);
     REQUIRE(bootstrap.snapshots.size() == 2U);
     CHECK(bootstrap.snapshots[0].system_id == application_stable_id("settings"));

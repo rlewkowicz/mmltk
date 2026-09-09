@@ -50,6 +50,20 @@ template <class T>
 }
 
 template <class T>
+[[nodiscard]] bool encode_compact(FixedCborEncoder& writer, const T& value) {
+    return implementation::compact_detail::encode(writer, value);
+}
+template <class T>
+[[nodiscard]] bool decode_compact_item(T& value, wire::Reader& reader, const std::size_t depth) {
+    return implementation::compact_detail::decode(reader, value, depth);
+}
+template <class T>
+[[nodiscard]] bool decode_compact_into(T& value, wire::ByteSegments bytes, wire::Limits limits) {
+    wire::Reader reader(bytes, limits);
+    return implementation::compact_detail::decode(reader, value, 0U) && reader.finish().has_value();
+}
+
+template <class T>
 inline constexpr bool reflected_byte_sequence = implementation::reflected_byte_sequence<T>;
 
 template <class T>

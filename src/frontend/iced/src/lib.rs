@@ -1,4 +1,6 @@
 #[cfg(any(target_arch = "wasm32", test))]
+mod annotation_input;
+#[cfg(any(target_arch = "wasm32", test))]
 mod app;
 pub mod application_codec;
 #[cfg(any(target_arch = "wasm32", test))]

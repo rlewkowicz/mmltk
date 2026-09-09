@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -16,13 +17,14 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 
 #include "src/controller/contracts/application_boundary.h"
+#include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/frameworks/serialization/serialization.h"
 
 namespace mmltk::controller::browser {
 
 namespace field_policy = mmltk::frameworks::reflection;
 namespace wire = mmltk::frameworks::serialization::wire;
-inline constexpr std::uint64_t kBrowserProtocolVersion = 13U;
+inline constexpr std::uint64_t kBrowserProtocolVersion = 14U;
 // Aggregate output admission ceilings. Dynamic values remain actual-sized;
 // individual input fields retain the independent intent limits below.
 inline constexpr std::size_t kMaxOutputValueBytes = 8U * 1024U * 1024U;
@@ -53,9 +55,16 @@ struct Intent final {
 struct Interaction final {
     std::uint64_t protocol_version = kBrowserProtocolVersion;
     [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t endpoint_id = 0U;
-    [[= field_policy::MaxBytes{kMaxIntentValueBytes}]][[= field_policy::MaxItems{kMaxIntentValueItems}]] wire::Value value{};
+    [[= field_policy::MaxBytes{kMaxIntentValueBytes}]] wire::ByteBuffer value{};
     bool operator==(const Interaction&) const = default;
 };
+
+struct InteractionView final {
+    std::uint64_t endpoint_id = 0U;
+    wire::ByteSegments value{};
+};
+[[nodiscard]] bool is_interaction_record(std::span<const std::byte>) noexcept;
+[[nodiscard]] std::optional<InteractionView> decode_interaction_view(std::span<const std::byte>);
 
 enum class RendererObservationKind : std::uint8_t {
     Ready,
@@ -82,6 +91,7 @@ struct SystemSnapshot final {
 struct Bootstrap final {
     std::uint64_t protocol_version = kBrowserProtocolVersion;
     std::array<std::uint64_t, 2U> schema_fingerprint{};
+    std::uint64_t input_epoch = 0U;
     [[= field_policy::MaxItems{kMaxSnapshotCount}]] std::vector<SystemSnapshot> snapshots;
     bool operator==(const Bootstrap&) const = default;
 };
@@ -98,7 +108,7 @@ struct IntentReply final {
     std::uint64_t protocol_version = kBrowserProtocolVersion;
     [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t correlation = 0U;
     [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] std::optional<wire::Value> result;
-    std::optional<ApplicationErrorRecord> error;
+    std::optional<ApplicationErrorRecord> error{};
     bool operator==(const IntentReply&) const = default;
 };
 
@@ -112,8 +122,24 @@ struct SystemEvent final {
     bool operator==(const SystemEvent&) const = default;
 };
 
+struct InteractionRejected final {
+    bool operator==(const InteractionRejected&) const = default;
+    std::uint64_t protocol_version = kBrowserProtocolVersion;
+    std::uint64_t endpoint_id = 0U;
+    ApplicationErrorRecord error{};
+};
+MMLTK_REFLECT_FIELDS(InteractionRejected)
+
+struct InputProgress final {
+    bool operator==(const InputProgress&) const = default;
+    std::uint64_t protocol_version = kBrowserProtocolVersion;
+    AnnotationInputProgress progress{};
+    std::optional<ApplicationErrorRecord> error{};
+};
+MMLTK_REFLECT_FIELDS(InputProgress)
+
 using ClientRecord = std::variant<Intent, Interaction, RendererObservation>;
-using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent>;
+using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InputProgress, InteractionRejected>;
 
 MMLTK_REFLECT_ENUM(RendererObservationKind)
 MMLTK_REFLECT_FIELDS(IntentField)

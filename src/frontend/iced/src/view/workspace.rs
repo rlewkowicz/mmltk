@@ -10,20 +10,23 @@ pub fn aspect_id(aspect: crate::generated::WorkspaceAspectRatio) -> &'static str
     crate::view::aspect_ratio::option_id(crate::view::aspect_ratio::Scope::Workspace, aspect)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Message {
+    InputFailed(crate::transport_connection::OutboundSendError),
     Gesture(SurfaceGesture),
     AspectSelected(crate::generated::WorkspaceAspectRatio),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum Outcome {
+    InputFailed(crate::transport_connection::OutboundSendError),
     Gesture(SurfaceGesture),
     AspectSelected(crate::generated::WorkspaceAspectRatio),
 }
 
 pub fn update(message: Message) -> Outcome {
     match message {
+        Message::InputFailed(error) => Outcome::InputFailed(error),
         Message::Gesture(gesture) => Outcome::Gesture(gesture),
         Message::AspectSelected(aspect) => Outcome::AspectSelected(aspect),
     }
@@ -63,6 +66,7 @@ pub fn view(
         },
         |surface| {
             shader(crate::presentation_surface::Program {
+                local: None,
                 surface,
                 publish: Some(Message::Gesture),
                 placement: crate::presentation_surface::Placement::Contain,

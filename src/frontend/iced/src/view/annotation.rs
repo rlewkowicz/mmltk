@@ -51,6 +51,7 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    InputFailed(crate::transport_connection::OutboundSendError),
     ShortcutRequested(Shortcut),
     OpenRequested,
     SaveRequested,
@@ -67,10 +68,11 @@ pub struct Component {
     canvas: canvas::Component,
     timeline: timeline::Component,
     fit_revision: u64,
-    keyboard_canvas: bool,
+    keyboard_canvas: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Component {
+    pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) { self.canvas.set_connection(connection); }
     pub fn rebase(&mut self, model: &ApplicationModel) {
         if !model.annotation_edit_available() {
             self.canvas.clear_pointer_lifecycle();
@@ -88,23 +90,23 @@ impl Component {
             &message,
             Message::OutputDirectoryChanged(_) | Message::Sidebar(_) | Message::DialogRequested(_)
         ) {
-            self.keyboard_canvas = false;
+            self.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
         }
         let outcome = match message {
             Message::TextFocused => {
-                self.keyboard_canvas = false;
+                self.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
                 return Ok(None);
             }
             Message::Shortcut(shortcut) => {
                 return Ok(self
-                    .keyboard_canvas
+                    .keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed)
                     .then_some(Outcome::ShortcutRequested(shortcut)));
             }
             Message::ShortcutResolved { shortcut, focused } => {
                 if focused {
                     return Ok(None);
                 }
-                if !self.keyboard_canvas {
+                if !self.keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(None);
                 }
                 let command = match shortcut {
@@ -119,7 +121,7 @@ impl Component {
                     Shortcut::Fit => Message::FitRequested,
                 };
                 let result = self.update(application, settings, command);
-                self.keyboard_canvas = true;
+                self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
                 return result;
             }
             Message::FitRequested => {
@@ -165,9 +167,10 @@ impl Component {
                 timeline::Outcome::EditRequested(request) => Outcome::EditRequested(request),
             },
             Message::Workspace(message) => match workspace::update(message) {
+                workspace::Outcome::InputFailed(error) => Outcome::InputFailed(error),
                 workspace::Outcome::Gesture(gesture) => {
                     if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
-                        self.keyboard_canvas = true;
+                        self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     if !application.annotation_edit_available() {
                         self.canvas.clear_pointer_lifecycle();
@@ -303,7 +306,7 @@ impl Component {
             |draft| draft.ui.workspaceaspectratio,
         );
         let workspace: Element<'a, Message> = container(
-            canvas::view(surface, aspect, settings_edit_available, canvas_width)
+            canvas::view(surface, aspect, settings_edit_available, canvas_width, self.canvas.dispatch(model, settings.draft.as_ref().map_or_else(|| crate::generated::default_uiannotationbrushradius().unwrap(), |draft| draft.ui.annotationbrushradius) as u16, self.keyboard_canvas.clone()))
                 .map(Message::Workspace),
         )
         .into();

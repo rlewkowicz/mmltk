@@ -74,6 +74,8 @@ impl Router {
         self.annotation.rebase(model);
     }
 
+    pub fn set_annotation_connection(&self, connection: Option<crate::transport_connection::Connection>) { self.annotation.set_connection(connection); }
+
     pub fn rebase_annotation(&mut self, model: &ApplicationModel) {
         self.annotation.rebase(model);
     }

@@ -3,6 +3,11 @@
 #include "src/controller/presentation/visual_source_projection.h"
 
 #include <memory>
+#include <optional>
+#include <cstddef>
+#include <cstdint>
+#include <array>
+#include <inplace_vector>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -32,6 +37,21 @@ struct AnnotationPointer final {
                point.finite() && brush_radius >= contracts::kMinAnnotationBrushRadius &&
                brush_radius <= contracts::kMaxAnnotationBrushRadius;
     }
+};
+inline constexpr std::size_t kAnnotationInputBatchCapacity = 32U;
+inline constexpr std::size_t kAnnotationInputAdmissionSlots = 2U;
+struct AnnotationInputBatch final {
+    std::uint64_t epoch = 0U;
+    std::uint64_t document_epoch = 0U;
+    std::uint64_t sequence = 0U;
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationInputBatchCapacity}]]
+    std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity> samples{};
+};
+struct AnnotationInputProgress final {
+    bool operator==(const AnnotationInputProgress&) const = default;
+    std::uint64_t epoch = 0U;
+    std::uint64_t consumed_sequence = 0U;
+    [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::optional<std::string> rejection{};
 };
 struct AnnotationOpen final {
     VisualFrame source{};
@@ -121,6 +141,7 @@ class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
 };
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
+    std::uint64_t input_document_epoch = 0U;
     bool busy = false;
     bool cancellation_requested = false;
     // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
@@ -129,7 +150,7 @@ struct AnnotationSnapshot final {
     VisualFrame frame{};
     // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
 };
-struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] AnnotationChanged final {
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationChanged final {
     AnnotationSnapshot snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] AnnotationFailed final {
@@ -149,7 +170,9 @@ class AnnotationSystem final {
     ~AnnotationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
-    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Pointer(AnnotationPointer);
+    void Pointer(AnnotationPointer);
+    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(AnnotationInputBatch);
+    void SetInputPeer(std::uint64_t, SystemEventSink<AnnotationInputProgress>);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
     // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
@@ -169,6 +192,8 @@ class AnnotationSystem final {
 [[nodiscard]] VisualRuntimeFactory make_native_annotation_runtime_factory(VisualDeviceSettings);
 // CLEANUP-IGNORE: Annotation's canonical field registrations are distinct stable schema identities.
 MMLTK_REFLECT_FIELDS(AnnotationPointer)
+MMLTK_REFLECT_FIELDS(AnnotationInputBatch)
+MMLTK_REFLECT_FIELDS(AnnotationInputProgress)
 MMLTK_REFLECT_FIELDS(AnnotationOpen)
 MMLTK_REFLECT_FIELDS(AnnotationSave)
 MMLTK_REFLECT_FIELDS(AnnotationToolEdit)

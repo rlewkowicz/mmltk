@@ -238,7 +238,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     use mmltk_browser_app::generated::{ApplicationEvent, ApplicationReply, ApplicationSnapshot};
     use mmltk_browser_app::protocol::ServerRecord;
 
-    let bytes = fs::read(env!("MMLTK_PROTOCOL_V13_SERVER_FIXTURE_PATH"))?;
+    let bytes = fs::read(env!("MMLTK_PROTOCOL_V14_SERVER_FIXTURE_PATH"))?;
     let mut records = Vec::new();
     let mut cursor = 0_usize;
     while cursor < bytes.len() {
@@ -254,7 +254,11 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         )?);
         cursor += size;
     }
-    require(records.len() == 4, "native fixture record count changed")?;
+    require(records.len() == 6, "native fixture record count changed")?;
+    require(matches!(&records[4], ServerRecord::InputProgress { progress, error: None }
+        if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none()), "native cumulative progress fixture changed")?;
+    require(matches!(&records[5], ServerRecord::InteractionRejected(error)
+        if error.category == generated::ApplicationErrorCategory::Unavailable && error.detail == "fixture unavailable"), "native interaction rejection fixture changed")?;
     let Some(ServerRecord::Bootstrap(bootstrap)) = records
         .iter()
         .find(|record| matches!(record, ServerRecord::Bootstrap(_)))
@@ -262,7 +266,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         return Err(io::Error::other("native Bootstrap fixture is missing").into());
     };
     require(
-        bootstrap.schema_fingerprint == mmltk_browser_app::generated::SCHEMA_FINGERPRINT
+        bootstrap.input_epoch == 1 && bootstrap.schema_fingerprint == mmltk_browser_app::generated::SCHEMA_FINGERPRINT
             && mmltk_browser_app::generated::application_bootstrap_complete(&bootstrap.snapshots),
         "native Bootstrap did not decode into the generated snapshot",
     )?;
@@ -375,7 +379,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
                 FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(value) => {
                     require(selected, "native dialog selected/cancelled fixture changed")?;
                     require(
-                        value.path == "/tmp/protocol-v13-fixture",
+                        value.path == "/tmp/protocol-v14-fixture",
                         "native dialog selected path changed",
                     )?;
                 }
@@ -579,8 +583,21 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
                 viewport: generated::default_request_exploreUpdateViewportviewport()
                     .map_err(io::Error::other)?,
                 focusedcompiledindex: None,
-            })
+            })?
             .encode()?,
+        ),
+        (
+            "Interaction:annotation.Input",
+            generated::encode_annotation_Input(generated::AnnotationInputBatch {
+                epoch: 7, documentepoch: 1, sequence: 1,
+                samples: [generated::AnnotationPointerPhase::Begin, generated::AnnotationPointerPhase::Update, generated::AnnotationPointerPhase::End]
+                    .into_iter().enumerate().map(|(index, phase)| generated::AnnotationPointer {
+                        phase, interactionid: 1, sequence: index as u64 + 1,
+                        target: generated::AnnotationPointerTarget { object: None, element: None, role: None },
+                        point: generated::AnnotationPoint { x: index as f32, y: 1.0 },
+                        brushradius: generated::default_uiannotationbrushradius().unwrap() as u16,
+                    }).collect(),
+            })?.encode()?,
         ),
     ])
 }

@@ -663,10 +663,11 @@ pub(crate) enum Placement {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Program<Message> {
     pub surface: Surface,
     pub publish: Option<fn(SurfaceGesture) -> Message>,
+    pub local: Option<std::sync::Arc<dyn Fn(SurfaceGesture) -> Option<Message> + Send + Sync>>,
     pub placement: Placement,
     pub control_id: &'static str,
 }
@@ -721,13 +722,17 @@ impl<Message> shader::Program<Message> for Program<Message> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<shader::Action<Message>> {
+        let dispatch = |gesture| {
+            let message = self.local.as_ref().map_or_else(|| self.publish.map(|publish| publish(gesture)), |local| local(gesture));
+            message.map_or_else(shader::Action::capture, shader::Action::publish)
+        };
         state.update(
             event,
             bounds,
             cursor,
             self.surface,
             self.placement,
-            self.publish,
+            (self.publish.is_some() || self.local.is_some()).then_some(&dispatch as &dyn Fn(SurfaceGesture) -> shader::Action<Message>),
         )
     }
 
@@ -873,11 +878,11 @@ impl ViewportOwner {
         cursor: mouse::Cursor,
         surface: Surface,
         placement: Placement,
-        publish: Option<fn(SurfaceGesture) -> Message>,
+        publish: Option<&dyn Fn(SurfaceGesture) -> shader::Action<Message>>,
     ) -> Option<shader::Action<Message>> {
         if let Some(gesture) = self.synchronize_source(surface) {
             return Some(publish.map_or_else(shader::Action::capture, |publish| {
-                shader::Action::publish(publish(gesture)).and_capture()
+                publish(gesture).and_capture()
             }));
         }
         match event {
@@ -904,10 +909,10 @@ impl ViewportOwner {
                 self.pointer_active = sample.is_some();
                 self.last_pointer_sample = sample;
                 Some(sample.map_or_else(shader::Action::capture, |sample| {
-                    shader::Action::publish(publish(SurfaceGesture {
+                    publish(SurfaceGesture {
                         kind: SurfaceGestureKind::Pointer,
                         sample,
-                    }))
+                    })
                     .and_capture()
                 }))
             }
@@ -934,20 +939,20 @@ impl ViewportOwner {
                         self.last_pointer_sample = sample;
                     }
                     Some(sample.map_or_else(shader::Action::capture, |sample| {
-                        shader::Action::publish(publish(SurfaceGesture {
+                        publish(SurfaceGesture {
                             kind: SurfaceGestureKind::Pointer,
                             sample,
-                        }))
+                        })
                         .and_capture()
                     }))
                 } else {
                     let publish = publish?;
                     self.sample(bounds, cursor, surface, placement, false)
                         .map(|sample| {
-                            shader::Action::publish(publish(SurfaceGesture {
+                            publish(SurfaceGesture {
                                 kind: SurfaceGestureKind::Viewport,
                                 sample,
-                            }))
+                            })
                         })
                 }
             }
@@ -957,7 +962,7 @@ impl ViewportOwner {
                 let sample = self.sample(bounds, cursor, surface, placement, false);
                 Some(match (publish, self.finish_pointer(sample)) {
                     (Some(publish), Some(gesture)) => {
-                        shader::Action::publish(publish(gesture)).and_capture()
+                        publish(gesture).and_capture()
                     }
                     _ => shader::Action::capture(),
                 })

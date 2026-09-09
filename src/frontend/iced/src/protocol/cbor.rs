@@ -122,6 +122,8 @@ fn preflight_protocol_record(bytes: &[u8]) -> Result<(), ProtocolError> {
         b"Bootstrap" => RecordKind::Bootstrap,
         b"IntentReply" => RecordKind::IntentReply,
         b"SystemEvent" => RecordKind::SystemEvent,
+        b"InputProgress" => RecordKind::InputProgress,
+        b"InteractionRejected" => RecordKind::InteractionRejected,
         _ => RecordKind::Unknown,
     };
     ciborium_walk_complete_item(bytes, PROTOCOL_ITEM_BUDGET, PreflightPath::Envelope(record))
@@ -132,6 +134,8 @@ enum RecordKind {
     Bootstrap,
     IntentReply,
     SystemEvent,
+    InputProgress,
+    InteractionRejected,
     Unknown,
 }
 
@@ -152,8 +156,9 @@ impl PreflightPath {
     fn max_collection_items(self) -> usize {
         match self {
             Self::Envelope(_) => 2,
-            Self::Payload(RecordKind::Bootstrap) => 3,
+            Self::Payload(RecordKind::Bootstrap) => 4,
             Self::Payload(RecordKind::IntentReply) => 4,
+            Self::Payload(RecordKind::InputProgress | RecordKind::InteractionRejected) => 3,
             Self::Payload(RecordKind::SystemEvent) => SYSTEM_EVENT_FIELD_COUNT,
             Self::BootstrapSnapshots => MAX_SNAPSHOT_COUNT,
             Self::BootstrapSnapshot | Self::ReplyError => 2,
@@ -186,7 +191,7 @@ impl PreflightPath {
             (Self::Payload(RecordKind::Bootstrap), b"snapshots") => Self::BootstrapSnapshots,
             (Self::BootstrapSnapshot, b"value") => Self::BootstrapSnapshotValue,
             (Self::Payload(RecordKind::IntentReply), b"result") => Self::OrdinaryDynamic,
-            (Self::Payload(RecordKind::IntentReply), b"error") => Self::ReplyError,
+            (Self::Payload(RecordKind::IntentReply | RecordKind::InputProgress | RecordKind::InteractionRejected), b"error") => Self::ReplyError,
             (Self::ReplyError, b"detail") => Self::ReplyErrorDetail,
             (Self::Payload(RecordKind::SystemEvent), b"value") => Self::OrdinaryDynamic,
             (Self::BootstrapSnapshotValue | Self::OrdinaryDynamic, _) => Self::OrdinaryDynamic,
@@ -555,7 +560,7 @@ pub(crate) fn encode_text_item(value: &str, output: &mut Vec<u8>) {
     output.extend_from_slice(value.as_bytes());
 }
 
-fn head(major: u8, value: u64, output: &mut Vec<u8>) {
+pub(crate) fn head(major: u8, value: u64, output: &mut Vec<u8>) {
     match value {
         0..=23 => output.push((major << 5) | value as u8),
         24..=0xff => output.extend([(major << 5) | 24, value as u8]),
@@ -839,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_thirteen_preflight_routes_reflected_field_limits() {
+    fn protocol_fourteen_preflight_routes_reflected_field_limits() {
         let oversized_snapshot = object([
             ("system_id", Value::Unsigned(1)),
             ("value", Value::Text("x".repeat(MAX_OUTPUT_VALUE_BYTES + 1))),

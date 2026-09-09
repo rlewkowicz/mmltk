@@ -44,7 +44,7 @@ namespace {
         []<class Record>(const Record& value) noexcept {
             using T = std::remove_cvref_t<Record>;
             if constexpr (std::same_as<T, Bootstrap>) {
-                if (value.protocol_version != kBrowserProtocolVersion || value.schema_fingerprint[0] == 0U ||
+                if (value.protocol_version != kBrowserProtocolVersion || value.input_epoch == 0U || value.schema_fingerprint[0] == 0U ||
                     value.schema_fingerprint[1] == 0U)
                     return false;
                 return std::ranges::all_of(value.snapshots, [&value](const SystemSnapshot& snapshot) {
@@ -54,6 +54,10 @@ namespace {
             } else if constexpr (std::same_as<T, IntentReply>) {
                 return value.protocol_version == kBrowserProtocolVersion && value.correlation != 0U &&
                        (value.result.has_value() != value.error.has_value());
+            } else if constexpr (std::same_as<T, InteractionRejected>) {
+                return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
+            } else if constexpr (std::same_as<T, InputProgress>) {
+                return value.protocol_version == kBrowserProtocolVersion && value.progress.epoch != 0U;
             } else {
                 return value.protocol_version == kBrowserProtocolVersion && value.system_id != 0U && value.event_id != 0U;
             }
@@ -107,6 +111,28 @@ template <class Record>
 }
 
 }  // namespace
+
+bool is_interaction_record(const std::span<const std::byte> bytes) noexcept {
+    constexpr std::string_view prefix = "\xa2\x64" "kind" "\x6b" "Interaction";
+    return bytes.size() >= prefix.size() && std::string_view(reinterpret_cast<const char*>(bytes.data()), prefix.size()) == prefix;
+}
+std::optional<InteractionView> decode_interaction_view(const std::span<const std::byte> bytes) {
+    wire::Reader reader({.first = bytes}, {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth});
+    auto outer = reader.begin_object_item(0U);
+    if (!outer || *outer != 2U || !reader.expect_text_item(1U, "kind") || !reader.expect_text_item(1U, "Interaction") ||
+        !reader.expect_text_item(1U, "payload")) return std::nullopt;
+    auto fields = reader.begin_object_item(1U);
+    if (!fields || *fields != 3U || !reader.expect_text_item(2U, "protocol_version")) return std::nullopt;
+    std::uint64_t version = 0U;
+    InteractionView result;
+    namespace compact = mmltk::frameworks::serialization;
+    if (!compact::decode_compact_item(version, reader, 2U) || version != kBrowserProtocolVersion || !reader.expect_text_item(2U, "endpoint_id") ||
+        !compact::decode_compact_item(result.endpoint_id, reader, 2U) || result.endpoint_id == 0U || !reader.expect_text_item(2U, "value")) return std::nullopt;
+    auto payload = reader.borrow_bytes_item(2U);
+    if (!payload || payload->size() > kMaxIntentValueBytes || !reader.finish()) return std::nullopt;
+    result.value = *payload;
+    return result;
+}
 
 std::expected<void, RecordCodecError> encode_client_record(const ClientRecord& record, wire::ByteBuffer& destination) {
     if (!valid_client_record(record)) return failure(wire::ErrorCode::TypeMismatch);

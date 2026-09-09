@@ -340,6 +340,18 @@ class BindingEmitter final {
         EmitMetadata();
         EmitIdentitiesAndApplicationEnums();
         EmitSnapshotDefaults();
+        Schema::VisitEndpoints([&]<class Endpoint>() {
+            if constexpr (Endpoint::interaction) EmitCompactType<typename Endpoint::request_type>();
+        });
+        symbols_.Reserve("module", "ANNOTATION_INPUT_BATCH_CAPACITY", "native annotation batch capacity");
+        symbols_.Reserve("module", "ANNOTATION_INPUT_ADMISSION_SLOTS", "native annotation admission slots");
+        output_ << "pub const ANNOTATION_INPUT_BATCH_CAPACITY: usize = " << mmltk::controller::kAnnotationInputBatchCapacity
+                << ";\npub const ANNOTATION_INPUT_ADMISSION_SLOTS: usize = " << mmltk::controller::kAnnotationInputAdmissionSlots << ";\n";
+        symbols_.Reserve("module", "ANNOTATION_INPUT_ENCODED_CAPACITY", "native annotation input wire bound");
+        constexpr auto input_wire_bound = cbor::reflected_maximum_cbor_bytes<mmltk::controller::AnnotationInputBatch>();
+        constexpr auto interaction_overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() - kMaxIntentValueBytes;
+        static_assert(input_wire_bound <= kMaxIntentValueBytes);
+        output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << input_wire_bound + interaction_overhead << ";\n";
         EmitEndpoints();
         EmitRequestDefaults();
         EmitDefaults();
@@ -633,6 +645,7 @@ class BindingEmitter final {
 
     void VisitBoundaryTypes() {
         EmitType<mmltk::controller::VisualCleanContentIdentity>();
+        EmitType<mmltk::controller::AnnotationInputProgress>();
         EmitType<mmltk::controller::contracts::FeatureId>();
         EmitType<mmltk::controller::contracts::reflection::OperationStateSemantic>();
         EmitType<mmltk::controller::contracts::reflection::ProgressFieldSemantic>();
@@ -810,8 +823,14 @@ class BindingEmitter final {
                              "endpoint encoder " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name));
             if constexpr (Endpoint::interaction) {
                 output_ << "pub fn " << function << "(request: " << rust_type<typename Endpoint::request_type>()
-                        << ") -> Interaction { Interaction { endpoint_id: " << Endpoint::stable_id
-                        << ", value: request.into_application_value() } }\n";
+                        << ") -> Result<Interaction, crate::protocol::ProtocolError> { Ok(Interaction { endpoint_id: " << Endpoint::stable_id
+                        << ", replaceable: " << (Endpoint::replaceable ? "true" : "false")
+                        << ", value: crate::protocol::client_records::compact_bytes(&request)? }) }\n";
+                symbols_.Reserve("module", function + "_into", "retained compact endpoint encoder " + std::string(Endpoint::name));
+                output_ << "pub fn " << function << "_into(request: &" << rust_type<typename Endpoint::request_type>()
+                        << ", scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "
+                           "crate::protocol::client_records::encode_compact_interaction(" << Endpoint::stable_id
+                        << ", request, scratch, output) }\n";
             } else {
                 output_ << "pub fn " << function << "(correlation: u64";
                 if constexpr (Endpoint::signature::has_request) output_ << ", request: " << rust_type<typename Endpoint::request_type>();
@@ -830,6 +849,39 @@ class BindingEmitter final {
             }
         });
     }
+
+    template <class Value>
+    void EmitCompactType() {
+        using Type = std::remove_cvref_t<Value>;
+        if constexpr (schema::Optional<Type>::value) {
+            EmitCompactType<typename schema::Optional<Type>::value_type>();
+        } else if constexpr (schema::Sequence<Type>::value) {
+            EmitCompactType<typename schema::Sequence<Type>::value_type>();
+        } else if constexpr (std::is_enum_v<Type>) {
+            if (!compact_types_.insert(NativeSource<Type>()).second) return;
+            output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()
+                    << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { let value: "
+                    << (std::is_signed_v<std::underlying_type_t<Type>> ? "i64" : "u64") << " = match self {\n";
+            for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>()) {
+                output_ << "Self::" << rust_identifier(entry.name, true) << " => ";
+                if constexpr (std::is_signed_v<std::underlying_type_t<Type>>) output_ << static_cast<std::int64_t>(entry.value);
+                else output_ << static_cast<std::uint64_t>(entry.value);
+                output_ << ",\n";
+            }
+            output_ << "}; crate::protocol::client_records::Compact::compact(&value, bytes) } }\n";
+        } else if constexpr (schema::ReflectedObject<Type> && !Builtin<Type>) {
+            if (!compact_types_.insert(NativeSource<Type>()).second) return;
+            std::size_t count = 0U;
+            VisitRustFields<Type>([&]<class Field, class>(const auto&, const std::string&) { ++count; EmitCompactType<Field>(); });
+            output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()
+                    << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { crate::protocol::client_records::compact_head(4, " << count << ", bytes)?;\n";
+            VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) {
+                output_ << "crate::protocol::client_records::Compact::compact(&self." << member << ", bytes)?;\n";
+            });
+            output_ << "Ok(()) } }\n";
+        }
+    }
+    std::set<std::string> compact_types_;
 
     void EmitSnapshotDefaults() {
         ReserveGeneratedStruct("SnapshotDefaultFact", "canonical snapshot defaults", {"system_id", "value"});

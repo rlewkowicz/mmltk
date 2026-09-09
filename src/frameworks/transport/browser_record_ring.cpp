@@ -6,6 +6,11 @@ namespace mmltk::frameworks::transport {
 
 BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
     std::scoped_lock lock(mutex_);
+    if (record.priority == BrowserRecordPriority::Progress) {
+        if (progress_) progress_storage_ = std::move(progress_->bytes);
+        progress_ = std::move(record);
+        return BrowserRecordPush::Enqueued;
+    }
     if (record.state_system != 0U && record.state_event != 0U) {
         for (std::size_t offset = 0U; offset != size_; ++offset) {
             auto& prior = records_[(read_ + offset) % records_.size()];
@@ -32,6 +37,7 @@ BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
 
 std::optional<BrowserOutputRecord> BrowserRecordRing::pop() {
     std::scoped_lock lock(mutex_);
+    if (progress_) return std::exchange(progress_, std::nullopt);
     if (size_ == 0U) return std::nullopt;
     auto result = std::move(records_[read_]);
     records_[read_].reset();
@@ -40,10 +46,23 @@ std::optional<BrowserOutputRecord> BrowserRecordRing::pop() {
     return result;
 }
 
+mmltk::frameworks::serialization::wire::ByteBuffer BrowserRecordRing::acquire_progress_storage() {
+    std::scoped_lock lock(mutex_);
+    auto bytes = std::move(progress_storage_);
+    bytes.clear();
+    return bytes;
+}
+void BrowserRecordRing::recycle(BrowserOutputRecord record) {
+    if (record.priority != BrowserRecordPriority::Progress) return;
+    std::scoped_lock lock(mutex_);
+    if (record.bytes.capacity() > progress_storage_.capacity()) progress_storage_ = std::move(record.bytes);
+}
+
 void BrowserRecordRing::clear() noexcept {
     std::scoped_lock lock(mutex_);
     for (auto& record : records_)
         record.reset();
+    progress_.reset();
     read_ = 0U;
     write_ = 0U;
     size_ = 0U;
@@ -51,7 +70,7 @@ void BrowserRecordRing::clear() noexcept {
 
 std::size_t BrowserRecordRing::size() const noexcept {
     std::scoped_lock lock(mutex_);
-    return size_;
+    return size_ + (progress_ ? 1U : 0U);
 }
 
 bool BrowserRecordRing::empty() const noexcept { return size() == 0U; }

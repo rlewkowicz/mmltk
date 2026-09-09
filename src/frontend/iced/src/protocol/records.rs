@@ -19,6 +19,7 @@ pub enum RendererObservation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bootstrap {
     pub schema_fingerprint: [u64; 2],
+    pub input_epoch: u64,
     pub snapshots: Vec<crate::generated::ApplicationSnapshot>,
 }
 
@@ -37,6 +38,7 @@ pub struct IntentReply {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SystemEvent {
     pub delivery: EventDelivery,
+    pub state_revision: u64,
     pub event: crate::generated::ApplicationEvent,
 }
 
@@ -45,6 +47,8 @@ pub enum ServerRecord {
     Bootstrap(Bootstrap),
     IntentReply(IntentReply),
     SystemEvent(SystemEvent),
+    InteractionRejected(ApplicationError),
+    InputProgress { progress: crate::generated::AnnotationInputProgress, error: Option<ApplicationError> },
 }
 
 fn protocol_payload(values: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -105,14 +109,12 @@ impl Interaction {
         if self.endpoint_id == 0 {
             return Err(ProtocolError("interaction endpoint is invalid".into()));
         }
-        validate_client_dynamic_value(&self.value)?;
-        encode_envelope(
-            "Interaction",
-            &protocol_payload([
-                ("endpoint_id", Value::Unsigned(self.endpoint_id)),
-                ("value", self.value.clone()),
-            ]),
-        )
+        if self.value.len() > crate::generated::MAX_INTENT_VALUE_BYTES {
+            return Err(ProtocolError("interaction byte capacity exceeded".into()));
+        }
+        let mut bytes = Vec::new();
+        super::client_records::encode_interaction_bytes(self.endpoint_id, &self.value, &mut bytes)?;
+        Ok(bytes)
     }
 }
 
@@ -208,6 +210,17 @@ fn decode_snapshot(
         .map_err(ProtocolError)
 }
 
+fn decode_error(value: Value) -> Result<ApplicationError, ProtocolError> {
+    let mut fields = into_required_object(value, &["category", "detail"])?;
+    let category = ApplicationErrorCategory::from_application_value(take_required(&mut fields, "category"))
+        .map_err(|_| ProtocolError("reply error category is invalid".into()))?;
+    let Value::Text(detail) = take_required(&mut fields, "detail") else {
+        return Err(ProtocolError("reply error detail is invalid".into()));
+    };
+    if detail.len() > MAX_ERROR_DETAIL_BYTES { return Err(ProtocolError("reply error detail is invalid".into())); }
+    Ok(ApplicationError { category, detail })
+}
+
 pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
     let envelope = decode_envelope(bytes)?;
     protocol(&envelope.payload)?;
@@ -215,7 +228,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
         "Bootstrap" => {
             let mut fields = into_required_object(
                 envelope.payload,
-                &["protocol_version", "schema_fingerprint", "snapshots"],
+                &["protocol_version", "schema_fingerprint", "input_epoch", "snapshots"],
             )?;
             let Value::Array(fingerprint) = take_required(&mut fields, "schema_fingerprint") else {
                 return Err(ProtocolError("schema fingerprint must be an array".into()));
@@ -253,12 +266,31 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             }
             Ok(ServerRecord::Bootstrap(Bootstrap {
                 schema_fingerprint,
+                input_epoch: take_required(&mut fields, "input_epoch").integer_u64().filter(|epoch| *epoch != 0).ok_or_else(|| ProtocolError("invalid input epoch".into()))?,
                 snapshots: snapshots
                     .into_iter()
                     .map(|(_, snapshot)| snapshot)
                     .collect(),
             }))
         }
+        "InteractionRejected" => {
+            required_object(&envelope.payload, &["protocol_version", "endpoint_id", "error"])?;
+            if envelope.payload.field("endpoint_id").and_then(Value::integer_u64).filter(|id| *id != 0).is_none() {
+                return Err(ProtocolError("invalid rejected endpoint".into()));
+            }
+            Ok(ServerRecord::InteractionRejected(decode_error(envelope.payload.field("error").expect("required error").clone())?))
+        }
+        "InputProgress" => {
+            let names: &[&str] = if envelope.payload.field("error").is_some() {
+                &["protocol_version", "progress", "error"]
+            } else { &["protocol_version", "progress"] };
+            let mut fields = into_required_object(envelope.payload, names)?;
+            let progress = crate::generated::AnnotationInputProgress::from_application_value(take_required(&mut fields, "progress")).map_err(ProtocolError)?;
+            if progress.epoch == 0 { return Err(ProtocolError("invalid progress epoch".into())); }
+            let error = fields.into_iter().find(|(name, _)| name == "error").map(|(_, value)| decode_error(value)).transpose()?;
+            Ok(ServerRecord::InputProgress { progress, error })
+        }
+
         "IntentReply" => {
             let Value::Object(mut fields) = envelope.payload else {
                 return Err(ProtocolError("record payload must be an object".into()));
@@ -285,28 +317,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
                 .ok_or_else(|| ProtocolError("reply correlation is invalid".into()))?;
             let result = if let Some(index) = fields.iter().position(|(name, _)| name == "error") {
                 let error = fields.swap_remove(index).1;
-                match error {
-                    error @ Value::Object(_) => {
-                        let mut fields = into_required_object(error, &["category", "detail"])?;
-                        let category_value = take_required(&mut fields, "category");
-                        let category =
-                            ApplicationErrorCategory::from_application_value(category_value)
-                                .map_err(|_| {
-                                    ProtocolError("reply error category is invalid".into())
-                                })?;
-                        let detail = take_required(&mut fields, "detail");
-                        let Value::Text(detail) = detail else {
-                            return Err(ProtocolError("reply error detail is invalid".into()));
-                        };
-                        if detail.len() > MAX_ERROR_DETAIL_BYTES {
-                            return Err(ProtocolError("reply error detail is invalid".into()));
-                        }
-                        Err(ApplicationError { category, detail })
-                    }
-                    _ => {
-                        return Err(ProtocolError("reply error payload is invalid".into()));
-                    }
-                }
+                Err(decode_error(error)?)
             } else {
                 let value = take_required(&mut fields, "result");
                 if matches!(value, Value::Null) {
@@ -341,7 +352,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
                 .filter(|identity| *identity != 0)
                 .ok_or_else(|| ProtocolError("event identity is invalid".into()))?;
             let delivery_value = take_required(&mut fields, "delivery");
-            take_required(&mut fields, "state_revision")
+            let state_revision = take_required(&mut fields, "state_revision")
                 .integer_u64()
                 .ok_or_else(|| ProtocolError("event state revision is invalid".into()))?;
             let delivery = EventDelivery::from_application_value(delivery_value)
@@ -356,7 +367,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             validate_server_dynamic_value(&value)?;
             let event = crate::generated::decode_application_event(system_id, event_id, value)
                 .map_err(ProtocolError)?;
-            Ok(ServerRecord::SystemEvent(SystemEvent { delivery, event }))
+            Ok(ServerRecord::SystemEvent(SystemEvent { delivery, state_revision, event }))
         }
         _ => Err(ProtocolError("unknown server record".into())),
     }
@@ -390,6 +401,7 @@ mod tests {
         }];
         let value = snapshot.clone().into_application_value();
         let bootstrap = protocol_payload([
+            ("input_epoch", Value::Unsigned(1)),
             (
                 "schema_fingerprint",
                 Value::Array(
@@ -432,7 +444,7 @@ mod tests {
         ]);
         assert!(matches!(
             decode_server(&encode_envelope("SystemEvent", &event).unwrap()),
-            Ok(ServerRecord::SystemEvent(_))
+            Ok(ServerRecord::SystemEvent(decoded)) if Some(decoded.state_revision) == event.field("state_revision").and_then(Value::integer_u64)
         ));
         let reply = protocol_payload([
             ("correlation", Value::Unsigned(1)),
@@ -444,8 +456,9 @@ mod tests {
         ));
         assert!(
             Interaction {
+                replaceable: false,
                 endpoint_id: 1,
-                value: value.clone()
+                value: vec![0; crate::generated::MAX_INTENT_VALUE_BYTES + 1],
             }
             .encode()
             .is_err()
@@ -474,6 +487,7 @@ mod tests {
         let valid = encode_envelope(
             "Bootstrap",
             &protocol_payload([
+                ("input_epoch", Value::Unsigned(1)),
                 (
                     "schema_fingerprint",
                     Value::Array(
@@ -494,6 +508,7 @@ mod tests {
         let mismatched = encode_envelope(
             "Bootstrap",
             &protocol_payload([
+                ("input_epoch", Value::Unsigned(1)),
                 (
                     "schema_fingerprint",
                     Value::Array(vec![Value::Unsigned(1), Value::Unsigned(2)]),
@@ -535,6 +550,7 @@ mod tests {
             encode_envelope(
                 "Bootstrap",
                 &protocol_payload([
+                    ("input_epoch", Value::Unsigned(1)),
                     (
                         "schema_fingerprint",
                         Value::Array(fingerprint.into_iter().map(Value::Unsigned).collect()),
@@ -576,7 +592,7 @@ mod tests {
     }
 
     fn client_fixtures() -> Vec<(&'static str, Vec<u8>)> {
-        include_str!(env!("MMLTK_PROTOCOL_V13_CLIENT_FIXTURE_PATH"))
+        include_str!(env!("MMLTK_PROTOCOL_V14_CLIENT_FIXTURE_PATH"))
             .lines()
             .map(|line| {
                 let (kind, hex) = line.split_once(' ').expect("client fixture");
@@ -586,7 +602,7 @@ mod tests {
     }
 
     fn native_server_fixtures() -> Vec<&'static [u8]> {
-        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V13_SERVER_FIXTURE_PATH"));
+        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V14_SERVER_FIXTURE_PATH"));
         let mut records = Vec::new();
         let mut cursor = 0;
         while cursor < bytes.len() {
@@ -606,7 +622,7 @@ mod tests {
     }
 
     #[test]
-    fn client_records_match_native_protocol_thirteen_fixtures() {
+    fn client_records_match_native_protocol_fourteen_fixtures() {
         let fixtures = client_fixtures();
         // Native interop checks exhaustive coverage against the reflected variant.
         for (kind, bytes) in &fixtures {
@@ -652,7 +668,7 @@ mod tests {
     #[test]
     fn bootstrap_reply_and_event_decode_without_session_state() {
         let native = native_server_fixtures();
-        assert_eq!(native.len(), 4);
+        assert_eq!(native.len(), 6);
         let Ok(ServerRecord::Bootstrap(bootstrap)) = decode_server(native[0]) else {
             panic!("native Bootstrap");
         };
@@ -660,6 +676,14 @@ mod tests {
             bootstrap.schema_fingerprint,
             crate::generated::SCHEMA_FINGERPRINT
         );
+        assert_eq!(bootstrap.input_epoch, 1);
+        assert!(matches!(decode_server(native[4]).unwrap(), ServerRecord::InputProgress { progress, error: None }
+            if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none()));
+        assert!(matches!(decode_server(native[5]).unwrap(), ServerRecord::InteractionRejected(error)
+            if error.category == crate::generated::ApplicationErrorCategory::Unavailable && error.detail == "fixture unavailable"));
+        let mut zero_epoch = decode_envelope(native[0]).unwrap().payload;
+        if let Value::Object(fields) = &mut zero_epoch { fields.iter_mut().find(|(name, _)| name == "input_epoch").unwrap().1 = Value::Unsigned(0); }
+        assert!(decode_server(&encode_envelope("Bootstrap", &zero_epoch).unwrap()).is_err());
         for (index, selected) in [(1, false), (2, true)] {
             let ServerRecord::IntentReply(reply) =
                 decode_server(native[index]).expect("decode native IntentReply")
@@ -686,7 +710,7 @@ mod tests {
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogSelected(value) => {
                         assert!(selected);
-                        assert_eq!(value.path, "/tmp/protocol-v13-fixture");
+                        assert_eq!(value.path, "/tmp/protocol-v14-fixture");
                     }
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogCancelled(_) => assert!(!selected),
@@ -705,6 +729,7 @@ mod tests {
         let bootstrap = encode_envelope(
             "Bootstrap",
             &protocol_payload([
+                ("input_epoch", Value::Unsigned(1)),
                 (
                     "schema_fingerprint",
                     Value::Array(
@@ -1001,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_records_are_not_part_of_protocol_thirteen() {
+    fn legacy_session_records_are_not_part_of_protocol_fourteen() {
         let legacy = encode_envelope(
             "HostReset",
             &protocol_payload([("legacy_payload", Value::Object(Vec::new()))]),

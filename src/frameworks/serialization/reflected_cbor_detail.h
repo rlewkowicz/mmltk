@@ -139,25 +139,7 @@ inline constexpr bool kUniqueVariantAlternatives = []<class... Alternatives>(std
 }(std::type_identity<RemoveCvRef<T>>{});
 
 template <class T>
-struct IsByteSequence : std::false_type {};
-template <class Allocator>
-struct IsByteSequence<std::vector<std::byte, Allocator>> : std::true_type {};
-template <class Allocator>
-struct IsByteSequence<std::vector<std::uint8_t, Allocator>> : std::true_type {};
-template <std::size_t Count>
-struct IsByteSequence<std::array<std::byte, Count>> : std::true_type {};
-template <std::size_t Count>
-struct IsByteSequence<std::array<std::uint8_t, Count>> : std::true_type {};
-template <std::size_t Count>
-struct IsByteSequence<std::array<char, Count>> : std::true_type {};
-template <class Byte, std::size_t Count>
-    requires(std::is_same_v<std::remove_const_t<Byte>, std::byte>)
-struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
-template <class Byte, std::size_t Count>
-    requires(std::is_same_v<std::remove_const_t<Byte>, std::uint8_t>)
-struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
-template <class T>
-inline constexpr bool kByteSequence = IsByteSequence<RemoveCvRef<T>>::value;
+inline constexpr bool kByteSequence = mmltk::frameworks::reflection::kByteSequence<T>;
 
 template <class T>
 inline constexpr bool kFlatScalar =
@@ -1977,5 +1959,85 @@ template <class T>
 [[nodiscard]] std::string reflected_schema_type_name() {
     return std::string(mmltk::frameworks::reflection::type_name<T>());
 }
+
+// Positional projection for schema-agreed interaction records. Scalars use the
+// canonical Reader/encoder; structure and validation derive from declarations.
+namespace compact_detail {
+template <class T, class Visitor>
+void visit_fields(T& value, Visitor& visitor) {
+    using U = std::remove_cvref_t<T>;
+    detail::visit_bases<U>([&]<class Base>() {
+        using QualifiedBase = std::conditional_t<std::is_const_v<T>, const Base, Base>;
+        visit_fields(static_cast<QualifiedBase&>(value), visitor);
+    });
+    detail::visit_members<U>([&]<class Declaration>(const auto&) {
+        visitor.template operator()<Declaration>(value.*Declaration::pointer);
+    });
+}
+template <class T>
+[[nodiscard]] bool encode(FixedCborEncoder& writer, const T& value) {
+    namespace d = detail;
+    if constexpr (d::kIsOptional<T>) {
+        return value ? encode(writer, *value) : writer.null();
+    } else if constexpr (d::kIsArray<T> || d::kIsVector<T> || d::kIsInplaceVector<T>) {
+        if (!writer.array(value.size())) return false;
+        for (const auto& item : value) if (!encode(writer, item)) return false;
+        return true;
+    } else if constexpr (std::is_enum_v<T>) {
+        return mmltk::frameworks::reflection::enum_contains(value) && encode(writer, static_cast<std::underlying_type_t<T>>(value));
+    } else if constexpr (d::kReflectedObject<T>) {
+        bool valid = writer.array(d::flattened_member_count<T>());
+        auto field = [&]<class Declaration>(const auto& member) {
+            valid = valid && d::member_constraints_accept<Declaration>(member) && encode(writer, member);
+        };
+        visit_fields(value, field);
+        return valid;
+    } else {
+        return encode_fixed(writer, value);
+    }
+}
+template <class T>
+[[nodiscard]] bool decode(wire::Reader& reader, T& value, const std::size_t depth) {
+    namespace d = detail;
+    if constexpr (d::kIsOptional<T>) {
+        auto absent = reader.next_is_null();
+        if (!absent) return false;
+        if (*absent) { value.reset(); return reader.read_scalar_item(depth).has_value(); }
+        value.emplace();
+        return decode(reader, *value, depth);
+    } else if constexpr (d::kIsArray<T> || d::kIsInplaceVector<T>) {
+        auto count = reader.begin_array_item(depth);
+        if (!count) return false;
+        if constexpr (d::kIsArray<T>) {
+            if (*count != value.size()) return false;
+        } else {
+            if (*count > value.capacity()) return false;
+            value.resize(*count);
+        }
+        for (auto& item : value) if (!decode(reader, item, depth + 1U)) return false;
+        return true;
+    } else if constexpr (std::is_enum_v<T>) {
+        std::underlying_type_t<T> raw{};
+        if (!decode(reader, raw, depth)) return false;
+        value = static_cast<T>(raw);
+        return mmltk::frameworks::reflection::enum_contains(value);
+    } else if constexpr (d::kReflectedObject<T>) {
+        auto count = reader.begin_array_item(depth);
+        if (!count || *count != d::flattened_member_count<T>()) return false;
+        bool valid = true;
+        auto field = [&]<class Declaration>(auto& member) {
+            valid = valid && decode(reader, member, depth + 1U) && d::member_constraints_accept<Declaration>(member);
+        };
+        visit_fields(value, field);
+        return valid;
+    } else {
+        auto scalar = d::decode_projected<T>(reader, depth);
+        if (!scalar) return false;
+        value = std::move(*scalar);
+        return true;
+    }
+}
+} // namespace compact_detail
+
 
 }  // namespace mmltk::frameworks::serialization::implementation

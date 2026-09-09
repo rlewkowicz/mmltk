@@ -180,7 +180,8 @@ mod route_tests {
 
     fn settings_event(app: &mut App, snapshot: crate::generated::SettingsUiState) {
         app.reduce_event(SystemEvent {
-            delivery: crate::generated::EventDelivery::Transient,
+            state_revision: 0,
+            delivery: crate::generated::EventDelivery::Critical,
             event: crate::generated::ApplicationEvent::SettingsSettingsChanged(
                 crate::generated::SettingsChanged { snapshot },
             ),
@@ -297,6 +298,7 @@ mod route_tests {
             })
             .collect();
         app.install_bootstrap(Bootstrap {
+            input_epoch: 1,
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
             snapshots,
         });
@@ -385,6 +387,7 @@ mod tests {
             .map(|snapshot| snapshot.value)
             .collect();
         app.install_bootstrap(Bootstrap {
+            input_epoch: 1,
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
             snapshots,
         });
@@ -479,7 +482,8 @@ mod tests {
         settings.settingsstate.workflows.train.modelinput =
             crate::generated::ModelArtifactInputKind::Weights;
         app.reduce_event(SystemEvent {
-            delivery: crate::generated::EventDelivery::Transient,
+            state_revision: 0,
+            delivery: crate::generated::EventDelivery::Critical,
             event: crate::generated::ApplicationEvent::SettingsSettingsChanged(
                 crate::generated::SettingsChanged { snapshot: settings },
             ),
@@ -559,7 +563,8 @@ mod tests {
 
     fn reduce_explore_changed(app: &mut App, snapshot: crate::generated::ExploreSnapshot) {
         app.reduce_event(SystemEvent {
-            delivery: crate::generated::EventDelivery::Transient,
+            state_revision: snapshot.revision,
+            delivery: crate::generated::EventDelivery::LatestState,
             event: crate::generated::ApplicationEvent::ExploreExploreChanged(
                 crate::generated::ExploreChanged { snapshot },
             ),
@@ -578,9 +583,9 @@ mod tests {
     fn root_transport_connection_and_peer_loss_reset_the_application_boundary() {
         let (mut app, task) = boot();
         drop(task);
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
+        let (sender, _receiver) = Connection::test_channel();
 
-        drop(app.on_transport(TransportEvent::Connected(Connection::new(sender))));
+        drop(app.on_transport(TransportEvent::Connected(sender)));
 
         assert!(app.connection.is_some());
         assert_eq!(
@@ -605,9 +610,9 @@ mod tests {
     #[test]
     fn ready_surface_presented_intent_and_protocol_terminal_paths_retire_the_peer() {
         let closed_connection = || {
-            let (sender, receiver) = futures_channel::mpsc::channel(1);
+            let (sender, receiver) = Connection::test_channel();
             drop(receiver);
-            Connection::new(sender)
+            sender
         };
 
         let (mut ready, task) = boot();
@@ -716,12 +721,10 @@ mod tests {
                     overlay: requested.clone(),
                 });
             app.model.explore.desired_overlay = Some(requested.clone());
-            let (sender, receiver) = futures_channel::mpsc::channel(0);
-            let mut connection = Connection::new(sender);
+            let (sender, receiver) = Connection::test_channel();
+            let mut connection = sender;
             if failure == "capacity" {
-                connection
-                    .send_renderer_observation(RendererObservation::Ready)
-                    .unwrap();
+                for _ in 0..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
             }
             if failure != "disconnected" {
                 app.connection = Some(connection);
@@ -773,14 +776,15 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
-        let (sender, receiver) = futures_channel::mpsc::channel(0);
-        let mut connection = Connection::new(sender);
+        let (sender, receiver) = Connection::test_channel();
+        let mut connection = sender;
         assert_eq!(
             connection
                 .send_renderer_observation(RendererObservation::Ready)
                 .unwrap(),
             crate::transport_connection::SendDisposition::Queued
         );
+        for _ in 1..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
         app.connection = Some(connection);
         assert!(
             !app.submit_intent(ApplicationIntentEndpoint::DatasetStop, |correlation| {
@@ -801,8 +805,8 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_ready_annotation(&mut app);
-        let (sender, receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, receiver) = Connection::test_channel();
+        app.connection = Some(sender);
 
         let first = local_annotation_press(&mut app);
         drop(app.on_workspace(crate::view::router::Message::Annotation(
@@ -834,14 +838,15 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_ready_annotation(&mut app);
-        let (sender, receiver) = futures_channel::mpsc::channel(0);
-        let mut connection = Connection::new(sender);
+        let (sender, receiver) = Connection::test_channel();
+        let mut connection = sender;
         assert_eq!(
             connection
                 .send_renderer_observation(RendererObservation::Ready)
                 .unwrap(),
             crate::transport_connection::SendDisposition::Queued
         );
+        for _ in 1..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
         app.connection = Some(connection);
 
         let first = local_annotation_press(&mut app);
@@ -872,14 +877,25 @@ mod tests {
         annotation.busy = false;
         annotation.frame =
             crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
-        let (sender, receiver) = futures_channel::mpsc::channel(1);
+        let (sender, receiver) = Connection::test_channel();
         drop(receiver);
-        app.connection = Some(Connection::new(sender));
+        app.connection = Some(sender);
         app.submit_annotation_pointer(annotation_pointer(
             crate::generated::AnnotationPointerPhase::Begin,
             1,
         ));
         assert_persistent_owners_retired(&app);
+        let (mut local, task) = boot();
+        drop(task);
+        stage_annotation_retirement(&mut local);
+        let (connection, _capture) = Connection::test_channel();
+        local.connection = Some(connection);
+        drop(local.on_workspace(crate::view::router::Message::Annotation(
+            crate::view::annotation::Message::Workspace(crate::view::workspace::Message::InputFailed(
+                crate::transport_connection::OutboundSendError::Closed,
+            )),
+        )));
+        assert_persistent_owners_retired(&local);
     }
 
     #[test]
@@ -900,22 +916,27 @@ mod tests {
     }
 
     #[test]
-    fn ordered_annotation_capacity_retires_the_peer_and_all_persistent_owners() {
+    fn ordered_annotation_capacity_retains_samples_without_retiring_the_peer() {
         let (mut app, task) = boot();
         drop(task);
         stage_annotation_retirement(&mut app);
-        let (sender, receiver) = futures_channel::mpsc::channel(0);
-        app.connection = Some(Connection::new(sender));
+        let (sender, receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         app.submit_annotation_pointer(annotation_pointer(
             crate::generated::AnnotationPointerPhase::Begin,
             1,
         ));
         assert!(app.connection.is_some());
         app.submit_annotation_pointer(annotation_pointer(
-            crate::generated::AnnotationPointerPhase::End,
+            crate::generated::AnnotationPointerPhase::Update,
             2,
         ));
-        assert_persistent_owners_retired(&app);
+        for sequence in 3..=130 { app.submit_annotation_pointer(annotation_pointer(if sequence == 130 { crate::generated::AnnotationPointerPhase::End } else { crate::generated::AnnotationPointerPhase::Update }, sequence)); }
+        assert!(app.connection.is_some());
+        let mut receiver = receiver;
+        let mut batches = 0;
+        while let Ok(record) = receiver.try_recv() { if let crate::transport_connection::CapturedRecord::Other(envelope) = record { assert_eq!(envelope.kind, "Interaction"); batches += 1; } }
+        assert_eq!(batches, 2, "all remaining samples await consumption credits");
         drop(receiver);
     }
 
@@ -936,9 +957,9 @@ mod tests {
         };
         send.workspace
             .explore_request_viewport(send.model.explore.snapshot.as_ref(), request);
-        let (sender, receiver) = futures_channel::mpsc::channel(1);
+        let (sender, receiver) = Connection::test_channel();
         drop(receiver);
-        send.connection = Some(Connection::new(sender));
+        send.connection = Some(sender);
         drop(send.dispatch_explore_viewport());
         assert!(send.connection.is_none());
         assert!(send.workspace.explore_dispatchable_viewport().is_none());
@@ -972,13 +993,13 @@ mod tests {
     fn stale_explore_writable_completion_cannot_touch_a_replacement_peer() {
         let (mut app, task) = boot();
         drop(task);
-        let (first_sender, first_receiver) = futures_channel::mpsc::channel(4);
-        drop(app.on_transport(TransportEvent::Connected(Connection::new(first_sender))));
+        let (first_sender, first_receiver) = Connection::test_channel();
+        drop(app.on_transport(TransportEvent::Connected(first_sender)));
         let first_generation = app.peer_generation;
         drop(first_receiver);
 
-        let (second_sender, second_receiver) = futures_channel::mpsc::channel(4);
-        drop(app.on_transport(TransportEvent::Connected(Connection::new(second_sender))));
+        let (second_sender, second_receiver) = Connection::test_channel();
+        drop(app.on_transport(TransportEvent::Connected(second_sender)));
         assert_ne!(app.peer_generation, first_generation);
         assert!(app.workspace.explore_arm_writable_wait());
         drop(app.on_explore_writable(
@@ -1020,8 +1041,8 @@ mod tests {
             let source =
                 crate::view_model::test_support::visual_frame(PresentationSourceKind::Live, 1);
             app.model.live_snapshot.as_mut().unwrap().frame = source.clone();
-            let (sender, mut receiver) = futures_channel::mpsc::channel(8);
-            app.connection = Some(Connection::new(sender));
+            let (sender, mut receiver) = Connection::test_channel();
+            app.connection = Some(sender);
             drop(update(
                 &mut app,
                 Message::Workspace(crate::view::router::Message::Navigation(
@@ -1030,7 +1051,7 @@ mod tests {
             ));
             assert_eq!(app.workspace.active(), FeatureId::Live);
             assert!(app.model.error.is_none());
-            let crate::transport_connection::OutboundRecord::Intent(intent) =
+            let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().unwrap()
             else {
                 panic!("expected Live foreground selection");
@@ -1220,8 +1241,8 @@ mod tests {
             let (mut app, task) = boot();
             drop(task);
             install_default_bootstrap(&mut app);
-            let (sender, receiver) = futures_channel::mpsc::channel(4);
-            app.connection = Some(Connection::new(sender));
+            let (sender, receiver) = Connection::test_channel();
+            app.connection = Some(sender);
             (app, receiver)
         };
 
@@ -1296,8 +1317,8 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         let before = app.model.explore.snapshot.clone().unwrap();
         assert!(!before.ready);
         assert!(app.model.explore_augmentation_update_available());
@@ -1447,6 +1468,7 @@ mod tests {
             }
         }
         reconnect.install_bootstrap(Bootstrap {
+            input_epoch: 1,
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
             snapshots,
         });
@@ -1519,8 +1541,8 @@ mod tests {
         settings.exploresource.compiledsource = "./compiled/train.bin".into();
         settings.exploresource.available = true;
         app.settings.install(settings);
-        let (sender, _receiver) = futures_channel::mpsc::channel(4);
-        app.connection = Some(Connection::new(sender));
+        let (sender, _receiver) = Connection::test_channel();
+        app.connection = Some(sender);
         assert!(app.model.explore_open_available());
 
         drop(app.on_explore(crate::view::explore::Outcome::OpenRequested));

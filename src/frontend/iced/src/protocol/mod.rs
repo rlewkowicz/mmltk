@@ -4,7 +4,7 @@
 //! document bindings; this module is the deliberately small boundary between
 //! the native reflected envelope and browser presentation code.
 
-mod cbor;
+pub(crate) mod cbor;
 pub mod client_records;
 mod records;
 

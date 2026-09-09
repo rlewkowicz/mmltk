@@ -324,9 +324,11 @@ impl App {
             self.workspace.explore_clear_viewport_admission();
             return Task::none();
         };
-        match connection.send_interaction(crate::generated::encode_explore_UpdateViewport(
-            request.clone(),
-        )) {
+        let interaction = match crate::generated::encode_explore_UpdateViewport(request.clone()) {
+            Ok(interaction) => interaction,
+            Err(error) => { self.retire_peer(UiError::transport(error.to_string())); return Task::none(); }
+        };
+        match connection.send_interaction(interaction) {
             Ok(crate::transport_connection::SendDisposition::Queued) => {
                 self.workspace.explore_viewport_queued(request);
                 Task::none()
@@ -351,6 +353,10 @@ impl App {
                 Task::none()
             }
             Err(crate::transport_connection::OutboundSendError::Capacity) => Task::none(),
+            Err(crate::transport_connection::OutboundSendError::Allocation) => {
+                self.retire_peer(UiError::transport("retained outbound allocation failed"));
+                Task::none()
+            }
         }
     }
 
@@ -560,6 +566,10 @@ impl App {
                 Task::none()
             }
             Err(crate::transport_connection::OutboundSendError::Capacity) => Task::none(),
+            Err(crate::transport_connection::OutboundSendError::Allocation) => {
+                self.retire_peer(UiError::transport("retained outbound allocation failed"));
+                Task::none()
+            }
         }
     }
 }

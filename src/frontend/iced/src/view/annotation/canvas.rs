@@ -127,14 +127,14 @@ pub(super) fn target(state: &AnnotationUiState, x: f32, y: f32) -> Target {
     empty()
 }
 
-pub(super) struct Component {
+struct GestureState {
     pointer_active: bool,
     pointer_interaction: u64,
     pointer_sequence: u64,
     gesture_target: Option<Target>,
     last_pointer: AnnotationPoint,
 }
-impl Default for Component {
+impl Default for GestureState {
     fn default() -> Self {
         Self {
             pointer_active: false,
@@ -145,7 +145,7 @@ impl Default for Component {
         }
     }
 }
-impl Component {
+impl GestureState {
     pub(super) fn cancel_pointer(&mut self) -> Option<crate::generated::AnnotationPointer> {
         self.finish_pointer(
             crate::generated::AnnotationPointerPhase::Cancel,
@@ -245,11 +245,62 @@ impl Component {
     }
 }
 
+#[derive(Default)]
+struct Retained {
+    gesture: GestureState,
+    model: crate::view_model::AnnotationModel,
+    available: bool,
+    radius: u16,
+    connection: Option<crate::transport_connection::Connection>,
+}
+#[derive(Default)]
+pub(super) struct Component {
+    retained: std::sync::Arc<std::sync::Mutex<Retained>>,
+}
+impl Component {
+    pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
+        let mut retained = self.retained.lock().expect("annotation canvas");
+        retained.gesture.clear_pointer_lifecycle();
+        retained.connection = connection;
+    }
+    pub fn clear_pointer_lifecycle(&self) { self.retained.lock().expect("annotation canvas").gesture.clear_pointer_lifecycle(); }
+    pub fn cancel_pointer(&self) -> Option<crate::generated::AnnotationPointer> { self.retained.lock().expect("annotation canvas").gesture.cancel_pointer() }
+    pub fn pointer_from_gesture(&self, model: &crate::view_model::AnnotationModel, gesture: crate::presentation_surface::SurfaceGesture) -> Option<crate::generated::AnnotationPointer> {
+        self.retained.lock().expect("annotation canvas").gesture.pointer_from_gesture(model, gesture)
+    }
+    pub fn dispatch(&self, model: &crate::view_model::ApplicationModel, radius: u16, keyboard: std::sync::Arc<std::sync::atomic::AtomicBool>)
+        -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<crate::view::workspace::Message> + Send + Sync> {
+        {
+            let mut retained = self.retained.lock().expect("annotation canvas");
+            if retained.model.snapshot.as_ref().map(|value| value.revision) != model.annotation.snapshot.as_ref().map(|value| value.revision) {
+                retained.model = model.annotation.clone();
+            }
+            retained.available = model.annotation_edit_available();
+            retained.radius = radius;
+        }
+        let owner = self.retained.clone();
+        std::sync::Arc::new(move |gesture| {
+            let mut retained = owner.lock().expect("annotation canvas");
+            if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
+                keyboard.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            let Retained { gesture: lifecycle, model, available, radius, connection } = &mut *retained;
+            if !*available { lifecycle.clear_pointer_lifecycle(); return None; }
+            let mut pointer = lifecycle.pointer_from_gesture(model, gesture)?;
+            pointer.brushradius = *radius;
+            let result = connection.as_mut().ok_or(crate::transport_connection::OutboundSendError::Closed)
+                .and_then(|connection| connection.send_annotation_pointer(pointer, model.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch)));
+            result.err().map(|error| crate::view::workspace::Message::InputFailed(error))
+        })
+    }
+}
+
 pub(super) fn view(
     surface: Option<crate::presentation_surface::Surface>,
     aspect: crate::generated::WorkspaceAspectRatio,
     settings_available: bool,
     width: f32,
+    local: std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<crate::view::workspace::Message> + Send + Sync>,
 ) -> crate::fluent_theme::Element<'static, crate::view::workspace::Message> {
     use crate::view::workspace;
     use iced::widget::{column, container, shader, text};
@@ -263,7 +314,8 @@ pub(super) fn view(
         |surface| {
             shader(crate::presentation_surface::Program {
                 surface,
-                publish: Some(workspace::Message::Gesture),
+                publish: None,
+                local: Some(local),
                 placement: crate::presentation_surface::Placement::Contain,
                 control_id: workspace::STABLE_ID,
             })

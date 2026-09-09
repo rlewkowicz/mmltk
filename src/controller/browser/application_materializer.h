@@ -125,7 +125,7 @@ struct InteractionDispatchResult final {
 };
 
 template <class Composition>
-[[nodiscard]] InteractionDispatchResult dispatch_interaction(Composition& systems, Interaction interaction) noexcept {
+[[nodiscard]] InteractionDispatchResult dispatch_interaction(Composition& systems, const InteractionView interaction) noexcept {
     InteractionDispatchResult result{.endpoint_id = interaction.endpoint_id};
     try {
         bool found = false;
@@ -135,7 +135,7 @@ template <class Composition>
                 found = true;
                 result.endpoint_name = Endpoint::name;
                 typename Endpoint::request_type request{};
-                if (!mmltk::frameworks::serialization::decode_into(request, std::move(interaction.value))) { return; }
+                if (!mmltk::frameworks::serialization::decode_compact_into(request, interaction.value, {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth})) { return; }
                 try {
                     auto* system = systems.*Endpoint::system_cell::pointer;
                     if (system == nullptr) throw mmltk::controller::contracts::UnavailableError("application system is unavailable");
@@ -152,6 +152,11 @@ template <class Composition>
         if (!found) return result;
     } catch (...) { return result; }
     return result;
+}
+
+template <class Composition>
+[[nodiscard]] InteractionDispatchResult dispatch_interaction(Composition& systems, const Interaction& interaction) noexcept {
+    return dispatch_interaction(systems, InteractionView{.endpoint_id = interaction.endpoint_id, .value = {.first = interaction.value}});
 }
 
 template <class Composition>
