@@ -6,6 +6,7 @@
 #include <exception>
 #include <meta>
 #include <span>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>

@@ -1656,6 +1656,92 @@ append_native_environment() {
     done
 }
 
+append_native_logging_environment() {
+    local -n logging_args="$1"
+    local logging_mode="$2"
+    shift 2
+    local -A logging_values=() logging_entries=()
+    local name value entry
+    for name in MMLTK_LOG_LEVEL MMLTK_LOG_FILE MMLTK_LOG_DIR; do
+        value="${!name:-}"
+        if [[ -n "${value}" ]]; then
+            if [[ "${name}" != MMLTK_LOG_LEVEL ]]; then
+                value="$(rewrite_host_path "${value}")"
+            fi
+            logging_values["${name}"]="${value}"
+            logging_entries["${name}"]="${name}=${value}"
+        fi
+    done
+    if [[ "${logging_mode}" != exec ]]; then
+        for entry in "${test_environment[@]}"; do
+            name="${entry%%=*}"
+            case "${name}" in
+                MMLTK_LOG_LEVEL|MMLTK_LOG_FILE|MMLTK_LOG_DIR)
+                    # Explicit test paths are already container paths. Bare names
+                    # retain Docker's host-environment forwarding semantics.
+                    value="${!name:-}"
+                    if [[ "${entry}" == *=* ]]; then value="${entry#*=}"; fi
+                    logging_values["${name}"]="${value}"
+                    logging_entries["${name}"]="${entry}"
+                    ;;
+            esac
+        done
+    fi
+
+    local effective_level="${logging_values[MMLTK_LOG_LEVEL]:-}"
+    local accepted_level_pattern='^(trace|debug|info|warn|warning|error|err|critical|off)?$'
+    # Native parsing rejects an invalid level before any later override applies.
+    local level_valid=1
+    [[ "${effective_level,,}" =~ ${accepted_level_pattern} ]] || level_valid=0
+    local has_destination=0
+    if [[ -n "${logging_values[MMLTK_LOG_FILE]:-}${logging_values[MMLTK_LOG_DIR]:-}" ]]; then
+        has_destination=1
+    fi
+    # Mirror the native scan only to decide whether it needs a writable default.
+    # Forward the original options unchanged; native parsing still owns errors.
+    local option
+    while (( level_valid && $# )); do
+        option="$1"
+        shift
+        case "${option}" in
+            --log-level=*|--log-file=*|--log-dir=*)
+                value="${option#*=}"
+                option="${option%%=*}"
+                ;;
+            --log-level|--log-file|--log-dir)
+                (($#)) || continue
+                value="$1"
+                shift
+                ;;
+            *) continue ;;
+        esac
+        if [[ "${option}" == --log-level ]]; then
+            # An empty native level override leaves the environment level intact.
+            effective_level="${value:-${logging_values[MMLTK_LOG_LEVEL]:-}}"
+            [[ "${effective_level,,}" =~ ${accepted_level_pattern} ]] || level_valid=0
+        else
+            has_destination=1
+        fi
+    done
+    local enabled=0
+    case "${effective_level,,}" in
+        off) ;;
+        "") if [[ "${logging_mode}" == wayland ]]; then enabled=1; fi ;;
+        *) enabled="${level_valid}" ;;
+    esac
+    if (( enabled && ! has_destination )); then
+        prepare_owned_dirs "${repo_root}/.mmltk-data/logs"
+        value="$(rewrite_host_path "${repo_root}/.mmltk-data/logs")"
+        if [[ "${logging_mode}" == wayland ]]; then value=/workspace/.mmltk-data/logs; fi
+        logging_entries[MMLTK_LOG_DIR]="MMLTK_LOG_DIR=${value}"
+    fi
+    for name in MMLTK_LOG_LEVEL MMLTK_LOG_FILE MMLTK_LOG_DIR; do
+        if [[ -v "logging_entries[${name}]" ]]; then
+            logging_args+=(--env "${logging_entries[${name}]}")
+        fi
+    done
+}
+
 build_run_args() {
     run_args=(
         run
@@ -1811,15 +1897,7 @@ build_exec_env_args() {
     append_native_environment exec_env_args
     exec_env_args+=(-e "MMLTK_RFDETR_TEST_CACHE_DIR=/host${cache_root}/tests/rfdetr")
     exec_env_args+=(-e "MMLTK_BENCHMARK_DATASET_CACHE_ROOT=/host${cache_root}/benchmark-dataset/v1")
-    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
-        exec_env_args+=(-e "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
-    fi
-    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
-        exec_env_args+=(-e "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
-    fi
-    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
-        exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
-    fi
+    append_native_logging_environment exec_env_args exec "${rewritten_args[@]}"
     if (( gui_mode )); then
         resolve_gui_session
 
@@ -2654,6 +2732,9 @@ append_explicit_test_environment() {
     local -n environment_args="$1"
     local environment_entry
     for environment_entry in "${test_environment[@]}"; do
+        case "${environment_entry%%=*}" in
+            MMLTK_LOG_LEVEL|MMLTK_LOG_FILE|MMLTK_LOG_DIR) continue ;;
+        esac
         environment_args+=(--env "${environment_entry}")
     done
 }
@@ -2685,9 +2766,7 @@ run_test_executable() {
     local executable="$1"
     shift
 
-    prepare_owned_dirs \
-        "${cache_root}/tests/rfdetr" \
-        "${repo_root}/.mmltk-data/logs"
+    prepare_owned_dirs "${cache_root}/tests/rfdetr"
     build_common_group_args
     local -a docker_args=(
         run --rm --init -i
@@ -2710,15 +2789,7 @@ run_test_executable() {
     if [[ -t 0 && -t 1 ]]; then
         docker_args+=(-t)
     fi
-    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
-    fi
-    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
-    fi
-    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
-    fi
+    append_native_logging_environment docker_args test "$@"
     append_forwarded_test_environment docker_args
     append_explicit_test_environment docker_args
     docker_args+=("${common_group_args[@]}")
@@ -2815,7 +2886,6 @@ run_workspace_wayland_test_executable() {
     prepare_owned_dirs \
         "${cache_root}/container-home" \
         "${cache_root}/tests/rfdetr" \
-        "${repo_root}/.mmltk-data/logs" \
         "${repo_root}/build/validation"
     prepare_workspace_wayland_test_mounts
     build_common_group_args
@@ -2857,17 +2927,7 @@ run_workspace_wayland_test_executable() {
     if [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]]; then
         docker_args+=(--env "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
     fi
-    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
-    fi
-    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
-    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
-        docker_args+=(--env MMLTK_LOG_DIR=/workspace/.mmltk-data/logs)
-    fi
-    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
-        docker_args+=(--env "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
-    fi
+    append_native_logging_environment docker_args wayland "$@"
     if [[ -n "${MMLTK_GUI_TRACE_FILE:-}" ]]; then
         docker_args+=(--env "MMLTK_GUI_TRACE_FILE=$(rewrite_host_path "${MMLTK_GUI_TRACE_FILE}")")
     fi

@@ -549,6 +549,21 @@ void test_log_file_flag_creates_requested_log_file() {
 
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(log_path));
+    fs::remove(log_path);
+    for (const std::string level_source : {"MMLTK_LOG_LEVEL=off", "MMLTK_LOG_LEVEL=debug"}) {
+        const SubprocessResult disabled = run_subprocess_capture_output({
+            "env",
+            level_source,
+            mmltk_cli_path(),
+            "--log-level=off",
+            "--log-file",
+            log_path.string(),
+            "--help",
+        });
+        MMLTK_ASSERT(disabled.exit_code == 0);
+        MMLTK_ASSERT(disabled.stderr_text.empty());
+        MMLTK_ASSERT(!fs::exists(log_path));
+    }
     cleanup_temp_dir(temp_dir);
 }
 
@@ -580,6 +595,20 @@ void test_env_log_file_creates_requested_log_file() {
 
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(log_path));
+    fs::remove(log_path);
+    for (const bool override_off : {false, true}) {
+        std::vector<std::string> arguments{
+            "env",
+            "MMLTK_LOG_LEVEL=off",
+            "MMLTK_LOG_FILE=" + log_path.string(),
+            mmltk_cli_path(),
+            "--help",
+        };
+        if (override_off) arguments.push_back("--log-level=info");
+        const SubprocessResult overridden = run_subprocess_capture_output(arguments);
+        MMLTK_ASSERT(overridden.exit_code == 0);
+        MMLTK_ASSERT(fs::exists(log_path) == override_off);
+    }
     cleanup_temp_dir(temp_dir);
 }
 
@@ -625,6 +654,36 @@ void prepare_fake_docker_state(const fs::path& temp_dir, const fs::path& state_d
     fs::create_directories(state_dir, error);
     MMLTK_ASSERT(!error);
     write_fake_docker_script(temp_dir);
+    const fs::path wrapper = locate_repo_wrapper_path();
+    fs::create_directories(temp_dir / "tools");
+    fs::copy_file(wrapper, temp_dir / "mmltk", fs::copy_options::overwrite_existing);
+    fs::copy_file(wrapper.parent_path() / "tools/runtime_package.sh", temp_dir / "tools/runtime_package.sh",
+                  fs::copy_options::overwrite_existing);
+}
+
+std::vector<std::string> capture_wrapper_logging_arguments(const fs::path& temp_dir, const fs::path& state_dir,
+                                                         const std::vector<std::string>& environment,
+                                                         const std::vector<std::string>& arguments) {
+    fs::remove(state_dir / "exec_count.txt");
+    fs::remove_all(temp_dir / ".mmltk-data");
+    std::vector<std::string> command{
+        "env",
+        "-u", "MMLTK_LOG_LEVEL",
+        "-u", "MMLTK_LOG_FILE",
+        "-u", "MMLTK_LOG_DIR",
+        "-u", "MMLTK_CACHE_ROOT",
+        "-u", "MMLTK_RELEASE_STAGE_ROOT",
+        "PATH=" + prepend_path_env(temp_dir / "bin"),
+        "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
+        "MMLTK_IMAGE=fake-mmltk",
+    };
+    command.insert(command.end(), environment.begin(), environment.end());
+    command.push_back((temp_dir / "mmltk").string());
+    command.insert(command.end(), arguments.begin(), arguments.end());
+    const SubprocessResult result = run_subprocess_capture_output(command);
+    INFO("wrapper stdout:\n" << result.stdout_text << "\nwrapper stderr:\n" << result.stderr_text);
+    MMLTK_ASSERT(result.exit_code == 0);
+    return read_text_lines(state_dir / "exec_1_args.txt");
 }
 
 void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
@@ -634,26 +693,31 @@ void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
     const fs::path log_dir = temp_dir / "logs";
     prepare_fake_docker_state(temp_dir, state_dir);
 
-    const SubprocessResult result = run_subprocess_capture_output({
-        "env",
-        "PATH=" + prepend_path_env(temp_dir / "bin"),
-        "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
-        "MMLTK_IMAGE=fake-mmltk",
-        "MMLTK_LOG_LEVEL=debug",
-        "MMLTK_LOG_FILE=" + log_path.string(),
-        "MMLTK_LOG_DIR=" + log_dir.string(),
-        locate_repo_wrapper_path().string(),
-        "--help",
-    });
-
-    MMLTK_ASSERT(result.exit_code == 0);
-    const std::vector<std::string> exec_args = read_text_lines(state_dir / "exec_1_args.txt");
-    assert_contains_line(exec_args, "-e");
+    const auto exec_args = capture_wrapper_logging_arguments(
+        temp_dir, state_dir,
+        {"MMLTK_LOG_LEVEL=debug", "MMLTK_LOG_FILE=" + log_path.string(), "MMLTK_LOG_DIR=" + log_dir.string()}, {"--help"});
+    assert_contains_line(exec_args, "--env");
     assert_contains_line(exec_args, "MMLTK_LOG_LEVEL=debug");
     assert_contains_line(exec_args, "MMLTK_LOG_FILE=/host" + log_path.string());
     assert_contains_line(exec_args, "MMLTK_LOG_DIR=/host" + log_dir.string());
     assert_contains_line(exec_args, "/opt/mmltk/bin/mmltk");
     assert_contains_line(exec_args, "--help");
+    MMLTK_ASSERT(!fs::exists(temp_dir / ".mmltk-data/logs"));
+
+    const std::string fallback = "MMLTK_LOG_DIR=/host" + (temp_dir / ".mmltk-data/logs").string();
+    for (const std::string level : {"", "info", "off", "OFF"}) {
+        const auto arguments = capture_wrapper_logging_arguments(
+            temp_dir, state_dir, level.empty() ? std::vector<std::string>{} : std::vector<std::string>{"MMLTK_LOG_LEVEL=" + level},
+            {"--help"});
+        MMLTK_ASSERT((std::find(arguments.begin(), arguments.end(), fallback) != arguments.end()) == (level == "info"));
+        MMLTK_ASSERT(fs::exists(temp_dir / ".mmltk-data/logs") == (level == "info"));
+        if (level.empty()) {
+            MMLTK_ASSERT(std::none_of(arguments.begin(), arguments.end(),
+                                      [](const auto& argument) { return argument.starts_with("MMLTK_LOG_"); }));
+        } else {
+            assert_contains_line(arguments, "MMLTK_LOG_LEVEL=" + level);
+        }
+    }
 
     cleanup_temp_dir(temp_dir);
 }
@@ -665,23 +729,9 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     const fs::path log_dir = temp_dir / "logdir";
     prepare_fake_docker_state(temp_dir, state_dir);
 
-    const SubprocessResult result = run_subprocess_capture_output({
-        "env",
-        "PATH=" + prepend_path_env(temp_dir / "bin"),
-        "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
-        "MMLTK_IMAGE=fake-mmltk",
-        locate_repo_wrapper_path().string(),
-        "--log-level",
-        "trace",
-        "--log-file",
-        log_path.string(),
-        "--log-dir",
-        log_dir.string(),
-        "--help",
-    });
-
-    MMLTK_ASSERT(result.exit_code == 0);
-    const std::vector<std::string> exec_args = read_text_lines(state_dir / "exec_1_args.txt");
+    const auto exec_args = capture_wrapper_logging_arguments(
+        temp_dir, state_dir, {},
+        {"--log-level", "trace", "--log-file", log_path.string(), "--log-dir", log_dir.string(), "--help"});
     assert_contains_line(exec_args, "/opt/mmltk/bin/mmltk");
     assert_contains_line(exec_args, "--log-level");
     assert_contains_line(exec_args, "trace");
@@ -690,6 +740,44 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     assert_contains_line(exec_args, "--log-dir");
     assert_contains_line(exec_args, "/host" + log_dir.string());
     assert_contains_line(exec_args, "--help");
+
+    struct LoggingCase {
+        std::vector<std::string> environment;
+        std::vector<std::string> arguments;
+        bool fallback;
+        bool invalid_level = false;
+    };
+    const std::vector<LoggingCase> cases{
+        {{}, {"--log-level", "info"}, true},
+        {{}, {"--log-level=debug"}, true},
+        {{}, {"--log-level=off"}, false},
+        {{"MMLTK_LOG_LEVEL=off"}, {"--log-level=info"}, true},
+        {{"MMLTK_LOG_LEVEL=debug"}, {"--log-level=off"}, false},
+        {{"MMLTK_LOG_LEVEL=off"}, {"--log-level=info", "--log-level="}, false},
+        {{"MMLTK_LOG_LEVEL=info"}, {"--log-level=off", "--log-level="}, true},
+        {{"MMLTK_LOG_LEVEL=info"}, {"--log-file", log_path.string()}, false},
+        {{"MMLTK_LOG_LEVEL=info"}, {"--log-dir=" + log_dir.string()}, false},
+        {{"MMLTK_LOG_FILE=" + log_path.string()}, {"--log-level=info"}, false},
+        {{"MMLTK_LOG_DIR=" + log_dir.string()}, {"--log-level=info"}, false},
+        {{}, {"--log-level=banana"}, false, true},
+        {{"MMLTK_LOG_LEVEL=banana"}, {"--log-level=info"}, false, true},
+        {{}, {"--log-level=banana", "--log-level=info"}, false, true},
+        {{}, {"--log-level"}, false},
+    };
+    const std::string fallback = "MMLTK_LOG_DIR=/host" + (temp_dir / ".mmltk-data/logs").string();
+    for (const auto& logging_case : cases) {
+        const auto arguments =
+            capture_wrapper_logging_arguments(temp_dir, state_dir, logging_case.environment, logging_case.arguments);
+        MMLTK_ASSERT((std::find(arguments.begin(), arguments.end(), fallback) != arguments.end()) == logging_case.fallback);
+        MMLTK_ASSERT(fs::exists(temp_dir / ".mmltk-data/logs") == logging_case.fallback);
+        if (logging_case.invalid_level) {
+            MMLTK_ASSERT(std::none_of(arguments.begin(), arguments.end(),
+                                      [](const auto& argument) { return argument.starts_with("MMLTK_LOG_DIR="); }));
+            for (const auto& entry : logging_case.environment) assert_contains_line(arguments, entry);
+            MMLTK_ASSERT(arguments.size() >= logging_case.arguments.size());
+            MMLTK_ASSERT(std::equal(logging_case.arguments.rbegin(), logging_case.arguments.rend(), arguments.rbegin()));
+        }
+    }
 
     cleanup_temp_dir(temp_dir);
 }

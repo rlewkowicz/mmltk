@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <format>
 #include <print>
+#include <spdlog/spdlog.h>
 
 #include "archive_utils.h"
 #include "detection_ops.h"

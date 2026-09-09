@@ -1,5 +1,6 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
+#include <spdlog/spdlog.h>
 #include <unistd.h>
 
 #include <algorithm>
