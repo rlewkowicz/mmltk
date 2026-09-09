@@ -35,6 +35,7 @@ pub enum Shortcut {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    InputFailed(crate::transport_connection::OutboundSendError),
     Shortcut(Shortcut),
     ShortcutResolved { shortcut: Shortcut, focused: bool },
     TextFocused,
@@ -131,6 +132,7 @@ impl Component {
             Message::CancelRequested => {
                 return Ok(self.canvas.cancel_pointer().map(Outcome::Pointer));
             }
+            Message::InputFailed(error) => Outcome::InputFailed(error),
             Message::OpenRequested => Outcome::OpenRequested,
             Message::SaveRequested => Outcome::SaveRequested,
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
@@ -167,7 +169,6 @@ impl Component {
                 timeline::Outcome::EditRequested(request) => Outcome::EditRequested(request),
             },
             Message::Workspace(message) => match workspace::update(message) {
-                workspace::Outcome::InputFailed(error) => Outcome::InputFailed(error),
                 workspace::Outcome::Gesture(gesture) => {
                     if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
                         self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -306,8 +307,7 @@ impl Component {
             |draft| draft.ui.workspaceaspectratio,
         );
         let workspace: Element<'a, Message> = container(
-            canvas::view(surface, aspect, settings_edit_available, canvas_width, self.canvas.dispatch(model, settings.draft.as_ref().map_or_else(|| crate::generated::default_uiannotationbrushradius().unwrap(), |draft| draft.ui.annotationbrushradius) as u16, self.keyboard_canvas.clone()))
-                .map(Message::Workspace),
+            canvas::view(surface, aspect, settings_edit_available, canvas_width, self.canvas.dispatch(model, settings.draft.as_ref().map_or_else(|| crate::generated::default_uiannotationbrushradius().unwrap(), |draft| draft.ui.annotationbrushradius) as u16, self.keyboard_canvas.clone())),
         )
         .into();
         let advanced = self

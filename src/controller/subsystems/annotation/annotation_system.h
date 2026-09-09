@@ -170,7 +170,6 @@ class AnnotationSystem final {
     ~AnnotationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
-    void Pointer(AnnotationPointer);
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(AnnotationInputBatch);
     void SetInputPeer(std::uint64_t, SystemEventSink<AnnotationInputProgress>);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);

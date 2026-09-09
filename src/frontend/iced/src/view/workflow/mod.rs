@@ -195,7 +195,6 @@ pub fn update_workspace(
 ) -> Result<Option<crate::view::settings::EditSchedule>, String> {
     match crate::view::workspace::update(message) {
         crate::view::workspace::Outcome::Gesture(_) => Ok(None),
-        crate::view::workspace::Outcome::InputFailed(error) => Err(error),
         crate::view::workspace::Outcome::AspectSelected(aspect) => {
             crate::view::workspace::edit_aspect(settings, aspect).map(Some)
         }

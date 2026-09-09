@@ -891,9 +891,9 @@ mod tests {
         let (connection, _capture) = Connection::test_channel();
         local.connection = Some(connection);
         drop(local.on_workspace(crate::view::router::Message::Annotation(
-            crate::view::annotation::Message::Workspace(crate::view::workspace::Message::InputFailed(
+            crate::view::annotation::Message::InputFailed(
                 crate::transport_connection::OutboundSendError::Closed,
-            )),
+            ),
         )));
         assert_persistent_owners_retired(&local);
     }

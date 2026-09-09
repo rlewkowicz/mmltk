@@ -114,40 +114,6 @@ class AnnotationSystem::Impl final {
         return admitted;
     }
 
-    void Pointer(const AnnotationPointer pointer) {
-        if (!pointer.valid()) throw contracts::InvalidIntentError("Annotation pointer input is invalid");
-        VisualExtent extent;
-        {
-            std::scoped_lock lock(mutex_);
-            RequireReady();
-            if (terminal_barrier_) throw contracts::UnavailableError("Annotation pointer ingress is resetting");
-            if (pointer.point.x < 0.0F || pointer.point.y < 0.0F || pointer.point.x > static_cast<float>(state_.frame.extent.width) ||
-                pointer.point.y > static_cast<float>(state_.frame.extent.height))
-                throw contracts::InvalidIntentError("Annotation pointer is outside the active image");
-            extent = state_.frame.extent;
-        }
-        auto work = [this, pointer, extent](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                            const std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
-            const auto input = runtime.BorrowInput();
-            if (!input.valid()) throw contracts::UnavailableError("Annotation source storage is unavailable");
-            const auto source = input.plane(0U).plane();
-            if (stop.stop_requested()) return {};
-            auto result = annotation_algorithm(runtime).Pointer(pointer);
-            runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
-                annotation_algorithm(runtime).Render(source, clean, semantic, stream);
-            });
-            auto frame = Frame(runtime, extent);
-            if (result.outcome == AnnotationOperationOutcome::Rejected)
-                return [this, ui = std::move(result.ui), detail = std::move(result.detail), frame]() mutable {
-                    Rejected(std::move(detail), false, std::move(ui), frame);
-                };
-            return [this, ui = std::move(result.ui), frame]() mutable { InstallInteraction(std::move(ui), frame); };
-        };
-        std::scoped_lock admission_lock(mutex_);
-        if (terminal_barrier_) throw contracts::UnavailableError("Annotation pointer ingress is resetting");
-        if (!worker_.SubmitOrdered(std::move(work))) { throw contracts::BusyError("Annotation pointer queue is full"); }
-    }
-
     void SetInputPeer(const std::uint64_t epoch, SystemEventSink<AnnotationInputProgress> progress) {
         bool ready = false;
         {
@@ -457,8 +423,16 @@ class AnnotationSystem::Impl final {
     void Failed(const std::exception_ptr failure) noexcept {
         auto detail = visual_failure_detail(failure, "Annotation GPU worker failed");
         AnnotationSnapshot failed;
+        SystemEventSink<AnnotationInputProgress> progress;
+        AnnotationInputProgress rejected;
         {
             std::scoped_lock lock(mutex_);
+            if (std::ranges::any_of(input_slots_, [this](const auto& slot) {
+                    return slot.occupied && slot.batch.epoch == input_epoch_;
+                })) {
+                progress = input_progress_;
+                rejected = {input_epoch_, consumed_sequence_, detail};
+            }
             state_.ready = false;
             state_.frame = {};
             state_.busy = false;
@@ -472,13 +446,6 @@ class AnnotationSystem::Impl final {
             failed = state_;
         }
         report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Annotation, settings_.device, detail);
-        SystemEventSink<AnnotationInputProgress> progress;
-        AnnotationInputProgress rejected;
-        {
-            std::scoped_lock lock(mutex_);
-            progress = input_progress_;
-            rejected = {input_epoch_, consumed_sequence_, detail};
-        }
         if (progress) progress(std::move(rejected));
         Publish(AnnotationFailed{std::move(failed), std::move(detail)});
     }
@@ -513,7 +480,6 @@ AnnotationSystem::AnnotationSystem(const VisualDeviceSettings settings, VisualRu
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(borrow_source), std::move(events), diagnostics)) {}
 AnnotationSystem::~AnnotationSystem() = default;
 AnnotationSnapshot AnnotationSystem::Open(const AnnotationOpen request) { return impl_->Open(request); }
-void AnnotationSystem::Pointer(const AnnotationPointer pointer) { impl_->Pointer(pointer); }
 void AnnotationSystem::Input(AnnotationInputBatch batch) { impl_->Input(std::move(batch)); }
 void AnnotationSystem::SetInputPeer(std::uint64_t epoch, SystemEventSink<AnnotationInputProgress> progress) { impl_->SetInputPeer(epoch, std::move(progress)); }
 AnnotationSnapshot AnnotationSystem::Edit(AnnotationEditRequest request) { return impl_->Edit(std::move(request)); }

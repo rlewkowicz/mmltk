@@ -269,7 +269,7 @@ impl Component {
         self.retained.lock().expect("annotation canvas").gesture.pointer_from_gesture(model, gesture)
     }
     pub fn dispatch(&self, model: &crate::view_model::ApplicationModel, radius: u16, keyboard: std::sync::Arc<std::sync::atomic::AtomicBool>)
-        -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<crate::view::workspace::Message> + Send + Sync> {
+        -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<super::Message> + Send + Sync> {
         {
             let mut retained = self.retained.lock().expect("annotation canvas");
             if retained.model.snapshot.as_ref().map(|value| value.revision) != model.annotation.snapshot.as_ref().map(|value| value.revision) {
@@ -290,7 +290,7 @@ impl Component {
             pointer.brushradius = *radius;
             let result = connection.as_mut().ok_or(crate::transport_connection::OutboundSendError::Closed)
                 .and_then(|connection| connection.send_annotation_pointer(pointer, model.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch)));
-            result.err().map(|error| crate::view::workspace::Message::InputFailed(error))
+            result.err().map(|error| super::Message::InputFailed(error))
         })
     }
 }
@@ -300,12 +300,12 @@ pub(super) fn view(
     aspect: crate::generated::WorkspaceAspectRatio,
     settings_available: bool,
     width: f32,
-    local: std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<crate::view::workspace::Message> + Send + Sync>,
-) -> crate::fluent_theme::Element<'static, crate::view::workspace::Message> {
+    local: std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<super::Message> + Send + Sync>,
+) -> crate::fluent_theme::Element<'static, super::Message> {
     use crate::view::workspace;
     use iced::widget::{column, container, shader, text};
     let (width, height) = workspace::surface_extent(width, aspect);
-    let image: crate::fluent_theme::Element<'static, workspace::Message> = surface.map_or_else(
+    let image: crate::fluent_theme::Element<'static, super::Message> = surface.map_or_else(
         || {
             container(text("Open an image from Explore to begin annotating"))
                 .center(iced::Fill)
@@ -329,7 +329,7 @@ pub(super) fn view(
             aspect,
             settings_available,
             crate::view::aspect_ratio::Scope::Workspace,
-            workspace::Message::AspectSelected
+            |aspect| super::Message::Workspace(workspace::Message::AspectSelected(aspect))
         ),
         container(
             container(image)
