@@ -106,9 +106,8 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
     }
     [[nodiscard]] bool cancellation_failure_only() const noexcept {
         std::scoped_lock lock(mutex_);
-        return !overflow_ &&
-               std::ranges::all_of(std::span{errors_}.first(static_cast<std::size_t>(count_)),
-                                   [](const auto code) { return code == nvinfer1::ErrorCode::kFAILED_EXECUTION; });
+        return !overflow_ && std::ranges::all_of(std::span{errors_}.first(static_cast<std::size_t>(count_)),
+                                                 [](const auto code) { return code == nvinfer1::ErrorCode::kFAILED_EXECUTION; });
     }
 
    private:

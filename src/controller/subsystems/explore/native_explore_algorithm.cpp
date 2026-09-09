@@ -127,8 +127,7 @@ class ExploreAcceptanceGate::Impl final {
                 if (initial_released_generation_ != current_generation_) release_one_ = true;
             } else if (command.value == 2U) {
                 // Already latched before the generation-local stale check.
-            }
-            else
+            } else
                 terminal_ = true;
             changed_.notify_all();
         }
@@ -147,7 +146,7 @@ class ExploreAcceptanceGate::Impl final {
     }
 
     [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot,
-                                                const std::uint64_t compiled_index, const std::uint64_t staging_bytes) {
+                                                 const std::uint64_t compiled_index, const std::uint64_t staging_bytes) {
         ControlObservation observation{.event = ControlEvent::HeldWait,
                                        .generation = generation,
                                        .slot = slot,
@@ -181,8 +180,7 @@ class ExploreAcceptanceGate::Impl final {
             lock.lock();
             reader_ = false;
             changed_.notify_all();
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_)
-                return finish(WaitResult::Stale);
+            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) return finish(WaitResult::Stale);
             if (command.generation_changed) continue;
             if (command.value == 4U) return finish(WaitResult::Proceed);
             terminal_ = true;

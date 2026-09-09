@@ -218,7 +218,8 @@ struct VisualDiagnosticSink final {
             write_batch(context, facts);
             return;
         }
-        for (const auto& fact : facts) write(context, fact);
+        for (const auto& fact : facts)
+            write(context, fact);
     }
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
@@ -245,7 +246,8 @@ struct VisualDiagnosticSink final {
                 constexpr std::size_t capacity = 25U;
                 auto& runtime_target = *static_cast<services::RuntimeDiagnosticTarget*>(context);
                 if (facts.size() > capacity) {
-                    for (const auto& fact : facts) runtime_target.write(visual_runtime_diagnostic(fact));
+                    for (const auto& fact : facts)
+                        runtime_target.write(visual_runtime_diagnostic(fact));
                     return;
                 }
                 std::array<services::RuntimeDiagnosticFact, capacity> runtime_facts;

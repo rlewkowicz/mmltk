@@ -484,7 +484,7 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(c
 }
 
 DiagnosticSubmitResult DiagnosticsProducer::Operation::try_submit_encoded_batch(const std::size_t count, void* const context,
-                                                                                 const EncodedBatchWriter writer) const noexcept {
+                                                                                const EncodedBatchWriter writer) const noexcept {
     if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
     if (count == 0U) return DiagnosticSubmitResult::Accepted;
     if (writer == nullptr || count > DiagnosticsClient::kQueueCapacity) {

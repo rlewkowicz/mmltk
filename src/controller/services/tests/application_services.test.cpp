@@ -451,9 +451,7 @@ TEST_CASE("runtime trace overflow never waits for a stalled background writer", 
     for (std::size_t index = 0U; index < DiagnosticsClient::kQueueCapacity + 2U; ++index)
         runtime.target().write({.event = "capacity", .sequence = index});
     CHECK(diagnostics.counters().dropped >= 2U);
-    auto required = std::async(std::launch::async, [target = runtime.target()] {
-        target.write_required({.event = "shutdown.complete"});
-    });
+    auto required = std::async(std::launch::async, [target = runtime.target()] { target.write_required({.event = "shutdown.complete"}); });
     const auto required_ready = required.wait_for(std::chrono::seconds{2});
     if (required_ready != std::future_status::ready) diagnostics.close(DiagnosticsCloseMode::Discard);
     REQUIRE(required_ready == std::future_status::ready);
@@ -641,7 +639,8 @@ TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]")
     require_one_terminal_wake(diagnostics);
     std::ifstream input{path};
     std::string last;
-    for (std::string line; std::getline(input, line);) last = std::move(line);
+    for (std::string line; std::getline(input, line);)
+        last = std::move(line);
     CHECK(last.contains(R"("event":"shutdown.complete")"));
 }
 

@@ -99,8 +99,7 @@ struct ExploreOrderFacts final {
     std::uint64_t shuffle_seed = 0U;
     [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<std::uint32_t> visible_indices{};
 };
-[[nodiscard]] constexpr std::uint64_t explore_visible_indices_digest(
-    const std::span<const std::uint32_t> visible_indices) noexcept {
+[[nodiscard]] constexpr std::uint64_t explore_visible_indices_digest(const std::span<const std::uint32_t> visible_indices) noexcept {
     constexpr std::uint64_t offset = 14'695'981'039'346'656'037ULL;
     constexpr std::uint64_t prime = 1'099'511'628'211ULL;
     std::uint64_t digest = offset;
@@ -110,7 +109,8 @@ struct ExploreOrderFacts final {
             digest *= prime;
         }
     };
-    for (const auto compiled_index : visible_indices) append(compiled_index);
+    for (const auto compiled_index : visible_indices)
+        append(compiled_index);
     append(static_cast<std::uint32_t>(visible_indices.size()));
     return digest;
 }

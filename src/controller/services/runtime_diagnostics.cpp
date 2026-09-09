@@ -380,8 +380,7 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
         };
         BatchContext context{
             .facts = facts,
-            .steady_ns =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+            .steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),
         };
         static_cast<void>(operation.try_submit_encoded_batch(
             facts.size(), &context,

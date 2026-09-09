@@ -775,8 +775,7 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
                 slot.runtime->mark_consumed(stream);
             } catch (...) { throw ImageUpscalerUnsettledFailure{primary, std::current_exception()}; }
             if (retire_runtime) {
-                if (slot.runtime->Stop() != cudaSuccess)
-                    throw ImageUpscalerUnsettledFailure{primary, slot.runtime->cleanup_failure()};
+                if (slot.runtime->Stop() != cudaSuccess) throw ImageUpscalerUnsettledFailure{primary, slot.runtime->cleanup_failure()};
                 slot.runtime.reset();
             }
         }
@@ -867,9 +866,7 @@ ImageUpscalerStatus ImageUpscaler::Stop() noexcept {
         client_ = {};
     }
     const cudaError_t failure = owner_->Stop();
-    if (failure == cudaSuccess) {
-        owner_.reset();
-    }
+    if (failure == cudaSuccess) { owner_.reset(); }
     return static_cast<ImageUpscalerStatus>(failure);
 }
 

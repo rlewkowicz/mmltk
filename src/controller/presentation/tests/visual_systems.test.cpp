@@ -2860,9 +2860,7 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         CHECK(restored.order.visible_indices == committed.order.visible_indices);
         CHECK((rejection == Rejection::Cancelled) == restored.failure.empty());
         CHECK(scenario.failure_count() == (rejection == Rejection::Cancelled ? 0U : 1U));
-        REQUIRE(scenario.probe().Wait([&] {
-            return scenario.probe().rollbacks != 0U && scenario.probe().assignments.size() == 2U;
-        }));
+        REQUIRE(scenario.probe().Wait([&] { return scenario.probe().rollbacks != 0U && scenario.probe().assignments.size() == 2U; }));
         {
             std::scoped_lock lock(scenario.probe().mutex);
             CHECK(scenario.probe().aborted_assignments >= 2U);
@@ -5368,12 +5366,9 @@ TEST_CASE("TensorRT build progress accepts cancellation without an initializatio
     };
     std::optional<TensorRtEngine> engine;
     try {
-        engine.emplace(mmltk::common::system::runtime_paths::repository_root() /
-                           "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx",
+        engine.emplace(mmltk::common::system::runtime_paths::repository_root() / "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx",
                        std::move(options));
-    } catch (const TensorRtOperationError& failure) {
-        FAIL("TensorRT cancellation reported operation error code " << failure.code());
-    }
+    } catch (const TensorRtOperationError& failure) { FAIL("TensorRT cancellation reported operation error code " << failure.code()); }
     REQUIRE(engine);
     CHECK(engine->cancelled());
     CHECK(engine->native_engine_handle() == 0U);
