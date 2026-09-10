@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/detail/gdr_buffer_backend.h"
 #include "third_party/gdrcopy/src/gdr_backend_selection.h"
@@ -15,6 +16,8 @@
 #include <cerrno>
 #include <limits>
 #include <mutex>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -56,9 +59,7 @@ class FakeGdrBackend final : public detail::GdrBufferBackend {
     std::size_t exported_fds = 0, closed_fds = 0;
     std::size_t copied = 0, waits = 0, context_waits = 0, events_created = 0, events_destroyed = 0;
     CUdeviceptr sync_allocation = 0;
-    bool defer_copy = false, copy_entered = false, release_copy = false;
-    std::mutex gate_mutex;
-    std::condition_variable gate;
+    std::optional<mmltk::testsupport::TestGate::Receipt> copy_gate;
 
     void fail(const char* operation) {
         if (failure == operation) {
@@ -161,14 +162,7 @@ class FakeGdrBackend final : public detail::GdrBufferBackend {
     }
     void copy(std::uintptr_t, void* destination, const void* source, std::size_t bytes) override {
         fail("copy");
-        {
-            std::unique_lock lock(gate_mutex);
-            if (defer_copy) {
-                copy_entered = true;
-                gate.notify_all();
-                gate.wait(lock, [&] { return release_copy; });
-            }
-        }
+        if (copy_gate) copy_gate->ArriveAndWait();
         std::memcpy(destination, source, bytes);
         ++copied;
     }
@@ -396,23 +390,13 @@ TEST_CASE("Independent mapped owners register and copy while another CPU writer 
     auto second = std::make_shared<FakeGdrBackend>();
     GdrMappedBuffer existing(owner_context, 1, first);
     existing.ensure_bytes(1);
-    first->defer_copy = true;
+    mmltk::testsupport::TestGate gate{"independent mapped CPU copy"};
+    first->copy_gate = gate.receipt();
     std::array<std::byte, 3> bytes{};
     auto copying = std::async(std::launch::async, [&] { return existing.write(0, bytes); });
-    struct CopyGate final {
-        FakeGdrBackend& backend;
-        ~CopyGate() {
-            std::lock_guard lock(backend.gate_mutex);
-            backend.release_copy = true;
-            backend.gate.notify_all();
-        }
-    };
+    mmltk::testsupport::ScopedTestCleanup release{[&] { gate.Release(); }};
     {
-        CopyGate release{*first};
-        {
-            std::unique_lock lock(first->gate_mutex);
-            first->gate.wait(lock, [&] { return first->copy_entered; });
-        }
+        REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
         GdrMappedBuffer registering(owner_context, 1, second);
         registering.ensure_bytes(1);
         REQUIRE(registering.write(0, bytes));
@@ -421,7 +405,9 @@ TEST_CASE("Independent mapped owners register and copy while another CPU writer 
         CHECK(second->copied == 1);
         CHECK(first->copied == 0);
     }
-    CHECK(copying.get());
+    gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(copying, "released independent mapped copy"));
+    CHECK(gate.WaitSettled(std::chrono::seconds{2}));
 }
 
 TEST_CASE("Mapped retirement retries retain dependent resources and zero capacity stays empty", "[frameworks][gpu][gdr]") {
@@ -459,17 +445,16 @@ TEST_CASE("Cancellation cannot relinquish an active mapped CPU writer", "[framew
     CHECK_FALSE(buffer.write(0, bytes, cancellation.get_token()));
     CHECK(api->copied == 0);
     cancellation = std::stop_source{};
-    api->defer_copy = true;
+    mmltk::testsupport::TestGate gate{"cancel active mapped CPU copy"};
+    api->copy_gate = gate.receipt();
     auto writing = std::async(std::launch::async, [&] { return buffer.write(0, bytes, cancellation.get_token()); });
-    {
-        std::unique_lock lock(api->gate_mutex);
-        api->gate.wait(lock, [&] { return api->copy_entered; });
-        cancellation.request_stop();
-        CHECK(api->freed == 0);
-        api->release_copy = true;
-        api->gate.notify_all();
-    }
-    CHECK(writing.get());
+    mmltk::testsupport::ScopedTestCleanup release{[&] { cancellation.request_stop(); gate.Release(); }};
+    REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
+    cancellation.request_stop();
+    CHECK(api->freed == 0);
+    gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(writing, "cancelled mapped CPU writer"));
+    CHECK(gate.WaitSettled(std::chrono::seconds{2}));
     CHECK(api->copied == 1);
     buffer.close();
     CHECK(api->freed == 1);
@@ -553,7 +538,9 @@ struct HardwareConsumer final {
 };
 
 CUdevice hardware_device() {
-    if (cuInit(0) != CUDA_SUCCESS) SKIP("CUDA unavailable; GDR hardware behavior unverified");
+    const auto initialized = cuInit(0);
+    if (initialized == CUDA_ERROR_NO_DEVICE) SKIP("No CUDA-visible GPU; GDR hardware behavior unverified");
+    REQUIRE(initialized == CUDA_SUCCESS);
     int count{};
     REQUIRE(cuDeviceGetCount(&count) == CUDA_SUCCESS);
     if (!count) SKIP("No CUDA-visible GPU; GDR hardware behavior unverified");
@@ -566,25 +553,28 @@ CUdevice hardware_device() {
 }
 void require_hardware_backend() {
     const auto api = detail::gdr_buffer_backend();
-    void* handle{};
-    try {
-        handle = api->open();
-    } catch (const std::runtime_error& error) {
-        SKIP(std::string("GDR backend unavailable; hardware transfer unverified: ") + error.what());
-    }
+    const auto retire = [api](void* handle) noexcept { (void)api->close(handle); };
+    std::unique_ptr<void, decltype(retire)> handle{nullptr, retire};
+    const auto close_preflight = [&] {
+        if (!handle) return;
+        const auto result = api->close(handle.get());
+        if (result == 0) static_cast<void>(handle.release());
+        REQUIRE(result == 0);
+    };
     bool dmabuf{};
     try {
-        dmabuf = api->uses_dmabuf(handle);
+        handle.reset(api->open());
+        dmabuf = api->uses_dmabuf(handle.get());
         api->require_device_support(dmabuf, api->current_device());
-    } catch (const std::runtime_error& error) {
-        (void)api->close(handle);
-        SKIP(std::string("Selected GPU lacks required support; hardware transfer unverified: ") + error.what());
+    } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable& error) {
+        close_preflight();
+        SKIP(std::string("GDR transport unsupported; hardware transfer unverified: ") + error.what());
     }
-    REQUIRE(api->close(handle) == 0);
+    close_preflight();
     if (const char* expected = std::getenv("MMLTK_GDR_TEST_BACKEND")) {
         const std::string backend(expected);
         REQUIRE((backend == "gdrdrv" || backend == "dmabuf"));
-        if (dmabuf != (backend == "dmabuf")) SKIP("Requested GDR backend is unavailable; that backend remains unverified");
+        REQUIRE(dmabuf == (backend == "dmabuf"));
     }
     INFO("GDR hardware backend: " << (dmabuf ? "dmabuf" : "gdrdrv"));
 }
@@ -683,10 +673,12 @@ TEST_CASE("Independent GDR handles copy while another isolated owner registers a
         }
         stable.close();
     };
-    auto copies = std::async(std::launch::async, worker, false);
-    auto registrations = std::async(std::launch::async, worker, true);
+    std::future<void> copies, registrations;
+    mmltk::testsupport::ScopedTestCleanup release_workers{[&] { mmltk::testsupport::release_test_promise(start); }};
+    copies = std::async(std::launch::async, worker, false);
+    registrations = std::async(std::launch::async, worker, true);
     start.set_value();
-    REQUIRE_NOTHROW(copies.get());
-    REQUIRE_NOTHROW(registrations.get());
+    CHECK_NOTHROW(mmltk::testsupport::await_test_future(copies, "hardware GDR copying worker", std::chrono::seconds{120}));
+    CHECK_NOTHROW(mmltk::testsupport::await_test_future(registrations, "hardware GDR registration worker", std::chrono::seconds{120}));
 }
 }  // namespace

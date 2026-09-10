@@ -144,6 +144,8 @@ void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
 }  // namespace
 
 TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal", "[gui][services][firefox][lifecycle]") {
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, true) == 0);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, false) == 1);
     CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0, .stop_requested = true}, true) == 0);
     CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 17, .stop_requested = true}, true) == 17);
     CHECK(browser_runtime_exit_status(

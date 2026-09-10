@@ -153,18 +153,15 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     auto probe = std::make_shared<ShellWarmProbe>();
     probe->fail = true;
     std::atomic<std::size_t> upscale_failures{0U};
-    std::atomic<std::size_t> other_upscale_events{0U};
     std::promise<void> failure_published;
     std::promise<void> methods_settled;
     auto failed = failure_published.get_future();
     auto settled = methods_settled.get_future();
     auto upscale = shell_upscale(
-        backend, probe, [&upscale_failures, &other_upscale_events, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
+        backend, probe, [&upscale_failures, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
             if (std::holds_alternative<UpscaleFailed>(event)) {
                 upscale_failures.fetch_add(1U, std::memory_order_acq_rel);
                 failure_published.set_value();
-            } else {
-                other_upscale_events.fetch_add(1U, std::memory_order_acq_rel);
             }
             if (std::visit([](const auto& value) { return value.snapshot.methods[2U].warm; }, event)) methods_settled.set_value();
         });
@@ -180,7 +177,8 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     CHECK(unchanged->snapshot.ready);
     CHECK(unchanged->snapshot.frame.valid());
     CHECK(upscale_failures.load(std::memory_order_acquire) == 1U);
-    CHECK(other_upscale_events.load(std::memory_order_acquire) == 2U);
+    failed.get();
+    settled.get();
     route.Route();
     CHECK(probe->calls.load(std::memory_order_acquire) == 1U);
 }

@@ -1,9 +1,11 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/common/concurrency/worker_pool.h"
 
 #include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <cstddef>
+#include <chrono>
 #include <future>
 #include <mutex>
 #include <set>
@@ -94,34 +96,33 @@ TEST_CASE("WorkerPool clamps and pins worker threads", "[common][concurrency][wo
     WorkerPool pool(subset.size() + 4, subset, "twp");
     REQUIRE(pool.size() == subset.size());
 
-    std::atomic<int> ready{0};
-    std::atomic<bool> release{false};
+    mmltk::testsupport::TestGate gate{"pinned worker mask captured"};
     std::vector<std::future<std::vector<int>>> futures;
     futures.reserve(pool.size());
+    mmltk::testsupport::ScopedTestCleanup release_workers{[&] {
+        gate.Release();
+        try { pool.wait_idle(); } catch (...) {}
+    }};
     for (std::size_t index = 0; index < pool.size(); ++index) {
         futures.push_back(pool.enqueue([&] {
             std::vector<int> mask = allowed_cpu_set();
-            ready.fetch_add(1, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
+            gate.receipt().ArriveAndWait();
             return mask;
         }));
     }
 
-    while (ready.load(std::memory_order_acquire) != static_cast<int>(pool.size())) {
-        std::this_thread::yield();
-    }
-    release.store(true, std::memory_order_release);
+    REQUIRE(gate.WaitEntered(std::chrono::seconds{2}, pool.size()));
+    gate.Release();
 
     std::set<int> observed;
     for (auto& future : futures) {
-        const std::vector<int> mask = future.get();
+        const std::vector<int> mask = mmltk::testsupport::await_test_future(future, "released pinned worker");
         REQUIRE(mask.size() == 1);
         REQUIRE(std::find(subset.begin(), subset.end(), mask.front()) != subset.end());
         observed.insert(mask.front());
     }
     REQUIRE(observed.size() == pool.size());
+    CHECK(gate.WaitSettled(std::chrono::seconds{2}, pool.size()));
 }
 
 TEST_CASE("parallel range workers are pinned", "[common][concurrency][worker_pool]") {
@@ -151,23 +152,21 @@ TEST_CASE("WorkerPool detached failures wake waiters and close admission", "[com
 TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "[common][concurrency][worker_pool]") {
     WorkerPool pool(1U, {}, "queue-order", 3U);
     std::vector<int> observed;
+    mmltk::testsupport::ScopedTestCleanup settle_fifo{[&] { try { pool.wait_idle(); } catch (...) {} }};
     std::vector<int> expected;
     for (int round = 0; round < 4; ++round) {
-        std::promise<void> entered;
-        std::promise<void> release;
-        const auto proceed = release.get_future().share();
-        pool.enqueue_detached([&entered, proceed] {
-            entered.set_value();
-            proceed.wait();
+        mmltk::testsupport::TestGate gate{"FIFO worker admission"};
+        pool.enqueue_detached([receipt = gate.receipt()] {
+            receipt.ArriveAndWait();
         });
-        entered.get_future().wait();
+        REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
         const int count = round == 1 ? 19 : 7;
         for (int index = 0; index < count; ++index) {
             const int value = round * 100 + index;
             expected.push_back(value);
             pool.enqueue_detached([&observed, value] { observed.push_back(value); });
         }
-        release.set_value();
+        gate.Release();
         pool.wait_idle();
         REQUIRE(observed == expected);
     }
@@ -177,17 +176,14 @@ TEST_CASE("WorkerPool shutdown drains previously admitted FIFO work after detach
     std::future<int> accepted;
     {
         WorkerPool pool(1U, {}, "queue-failure", 1U);
-        std::promise<void> entered;
-        std::promise<void> release;
-        const auto proceed = release.get_future().share();
-        pool.enqueue_detached([&entered, proceed] {
-            entered.set_value();
-            proceed.wait();
+        mmltk::testsupport::TestGate gate{"FIFO worker admission"};
+        pool.enqueue_detached([receipt = gate.receipt()] {
+            receipt.ArriveAndWait();
             throw std::runtime_error("detached failure before accepted work");
         });
-        entered.get_future().wait();
+        REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
         accepted = pool.enqueue([] { return 31; });
-        release.set_value();
+        gate.Release();
         REQUIRE_THROWS_AS(pool.wait_idle(), std::runtime_error);
     }
     REQUIRE(accepted.get() == 31);

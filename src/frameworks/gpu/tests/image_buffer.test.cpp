@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/exported_image_buffer.h"
@@ -417,10 +418,13 @@ TEST_CASE("borrowed image storage remains stable until receiver completion") {
     runtime.Publish(8U, 8U, [](auto, auto, auto) {});
     auto borrowed = runtime.Borrow();
 
+    SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(runtime.TryAcquireOutput(baseline).valid());
     auto writer = std::async(std::launch::async, [&runtime] { runtime.Publish(16U, 16U, [](auto, auto, auto) {}); });
-    CHECK(writer.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup release_borrow{[&] { borrowed = {}; }};
     borrowed = {};
-    CHECK(writer.wait_for(1s) == std::future_status::ready);
+    REQUIRE(writer.wait_for(1s) == std::future_status::ready);
+    writer.get();
 }
 
 TEST_CASE("multi-plane products copy atomically and reject self copy") {
@@ -562,9 +566,11 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
     CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(1U).plane().data) == 0x65U);
     CHECK(*reinterpret_cast<const std::uint8_t*>(incumbent.plane(1U).plane().data) == 0x43U);
 
+    SystemImageRuntime::CompletedOutput unavailable_baseline;
+    REQUIRE_FALSE(runtime.TryAcquireOutput(unavailable_baseline).valid());
     std::stop_source stop;
     auto admission = std::async(std::launch::async, [&runtime, token = stop.get_token()] { return runtime.AcquireOutput(token); });
-    CHECK(admission.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup stop_admission{[&] { stop.request_stop(); }};
     incumbent = {};
     REQUIRE(admission.wait_for(1s) == std::future_status::ready);
     CHECK(admission.get().valid());
@@ -811,11 +817,12 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
     auto borrowed = baseline.Borrow();
     auto plane = std::move(borrowed).TakePlane(0U);
     borrowed = {};
+    REQUIRE_FALSE(runtime.TryAcquireOutput(baseline).valid());
     std::stop_source stop;
     auto admission = std::async(std::launch::async, [&runtime, baseline = std::move(baseline), token = stop.get_token()]() mutable {
         return runtime.AcquireOutput(token, std::move(baseline));
     });
-    CHECK(admission.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup stop_admission{[&] { stop.request_stop(); }};
     plane = {};
     const auto status = admission.wait_for(1s);
     if (status != std::future_status::ready) stop.request_stop();
@@ -840,13 +847,20 @@ TEST_CASE("retained completed handles bound admission and stopping releases its 
     SystemImageRuntime runtime{{.device = 0, .backend = backend}};
     runtime.Publish(8U, 8U, [](auto, auto, auto) {});
     auto retained = runtime.Completed();
+    SystemImageRuntime::CompletedOutput unavailable_baseline;
+    REQUIRE_FALSE(runtime.TryAcquireOutput(unavailable_baseline).valid());
+    // The public reservation attempt proves capacity pressure. Cancellation
+    // must settle with custody still held whether it wins before or after the
+    // private condition-variable wait registers; no scheduling delay proves
+    // which interleaving occurred.
     std::stop_source stop;
     auto waiting = std::async(std::launch::async, [&] { return runtime.AcquireOutput(stop.get_token()); });
-    CHECK(waiting.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup stop_admission{[&] { stop.request_stop(); }};
     stop.request_stop();
     REQUIRE(waiting.wait_for(1s) == std::future_status::ready);
     CHECK_FALSE(waiting.get().valid());
     CHECK(retained.valid());
+    CHECK(runtime.OutputFacts().revision == retained.revision());
     CHECK(backend->planes_allocated == 1U);
 }
 
@@ -1097,6 +1111,7 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_events = true;
+    auto event_gate = backend->HoldEventWaits("deferred producer event wait");
     auto source = make_clean_semantic_runtime(backend);
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     DeviceContext context{0, backend};
@@ -1106,7 +1121,9 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
         stream.Await(product);
         return product.plane(0U).revision();
     });
-    CHECK(reading.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup release_reader{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    REQUIRE(event_gate->WaitEntered(1s));
+    event_gate->Release();
     backend->CompleteEvents();
     REQUIRE(reading.wait_for(1s) == std::future_status::ready);
     CHECK(reading.get() == 1U);
@@ -1150,10 +1167,13 @@ TEST_CASE("receiver completion releases product access across threads but retain
     completion.emplace(source->Borrow());
     CHECK(completion->pending());
     const auto before = available.load();
+    SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(source->TryAcquireOutput(baseline).valid());
     auto writer = std::async(std::launch::async, [&] { source->Publish(8U, 8U, [](auto, auto, auto) {}); });
-    CHECK(writer.wait_for(10ms) == std::future_status::timeout);
-    auto callback = std::async(std::launch::async, [&] { completion->Complete(); });
-    callback.get();
+    std::future<void> callback;
+    mmltk::testsupport::ScopedTestCleanup release_completion{[&] { if (completion) completion->Complete(); }};
+    callback = std::async(std::launch::async, [&] { completion->Complete(); });
+    mmltk::testsupport::await_test_future(callback, "receiver completion callback");
     CHECK_FALSE(completion->pending());
     CHECK(available.load() > before);
     // A one-slot producer can reuse its planes before diagnostic ownership of
@@ -1227,13 +1247,17 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_events = true;
+    auto event_gate = backend->HoldEventWaits("deferred producer event wait");
     auto source = make_clean_semantic_runtime(backend);
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     auto receiver = make_clean_semantic_runtime(backend);
     auto copy = std::async(std::launch::async, [&] { return receiver.CopyFrom(source.Borrow()); });
-    CHECK(copy.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup release_copy{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    REQUIRE(event_gate->WaitEntered(1s));
+    event_gate->Release();
     backend->CompleteEvents();
     REQUIRE(copy.wait_for(1s) == std::future_status::ready);
+    static_cast<void>(copy.get());
     CHECK(receiver.OutputFacts().revision == 1U);
 }
 
@@ -1244,10 +1268,11 @@ TEST_CASE("final borrowed view retires on the owning runtime path") {
     runtime->Publish(8U, 8U, [](auto, auto, auto) {});
     auto borrowed = runtime->Borrow();
     auto retirement = std::async(std::launch::async, [owner = std::move(runtime)]() mutable { owner.reset(); });
-    CHECK(retirement.wait_for(10ms) == std::future_status::timeout);
+    mmltk::testsupport::ScopedTestCleanup release_borrow{[&] { borrowed = {}; }};
     CHECK(backend->contexts_destroyed == 0U);
     borrowed = {};
-    CHECK(retirement.wait_for(1s) == std::future_status::ready);
+    REQUIRE(retirement.wait_for(1s) == std::future_status::ready);
+    retirement.get();
     CHECK(backend->contexts_destroyed == 1U);
 }
 

@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/websocket_test_utils.hpp"
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -13,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cerrno>
 #include <condition_variable>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +27,7 @@
 #include <ranges>
 #include <span>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -384,6 +387,7 @@ class LoopbackWebSocket final {
         REQUIRE(descriptor_.get() >= 0);
         timeval timeout{.tv_sec = 2, .tv_usec = 0};
         REQUIRE(::setsockopt(descriptor_.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
+        REQUIRE(::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) == 0);
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_port = htons(port);
@@ -395,12 +399,14 @@ class LoopbackWebSocket final {
                                     "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                                     "Sec-WebSocket-Version: 13\r\n\r\n";
-        REQUIRE(::send(descriptor_.get(), request.data(), request.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(request.size()));
+        write_exact(request);
         std::string response;
         while (response.find("\r\n\r\n") == std::string::npos) {
             char byte = '\0';
-            const ssize_t received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0);
+            ssize_t received;
+            do { received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0); } while (received < 0 && errno == EINTR);
             if (received == 0) {
+                REQUIRE(response.empty());
                 REQUIRE(handshake == HandshakePolicy::AllowPeerClose);
                 return;
             }
@@ -412,7 +418,7 @@ class LoopbackWebSocket final {
 
     [[nodiscard]] std::optional<WebSocketFrame> receive() {
         std::array<std::byte, 2U> header{};
-        if (!read_exact(header)) return std::nullopt;
+        if (!read_exact(header, true)) return std::nullopt;
         WebSocketFrame frame{
             .opcode = static_cast<std::uint8_t>(std::to_integer<unsigned int>(header[0]) & 0x0fU),
             .payload = {},
@@ -436,31 +442,33 @@ class LoopbackWebSocket final {
     }
 
     void send_binary(const std::span<const std::byte> payload) {
-        std::vector<std::byte> frame;
-        frame.push_back(std::byte{0x82});
-        if (payload.size() < 126U) {
-            frame.push_back(std::byte{static_cast<unsigned char>(0x80U | payload.size())});
-        } else {
-            REQUIRE(payload.size() <= 65535U);
-            frame.push_back(std::byte{0xfe});
-            frame.push_back(std::byte{static_cast<unsigned char>(payload.size() >> 8U)});
-            frame.push_back(std::byte{static_cast<unsigned char>(payload.size())});
-        }
-        constexpr std::array mask{std::byte{0x31}, std::byte{0x41}, std::byte{0x59}, std::byte{0x26}};
-        frame.insert(frame.end(), mask.begin(), mask.end());
-        for (std::size_t index = 0U; index < payload.size(); ++index)
-            frame.push_back(payload[index] ^ mask[index % mask.size()]);
-        REQUIRE(::send(descriptor_.get(), frame.data(), frame.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(frame.size()));
+        write_exact(mmltk::testsupport::masked_websocket_frame(2U, payload));
     }
 
    private:
+    void write_exact(std::string_view bytes) {
+        while (!bytes.empty()) {
+            const auto count = ::send(descriptor_.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) throw std::runtime_error("WebSocket write failed: " + std::string(std::strerror(errno)));
+            bytes.remove_prefix(static_cast<std::size_t>(count));
+        }
+    }
     template <std::ranges::contiguous_range Range>
-    [[nodiscard]] bool read_exact(Range&& destination) {
+    [[nodiscard]] bool read_exact(Range&& destination, bool allow_clean_eof = false) {
         auto bytes = std::as_writable_bytes(std::span{destination});
         std::size_t offset = 0U;
         while (offset != bytes.size()) {
             const auto count = ::recv(descriptor_.get(), bytes.data() + offset, bytes.size() - offset, 0);
-            if (count <= 0) return false;
+            if (count < 0 && errno == EINTR) continue;
+            if (count == 0) {
+                if (allow_clean_eof && offset == 0U) return false;
+                throw std::runtime_error("WebSocket frame truncated");
+            }
+            if (count < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) throw std::runtime_error("WebSocket receive deadline expired");
+                throw std::runtime_error("WebSocket receive failed: " + std::string(std::strerror(errno)));
+            }
             offset += static_cast<std::size_t>(count);
         }
         return true;

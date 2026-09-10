@@ -310,16 +310,23 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
     mmltk::frameworks::gpu::SystemImageRuntime source{{.device = 0, .backend = backend}};
     mmltk::frameworks::gpu::SystemImageRuntime receiver{{.device = 0, .backend = backend}};
     backend->defer_events = true;
+    auto event_gate = backend->HoldEventWaits("receiver source event wait");
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     auto borrowed = source.Borrow();
     REQUIRE(borrowed.valid());
 
-    auto copy = std::async(std::launch::async, [&receiver, product = std::move(borrowed)]() mutable {
+    std::future<void> copy;
+    std::future<void> superseding_publish;
+    mmltk::testsupport::ScopedTestCleanup release_wait{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    copy = std::async(std::launch::async, [&receiver, product = std::move(borrowed)]() mutable {
         static_cast<void>(receiver.CopyFrom(std::move(product)));
     });
-    auto superseding_publish = std::async(std::launch::async, [&source] { source.Publish(4U, 4U, [](auto, auto, auto) {}); });
-    CHECK(superseding_publish.wait_for(100ms) == std::future_status::timeout);
+    REQUIRE(event_gate->WaitEntered(2s));
+    mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
+    superseding_publish = std::async(std::launch::async, [&source] { source.Publish(4U, 4U, [](auto, auto, auto) {}); });
 
+    event_gate->Release();
     backend->CompleteEvents();
     REQUIRE(copy.wait_for(2s) == std::future_status::ready);
     copy.get();
@@ -1547,7 +1554,7 @@ void submit_blocked_visual_work(detail::VisualRuntimeOwner& owner, std::promise<
         release.wait();
         return detail::VisualRuntimeOwner::Notification{};
     }));
-    entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(entered, "entered");
 }
 
 void submit_counting_continuation(detail::VisualRuntimeOwner& owner, std::atomic_uint32_t& count) {
@@ -1593,6 +1600,31 @@ struct TestPresentationWriterState final {
         std::unique_lock lock(pump_mutex);
         return pump_changed.wait_for(lock, 2s, [&] { return pump_count > prior; });
     }
+    [[nodiscard]] std::uint64_t ArmWaiting() {
+        std::scoped_lock lock(pump_mutex);
+        return ++waiting_step;
+    }
+    void RecordWaiting(bool connected, std::uint64_t source_revision, bool has_pending, bool readiness_consumed) {
+        if (!readiness_consumed) return;
+        {
+            std::scoped_lock lock(pump_mutex);
+            waiting = {.step = waiting_step, .connected = connected, .source_revision = source_revision, .pending = has_pending};
+        }
+        pump_changed.notify_all();
+    }
+    [[nodiscard]] bool WaitDisconnected(std::uint64_t step, bool pending, std::uint64_t source_revision) {
+        std::unique_lock lock(pump_mutex);
+        return pump_changed.wait_for(lock, 2s, [&] {
+            return waiting.step == step && !waiting.connected && waiting.pending == pending && waiting.source_revision == source_revision;
+        });
+    }
+    struct Waiting {
+        std::uint64_t step = 0;
+        bool connected = true;
+        std::uint64_t source_revision = 0;
+        bool pending = false;
+    } waiting;
+    std::uint64_t waiting_step = 0;
     // CLEANUP-IGNORE: This descriptor begins presentation-writer readiness and lifecycle evidence, not fake GPU
     // synchronization and transfer counters.
     mmltk::common::io::ScopedFd readiness;
@@ -1625,6 +1657,26 @@ struct TestPresentationWriterState final {
     mutable std::mutex pump_mutex;
     std::condition_variable pump_changed;
     std::uint64_t pump_count = 0U;
+};
+
+// Declared immediately after the system, before assertions. Event/callback
+// storage precedes the system and therefore outlives terminal settlement.
+class PresentationScenario final {
+   public:
+    PresentationScenario(PresentationSystem& system, std::shared_ptr<TestPresentationWriterState> state)
+        : system_(system), state_(std::move(state)) {}
+    ~PresentationScenario() {
+        mmltk::testsupport::release_test_promise(state_->release_pump);
+        if (system_.stopped()) return;
+        system_.CloseAdmission();
+        system_.BrowserPeerLost();
+        static_cast<void>(system_.Shutdown());
+    }
+    PresentationScenario(const PresentationScenario&) = delete;
+    PresentationScenario& operator=(const PresentationScenario&) = delete;
+   private:
+    PresentationSystem& system_;
+    std::shared_ptr<TestPresentationWriterState> state_;
 };
 
 class TestPresentationWriter final : public PresentationNativeWriter {
@@ -1693,7 +1745,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             const auto prior = state_->allocation_retirements.fetch_add(1U, std::memory_order_acq_rel);
             if (prior == 0U) state_->allocation_retired.set_value();
         }
-        state_->RecordPump();
+        mmltk::testsupport::ScopedTestCleanup pumped{[state = state_] { state->RecordPump(); }};
         if (submitted_.selection_generation != current_selection_generation) {
             pending_.reset();
             return {
@@ -1701,9 +1753,11 @@ class TestPresentationWriter final : public PresentationNativeWriter {
                 .submitted = submitted_,
             };
         }
-        if (!pending_ || !application_peer_connected_.load(std::memory_order_acquire) ||
-            !state_->allow_publication.load(std::memory_order_acquire))
+        const bool peer_connected = application_peer_connected_.load(std::memory_order_acquire);
+        if (!pending_ || !peer_connected || !state_->allow_publication.load(std::memory_order_acquire)) {
+            state_->RecordWaiting(peer_connected, submitted_.observation.frame.revision, pending_.has_value(), consumed > 0);
             return {.capability = capability()};
+        }
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
         if (candidate_target && retiring_) return {.capability = capability()};
         auto source = reader_->borrow();
@@ -2220,6 +2274,10 @@ class MutableVisualSource final {
         frame_.revision = runtime_.OutputFacts().revision;
         snapshot_revision_ = mmltk::common::types::advance_monotonic_identity(snapshot_revision_);
     }
+    [[nodiscard]] mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate TryReserveOutput() {
+        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+        return runtime_.TryAcquireOutput(baseline);
+    }
     [[nodiscard]] VisualFrame frame() const {
         std::scoped_lock lock(mutex_);
         return frame_;
@@ -2456,15 +2514,21 @@ TEST_CASE("Explore demand completes on another thread while publication owns fin
     EventGate events;
     ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
                           [&events](ExploreSystem::event_type) { events.Advance(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, .compiled_source = "/test"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     auto observation = std::async(std::launch::async, [gate] { return gate->demand(gate->generation); });
     // Release before joining or asserting: an owner-mutex demand callback must
     // fail the bounded completion check without stranding either worker.
     const auto completion = observation.wait_for(200ms);
     gate->release.set_value();
     CHECK(completion == std::future_status::ready);
-    CHECK(observation.get());
+    CHECK(mmltk::testsupport::await_test_future(observation, "released Explore demand observation"));
     REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
     CHECK_FALSE(gate->release_timed_out.load());
 }
@@ -2535,6 +2599,7 @@ TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacem
     const auto incumbent = explore.snapshot();
     static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/replacement"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     const auto replacement = explore.LastInteractionGeneration();
     CHECK((*retained)(replacement));
     explore.Shutdown();
@@ -2850,6 +2915,12 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         }
         std::shared_ptr<ExplorePostRenderGate> gate;
         std::future<void> entered;
+        mmltk::testsupport::ScopedTestCleanup settle_mutation{[&] {
+            if (gate) mmltk::testsupport::release_test_promise(gate->release);
+            scenario.probe().ReleaseAll();
+            static_cast<void>(explore.Stop());
+            explore.Shutdown();
+        }};
         if (rejection == Rejection::Failed) {
             std::scoped_lock lock(scenario.probe().mutex);
             scenario.probe().fail_next_render = true;
@@ -2870,6 +2941,7 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         }();
         if (gate) {
             REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+            entered.get();
             if (rejection == Rejection::Cancelled) {
                 static_cast<void>(explore.Stop());
             } else {
@@ -3178,7 +3250,11 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(diagnostics.last_system.load(std::memory_order_acquire) == contracts::DiagnosticOwner::Explore);
 
     EventGate annotation_events;
-    std::atomic_uint64_t ui_observations{0U}, credit_records{0U}, frame_records{0U};
+    std::atomic_uint64_t credit_records{0U}, frame_records{0U};
+    mmltk::testsupport::TestGate pointer_ui{"accepted pointer UI settlement"};
+    mmltk::testsupport::TestGate command_entry{"Save worker entry before output flush"};
+    std::mutex ui_gate_mutex;
+    std::optional<mmltk::testsupport::TestGate::Receipt> next_ui_gate;
     auto document_revision = std::make_shared<std::atomic<std::uint64_t>>(0U);
     auto annotation_order = std::make_shared<std::vector<std::uint64_t>>();
     auto save_applied = std::make_shared<std::atomic_bool>(false);
@@ -3188,12 +3264,16 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     AnnotationSystem annotation{
         kDevice,
         RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                       [document_revision, annotation_order, save_applied, pointer_gate, &ui_observations, &annotation_events] {
+                       [document_revision, annotation_order, save_applied, pointer_gate, &ui_gate_mutex, &next_ui_gate] {
                            return std::make_unique<TestAnnotationAlgorithm>(document_revision, annotation_order, save_applied, nullptr,
                                                                             nullptr, pointer_gate, nullptr, nullptr,
-                                                                            [&ui_observations, &annotation_events] {
-                                                                                ui_observations.fetch_add(1U, std::memory_order_release);
-                                                                                annotation_events.Advance();
+                                                                            [&ui_gate_mutex, &next_ui_gate] {
+                                                                                std::optional<mmltk::testsupport::TestGate::Receipt> receipt;
+                                                                                {
+                                                                                    std::scoped_lock lock(ui_gate_mutex);
+                                                                                    receipt = std::exchange(next_ui_gate, std::nullopt);
+                                                                                }
+                                                                                if (receipt) receipt->ArriveAndWait();
                                                                             });
                        }),
         borrow_exactly_from(explore), [&annotation_events, &frame_records, save_failures](AnnotationSystem::event_type event) {
@@ -3211,6 +3291,13 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK_FALSE(annotation.snapshot().busy);
     CHECK(annotation.snapshot().revision > annotation_admitted.revision);
     std::atomic_uint64_t consumed{0U};
+    mmltk::testsupport::ScopedTestCleanup settle_annotation{[&] {
+        pointer_ui.Release();
+        command_entry.Release();
+        try { pointer_gate->release.set_value(); } catch (...) {}
+        static_cast<void>(annotation.Stop());
+        annotation.Shutdown();
+    }};
     annotation.SetInputPeer(7U, [&](AnnotationInputProgress progress) {
         if (progress.epoch == 7U) {
             if (progress.consumed_sequence != 0U) credit_records.fetch_add(1U, std::memory_order_release);
@@ -3252,8 +3339,13 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     const auto initial_annotation_frame = annotation.snapshot().frame;
     auto retained_annotation_frame = annotation.BorrowFrame();
     REQUIRE(retained_annotation_frame.valid());
+    {
+        std::scoped_lock lock(ui_gate_mutex);
+        next_ui_gate = pointer_ui.receipt();
+    }
     annotation.Input(first);
     REQUIRE(pointer_entered.wait_for(2s) == std::future_status::ready);
+    pointer_entered.get();
     AnnotationInputBatch second{.epoch = 7U,
                                 .document_epoch = input_document,
                                 .sequence = 2U,
@@ -3272,12 +3364,20 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     // Both batches are consumed while a receiver still owns the output. Releasing
     // that exact borrow renders the newest accumulated state once.
     CHECK(annotation.snapshot().frame == initial_annotation_frame);
-    REQUIRE(annotation_events.Wait([&] { return ui_observations.load(std::memory_order_acquire) == 2U; }));
+    // Credits precede Ui(), so observe pointer settlement before arming Save.
+    // No more input is admitted, and output retries do not call Ui(). This
+    // proves cancellation inside the command, while real borrowed custody
+    // continues to prevent output admission until the recovery below.
+    REQUIRE(pointer_ui.WaitEntered(2s));
+    {
+        std::scoped_lock lock(ui_gate_mutex);
+        next_ui_gate = command_entry.receipt();
+    }
+    pointer_ui.Release();
     static_cast<void>(annotation.Save({.destination = "/test/cancelled-before-save.json"}));
-    // The third algorithm observation is inside the active Save worker, after
-    // its entry stop check and before its unconditional blocking boundary flush.
-    REQUIRE(annotation_events.Wait([&] { return ui_observations.load(std::memory_order_acquire) == 3U; }));
+    REQUIRE(command_entry.WaitEntered(2s));
     static_cast<void>(annotation.Stop());
+    command_entry.Release();
     REQUIRE(annotation_events.Wait([&] { return !annotation.snapshot().busy; }));
     CHECK(save_failures->load(std::memory_order_acquire) == 0U);
     CHECK(annotation.snapshot().frame == initial_annotation_frame);
@@ -3572,8 +3672,14 @@ TEST_CASE("Explore Open rejects a settings candidate made stale during rendering
                              },
                              count_explore_failures(failures)};
     auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
 
     enable_dark_mode(settings);
     gate->release.set_value();
@@ -3619,6 +3725,7 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
         gate->Arm();
         const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        entered.get();
         static_cast<void>(explore.Stop());
         gate->release.set_value();
         REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
@@ -3801,10 +3908,16 @@ TEST_CASE("Explore stale filter persistence discards the rendered candidate and 
                              },
                              count_explore_failures(failures)};
     auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto committed = explore.snapshot();
     const auto admission = explore.UpdateFilter({.filter = {.minimum_instances = 1U}});
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     enable_dark_mode(settings);
     gate->release.set_value();
     const auto restored = wait_for_explore_failure(scenario, failures, admission.revision);
@@ -3829,13 +3942,21 @@ TEST_CASE("Explore successful persistence is settled before Stop can observe it"
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     auto scenario = tracked_explore_scenario(settings, backend, commits);
     auto& explore = scenario.system();
+    std::future<ExploreSnapshot> stopped;
+    mmltk::testsupport::ScopedTestCleanup settle_persistence{[&] {
+        mmltk::testsupport::release_test_promise(*release_persistence);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     scenario.OpenAndWait({.extent = {64U, 64U}});
     static_cast<void>(explore.UpdateFilter({
         .filter = {.minimum_instances = 1U},
     }));
-    REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
-    auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
-    CHECK(stopped.wait_for(100ms) == std::future_status::timeout);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(*persistence_entered, "persistence_entered", 2s));
+    stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
+    // Persistence has reached its dependency-owned publication boundary.
+    // Stop must observe its committed outcome after release, independently of
+    // when the concurrent call reaches the private admission mutex.
     release_persistence->set_value();
     REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
     const auto stopping = stopped.get();
@@ -3859,9 +3980,15 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
                                                                                commits, gate);
                              }};
     auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     gate->Arm();
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     const auto stopping = explore.Stop();
     CHECK(stopping.busy);
     CHECK(stopping.cancellation_requested);
@@ -3894,6 +4021,12 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
             }
         });
     auto& explore = scenario.system();
+    std::future<ExploreSnapshot> stopped;
+    mmltk::testsupport::ScopedTestCleanup settle_persistence{[&] {
+        mmltk::testsupport::release_test_promise(*release_persistence);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
     static_cast<void>(select_explore_subset(settings, scenario, 1U));
@@ -3903,9 +4036,11 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     // CLEANUP-IGNORE: This Open drives catalog replacement through a blocked persistence boundary; the prior filter
     // operation tests successful persistence before Stop.
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
-    REQUIRE(persistence_entered->get_future().wait_for(2s) == std::future_status::ready);
-    auto stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
-    CHECK(stopped.wait_for(100ms) == std::future_status::timeout);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(*persistence_entered, "persistence_entered", 2s));
+    stopped = std::async(std::launch::async, [&explore] { return explore.Stop(); });
+    // Persistence has reached its dependency-owned publication boundary.
+    // Stop must observe its committed outcome after release, independently of
+    // when the concurrent call reaches the private admission mutex.
 
     release_persistence->set_value();
     REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
@@ -3941,9 +4076,11 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
 
         const auto admission = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/cancelled"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        entered.get();
         const auto stopping = explore.Stop();
         CHECK_FALSE((stopping.busy && !stopping.cancellation_requested));
         REQUIRE(cancelled.wait_for(2s) == std::future_status::ready);
+        cancelled.get();
         REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admission.revision; }));
         const auto settled = explore.snapshot();
         CHECK(settled.ready == (blocked_call != 0U));
@@ -4237,10 +4374,16 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         ExploreScenario scenario{settings, backend,
                                  [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
         auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
 
         explore.UpdateViewport({.viewport = {.extent = {48U, 16U}, .row_count = 1U, .columns = 3U}});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        entered.get();
         explore.UpdateViewport({.viewport = {.extent = {30U, 10U}, .row_count = 1U, .columns = 3U}});
         if (select)
             static_cast<void>(explore.Select({.compiled_index = 1U}));
@@ -4282,10 +4425,16 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
                                  return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits);
                              }};
     auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto committed = explore.snapshot();
     explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}});
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     const auto admitted = explore.Reroll();
     CHECK(admitted.busy);
 
@@ -4318,6 +4467,11 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
                                                                                    commits, nullptr, nullptr, gate);
                                  }};
         auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
         const auto before = explore.snapshot();
         if (selection)
@@ -4325,6 +4479,7 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
         else
             static_cast<void>(explore.Reroll());
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+        entered.get();
         const auto stopping = explore.Stop();
         CHECK(stopping.busy == !selection);
         CHECK(stopping.cancellation_requested == !selection);
@@ -4453,11 +4608,13 @@ TEST_CASE("stopping Explore retains busy until its admitted operation settles") 
     CHECK(second_admission.busy);
     CHECK_THROWS_AS(explore.Open({.viewport = {}, .compiled_source = {}}), contracts::BusyError);
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     const auto stopping = explore.Stop();
     CHECK_FALSE((stopping.busy && !stopping.cancellation_requested));
     const auto repeated = explore.Stop();
     CHECK(repeated.revision >= stopping.revision);
     REQUIRE(cancellation.wait_for(2s) == std::future_status::ready);
+    cancellation.get();
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(explore.snapshot().revision > stopping.revision);
     CHECK(explore.snapshot().frame.revision == completed);
@@ -4482,8 +4639,10 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
         .filter = {.minimum_instances = 1U},
     }));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     static_cast<void>(explore.Stop());
     REQUIRE(cancelled.wait_for(2s) == std::future_status::ready);
+    cancelled.get();
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(commits->load(std::memory_order_acquire) == 1U);
     CHECK(explore.snapshot().filter == before.filter);
@@ -4506,6 +4665,11 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
                                  return std::make_unique<TestExploreAlgorithm>(observed_nproc, nullptr, nullptr, gate);
                              }};
     auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
     scenario.OpenAndWait({.extent = {32U, 32U}});
     const auto before = explore.snapshot();
     const auto settings_revision = settings.system().snapshot().revision;
@@ -4515,6 +4679,7 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
         .overlay = {.show_boxes = false, .show_masks = true},
     }));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     const auto stopping = explore.Stop();
     CHECK(stopping.cancellation_requested);
     release_and_wait_for_idle(scenario, gate->release);
@@ -4670,12 +4835,18 @@ TEST_CASE("Annotation publishes an admitted mutation that committed before Stop"
                                                        std::shared_ptr<std::atomic_bool>{}, mutation);
                                                }),
                                 borrow_exactly_from(explore), [&events](AnnotationSystem::event_type) { events.Advance(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_annotation{[&] {
+        mmltk::testsupport::release_test_promise(mutation->release);
+        static_cast<void>(annotation.Stop());
+        annotation.Shutdown();
+    }};
     static_cast<void>(annotation.Open({.source = explore.snapshot().frame}));
     REQUIRE(events.Wait([&] { return annotation.snapshot().ready; }));
     const auto before = annotation.snapshot();
     // CLEANUP-IGNORE: Undo commit settlement and Explore publish settlement exercise different system-owned products.
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}));
     REQUIRE(committed.wait_for(2s) == std::future_status::ready);
+    committed.get();
     const auto stopping = annotation.Stop();
     CHECK(stopping.cancellation_requested);
     mutation->release.set_value();
@@ -4853,6 +5024,11 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
                               return source.BorrowExact(frame);
                           },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics.sink()};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     std::array<VisualFrame, 2U> cached;
     for (const auto method : {UpscaleKernel::Default, UpscaleKernel::ShiftLut}) {
         static_cast<void>(upscale.Start(test_upscale_request({source.frame(), method})));
@@ -4908,7 +5084,13 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
             if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAllocation) ++probe.prepared;
         }};
     EventGate events;
-    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
+    std::atomic<mmltk::frameworks::gpu::SystemImageRuntime*> output_runtime{nullptr};
+    const auto factory = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs);
+    UpscaleSystem upscale{kDevice, [&, factory](auto revisions) {
+                              auto runtime = factory(std::move(revisions));
+                              output_runtime.store(runtime.get(), std::memory_order_release);
+                              return runtime;
+                          },
                           [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
     std::vector<mmltk::frameworks::gpu::BorrowedImageProductReadView> readers;
@@ -4919,6 +5101,13 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
         readers.push_back(upscale.BorrowFrame());
         REQUIRE(readers.back().valid());
     }
+    auto* const runtime = output_runtime.load(std::memory_order_acquire);
+    REQUIRE(runtime != nullptr);
+    // Check custody before starting competing work: an active reservation
+    // must not mask an incorrectly writable reader-owned slot.
+    REQUIRE(readers.size() == 4U);
+    mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(runtime->TryAcquireOutput(baseline).valid());
     if (preempt_warm)
         upscale.Warm({16U, 8U});
     else {
@@ -4926,7 +5115,7 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
         static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     }
     REQUIRE(blocked.wait_for(2s) == std::future_status::ready);
-    CHECK(returned.wait_for(50ms) == std::future_status::timeout);
+    blocked.get();
     const auto copied = backend->same_copies.load();
     const auto allocated = backend->planes_allocated.load();
     const auto prepared = admissions.prepared.load();
@@ -4935,6 +5124,7 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     static_cast<void>(upscale.Start(latest));
     readers[0U] = {};
     REQUIRE(returned.wait_for(2s) == std::future_status::ready);
+    returned.get();
     REQUIRE(events.Wait([&] {
         return !upscale.snapshot().busy && upscale.snapshot().kernel == latest.kernel && upscale.snapshot().input == latest.source;
     }));
@@ -4967,13 +5157,19 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
                                   ready_publications.fetch_add(1U, std::memory_order_acq_rel);
                               events.Advance();
                           }};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::ShiftLut})));
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr})));
     CHECK_FALSE(upscale.snapshot().ready);
     gate->release.set_value();
-    REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
+    REQUIRE(events.Wait([&] { return upscale.snapshot().ready && ready_publications.load(std::memory_order_acquire) == 1U; }));
     CHECK(upscale.snapshot().kernel == UpscaleKernel::RealPlksr);
     CHECK(upscale.snapshot().input == source.frame());
     CHECK(runs->load(std::memory_order_acquire) == 2U);
@@ -5003,8 +5199,13 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
                           [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(gate.release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
-    REQUIRE(gate.copied.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(gate.copied, "gate.copied", 2s));
     upscale.Stop();
     CHECK_FALSE(upscale.snapshot().busy);
     CHECK_FALSE(upscale.snapshot().ready);
@@ -5051,6 +5252,11 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
                               return borrowed;
                           },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(gate.release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     static_cast<void>(upscale.Start(test_upscale_request({source.frame(), UpscaleKernel::Default})));
     const auto entered = gate.entered.get_future().wait_for(2s);
     if (entered != std::future_status::ready) gate.release.set_value();
@@ -5108,6 +5314,7 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
     upscale.Warm({32U, 32U});
     upscale.Warm({32U, 32U});
     REQUIRE(completed.wait_for(2s) == std::future_status::ready);
+    completed.get();
     upscale.Warm({32U, 32U});
     REQUIRE(events.Wait([&] { return std::ranges::all_of(upscale.snapshot().methods, [](const auto& method) { return method.warm; }); }));
     CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
@@ -5343,10 +5550,13 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
                                                               }),
                           [&source](const VisualFrame& frame) { return source.Borrow(frame); },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_native{[&] {
+        mmltk::testsupport::release_test_promise(release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     static_cast<void>(upscale.Start(test_upscale_request({source.frame, method})));
-    const auto reached = admitted.get_future().wait_for(120s);
-    if (reached != std::future_status::ready) release.set_value();
-    REQUIRE(reached == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(admitted, "native Upscale admitted boundary", 120s));
     if (stop)
         static_cast<void>(upscale.Stop());
     else
@@ -5746,6 +5956,7 @@ TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
 
     upscale.Warm({32U, 32U});
     REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
+    warmed.get();
     upscale.Shutdown();
     CHECK(upscale.stopped());
     CHECK(release->releases.load(std::memory_order_acquire) == 1U);
@@ -5775,6 +5986,11 @@ TEST_CASE("Upscale requests behind warmup retain identities without queued sourc
                               if (std::holds_alternative<UpscaleFailed>(event)) failures.fetch_add(1U);
                               events.Advance();
                           }};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(activation->warm_release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     upscale.Warm(source.frame().extent);
     const bool warming = warm_entered.wait_for(2s) == std::future_status::ready;
     if (!warming) activation->warm_release.set_value();
@@ -5812,7 +6028,7 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
                           }};
 
     upscale.Warm({32U, 32U});
-    REQUIRE(warm_failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(warm_failed, "warm_failed", 2s));
     upscale.Warm({32U, 32U});
     CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
     CHECK_FALSE(upscale.snapshot().busy);
@@ -5853,6 +6069,11 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
                 changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
                 completed.set_value(changed->snapshot);
         }};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(activation->warm_release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     upscale.Warm({32U, 32U});
     const auto waiting = entered.wait_for(2s);
     if (waiting != std::future_status::ready) activation->warm_release.set_value();
@@ -5917,7 +6138,7 @@ TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavaila
 
 TEST_CASE("Upscale copies the admitted exact revision before a source update can replace it") {
     auto backend = std::make_shared<FakeImageBackend>();
-    backend->defer_same_device_copies.store(true, std::memory_order_release);
+    auto copy_gate = backend->HoldSameDeviceCopies("Presentation source copy");
     auto race = std::make_shared<UpscaleAdmissionRaceProbe>();
     UpscaleSourceFixture subject{backend,
                                  {24U, 15U},
@@ -5929,14 +6150,16 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
     auto& events = subject.events;
     auto& upscale = subject.upscale;
     const auto admitted_frame = source.frame();
+    mmltk::testsupport::ScopedTestCleanup settle_copy{[&] { copy_gate->Release(); upscale.Stop(); upscale.Shutdown(); }};
 
     static_cast<void>(upscale.Start(test_upscale_request({.source = admitted_frame})));
-    const bool copy_entered = backend->WaitForSameDeviceCopy(2s);
-    if (!copy_entered) backend->CompleteSameDeviceCopies();
+    const bool copy_entered = copy_gate->WaitEntered(2s);
+    if (!copy_entered) copy_gate->Release();
     REQUIRE(copy_entered);
+    REQUIRE_FALSE(source.TryReserveOutput().valid());
     auto replacement = std::async(std::launch::async, [&source] { source.Publish({24U, 15U}, 29U); });
-    CHECK(replacement.wait_for(100ms) == std::future_status::timeout);
-    backend->CompleteSameDeviceCopies();
+    mmltk::testsupport::ScopedTestCleanup release_replacement{[&] { copy_gate->Release(); }};
+    copy_gate->Release();
     REQUIRE(replacement.wait_for(2s) == std::future_status::ready);
     replacement.get();
     CHECK(source.frame().revision > admitted_frame.revision);
@@ -6001,6 +6224,7 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     PresentationSystem presentation{
         output_envelope, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(sources[0].source));
     writer_state->SignalReadiness();
     REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[0].source; }));
@@ -6015,9 +6239,10 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     CHECK(presentation.snapshot().completed.revision == upscale.snapshot().frame.revision);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == initial_generation);
-    CHECK(allocation_retired.wait_for(0s) == std::future_status::timeout);
+
     writer_state->AcknowledgeAllocationRetirement(initial_generation);
     REQUIRE(allocation_retired.wait_for(2s) == std::future_status::ready);
+    allocation_retired.get();
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
     const auto pump_count = writer_state->PumpCount();
@@ -6065,6 +6290,7 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     PresentationSystem presentation{
         kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         presentation_sources, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationScenario scenario{presentation, writer_state};
     present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
     CHECK((presentation.snapshot().completed.extent == VisualExtent{320U, 160U}));
     CHECK((presentation.snapshot().capability.extent == VisualExtent{320U, 160U}));
@@ -6108,6 +6334,7 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
         kDevice,
         [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationScenario scenario{presentation, writer_state};
 
     const auto source_a = sources[0].source;
     const auto source_b = sources[2].source;
@@ -6128,6 +6355,7 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
     static_cast<void>(presentation.Select(source_c));
     writer_state->SignalReadiness();
     REQUIRE(third_submission.wait_for(2s) == std::future_status::ready);
+    third_submission.get();
     CHECK(presentation.snapshot().completed.source == source_b);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
@@ -6175,11 +6403,17 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [selected_kernel, gate] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel, gate); }, 4U),
                           borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
+        mmltk::testsupport::release_test_promise(gate->release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
     const auto admitted = upscale.Start(test_upscale_request({
         .source = explore.snapshot().frame,
         .kernel = UpscaleKernel::ShiftLut,
     }));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    entered.get();
     CHECK_FALSE(upscale.BorrowFrame().valid());
     CHECK_THROWS_AS(upscale.Start(test_upscale_request({
                         .source = {},
@@ -6203,6 +6437,7 @@ TEST_CASE("Presentation copies every private visual product into its exported ba
         kDevice,
         [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationScenario scenario{presentation, writer_state};
 
     std::uint64_t previous_presentation_revision = 0U;
     for (auto source = sources.rbegin(); source != sources.rend(); ++source) {
@@ -6279,6 +6514,7 @@ TEST_CASE("Published frames retain their physical allocation while a waiting can
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
         source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationScenario scenario{presentation, writer};
     publish_first_presentation(presentation, source, *writer, events);
     const auto completed = presentation.snapshot();
     CHECK(completed.capability.surface_low == 1U);
@@ -6316,6 +6552,7 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
         source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    PresentationScenario scenario{presentation, writer};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
     const auto admitted = presentation.snapshot().capability;
@@ -6341,21 +6578,25 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     EventGate events;
     std::atomic<std::uint64_t> completed_events{0U};
     std::atomic<std::uint64_t> last_completed_revision{0U};
+    std::atomic<std::uint64_t> last_completed_product{0U};
     std::atomic<std::uint64_t> last_completed_sample{0U};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         source.sources(),
-        [&events, &completed_events, &last_completed_revision, &last_completed_sample](PresentationSystem::event_type event) {
+        [&events, &completed_events, &last_completed_revision, &last_completed_sample, &last_completed_product](PresentationSystem::event_type event) {
             if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
                 last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
                 last_completed_sample.store(completed->snapshot.browser_completed_sample, std::memory_order_release);
                 completed_events.fetch_add(1U, std::memory_order_acq_rel);
+                last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
             }
             events.Advance();
         }};
+    PresentationScenario scenario{presentation, writer_state};
 
     publish_first_presentation(presentation, source, *writer_state, events);
+    REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
 
     const auto before_acknowledgement = presentation.snapshot();
     const auto before_acknowledgement_events = completed_events.load(std::memory_order_acquire);
@@ -6391,7 +6632,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
     CHECK(presentation.snapshot().browser_completed_sample == 7U);
-    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 2U);
+    REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 2U; }));
 
     writer_state->allow_publication.store(false, std::memory_order_release);
     source.Advance();
@@ -6407,12 +6648,12 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
 
-    const auto paused_pump = writer_state->PumpCount();
+    const auto paused_step = writer_state->ArmWaiting();
     presentation.SetApplicationPeerConnected(false);
     source.Advance();
     presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
-    REQUIRE(writer_state->WaitForPumpAfter(paused_pump));
+    REQUIRE(writer_state->WaitDisconnected(paused_step, false, 4U));
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     presentation.SetApplicationPeerConnected(true);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 5U; }));
@@ -6425,9 +6666,9 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
     presentation.SetApplicationPeerConnected(false);
     writer_state->allow_publication.store(true, std::memory_order_release);
-    const auto disconnected_pump = writer_state->PumpCount();
+    const auto disconnected_step = writer_state->ArmWaiting();
     writer_state->SignalReadiness();
-    REQUIRE(writer_state->WaitForPumpAfter(disconnected_pump));
+    REQUIRE(writer_state->WaitDisconnected(disconnected_step, true, 6U));
     CHECK(presentation.snapshot().completed.revision == 5U);
     presentation.SetApplicationPeerConnected(true);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 6U; }));
@@ -6447,6 +6688,7 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
         source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationScenario scenario{presentation, writer};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
     source.AdvanceObservation();
@@ -6483,6 +6725,7 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
         source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    PresentationScenario scenario{presentation, writer};
     const auto await_publication = [&](std::uint64_t revision) {
         writer->SignalReadiness();
         REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision == revision; }));
@@ -6494,7 +6737,7 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
     source.Advance();
     auto second = source.Completed();
     static_cast<void>(presentation.Select(source.identity()));
-    REQUIRE(writer->second_submission.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(writer->second_submission, "writer->second_submission", 2s));
     source.SelectCompleted(first);
     static_cast<void>(presentation.Select(source.identity()));
     writer->allow_publication.store(true);
@@ -6595,10 +6838,12 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
     PresentationSystem presentation{
         kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, std::span{sources},
         [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationScenario scenario{presentation, writer_state};
     CHECK(writer_state->constructions.load(std::memory_order_acquire) == 1U);
     const auto first_selection = presentation.Select(sources[0].source);
     CHECK(first_selection.revision != 0U);
     REQUIRE(first_submission.wait_for(2s) == std::future_status::ready);
+    first_submission.get();
     REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().capability.valid(); }));
     CHECK(presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted);
     const auto second_selection = presentation.Select(sources[1].source);
@@ -6654,6 +6899,11 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
     std::atomic_bool owner_failed = false;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
                                      [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_latest);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     owner.SubmitLatest(
         [&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
             std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
@@ -6661,7 +6911,7 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
             release.wait();
             return detail::VisualRuntimeOwner::Notification{};
         });
-    latest_entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(latest_entered, "latest_entered");
     REQUIRE(owner.SubmitDiscrete(
         [&queued_ran](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
             queued_ran.store(true, std::memory_order_release);
@@ -6669,8 +6919,8 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
         },
         [&queued_cancelled] { queued_cancelled.set_value(); }));
     owner.RequestActiveStop();
-    REQUIRE(active_cancelled.get_future().wait_for(2s) == std::future_status::ready);
-    REQUIRE(queued_cancelled.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(active_cancelled, "active_cancelled", 2s));
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(queued_cancelled, "queued_cancelled", 2s));
     CHECK_FALSE(queued_ran.load(std::memory_order_acquire));
     release_latest.set_value();
     owner.StopAndWait();
@@ -6702,7 +6952,7 @@ TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
     submit([&completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
     });
-    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(completed, "completed", 2s));
     CHECK(attempts->load(std::memory_order_acquire) == 3U);
     CHECK(failures->load(std::memory_order_acquire) == 2U);
 }
@@ -6738,7 +6988,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     submit_visual_revision(owner, first_completed);
     const auto first_revision = first_completed.get_future().get();
     REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
-    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
 
     auto retained = owner.Borrow();
     REQUIRE(retained.valid());
@@ -6748,7 +6998,7 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     REQUIRE(owner.SubmitDiscrete(
         [&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; }, {},
         true));
-    REQUIRE(rejected.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(rejected, "rejected", 2s));
     retained = owner.Borrow();
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == first_revision);
@@ -6766,6 +7016,11 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
     std::promise<void> settled;
     std::atomic_bool success_notified = false;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
         const auto revision = runtime.Completed().revision();
@@ -6780,13 +7035,13 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
             return detail::VisualRuntimeOwner::Notification{[&] { success_notified = true; }};
         },
         [&] { settled.set_value(); }, true));
-    submitted.get_future().wait();
+    mmltk::testsupport::await_test_promise(submitted, "submitted");
     auto read = owner.Borrow();
     const auto revision = read.valid() ? read.plane(0U).revision() : 0U;
     read = {};
     owner.RequestActiveStop();
     release.set_value();
-    REQUIRE(settled.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(settled, "settled", 2s));
     CHECK(revision == incumbent);
     CHECK_FALSE(success_notified.load());
     auto retained = owner.Borrow();
@@ -6815,8 +7070,13 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
                                              released.wait();
                                          }
                                      }};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     submit_visual_completion(owner, first);
-    first.get_future().wait();
+    mmltk::testsupport::await_test_promise(first, "first");
     auto prior = owner.Borrow();
     const auto prior_revision = prior.plane(0U).revision();
     prior = {};
@@ -6833,7 +7093,7 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
             return detail::VisualRuntimeOwner::Notification{[&, revision] { published.set_value(revision); }};
         },
         [&] { cancelled = true; }, true));
-    latched.get_future().wait();
+    mmltk::testsupport::await_test_promise(latched, "latched");
     owner.RequestActiveStop();
     release.set_value();
     auto publication = published.get_future();
@@ -6862,16 +7122,21 @@ TEST_CASE("runtime construction does not hold scheduler admission while stop is 
                                          return factory(std::move(revisions));
                                      },
                                      [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
         entered = true;
         return detail::VisualRuntimeOwner::Notification{};
     }));
-    constructing.get_future().wait();
+    mmltk::testsupport::await_test_promise(constructing, "constructing");
     auto stopped = std::async(std::launch::async, [&] { owner.RequestStop(); });
     const auto status = stopped.wait_for(2s);
     release.set_value();
     CHECK(status == std::future_status::ready);
-    stopped.get();
+    mmltk::testsupport::await_test_future(stopped, "released construction stop");
     owner.StopAndWait();
     CHECK(owner.stopped());
     CHECK_FALSE(entered.load());
@@ -6886,7 +7151,7 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
     std::atomic<std::uint64_t> promoted = 0U;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
     submit_visual_completion(owner, first);
-    first.get_future().wait();
+    mmltk::testsupport::await_test_promise(first, "first");
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
             runtime.Publish(8U, 8U, [](auto, auto, auto) {});
@@ -6895,14 +7160,14 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
             return detail::VisualRuntimeOwner::Notification{};
         },
         {}, true));
-    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     auto retained = owner.Borrow();
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == promoted.load(std::memory_order_acquire));
     retained = {};
     REQUIRE(
         owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { next.set_value(); }}; }));
-    REQUIRE(next.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(next, "next", 2s));
     owner.StopAndWait();
 }
 
@@ -6925,8 +7190,13 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
                                          return factory(std::move(revisions));
                                      },
                                      [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     submit_visual_completion(owner, first);
-    first.get_future().wait();
+    mmltk::testsupport::await_test_promise(first, "first");
     auto incumbent = owner.Borrow();
     const auto revision = incumbent.plane(0U).revision();
     incumbent = {};
@@ -6936,10 +7206,10 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
             return detail::VisualRuntimeOwner::Notification{};
         },
         [&] { cancelled.set_value(); }, true));
-    constructing.get_future().wait();
+    mmltk::testsupport::await_test_promise(constructing, "constructing");
     owner.RequestActiveStop();
     release.set_value();
-    REQUIRE(cancelled.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(cancelled, "cancelled", 2s));
     CHECK_FALSE(entered.load());
     auto retained = owner.Borrow();
     REQUIRE(retained.valid());
@@ -6959,6 +7229,11 @@ TEST_CASE("ordered visual input retains boundaries and only the latest replaceab
     std::mutex values_mutex;
     std::vector<int> values;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_boundary);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     REQUIRE(owner.SubmitOrdered(
         [&boundary_entered, release, &values_mutex, &values](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
             {
@@ -6969,14 +7244,14 @@ TEST_CASE("ordered visual input retains boundaries and only the latest replaceab
             release.wait();
             return detail::VisualRuntimeOwner::Notification{};
         }));
-    boundary_entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(boundary_entered, "boundary_entered");
     // CLEANUP-IGNORE: Latest/discrete and continuation submissions exercise different queue contracts using shared
     // recording work.
     owner.SubmitLatest(record_visual_work(values_mutex, values, 2));
     owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
     REQUIRE(owner.SubmitDiscrete(record_visual_work(values_mutex, values, 4, &complete)));
     release_boundary.set_value();
-    REQUIRE(complete.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(complete, "complete", 2s));
     owner.StopAndWait();
     CHECK(values == std::vector<int>{1, 3, 4});
 }
@@ -6992,6 +7267,11 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     std::mutex values_mutex;
     std::vector<int> values;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_boundary);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     REQUIRE(owner.SubmitOrdered([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         boundary_entered.set_value();
         release.wait();
@@ -6999,13 +7279,13 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
         values.push_back(1);
         return detail::VisualRuntimeOwner::Notification{};
     }));
-    boundary_entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(boundary_entered, "boundary_entered");
     owner.RegisterContinuation(record_visual_work(values_mutex, values, 4, &completed));
     REQUIRE(owner.NotifyContinuation());
     owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
     REQUIRE(owner.NotifyContinuation());
     release_boundary.set_value();
-    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(completed, "completed", 2s));
     owner.StopAndWait();
     CHECK(values == std::vector<int>{1, 3, 4});
 
@@ -7086,6 +7366,18 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
                                      [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t) noexcept {
                                          if (stage == detail::VisualRuntimeOwner::ActivityStage::BorrowLocked) borrow_locked.set_value();
                                      }};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_publish);
+        mmltk::testsupport::release_test_promise(release_work);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
+    std::future<mmltk::frameworks::gpu::BorrowedImageProductReadView> borrow;
+    std::future<bool> notification;
+    mmltk::testsupport::ScopedTestCleanup release_futures{[&] {
+        mmltk::testsupport::release_test_promise(release_publish);
+        mmltk::testsupport::release_test_promise(release_work);
+    }};
     owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         notified.set_value();
         return detail::VisualRuntimeOwner::Notification{};
@@ -7098,24 +7390,22 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
         finish.wait();
         return detail::VisualRuntimeOwner::Notification{};
     }));
-    publish_entered.get_future().wait();
-    auto borrow = std::async(std::launch::async, [&] { return owner.Borrow(); });
-    borrow_locked.get_future().wait();
-    CHECK(borrow.wait_for(0ms) == std::future_status::timeout);
-    auto notification = std::async(std::launch::async, [&] { return owner.NotifyContinuation(); });
-    const auto notification_status = notification.wait_for(2s);
-    // Always release the product even when the assertion fails, so the evidence
-    // reports a failed boundary instead of leaving a test-owned worker blocked.
+    mmltk::testsupport::await_test_promise(publish_entered, "publish_entered");
+    borrow = std::async(std::launch::async, [&] { return owner.Borrow(); });
+    mmltk::testsupport::await_test_promise(borrow_locked, "borrow_locked");
+
+    notification = std::async(std::launch::async, [&] { return owner.NotifyContinuation(); });
+    // BorrowLocked identifies the actual runtime lock. Notification must
+    // complete while the first physical publication is still held; cleanup
+    // releases both promises before either future can unwind on a deadline.
+    CHECK(mmltk::testsupport::await_test_future(notification, "continuation notification during held publication"));
     release_publish.set_value();
-    const auto borrow_status = borrow.wait_for(2s);
     release_work.set_value();
-    CHECK(notification_status == std::future_status::ready);
-    CHECK(borrow_status == std::future_status::ready);
-    CHECK(notification.get());
-    auto view = borrow.get();
-    CHECK(view.valid());
+    auto view = mmltk::testsupport::await_test_future(borrow, "released product borrow");
+    REQUIRE(view.valid());
+    CHECK(view.plane(0U).revision() == 1U);
     view = {};
-    REQUIRE(notified.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(notified, "notified", 2s));
     owner.StopAndWait();
 }
 
@@ -7128,6 +7418,11 @@ TEST_CASE("visual continuation arrivals while draining survive without later inp
     std::promise<void> completed;
     std::atomic_uint32_t drains = 0U;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_drain);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         if (drains.fetch_add(1U) == 0U) {
             entered.set_value();
@@ -7138,11 +7433,11 @@ TEST_CASE("visual continuation arrivals while draining survive without later inp
         return detail::VisualRuntimeOwner::Notification{};
     });
     REQUIRE(owner.NotifyContinuation());
-    entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(entered, "entered");
     REQUIRE(owner.NotifyContinuation());
     REQUIRE(owner.NotifyContinuation());
     release_drain.set_value();
-    REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(completed, "completed", 2s));
     owner.StopAndWait();
     CHECK(drains.load() == 2U);
     CHECK_FALSE(owner.NotifyContinuation());
@@ -7157,6 +7452,11 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     const auto release = release_boundary.get_future().share();
     std::promise<void> terminal_completed;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
+        mmltk::testsupport::release_test_promise(release_boundary);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
     submit_blocked_visual_work(owner, boundary_entered, release);
     submit_counting_continuation(owner, continuations);
     REQUIRE(owner.SubmitTerminalBarrier([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -7164,7 +7464,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
         return detail::VisualRuntimeOwner::Notification{};
     }));
     release_boundary.set_value();
-    REQUIRE(terminal_completed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(terminal_completed, "terminal_completed", 2s));
     owner.StopAndWait();
     CHECK(continuations.load(std::memory_order_acquire) == 0U);
 
@@ -7173,6 +7473,11 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     std::promise<void> release_failure_boundary;
     const auto failure_release = release_failure_boundary.get_future().share();
     detail::VisualRuntimeOwner failing{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_failing{[&] {
+        mmltk::testsupport::release_test_promise(release_failure_boundary);
+        failing.RequestStop();
+        failing.StopAndWait();
+    }};
     submit_blocked_visual_work(failing, failure_boundary_entered, failure_release);
     REQUIRE(
         failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
@@ -7180,7 +7485,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
         }));
     submit_counting_continuation(failing, continuations);
     release_failure_boundary.set_value();
-    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     failing.StopAndWait();
     CHECK(continuations.load(std::memory_order_acquire) == 0U);
 
@@ -7188,6 +7493,11 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     std::promise<void> release_stop_boundary;
     const auto stop_release = release_stop_boundary.get_future().share();
     detail::VisualRuntimeOwner stopping{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    mmltk::testsupport::ScopedTestCleanup settle_stopping{[&] {
+        mmltk::testsupport::release_test_promise(release_stop_boundary);
+        stopping.RequestStop();
+        stopping.StopAndWait();
+    }};
     submit_blocked_visual_work(stopping, stop_boundary_entered, stop_release);
     submit_counting_continuation(stopping, continuations);
     stopping.RequestStop();
@@ -7293,7 +7603,7 @@ void check_visual_construction_custody(const FakeImageBackend::FailurePoint fail
             }};
         backend->FailAfter(failure_point, 0U, construction_failure);
         REQUIRE(owner.SubmitOrdered(no_op_visual_work));
-        REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+        REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
         CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
         owner.StopAndWait();
         CHECK(owner.stopped());
@@ -7352,7 +7662,7 @@ TEST_CASE("visual retirement reports an unestablished context boundary and disab
             backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
             throw std::runtime_error("deterministic work failure before retirement");
         }));
-    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
     owner.StopAndWait();
     CHECK(owner.stopped());
@@ -7662,13 +7972,16 @@ TEST_CASE("Presentation control remains available during a native wait") {
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         source.sources()};
+    PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(pump_entered.wait_for(2s) == std::future_status::ready);
+    pump_entered.get();
 
     auto admission_closed = std::async(std::launch::async, [&presentation] { presentation.CloseAdmission(); });
-    CHECK(admission_closed.wait_for(100ms) == std::future_status::ready);
+    mmltk::testsupport::ScopedTestCleanup release_wait{[&] { try { writer_state->release_pump.set_value(); } catch (...) {} }};
+    CHECK(admission_closed.wait_for(2s) == std::future_status::ready);
     writer_state->release_pump.set_value();
-    admission_closed.get();
+    mmltk::testsupport::await_test_future(admission_closed, "released Presentation admission close");
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
@@ -7679,6 +7992,7 @@ TEST_CASE("Presentation release failure publishes once and still stops") {
     writer_state->terminal_release_succeeds.store(false, std::memory_order_release);
     PresentationFailureProbe failures;
     auto presentation = make_failure_presentation(source, writer_state, failures);
+    PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(failures.events().Wait([&] { return presentation.snapshot().completed.valid(); }));
 
@@ -7701,6 +8015,7 @@ TEST_CASE("Presentation retains an unprovable native source read through termina
     PresentationFailureProbe failures;
     {
         auto presentation = make_failure_presentation(source, writer_state, failures);
+    PresentationScenario scenario{presentation, writer_state};
         presentation.CloseAdmission();
         presentation.BrowserPeerLost();
         CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
@@ -7717,6 +8032,7 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
     writer_state->fail_pump.store(true, std::memory_order_release);
     PresentationFailureProbe failures;
     auto presentation = make_failure_presentation(source, writer_state, failures);
+    PresentationScenario scenario{presentation, writer_state};
 
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(failures.events().Wait([&] { return failures.failures() == 1U; }));
@@ -7755,7 +8071,7 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
     REQUIRE(owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
         throw std::runtime_error("recoverable operation failure");
     }));
-    REQUIRE(failed.get_future().wait_for(2s) == std::future_status::ready);
+    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
         completed.set_value(allowed_cpu_set());
         return {};
@@ -7821,7 +8137,7 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
     auto overlay = current.overlay;
     overlay.show_masks = !overlay.show_masks;
     const auto admitted = active->UpdateFilter({.filter = current.filter, .overlay = overlay});
-    gate->entered.get_future().wait();
+    mmltk::testsupport::await_test_promise(gate->entered, "gate->entered");
     contracts::SettingsUpdateRequest update;
     update.updates.push_back(
         {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/acceptance/tests/async_test_utils.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -9,6 +11,8 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
 #include <functional>
@@ -72,7 +76,6 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::atomic<std::size_t> staged_uploads{0U};
     bool peer_access = false;
     bool defer_events = false;
-    std::atomic_bool defer_same_device_copies{false};
 
     void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U, std::exception_ptr failure = {}) noexcept {
         failure_point_ = point;
@@ -95,13 +98,17 @@ class FakeImageBackend final : public ImageCopyBackend {
         }
         event_ready_.notify_all();
     }
-    [[nodiscard]] bool WaitForSameDeviceCopy(const std::chrono::milliseconds timeout) {
-        std::unique_lock lock(copy_mutex_);
-        return copy_changed_.wait_for(lock, timeout, [this] { return same_device_copies_entered_ != 0U; });
+    [[nodiscard]] std::unique_ptr<mmltk::testsupport::TestGate> HoldSameDeviceCopies(std::string name) {
+        auto gate = std::make_unique<mmltk::testsupport::TestGate>(std::move(name));
+        std::scoped_lock lock(copy_mutex_);
+        copy_gate_ = gate->receipt();
+        return gate;
     }
-    void CompleteSameDeviceCopies() noexcept {
-        defer_same_device_copies.store(false, std::memory_order_release);
-        copy_changed_.notify_all();
+    [[nodiscard]] std::unique_ptr<mmltk::testsupport::TestGate> HoldEventWaits(std::string name) {
+        auto gate = std::make_unique<mmltk::testsupport::TestGate>(std::move(name));
+        std::scoped_lock lock(mutex_);
+        event_gate_ = gate->receipt();
+        return gate;
     }
 
     [[nodiscard]] std::uintptr_t CreateContext(const int device, DeviceContextMode) override {
@@ -179,12 +186,12 @@ class FakeImageBackend final : public ImageCopyBackend {
     void CopySameDevice(std::uintptr_t, std::uintptr_t, const ImagePlaneView& destination, std::uintptr_t,
                         const ImagePlaneView& source) override {
         MaybeFail(FailurePoint::Copy);
+        std::optional<mmltk::testsupport::TestGate::Receipt> gate;
         {
-            std::unique_lock lock(copy_mutex_);
-            ++same_device_copies_entered_;
-            copy_changed_.notify_all();
-            copy_changed_.wait(lock, [this] { return !defer_same_device_copies.load(std::memory_order_acquire); });
+            std::scoped_lock lock(copy_mutex_);
+            gate = copy_gate_;
         }
+        if (gate) gate->ArriveAndWait();
         CopyImagePlane(destination, source);
         if (source.data == watched_copy_source.load()) ++watched_source_copies;
         ++same_copies;
@@ -253,6 +260,12 @@ class FakeImageBackend final : public ImageCopyBackend {
 
     void Wait(const std::uintptr_t event) {
         std::unique_lock lock(mutex_);
+        const auto gate = event_gate_;
+        if (gate) {
+            lock.unlock();
+            gate->ArriveAndWait();
+            lock.lock();
+        }
         event_ready_.wait(lock, [this, event] {
             const auto found = events_.find(event);
             return found == events_.end() || found->second;
@@ -263,8 +276,8 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::mutex mutex_;
     std::condition_variable event_ready_;
     std::mutex copy_mutex_;
-    std::condition_variable copy_changed_;
-    std::size_t same_device_copies_entered_ = 0U;
+    std::optional<mmltk::testsupport::TestGate::Receipt> copy_gate_;
+    std::optional<mmltk::testsupport::TestGate::Receipt> event_gate_;
     std::unordered_map<std::uintptr_t, int> devices_;
     std::unordered_map<std::uintptr_t, bool> events_;
     FailurePoint failure_point_ = FailurePoint::None;

@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
@@ -29,12 +30,21 @@ TEST_CASE("Registered local storage preserves portable high-water registration",
     host.ensure_bytes(64);
     auto* first = host.data();
     REQUIRE(first);
-    REQUIRE(cuCtxPushCurrent(context) == CUDA_SUCCESS);
-    unsigned flags{};
-    REQUIRE(cuMemHostGetFlags(&flags, first) == CUDA_SUCCESS);
-    CHECK((flags & CU_MEMHOSTREGISTER_PORTABLE) != 0);
-    CUcontext popped{};
-    REQUIRE(cuCtxPopCurrent(&popped) == CUDA_SUCCESS);
+    const auto check_portable = [&](void* storage) {
+        REQUIRE(cuCtxPushCurrent(context) == CUDA_SUCCESS);
+        bool bound = true;
+        mmltk::testsupport::ScopedTestCleanup pop_context{[&] {
+            if (bound) { CUcontext ignored{}; (void)cuCtxPopCurrent(&ignored); }
+        }};
+        unsigned flags{};
+        REQUIRE(cuMemHostGetFlags(&flags, storage) == CUDA_SUCCESS);
+        CHECK((flags & CU_MEMHOSTREGISTER_PORTABLE) != 0);
+        CUcontext popped{};
+        REQUIRE(cuCtxPopCurrent(&popped) == CUDA_SUCCESS);
+        bound = false;
+        CHECK(popped == context);
+    };
+    check_portable(first);
     host.ensure_bytes(32);
     CHECK(host.data() == first);
     CHECK(host.node() == selected.placement.numa_node);
@@ -44,10 +54,7 @@ TEST_CASE("Registered local storage preserves portable high-water registration",
     CHECK_THROWS_AS(host.ensure_bytes(capacity + 1U), std::runtime_error);
     CHECK(host.data() == first);
     CHECK(host.capacity_bytes() == capacity);
-    REQUIRE(cuCtxPushCurrent(context) == CUDA_SUCCESS);
-    CHECK(cuMemHostGetFlags(&flags, first) == CUDA_SUCCESS);
-    CHECK((flags & CU_MEMHOSTREGISTER_PORTABLE) != 0);
-    REQUIRE(cuCtxPopCurrent(&popped) == CUDA_SUCCESS);
+    check_portable(first);
     REQUIRE(host.ReleaseSettled() == CUDA_SUCCESS);
     CHECK(host.data() == nullptr);
 }

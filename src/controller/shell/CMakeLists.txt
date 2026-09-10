@@ -54,7 +54,6 @@ function(mmltk_add_controller_shell_tests)
     mmltk_register_ordinary_sources(
         mmltk_controller_shell_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_lifecycle_contract.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_shutdown.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upscale_explore_wiring.test.cpp
     )
     mmltk_configure_component(

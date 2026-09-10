@@ -1,5 +1,8 @@
 #pragma once
 
+#include "linux_process_test_utils.hpp"
+#include "src/common/io/scoped_fd.h"
+
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/wait.h>
@@ -54,34 +57,29 @@ namespace {
 [[nodiscard]] inline std::string make_errno_message(const char* operation) { return std::string(operation) + ": " + std::strerror(errno); }
 
 inline void set_nonblocking(int fd) {
-    const int flags = ::fcntl(fd, F_GETFL, 0);
+    int flags;
+    do { flags = ::fcntl(fd, F_GETFL, 0); } while (flags < 0 && errno == EINTR);
     if (flags < 0) { throw std::runtime_error(make_errno_message("fcntl(F_GETFL) failed")); }
-    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { throw std::runtime_error(make_errno_message("fcntl(F_SETFL) failed")); }
+    int result;
+    do { result = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK); } while (result < 0 && errno == EINTR);
+    if (result < 0) { throw std::runtime_error(make_errno_message("fcntl(F_SETFL) failed")); }
 }
 
-inline void close_fd(int& fd) {
-    if (fd >= 0) {
-        ::close(fd);
-        fd = -1;
-    }
-}
-
-inline void append_available_output(int& fd, std::string& text, std::string& combined_text) {
+inline void append_available_output(mmltk::common::io::ScopedFd& fd, std::string& text, std::string& combined_text) {
     std::array<char, 4096> buffer{};
     while (true) {
-        const ssize_t bytes_read = ::read(fd, buffer.data(), buffer.size());
+        const ssize_t bytes_read = ::read(fd.get(), buffer.data(), buffer.size());
         if (bytes_read > 0) {
             text.append(buffer.data(), static_cast<std::size_t>(bytes_read));
             combined_text.append(buffer.data(), static_cast<std::size_t>(bytes_read));
             continue;
         }
         if (bytes_read == 0) {
-            close_fd(fd);
+            fd.reset();
             return;
         }
         if (errno == EINTR) { continue; }
         if (errno == EAGAIN || errno == EWOULDBLOCK) { return; }
-        close_fd(fd);
         throw std::runtime_error(make_errno_message("read failed"));
     }
 }
@@ -91,34 +89,29 @@ inline void append_available_output(int& fd, std::string& text, std::string& com
 inline SubprocessResult run_subprocess_capture_output(const std::vector<std::string>& args) {
     if (args.empty()) { throw std::runtime_error("run_subprocess_capture_output requires at least one argument"); }
 
-    std::array<int, 2> stdout_pipe{};
-    std::array<int, 2> stderr_pipe{};
-    if (::pipe(stdout_pipe.data()) != 0) { throw std::runtime_error(make_errno_message("pipe(stdout) failed")); }
-    if (::pipe(stderr_pipe.data()) != 0) {
-        ::close(stdout_pipe[0]);
-        ::close(stdout_pipe[1]);
-        throw std::runtime_error(make_errno_message("pipe(stderr) failed"));
-    }
-
     std::vector<char*> raw_args;
     raw_args.reserve(args.size() + 1);
-    for (const auto& arg : args) {
-        raw_args.push_back(const_cast<char*>(arg.c_str()));
-    }
+    for (const auto& arg : args) raw_args.push_back(const_cast<char*>(arg.c_str()));
     raw_args.push_back(nullptr);
 
+    std::array<int, 2> stdout_pipe{-1, -1};
+    std::array<int, 2> stderr_pipe{-1, -1};
+    if (::pipe2(stdout_pipe.data(), O_CLOEXEC) != 0) throw std::runtime_error(make_errno_message("pipe(stdout) failed"));
+    mmltk::common::io::ScopedFd stdout_read{stdout_pipe[0]}, stdout_write{stdout_pipe[1]};
+    if (::pipe2(stderr_pipe.data(), O_CLOEXEC) != 0) throw std::runtime_error(make_errno_message("pipe(stderr) failed"));
+    mmltk::common::io::ScopedFd stderr_read{stderr_pipe[0]}, stderr_write{stderr_pipe[1]};
+
     const pid_t pid = ::fork();
-    if (pid < 0) {
-        ::close(stdout_pipe[0]);
-        ::close(stdout_pipe[1]);
-        ::close(stderr_pipe[0]);
-        ::close(stderr_pipe[1]);
-        throw std::runtime_error(make_errno_message("fork failed"));
-    }
+    if (pid < 0) throw std::runtime_error(make_errno_message("fork failed"));
     if (pid == 0) {
         ::close(stdout_pipe[0]);
         ::close(stderr_pipe[0]);
-        if (::dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || ::dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
+        const auto duplicate = [](int source, int destination) {
+            int result;
+            do { result = ::dup2(source, destination); } while (result < 0 && errno == EINTR);
+            return result;
+        };
+        if (duplicate(stdout_pipe[1], STDOUT_FILENO) < 0 || duplicate(stderr_pipe[1], STDERR_FILENO) < 0) {
             std::fprintf(stderr, "dup2 failed: %s\n", std::strerror(errno));
             std::_Exit(127);
         }
@@ -129,8 +122,9 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
         std::_Exit(127);
     }
 
-    ::close(stdout_pipe[1]);
-    ::close(stderr_pipe[1]);
+    ScopedTestChild child{pid};
+    stdout_write.reset();
+    stderr_write.reset();
     set_nonblocking(stdout_pipe[0]);
     set_nonblocking(stderr_pipe[0]);
 
@@ -138,29 +132,26 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
     std::string stdout_text;
     std::string stderr_text;
     while (true) {
-        if (stdout_pipe[0] < 0 && stderr_pipe[0] < 0) { break; }
+        if (stdout_read.get() < 0 && stderr_read.get() < 0) { break; }
         std::array<pollfd, 2> poll_fds{{
-            {stdout_pipe[0], POLLIN | POLLHUP | POLLERR | POLLNVAL, 0},
-            {stderr_pipe[0], POLLIN | POLLHUP | POLLERR | POLLNVAL, 0},
+            {stdout_read.get(), POLLIN | POLLHUP | POLLERR | POLLNVAL, 0},
+            {stderr_read.get(), POLLIN | POLLHUP | POLLERR | POLLNVAL, 0},
         }};
         const int ready = ::poll(poll_fds.data(), poll_fds.size(), -1);
         if (ready < 0) {
             if (errno == EINTR) { continue; }
-            close_fd(stdout_pipe[0]);
-            close_fd(stderr_pipe[0]);
             throw std::runtime_error(make_errno_message("poll failed"));
         }
 
-        if (stdout_pipe[0] >= 0 && (poll_fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-            append_available_output(stdout_pipe[0], stdout_text, output_text);
+        if (stdout_read.get() >= 0 && (poll_fds[0].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            append_available_output(stdout_read, stdout_text, output_text);
         }
-        if (stderr_pipe[0] >= 0 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
-            append_available_output(stderr_pipe[0], stderr_text, output_text);
+        if (stderr_read.get() >= 0 && (poll_fds[1].revents & (POLLIN | POLLHUP | POLLERR | POLLNVAL))) {
+            append_available_output(stderr_read, stderr_text, output_text);
         }
     }
 
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) { throw std::runtime_error(make_errno_message("waitpid failed")); }
+    const int status = child.Wait();
     if (!WIFEXITED(status)) { throw std::runtime_error("subprocess did not exit normally"); }
 
     return SubprocessResult{

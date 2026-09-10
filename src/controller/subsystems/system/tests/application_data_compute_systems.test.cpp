@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
@@ -1660,8 +1661,15 @@ TEST_CASE("training completion releases admission before observer publication re
                              local_publishing.set_value();
                              release_local.wait();
                          }};
+    mmltk::testsupport::ScopedTestCleanup release_local_on_exit{[&] {
+        mmltk::testsupport::release_test_promise(release_local_publication);
+        local_gate->Release();
+        static_cast<void>(local.Stop({}));
+    }};
     static_cast<void>(local.Start({}));
-    local_publishing.get_future().wait();
+    auto publishing = local_publishing.get_future();
+    REQUIRE(publishing.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    publishing.get();
     CHECK(local.Stop({}).local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(local.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     release_local_publication.set_value();
@@ -1678,8 +1686,15 @@ TEST_CASE("training completion releases admission before observer publication re
                              query_publishing.set_value(changed->snapshot);
                              release_query.wait();
                          }};
+    mmltk::testsupport::ScopedTestCleanup release_query_on_exit{[&] {
+        mmltk::testsupport::release_test_promise(release_query_publication);
+        query_gate->Release();
+        static_cast<void>(query.Stop({}));
+    }};
     static_cast<void>(query.Query({}));
-    const auto published = query_publishing.get_future().get();
+    auto query_publication = query_publishing.get_future();
+    REQUIRE(query_publication.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    const auto published = query_publication.get();
     static_cast<void>(query.Stop({}));
     const auto cleared = query.Clear({});
     release_query_publication.set_value();
@@ -1704,21 +1719,31 @@ TEST_CASE("training admission and matching cancellation do not invert system and
                          [&](TrainingSystem::event_type event) {
                              if (!std::holds_alternative<TrainingProgress>(event)) local_done.set_value();
                          }};
-    std::barrier local_admission{3};
-    auto starting = std::async(std::launch::async, [&] {
-        local_admission.arrive_and_wait();
+    mmltk::testsupport::TestGate local_admission{"concurrent training Start and Stop admission"};
+    std::future<TrainingSnapshot> starting, stopping;
+    mmltk::testsupport::ScopedTestCleanup release_local{[&] { local_admission.Release(); local_gate->Release(); }};
+    starting = std::async(std::launch::async, [&] {
+        local_admission.receipt().ArriveAndWait();
         return local.Start({});
     });
-    auto stopping = std::async(std::launch::async, [&] {
-        local_admission.arrive_and_wait();
+    stopping = std::async(std::launch::async, [&] {
+        local_admission.receipt().ArriveAndWait();
         return local.Stop({});
     });
-    local_admission.arrive_and_wait();
-    static_cast<void>(starting.get());
-    static_cast<void>(stopping.get());
+    REQUIRE(local_admission.WaitEntered(std::chrono::seconds{2}, 2U));
+    local_admission.Release();
+    const auto start_status = starting.wait_for(std::chrono::seconds{2});
+    const auto stop_status = stopping.wait_for(std::chrono::seconds{2});
+    if (start_status != std::future_status::ready || stop_status != std::future_status::ready) local_gate->Release();
+    REQUIRE(start_status == std::future_status::ready);
+    REQUIRE(stop_status == std::future_status::ready);
+    CHECK_NOTHROW(static_cast<void>(starting.get()));
+    CHECK_NOTHROW(static_cast<void>(stopping.get()));
     static_cast<void>(local.Stop({}));
     // CLEANUP-IGNORE: Local Stop and provider Clear are separate lock-order paths within the same sealed system.
-    local_done.get_future().wait();
+    auto local_terminal = local_done.get_future();
+    REQUIRE(local_terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    local_terminal.get();
 
     auto query_gate = std::make_shared<StopGate>();
     std::promise<void> query_done;
@@ -1726,22 +1751,33 @@ TEST_CASE("training admission and matching cancellation do not invert system and
                          [&](TrainingSystem::event_type event) {
                              if (!std::holds_alternative<TrainingProgress>(event)) query_done.set_value();
                          }};
-    std::barrier query_admission{3};
-    auto querying = std::async(std::launch::async, [&] {
-        query_admission.arrive_and_wait();
+    mmltk::testsupport::TestGate query_admission{"concurrent provider Query and Clear admission"};
+    std::future<TrainingSnapshot> querying;
+    std::future<void> clearing;
+    mmltk::testsupport::ScopedTestCleanup release_query{[&] { query_admission.Release(); query_gate->Release(); }};
+    querying = std::async(std::launch::async, [&] {
+        query_admission.receipt().ArriveAndWait();
         return query.Query({});
     });
-    auto clearing = std::async(std::launch::async, [&] {
-        query_admission.arrive_and_wait();
+    clearing = std::async(std::launch::async, [&] {
+        query_admission.receipt().ArriveAndWait();
         try {
             static_cast<void>(query.Clear({}));
         } catch (const contracts::BusyError&) {}
     });
-    query_admission.arrive_and_wait();
-    static_cast<void>(querying.get());
-    clearing.get();
+    REQUIRE(query_admission.WaitEntered(std::chrono::seconds{2}, 2U));
+    query_admission.Release();
+    const auto query_status = querying.wait_for(std::chrono::seconds{2});
+    const auto clear_status = clearing.wait_for(std::chrono::seconds{2});
+    if (query_status != std::future_status::ready || clear_status != std::future_status::ready) query_gate->Release();
+    REQUIRE(query_status == std::future_status::ready);
+    REQUIRE(clear_status == std::future_status::ready);
+    CHECK_NOTHROW(static_cast<void>(querying.get()));
+    CHECK_NOTHROW(clearing.get());
     static_cast<void>(query.Clear({}));
-    query_done.get_future().wait();
+    auto query_terminal = query_done.get_future();
+    REQUIRE(query_terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    query_terminal.get();
 }
 
 }  // namespace
