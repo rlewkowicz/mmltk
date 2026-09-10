@@ -80,7 +80,9 @@ impl App {
                 let local_edits = self.settings.has_local_edits();
                 let open_available = self.model.explore_open_available();
                 if let Some(integration) = self.integration.as_mut() {
-                    integration.observe_explore_open_request(local_edits, open_available);
+                    integration.observe_reporting(|reporting| {
+                        reporting.observe_explore_open_request(local_edits, open_available);
+                    });
                 }
                 if local_edits || !open_available {
                     self.model.error = Some(UiError::busy(
@@ -105,19 +107,21 @@ impl App {
                     return Task::none();
                 }
                 if let Some(integration) = self.integration.as_mut() {
-                    let columns = settings
-                        .settingsstate
-                        .workflows
-                        .explore
-                        .gridwidth
-                        .clamp(1, 99) as u32;
-                    integration.observe_explore_open_layout(
-                        self.workspace
-                            .explore_measured_viewport(columns, 0, 0)
-                            .is_some(),
-                        self.model.explore.snapshot.as_ref(),
-                        columns,
-                    );
+                    integration.observe_reporting(|reporting| {
+                        let columns = settings
+                            .settingsstate
+                            .workflows
+                            .explore
+                            .gridwidth
+                            .clamp(1, 99) as u32;
+                        reporting.observe_explore_open_layout(
+                            self.workspace
+                                .explore_measured_viewport(columns, 0, 0)
+                                .is_some(),
+                            self.model.explore.snapshot.as_ref(),
+                            columns,
+                        );
+                    });
                 }
                 self.model.explore.desired_open = true;
                 self.dispatch_explore_desired();
@@ -190,12 +194,14 @@ impl App {
                 let local_edits = self.settings.has_local_edits();
                 let mutation_available = self.model.explore_mutation_available();
                 if let Some(integration) = self.integration.as_mut() {
-                    integration.observe_explore_filter_request(
-                        &request,
-                        self.model.explore.snapshot.as_ref(),
-                        local_edits,
-                        mutation_available,
-                    );
+                    integration.observe_reporting(|reporting| {
+                        reporting.observe_explore_filter_request(
+                            &request,
+                            self.model.explore.snapshot.as_ref(),
+                            local_edits,
+                            mutation_available,
+                        );
+                    });
                 }
                 if local_edits || !mutation_available {
                     self.model.error = Some(UiError::busy(
@@ -406,7 +412,9 @@ impl App {
                 |correlation| crate::generated::encode_explore_UpdateFilter(correlation, request),
             );
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_explore_filter_submission(submitted);
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_explore_filter_submission(submitted);
+                });
             }
             if submitted {
                 self.model.explore.desired_filter = None;
@@ -493,11 +501,13 @@ impl App {
             .clamp(1, 99) as u32;
         let Some(viewport) = self.workspace.explore_measured_viewport(columns, 0, 0) else {
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_explore_open_layout(
-                    false,
-                    self.model.explore.snapshot.as_ref(),
-                    columns,
-                );
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_explore_open_layout(
+                        false,
+                        self.model.explore.snapshot.as_ref(),
+                        columns,
+                    );
+                });
             }
             return;
         };
@@ -513,7 +523,9 @@ impl App {
                 )
             });
         if let Some(integration) = self.integration.as_mut() {
-            integration.observe_explore_open_submission(submitted);
+            integration.observe_reporting(|reporting| {
+                reporting.observe_explore_open_submission(submitted);
+            });
         }
         if submitted {
             self.model.explore.desired_open = false;

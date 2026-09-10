@@ -125,7 +125,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         } => task = app.on_explore_writable(peer_generation, result),
         Message::Workspace(message) => {
             if let Some(integration) = app.integration.as_ref() {
-                integration.observe_workspace_message(&message, app.workspace.active());
+                integration.observe_workspace_message(|| (&message, app.workspace.active()));
             }
             task = app.on_workspace(message);
         }

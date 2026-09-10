@@ -1,3 +1,4 @@
+mod reporting;
 mod annotation_checks;
 mod annotation_product;
 use crate::generated::FeatureId;
@@ -118,7 +119,7 @@ pub(crate) fn report_viewer_label(
     frame: crate::presentation_surface::FrameReady,
     detail: bool,
 ) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.viewer_label_rgb",
         explore::DETAIL_LABELS_ID,
         "actual-iced-label",
@@ -128,8 +129,8 @@ pub(crate) fn report_viewer_label(
             f64::from(color.g),
             f64::from(color.b),
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.viewer_label_catalog",
         explore::DETAIL_LABELS_ID,
         "full-native-catalog",
@@ -139,8 +140,8 @@ pub(crate) fn report_viewer_label(
             f64::from(u8::from(overlay.showboxes)),
             f64::from(u8::from(overlay.showmasks)),
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.viewer_label_frame",
         explore::DETAIL_LABELS_ID,
         if detail {
@@ -154,7 +155,7 @@ pub(crate) fn report_viewer_label(
             frame.content_session as f64,
             f64::from(u8::from(overlay.showboxes)),
         ],
-    );
+    ));
 }
 pub const EXPLORE_AUGMENTATION_TOGGLE: &str = explore::AUGMENTATION_TOGGLE_ID;
 pub const EXPLORE_AUGMENTATION_REROLL: &str = explore::AUGMENTATION_REROLL_ID;
@@ -718,8 +719,7 @@ extern "C" {
     fn fullscreen_js(enabled: bool);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFullscreenSettled)]
     fn fullscreen_settled_js(enabled: bool) -> bool;
-    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReport)]
-    fn report_js(event: &str, control: &str, detail: &str, a: f64, b: f64, c: f64, d: f64);
+
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationUpscalePixels)]
     fn upscale_pixels_js(
         receipt: &wasm_bindgen::JsValue,
@@ -729,17 +729,7 @@ extern "C" {
         presentation: f64,
         completed: &wasm_bindgen::JsValue,
     );
-    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationRenderedStyle)]
-    fn rendered_style_js(
-        control: &str,
-        semantic: &str,
-        red: f64,
-        green: f64,
-        blue: f64,
-        alpha: f64,
-        width: f64,
-        height: f64,
-    );
+
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClick)]
     fn click_js(x: f64, y: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]
@@ -1095,7 +1085,7 @@ fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'static) -> wasm
             let status = status.as_string();
             let outcome = ProbeOutcome::decode(status.as_deref(), [first.as_f64(), second.as_f64()]);
             if outcome == ProbeOutcome::Failed && status.as_deref() != Some("failed") {
-                report("integration.failure", "", "pixel callback returned invalid counts", [0.0; 4]);
+                reporting::emit(|sink| sink.record("integration.failure", "", "pixel callback returned invalid counts", [0.0; 4]));
             }
             completed(outcome);
         },
@@ -1137,54 +1127,13 @@ fn sample_upscale_pixels(
 #[cfg(not(target_arch = "wasm32"))]
 fn sample_upscale_pixels(_output: ScenarioOutput, _image: Rectangle, _button: Rectangle, _source: u64, _presentation: u64) {}
 
-#[cfg(target_arch = "wasm32")]
-fn report(event: &str, control: &str, detail: &str, values: [f64; 4]) {
-    if !reporting_enabled() {
-        return;
-    }
-    report_js(
-        event, control, detail, values[0], values[1], values[2], values[3],
-    );
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn report(_event: &str, _control: &str, _detail: &str, _values: [f64; 4]) {}
-
 pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.snapshot_conflict",
         family,
         fields,
         [revision as f64, 0.0, 0.0, 0.0],
-    );
-}
-
-#[cfg(target_arch = "wasm32")]
-fn report_rendered_control_style(
-    control: &str,
-    semantic: &str,
-    color: [f64; 4],
-    bounds: Rectangle,
-) {
-    rendered_style_js(
-        control,
-        semantic,
-        color[0],
-        color[1],
-        color[2],
-        color[3],
-        f64::from(bounds.width),
-        f64::from(bounds.height),
-    );
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn report_rendered_control_style(
-    _control: &str,
-    _semantic: &str,
-    _color: [f64; 4],
-    _bounds: Rectangle,
-) {
+    ));
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1206,7 +1155,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
     let visibility = u8::from(snapshot.overlay.showboxes)
         | (u8::from(snapshot.overlay.showmasks) << 1)
         | (u8::from(snapshot.overlay.showlabels) << 2);
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.atlas_geometry",
         EXPLORE_GALLERY,
         "uniform-square",
@@ -1216,8 +1165,8 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
             (image.width / snapshot.viewport.columns.max(1) as f32) as f64,
             (image.height / snapshot.viewport.rowcount.max(1) as f32) as f64,
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.atlas_scale",
         EXPLORE_GALLERY,
         "source-to-screen",
@@ -1227,8 +1176,8 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
             (image.width / frame.content_width.max(1) as f32) as f64,
             (image.height / frame.content_height.max(1) as f32) as f64,
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.atlas_clip",
         EXPLORE_GALLERY,
         "scrollable-clip",
@@ -1238,8 +1187,8 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
             (clip.y - image.y) as f64,
             (image.y + image.height - clip.y - clip.height) as f64,
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.atlas_visibility",
         EXPLORE_GALLERY,
         if dark { "dark" } else { "light" },
@@ -1254,7 +1203,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
                 .count() as f64,
             snapshot.gallery.slots.len() as f64,
         ],
-    );
+    ));
     let new_draw = SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
         let same_rendered_draw = observer.atlas.as_ref().is_some_and(|previous| {
@@ -1361,7 +1310,7 @@ pub(crate) fn report_surface_draw(
     count: u64,
     viewer: ViewerDraw,
 ) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_draw",
         control,
         if redraw { "redraw" } else { "draw" },
@@ -1371,9 +1320,9 @@ pub(crate) fn report_surface_draw(
             content_width as f64,
             content_height as f64,
         ],
-    );
+    ));
     if control == explore::DETAIL_WORKSPACE_ID {
-        report(
+        reporting::emit(|sink| sink.record(
             "integration.viewer_sample",
             control,
             "actual-draw",
@@ -1383,7 +1332,7 @@ pub(crate) fn report_surface_draw(
                 viewer.image.width as f64,
                 viewer.image.height as f64,
             ],
-        );
+        ));
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision, viewer);
@@ -1403,7 +1352,7 @@ pub(crate) fn report_surface_draw(
             }
         });
     }
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_draw_ordinal",
         control,
         if redraw { "redraw" } else { "draw" },
@@ -1413,7 +1362,7 @@ pub(crate) fn report_surface_draw(
             count as f64,
             if redraw { 1.0 } else { 0.0 },
         ],
-    );
+    ));
     if control == EXPLORE_GALLERY {
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
@@ -1466,7 +1415,7 @@ pub(crate) fn report_surface_sync(
             |surface| format!("{:016x}{:016x}", surface.high, surface.low),
         )
     };
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_sync",
         &identity(current),
         &identity(updated),
@@ -1476,7 +1425,7 @@ pub(crate) fn report_surface_sync(
             updated.map_or(0.0, |surface| surface.width as f64),
             updated.map_or(0.0, |surface| surface.height as f64),
         ],
-    );
+    ));
 }
 
 pub(crate) fn report_surface_geometry(
@@ -1485,7 +1434,7 @@ pub(crate) fn report_surface_geometry(
     source_revision: u64,
     geometry: Rectangle,
 ) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_geometry",
         control,
         "shader-viewport",
@@ -1495,7 +1444,7 @@ pub(crate) fn report_surface_geometry(
             f64::from(geometry.width),
             f64::from(geometry.height),
         ],
-    );
+    ));
 }
 
 pub(crate) fn report_surface_container(
@@ -1506,7 +1455,7 @@ pub(crate) fn report_surface_container(
     content_width: u32,
     content_height: u32,
 ) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_container",
         control,
         "rendered-contain-container",
@@ -1516,8 +1465,8 @@ pub(crate) fn report_surface_container(
             f64::from(bounds.width),
             f64::from(bounds.height),
         ],
-    );
-    report(
+    ));
+    reporting::emit(|sink| sink.record(
         "integration.surface_content",
         control,
         "exported-native-frame",
@@ -1527,7 +1476,7 @@ pub(crate) fn report_surface_container(
             content_width as f64,
             content_height as f64,
         ],
-    );
+    ));
 }
 
 pub(crate) fn report_surface_scale(
@@ -1536,7 +1485,7 @@ pub(crate) fn report_surface_scale(
     source_revision: u64,
     scale: f32,
 ) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.surface_scale",
         control,
         "physical-to-logical",
@@ -1546,16 +1495,16 @@ pub(crate) fn report_surface_scale(
             f64::from(scale),
             f64::from(scale),
         ],
-    );
+    ));
 }
 
 pub(crate) fn report_annotation_gesture(detail: &str, values: [f64; 4]) {
-    report(
+    reporting::emit(|sink| sink.record(
         "integration.annotation_gesture",
         ANNOTATION_SURFACE,
         detail,
         values,
-    );
+    ));
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2255,20 +2204,6 @@ fn route_edit_available(
     !settings.has_local_edits() && model.settings_edit_available()
 }
 
-fn report_advanced_field(control: &str, detail: &str, bounds: Rectangle) {
-    report(
-        "integration.advanced_field",
-        control,
-        detail,
-        [
-            f64::from(bounds.x),
-            f64::from(bounds.y),
-            f64::from(bounds.width),
-            f64::from(bounds.height),
-        ],
-    );
-}
-
 #[derive(Clone, Default)]
 struct SessionInputs {
     profile: String,
@@ -2291,9 +2226,9 @@ impl SessionInputs {
 }
 
 pub struct Controller {
+    reporting: reporting::Owner,
     generation: u64,
     phase: Phase,
-    reported_phase: Option<Phase>,
     location_pending: bool,
     window_close: bool,
     dataset_source: String,
@@ -2380,14 +2315,8 @@ pub struct Controller {
     ui_scale_baseline: f32,
     ui_scale_first: Option<f32>,
     input_scale: f32,
-    explore_snapshot_revision: u64,
-    reopen_wait_revision: u64,
     oversized_capacity: Option<crate::generated::VisualExtent>,
-    scroll_placeholder_reported: bool,
     selection_grid: Option<(u32, u32, u32, u64, u64)>,
-    resolved_primary: [f64; 4],
-    resolved_benchmark: [f64; 4],
-    reported_style_bits: u8,
 }
 
 impl Controller {
@@ -2425,78 +2354,19 @@ impl Controller {
         )
     }
 
-    pub fn observe_workspace_message(
+    pub fn observe_workspace_message<'a>(
         &self,
-        message: &crate::view::router::Message,
-        active: FeatureId,
+        payload: impl FnOnce() -> (&'a crate::view::router::Message, FeatureId),
     ) {
-        if !reporting_enabled() || !self.running() {
-            return;
-        }
-        if let crate::view::router::Message::Navigation(
-            crate::view::navigation::Message::PageSelected(feature),
-        ) = message
-        {
-            report(
-                "integration.navigation_message",
-                crate::view::navigation::stable_id(*feature),
-                crate::view::navigation::label(active),
-                [0.0; 4],
-            );
-        }
-        if matches!(
-            self.phase,
-            Phase::AwaitAdvancedNumericDraft(_) | Phase::AwaitAdvancedNumericSnapshot(_)
-        ) && matches!(
-            message,
-            crate::view::router::Message::Train(crate::view::train::Message::Advanced(_))
-        ) {
-            report(
-                "integration.advanced_message",
-                "",
-                &format!("{message:?}"),
-                [0.0; 4],
-            );
-        }
-        if let crate::view::router::Message::Explore(message) = message {
-            report(
-                "integration.explore_message",
-                "",
-                &format!("{message:?}"),
-                [0.0; 4],
-            );
-        }
+        self.observe_reporting(|reporting| {
+            let (message, active) = payload();
+            reporting.observe_workspace_message(message, active, &self.phase);
+        });
     }
 
-    pub fn observe_navigation_outcome(&self, selected: FeatureId, active: FeatureId) {
+    pub(crate) fn observe_reporting(&self, observe: impl FnOnce(&mut reporting::State)) {
         if self.running() {
-            report(
-                "integration.navigation_outcome",
-                crate::view::navigation::stable_id(selected),
-                crate::view::navigation::label(active),
-                [0.0; 4],
-            );
-        }
-    }
-
-    pub fn observe_authoritative_route(
-        &self,
-        source: &'static str,
-        authoritative: FeatureId,
-        active: FeatureId,
-    ) {
-        if self.running() {
-            report(
-                "integration.route_state",
-                crate::view::navigation::stable_id(authoritative),
-                source,
-                [
-                    if authoritative == active { 1.0 } else { 0.0 },
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-            );
+            self.reporting.observe(observe);
         }
     }
 
@@ -2513,13 +2383,13 @@ impl Controller {
         initialize_driver_js(enabled);
         let generation = if enabled { reset_observer() } else { 0 };
         Self {
+            reporting: reporting::Owner::new(),
             generation,
             phase: if enabled {
                 Phase::AwaitBootstrap
             } else {
                 Phase::Disabled
             },
-            reported_phase: None,
             location_pending: false,
             window_close,
             dataset_source,
@@ -2606,14 +2476,8 @@ impl Controller {
             ui_scale_baseline: 1.0,
             ui_scale_first: None,
             input_scale: 1.0,
-            explore_snapshot_revision: 0,
-            reopen_wait_revision: 0,
             oversized_capacity: None,
-            scroll_placeholder_reported: false,
             selection_grid: None,
-            resolved_primary: [0.0; 4],
-            resolved_benchmark: [0.0; 4],
-            reported_style_bits: 0,
         }
     }
 
@@ -2774,182 +2638,13 @@ impl Controller {
     }
 
     fn fail(&mut self, detail: &str) {
-        report("integration.failed", "", detail, [0.0; 4]);
+        self.fail_detail(|| std::borrow::Cow::Borrowed(detail));
+    }
+
+    fn fail_detail<'a>(&mut self, detail: impl FnOnce() -> std::borrow::Cow<'a, str>) {
+        reporting::emit(|sink| sink.record("integration.failed", "", &detail(), [0.0; 4]));
         self.phase = Phase::Failed;
         self.location_pending = false;
-    }
-
-    pub fn observe_native_frame(
-        &self,
-        frame: crate::presentation_surface::FrameReady,
-        surface: Option<crate::presentation_surface::Surface>,
-    ) {
-        if !self.running() {
-            return;
-        }
-        let matching_surface = surface.is_some_and(|candidate| {
-            candidate.high == frame.high
-                && candidate.low == frame.low
-                && frame.content_width <= candidate.width
-                && frame.content_height <= candidate.height
-        });
-        report(
-            "integration.native_frame",
-            "presentation.surface",
-            if matching_surface {
-                "accepted"
-            } else if surface.is_some() {
-                "rejected"
-            } else {
-                "surface-missing"
-            },
-            [
-                frame.content_sequence as f64,
-                frame.presentation_revision as f64,
-                surface.map_or(0.0, |candidate| candidate.generation as f64),
-                if matching_surface { 1.0 } else { 0.0 },
-            ],
-        );
-    }
-
-    pub fn observe_explore_open_submission(&self, submitted: bool) {
-        if self.running() {
-            report(
-                "integration.explore_open_submission",
-                EXPLORE_OPEN,
-                if submitted { "submitted" } else { "rejected" },
-                [0.0; 4],
-            );
-        }
-    }
-
-    pub fn observe_explore_open_layout(
-        &self,
-        measured: bool,
-        snapshot: Option<&crate::generated::ExploreSnapshot>,
-        columns: u32,
-    ) {
-        if self.running() {
-            report(
-                "integration.explore_open_layout",
-                EXPLORE_GALLERY,
-                if measured {
-                    "measured"
-                } else {
-                    "waiting-for-measurement"
-                },
-                [
-                    snapshot.map_or(0.0, |value| value.dataset.identity as f64),
-                    snapshot.map_or(0.0, |value| value.revision as f64),
-                    columns as f64,
-                    snapshot.map_or(0.0, |value| value.order.matchingcount as f64),
-                ],
-            );
-        }
-    }
-
-    pub fn observe_explore_filter_request(
-        &self,
-        request: &crate::generated::ExploreFilterUpdate,
-        snapshot: Option<&crate::generated::ExploreSnapshot>,
-        local_edits: bool,
-        mutation_available: bool,
-    ) {
-        if !self.running() {
-            return;
-        }
-        let detail = if local_edits {
-            "rejected-local-edits"
-        } else if !mutation_available {
-            "rejected-unavailable"
-        } else {
-            "preconditions-accepted"
-        };
-        let state = snapshot.map_or(0.0, |value| {
-            (u8::from(value.ready)
-                | (u8::from(value.busy) << 1)
-                | (u8::from(value.cancellationrequested) << 2)) as f64
-        });
-        report(
-            "integration.explore_filter_request",
-            if request.filter.order == crate::generated::ExploreOrder::Shuffled {
-                "shuffled"
-            } else {
-                "sequential"
-            },
-            detail,
-            [
-                snapshot.map_or(0.0, |value| value.revision as f64),
-                request.filter.minimumcompiledindex as f64,
-                state,
-                if mutation_available { 1.0 } else { 0.0 },
-            ],
-        );
-    }
-
-    pub fn observe_explore_filter_submission(&self, submitted: bool) {
-        if self.running() {
-            report(
-                "integration.explore_filter_submission",
-                "explore.UpdateFilter",
-                if submitted { "submitted" } else { "rejected" },
-                [0.0; 4],
-            );
-        }
-    }
-
-    pub fn observe_explore_filter_settlement(
-        &self,
-        source: &'static str,
-        snapshot: Option<&crate::generated::ExploreSnapshot>,
-        mutation_available: bool,
-    ) {
-        if !self.running() {
-            return;
-        }
-        let Some(snapshot) = snapshot else {
-            report(
-                "integration.explore_filter_settlement",
-                source,
-                "snapshot-unavailable",
-                [0.0; 4],
-            );
-            return;
-        };
-        let state = (u8::from(snapshot.ready)
-            | (u8::from(snapshot.busy) << 1)
-            | (u8::from(snapshot.cancellationrequested) << 2)) as f64;
-        report(
-            "integration.explore_filter_settlement",
-            source,
-            if snapshot.filter.order == crate::generated::ExploreOrder::Shuffled {
-                "shuffled"
-            } else {
-                "sequential"
-            },
-            [
-                snapshot.revision as f64,
-                snapshot.filter.minimumcompiledindex as f64,
-                state,
-                if mutation_available { 1.0 } else { 0.0 },
-            ],
-        );
-    }
-
-    pub fn observe_explore_open_request(&self, local_edits: bool, open_available: bool) {
-        if self.running() {
-            report(
-                "integration.explore_open_request",
-                EXPLORE_OPEN,
-                "received",
-                [
-                    if local_edits { 1.0 } else { 0.0 },
-                    if open_available { 1.0 } else { 0.0 },
-                    0.0,
-                    0.0,
-                ],
-            );
-        }
     }
 
     fn begin_copy_object_edit(
@@ -3188,12 +2883,12 @@ impl Controller {
             Message::NumberWheelDelivered => {
                 if let Phase::AwaitAdvancedSpinnerWheel(index) = self.phase {
                     self.phase = Phase::AdvancedSpinnerWheelVerify(index);
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.number_wheel_delivered",
                         &advanced_field_id(index),
                         "iced-widget-update-complete",
                         [0.0; 4],
-                    );
+                    ));
                 }
                 return None;
             }
@@ -3266,10 +2961,10 @@ impl Controller {
                 match outcome {
                     ProbeOutcome::Invalidated => self.invalidate_atlas_draw(),
                     ProbeOutcome::Observed(visible, nonblack) => {
-                        report("integration.atlas_canvas_pixels", EXPLORE_GALLERY, "visible-tile-interiors",
+                        reporting::emit(|sink| sink.record("integration.atlas_canvas_pixels", EXPLORE_GALLERY, "visible-tile-interiors",
                             [receipt.snapshot.frame.revision as f64,
                              receipt.surface.frame.map_or(0, |frame| frame.presentation_revision) as f64,
-                             visible as f64, nonblack as f64]);
+                             visible as f64, nonblack as f64]));
                         if visible != 0 && visible == nonblack { self.atlas_pixels = Some(receipt); }
                     }
                     ProbeOutcome::Failed => self.fail("Atlas canvas sampling failed"),
@@ -3285,7 +2980,7 @@ impl Controller {
                     frame_revision,
                 } = &self.phase
                 {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_reopen_draw",
                         EXPLORE_GALLERY,
                         "physical-gallery-draw",
@@ -3295,7 +2990,7 @@ impl Controller {
                             source_revision as f64,
                             presentation_revision as f64,
                         ],
-                    );
+                    ));
                 }
                 self.gallery_drawn = Some((presentation_revision, source_revision));
                 return None;
@@ -3338,12 +3033,12 @@ impl Controller {
             if bounds.width > 0.0 || bounds.height > 0.0 {
                 self.fail("Explore still renders an aspect-ratio selector");
             } else if let Some((presentation, source, _)) = self.viewer_drawn {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_complete",
                     "explore.detail.aspect",
                     &self.viewer_scenario,
                     [presentation as f64, source as f64, 1.0, 0.0],
-                );
+                ));
                 self.phase = if self.viewer_scenario == "terminal" {
                     Phase::OpenAnnotation
                 } else {
@@ -3353,40 +3048,16 @@ impl Controller {
             return None;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
-            report(
+            reporting::emit(|sink| sink.record(
                 "integration.locate_failed",
                 &control,
                 "stable identity absent from rendered tree",
                 [0.0; 4],
-            );
+            ));
             self.fail("Iced widget operation could not locate the stable identity");
             return None;
         }
-        report(
-            "integration.control_bounds",
-            &control,
-            "",
-            [
-                f64::from(bounds.x),
-                f64::from(bounds.y),
-                f64::from(bounds.width),
-                f64::from(bounds.height),
-            ],
-        );
-        match self.phase.clone() {
-            Phase::AdvancedField(index) => {
-                report_advanced_field(&control, &format!("fixed-{index}"), bounds)
-            }
-            Phase::AdvancedAssignment => report_advanced_field(&control, "assignment", bounds),
-            Phase::AdvancedMatchFree(index) => {
-                report_advanced_field(&control, &format!("match-free-{index}"), bounds)
-            }
-            Phase::AdvancedDenoisingToggle => report_advanced_field(&control, "dn-toggle", bounds),
-            Phase::AdvancedDenoising(index) => {
-                report_advanced_field(&control, &format!("dn-{index}"), bounds)
-            }
-            _ => {}
-        }
+        self.reporting.observe(|reporting| reporting.located(&self.phase, &control, bounds));
         let expected = match self.phase {
             Phase::SettingsOpen => "navigation.settings".to_owned(),
             Phase::SettingsModal => SETTINGS_MODAL.to_owned(),
@@ -3491,35 +3162,7 @@ impl Controller {
             self.fail("Iced widget operation returned the wrong stable identity");
             return None;
         }
-        let resolved_style = if control == BENCHMARK_OVERRIDE {
-            Some(("benchmark-purple", self.resolved_benchmark))
-        } else if matches!(
-            control.as_str(),
-            DATASET_BROWSE
-                | COMPILE_DATASET
-                | crate::view::workflow::model_card::TRAIN_CUSTOM_ID
-                | crate::view::workflow::model_card::TRAIN_ACTION_ID
-                | EXPLORE_OPEN
-        ) {
-            Some(("shared-primary", self.resolved_primary))
-        } else {
-            None
-        };
-        if let Some((semantic, color)) = resolved_style {
-            let bit = match control.as_str() {
-                DATASET_BROWSE => 1,
-                COMPILE_DATASET => 2,
-                crate::view::workflow::model_card::TRAIN_CUSTOM_ID => 4,
-                crate::view::workflow::model_card::TRAIN_ACTION_ID => 8,
-                EXPLORE_OPEN => 16,
-                BENCHMARK_OVERRIDE => 32,
-                _ => 0,
-            };
-            if self.reported_style_bits & bit == 0 {
-                self.reported_style_bits |= bit;
-                report_rendered_control_style(&control, semantic, color, bounds);
-            }
-        }
+        self.reporting.observe(|reporting| reporting.style(&control, bounds));
         let input_bounds = crate::presentation_surface::physical_bounds(bounds, self.input_scale);
         match self.phase.clone() {
             Phase::CopyCapability => {
@@ -3576,7 +3219,7 @@ impl Controller {
                 } else {
                     bounds.x >= image.x + image.width && (bounds.y - image.y).abs() <= 1.0
                 };
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.annotation_layout_viewport",
                     "annotation.inspector.scroll",
                     if self.copy_compact { "compact" } else { "wide" },
@@ -3594,12 +3237,12 @@ impl Controller {
                             0.0
                         },
                     ],
-                );
+                ));
                 if !bounded || !placed || stacked != self.copy_compact {
                     self.fail("Annotation canvas and inspector do not fit the actual viewport");
                     return None;
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.annotation_layout",
                     "annotation.inspector.scroll",
                     if stacked { "compact" } else { "wide" },
@@ -3613,7 +3256,7 @@ impl Controller {
                             bounds.x - image.x - image.width
                         }),
                     ],
-                );
+                ));
                 self.copy_inspector_offset =
                     (bounds.y - crate::view::NAVIGATION_HEIGHT - 10.0).max(0.0);
                 self.phase = Phase::CopyLayout(2);
@@ -3768,7 +3411,7 @@ impl Controller {
                 None
             }
             Phase::PageRegion { page, index } => {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.page_region",
                     region_id(page, index),
                     crate::view::navigation::label(page),
@@ -3778,7 +3421,7 @@ impl Controller {
                         f64::from(bounds.width),
                         f64::from(bounds.height),
                     ],
-                );
+                ));
                 let composition = crate::view::workflow::Composition::new(page, 0.0);
                 if index + 1 < composition.audit_regions().len() {
                     self.phase = Phase::PageRegion {
@@ -4139,7 +3782,7 @@ impl Controller {
                 None
             }
             Phase::AtlasCapacity | Phase::AtlasEmpty => {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.atlas_notice",
                     &control,
                     "rendered-local-outcome",
@@ -4149,7 +3792,7 @@ impl Controller {
                         bounds.width as f64,
                         bounds.height as f64,
                     ],
-                );
+                ));
                 self.phase = if matches!(self.phase, Phase::AtlasCapacity) {
                     Phase::AtlasRestoreColumns
                 } else {
@@ -4262,7 +3905,7 @@ impl Controller {
                     return None;
                 };
                 let selected = gallery_slot_bounds(input_bounds, columns, slot, self.atlas_clip.0);
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_pointer_scheduled",
                     EXPLORE_GALLERY,
                     "reopened-grid-slot",
@@ -4272,7 +3915,7 @@ impl Controller {
                         f64::from(selected.center_x()),
                         f64::from(selected.center_y()),
                     ],
-                );
+                ));
                 self.phase = Phase::AwaitDetailAgain;
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, false) {
                     self.fail("Firefox reopened-gallery click dispatch failed");
@@ -4442,35 +4085,30 @@ impl Controller {
                     self.fail("Explore selection grid is unavailable");
                     return None;
                 };
-                let resolved = (rows / 2)
-                    .saturating_mul(columns)
-                    .saturating_add(columns / 2);
                 let selected =
                     gallery_slot_bounds(bounds, columns, expected_slot, self.atlas_clip.0);
-                let pointer_x = selected.x + selected.width * 0.5;
-                let pointer_y = selected.y + selected.height * 0.5;
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_pointer_inverse",
                     EXPLORE_GALLERY,
                     "rendered-grid-slot",
                     [
                         expected_slot as f64,
-                        resolved as f64,
+                        (rows / 2).saturating_mul(columns).saturating_add(columns / 2) as f64,
                         index as f64,
                         snapshot_revision as f64,
                     ],
-                );
-                report(
+                ));
+                reporting::emit(|sink| sink.record(
                     "integration.explore_pointer_scheduled",
                     EXPLORE_GALLERY,
                     "real-canvas-pointer",
                     [
                         frame_revision as f64,
                         expected_slot as f64,
-                        f64::from(pointer_x),
-                        f64::from(pointer_y),
+                        f64::from(selected.x + selected.width * 0.5),
+                        f64::from(selected.y + selected.height * 0.5),
                     ],
-                );
+                ));
                 self.phase = Phase::AwaitDetail(index);
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, frame_revision, false) {
                     self.fail("Firefox click dispatch failed");
@@ -4498,14 +4136,12 @@ impl Controller {
     }
 
     fn advance_to(&mut self, phase: Phase) -> Task<RootMessage> {
-        if reporting_enabled() {
-            report(
-                "integration.phase_advanced",
-                "",
-                &format!("{phase:?}"),
-                [0.0; 4],
-            );
-        }
+        reporting::emit(|sink| sink.record(
+            "integration.phase_advanced",
+            "",
+            &format!("{phase:?}"),
+            [0.0; 4],
+        ));
         let reveal_annotation = matches!(phase, Phase::CopyProductWait);
         self.phase = phase;
         // A completed local step has no pending native event to wake its
@@ -4523,22 +4159,8 @@ impl Controller {
         }
     }
 
-    fn report_phase_progress(&mut self) {
-        if matches!(self.phase, Phase::Disabled) {
-            return;
-        }
-        if self.reported_phase.as_ref() == Some(&self.phase) {
-            return;
-        }
-        if reporting_enabled() {
-            report(
-                "integration.phase_progress",
-                self.phase.deadline_class(),
-                &format!("{:?}", self.phase),
-                [0.0; 4],
-            );
-        }
-        self.reported_phase = Some(self.phase.clone());
+    fn report_phase_progress(&self) {
+        self.reporting.observe(|reporting| reporting.phase_progress(&self.phase));
     }
 
     pub fn advance(
@@ -4564,74 +4186,7 @@ impl Controller {
         }
         self.input_scale = applied_scale;
         self.observe_presentation(model, frame);
-        if let Some(snapshot) = model.explore.snapshot.as_ref()
-            && snapshot.revision > self.explore_snapshot_revision
-        {
-            self.explore_snapshot_revision = snapshot.revision;
-            let aspect = settings.draft.as_ref().map_or(
-                crate::generated::WorkspaceAspectRatio::Widescreen,
-                |draft| draft.ui.workspaceaspectratio,
-            );
-            report(
-                "integration.explore_state",
-                if snapshot.mode == crate::generated::ExploreMode::Detail {
-                    explore::DETAIL_WORKSPACE_ID
-                } else {
-                    EXPLORE_GALLERY
-                },
-                if snapshot.augmentation.enabled {
-                    "augmentation-enabled"
-                } else {
-                    "augmentation-disabled"
-                },
-                [
-                    snapshot.revision as f64,
-                    snapshot.augmentation.seed as f64,
-                    if snapshot.detail.showoriginaldimensions {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                    f64::from(crate::view::aspect_ratio::height_factor(aspect)),
-                ],
-            );
-            report(
-                "integration.explore_frame",
-                explore::DETAIL_WORKSPACE_ID,
-                if snapshot.detail.showoriginaldimensions {
-                    "original"
-                } else {
-                    "padded"
-                },
-                [
-                    snapshot.frame.revision as f64,
-                    snapshot.frame.extent.width as f64,
-                    snapshot.frame.extent.height as f64,
-                    snapshot.selectedimage.map_or(-1.0, f64::from),
-                ],
-            );
-            if snapshot.mode == crate::generated::ExploreMode::Gallery {
-                for (slot, compiled_index) in
-                    snapshot.order.visibleindices.iter().copied().enumerate()
-                {
-                    report(
-                        "integration.explore_slot",
-                        EXPLORE_GALLERY,
-                        if snapshot.focusedimage.is_some() {
-                            "current-focused"
-                        } else {
-                            "current"
-                        },
-                        [
-                            snapshot.revision as f64,
-                            snapshot.frame.revision as f64,
-                            slot as f64,
-                            f64::from(compiled_index),
-                        ],
-                    );
-                }
-            }
-        }
+        self.reporting.observe(|reporting| reporting.explore_snapshot(model, settings));
         if let Some(error) = model.error.as_ref()
             && !matches!(
                 self.phase,
@@ -4648,11 +4203,7 @@ impl Controller {
                     | Phase::ViewerReconnect
             )
         {
-            if reporting_enabled() {
-                self.fail(&format!("{}: {}", error.title, error.detail));
-            } else {
-                self.fail("application reported an error");
-            }
+            self.fail_detail(|| format!("{}: {}", error.title, error.detail).into());
             return Task::none();
         }
         match self.phase.clone() {
@@ -4760,15 +4311,15 @@ impl Controller {
                         ),
                     ));
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_settings_preserved",
                     explore::DETAIL_WORKSPACE_ID,
                     "confirmed-native-settings",
                     [snapshot.revision as f64, 1.0, 0.0, 0.0],
-                );
+                ));
                 self.viewer_route_persistence =
                     settings.draft.is_some() && model.settings_edit_available();
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_departure_started",
                     explore::DETAIL_WORKSPACE_ID,
                     "upscale-observation",
@@ -4781,7 +4332,7 @@ impl Controller {
                         snapshot.revision as f64,
                         0.0,
                     ],
-                );
+                ));
                 self.phase = Phase::ViewerDepart;
                 Task::done(RootMessage::Settings(crate::view::settings::Message::Close)).chain(
                     Task::done(RootMessage::Workspace(
@@ -4816,7 +4367,7 @@ impl Controller {
                     .as_ref()
                     .map_or(0, |snapshot| snapshot.revision);
                 if crate::presentation_surface::pixel_trace::enabled() {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.viewer_route_confirmed",
                         "navigation.train",
                         "None",
@@ -4826,9 +4377,9 @@ impl Controller {
                             1.0,
                             0.0,
                         ],
-                    );
+                    ));
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_abandoned",
                     explore::DETAIL_WORKSPACE_ID,
                     "mapped-route-departure",
@@ -4841,7 +4392,7 @@ impl Controller {
                         0.0,
                         0.0,
                     ],
-                );
+                ));
                 self.phase = Phase::ViewerReenter;
                 self.viewer_drawn = None;
                 SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None);
@@ -4910,7 +4461,7 @@ impl Controller {
                     return Task::none();
                 }
                 if crate::presentation_surface::pixel_trace::enabled() {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.viewer_route_confirmed",
                         "navigation.explore",
                         if model.foreground_visual()
@@ -4930,9 +4481,9 @@ impl Controller {
                             1.0,
                             0.0,
                         ],
-                    );
+                    ));
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_basic_reentry",
                     explore::DETAIL_WORKSPACE_ID,
                     "automatic-completed-draw",
@@ -4942,7 +4493,7 @@ impl Controller {
                         upscale.frame.source.instance as f64,
                         upscale.frame.cleanrevision as f64,
                     ],
-                );
+                ));
                 self.viewer_continuity_request = Some(request.clone());
                 self.phase = Phase::ViewerAwaitDisconnect;
                 // Retiring the real outbound owner closes the worker's socket;
@@ -4994,7 +4545,7 @@ impl Controller {
                 if drawn != sampleable.presentation_revision {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_reconnected",
                     explore::DETAIL_WORKSPACE_ID,
                     "matching-completed-draw",
@@ -5004,7 +4555,7 @@ impl Controller {
                         upscale.frame.source.instance as f64,
                         upscale.frame.cleanrevision as f64,
                     ],
-                );
+                ));
                 self.annotation_sample_baseline = drawn;
                 let (next, control) = match self.viewer_scenario.as_str() {
                     "copy" => (Phase::OpenAnnotation, EXPLORE_ANNOTATE),
@@ -5034,7 +4585,7 @@ impl Controller {
                     && !self.compiled_directory.is_empty()
                     && !self.resolution.is_empty() =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.bootstrap",
                     "",
                     "typed-bootstrap",
@@ -5044,54 +4595,12 @@ impl Controller {
                         0.0,
                         0.0,
                     ],
-                );
+                ));
                 if !self.viewer_scenario.is_empty() {
                     self.phase = Phase::TrainNavigation;
                     return self.arm(crate::view::navigation::stable_id(FeatureId::Train));
                 }
-                let dark_mode = settings
-                    .draft
-                    .as_ref()
-                    .is_some_and(|draft| draft.ui.darkmode);
-                let fluent =
-                    crate::fluent_theme::conformance(&crate::fluent_theme::app_theme(dark_mode));
-                self.resolved_primary = [
-                    f64::from(fluent.primary_color.r),
-                    f64::from(fluent.primary_color.g),
-                    f64::from(fluent.primary_color.b),
-                    f64::from(fluent.primary_color.a),
-                ];
-                self.resolved_benchmark = [
-                    f64::from(fluent.benchmark_color.r),
-                    f64::from(fluent.benchmark_color.g),
-                    f64::from(fluent.benchmark_color.b),
-                    f64::from(fluent.benchmark_color.a),
-                ];
-                report(
-                    "integration.fluent_shell",
-                    "navigation",
-                    if fluent.dark { "dark" } else { "light" },
-                    [
-                        f64::from(fluent.navigation_border),
-                        f64::from(fluent.card_border),
-                        f64::from(fluent.primary_border),
-                        if fluent.resolved { 1.0 } else { 0.0 },
-                    ],
-                );
-                let status = crate::view::workflow::model_card::status_presentation(
-                    model.model_snapshot.as_ref(),
-                );
-                report(
-                    "integration.model_copy",
-                    TRAIN_MODEL_CARD,
-                    crate::view::workflow::model_card::card_title(FeatureId::Train),
-                    [
-                        if status.label.is_empty() { 0.0 } else { 1.0 },
-                        0.0,
-                        0.0,
-                        0.0,
-                    ],
-                );
+                self.reporting.observe(|reporting| reporting.bootstrap(model, settings));
                 self.phase = Phase::SettingsOpen;
                 self.arm("navigation.settings")
             }
@@ -5125,7 +4634,7 @@ impl Controller {
                 }
                 if self.ui_scale_first.is_none() {
                     self.ui_scale_first = Some(current);
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.ui_scale_drag",
                         SETTINGS_NUMERIC_CONTROLS[0],
                         "first-position",
@@ -5135,7 +4644,7 @@ impl Controller {
                             f64::from(applied_scale),
                             1.0,
                         ],
-                    );
+                    ));
                     return Task::none();
                 }
                 if self
@@ -5148,7 +4657,7 @@ impl Controller {
                     self.fail("UI-scale drag did not move the draft beyond 0.85");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.ui_scale_drag",
                     SETTINGS_NUMERIC_CONTROLS[0],
                     "second-position",
@@ -5158,7 +4667,7 @@ impl Controller {
                         f64::from(applied_scale),
                         2.0,
                     ],
-                );
+                ));
                 self.phase = Phase::AwaitSettingsScaleRelease;
                 Task::none()
             }
@@ -5182,12 +4691,12 @@ impl Controller {
                             )
                     }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.ui_scale_drag",
                     SETTINGS_NUMERIC_CONTROLS[0],
                     "released-and-settled",
                     ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
-                );
+                ));
                 self.settings_revision = model
                     .settings_snapshot
                     .as_ref()
@@ -5222,12 +4731,12 @@ impl Controller {
                         )
                     }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.ui_scale_restored",
                     SETTINGS_NUMERIC_CONTROLS[0],
                     "baseline",
                     ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
-                );
+                ));
                 self.phase = Phase::SettingsShowFps;
                 self.arm(SETTINGS_SHOW_FPS)
             }
@@ -5278,7 +4787,7 @@ impl Controller {
                         snapshot.settingsstate.ui.showworkspaceperformance == self.show_fps_baseline
                     }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.show_fps",
                     SETTINGS_SHOW_FPS,
                     "round-trip",
@@ -5291,7 +4800,7 @@ impl Controller {
                             .as_ref()
                             .map_or(0.0, |snapshot| snapshot.revision as f64),
                     ],
-                );
+                ));
                 self.phase = Phase::SettingsNumeric { index: 0, part: 0 };
                 self.arm(settings_numeric_id(0, 0))
             }
@@ -5333,12 +4842,12 @@ impl Controller {
             }
             Phase::AwaitReturnTrain if active == FeatureId::Train => {
                 self.phase = Phase::AdvancedField(0);
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.phase",
                     &advanced_field_id(0),
                     "advanced-field-0",
                     [0.0; 4],
-                );
+                ));
                 self.arm_scrolled(advanced_field_id(0), RelativeOffset::END)
             }
             Phase::AdvancedField(index) => {
@@ -5372,7 +4881,7 @@ impl Controller {
                     self.fail("numeric field allowed wheel mutation");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.spinnerless",
                     &advanced_field_id(index),
                     if index == 2 {
@@ -5381,7 +4890,7 @@ impl Controller {
                         "floating-upper-lower-edges"
                     },
                     [value, 1.0, 1.0, 1.0],
-                );
+                ));
                 self.begin_advanced_numeric_edit(model, settings, index)
             }
             Phase::AdvancedNumericEdit(index) => self.arm(advanced_field_id(index)),
@@ -5401,7 +4910,7 @@ impl Controller {
                             .is_some_and(|value| same_numeric_value(value, self.numeric_target))
                     }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.advanced_edit",
                     &advanced_field_id(index),
                     if index == 2 { "integer" } else { "floating" },
@@ -5414,7 +4923,7 @@ impl Controller {
                             .map_or(0.0, |snapshot| snapshot.revision as f64),
                         1.0,
                     ],
-                );
+                ));
                 self.phase = Phase::AdvancedField(index + 1);
                 self.arm(advanced_field_id(index + 1))
             }
@@ -5527,12 +5036,12 @@ impl Controller {
             }
             Phase::ErrorDismiss => self.arm(ERROR_DISMISS),
             Phase::AwaitErrorDismissed if model.error.is_none() => {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.error_modal",
                     ERROR_MODAL,
                     "copy-and-dismiss",
                     [1.0, 1.0, 1.0, 0.0],
-                );
+                ));
                 self.phase = Phase::TrainCard;
                 self.arm_scrolled(TRAIN_CARD, RelativeOffset::START)
             }
@@ -5595,7 +5104,7 @@ impl Controller {
                             == self.benchmark_baseline
                     }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.benchmark_override",
                     BENCHMARK_OVERRIDE,
                     "round-trip",
@@ -5608,7 +5117,7 @@ impl Controller {
                             .as_ref()
                             .map_or(0.0, |snapshot| snapshot.revision as f64),
                     ],
-                );
+                ));
                 self.phase = Phase::DatasetSource;
                 self.arm(DATASET_SOURCE)
             }
@@ -5671,12 +5180,12 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.dataset_configured",
                     COMPILE_RESOLUTION,
                     "typed-settings",
                     [snapshot.revision as f64, 1.0, 0.0, 0.0],
-                );
+                ));
                 if self.reuse_compiled {
                     self.phase = Phase::ExploreNavigation;
                     self.arm(crate::view::navigation::stable_id(FeatureId::Explore))
@@ -5697,7 +5206,7 @@ impl Controller {
                     && (!dataset.progress.activity.is_empty() || dataset.progress.total != 0)
                     && dataset.progress.droppedinstances != 0
                 {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.compile_progress",
                         COMPILE_PROGRESS,
                         &dataset.progress.activity,
@@ -5707,8 +5216,8 @@ impl Controller {
                             dataset.progress.total as f64,
                             dataset.progress.droppedinstances as f64,
                         ],
-                    );
-                    report(
+                    ));
+                    reporting::emit(|sink| sink.record(
                         "integration.compile_metrics",
                         COMPILE_PROGRESS,
                         "elapsed-eta-throughput-dropped",
@@ -5718,13 +5227,13 @@ impl Controller {
                             dataset.progress.throughputpersecond as f64,
                             dataset.progress.droppedinstances as f64,
                         ],
-                    );
+                    ));
                     self.phase = Phase::CompileProgress;
                     return self.arm(COMPILE_PROGRESS);
                 }
                 if compile_succeeded {
                     let split = dataset.inspection.splits.first();
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.dataset_complete",
                         DATASET_STATUS,
                         &dataset.terminal.artifact,
@@ -5734,7 +5243,7 @@ impl Controller {
                             split.map_or(0.0, |value| value.width as f64),
                             split.map_or(0.0, |value| value.height as f64),
                         ],
-                    );
+                    ));
                     self.phase = Phase::DatasetStatus;
                     return self.arm(DATASET_STATUS);
                 }
@@ -5784,7 +5293,7 @@ impl Controller {
                         return Task::none();
                     };
                     if measured.extent != snapshot.viewport.extent {
-                        report(
+                        reporting::emit(|sink| sink.record(
                             "integration.explore_extent_pending",
                             EXPLORE_GALLERY,
                             "measured-native-convergence",
@@ -5794,10 +5303,10 @@ impl Controller {
                                 snapshot.viewport.extent.width as f64,
                                 snapshot.viewport.extent.height as f64,
                             ],
-                        );
+                        ));
                         return Task::none();
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_ready",
                         "",
                         "",
@@ -5807,7 +5316,7 @@ impl Controller {
                             snapshot.dataset.imageheight as f64,
                             snapshot.dataset.classnames.len() as f64,
                         ],
-                    );
+                    ));
                     if self.viewer_scenario == "quiet" {
                         self.selection_grid = Some((
                             snapshot.viewport.columns, snapshot.viewport.rowcount, 0,
@@ -5830,7 +5339,7 @@ impl Controller {
                     }) else {
                         return Task::none();
                     };
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.initial_atlas_identity",
                         EXPLORE_GALLERY,
                         &format!(
@@ -5843,8 +5352,8 @@ impl Controller {
                             snapshot.viewport.extent.width as f64,
                             snapshot.viewport.extent.height as f64,
                         ],
-                    );
-                    report(
+                    ));
+                    reporting::emit(|sink| sink.record(
                         "integration.initial_atlas_complete",
                         EXPLORE_GALLERY,
                         "no-input-canvas-pixels",
@@ -5857,7 +5366,7 @@ impl Controller {
                                 .map_or(0, |frame| frame.presentation_revision)
                                 as f64,
                         ],
-                    );
+                    ));
                     COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
                     if pixel_fixture_enabled() && !self.atlas_fixture_checked {
                         self.atlas_fixture_checked = true;
@@ -5911,7 +5420,7 @@ impl Controller {
                         }
                         return self.arm(EXPLORE_GALLERY);
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_policy",
                         explore::ORDER_CONTROL_ID,
                         if snapshot.filter.order == crate::generated::ExploreOrder::Shuffled {
@@ -5925,7 +5434,7 @@ impl Controller {
                             snapshot.overlay.classselection.classes.len() as f64,
                             snapshot.order.shuffleseed as f64,
                         ],
-                    );
+                    ));
                     self.sweep_baseline = Some((
                         snapshot.revision,
                         snapshot.viewport.clone(),
@@ -5968,7 +5477,7 @@ impl Controller {
                     snapshot.frame.revision,
                 );
                 if initial_patch {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_patch_wait",
                         EXPLORE_GALLERY,
                         "revision-labels-busy-publication",
@@ -5978,8 +5487,8 @@ impl Controller {
                             f64::from(u8::from(snapshot.busy)),
                             f64::from(u8::from(sampleable.is_none())),
                         ],
-                    );
-                    report(
+                    ));
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_patch_draw",
                         EXPLORE_GALLERY,
                         "drawn-and-sampleable-publication",
@@ -5990,7 +5499,7 @@ impl Controller {
                             sampleable.map_or(0.0, |sample| sample.presentation_revision as f64),
                             sampleable.map_or(0.0, |sample| sample.source_revision as f64),
                         ],
-                    );
+                    ));
                 }
                 if revision_pending
                     || initial_overlays_pending
@@ -6007,7 +5516,7 @@ impl Controller {
                     self.phase = Phase::ExploreDatasetPane;
                     return self.arm(EXPLORE_DATASET_PANE);
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_initial_patch",
                     EXPLORE_GALLERY,
                     "stable-gallery-generation",
@@ -6017,7 +5526,7 @@ impl Controller {
                         frame_revision as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 let columns = snapshot.viewport.columns.max(1);
                 let capacity = snapshot.maximumatlasextent.clone();
                 self.oversized_capacity = Some(capacity.clone());
@@ -6057,7 +5566,7 @@ impl Controller {
                     self.fail("oversized Explore measurement did not produce an exact square grid");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_exact_grid",
                     EXPLORE_GALLERY,
                     "oversized-logical-fill",
@@ -6067,8 +5576,8 @@ impl Controller {
                         columns as f64,
                         rows as f64,
                     ],
-                );
-                report(
+                ));
+                reporting::emit(|sink| sink.record(
                     "integration.explore_exact_grid_capacity",
                     EXPLORE_GALLERY,
                     "measured-revision-capacity",
@@ -6078,7 +5587,7 @@ impl Controller {
                         capacity.width as f64,
                         capacity.height as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::AwaitExploreExactGridPatch {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -6091,7 +5600,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_policy_order_arm",
                     explore::ORDER_SHUFFLED_ID,
                     "model-availability",
@@ -6105,7 +5614,7 @@ impl Controller {
                             0.0
                         },
                     ],
-                );
+                ));
                 self.phase = Phase::ExplorePolicyOrder(snapshot.revision);
                 self.arm(explore::ORDER_SHUFFLED_ID)
             }
@@ -6249,7 +5758,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_augmentation",
                     EXPLORE_AUGMENTATION_TOGGLE,
                     "enabled-rendered-seed-zero",
@@ -6259,7 +5768,7 @@ impl Controller {
                         frame_revision as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::ExploreAugmentationReroll {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -6282,7 +5791,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_augmentation",
                     EXPLORE_AUGMENTATION_REROLL,
                     "rerolled-distinct-seed",
@@ -6292,7 +5801,7 @@ impl Controller {
                         frame_revision as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::ExploreReshuffle {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -6330,7 +5839,7 @@ impl Controller {
                     self.fail("Reshuffle did not change the visible gallery order");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_reshuffle",
                     EXPLORE_RESHUFFLE,
                     "order-only",
@@ -6340,8 +5849,8 @@ impl Controller {
                         augmentation_seed as f64,
                         snapshot.augmentation.seed as f64,
                     ],
-                );
-                report(
+                ));
+                reporting::emit(|sink| sink.record(
                     "integration.explore_patch_baseline",
                     EXPLORE_CARD,
                     "reshuffle-placeholder",
@@ -6351,7 +5860,7 @@ impl Controller {
                         0.0,
                         0.0,
                     ],
-                );
+                ));
                 self.phase = Phase::ExploreCard {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -6379,7 +5888,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_patch_observed",
                     EXPLORE_CARD,
                     "post-placeholder-frame",
@@ -6389,7 +5898,7 @@ impl Controller {
                         frame_revision as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 self.sweep_baseline = Some((
                     snapshot.revision,
                     snapshot.viewport.clone(),
@@ -6415,7 +5924,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_sweep_observed",
                     EXPLORE_GALLERY,
                     "typed-viewport",
@@ -6425,7 +5934,7 @@ impl Controller {
                         snapshot.viewport.extent.width as f64,
                         snapshot.viewport.extent.height as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::GalleryLaterReady;
                 Task::none()
             }
@@ -6436,7 +5945,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                self.scroll_placeholder_reported = false;
+                self.reporting.observe(|reporting| reporting.reset_scroll());
                 self.phase = Phase::GalleryLater(snapshot.viewport.firstrow);
                 self.arm(EXPLORE_LATER)
             }
@@ -6452,20 +5961,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                if !self.scroll_placeholder_reported {
-                    self.scroll_placeholder_reported = true;
-                    report(
-                        "integration.explore_scroll_placeholder",
-                        EXPLORE_GALLERY,
-                        "newest-without-wait-all",
-                        [
-                            snapshot.revision as f64,
-                            snapshot.frame.revision as f64,
-                            snapshot.viewport.firstrow as f64,
-                            snapshot.order.visibleindices.len() as f64,
-                        ],
-                    );
-                }
+                self.reporting.observe(|reporting| reporting.scroll_placeholder(snapshot));
                 if sampleable_presentation(
                     model,
                     frame,
@@ -6494,7 +5990,7 @@ impl Controller {
                     snapshot.revision,
                     snapshot.frame.revision,
                 ));
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_scrolled",
                     EXPLORE_GALLERY,
                     "",
@@ -6504,7 +6000,7 @@ impl Controller {
                         index as f64,
                         0.0,
                     ],
-                );
+                ));
                 self.phase = Phase::GalleryImage(index);
                 self.arm(EXPLORE_GALLERY)
             }
@@ -6524,7 +6020,7 @@ impl Controller {
                     return Task::none();
                 };
                 if selected != expected {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_pointer_mismatch",
                         EXPLORE_GALLERY,
                         "selected-image",
@@ -6534,12 +6030,12 @@ impl Controller {
                             snapshot.revision as f64,
                             snapshot.frame.revision as f64,
                         ],
-                    );
+                    ));
                     self.fail("gallery pointer selection did not match the rendered grid slot");
                     return Task::none();
                 }
                 if let Some((_, _, slot, revision, _)) = self.selection_grid {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.explore_pointer_selected",
                         EXPLORE_GALLERY,
                         "selected-from-dispatched-pointer",
@@ -6549,14 +6045,14 @@ impl Controller {
                             f64::from(expected),
                             f64::from(selected),
                         ],
-                    );
+                    ));
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_detail",
                     "",
                     "",
                     [selected as f64, snapshot.frame.revision as f64, 0.0, 0.0],
-                );
+                ));
                 if snapshot.detail.showoriginaldimensions
                     || snapshot.frame.extent.width != snapshot.dataset.imagewidth
                     || snapshot.frame.extent.height != snapshot.dataset.imageheight
@@ -6639,7 +6135,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_detail_source",
                     EXPLORE_DETAIL_ORIGINAL,
                     "padded-to-original-sampling",
@@ -6649,7 +6145,7 @@ impl Controller {
                         content.width as f64,
                         content.height as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::DetailFit;
                 self.arm(explore::DETAIL_FIT_ID)
             }
@@ -6668,12 +6164,12 @@ impl Controller {
                                 == crate::generated::ExploreViewportOutcome::VisibleCapacityExceeded
                         }) =>
             {
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.atlas_capacity",
                     explore::GALLERY_CAPACITY_ID,
                     "native-visible-capacity-exceeded",
                     [1.0, 0.0, 0.0, 0.0],
-                );
+                ));
                 self.phase = Phase::AtlasCapacity;
                 self.arm(explore::GALLERY_CAPACITY_ID)
             }
@@ -6759,7 +6255,7 @@ impl Controller {
                     || !gallery_matches
                     || !viewport_matches
                 {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.atlas_window_wait",
                         EXPLORE_GALLERY,
                         if fullscreen { "fullscreen" } else { "restored" },
@@ -6769,10 +6265,10 @@ impl Controller {
                             gallery_matches as u8 as f64,
                             viewport_matches as u8 as f64,
                         ],
-                    );
+                    ));
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.atlas_window_draw",
                     EXPLORE_GALLERY,
                     if fullscreen { "fullscreen" } else { "restored" },
@@ -6782,7 +6278,7 @@ impl Controller {
                         model.window_height as f64,
                         snapshot.viewport.columns as f64,
                     ],
-                );
+                ));
                 if fullscreen {
                     self.phase = Phase::AwaitAtlasWindow(false);
                     #[cfg(target_arch = "wasm32")]
@@ -6865,7 +6361,7 @@ impl Controller {
                     ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
                     receipt,
                 );
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.atlas_scroll",
                     EXPLORE_GALLERY,
                     ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
@@ -6875,7 +6371,7 @@ impl Controller {
                         self.atlas_clip.0 as f64,
                         self.atlas_clip.1 as f64,
                     ],
-                );
+                ));
                 match stage {
                     0 | 1 => {
                         let rows = 5 - u32::from(stage);
@@ -6944,7 +6440,7 @@ impl Controller {
                         return Task::none();
                     }
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.atlas_checkbox",
                     overlay_control(index, false),
                     "rendered-saved-visibility",
@@ -6954,7 +6450,7 @@ impl Controller {
                         snapshot.frame.revision as f64,
                         snapshot.augmentation.seed as f64,
                     ],
-                );
+                ));
                 self.atlas_baseline = Some((snapshot.frame.revision, snapshot.augmentation.seed));
                 if index == 7 {
                     self.phase = Phase::AwaitAtlasRows {
@@ -6995,7 +6491,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_overlay",
                     overlay_control(index, true),
                     "actual-draw",
@@ -7005,7 +6501,7 @@ impl Controller {
                         snapshot.frame.revision as f64,
                         snapshot.frame.cleanrevision as f64,
                     ],
-                );
+                ));
                 if index == 8 {
                     self.begin_upscale_series(model, &snapshot.frame)
                 } else {
@@ -7079,7 +6575,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.gallery_no_input_complete",
                     EXPLORE_GALLERY,
                     "matching-pixels-and-semantics",
@@ -7089,7 +6585,7 @@ impl Controller {
                         snapshot.frame.revision as f64,
                         snapshot.augmentation.seed as f64,
                     ],
-                );
+                ));
                 COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
                 self.selection_grid = Some((
                     snapshot.viewport.columns,
@@ -7135,7 +6631,7 @@ impl Controller {
                     );
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_detail_fit",
                     explore::DETAIL_FIT_ID,
                     "centered-contained",
@@ -7145,7 +6641,7 @@ impl Controller {
                         drawn.image.width as f64,
                         drawn.image.height as f64,
                     ],
-                );
+                ));
                 if self.viewer_scenario == "square" {
                     return self.advance_to(Phase::ViewerSquareBasic);
                 }
@@ -7181,7 +6677,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.upscale_action_arm",
                     EXPLORE_UPSCALE_ACTIONS[0],
                     "after-detail-fit",
@@ -7191,7 +6687,7 @@ impl Controller {
                         snapshot.frame.extent.height as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 self.begin_upscale_series(model, &snapshot.frame)
             }
             Phase::StartUpscale { kernel, .. } => self.arm(EXPLORE_UPSCALE_ACTIONS[kernel]),
@@ -7239,7 +6735,7 @@ impl Controller {
                     self.fail("Upscale did not publish the exact four-times output extent");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.upscale_growth",
                     EXPLORE_UPSCALE_ACTIONS[kernel],
                     upscale_acceptance_label(crate::generated::UPSCALE_KERNEL_VALUES[kernel]),
@@ -7249,7 +6745,7 @@ impl Controller {
                         upscale.frame.extent.width as f64,
                         upscale.frame.extent.height as f64,
                     ],
-                );
+                ));
                 if sampleable.content_width != expected_width
                     || sampleable.content_height != expected_height
                     || sampleable.capability_width < expected_width
@@ -7258,7 +6754,7 @@ impl Controller {
                     self.fail("Presentation did not import the exact Upscale output capability");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.upscale_presentation",
                     EXPLORE_UPSCALE_ACTIONS[kernel],
                     "complete-four-times-exported-frame",
@@ -7268,7 +6764,7 @@ impl Controller {
                         sampleable.capability_width as f64,
                         sampleable.capability_height as f64,
                     ],
-                );
+                ));
                 if model.displayed_upscale_kernel() != Some(upscale.kernel) {
                     return Task::none();
                 }
@@ -7304,12 +6800,12 @@ impl Controller {
                     self.fail("Upscale actual canvas image or completed blue method did not match its displayed result");
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.upscale_completed_pixels",
                     EXPLORE_UPSCALE_ACTIONS[kernel],
                     "exact-completed-blue",
                     [source as f64, drawn as f64, checksum as f64, blue as f64],
-                );
+                ));
                 if let Some(revision) = self.upscale_repeat_revision {
                     if !self.upscale_repeat_observed {
                         return Task::none();
@@ -7320,12 +6816,12 @@ impl Controller {
                         );
                         return Task::none();
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.upscale_same_method",
                         EXPLORE_UPSCALE_ACTIONS[kernel],
                         "same-completed-result",
                         [source as f64, drawn as f64, revision as f64, 1.0],
-                    );
+                    ));
                 } else {
                     self.upscale_repeat_revision = Some(upscale.revision);
                     if !click(button) {
@@ -7338,7 +6834,7 @@ impl Controller {
                         self.fail("cached method changed its completed physical product");
                         return Task::none();
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.upscale_cached",
                         EXPLORE_UPSCALE_ACTIONS[kernel],
                         "same-resident-product-drawn",
@@ -7348,7 +6844,7 @@ impl Controller {
                             kernel as f64,
                             upscale.revision as f64,
                         ],
-                    );
+                    ));
                     if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len()
                         && self.viewer_continuity_request.is_none()
                     {
@@ -7420,7 +6916,7 @@ impl Controller {
                     }) {
                         return Task::none();
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.viewer_complete",
                         EXPLORE_UPSCALE_ACTIONS[kernel],
                         "rapid",
@@ -7430,13 +6926,13 @@ impl Controller {
                             1.0,
                             kernel as f64,
                         ],
-                    );
+                    ));
                     self.phase = Phase::Complete;
                     return Task::none();
                 }
                 if kernel + 1 < EXPLORE_UPSCALE_ACTIONS.len() {
                     let next_kernel = kernel + 1;
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.upscale_action_arm",
                         EXPLORE_UPSCALE_ACTIONS[next_kernel],
                         "after-upscale-publication",
@@ -7446,7 +6942,7 @@ impl Controller {
                             upscale.frame.revision as f64,
                             sampleable.presentation_revision as f64,
                         ],
-                    );
+                    ));
                     self.phase = Phase::StartUpscale {
                         kernel: next_kernel,
                         source_width,
@@ -7495,7 +6991,7 @@ impl Controller {
                 if sampleable.presentation_revision <= self.annotation_sample_baseline {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.upscale_later_frame",
                     EXPLORE_GALLERY,
                     "distinct-imported-frame",
@@ -7505,7 +7001,7 @@ impl Controller {
                         sampleable.content_width as f64,
                         sampleable.content_height as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::DetailPrevious(selected);
                 self.arm(EXPLORE_PREVIOUS)
             }
@@ -7551,62 +7047,10 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.revision > self.reopen_wait_revision {
-                    let sampleable = sampleable_presentation(
-                        model,
-                        frame,
-                        crate::generated::PresentationSourceKind::Explore,
-                        snapshot.frame.revision,
-                    );
-                    let blocker = if !snapshot.ready {
-                        "snapshot-not-ready"
-                    } else if snapshot.busy {
-                        "snapshot-busy"
-                    } else if snapshot.revision <= revision {
-                        "snapshot-revision"
-                    } else if snapshot.frame.revision <= frame_revision {
-                        "frame-revision"
-                    } else if snapshot.gallery.generation == 0 {
-                        "gallery-generation"
-                    } else if snapshot.gallery.slots.len() != snapshot.order.visibleindices.len() {
-                        "slot-cardinality"
-                    } else if snapshot.gallery.slots.iter().any(|ready| !*ready) {
-                        "slot-readiness"
-                    } else if self.selection_grid.is_none() {
-                        "selection-grid"
-                    } else if snapshot.viewport.columns == 0 || snapshot.viewport.rowcount == 0 {
-                        "viewport"
-                    } else if sampleable.is_none() {
-                        "sampleable-presentation"
-                    } else if self.gallery_drawn.is_none_or(|(presentation, source)| {
-                        source != snapshot.frame.revision
-                            || model
-                                .presentation
-                                .as_ref()
-                                .is_none_or(|current| current.presentationrevision != presentation)
-                    }) {
-                        "physical-gallery-draw"
-                    } else {
-                        "ready"
-                    };
-                    report(
-                        "integration.explore_reopen_wait",
-                        EXPLORE_OPEN,
-                        blocker,
-                        [
-                            snapshot.revision as f64,
-                            snapshot.frame.revision as f64,
-                            snapshot.gallery.generation as f64,
-                            snapshot
-                                .gallery
-                                .slots
-                                .iter()
-                                .filter(|ready| **ready)
-                                .count() as f64,
-                        ],
-                    );
-                    self.reopen_wait_revision = snapshot.revision;
-                }
+                self.reporting.observe(|reporting| reporting.reopen_wait(
+                    model, frame, snapshot, revision, frame_revision,
+                    self.selection_grid.is_some(), self.gallery_drawn,
+                ));
                 if !snapshot.ready
                     || snapshot.busy
                     || snapshot.revision <= revision
@@ -7643,7 +7087,7 @@ impl Controller {
                 }) {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.explore_reopened",
                     EXPLORE_OPEN,
                     "usable-after-reopen",
@@ -7653,8 +7097,8 @@ impl Controller {
                         snapshot.order.visibleindices.len() as f64,
                         snapshot.dataset.imagecount as f64,
                     ],
-                );
-                report(
+                ));
+                reporting::emit(|sink| sink.record(
                     "integration.explore_final_cursor",
                     EXPLORE_GALLERY,
                     "coherent-placeholder",
@@ -7664,7 +7108,7 @@ impl Controller {
                         snapshot.gallery.generation as f64,
                         snapshot.order.visibleindices.len() as f64,
                     ],
-                );
+                ));
                 let columns = snapshot.viewport.columns;
                 let slot = (snapshot.viewport.rowcount / 2)
                     .saturating_mul(columns)
@@ -7740,7 +7184,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_import_edit",
                     ANNOTATION_SURFACE,
                     match self.copy_step {
@@ -7756,7 +7200,7 @@ impl Controller {
                         snapshot.ui.documentrevision as f64,
                         snapshot.frame.revision as f64,
                     ],
-                );
+                ));
                 if self.copy_step == 3 && snapshot.ui.scene.categories.len() > 1 {
                     self.copy_step = 4;
                     self.copy_before = Some(snapshot.ui.scene.objects[index as usize].clone());
@@ -8065,12 +7509,12 @@ impl Controller {
                 let Some((presentation, source)) = self.annotation_drawn else {
                     return Task::none();
                 };
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.viewer_complete",
                     VIEWER_SAVE,
                     "copy",
                     [presentation as f64, source as f64, 1.0, 0.0],
-                );
+                ));
                 self.phase = Phase::Complete;
                 Task::none()
             }
@@ -8085,7 +7529,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.annotation_ready",
                     "",
                     "receiver-owned",
@@ -8095,7 +7539,7 @@ impl Controller {
                         snapshot.ui.interactionrevision as f64,
                         0.0,
                     ],
-                );
+                ));
                 if matches!(self.viewer_scenario.as_str(), "quiet" | "terminal") {
                     self.bounded_document_revision = snapshot.ui.documentrevision;
                     self.bounded_object_count = snapshot.ui.scene.objects.len();
@@ -8191,7 +7635,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.annotation_tool_observed",
                     &annotation::tool_id(tool),
                     "typed-tool",
@@ -8201,7 +7645,7 @@ impl Controller {
                         0.0,
                         0.0,
                     ],
-                );
+                ));
                 if self.copy_step == 8 {
                     self.advance_to(Phase::CopyProductWait)
                 } else {
@@ -8280,7 +7724,7 @@ impl Controller {
                     return Task::none();
                 }
                 if self.copy_step == 8 && self.copy_product_cancel && !self.copy_product_cancelled {
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.annotation_preview",
                         ANNOTATION_SURFACE,
                         "visible-before-cancel",
@@ -8290,7 +7734,7 @@ impl Controller {
                             presentation_revision as f64,
                             0.0,
                         ],
-                    );
+                    ));
                     self.copy_product_cancelled = true;
                     self.copy_product_frame = snapshot.frame.revision;
                     return annotation_message(annotation::Message::CancelRequested);
@@ -8306,7 +7750,7 @@ impl Controller {
                     }
                     return self.arm(ANNOTATION_SURFACE);
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.annotation_pointer_observed",
                     ANNOTATION_SURFACE,
                     "typed-interaction",
@@ -8316,18 +7760,18 @@ impl Controller {
                         presentation_revision as f64,
                         0.0,
                     ],
-                );
+                ));
                 if self.viewer_scenario == "copy" && self.copy_step == 8 {
                     #[cfg(target_arch = "wasm32")]
                     if self.copy_product_cancel {
                         annotation_release_js();
                     }
                     match self.copy_product.observe(&snapshot.ui) {
-                        Ok(detail) => {
-                            report(
+                        Ok(step) => {
+                            reporting::emit(|sink| sink.record(
                                 "integration.annotation_product",
                                 ANNOTATION_SURFACE,
-                                &detail,
+                                &step.detail(),
                                 [
                                     snapshot.frame.revision as f64,
                                     presentation_revision as f64,
@@ -8339,11 +7783,10 @@ impl Controller {
                                         .filter(|fact| fact.available)
                                         .count() as f64,
                                 ],
-                            );
-                            return self.advance_to(if detail == "selection" {
-                                Phase::CopyCapability
-                            } else {
-                                Phase::CopyProductStart
+                            ));
+                            return self.advance_to(match step {
+                                annotation_product::Step::Select(_) => Phase::CopyCapability,
+                                _ => Phase::CopyProductStart,
                             });
                         }
                         Err(detail) => {
@@ -8376,7 +7819,7 @@ impl Controller {
                         self.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
                         return self.arm_scrolled(ANNOTATION_SURFACE, RelativeOffset::START);
                     }
-                    report(
+                    reporting::emit(|sink| sink.record(
                         "integration.annotation_shape",
                         ANNOTATION_SURFACE,
                         &format!("{:?}", object.shape),
@@ -8386,7 +7829,7 @@ impl Controller {
                             object.splineknots.len() as f64,
                             object.skeletonnodes.len() as f64,
                         ],
-                    );
+                    ));
                     if self.copy_step == 7 {
                         if let Err(detail) =
                             self.copy_product.start(&snapshot.ui, self.copy_objects)
@@ -8445,7 +7888,7 @@ impl Controller {
                     self.phase = Phase::CopyUndo { index, mask };
                     return self.arm_scrolled("annotation.undo", RelativeOffset::END);
                 }
-                report(
+                reporting::emit(|sink| sink.record(
                     "integration.complete",
                     "",
                     "typed-mvc-wayland",
@@ -8455,7 +7898,7 @@ impl Controller {
                         presentation_revision as f64,
                         presentation.browsercompletedsample as f64,
                     ],
-                );
+                ));
                 self.phase = Phase::Complete;
                 self.report_phase_progress();
                 Task::none()
@@ -8540,6 +7983,7 @@ mod tests {
         assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
         assert!(!reporting_enabled());
         assert!(!pixel_fixture_enabled());
+        assert!(driver.reporting.state_is_absent());
         let (_, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
@@ -8558,6 +8002,7 @@ mod tests {
         assert!(driver.running());
         assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
         assert!(!reporting_enabled());
+        assert!(driver.reporting.state_is_absent());
         let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
         let disabled = Controller::new(false, false, String::new(), String::new(), String::new(), String::new());
         assert!(!disabled.running());
@@ -8591,7 +8036,7 @@ mod tests {
         report_surface_draw(crate::view::workspace::STABLE_ID, 5, 1, false, 640, 480, 1, viewer);
         controller.location_pending = true;
         controller.atlas_baseline = Some((1, 5));
-        controller.reported_style_bits = 7;
+        controller.reporting.observe(|reporting| reporting.reported_style_bits = 7);
         controller.annotation_pixels_receipt = Some(old_receipt.clone());
         controller.upscale_pixel_pending = Some(old_receipt);
         assert!(controller.reset_scenario("new-source".into(), "new-output".into(), "512".into(), "upscale".into()).is_err());
@@ -8601,7 +8046,7 @@ mod tests {
         assert!(controller.atlas_baseline.is_none());
         assert!(controller.upscale_pixel_pending.is_none());
         assert!(controller.annotation_pixels_receipt.is_none());
-        assert_eq!(controller.reported_style_bits, 0);
+        controller.reporting.observe(|reporting| assert_eq!(reporting.reported_style_bits, 0));
         assert!(current_receipt(EXPLORE_GALLERY).is_none());
         assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().identity), (0, 0));
         controller.location_pending = true; // Same widget may already be armed in the replacement.
@@ -9093,6 +8538,7 @@ mod tests {
 
     #[test]
     fn inactive_controllers_do_not_observe_snapshots_or_consume_callbacks() {
+        initialize_reporting(false, false);
         let mut model = ApplicationModel::default();
         model
             .install_bootstrap(
@@ -9127,7 +8573,7 @@ mod tests {
                 0
             );
             assert_eq!(controller.input_scale, 1.0);
-            assert_eq!(controller.explore_snapshot_revision, 0);
+            assert!(controller.reporting.state_is_absent());
 
             controller.location_pending = true;
             let phase = std::mem::discriminant(&controller.phase);

@@ -306,7 +306,9 @@ impl App {
         let update = self.presentation.update(message, &self.model);
         if let Some((frame, surface)) = update.native {
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_native_frame(frame, surface);
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_native_frame(frame, surface);
+                });
             }
         }
         if let Some(observation) = update.observation

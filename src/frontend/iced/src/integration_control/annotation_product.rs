@@ -5,7 +5,7 @@ use crate::generated::{
 use crate::view::annotation::{Message, sidebar};
 
 #[derive(Clone, Copy)]
-enum Step {
+pub(super) enum Step {
     Select(u16),
     Tool(Tool),
     Sample,
@@ -252,7 +252,7 @@ impl Pass {
         })
     }
 
-    pub fn observe(&mut self, ui: &AnnotationUiState) -> Result<String, &'static str> {
+    pub fn observe(&mut self, ui: &AnnotationUiState) -> Result<Step, &'static str> {
         let step = self.steps[self.next];
         let selected = ui
             .editor
@@ -352,7 +352,13 @@ impl Pass {
             );
         }
         self.next += 1;
-        Ok(match step {
+        Ok(step)
+    }
+}
+
+impl Step {
+    pub(super) fn detail(self) -> String {
+        match self {
             Step::Select(_) => "selection".into(),
             Step::Tool(tool) => format!("tool-{tool:?}"),
             Step::Sample => "color-sample".into(),
@@ -370,6 +376,6 @@ impl Pass {
             Step::Handle => "spline-handle".into(),
             Step::Singleton => "singleton-spline".into(),
             Step::Cancel => "cancel-preview".into(),
-        })
+        }
     }
 }

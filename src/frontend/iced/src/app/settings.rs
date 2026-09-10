@@ -35,11 +35,13 @@ impl App {
                 self.settings.reset(&authoritative);
                 self.rebase_page(authoritative_route);
                 if let Some(integration) = self.integration.as_mut() {
-                    integration.observe_authoritative_route(
-                        "settings.reply",
-                        authoritative_route,
-                        self.workspace.active(),
-                    );
+                    integration.observe_reporting(|reporting| {
+                        reporting.observe_authoritative_route(
+                            "settings.reply",
+                            authoritative_route,
+                            self.workspace.active(),
+                        );
+                    });
                 }
             } else {
                 self.settings.settle_failure(None);
@@ -57,11 +59,13 @@ impl App {
             self.settings.install(authoritative);
             self.rebase_page(authoritative_route);
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_authoritative_route(
-                    "settings.reply",
-                    authoritative_route,
-                    self.workspace.active(),
-                );
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_authoritative_route(
+                        "settings.reply",
+                        authoritative_route,
+                        self.workspace.active(),
+                    );
+                });
             }
         }
     }

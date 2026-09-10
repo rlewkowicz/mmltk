@@ -182,11 +182,13 @@ impl App {
         self.settle_explore_reply(filter_admission_revision, filter_failed);
         if context == Some(ApplicationIntentEndpoint::ExploreUpdateFilter) {
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_explore_filter_settlement(
-                    "intent-reply",
-                    self.model.explore.snapshot.as_ref(),
-                    self.model.explore_mutation_available(),
-                );
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_explore_filter_settlement(
+                        "intent-reply",
+                        self.model.explore.snapshot.as_ref(),
+                        self.model.explore_mutation_available(),
+                    );
+                });
             }
         }
         if context.is_some_and(|endpoint| {
@@ -252,21 +254,25 @@ impl App {
             self.settings.install(authoritative);
             self.rebase_page(authoritative_route);
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_authoritative_route(
-                    "settings.event",
-                    authoritative_route,
-                    self.workspace.active(),
-                );
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_authoritative_route(
+                        "settings.event",
+                        authoritative_route,
+                        self.workspace.active(),
+                    );
+                });
             }
         }
         if reconcile_explore {
             self.settle_explore_event(explore_failed);
             if let Some(integration) = self.integration.as_mut() {
-                integration.observe_explore_filter_settlement(
-                    "system-event",
-                    self.model.explore.snapshot.as_ref(),
-                    self.model.explore_mutation_available(),
-                );
+                integration.observe_reporting(|reporting| {
+                    reporting.observe_explore_filter_settlement(
+                        "system-event",
+                        self.model.explore.snapshot.as_ref(),
+                        self.model.explore_mutation_available(),
+                    );
+                });
             }
         }
         self.reconcile_presentation(false);
