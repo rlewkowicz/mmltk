@@ -1,30 +1,37 @@
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <stb_image_write.h>
-#include <sys/file.h>
-#include <sys/socket.h>
-#include <unistd.h>
-
 #include <algorithm>
+#include <arpa/inet.h>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
+#include <memory>
+#include <mutex>
+#include <netinet/in.h>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <span>
+#include <stb_image_write.h>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/file.h>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
+#include "async_test_utils.hpp"
 #include "detail/benchmark_annotations.h"
 #include "detail/benchmark_cache.h"
 #include "detail/benchmark_compiler.h"
@@ -32,14 +39,16 @@
 #include "detail/benchmark_images.h"
 #include "detail/benchmark_sampling.h"
 #include "detail/benchmark_writer.h"
+#include "filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/data/image_resize.h"
-#include "src/common/io/file_memory.h"
 #include "src/common/concurrency/event_cancellation.h"
+#include "src/common/io/file_memory.h"
+#include "src/common/io/scoped_fd.h"
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -48,26 +57,6 @@ using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
 
 namespace {
-
-class ScopedTestRoot {
-   public:
-    explicit ScopedTestRoot(std::string_view name)
-        : path_(fs::temp_directory_path() /
-                ("mmltk-benchmark-" + std::string(name) + "-" + std::to_string(static_cast<unsigned long long>(::getpid())))) {
-        fs::remove_all(path_);
-        fs::create_directories(path_);
-    }
-
-    ~ScopedTestRoot() {
-        std::error_code error;
-        fs::remove_all(path_, error);
-    }
-
-    [[nodiscard]] const fs::path& path() const { return path_; }
-
-   private:
-    fs::path path_;
-};
 
 void require_condition(const bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -140,44 +129,54 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
 
 class HttpServer {
    public:
-    explicit HttpServer(std::vector<std::uint8_t> payload) : payload_(std::move(payload)) {
-        listener_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        require_condition(listener_ >= 0, "failed to create benchmark HTTP socket");
+    explicit HttpServer(std::span<const std::uint8_t> payload) : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+        require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
         const int reuse = 1;
-        require_condition(::setsockopt(listener_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0,
+        require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0,
                           "failed to configure benchmark HTTP socket");
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         address.sin_port = 0;
-        require_condition(::bind(listener_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
+        require_condition(::bind(listener_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
                           "failed to bind benchmark HTTP socket");
-        require_condition(::listen(listener_, 8) == 0, "failed to listen on benchmark HTTP socket");
+        require_condition(::listen(listener_.get(), 8) == 0, "failed to listen on benchmark HTTP socket");
         socklen_t length = sizeof(address);
-        require_condition(::getsockname(listener_, reinterpret_cast<sockaddr*>(&address), &length) == 0,
+        require_condition(::getsockname(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length) == 0,
                           "failed to inspect benchmark HTTP socket");
         port_ = ntohs(address.sin_port);
-        worker_ = std::thread([this] { run(); });
+        worker_ = std::jthread([this] {
+            try { run(); } catch (...) { failure_ = std::current_exception(); }
+        });
     }
 
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    ~HttpServer() {
-        stop_.store(true, std::memory_order_relaxed);
-        if (listener_ >= 0) {
-            ::shutdown(listener_, SHUT_RDWR);
-            ::close(listener_);
-            listener_ = -1;
+    ~HttpServer() { Stop(); }
+
+    void Stop() noexcept {
+        stop_.store(true, std::memory_order_release);
+        partial_.Release();
+        ::shutdown(listener_.get(), SHUT_RDWR);
+        {
+            std::scoped_lock lock(client_mutex_);
+            if (active_client_ >= 0) ::shutdown(active_client_, SHUT_RDWR);
         }
-        if (worker_.joinable()) { worker_.join(); }
+        if (worker_.joinable()) worker_.join();
     }
+    void Check() {
+        Stop();
+        if (failure_) std::rethrow_exception(failure_);
+    }
+    static constexpr std::size_t partial_bytes = 512U * 1024U;
+    void GateNextTransfer() { gate_next_.store(true, std::memory_order_release); }
+    [[nodiscard]] bool WaitPartial() const { return partial_.WaitEntered(3s); }
+    void ReleasePartial() const { partial_.Release(); }
 
     [[nodiscard]] std::string url(const std::string& path) const { return "http://127.0.0.1:" + std::to_string(port_) + "/" + path; }
 
     void fail_next(const int count) { failures_remaining_.store(count, std::memory_order_relaxed); }
-
-    void slow(const bool value) { slow_.store(value, std::memory_order_relaxed); }
 
     [[nodiscard]] std::uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }
 
@@ -189,6 +188,7 @@ class HttpServer {
         std::size_t sent = 0;
         while (sent < bytes) {
             const ssize_t result = ::send(socket, input + sent, bytes - sent, MSG_NOSIGNAL);
+            if (result < 0 && errno == EINTR) continue;
             if (result <= 0) { return false; }
             sent += static_cast<std::size_t>(result);
         }
@@ -197,21 +197,41 @@ class HttpServer {
 
     void run() {
         while (!stop_.load(std::memory_order_relaxed)) {
-            const int client = ::accept4(listener_, nullptr, nullptr, SOCK_CLOEXEC);
+            const mmltk::common::io::ScopedFd client_owner{::accept4(listener_.get(), nullptr, nullptr, SOCK_CLOEXEC)};
+            const int client = client_owner.get();
             if (client < 0) {
                 if (stop_.load(std::memory_order_relaxed)) { return; }
-                continue;
+                if (errno == EINTR) continue;
+                throw std::runtime_error("HTTP fixture accept failed");
             }
+            {
+                std::scoped_lock lock(client_mutex_);
+                if (stop_.load(std::memory_order_acquire)) return;
+                active_client_ = client;
+            }
+            const mmltk::testsupport::ScopedTestCleanup clear_client([&] {
+                std::scoped_lock lock(client_mutex_);
+                active_client_ = -1;
+            });
+            const timeval deadline{.tv_sec = 3, .tv_usec = 0};
+            require_condition(::setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &deadline, sizeof(deadline)) == 0, "HTTP receive deadline");
+            require_condition(::setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &deadline, sizeof(deadline)) == 0, "HTTP send deadline");
             serve(client);
-            ::close(client);
         }
     }
 
     void serve(const int client) {
-        std::string request(std::size_t{16U} * 1024U, '\0');
-        const ssize_t received = ::recv(client, request.data(), request.size(), 0);
-        if (received <= 0) { return; }
-        request.resize(static_cast<std::size_t>(received));
+        std::size_t received = 0U;
+        std::string_view request;
+        while (received < receive_.size()) {
+            const auto count = ::recv(client, receive_.data() + received, receive_.size() - received, 0);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) return;
+            received += static_cast<std::size_t>(count);
+            request = {receive_.data(), received};
+            if (request.find("\r\n\r\n") != std::string_view::npos) break;
+        }
+        require_condition(request.find("\r\n\r\n") != std::string_view::npos, "HTTP header exceeds bounded receive storage");
         requests_.fetch_add(1U, std::memory_order_relaxed);
         if (failures_remaining_.fetch_sub(1, std::memory_order_relaxed) > 0) {
             static constexpr std::string_view response =
@@ -229,7 +249,8 @@ class HttpServer {
             const std::size_t number_begin = range_header + std::strlen("\r\nRange: bytes=");
             const std::size_t dash = request.find('-', number_begin);
             if (dash != std::string::npos) {
-                begin = static_cast<std::size_t>(std::stoull(request.substr(number_begin, dash - number_begin)));
+                const auto parsed = std::from_chars(request.data() + number_begin, request.data() + dash, begin);
+                require_condition(parsed.ec == std::errc{} && parsed.ptr == request.data() + dash, "invalid HTTP range");
                 ranged = begin < payload_.size();
             }
         }
@@ -252,24 +273,31 @@ class HttpServer {
         if (!send_all(client, header.data(), header.size())) { return; }
 
         constexpr std::size_t chunk = std::size_t{16U} * 1024U;
+        const bool gated = gate_next_.exchange(false, std::memory_order_acq_rel);
         std::size_t offset = begin;
         while (offset < payload_.size()) {
             const std::size_t current = std::min(chunk, payload_.size() - offset);
             if (!send_all(client, payload_.data() + offset, current)) { return; }
             offset += current;
-            if (slow_.load(std::memory_order_relaxed)) { std::this_thread::sleep_for(2ms); }
+            if (gated && offset - begin == partial_bytes) partial_.receipt().ArriveAndWait();
+            if (stop_.load(std::memory_order_acquire)) return;
         }
     }
 
-    std::vector<std::uint8_t> payload_;
-    int listener_ = -1;
+    const std::span<const std::uint8_t> payload_;
+    mmltk::common::io::ScopedFd listener_;
+    std::array<char, 16U * 1024U> receive_{};
+    std::mutex client_mutex_;
+    int active_client_ = -1;
+    std::exception_ptr failure_;
+    mmltk::testsupport::TestGate partial_{"HTTP partial transfer byte boundary"};
     std::uint16_t port_ = 0U;
     std::atomic<bool> stop_{false};
-    std::atomic<bool> slow_{false};
+    std::atomic<bool> gate_next_{false};
     std::atomic<int> failures_remaining_{0};
     std::atomic<std::uint64_t> requests_{0U};
     std::atomic<std::uint64_t> ranged_requests_{0U};
-    std::thread worker_;
+    std::jthread worker_;
 };
 
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
@@ -279,7 +307,7 @@ DownloadRequest request_for(const fs::path& root, const std::string& id, const s
 }
 
 void test_benchmark_download_cache_lifecycle() {
-    ScopedTestRoot root("downloads");
+    mmltk::testsupport::ScopedTempDir root("downloads");
     const std::vector<std::uint8_t> payload = make_payload(std::size_t{8U} * 1024U * 1024U);
     HttpServer server(payload);
 
@@ -291,22 +319,33 @@ void test_benchmark_download_cache_lifecycle() {
 
     DownloadRequest resume = request_for(root.path(), "resume", server.url("resume"), payload);
     std::atomic<bool> cancel{false};
-    server.slow(true);
-    bool cancelled = false;
-    try {
-        (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
-                                 [&](const DownloadProgress& progress) {
-                                     if (progress.completed_bytes >= std::uint64_t{512U} * 1024U) {
-                                         cancel.store(true, std::memory_order_relaxed);
-                                     }
-                                 });
-    } catch (const std::exception&) { cancelled = true; }
-    REQUIRE(cancelled);
+    server.GateNextTransfer();
+    mmltk::testsupport::TestGate received("HTTP partial bytes persisted");
+    auto download = std::async(std::launch::async, [&] {
+        try {
+            (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
+                [&](const DownloadProgress& progress) {
+                    if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
+                });
+            return false;
+        } catch (const std::exception&) { return true; }
+    });
+    const mmltk::testsupport::ScopedTestCleanup cancel_download([&] {
+        cancel.store(true, std::memory_order_release);
+        received.Release();
+        server.ReleasePartial();
+    });
+    REQUIRE(server.WaitPartial());
+    REQUIRE(received.WaitEntered(3s));
+    cancel.store(true, std::memory_order_release);
+    received.Release();
+    // Keep the sender parked until cancellation settles, so the physical
+    // partial file is independent of callback frequency and scheduler speed.
+    REQUIRE(mmltk::testsupport::await_test_future(download, "partial HTTP cancellation", 5s));
     REQUIRE(!fs::exists(resume.destination));
-    REQUIRE(fs::file_size(resume.destination.string() + ".part") > 0U);
-
-    cancel.store(false, std::memory_order_relaxed);
-    server.slow(false);
+    REQUIRE(fs::file_size(resume.destination.string() + ".part") == HttpServer::partial_bytes);
+    server.ReleasePartial();
+    cancel.store(false, std::memory_order_release);
     const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel));
     REQUIRE(resumed[0].resumed);
     REQUIRE(server.ranged_requests() > 0U);
@@ -332,10 +371,11 @@ void test_benchmark_download_cache_lifecycle() {
     } catch (const std::exception&) { source_failed = true; }
     REQUIRE(source_failed);
     REQUIRE(!fs::exists(unavailable.destination));
+    server.Check();
 }
 
 void test_benchmark_annotation_indexes() {
-    ScopedTestRoot root("annotations");
+    mmltk::testsupport::ScopedTempDir root("annotations");
     const fs::path coco = root.path() / "mini-coco.json";
     write_text(coco, R"({"images":[{"id":1,"width":16,"height":8},{"id":2,"width":16,"height":8}],)"
                      R"("annotations":[{"image_id":1,"category_id":1,"bbox":[1,1,6,4]},)"
@@ -539,7 +579,7 @@ void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, c
 }
 
 void test_benchmark_archive_training_quarantine() {
-    ScopedTestRoot root("archive-quarantine");
+    mmltk::testsupport::ScopedTempDir root("archive-quarantine");
     const fs::path archive_path = root.path() / "images.tar";
     write_single_jpeg_tar(archive_path, 1U, make_jpeg(240U, 8U, 8U));
     const std::vector<std::uint64_t> requested{1U, 2U};
@@ -587,7 +627,7 @@ void test_benchmark_archive_training_quarantine() {
 
 void test_benchmark_cached_image_writer_and_loader() {
     constexpr std::uint32_t kNanoResolution = 384U;
-    ScopedTestRoot root("writer");
+    mmltk::testsupport::ScopedTempDir root("writer");
     const std::vector<std::uint8_t> red = make_jpeg(240U, 8U, 8U);
     const std::vector<std::uint8_t> green = make_jpeg(8U, 240U, 8U);
     std::vector<std::uint8_t> padded = red;
@@ -744,7 +784,7 @@ void test_benchmark_archive_quarantine_policy() {
 }
 
 void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress() {
-    ScopedTestRoot root("event-cancellation");
+    mmltk::testsupport::ScopedTempDir root("event-cancellation");
     const fs::path output = root.path() / "compiled";
     const fs::path cache = root.path() / "cache";
     const std::string normalized_output = fs::weakly_canonical(fs::absolute(output)).generic_string();
@@ -754,7 +794,8 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
          sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
          ".lock");
     fs::create_directories(lock_path.parent_path());
-    const int descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    const mmltk::common::io::ScopedFd lock_descriptor{::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)};
+    const int descriptor = lock_descriptor.get();
     require_condition(descriptor >= 0, "failed to open benchmark heartbeat lock");
     require_condition(::flock(descriptor, LOCK_EX | LOCK_NB) == 0, "failed to acquire benchmark heartbeat lock");
 
@@ -763,16 +804,16 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
     auto [cancellation, token] = CancellationSource::Mint();
     struct ReachedCancellation final {
         const decltype(token)* cancellation_token = nullptr;
-        std::atomic<bool>* reached = nullptr;
+        mmltk::testsupport::TestGate::Receipt reached;
         [[nodiscard]] bool cancelled() const noexcept {
-            reached->store(true, std::memory_order_release);
+            reached.ArriveAndWait();
             return cancellation_token->cancelled();
         }
     };
-    std::atomic<bool> reached_lock_wait{false};
-    const ReachedCancellation observed{.cancellation_token = &token, .reached = &reached_lock_wait};
+    mmltk::testsupport::TestGate reached_lock_wait("benchmark lock cancellation observation");
+    const ReachedCancellation observed{.cancellation_token = &token, .reached = reached_lock_wait.receipt()};
     std::exception_ptr compile_error;
-    std::thread compiler([&] {
+    auto compiler = std::async(std::launch::async, [&] {
         try {
             BenchmarkCompilerConfig config;
             config.output_dir = output;
@@ -784,15 +825,15 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
             BenchmarkDatasetCompiler::compile(std::move(config));
         } catch (...) { compile_error = std::current_exception(); }
     });
-    const auto deadline = std::chrono::steady_clock::now() + 3s;
-    while (!reached_lock_wait.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::yield();
-    }
-    REQUIRE(reached_lock_wait.load(std::memory_order_acquire));
+    const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+        static_cast<void>(cancellation.RequestCancel());
+        reached_lock_wait.Release();
+        (void)::flock(descriptor, LOCK_UN);
+    });
+    REQUIRE(reached_lock_wait.WaitEntered(3s));
     REQUIRE(cancellation.RequestCancel());
-    compiler.join();
-    (void)::flock(descriptor, LOCK_UN);
-    (void)::close(descriptor);
+    reached_lock_wait.Release();
+    mmltk::testsupport::await_test_future(compiler, "benchmark cancelled lock settlement", 3s);
     REQUIRE(compile_error != nullptr);
 }
 

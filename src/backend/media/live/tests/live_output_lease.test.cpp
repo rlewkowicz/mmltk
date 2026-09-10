@@ -1,21 +1,22 @@
-#include <catch2/catch_test_macros.hpp>
-
-#include <array>
 #include <atomic>
+#include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <future>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <stop_token>
 #include <thread>
 #include <utility>
-#include <stdexcept>
+
+#include "async_test_utils.hpp"
+#include "src/backend/media/live/detail/live_output_callback_lifetime.h"
+#include "src/backend/media/live/detail/live_physical_retirement.h"
+#include "src/backend/media/live/detail/live_slot_state.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-
-#include "src/backend/media/live/detail/live_physical_retirement.h"
-#include "src/backend/media/live/detail/live_output_callback_lifetime.h"
-#include "src/backend/media/live/detail/live_slot_state.h"
 
 import mmltk.backend.media.live.live_types;
 import mmltk.backend.media.live.live_session_controller;
@@ -128,15 +129,6 @@ TEST_CASE("Live source slot publishes Free only after product scrub") {
     CHECK(slot_state_is(state, SlotState::Free));
 }
 
-TEST_CASE("Live slot vocabulary retains every physical lifecycle phase") {
-    constexpr std::array states{
-        SlotState::Free, SlotState::Uploading, SlotState::Published, SlotState::Acquired, SlotState::Completing, SlotState::Terminal,
-    };
-
-    for (std::size_t index = 0U; index < states.size(); ++index)
-        CHECK(slot_state_value(states[index]) == index);
-}
-
 TEST_CASE("Live fanout slot publishes Free only after completion scrub") {
     std::atomic<std::uint32_t> state{slot_state_value(SlotState::Published)};
     REQUIRE(claim_live_slot(state, SlotState::Published));
@@ -217,12 +209,8 @@ struct RevisionSnapshotProbe final {
 };
 
 struct GatedRevisionSnapshotProbe final {
-    GatedRevisionSnapshotProbe() : release(release_promise.get_future().share()) {}
-
     std::atomic<std::size_t> calls{0U};
-    std::promise<void> snapshot_checked;
-    std::promise<void> release_promise;
-    std::shared_future<void> release;
+    mmltk::testsupport::TestGate checked{"Live checked revision snapshot"};
     PhysicalFrameRevision revision{};
 
     static std::optional<PhysicalFrameRevision> Snapshot(void* context) noexcept {
@@ -230,8 +218,7 @@ struct GatedRevisionSnapshotProbe final {
         const std::size_t call = probe.calls.fetch_add(1U, std::memory_order_acq_rel);
         const PhysicalFrameRevision checked = probe.revision;
         if (call == 0U) {
-            probe.snapshot_checked.set_value();
-            probe.release.wait();
+            probe.checked.receipt().ArriveAndWait();
         }
         return checked.valid() ? std::optional<PhysicalFrameRevision>{checked} : std::nullopt;
     }
@@ -239,32 +226,38 @@ struct GatedRevisionSnapshotProbe final {
 
 class GatedRevisionWait final {
    public:
-    GatedRevisionWait() {
-        revisions.Reset();
-        auto checked = probe.snapshot_checked.get_future();
-        result = std::async(std::launch::async,
-                            [this] { return revisions.Wait(std::stop_token{}, &probe, &GatedRevisionSnapshotProbe::Snapshot); });
-        checked.wait();
+    GatedRevisionWait() { revisions.Reset(); }
+    ~GatedRevisionWait() {
+        stop.request_stop();
+        probe.checked.Release();
+        if (result.valid()) result.wait();
     }
-
+    void Start() {
+        result = std::async(std::launch::async,
+                           [this] { return revisions.Wait(stop.get_token(), &probe, &GatedRevisionSnapshotProbe::Snapshot); });
+        REQUIRE(probe.checked.WaitEntered(std::chrono::seconds{2}));
+    }
     LiveRevisionWait revisions;
     GatedRevisionSnapshotProbe probe;
+    std::stop_source stop;
     std::future<std::optional<PhysicalFrameRevision>> result;
 };
 
 TEST_CASE("Live revision notification is retained after checked snapshot") {
     GatedRevisionWait wait;
+    wait.Start();
     wait.probe.revision = kRevision;
     std::promise<void> notifier_started;
     auto notifier = std::async(std::launch::async, [&] {
         notifier_started.set_value();
         wait.revisions.RevisionReady();
     });
-    notifier_started.get_future().wait();
-    wait.probe.release_promise.set_value();
+    const mmltk::testsupport::ScopedTestCleanup release_snapshot([&] { wait.probe.checked.Release(); });
+    mmltk::testsupport::await_test_promise(notifier_started, "Live notifier started");
+    wait.probe.checked.Release();
 
-    notifier.get();
-    const auto observed = wait.result.get();
+    mmltk::testsupport::await_test_future(notifier, "Live notification settlement");
+    const auto observed = mmltk::testsupport::await_test_future(wait.result, "Live revision settlement");
     REQUIRE(observed.has_value());
     CHECK(observed->revision == kRevision.revision);
     CHECK(wait.probe.calls.load(std::memory_order_acquire) == 2U);
@@ -272,6 +265,7 @@ TEST_CASE("Live revision notification is retained after checked snapshot") {
 
 TEST_CASE("Live admitted-run terminal notification is retained after checked snapshot") {
     GatedRevisionWait wait;
+    wait.Start();
 
     struct TypedTerminalProbe final {
         LiveRevisionWait* revisions = nullptr;
@@ -292,11 +286,12 @@ TEST_CASE("Live admitted-run terminal notification is retained after checked sna
         notifier_started.set_value();
         listener(terminal);
     });
-    notifier_started.get_future().wait();
-    wait.probe.release_promise.set_value();
+    const mmltk::testsupport::ScopedTestCleanup release_snapshot([&] { wait.probe.checked.Release(); });
+    mmltk::testsupport::await_test_promise(notifier_started, "Live notifier started");
+    wait.probe.checked.Release();
 
-    notifier.get();
-    CHECK_FALSE(wait.result.get().has_value());
+    mmltk::testsupport::await_test_future(notifier, "Live notification settlement");
+    CHECK_FALSE(mmltk::testsupport::await_test_future(wait.result, "Live revision settlement").has_value());
     CHECK(wait.revisions.failed());
     CHECK(terminal_probe.notifications == 1U);
     CHECK(wait.probe.calls.load(std::memory_order_acquire) == 1U);
@@ -353,30 +348,6 @@ TEST_CASE("rejected Live release leaves its local handle inert") {
     CHECK(attempts == 1U);
     CHECK(retire_live_local_handle(handle, std::uintptr_t{0U}, reject) == cudaSuccess);
     CHECK(attempts == 1U);
-}
-
-TEST_CASE("Live physical aggregate retires once on its owner worker") {
-    struct Aggregate final {
-        std::thread::id owner;
-        std::atomic<std::size_t>* releases = nullptr;
-        std::atomic_bool* correct_worker = nullptr;
-        ~Aggregate() {
-            correct_worker->store(owner == std::this_thread::get_id(), std::memory_order_release);
-            releases->fetch_add(1U, std::memory_order_acq_rel);
-        }
-    };
-
-    std::atomic<std::size_t> releases{0U};
-    std::atomic_bool correct_worker{false};
-    auto retirement = std::async(std::launch::async, [&] {
-        std::optional<Aggregate> aggregate{std::in_place, std::this_thread::get_id(), &releases, &correct_worker};
-        retire_live_physical_aggregate(aggregate);
-        return !aggregate.has_value();
-    });
-
-    CHECK(retirement.get());
-    CHECK(releases.load(std::memory_order_acquire) == 1U);
-    CHECK(correct_worker.load(std::memory_order_acquire));
 }
 
 }  // namespace

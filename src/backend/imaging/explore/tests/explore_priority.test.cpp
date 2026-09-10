@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include <numeric>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "src/backend/data/compiled_format.h"
+#include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
@@ -109,26 +111,53 @@ struct HighWaterReleaseProbe final {
 
 class CudaBuffer final {
    public:
-    explicit CudaBuffer(const std::size_t bytes) { REQUIRE(cudaMalloc(&data_, std::max<std::size_t>(bytes, 1U)) == cudaSuccess); }
-    ~CudaBuffer() { CHECK(cudaFree(data_) == cudaSuccess); }
+    explicit CudaBuffer(const std::size_t bytes = 0U) { if (bytes != 0U) ensure(bytes); }
+    void ensure(const std::size_t bytes) {
+        const auto retired = allocation_.RetryPending(&cudaFree);
+        REQUIRE(retired.failure == cudaSuccess);
+        REQUIRE(allocation_.replacement_available());
+        if (bytes <= capacity_ && allocation_.active() != nullptr) return;
+        const auto next_capacity = std::max<std::size_t>(bytes, 1U);
+        const auto allocated = allocation_.AllocateCandidate([next_capacity](void*& replacement) noexcept {
+            return cudaMalloc(&replacement, next_capacity);
+        });
+        REQUIRE(allocated.failure == cudaSuccess);
+        const auto promoted = allocation_.PromoteCandidate(&cudaFree);
+        REQUIRE(promoted.failure == cudaSuccess);
+        capacity_ = next_capacity;
+        uploaded_.clear();
+    }
+    ~CudaBuffer() {
+        const auto released = allocation_.ReleaseAll(&cudaFree);
+        CHECK(released.failure == cudaSuccess);
+    }
     CudaBuffer(const CudaBuffer&) = delete;
     CudaBuffer& operator=(const CudaBuffer&) = delete;
 
     template <class Value>
     void upload(const std::span<const Value> values) {
-        if (!values.empty()) REQUIRE(cudaMemcpy(data_, values.data(), values.size_bytes(), cudaMemcpyHostToDevice) == cudaSuccess);
+        ensure(values.size_bytes());
+        const auto bytes = std::as_bytes(values);
+        if (uploaded_.size() == bytes.size() && std::equal(bytes.begin(), bytes.end(), uploaded_.begin())) return;
+        if (!values.empty()) REQUIRE(cudaMemcpy(allocation_.active(), values.data(), values.size_bytes(), cudaMemcpyHostToDevice) == cudaSuccess);
+        uploaded_.assign(bytes.begin(), bytes.end());
     }
-    [[nodiscard]] void* data() const noexcept { return data_; }
+    [[nodiscard]] void* data() const noexcept { return allocation_.active(); }
 
    private:
-    void* data_ = nullptr;
+    mmltk::frameworks::gpu::CudaHighWaterAllocation<void*> allocation_;
+    std::size_t capacity_ = 0U;
+    std::vector<std::byte> uploaded_;
 };
 
 class CudaStream final {
    public:
     CudaStream() { REQUIRE(cudaStreamCreate(&stream_) == cudaSuccess); }
     ~CudaStream() {
-        if (stream_ != nullptr) static_cast<void>(cudaStreamDestroy(stream_));
+        if (stream_ != nullptr) {
+            static_cast<void>(cudaStreamSynchronize(stream_));
+            static_cast<void>(cudaStreamDestroy(stream_));
+        }
     }
     CudaStream(const CudaStream&) = delete;
     CudaStream& operator=(const CudaStream&) = delete;
@@ -154,7 +183,9 @@ TEST_CASE("Host render demand samples only the current atomic generation", "[bac
 
 TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha", "[backend][imaging][explore][probe]") {
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    const auto status = cudaGetDeviceCount(&devices);
+    if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver || (status == cudaSuccess && devices == 0)) SKIP("CUDA device unavailable");
+    REQUIRE(status == cudaSuccess);
     constexpr std::size_t pitch = 32U;
     std::array<std::uint8_t, pitch * 4U> pixels{};
     for (std::size_t y = 0U; y < 4U; ++y)
@@ -199,21 +230,54 @@ struct SemanticOracleResult final {
     std::uint64_t nonzero_alpha = 0U;
 };
 
+struct PixelOracleGeometry final {
+    std::uint32_t width = 4U;
+    std::uint32_t height = 4U;
+    std::uint32_t extent = 4U;
+    std::uint32_t crop_x = 0U;
+    std::uint32_t crop_y = 0U;
+    std::uint32_t crop_width = 0U;
+    std::uint32_t crop_height = 0U;
+};
+
 class SemanticOracleBuffers final {
    public:
-    SemanticOracleBuffers(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                          const std::span<const mmltk::backend::data::RLEPair> runs,
-                          const std::span<const ExploreRenderClassDescriptor> classes)
-        : annotations_(std::max<std::size_t>(annotations.size_bytes(), 1U)),
-          runs_(std::max<std::size_t>(runs.size_bytes(), 1U)),
-          classes_(std::max<std::size_t>(classes.size_bytes(), 1U)),
-          annotation_count_(static_cast<std::uint32_t>(annotations.size())),
-          run_count_(static_cast<std::uint32_t>(runs.size())),
-          class_count_(static_cast<std::uint32_t>(classes.size())) {
+    [[nodiscard]] SemanticOracleResult RenderDetail(
+        std::span<const ExploreRenderAnnotationDescriptor> annotations,
+        std::span<const mmltk::backend::data::RLEPair> runs,
+        std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
+        mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
+        PixelOracleGeometry geometry = {}, bool masks_with_boxes = false);
+    [[nodiscard]] SemanticOracleResult RenderAtlas(
+        std::span<const ExploreRenderAnnotationDescriptor> annotations,
+        std::span<const mmltk::backend::data::RLEPair> runs,
+        std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
+        mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
+        PixelOracleGeometry geometry = {.width = 4U, .height = 2U}, bool masks_with_boxes = false);
+
+   private:
+    void prepare(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
+                 const std::span<const mmltk::backend::data::RLEPair> runs,
+                 const std::span<const ExploreRenderClassDescriptor> classes,
+                 const std::uint32_t width, const std::uint32_t height, const std::uint32_t extent, const bool blue) {
+        annotation_count_ = static_cast<std::uint32_t>(annotations.size());
+        run_count_ = static_cast<std::uint32_t>(runs.size());
+        class_count_ = static_cast<std::uint32_t>(classes.size());
         annotations_.upload<ExploreRenderAnnotationDescriptor>(annotations);
         runs_.upload<mmltk::backend::data::RLEPair>(runs);
         classes_.upload<ExploreRenderClassDescriptor>(classes);
-        REQUIRE(cudaMemset(count_.data(), 0, sizeof(std::uint64_t)) == cudaSuccess);
+        const std::size_t plane = std::size_t{width} * height;
+        if (source_.size() != plane * 3U || source_blue_ != blue) {
+            source_.assign(plane * 3U, 0.0F);
+            if (blue) std::fill(source_.begin() + 2U * plane, source_.end(), 1.0F);
+            source_blue_ = blue;
+            source_device.upload<float>(source_);
+        }
+        const std::size_t bytes = std::size_t{extent} * extent * 4U;
+        clean_device.ensure(bytes);
+        semantic_device.ensure(bytes);
+        composed_device.ensure(bytes);
+        REQUIRE(cudaMemsetAsync(count_.data(), 0, sizeof(std::uint64_t), stream.get()) == cudaSuccess);
     }
 
     [[nodiscard]] ExploreRenderScratchView scratch(CudaBuffer& cards, CudaBuffer* tiles = nullptr) noexcept {
@@ -243,17 +307,30 @@ class SemanticOracleBuffers final {
 
     [[nodiscard]] std::uint64_t* count() noexcept { return static_cast<std::uint64_t*>(count_.data()); }
 
-    [[nodiscard]] SemanticOracleResult download(CudaBuffer& pixels, const std::size_t pixel_count, const CudaStream& stream) {
-        SemanticOracleResult result{.pixels = std::vector<std::array<std::uint8_t, 4U>>(pixel_count)};
-        REQUIRE(cudaMemcpyAsync(result.pixels.data(), pixels.data(), pixel_count * 4U, cudaMemcpyDeviceToHost, stream.get()) ==
+    [[nodiscard]] SemanticOracleResult download(CudaBuffer& pixels, const std::size_t pixel_count) {
+        readback_.resize(pixel_count);
+        readback_alpha_ = 0U;
+        REQUIRE(cudaMemcpyAsync(readback_.data(), pixels.data(), pixel_count * 4U, cudaMemcpyDeviceToHost, stream.get()) ==
                 cudaSuccess);
-        REQUIRE(cudaMemcpyAsync(&result.nonzero_alpha, count_.data(), sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream.get()) ==
+        REQUIRE(cudaMemcpyAsync(&readback_alpha_, count_.data(), sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream.get()) ==
                 cudaSuccess);
         REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
-        return result;
+        // Each comparison owns an independent snapshot; the next render reuses
+        // device and readback storage without mutating earlier oracle results.
+        return {.pixels = readback_, .nonzero_alpha = readback_alpha_};
     }
 
-   private:
+    CudaBuffer source_device;
+    CudaBuffer cards_device{sizeof(ExploreRenderCardDescriptor)};
+    CudaBuffer tiles_device{sizeof(ExploreRenderTileDescriptor)};
+    CudaBuffer clean_device;
+    CudaBuffer semantic_device;
+    CudaBuffer composed_device;
+
+    std::vector<float> source_;
+    bool source_blue_ = false;
+    std::vector<std::array<std::uint8_t, 4U>> readback_;
+    std::uint64_t readback_alpha_ = 0U;
     CudaBuffer annotations_;
     CudaBuffer runs_;
     CudaBuffer classes_;
@@ -261,6 +338,9 @@ class SemanticOracleBuffers final {
     std::uint32_t annotation_count_ = 0U;
     std::uint32_t run_count_ = 0U;
     std::uint32_t class_count_ = 0U;
+
+    // Last member settles work before any retained host/device storage dies.
+    CudaStream stream;
 };
 
 [[nodiscard]] ExploreRenderCardDescriptor make_card(const float* pixels, const std::uint32_t source_width,
@@ -292,40 +372,27 @@ class SemanticOracleBuffers final {
     };
 }
 
-[[nodiscard]] bool has_cuda_device() noexcept {
+[[nodiscard]] bool has_cuda_device() {
     int count = 0;
-    // CLEANUP-IGNORE: Device availability followed by the detail oracle is not the atlas oracle's independent setup.
-    return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+    const auto status = cudaGetDeviceCount(&count);
+    if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver) return false;
+    REQUIRE(status == cudaSuccess);
+    return count > 0;
 }
 
-struct PixelOracleGeometry final {
-    std::uint32_t width = 4U;
-    std::uint32_t height = 4U;
-    std::uint32_t extent = 4U;
-    std::uint32_t crop_x = 0U;
-    std::uint32_t crop_y = 0U;
-    std::uint32_t crop_width = 0U;
-    std::uint32_t crop_height = 0U;
-};
 
-[[nodiscard]] SemanticOracleResult render_semantic_oracle(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                                                          const std::span<const mmltk::backend::data::RLEPair> runs,
-                                                          const std::span<const ExploreRenderClassDescriptor> classes,
-                                                          const bool boxes = false,
-                                                          const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-                                                          const PixelOracleGeometry geometry = {}, const bool masks_with_boxes = false) {
+[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderDetail(
+    const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
+    const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
+    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
+    const PixelOracleGeometry geometry, const bool masks_with_boxes) {
     const auto kExtent = geometry.extent;
     const std::size_t kPixelCount = kExtent * kExtent;
-    const std::vector<float> source(geometry.width * geometry.height * 3U);
+    prepare(annotations, runs, classes, geometry.width, geometry.height, kExtent, false);
+    auto& target_device = semantic_device;
     const std::array<ExploreRenderCardDescriptor, 1U> cards{};
-    CudaBuffer source_device(source.size() * sizeof(float));
-    CudaBuffer cards_device(sizeof(cards));
-    SemanticOracleBuffers semantic_buffers(annotations, runs, classes);
-    CudaBuffer target_device(kPixelCount * 4U);
-    source_device.upload<float>(source);
     cards_device.upload<ExploreRenderCardDescriptor>(cards);
-    CudaStream stream;
-    const auto scratch = semantic_buffers.scratch(cards_device);
+    const auto scratch_view = scratch(cards_device);
     const ExploreRenderTargetView target{
         .data = static_cast<std::uint8_t*>(target_device.data()),
         .pitch_bytes = kExtent * 4U,
@@ -343,27 +410,23 @@ struct PixelOracleGeometry final {
         .crop_height = geometry.crop_height == 0 ? geometry.height : geometry.crop_height,
         .draw_base = 0U,
     };
-    REQUIRE(render_explore_detail(detail, semantic_buffers.semantics(boxes, masks_with_boxes), scratch, target, stream.address()) ==
+    REQUIRE(render_explore_detail(detail, semantics(boxes, masks_with_boxes), scratch_view, target, stream.address()) ==
             kExploreStorageSuccess);
-    REQUIRE(count_explore_nonzero_alpha(target, semantic_buffers.count(), stream.address()) == kExploreStorageSuccess);
-    return semantic_buffers.download(target_device, kPixelCount, stream);
+    REQUIRE(count_explore_nonzero_alpha(target, count(), stream.address()) == kExploreStorageSuccess);
+    return download(target_device, kPixelCount);
 }
 
-// CLEANUP-IGNORE: Atlas and detail pixel oracles call different renderers through the same semantic input types.
-[[nodiscard]] SemanticOracleResult render_atlas_composition_oracle(
+[[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderAtlas(
     const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
-    const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes = false,
-    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-    const PixelOracleGeometry geometry = {.width = 4U, .height = 2U}, const bool masks_with_boxes = false) {
+    const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
+    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
+    const PixelOracleGeometry geometry, const bool masks_with_boxes) {
     namespace raster = mmltk::backend::imaging::raster;
     const auto kSourceWidth = geometry.width;
     const auto kSourceHeight = geometry.height;
     const auto kExtent = geometry.extent;
     const std::size_t kPixelCount = kExtent * kExtent;
-    std::vector<float> source(kSourceWidth * kSourceHeight * 3U);
-    std::ranges::fill(source.begin() + 2U * kSourceWidth * kSourceHeight, source.end(), 1.0F);
-    CudaBuffer source_device(source.size() * sizeof(float));
-    source_device.upload<float>(source);
+    prepare(annotations, runs, classes, kSourceWidth, kSourceHeight, kExtent, true);
     std::array cards{make_card(static_cast<const float*>(source_device.data()), kSourceWidth, kSourceHeight, kExtent,
                                static_cast<std::uint32_t>(annotations.size()))};
     cards.front().erasure = erasure;
@@ -372,16 +435,9 @@ struct PixelOracleGeometry final {
         .destination_height = kExtent,
         .generation = {.viewport = 11U, .tile = 1U},
     }};
-    CudaBuffer cards_device(sizeof(cards));
-    SemanticOracleBuffers semantic_buffers(annotations, runs, classes);
-    CudaBuffer tiles_device(sizeof(tiles));
-    CudaBuffer clean_device(kPixelCount * 4U);
-    CudaBuffer semantic_device(kPixelCount * 4U);
-    CudaBuffer composed_device(kPixelCount * 4U);
     cards_device.upload<ExploreRenderCardDescriptor>(cards);
     tiles_device.upload<ExploreRenderTileDescriptor>(tiles);
-    CudaStream stream;
-    const auto scratch = semantic_buffers.scratch(cards_device, &tiles_device);
+    const auto scratch_view = scratch(cards_device, &tiles_device);
     const ExploreRenderAtlasView atlas{
         .card_extent = kExtent, .card_count = 1U, .source_width = kSourceWidth, .source_height = kSourceHeight, .draw_base = 1U};
     const ExploreRenderTileBatchView batch{
@@ -390,12 +446,12 @@ struct PixelOracleGeometry final {
         .data = static_cast<std::uint8_t*>(clean_device.data()), .pitch_bytes = kExtent * 4U, .width = kExtent, .height = kExtent};
     const ExploreRenderTargetView semantic{
         .data = static_cast<std::uint8_t*>(semantic_device.data()), .pitch_bytes = kExtent * 4U, .width = kExtent, .height = kExtent};
-    REQUIRE(render_explore_atlas_tiles(atlas, batch, {}, scratch, clean, stream.address()) == kExploreStorageSuccess);
+    REQUIRE(render_explore_atlas_tiles(atlas, batch, {}, scratch_view, clean, stream.address()) == kExploreStorageSuccess);
     auto semantic_atlas = atlas;
     semantic_atlas.draw_base = 0U;
-    REQUIRE(render_explore_atlas_tiles(semantic_atlas, batch, semantic_buffers.semantics(boxes, masks_with_boxes), scratch, semantic,
+    REQUIRE(render_explore_atlas_tiles(semantic_atlas, batch, semantics(boxes, masks_with_boxes), scratch_view, semantic,
                                        stream.address()) == kExploreStorageSuccess);
-    REQUIRE(count_explore_nonzero_alpha(semantic, semantic_buffers.count(), stream.address()) == kExploreStorageSuccess);
+    REQUIRE(count_explore_nonzero_alpha(semantic, count(), stream.address()) == kExploreStorageSuccess);
     REQUIRE(cudaMemcpyAsync(composed_device.data(), clean_device.data(), kPixelCount * 4U, cudaMemcpyDeviceToDevice, stream.get()) ==
             cudaSuccess);
     REQUIRE(
@@ -405,11 +461,12 @@ struct PixelOracleGeometry final {
                              static_cast<int>(kExtent)},
             .stream = stream.get(),
         }) == cudaSuccess);
-    return semantic_buffers.download(composed_device, kPixelCount, stream);
+    return download(composed_device, kPixelCount);
 }
 
 TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail scaling", "[backend][imaging][explore][cuda][support]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     namespace augment = mmltk::backend::models::rfdetr;
     using mmltk::backend::data::RLEPair;
     constexpr std::uint32_t width = 8U;
@@ -456,17 +513,17 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
                     CAPTURE(extent, atlas);
                     const auto render = [&](const bool boxes) {
                         return atlas
-                                   ? render_atlas_composition_oracle(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure,
+                                   ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure,
                                                                      geometry, true)
-                                   : render_semantic_oracle(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure, geometry, true);
+                                   : oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure, geometry, true);
                     };
                     const auto masks = render(false);
                     const auto combined = render(true);
                     auto hidden_classes = classes;
                     hidden_classes[0].visible = 0U;
-                    const auto hidden = atlas ? render_atlas_composition_oracle(std::span{&annotation, 1U}, runs, hidden_classes, true,
+                    const auto hidden = atlas ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, hidden_classes, true,
                                                                                 plan.erasure, geometry, true)
-                                              : render_semantic_oracle(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure,
+                                              : oracle.RenderDetail(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure,
                                                                        geometry, true);
                     const auto image = atlas ? make_explore_contain_rect(width, height, extent)
                                              : decltype(make_explore_contain_rect(width, height, extent)){0, 0, extent, extent};
@@ -523,12 +580,13 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
 
 TEST_CASE("Explore cropped detail clips exterior edges without painting surviving pixels", "[backend][imaging][explore][cuda][support]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .rle_count = 1}};
     const std::array runs{mmltk::backend::data::RLEPair{10, 4}};
     const std::array classes{ExploreRenderClassDescriptor{}};
     const PixelOracleGeometry geometry{.width = 8, .height = 4, .extent = 13, .crop_x = 3, .crop_y = 1, .crop_width = 2, .crop_height = 1};
-    const auto masks = render_semantic_oracle(annotations, runs, classes, false, {}, geometry);
-    const auto combined = render_semantic_oracle(annotations, runs, classes, true, {}, geometry, true);
+    const auto masks = oracle.RenderDetail(annotations, runs, classes, false, {}, geometry);
+    const auto combined = oracle.RenderDetail(annotations, runs, classes, true, {}, geometry, true);
     REQUIRE(masks.nonzero_alpha == 13U * 13U);
     CHECK(combined.pixels == masks.pixels);
 }
@@ -758,13 +816,14 @@ TEST_CASE("Semantic upscaling preserves class color and alpha at exact nearest s
 
 TEST_CASE("Explore atlas semantic planes compose through the Presentation raster path", "[backend][imaging][explore][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     constexpr std::array<std::uint8_t, 4U> kBase{0U, 0U, 255U, 255U};
     constexpr std::array<std::uint8_t, 4U> kPadding{24U, 18U, 35U, 255U};
     ExploreRenderAnnotationDescriptor source{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U};
     const std::array single_run{mmltk::backend::data::RLEPair{.start = 0U, .length = 1U}};
     std::array classes{ExploreRenderClassDescriptor{}, ExploreRenderClassDescriptor{}};
 
-    const auto visible = render_atlas_composition_oracle(std::span{&source, 1U}, single_run, classes);
+    const auto visible = oracle.RenderAtlas(std::span{&source, 1U}, single_run, classes);
     REQUIRE(visible.nonzero_alpha == 1U);
     CHECK(visible.pixels[4U] != kBase);
     CHECK(visible.pixels[5U] == kBase);
@@ -772,19 +831,19 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
     CHECK(visible.pixels[15U] == kPadding);
 
     classes[0].visible = 0U;
-    const auto hidden = render_atlas_composition_oracle(std::span{&source, 1U}, single_run, classes);
+    const auto hidden = oracle.RenderAtlas(std::span{&source, 1U}, single_run, classes);
     CHECK(hidden.nonzero_alpha == 0U);
     CHECK(hidden.pixels[4U] == kBase);
     classes[0].visible = 1U;
     source.rle_count = 0U;
-    const auto empty = render_atlas_composition_oracle(std::span{&source, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes);
+    const auto empty = oracle.RenderAtlas(std::span{&source, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes);
     CHECK(empty.nonzero_alpha == 0U);
     CHECK(empty.pixels[4U] == kBase);
 
     source.rle_count = 1U;
     source.inverse[0] = -1.0F;
     source.inverse[2] = 1.0F;
-    const auto transformed = render_atlas_composition_oracle(std::span{&source, 1U}, single_run, classes);
+    const auto transformed = oracle.RenderAtlas(std::span{&source, 1U}, single_run, classes);
     CHECK(transformed.nonzero_alpha == 1U);
     CHECK(transformed.pixels[7U] != kBase);
     CHECK(transformed.pixels[4U] == kBase);
@@ -792,54 +851,55 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
     auto annotations = make_occlusion_annotations({0.0F, 0.0F, 0.25F, 0.5F});
     const std::array occluded_runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 8U},
                                    mmltk::backend::data::RLEPair{.start = 0U, .length = 1U}};
-    const auto occluded = render_atlas_composition_oracle(annotations, occluded_runs, classes);
+    const auto occluded = oracle.RenderAtlas(annotations, occluded_runs, classes);
     annotations[0].rle_count = 0U;
-    const auto donor_only = render_atlas_composition_oracle(annotations, occluded_runs, classes);
+    const auto donor_only = oracle.RenderAtlas(annotations, occluded_runs, classes);
     CHECK(occluded.pixels[4U] == donor_only.pixels[4U]);
     CHECK(occluded.pixels[5U] != kBase);
 
     annotations[0].rle_count = 1U;
     classes[1].visible = 0U;
-    const auto hidden_donor = render_atlas_composition_oracle(annotations, occluded_runs, classes);
+    const auto hidden_donor = oracle.RenderAtlas(annotations, occluded_runs, classes);
     CHECK(hidden_donor.pixels[4U] != donor_only.pixels[4U]);
     annotations[0].occluder_index = -1;
     std::ranges::copy(std::array{0.25F, 0.25F, 0.75F, 0.75F}, annotations[0].box_xyxy);
     const auto visible_box =
-        render_atlas_composition_oracle(std::span{annotations}.first(1U), std::span<const mmltk::backend::data::RLEPair>{}, classes, true);
+        oracle.RenderAtlas(std::span{annotations}.first(1U), std::span<const mmltk::backend::data::RLEPair>{}, classes, true);
     CHECK(visible_box.nonzero_alpha != 0U);
     classes[0].visible = 0U;
     const auto hidden_box =
-        render_atlas_composition_oracle(std::span{annotations}.first(1U), std::span<const mmltk::backend::data::RLEPair>{}, classes, true);
+        oracle.RenderAtlas(std::span{annotations}.first(1U), std::span<const mmltk::backend::data::RLEPair>{}, classes, true);
     CHECK(hidden_box.nonzero_alpha == 0U);
 }
 
 TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition pixels", "[backend][imaging][explore][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U};
     const std::array runs{mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
     std::array classes{ExploreRenderClassDescriptor{}};
 
-    const auto visible = render_semantic_oracle(std::span{&annotation, 1U}, runs, classes);
+    const auto visible = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
     CHECK(visible.nonzero_alpha == 1U);
     CHECK(visible.pixels[5U][3U] == 92U);
     CHECK(visible.pixels[0U][3U] == 0U);
 
     classes[0].visible = 0U;
-    const auto hidden = render_semantic_oracle(std::span{&annotation, 1U}, runs, classes);
+    const auto hidden = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
     CHECK(hidden.nonzero_alpha == 0U);
 
     classes[0].visible = 1U;
     annotation.rle_count = 0U;
-    CHECK(render_semantic_oracle(std::span{&annotation, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes).nonzero_alpha ==
+    CHECK(oracle.RenderDetail(std::span{&annotation, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes).nonzero_alpha ==
           0U);
     annotation.rle_offset = 1U;
     annotation.rle_count = 1U;
-    CHECK(render_semantic_oracle(std::span{&annotation, 1U}, runs, classes).nonzero_alpha == 0U);
+    CHECK(oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes).nonzero_alpha == 0U);
 
     annotation.rle_offset = 0U;
     annotation.inverse[0] = -1.0F;
     annotation.inverse[2] = 1.0F;
-    const auto transformed = render_semantic_oracle(std::span{&annotation, 1U}, runs, classes);
+    const auto transformed = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
     CHECK(transformed.nonzero_alpha == 1U);
     CHECK(transformed.pixels[6U][3U] == 92U);
     CHECK(transformed.pixels[5U][3U] == 0U);
@@ -862,21 +922,22 @@ TEST_CASE("Explore renderer rejects semantic descriptors beyond admitted storage
 
 TEST_CASE("Explore CUDA donor occlusion remains independent of semantic class visibility", "[backend][imaging][explore][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     auto annotations = make_occlusion_annotations({0.0F, 0.0F, 1.0F, 1.0F});
     const std::array runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 16U},
                           mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
     std::array classes{ExploreRenderClassDescriptor{}, ExploreRenderClassDescriptor{}};
-    const auto donor_visible = render_semantic_oracle(annotations, runs, classes);
+    const auto donor_visible = oracle.RenderDetail(annotations, runs, classes);
     CHECK(donor_visible.nonzero_alpha == 16U);
     const auto donor_pixel = donor_visible.pixels[5U];
 
     annotations[0].rle_count = 0U;
-    const auto donor_only = render_semantic_oracle(annotations, runs, classes);
+    const auto donor_only = oracle.RenderDetail(annotations, runs, classes);
     CHECK(donor_pixel == donor_only.pixels[5U]);
 
     annotations[0].rle_count = 1U;
     classes[1].visible = 0U;
-    const auto hidden_donor = render_semantic_oracle(annotations, runs, classes);
+    const auto hidden_donor = oracle.RenderDetail(annotations, runs, classes);
     CHECK(hidden_donor.nonzero_alpha == 15U);
     CHECK(hidden_donor.pixels[5U][3U] == 0U);
     CHECK(hidden_donor.pixels[5U] != donor_pixel);
@@ -884,15 +945,17 @@ TEST_CASE("Explore CUDA donor occlusion remains independent of semantic class vi
 
 TEST_CASE("Explore CUDA class filtering applies to box composition", "[backend][imaging][explore][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.75F}, .class_id = 0U}};
     std::array classes{ExploreRenderClassDescriptor{}};
-    CHECK(render_semantic_oracle(annotations, std::span<const mmltk::backend::data::RLEPair>{}, classes, true).nonzero_alpha != 0U);
+    CHECK(oracle.RenderDetail(annotations, std::span<const mmltk::backend::data::RLEPair>{}, classes, true).nonzero_alpha != 0U);
     classes[0].visible = 0U;
-    CHECK(render_semantic_oracle(annotations, std::span<const mmltk::backend::data::RLEPair>{}, classes, true).nonzero_alpha == 0U);
+    CHECK(oracle.RenderDetail(annotations, std::span<const mmltk::backend::data::RLEPair>{}, classes, true).nonzero_alpha == 0U);
 }
 
 TEST_CASE("Explore detail and atlas mask support follows final spatial erasure", "[backend][imaging][explore][cuda]") {
     if (!has_cuda_device()) { SKIP("CUDA unavailable"); }
+    SemanticOracleBuffers oracle;
     namespace rfdetr = mmltk::backend::models::rfdetr;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U}};
     const std::array runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 16U}};
@@ -904,7 +967,7 @@ TEST_CASE("Explore detail and atlas mask support follows final spatial erasure",
         rfdetr::AugmentationSpatialErasure{.dropout_probability = 1.0F},
     };
     for (const auto& erasure : erasures) {
-        const auto detail = render_semantic_oracle(annotations, runs, classes, false, erasure);
+        const auto detail = oracle.RenderDetail(annotations, runs, classes, false, erasure);
         std::uint64_t expected_detail = 0U;
         std::uint64_t expected_atlas = 0U;
         for (std::int64_t y = 0; y < 4; ++y) {
@@ -916,18 +979,18 @@ TEST_CASE("Explore detail and atlas mask support follows final spatial erasure",
             }
         }
         CHECK(detail.nonzero_alpha == expected_detail);
-        const auto atlas = render_atlas_composition_oracle(annotations, runs, classes, false, erasure);
+        const auto atlas = oracle.RenderAtlas(annotations, runs, classes, false, erasure);
         CHECK(atlas.nonzero_alpha == expected_atlas);
     }
     const auto donor_annotations = make_occlusion_annotations({0.0F, 0.0F, 1.0F, 1.0F});
     const std::array donor_runs{runs.front(), mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
     const std::array donor_classes{classes.front(), classes.front()};
-    const auto donor = render_semantic_oracle(donor_annotations, donor_runs, donor_classes, false, erasures[2]);
+    const auto donor = oracle.RenderDetail(donor_annotations, donor_runs, donor_classes, false, erasures[2]);
     CHECK(donor.nonzero_alpha == 12U);
     CHECK(donor.pixels[5U][3U] == 0U);
     CHECK(donor.pixels[6U][3U] == 92U);
-    const auto boxes = render_semantic_oracle(annotations, runs, classes, true);
-    CHECK(render_semantic_oracle(annotations, runs, classes, true, erasures.back()).nonzero_alpha == boxes.nonzero_alpha);
+    const auto boxes = oracle.RenderDetail(annotations, runs, classes, true);
+    CHECK(oracle.RenderDetail(annotations, runs, classes, true, erasures.back()).nonzero_alpha == boxes.nonzero_alpha);
 }
 
 }  // namespace

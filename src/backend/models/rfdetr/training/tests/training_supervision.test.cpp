@@ -295,7 +295,7 @@ class TargetConsumerGate final {
 };
 
 void test_target_scratch_reuse_waits_for_consumer_retirement() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
     rfdetr::TargetScratch scratch;
     scratch.ensure_batch(2, 8, 8, device_id);
@@ -378,7 +378,7 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
 }
 
 void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
     rfdetr::TargetScratch scratch(2);
     scratch.ensure_batch(1, 8, 8, device_id);
@@ -415,7 +415,7 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
 }
 
 void test_target_scratch_retires_cross_device_events_on_their_owner() {
-    if (!torch_api::cuda::is_available() || torch_api::cuda::device_count() < 2) { return; }
+    if (!torch_api::cuda::is_available() || torch_api::cuda::device_count() < 2) { SKIP("Two CUDA devices required; peer coverage remains unverified"); }
     c10::cuda::CUDAGuard ambient_device(static_cast<c10::DeviceIndex>(0));
     auto scratch = std::make_unique<rfdetr::TargetScratch>(1);
     scratch->ensure_batch(1, 8, 8, 0);
@@ -442,7 +442,7 @@ void test_target_scratch_retires_cross_device_events_on_their_owner() {
 }
 
 void test_build_targets_recovers_after_staging_growth_and_failure() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
     using mmltk::backend::data::Batch;
     using mmltk::backend::data::LabelIndexEntry;
@@ -498,7 +498,7 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
 }
 
 void test_copy_paste_cache_publication_recovers_without_targets() {
-    if (!torch_api::cuda::is_available()) return;
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
@@ -563,7 +563,7 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
 }
 
 void test_training_adapter_matches_raw_augmentation_executor() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int height = 8;
     constexpr int width = 8;
     constexpr std::uint64_t seed = 127U;
@@ -770,7 +770,7 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
 }
 
 void test_copy_paste_ring_support_and_cache_cycles() {
-    if (!torch_api::cuda::is_available()) return;
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
     using namespace rfdetr::test_support;
     using mmltk::backend::data::PackedInstance;
@@ -969,7 +969,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
 }
 
 void test_native_augmentation_preview_target_support_parity() {
-    if (!torch_api::cuda::is_available()) return;
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
@@ -1031,7 +1031,7 @@ void test_native_augmentation_preview_target_support_parity() {
 }
 
 void test_tiny_mask_training_outer_edges() {
-    if (!torch_api::cuda::is_available()) return;
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
@@ -1079,7 +1079,7 @@ void test_tiny_mask_training_outer_edges() {
 }
 
 void test_training_mask_targets_follow_spatial_image_erasure() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr std::size_t count = 64U;
     constexpr int extent = 8;
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -1133,7 +1133,7 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
 }
 
 void test_parallel_wave_drains_failures_and_cancellation() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const rfdetr::DistributedContext distributed;
     const auto device = rfdetr::cuda_device(0);
 
@@ -1235,7 +1235,7 @@ void test_parallel_wave_drains_failures_and_cancellation() {
 }
 
 void test_all_supervision_routes_execute_fixture_backed_training() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const auto root = std::filesystem::temp_directory_path() / "mmltk_rfdetr_supervision_routes";
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);

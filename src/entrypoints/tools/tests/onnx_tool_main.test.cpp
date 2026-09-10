@@ -1,10 +1,19 @@
-#include "detail/onnx_tool_main.h"
-
+#include <array>
+#include <cstdlib>
+#include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "async_test_utils.hpp"
 #include "catch2_compat.hpp"
+#include "detail/onnx_tool_main.h"
+#include "filesystem_test_utils.hpp"
+
+import mmltk.common.logging.mmltk_logging;
 
 namespace {
 
@@ -19,14 +28,15 @@ constexpr mmltk::entrypoints::tools::OnnxToolMainConfig kTestConfig{
     .error_prefix = "onnx-info-test: ",
 };
 
-[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments) {
+[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments, mmltk::entrypoints::tools::OnnxToolOperation operation = &capture_model_path) {
     std::vector<char*> argv;
     argv.reserve(arguments.size());
     for (std::string& argument : arguments)
         argv.push_back(argument.data());
 
+    mmltk::common::logging::initialize(mmltk::common::logging::default_config("onnx-test"));
     captured_model_path.clear();
-    return mmltk::entrypoints::tools::run_onnx_tool_main(static_cast<int>(argv.size()), argv.data(), kTestConfig, &capture_model_path);
+    return mmltk::entrypoints::tools::run_onnx_tool_main(static_cast<int>(argv.size()), argv.data(), kTestConfig, operation);
 }
 
 void test_onnx_tool_main_routes_one_model_after_logging_options() {
@@ -40,7 +50,61 @@ void test_onnx_tool_main_rejects_a_missing_model() {
     CHECK(captured_model_path.empty());
 }
 
+std::size_t error_text_reads = 0U;
+struct ObservedFailure final : std::exception {
+    const char* what() const noexcept override {
+        ++error_text_reads;
+        return "observed model operation failure";
+    }
+};
+void fail_model_operation(const std::filesystem::path& path) {
+    captured_model_path = path;
+    throw ObservedFailure{};
+}
+
+void test_onnx_failure_diagnostics_are_lazy() {
+    namespace logging = mmltk::common::logging;
+    const mmltk::testsupport::ScopedTempDir root("mmltk_onnx_failure");
+    const auto sink = root.path() / "failure.log";
+    // An empty level resets an explicit choice to inherited configuration.
+    // Clear inherited logging for the default branch and restore it on exit.
+    const std::array names{"MMLTK_LOG_LEVEL", "MMLTK_LOG_FILE", "MMLTK_LOG_DIR"};
+    std::array<std::optional<std::string>, 3> inherited;
+    const mmltk::testsupport::ScopedTestCleanup restore([&] {
+        logging::initialize(logging::default_config("onnx-test"));
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (inherited[i]) ::setenv(names[i], inherited[i]->c_str(), 1);
+            else ::unsetenv(names[i]);
+        }
+    });
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        if (const char* value = std::getenv(names[i])) inherited[i] = value;
+        REQUIRE(::unsetenv(names[i]) == 0);
+    }
+    for (const bool explicit_off : {false, true}) {
+        std::vector<std::string> arguments{"onnx-test", "/tmp/model.onnx"};
+        if (explicit_off) {
+            arguments.push_back("--log-level=off");
+            arguments.push_back("--log-file=" + sink.string());
+        }
+        error_text_reads = 0U;
+        CHECK(run_onnx_tool(std::move(arguments), &fail_model_operation) == 1);
+        CHECK(captured_model_path == "/tmp/model.onnx");
+        CHECK(error_text_reads == 0U);
+        CHECK_FALSE(std::filesystem::exists(sink));
+    }
+    CHECK(run_onnx_tool({"onnx-test", "--log-level=info", "--log-file=" + sink.string(), "/tmp/model.onnx"}, &fail_model_operation) == 1);
+    logging::flush();
+    CHECK(error_text_reads == 1U);
+    std::ifstream input(sink);
+    REQUIRE(input.is_open());
+    const std::string text{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    CHECK(text.find("onnx-info-test: observed model operation failure") != std::string::npos);
+}
+
 }  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_routes_one_model_after_logging_options);
 MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_rejects_a_missing_model);
+
+MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_failure_diagnostics_are_lazy);

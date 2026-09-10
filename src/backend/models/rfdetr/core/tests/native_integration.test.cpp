@@ -1,23 +1,13 @@
-#include <sys/wait.h>
 
 #include "src/backend/models/rfdetr/core/model_state.h"
 // RF-DETR core integration coverage.
-#include <unistd.h>
 
-#include <array>
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
-#include <utility>
 #include <vector>
 
 #include "catch2_compat.hpp"
@@ -58,36 +48,9 @@ std::string command_string(const std::vector<std::string>& args) {
 }
 
 void run_subprocess(const std::vector<std::string>& args) {
-    if (args.empty()) { throw std::runtime_error("run_subprocess requires at least one argument"); }
-
-    std::vector<char*> raw_args;
-    raw_args.reserve(args.size() + 1);
-    for (const auto& arg : args) {
-        raw_args.push_back(const_cast<char*>(arg.c_str()));
-    }
-    raw_args.push_back(nullptr);
-
-    pid_t pid = ::fork();
-    if (pid < 0) { throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno)); }
-    if (pid == 0) {
-        ::execvp(raw_args.front(), raw_args.data());
-        std::fprintf(stderr, "execvp failed: %s\n", std::strerror(errno));
-        std::_Exit(127);
-    }
-
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) { throw std::runtime_error(std::string("waitpid failed: ") + std::strerror(errno)); }
-    const std::string command = command_string(args);
-    if (WIFEXITED(status)) {
-        const int exit_code = WEXITSTATUS(status);
-        if (exit_code == 0) { return; }
-        if (exit_code == 127) { throw std::runtime_error("subprocess exec failed for command: " + command); }
-        throw std::runtime_error("subprocess exited with code " + std::to_string(exit_code) + ": " + command);
-    }
-    if (WIFSIGNALED(status)) {
-        throw std::runtime_error("subprocess terminated by signal " + std::to_string(WTERMSIG(status)) + ": " + command);
-    }
-    throw std::runtime_error("subprocess ended unexpectedly: " + command);
+    const auto result = mmltk::testsupport::run_subprocess_capture_output(args);
+    INFO("command: " << command_string(args) << "\nexit status: " << result.exit_code << "\n" << result.output_text);
+    REQUIRE(result.exit_code == 0);
 }
 
 void assert_native_checkpoint(const fs::path& path, const char* expected_preset) {
@@ -154,13 +117,7 @@ void test_native_rfdetr_cached_nano_export_pipeline() {
     REQUIRE(fs::exists(assets.tensorrt_path));
     assert_native_checkpoint(assets.native_checkpoint_path, "rf-detr-nano");
 
-    run_subprocess({
-        cli_path.string(),
-        "rfdetr",
-        "info",
-        "--onnx",
-        assets.onnx_path.string(),
-    });
+    REQUIRE(assets.onnx_metadata_validated);
     run_subprocess({
         cli_path.string(),
         "rfdetr",

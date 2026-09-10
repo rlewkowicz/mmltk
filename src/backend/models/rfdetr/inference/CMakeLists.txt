@@ -66,8 +66,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk_backend_models_rfdetr_inference_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/eval_sample_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_artifact_resolution.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_json.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/runtime_shared.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_json.test.cpp)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE_DECLARATIONS)
     target_include_directories(

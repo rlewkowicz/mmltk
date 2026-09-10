@@ -37,10 +37,9 @@ int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& co
         operation(std::filesystem::path(positionals.front()));
         return 0;
     } catch (const std::exception& error) {
-        const std::string message = std::string(config.error_prefix) + error.what();
         try {
-            mmltk::common::logging::error(config.logger_name, [&message](auto& logger) { logger.error("{}", message); });
-        } catch (...) { std::fprintf(stderr, "%s\n", message.c_str()); }
+            mmltk::common::logging::error(config.logger_name, [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
+        } catch (...) {}
         return 1;
     }
 }

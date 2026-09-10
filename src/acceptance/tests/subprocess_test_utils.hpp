@@ -152,7 +152,24 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
     }
 
     const int status = child.Wait();
-    if (!WIFEXITED(status)) { throw std::runtime_error("subprocess did not exit normally"); }
+    if (!WIFEXITED(status)) {
+        std::string failure = "subprocess command:";
+        for (const auto& argument : args) {
+            failure += " [" + argument + "]";
+        }
+        if (WIFSIGNALED(status)) {
+            failure += "\nterminated by signal " + std::to_string(WTERMSIG(status));
+            if (WCOREDUMP(status)) failure += " (core dumped)";
+        } else if (WIFSTOPPED(status)) {
+            failure += "\nstopped by signal " + std::to_string(WSTOPSIG(status));
+        } else if (WIFCONTINUED(status)) {
+            failure += "\ncontinued without terminal exit";
+        } else {
+            failure += "\nunrecognized wait status";
+        }
+        failure += "\nraw wait status: " + std::to_string(status) + "\nstdout:\n" + stdout_text + "\nstderr:\n" + stderr_text;
+        throw std::runtime_error(std::move(failure));
+    }
 
     return SubprocessResult{
         WEXITSTATUS(status),

@@ -3,6 +3,8 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "subprocess_test_utils.hpp"
+#include "filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 
@@ -24,6 +27,7 @@ struct CachedModelAssets {
     fs::path native_checkpoint_path;
     fs::path onnx_path;
     fs::path tensorrt_path;
+    bool onnx_metadata_validated = false;
 };
 
 inline fs::path cached_model_assets_root() {
@@ -87,15 +91,23 @@ inline std::string md5_of_file(const fs::path& path) {
 
 inline bool validate_onnx_model(const fs::path& onnx_path) {
     if (!is_nonempty_regular_file(onnx_path)) { return false; }
+    const mmltk::testsupport::ScopedTempDir diagnostics("mmltk_onnx_validation");
+    const auto diagnostic_path = diagnostics.path() / "metadata.log";
     const auto result = mmltk::testsupport::run_subprocess_capture_output({
         mmltk::testsupport::mmltk_cli_path(),
+        "--log-level=info",
+        "--log-file=" + diagnostic_path.string(),
         "rfdetr",
         "info",
         "--onnx",
         onnx_path.string(),
     });
-    return result.exit_code == 0 && result.output_text.find("output: pred_logits ") != std::string::npos &&
-           result.output_text.find("output: pred_boxes ") != std::string::npos;
+    if (result.exit_code != 0) return false;
+    std::ifstream stream(diagnostic_path);
+    if (!stream.is_open()) return false;
+    const std::string metadata{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
+    return !stream.bad() && metadata.find("output: pred_logits ") != std::string::npos &&
+           metadata.find("output: pred_boxes ") != std::string::npos;
 }
 
 inline bool validate_tensorrt_engine(const fs::path& tensorrt_path) {
@@ -111,28 +123,25 @@ inline bool validate_tensorrt_engine(const fs::path& tensorrt_path) {
 }
 
 // Regenerates `output_path` atomically: the command produced by `make_command(temp_path)` writes to
-// a sibling `.part` file which is verified (optionally) and then renamed over the output. When
-// `remove_output_before_run` is set, the stale output is deleted before the command runs.
+// a sibling `.part` file which is verified (optionally) and then renamed over the output.
+// The incumbent remains intact until that publication succeeds.
 template <typename MakeCommand, typename VerifyTemp>
 inline void regenerate_file_atomically(const fs::path& output_path, const std::string_view step_name, MakeCommand&& make_command,
-                                       VerifyTemp&& verify_temp, const bool remove_output_before_run = false) {
+                                       VerifyTemp&& verify_temp) {
     fs::create_directories(output_path.parent_path());
     const fs::path temp_path = output_path.string() + ".part";
     remove_if_exists(temp_path);
-    if (remove_output_before_run) { remove_if_exists(output_path); }
 
     run_checked(make_command(temp_path), step_name);
     verify_temp(temp_path);
 
-    remove_if_exists(output_path);
     fs::rename(temp_path, output_path);
 }
 
 template <typename MakeCommand>
-inline void regenerate_file_atomically(const fs::path& output_path, const std::string_view step_name, MakeCommand&& make_command,
-                                       const bool remove_output_before_run = false) {
+inline void regenerate_file_atomically(const fs::path& output_path, const std::string_view step_name, MakeCommand&& make_command) {
     regenerate_file_atomically(
-        output_path, step_name, std::forward<MakeCommand>(make_command), [](const fs::path&) {}, remove_output_before_run);
+        output_path, step_name, std::forward<MakeCommand>(make_command), [](const fs::path&) {});
 }
 
 inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAsset& asset) {
@@ -211,8 +220,7 @@ inline void ensure_built_tensorrt_engine(const fs::path& onnx_path, const fs::pa
                 "--device-id",
                 "0",
             };
-        },
-        true);
+        });
 }
 
 inline CachedModelAssets ensure_cached_model_assets(std::string_view preset_name = "rf-detr-nano") {
@@ -230,6 +238,7 @@ inline CachedModelAssets ensure_cached_model_assets(std::string_view preset_name
     ensure_downloaded_weight(assets.upstream_weights_path, asset);
     ensure_native_checkpoint(assets.upstream_weights_path, assets.native_checkpoint_path);
     ensure_exported_onnx(assets.native_checkpoint_path, assets.onnx_path);
+    assets.onnx_metadata_validated = true;
     ensure_built_tensorrt_engine(assets.onnx_path, assets.tensorrt_path);
     return assets;
 }

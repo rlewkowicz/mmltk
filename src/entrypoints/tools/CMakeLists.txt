@@ -50,7 +50,7 @@ if(BUILD_RFDETR_NATIVE)
 
     function(mmltk_add_entrypoints_tools_tests)
         add_executable(mmltk_entrypoints_tools_tests EXCLUDE_FROM_ALL)
-        mmltk_register_ordinary_sources(
+        mmltk_register_retained_module_importers(
             mmltk_entrypoints_tools_tests
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/onnx_tool_main.test.cpp)
         mmltk_configure_component(
@@ -59,6 +59,7 @@ if(BUILD_RFDETR_NATIVE)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
         target_link_libraries(mmltk_entrypoints_tools_tests PRIVATE
             mmltk_acceptance_support
+            mmltk::common::logging
             mmltk_entrypoints_tools_support)
         catch_discover_tests(mmltk_entrypoints_tools_tests
             TEST_PREFIX "entrypoints::tools::"

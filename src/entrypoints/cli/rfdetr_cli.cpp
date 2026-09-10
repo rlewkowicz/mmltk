@@ -791,9 +791,15 @@ void run_compile(const CompileCliRequest& request) {
     }
 }
 
-[[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path) {
+[[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path, const logging::CliOverrides& logging_options) {
     const auto tool = rfdetr::resolve_sibling_tool_path("mmltk-rfdetr-onnx-info").string();
     std::vector<std::string> arguments{tool, model_path.string()};
+    if (logging_options.level) {
+        const auto level_name = spdlog::level::to_string_view(*logging_options.level);
+        arguments.push_back("--log-level=" + std::string(level_name.data(), level_name.size()));
+    }
+    if (logging_options.log_file) arguments.push_back("--log-file=" + logging_options.log_file->string());
+    if (logging_options.log_dir) arguments.push_back("--log-dir=" + logging_options.log_dir->string());
     auto argv = rfdetr::make_exec_argv(arguments);
     ::execv(argv.front(), argv.data());
     throw std::system_error(errno, std::generic_category(), "failed to exec ONNX info helper");
@@ -904,7 +910,7 @@ class DistributedTrainingProcess final {
 };
 
 int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const std::span<const std::string_view> arguments,
-                     const bool help_requested) {
+                     const bool help_requested, const logging::CliOverrides& logging_options) {
     switch (descriptor.command) {
         case rfdetr::RfdetrCommand::Compile: {
             if (help_requested) {
@@ -927,7 +933,7 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
                     "rfdetr info requires exactly one of --onnx or "
                     "--tensorrt");
             }
-            if (!request.onnx_path.empty()) exec_onnx_info_tool(request.onnx_path);
+            if (!request.onnx_path.empty()) exec_onnx_info_tool(request.onnx_path, logging_options);
             rfdetr::ModelArtifactRequest artifacts;
             artifacts.tensorrt_path = request.tensorrt_path;
             const rfdetr::ModelInfo info = rfdetr::inspect_tensorrt_model(artifacts, request.device_id);
@@ -1040,7 +1046,7 @@ void print_rfdetr_help() {
 
 }  // namespace
 
-int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int, char**) {
+int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int argc, char** argv) {
     if (arguments.empty() || arguments.front() == "--help" || arguments.front() == "-h") {
         print_rfdetr_help();
         return 0;
@@ -1056,7 +1062,7 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int, ch
     const bool help_requested = std::ranges::find(command_arguments, std::string_view{"--help"}) != command_arguments.end() ||
                                 std::ranges::find(command_arguments, std::string_view{"-h"}) != command_arguments.end();
     try {
-        return dispatch_command(*descriptor, command_arguments, help_requested);
+        return dispatch_command(*descriptor, command_arguments, help_requested, logging::scan_cli_overrides(argc, argv));
     } catch (const reflection::ParseError& error) { std::fprintf(stderr, "%s\n", error.what()); } catch (const std::exception& error) {
         if (logging::enabled(spdlog::level::err)) {
             logging::error("rfdetr.cli", [&](auto& current) { current.error("mmltk rfdetr error: {}", error.what()); });

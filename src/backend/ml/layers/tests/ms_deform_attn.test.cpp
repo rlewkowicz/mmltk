@@ -8,7 +8,7 @@
 namespace {
 
 void test_cuda_ms_deform_attn_matches_reference() {
-    if (!torch::cuda::is_available()) { return; }
+    if (!torch::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
 
     const auto device = torch::Device(torch::kCUDA, 0);
     auto value = torch::randn({2, 8, 2, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(device)).requires_grad_(true);

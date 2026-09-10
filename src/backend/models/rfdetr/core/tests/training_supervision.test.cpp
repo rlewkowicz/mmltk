@@ -496,7 +496,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
 }
 
 void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = match_free_config();
     rfdetr::TrainingSupervisionImpl supervision(config);
     supervision.initialize(43);
@@ -554,7 +554,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
     REQUIRE(disabled_handoff.completed_leases == 0);
     REQUIRE(disabled_handoff.outstanding_leases == 0);
 
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = match_free_config();
     rfdetr::TrainingSupervisionImpl supervision(config);
     supervision.initialize(45);
@@ -1527,7 +1527,7 @@ void test_active_empty_loss_anchors_every_selected_mask_operand() {
 }
 
 void test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = denoising_config();
     rfdetr::TrainingSupervisionImpl supervision(config);
     supervision.initialize(111);
@@ -1595,7 +1595,7 @@ void test_feature_initialization_is_reproducible_and_independent_of_dn_toggle() 
 }
 
 void test_sparse_masks_share_erasure_after_geometry_and_donor_composition() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const auto floats = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     const auto integers = floats.dtype(torch::kInt64);
     const std::array<rfdetr::AugmentationSpatialErasure, 4U> erasures{

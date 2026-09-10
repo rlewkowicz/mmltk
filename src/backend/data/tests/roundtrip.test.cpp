@@ -3,10 +3,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <future>
 #include <optional>
-#include <semaphore>
+#include "async_test_utils.hpp"
+#include "filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
-#include <catch2/generators/catch_generators.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,34 +40,6 @@ using namespace mmltk::common::system;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 using namespace mmltk::backend::data::testsupport;
 
-struct TestOptions {
-    std::string test_dir = "/tmp/mmltk_test";
-    bool keep_artifacts = false;
-    int width = 65;
-    int height = 65;
-    int num_images = 20;
-};
-
-void assert_files_equal(const fs::path& lhs_path, const fs::path& rhs_path) {
-    REQUIRE(fs::file_size(lhs_path) == fs::file_size(rhs_path));
-    std::ifstream lhs(lhs_path, std::ios::binary);
-    std::ifstream rhs(rhs_path, std::ios::binary);
-    REQUIRE(lhs.is_open());
-    REQUIRE(rhs.is_open());
-
-    std::vector<char> lhs_buffer(1 << 16);
-    std::vector<char> rhs_buffer(1 << 16);
-    while (lhs && rhs) {
-        lhs.read(lhs_buffer.data(), static_cast<std::streamsize>(lhs_buffer.size()));
-        rhs.read(rhs_buffer.data(), static_cast<std::streamsize>(rhs_buffer.size()));
-        const std::streamsize lhs_read = lhs.gcount();
-        const std::streamsize rhs_read = rhs.gcount();
-        REQUIRE(lhs_read == rhs_read);
-        REQUIRE(std::memcmp(lhs_buffer.data(), rhs_buffer.data(), static_cast<size_t>(lhs_read)) == 0);
-        if (lhs_read == 0) { break; }
-    }
-}
-
 void exercise_compiled_stream(const std::string& path, bool h2d) {
     const auto source = CompiledDataset::open(path);
     const auto stride = static_cast<std::size_t>(source.header().image_stride);
@@ -82,6 +55,12 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     // Model construction precedes the isolated runtime context. The stream
     // must capture the later context and bind it on its completion/I/O workers.
     std::optional<mmltk::frameworks::gpu::DeviceContext> context;
+    // Callback facts and receiver memory outlive stream teardown on assertions.
+    std::vector<std::byte> received(2U * stride);
+    struct Completion {
+        std::atomic<bool> done = false;
+        std::exception_ptr failure;
+    } completion;
     CompiledImageStream stream({.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(h2d)});
     context.emplace(0, mmltk::frameworks::gpu::cuda_image_copy_backend());
     context->Bind();
@@ -98,13 +77,8 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     REQUIRE(std::memcmp(host, source.image_pixels(3U), stride) == 0);
     REQUIRE(std::memcmp(static_cast<const std::byte*>(host) + stride, source.image_pixels(1U), stride) == 0);
     stream.handoff(0U, nullptr);
-    std::vector<std::byte> received(2U * stride);
     ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr),
                    "compiled stream consumer read");
-    struct Completion {
-        std::atomic<bool> done = false;
-        std::exception_ptr failure;
-    } completion;
     const CompiledImageStream::CompletionObserver completed{.context = &completion,
                                                             .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
                                                                 auto& state = *static_cast<Completion*>(raw);
@@ -145,23 +119,28 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     stream.submit(0U, source, invalid, {});
     REQUIRE_THROWS_AS(stream.wait_read(0U), std::out_of_range);
     stream.synchronize();
-    struct ReadGate {
-        std::binary_semaphore entered{0};
-        std::binary_semaphore proceed{0};
-    } gate;
-    stream.submit(0U, source, reads, {.context = &gate, .before = [](void* raw, std::size_t) {
-                                          auto& state = *static_cast<ReadGate*>(raw);
-                                          state.entered.release();
-                                          state.proceed.acquire();
-                                          return true;
-                                      }});
-    gate.entered.acquire();
-    // A checked-out physical read job cannot be replaced while its worker owns it.
-    CHECK_THROWS_AS(stream.submit(0U, source, reads, {}), std::logic_error);
-    stream.cancel_read(0U);
-    gate.proceed.release();
-    REQUIRE_FALSE(stream.wait_read(0U));
-    stream.synchronize();
+    {
+        mmltk::testsupport::TestGate gate("compiled stream physical read");
+        auto receipt = gate.receipt();
+        std::future<bool> read_result;
+        const mmltk::testsupport::ScopedTestCleanup release_read([&] {
+            stream.cancel_read(0U);
+            gate.Release();
+            stream.wait_reads();
+        });
+        stream.submit(0U, source, reads, {.context = &receipt, .before = [](void* raw, std::size_t) {
+                                              static_cast<mmltk::testsupport::TestGate::Receipt*>(raw)->ArriveAndWait();
+                                              return true;
+                                          }});
+        read_result = std::async(std::launch::async, [&] { return stream.wait_read(0U); });
+        REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
+        // A checked-out physical read job cannot be replaced while its worker owns it.
+        CHECK_THROWS_AS(stream.submit(0U, source, reads, {}), std::logic_error);
+        stream.cancel_read(0U);
+        gate.Release();
+        REQUIRE_FALSE(mmltk::testsupport::await_test_future(read_result, "cancelled compiled read settlement"));
+        stream.synchronize();
+    }
     // The cancelled worker has begun its mapped write but never published an
     // input lease. Retained-cache work still needs the lane's completion event.
     if (!h2d) REQUIRE(stream.device_storage(0U).data() == nullptr);
@@ -188,77 +167,17 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     REQUIRE_FALSE(stream.owns_resources());
 }
 
-void test_roundtrip_end_to_end() {
-    profile_set_run_label("test_roundtrip");
-    const TestOptions opts;
-    const FixtureSpec fixture{
-        opts.test_dir, "train", opts.width, opts.height, opts.num_images,
-    };
-    const std::string test_dir = fixture.root_dir;
+void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cudaStream_t compute_stream) {
+    const std::string bin_path = compiled_bin_path(fixture);
     const std::string dataset_dir_path = dataset_dir(fixture);
-    const std::string compiled_dir_path = compiled_dir(fixture);
-    const std::string split = fixture.split;
+    const std::string& split = fixture.split;
     const int W = fixture.width;
     const int H = fixture.height;
     const int NUM_IMAGES = fixture.num_images;
     const size_t IMAGE_STRIDE = static_cast<size_t>(3) * H * W * sizeof(float);
     const size_t STRIDE_FLOATS = IMAGE_STRIDE / sizeof(float);
-    cudaStream_t compute_stream = nullptr;
-
-    ensure_cuda_ok(cudaSetDevice(0), "cudaSetDevice");
-    ensure_cuda_ok(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
-
-    create_synthetic_dataset(fixture);
-
-    printf("=== Test dataset: %d images at %dx%d ===\n", NUM_IMAGES, W, H);
-
-    CompilerConfig ccfg;
-    ccfg.source_dir = dataset_dir_path;
-    ccfg.output_dir = compiled_dir_path;
-    ccfg.split = split;
-    ccfg.target_width = W;
-    ccfg.target_height = H;
-    ccfg.num_workers = 2;
-    const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
-    DatasetCompiler::compile(compile_plan, 0U);
-    printf("=== Compiled ===\n");
-
-    CompilerConfig resized_cpu_cfg = ccfg;
-    resized_cpu_cfg.output_dir = test_dir + "/compiled_resized_cpu";
-    resized_cpu_cfg.target_width = std::max(32, W - 13);
-    resized_cpu_cfg.target_height = std::max(32, H - 9);
-    std::vector<CompileProgress> resized_progress;
-    resized_progress.reserve(32U);
-    const DatasetCompilePlan resized_plan = DatasetCompiler::prepare(resized_cpu_cfg, {resized_cpu_cfg.split});
-    CompileTelemetry resized_telemetry{
-        resized_plan.splits[0].image_count,
-        {.context = &resized_progress, .report = [](void* context, const CompileProgress& progress) noexcept {
-             static_cast<std::vector<CompileProgress>*>(context)->push_back(progress);
-         }}};
-    DatasetCompiler::compile(resized_plan, 0U, &resized_telemetry);
-    const size_t resized_total_steps = resized_plan.total_steps();
-    REQUIRE(!resized_progress.empty());
-    REQUIRE(std::is_sorted(resized_progress.begin(), resized_progress.end(),
-                           [](const CompileProgress& lhs, const CompileProgress& rhs) { return lhs.done < rhs.done; }));
-    REQUIRE(std::all_of(resized_progress.begin(), resized_progress.end(), [&](const CompileProgress& progress) {
-        return progress.done <= resized_total_steps && progress.total == resized_total_steps;
-    }));
-    REQUIRE(resized_progress.back().done == resized_total_steps);
-    REQUIRE(resized_progress.back().phase == DatasetCompilePhase::Publishing);
-    REQUIRE(resized_progress.back().active_workers == 0U);
-
-    const std::string bin_path = compiled_bin_path(fixture);
-    const bool bin_exists = fs::exists(bin_path);
-    REQUIRE(bin_exists);
-    printf("Compiled file: %zu bytes\n", static_cast<size_t>(fs::file_size(bin_path)));
-    const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
-    try {
-        exercise_compiled_stream(bin_path, h2d);
-    } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable& error) {
-        if (h2d) throw;
-        SKIP("GDR hardware unavailable; compiled-stream GDR coverage remains unverified: " << error.what());
-    }
+    exercise_compiled_stream(bin_path, h2d);
     ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after isolated stream coverage");
     {
         DatasetLoader::Config direct_cfg;
@@ -530,10 +449,53 @@ void test_roundtrip_end_to_end() {
     while (same_seed_a.next_batch(batch))
         same_seed_a.release_batch(batch);
     same_seed_a.synchronize();
+}
 
-    ensure_cuda_ok(cudaStreamDestroy(compute_stream), "cudaStreamDestroy");
+void test_roundtrip_end_to_end() {
+    profile_set_run_label("test_roundtrip");
+    const mmltk::testsupport::ScopedTempDir root("mmltk_roundtrip");
+    const FixtureSpec fixture{root.path().string(), "train", 65, 65, 20};
+    const std::string dataset_dir_path = dataset_dir(fixture);
+    const std::string compiled_dir_path = compiled_dir(fixture);
+    const std::string split = fixture.split;
+    const int W = fixture.width;
+    const int H = fixture.height;
+    const int NUM_IMAGES = fixture.num_images;
+    ensure_cuda_ok(cudaSetDevice(0), "cudaSetDevice");
+    const mmltk::frameworks::gpu::DeviceContext context(0, mmltk::frameworks::gpu::cuda_image_copy_backend(),
+                                                       mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
+    mmltk::frameworks::gpu::ImageStream owned_stream(context);
+    const auto compute_stream = reinterpret_cast<cudaStream_t>(owned_stream.native_handle());
 
-    if (!opts.keep_artifacts) { fs::remove_all(test_dir); }
+    create_synthetic_dataset(fixture);
+
+    printf("=== Test dataset: %d images at %dx%d ===\n", NUM_IMAGES, W, H);
+
+    CompilerConfig ccfg;
+    ccfg.source_dir = dataset_dir_path;
+    ccfg.output_dir = compiled_dir_path;
+    ccfg.split = split;
+    ccfg.target_width = W;
+    ccfg.target_height = H;
+    ccfg.num_workers = 2;
+    const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
+    DatasetCompiler::compile(compile_plan, 0U);
+    printf("=== Compiled ===\n");
+
+    // Resized compilation, canonical progress, letterboxing, and tiny masks
+    // are covered by compile_progress; all transport runs share this artifact.
+    const std::string bin_path = compiled_bin_path(fixture);
+    const bool bin_exists = fs::exists(bin_path);
+    REQUIRE(bin_exists);
+    printf("Compiled file: %zu bytes\n", static_cast<size_t>(fs::file_size(bin_path)));
+    // Run every H2D assertion before probing the optional GDR transport.
+    for (const bool h2d : {true, false}) {
+        try { exercise_roundtrip_transport(fixture, h2d, compute_stream); }
+        catch (const mmltk::frameworks::gpu::GdrTransportUnavailable& error) {
+            if (h2d) throw;
+            SKIP("GDR hardware unavailable after complete H2D coverage: " << error.what());
+        }
+    }
     printf("=== ALL TESTS PASSED ===\n");
 }
 

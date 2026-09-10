@@ -423,7 +423,7 @@ void test_sparse_mask_loss_matches_dense_reference() {
 }
 
 void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
 
     auto targets = make_targets();
     targets.packed_masks = pack_dense_masks(torch_api::ones({1, 1, 1}, torch_api::TensorOptions().dtype(torch_api::kFloat32)));
@@ -447,7 +447,7 @@ void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
 }
 
 void test_packed_mask_sampling_matches_grid_sample_nearest_boundaries() {
-    if (!torch_api::cuda::is_available()) { return; }
+    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
 
     auto dense_masks = torch_api::tensor({{{0.0f, 1.0f, 0.0f, 1.0f}}}, torch_api::TensorOptions().dtype(torch_api::kFloat32));
     const auto packed = pack_dense_masks(dense_masks);
@@ -550,12 +550,15 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
     const bool selected_h2d = GENERATE(true, false);
     const int group = GENERATE(1, 2);
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0)
+    const auto device_status = cudaGetDeviceCount(&devices);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver || (device_status == cudaSuccess && devices == 0))
         SKIP("CUDA unavailable; criterion transport parity remains unverified");
+    REQUIRE(device_status == cudaSuccess);
     c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(0));
     if (!selected_h2d) {
         int mmap = 0;
         const auto status = cuDeviceGetAttribute(&mmap, static_cast<CUdevice_attribute>(152), 0);
+        REQUIRE((status == CUDA_SUCCESS || status == CUDA_ERROR_INVALID_VALUE));
         if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
             SKIP("GDR unavailable; criterion GDR loss and gradient parity remain unverified");
     }

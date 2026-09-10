@@ -1,19 +1,28 @@
 #include <algorithm>
 #include <array>
-#include <sstream>
+#include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <latch>
+#include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "async_test_utils.hpp"
+#include "filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
@@ -32,8 +41,7 @@ namespace {
 
 std::atomic<std::uint64_t> g_compile_elapsed_seconds{0U};
 std::atomic<std::size_t> g_overlap_clock_calls{0U};
-std::latch* g_overlap_reset_entered = nullptr;
-std::latch* g_overlap_reset_release = nullptr;
+std::atomic<std::shared_ptr<const mmltk::testsupport::TestGate::Receipt>> g_overlap_reset;
 
 CompileTelemetry::Clock::time_point compile_test_now() noexcept {
     return CompileTelemetry::Clock::time_point{std::chrono::seconds{g_compile_elapsed_seconds.load(std::memory_order_relaxed)}};
@@ -42,19 +50,9 @@ CompileTelemetry::Clock::time_point compile_test_now() noexcept {
 CompileTelemetry::Clock::time_point overlap_compile_test_now() noexcept {
     const std::uint64_t captured_seconds = g_compile_elapsed_seconds.load(std::memory_order_relaxed);
     if (g_overlap_clock_calls.fetch_add(1U, std::memory_order_relaxed) == 1U) {
-        g_overlap_reset_entered->count_down();
-        g_overlap_reset_release->wait();
+        if (const auto receipt = g_overlap_reset.load()) receipt->ArriveAndWait();
     }
     return CompileTelemetry::Clock::time_point{std::chrono::seconds{captured_seconds}};
-}
-
-std::string make_unique_root_dir(const std::string& prefix) {
-    std::string pattern = (fs::temp_directory_path() / (prefix + "_XXXXXX")).string();
-    std::vector<char> buffer(pattern.begin(), pattern.end());
-    buffer.push_back('\0');
-    char* created = ::mkdtemp(buffer.data());
-    if (created == nullptr) { throw std::runtime_error("mkdtemp failed to create a temporary directory"); }
-    return {created};
 }
 
 void expect_compile_failure(const FixtureSpec& fixture, const std::function<void(const fs::path&)>& mutate,
@@ -122,8 +120,9 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
 }
 
 void test_vanished_masks_are_omitted() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_drop_vanished_mask");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_drop_vanished_mask"), "train", 16, 16, 20,
+        root.path().string(), "train", 16, 16, 20,
     };
     create_synthetic_dataset(fixture);
     overwrite_annotation(
@@ -137,8 +136,9 @@ void test_vanished_masks_are_omitted() {
 }
 
 void test_partial_mask_vanish_keeps_instance() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_keep_partial_mask");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_keep_partial_mask"), "train", 16, 16, 20,
+        root.path().string(), "train", 16, 16, 20,
     };
     create_synthetic_dataset(fixture);
     overwrite_annotation(
@@ -159,8 +159,9 @@ void test_partial_mask_vanish_keeps_instance() {
 }
 
 void test_native_compile_letterboxes_pixels_boxes_and_masks() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_letterbox");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_letterbox"), "train", 16, 8, 11,
+        root.path().string(), "train", 16, 8, 11,
     };
     create_synthetic_dataset(fixture);
     overwrite_annotation(
@@ -209,11 +210,11 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     constexpr MaskDifference row_offset = 8;
     REQUIRE(std::ranges::all_of(dense_mask.begin(), dense_mask.begin() + 3 * row_offset, [](const uint8_t value) { return value == 0U; }));
     REQUIRE(std::ranges::all_of(dense_mask.begin() + 5 * row_offset, dense_mask.end(), [](const uint8_t value) { return value == 0U; }));
-    fs::remove_all(fixture.root_dir);
 }
 
 void test_compiled_tiny_masks_keep_outer_pixel_edges() {
-    const FixtureSpec fixture{make_unique_root_dir("mmltk_compile_tiny_masks"), "train", 8, 4, 11};
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_tiny_masks");
+    const FixtureSpec fixture{root.path().string(), "train", 8, 4, 11};
     create_synthetic_dataset(fixture);
     const std::array source_runs{RLEPair{0, 1},  RLEPair{7, 1},  RLEPair{24, 1}, RLEPair{31, 1},
                                  RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}};
@@ -239,13 +240,14 @@ void test_compiled_tiny_masks_keep_outer_pixel_edges() {
         CHECK(compiled.start == source.start + 16);
         CHECK(compiled.length == source.length);
     }
-    fs::remove_all(fixture.root_dir);
 }
 
 void test_invalid_annotations_fail_loud() {
+    const mmltk::testsupport::ScopedTempDir invalid_json("mmltk_compile_invalid_json");
+    const mmltk::testsupport::ScopedTempDir unknown_class("mmltk_compile_unknown_class");
     expect_compile_failure(
         FixtureSpec{
-            make_unique_root_dir("mmltk_compile_invalid_json"),
+            invalid_json.path().string(),
             "train",
             65,
             65,
@@ -260,7 +262,7 @@ void test_invalid_annotations_fail_loud() {
 
     expect_compile_failure(
         FixtureSpec{
-            make_unique_root_dir("mmltk_compile_unknown_class"),
+            unknown_class.path().string(),
             "train",
             65,
             65,
@@ -290,8 +292,9 @@ void test_checked_progress_estimates() {
 }  // namespace
 
 void test_compile_progress_reports_monotonic_updates() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_progress");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_progress"), "train", 257, 193, 96,
+        root.path().string(), "train", 257, 193, 96,
     };
     create_synthetic_dataset(fixture);
 
@@ -304,122 +307,73 @@ void test_compile_progress_reports_monotonic_updates() {
     config.num_workers = 4;
 
     const std::thread::id main_thread_id = std::this_thread::get_id();
-    std::vector<size_t> observed_done;
-    std::vector<size_t> observed_totals;
-    std::vector<DatasetCompilePhase> observed_phases;
-    std::vector<size_t> observed_active;
-    std::vector<size_t> observed_label_done;
-    std::vector<size_t> observed_pixel_done;
-    std::vector<std::uint64_t> observed_dropped_instances;
-    std::vector<std::uint64_t> observed_elapsed;
-    std::vector<std::uint64_t> observed_remaining;
-    std::vector<std::uint64_t> observed_throughput;
-    std::vector<std::thread::id> callback_threads;
-    std::atomic<bool> callback_active{false};
-    std::atomic<bool> callback_overlap{false};
-    observed_done.reserve(32U);
-    observed_totals.reserve(32U);
-    observed_phases.reserve(32U);
-    observed_active.reserve(32U);
-    observed_label_done.reserve(32U);
-    observed_pixel_done.reserve(32U);
-    observed_dropped_instances.reserve(32U);
-    observed_elapsed.reserve(32U);
-    observed_remaining.reserve(32U);
-    observed_throughput.reserve(32U);
-    callback_threads.reserve(32U);
+    struct ProgressRecorder final {
+        struct Entry { CompileProgress progress; std::thread::id thread; };
+        std::array<Entry, 1024U> entries{};
+        std::size_t size = 0U;
+        std::mutex mutex;
+        std::atomic<unsigned> active{0U};
+        std::atomic<bool> overlap{false};
+        bool overflow = false;
+        void Record(const CompileProgress& progress) noexcept {
+            if (active.fetch_add(1U, std::memory_order_acq_rel) != 0U) overlap.store(true, std::memory_order_relaxed);
+            {
+                std::scoped_lock lock(mutex);
+                if (size == entries.size()) overflow = true;
+                else entries[size++] = {progress, std::this_thread::get_id()};
+                g_compile_elapsed_seconds.fetch_add(1U, std::memory_order_relaxed);
+            }
+            active.fetch_sub(1U, std::memory_order_release);
+        }
+    } state;
     const DatasetCompilePlan plan = DatasetCompiler::prepare(config, {config.split});
     const size_t expected_images = static_cast<size_t>(fixture.num_images);
     const size_t expected_total = expected_images * 2 + 1;
     REQUIRE(plan.splits.size() == 1U);
     REQUIRE(plan.splits.front().image_count == static_cast<uint32_t>(fixture.num_images));
     REQUIRE(plan.total_steps() == expected_total);
-    struct ProgressState final {
-        std::vector<size_t>* done;
-        std::vector<size_t>* totals;
-        std::vector<DatasetCompilePhase>* phases;
-        std::vector<size_t>* active;
-        std::vector<size_t>* label_done;
-        std::vector<size_t>* pixel_done;
-        std::vector<std::uint64_t>* dropped;
-        std::vector<std::uint64_t>* elapsed;
-        std::vector<std::uint64_t>* remaining;
-        std::vector<std::uint64_t>* throughput;
-        std::vector<std::thread::id>* threads;
-        std::atomic<bool>* callback_active;
-        std::atomic<bool>* callback_overlap;
-    } state{&observed_done,
-            &observed_totals,
-            &observed_phases,
-            &observed_active,
-            &observed_label_done,
-            &observed_pixel_done,
-            &observed_dropped_instances,
-            &observed_elapsed,
-            &observed_remaining,
-            &observed_throughput,
-            &callback_threads,
-            &callback_active,
-            &callback_overlap};
     g_compile_elapsed_seconds.store(0U, std::memory_order_relaxed);
     CompileTelemetry telemetry{plan.splits[0].image_count,
-                               {.context = &state,
-                                .report =
-                                    [](void* context, const CompileProgress& progress) noexcept {
-                                        auto& progress_state = *static_cast<ProgressState*>(context);
-                                        if (progress_state.callback_active->exchange(true, std::memory_order_acq_rel)) {
-                                            progress_state.callback_overlap->store(true, std::memory_order_relaxed);
-                                        }
-                                        progress_state.done->push_back(progress.done);
-                                        progress_state.totals->push_back(progress.total);
-                                        progress_state.phases->push_back(progress.phase);
-                                        progress_state.active->push_back(progress.active_workers);
-                                        progress_state.label_done->push_back(progress.label_done);
-                                        progress_state.pixel_done->push_back(progress.pixel_done);
-                                        progress_state.dropped->push_back(progress.dropped_instances);
-                                        progress_state.elapsed->push_back(progress.elapsed_seconds);
-                                        progress_state.remaining->push_back(progress.remaining_seconds);
-                                        progress_state.throughput->push_back(progress.throughput_per_second);
-                                        progress_state.threads->push_back(std::this_thread::get_id());
-                                        g_compile_elapsed_seconds.fetch_add(1U, std::memory_order_relaxed);
-                                        progress_state.callback_active->store(false, std::memory_order_release);
-                                    }},
-                               &compile_test_now};
+                               {.context = &state, .report = [](void* context, const CompileProgress& progress) noexcept {
+                                    static_cast<ProgressRecorder*>(context)->Record(progress);
+                                }}, &compile_test_now};
     DatasetCompiler::compile(plan, 0U, &telemetry);
 
-    REQUIRE(!observed_done.empty());
-    for (size_t index = 1; index < observed_done.size(); ++index) {
-        REQUIRE(observed_done[index] >= observed_done[index - 1]);
-    }
-    REQUIRE(std::all_of(observed_totals.begin(), observed_totals.end(), [&](size_t total) { return total == expected_total; }));
-    REQUIRE(std::all_of(observed_done.begin(), observed_done.end(), [&](size_t done) { return done <= expected_total; }));
-    REQUIRE(observed_done.back() == expected_total);
-    REQUIRE(observed_phases.back() == DatasetCompilePhase::Publishing);
+    REQUIRE_FALSE(state.overflow);
+    REQUIRE_FALSE(state.overlap.load(std::memory_order_relaxed));
+    REQUIRE(state.size != 0U);
+    const std::span observed{state.entries.data(), state.size};
     std::vector<DatasetCompilePhase> semantic_transitions;
-    for (const DatasetCompilePhase phase : observed_phases) {
-        if (semantic_transitions.empty() || semantic_transitions.back() != phase) { semantic_transitions.push_back(phase); }
+    bool main_thread_observed = false;
+    for (std::size_t index = 0; index < observed.size(); ++index) {
+        const auto& progress = observed[index].progress;
+        CHECK(progress.total == expected_total);
+        CHECK(progress.done <= expected_total);
+        main_thread_observed |= observed[index].thread == main_thread_id;
+        if (semantic_transitions.empty() || semantic_transitions.back() != progress.phase) semantic_transitions.push_back(progress.phase);
+        if (index != 0U) {
+            const auto& previous = observed[index - 1U].progress;
+            CHECK(progress.done >= previous.done);
+            CHECK(progress.label_done >= previous.label_done);
+            CHECK(progress.pixel_done >= previous.pixel_done);
+            CHECK(progress.elapsed_seconds >= previous.elapsed_seconds);
+        }
+        const auto estimate = estimate_progress(progress.done, progress.total, progress.elapsed_seconds);
+        CHECK(progress.remaining_seconds == estimate.remaining_seconds);
+        CHECK(progress.throughput_per_second == estimate.throughput_per_second);
     }
     REQUIRE(semantic_transitions == std::vector{DatasetCompilePhase::Planning, DatasetCompilePhase::Labels, DatasetCompilePhase::Pixels,
                                                 DatasetCompilePhase::Syncing, DatasetCompilePhase::Publishing});
-    REQUIRE(observed_label_done.back() == expected_images);
-    REQUIRE(observed_pixel_done.back() == expected_images);
-    REQUIRE(observed_active.back() == 0U);
-    REQUIRE(observed_dropped_instances.back() == 0U);
-    for (size_t index = 1; index < observed_done.size(); ++index) {
-        REQUIRE(observed_label_done[index] >= observed_label_done[index - 1]);
-        REQUIRE(observed_pixel_done[index] >= observed_pixel_done[index - 1]);
-        REQUIRE(observed_elapsed[index] >= observed_elapsed[index - 1]);
-    }
-    REQUIRE(observed_elapsed.front() == 0U);
-    for (size_t index = 0; index < observed_done.size(); ++index) {
-        const auto estimate = estimate_progress(observed_done[index], observed_totals[index], observed_elapsed[index]);
-        CHECK(observed_remaining[index] == estimate.remaining_seconds);
-        CHECK(observed_throughput[index] == estimate.throughput_per_second);
-    }
-    CHECK(observed_remaining.back() == 0U);
-    REQUIRE(!callback_threads.empty());
-    REQUIRE_FALSE(callback_overlap.load(std::memory_order_relaxed));
-    REQUIRE(std::ranges::contains(callback_threads, main_thread_id));
+    const auto& completed = observed.back().progress;
+    CHECK(completed.done == expected_total);
+    CHECK(completed.phase == DatasetCompilePhase::Publishing);
+    CHECK(completed.label_done == expected_images);
+    CHECK(completed.pixel_done == expected_images);
+    CHECK(completed.active_workers == 0U);
+    CHECK(completed.dropped_instances == 0U);
+    CHECK(completed.remaining_seconds == 0U);
+    CHECK(observed.front().progress.elapsed_seconds == 0U);
+    CHECK(main_thread_observed);
 
     test_vanished_masks_are_omitted();
     test_partial_mask_vanish_keeps_instance();
@@ -429,8 +383,9 @@ void test_compile_progress_reports_monotonic_updates() {
 }
 
 void test_snapshot_overlaps_compile_reset() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_progress_reset_overlap");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_progress_reset_overlap"), "train", 16, 16, 1,
+        root.path().string(), "train", 16, 16, 1,
     };
     create_synthetic_dataset(fixture);
     CompilerConfig config;
@@ -444,27 +399,28 @@ void test_snapshot_overlaps_compile_reset() {
 
     g_compile_elapsed_seconds.store(5U, std::memory_order_relaxed);
     g_overlap_clock_calls.store(0U, std::memory_order_relaxed);
-    std::latch reset_entered{1};
-    std::latch reset_release{1};
-    g_overlap_reset_entered = &reset_entered;
-    g_overlap_reset_release = &reset_release;
+    mmltk::testsupport::TestGate reset("compile reset clock sample");
+    g_overlap_reset.store(std::make_shared<const mmltk::testsupport::TestGate::Receipt>(reset.receipt()));
     CompileTelemetry telemetry{plan.splits.front().image_count, {}, &overlap_compile_test_now};
-
     g_compile_elapsed_seconds.store(20U, std::memory_order_relaxed);
-    std::exception_ptr compile_failure;
-    std::thread compile_thread{[&] {
-        try {
-            DatasetCompiler::compile(plan, 0U, &telemetry);
-        } catch (...) { compile_failure = std::current_exception(); }
-    }};
-    reset_entered.wait();
+    struct CancellationTag;
+    using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
+    auto [stop, token] = CancellationSource::Mint();
+    std::future<void> compiler;
+    const mmltk::testsupport::ScopedTestCleanup cleanup([&] {
+        static_cast<void>(stop.RequestCancel());
+        reset.Release();
+        if (compiler.valid()) compiler.wait();
+        g_overlap_reset.store(nullptr);
+    });
+    compiler = std::async(std::launch::async, [&] {
+        DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token));
+    });
+    REQUIRE(reset.WaitEntered(std::chrono::seconds{2}));
     g_compile_elapsed_seconds.store(30U, std::memory_order_relaxed);
     const CompileProgress overlapping = telemetry.snapshot();
-    reset_release.count_down();
-    compile_thread.join();
-    g_overlap_reset_entered = nullptr;
-    g_overlap_reset_release = nullptr;
-    if (compile_failure) { std::rethrow_exception(compile_failure); }
+    reset.Release();
+    mmltk::testsupport::await_test_future(compiler, "compile reset settlement", std::chrono::seconds{30});
 
     CHECK(overlapping.elapsed_seconds == 25U);
     const ProgressEstimate overlapping_estimate = estimate_progress(overlapping.done, overlapping.total, overlapping.elapsed_seconds);
@@ -477,8 +433,9 @@ void test_snapshot_overlaps_compile_reset() {
 }
 
 void test_compile_observes_event_cancellation_without_progress() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_event_cancellation");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_event_cancellation"), "train", 32, 32, 4,
+        root.path().string(), "train", 32, 32, 4,
     };
     struct CancellationTag;
     using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
@@ -490,8 +447,9 @@ void test_compile_observes_event_cancellation_without_progress() {
 }
 
 void test_compile_reobserves_cancellation_after_publishing_event() {
+    const mmltk::testsupport::ScopedTempDir root("mmltk_compile_publish_cancellation");
     const FixtureSpec fixture{
-        make_unique_root_dir("mmltk_compile_publish_cancellation"), "train", 32, 32, 4,
+        root.path().string(), "train", 32, 32, 4,
     };
     struct CancellationTag;
     using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;

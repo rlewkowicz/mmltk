@@ -1,6 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <stdexcept>
+#include <memory>
+#include <type_traits>
+#include <utility>
+#include "src/backend/ml/runtime/analysis_provider.h"
 
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
@@ -10,6 +14,9 @@ import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 
 namespace rfdetr = mmltk::backend::models::rfdetr;
+
+static_assert(std::is_same_v<decltype(rfdetr::MakeRfdetrAnalysisProvider(std::declval<const rfdetr::RfdetrAnalysisOptions&>())),
+                             std::shared_ptr<mmltk::backend::ml::runtime::AnalysisProvider>>);
 
 TEST_CASE("inference owns ONNX and TensorRT artifact selection", "[model][rfdetr][artifact_resolution]") {
     rfdetr::ModelArtifactRequest onnx;

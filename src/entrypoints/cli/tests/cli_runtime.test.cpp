@@ -24,6 +24,7 @@
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "subprocess_test_utils.hpp"
+#include "filesystem_test_utils.hpp"
 
 namespace {
 
@@ -536,6 +537,50 @@ void test_subprocess_capture_keeps_stdout_and_stderr_separate() {
     MMLTK_ASSERT(result.output_text.find("stderr-line\n") != std::string::npos);
 }
 
+void test_rfdetr_info_forwards_explicit_logging_options() {
+    const ScopedTempDir root("mmltk_rfdetr_info_logging");
+    const auto missing = root.path() / "missing.onnx";
+    const auto file = root.path() / "explicit.log";
+    const auto directory = root.path() / "directory";
+    struct LoggingCase {
+        std::vector<std::string> environment;
+        std::vector<std::string> options;
+        fs::path sink;
+        bool enabled = false;
+    };
+    const std::vector<LoggingCase> cases{
+        {{}, {}, {}, false},
+        {{}, {"--log-level=off", "--log-file=" + file.string()}, file, false},
+        {{"MMLTK_LOG_LEVEL=debug"}, {"--log-level", "off", "--log-file", file.string()}, file, false},
+        {{"MMLTK_LOG_LEVEL=off"}, {"--log-level", "info", "--log-file", file.string()}, file, true},
+        {{}, {"--log-file=" + file.string()}, file, true},
+        {{}, {"--log-level=off", "--log-level=info", "--log-dir=" + directory.string()}, directory / "mmltk-rfdetr-onnx-info.log", true},
+        {{"MMLTK_LOG_LEVEL=off"}, {"--log-level=info", "--log-level=", "--log-file=" + file.string()}, file, false},
+    };
+    for (const auto& entry : cases) {
+        fs::remove(file);
+        fs::remove_all(directory);
+        std::vector<std::string> command{"env", "-u", "MMLTK_LOG_LEVEL", "-u", "MMLTK_LOG_FILE", "-u", "MMLTK_LOG_DIR"};
+        command.insert(command.end(), entry.environment.begin(), entry.environment.end());
+        command.push_back(mmltk_cli_path());
+        command.insert(command.end(), entry.options.begin(), entry.options.end());
+        command.insert(command.end(), {"rfdetr", "info", "--onnx", missing.string()});
+        const auto result = run_subprocess_capture_output(command);
+        INFO("exit status=" << result.exit_code << "\n" << result.output_text);
+        CHECK(result.exit_code == 1);
+        CHECK(result.stdout_text.empty());
+        if (!entry.enabled) {
+            CHECK(result.stderr_text.empty());
+            if (!entry.sink.empty()) CHECK_FALSE(fs::exists(entry.sink));
+        } else {
+            REQUIRE(fs::exists(entry.sink));
+            const auto lines = read_text_lines(entry.sink);
+            assert_contains_substring(lines, "mmltk rfdetr onnx info error:");
+            assert_contains_substring(lines, "missing.onnx");
+        }
+    }
+}
+
 void test_log_file_flag_creates_requested_log_file() {
     const fs::path temp_dir = make_temp_dir("mmltk-log-file-flag");
     const fs::path log_path = temp_dir / "explicit.log";
@@ -862,3 +907,5 @@ TEST_CASE("negative reflected flags preserve canonical defaults and round trip p
     REQUIRE(parsed);
     CHECK(parsed->request.enabled);
 }
+
+MMLTK_REGISTER_TEST_CASE("[core][cli][logging][rfdetr]", test_rfdetr_info_forwards_explicit_logging_options);
