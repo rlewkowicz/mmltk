@@ -824,7 +824,7 @@ TEST_CASE("protocol-14 fingerprint is deterministic and covers stable compositio
     for (const bool reassign : {false, true}) {
         application_schema_detail::FingerprintSink expected_enum;
         expected_enum.append("type");
-        expected_enum.append("enum");
+        expected_enum.append("enum");  // CLEANUP-IGNORE: This altered-enum oracle independently verifies the production fingerprint.
         using Underlying = std::underlying_type_t<RendererObservationKind>;
         expected_enum.append_number(sizeof(Underlying));
         expected_enum.append_number(std::is_signed_v<Underlying>);

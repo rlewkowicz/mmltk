@@ -57,6 +57,23 @@ fn protocol_payload(values: impl IntoIterator<Item = (&'static str, Value)>) -> 
     Value::Object(fields)
 }
 
+#[cfg(test)]
+fn bootstrap_payload(input_epoch: u64, schema_fingerprint: [u64; 2], snapshots: Vec<Value>) -> Value {
+    protocol_payload([
+        ("input_epoch", Value::Unsigned(input_epoch)),
+        (
+            "schema_fingerprint",
+            Value::Array(
+                schema_fingerprint
+                    .into_iter()
+                    .map(Value::Unsigned)
+                    .collect(),
+            ),
+        ),
+        ("snapshots", Value::Array(snapshots)),
+    ])
+}
+
 fn encode_fields(fields: &[IntentField]) -> Result<Value, ProtocolError> {
     if fields.len() > MAX_INTENT_FIELDS
         || fields.iter().any(|field| field.field_id == 0)
@@ -399,28 +416,17 @@ mod tests {
             value: 1.0,
         }];
         let value = snapshot.clone().into_application_value();
-        let bootstrap = protocol_payload([
-            ("input_epoch", Value::Unsigned(1)),
-            (
-                "schema_fingerprint",
-                Value::Array(
-                    crate::generated::SCHEMA_FINGERPRINT
-                        .into_iter()
-                        .map(Value::Unsigned)
-                        .collect(),
+        let bootstrap = bootstrap_payload(
+            1,
+            crate::generated::SCHEMA_FINGERPRINT,
+            vec![object([
+                (
+                    "system_id",
+                    Value::Unsigned(crate::generated::SYSTEM_Explore),
                 ),
-            ),
-            (
-                "snapshots",
-                Value::Array(vec![object([
-                    (
-                        "system_id",
-                        Value::Unsigned(crate::generated::SYSTEM_Explore),
-                    ),
-                    ("value", value.clone()),
-                ])]),
-            ),
-        ]);
+                ("value", value.clone()),
+            ])],
+        );
         assert!(matches!(
             decode_server(&encode_envelope("Bootstrap", &bootstrap).unwrap()),
             Ok(ServerRecord::Bootstrap(_))
@@ -485,19 +491,7 @@ mod tests {
     fn bootstrap_rejects_mismatched_or_invalid_fingerprints() {
         let valid = encode_envelope(
             "Bootstrap",
-            &protocol_payload([
-                ("input_epoch", Value::Unsigned(1)),
-                (
-                    "schema_fingerprint",
-                    Value::Array(
-                        crate::generated::SCHEMA_FINGERPRINT
-                            .into_iter()
-                            .map(Value::Unsigned)
-                            .collect(),
-                    ),
-                ),
-                ("snapshots", Value::Array(Vec::new())),
-            ]),
+            &bootstrap_payload(1, crate::generated::SCHEMA_FINGERPRINT, Vec::new()),
         )
         .expect("valid Bootstrap");
         assert!(matches!(
@@ -506,14 +500,7 @@ mod tests {
         ));
         let mismatched = encode_envelope(
             "Bootstrap",
-            &protocol_payload([
-                ("input_epoch", Value::Unsigned(1)),
-                (
-                    "schema_fingerprint",
-                    Value::Array(vec![Value::Unsigned(1), Value::Unsigned(2)]),
-                ),
-                ("snapshots", Value::Array(Vec::new())),
-            ]),
+            &bootstrap_payload(1, [1, 2], Vec::new()),
         )
         .expect("mismatched Bootstrap");
         assert!(decode_server(&mismatched).is_err());
@@ -548,23 +535,17 @@ mod tests {
         let encoded = |fingerprint: [u64; 2]| {
             encode_envelope(
                 "Bootstrap",
-                &protocol_payload([
-                    ("input_epoch", Value::Unsigned(1)),
-                    (
-                        "schema_fingerprint",
-                        Value::Array(fingerprint.into_iter().map(Value::Unsigned).collect()),
-                    ),
-                    (
-                        "snapshots",
-                        Value::Array(vec![Value::Object(vec![
-                            (
-                                "system_id".into(),
-                                Value::Unsigned(crate::generated::SYSTEM_Settings),
-                            ),
-                            ("value".into(), invalid_settings.clone()),
-                        ])]),
-                    ),
-                ]),
+                &bootstrap_payload(
+                    1,
+                    fingerprint,
+                    vec![Value::Object(vec![
+                        (
+                            "system_id".into(),
+                            Value::Unsigned(crate::generated::SYSTEM_Settings),
+                        ),
+                        ("value".into(), invalid_settings.clone()),
+                    ])],
+                ),
             )
             .unwrap()
         };
@@ -798,25 +779,14 @@ mod tests {
 
         let bootstrap = encode_envelope(
             "Bootstrap",
-            &protocol_payload([
-                ("input_epoch", Value::Unsigned(1)),
-                (
-                    "schema_fingerprint",
-                    Value::Array(
-                        crate::generated::SCHEMA_FINGERPRINT
-                            .into_iter()
-                            .map(Value::Unsigned)
-                            .collect(),
-                    ),
-                ),
-                (
-                    "snapshots",
-                    Value::Array(vec![object([
-                        ("system_id", Value::Unsigned(u64::MAX)),
-                        ("value", Value::Object(Vec::new())),
-                    ])]),
-                ),
-            ]),
+            &bootstrap_payload(
+                1,
+                crate::generated::SCHEMA_FINGERPRINT,
+                vec![object([
+                    ("system_id", Value::Unsigned(u64::MAX)),
+                    ("value", Value::Object(Vec::new())),
+                ])],
+            ),
         )
         .expect("encode bootstrap");
         assert!(decode_server(&bootstrap).is_err());

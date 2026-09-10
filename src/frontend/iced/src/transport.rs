@@ -578,6 +578,19 @@ mod tests {
                 result: Ok(Value::Null),
             })
         };
+        let drain_latest = |pending: &mut std::collections::VecDeque<TransportEvent>,
+                            correlations: std::ops::Range<u64>| {
+            for expected in correlations {
+                assert!(
+                    matches!(pending.pop_front(), Some(TransportEvent::IntentReply(reply)) if reply.correlation == expected)
+                );
+            }
+            assert!(
+                matches!(pending.pop_front(), Some(TransportEvent::SystemEvent(crate::protocol::SystemEvent {
+                event: crate::generated::ApplicationEvent::AnnotationAnnotationChanged(changed), ..
+            })) if changed.snapshot.revision == 130)
+            );
+        };
         let mut pending = std::collections::VecDeque::with_capacity(64);
         retain_event(
             &mut pending,
@@ -603,16 +616,7 @@ mod tests {
                 "blocked delivery retains only the latest state and discrete edges"
             );
         }
-        for expected in [1, 2] {
-            assert!(
-                matches!(pending.pop_front(), Some(TransportEvent::IntentReply(reply)) if reply.correlation == expected)
-            );
-        }
-        assert!(
-            matches!(pending.pop_front(), Some(TransportEvent::SystemEvent(crate::protocol::SystemEvent {
-            event: crate::generated::ApplicationEvent::AnnotationAnnotationChanged(changed), ..
-        })) if changed.snapshot.revision == 130)
-        );
+        drain_latest(&mut pending, 1..3);
         retain_event(
             &mut pending,
             state(11, crate::generated::EventDelivery::LatestState),
@@ -678,15 +682,6 @@ mod tests {
             )
             .is_err()
         );
-        for expected in 0..63 {
-            assert!(
-                matches!(pending.pop_front(), Some(TransportEvent::IntentReply(reply)) if reply.correlation == expected)
-            );
-        }
-        assert!(
-            matches!(pending.pop_front(), Some(TransportEvent::SystemEvent(crate::protocol::SystemEvent {
-            event: crate::generated::ApplicationEvent::AnnotationAnnotationChanged(changed), ..
-        })) if changed.snapshot.revision == 130)
-        );
+        drain_latest(&mut pending, 0..63);
     }
 }

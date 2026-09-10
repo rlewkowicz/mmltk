@@ -848,13 +848,13 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
 
 class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
    public:
-    explicit TestExploreAlgorithm(std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {},
-                                  std::shared_ptr<std::atomic_uint64_t> commits = {},
-                                  std::shared_ptr<ExploreFinalizationGate> finalization_gate = {},
-                                  std::shared_ptr<ExploreWorkProbe> work_probe = {},
-                                  std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
-                                  std::shared_ptr<ExploreDetailExtentProbe> detail_extent = {})
-        : observed_nproc_(std::move(observed_nproc)),
+    explicit TestExploreAlgorithm(
+        std::shared_ptr<std::atomic<std::size_t>> observed_nproc, std::shared_ptr<ExploreRenderGate> gate = {},
+        std::shared_ptr<std::atomic_uint64_t> commits = {}, std::shared_ptr<ExploreFinalizationGate> finalization_gate = {},
+        std::shared_ptr<ExploreWorkProbe> work_probe = {}, std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
+        std::shared_ptr<ExploreDetailExtentProbe> detail_extent = {})  // CLEANUP-IGNORE: This test algorithm has its own injected controls.
+        : observed_nproc_(
+              std::move(observed_nproc)),  // CLEANUP-IGNORE: Distinct test algorithms directly retain their own injected controls.
           gate_(std::move(gate)),
           commits_(std::move(commits)),
           finalization_gate_(std::move(finalization_gate)),
@@ -1180,17 +1180,16 @@ struct MutationCommitProbe final {
 
 class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
-    explicit TestAnnotationAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> document_revision,
-                                     std::shared_ptr<std::vector<std::uint64_t>> order = {},
-                                     std::shared_ptr<std::atomic_bool> save_applied = {},
-                                     std::shared_ptr<MutationCommitProbe> mutation = {},
-                                     std::shared_ptr<std::promise<void>> peer_closed = {},
-                                     std::shared_ptr<MutationCommitProbe> pointer_gate = {},
-                                     std::shared_ptr<std::atomic_bool> pointer_failure = {},
-                                     std::shared_ptr<std::atomic_bool> invalid_ui = {}, std::function<void()> ui_observed = {})
+    explicit TestAnnotationAlgorithm(
+        std::shared_ptr<std::atomic<std::uint64_t>> document_revision, std::shared_ptr<std::vector<std::uint64_t>> order = {},
+        std::shared_ptr<std::atomic_bool> save_applied = {}, std::shared_ptr<MutationCommitProbe> mutation = {},
+        std::shared_ptr<std::promise<void>> peer_closed = {}, std::shared_ptr<MutationCommitProbe> pointer_gate = {},
+        std::shared_ptr<std::atomic_bool> pointer_failure = {},
+        std::shared_ptr<std::atomic_bool> invalid_ui = {},  // CLEANUP-IGNORE: Annotation test controls are intentionally domain-specific.
+        std::function<void()> ui_observed = {})
         : document_revision_(std::move(document_revision)),
-          order_(std::move(order)),
-          save_applied_(std::move(save_applied)),
+          order_(std::move(order)),                // CLEANUP-IGNORE: This test algorithm directly retains its ordered observation control.
+          save_applied_(std::move(save_applied)),  // CLEANUP-IGNORE: This test algorithm directly retains its mutation controls.
           mutation_(std::move(mutation)),
           peer_closed_(std::move(peer_closed)),
           pointer_gate_(std::move(pointer_gate)),

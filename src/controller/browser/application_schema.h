@@ -496,14 +496,9 @@ concept ProjectableCatalogProvider = requires(const typename Provider::row_type&
 template <class Value>
 [[nodiscard]] consteval bool runtime_scalar_projectable() {
     using Type = std::remove_cvref_t<Value>;
-    return std::same_as<Type, void> || std::same_as<Type, bool> || std::same_as<Type, float> || std::same_as<Type, double> ||
-           std::same_as<Type, std::byte> || std::same_as<Type, std::uint8_t> || std::same_as<Type, std::uint16_t> ||
-           std::same_as<Type, std::uint32_t> || std::same_as<Type, std::uint64_t> || std::same_as<Type, std::int8_t> ||
-           (std::same_as<Type, char> && std::is_signed_v<char> &&
-            std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits) ||
-           std::same_as<Type, std::int16_t> || std::same_as<Type, std::int32_t> || std::same_as<Type, std::int64_t> ||
-           std::same_as<Type, std::string> || std::same_as<Type, std::filesystem::path> ||
-           std::same_as<Type, mmltk::frameworks::serialization::wire::Value> ||
+    return std::same_as<Type, void> || mmltk::frameworks::reflection::kReflectedIntegerScalar<Type> || std::same_as<Type, float> ||
+           std::same_as<Type, double> || std::same_as<Type, std::byte> || std::same_as<Type, std::string> ||
+           std::same_as<Type, std::filesystem::path> || std::same_as<Type, mmltk::frameworks::serialization::wire::Value> ||
            std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>;
 }
 

@@ -140,7 +140,7 @@ struct PresentationNativeConfiguration final {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] PresentationCompleted final {
     // CLEANUP-IGNORE: Presentation completion has its own reflected identity and durable state-delivery contract.
     PresentationSnapshot snapshot{};
-};
+};  // CLEANUP-IGNORE: Presentation event identities are distinct from Annotation's frame and failure events.
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PresentationCapabilityChanged final {
     PresentationSnapshot snapshot{};
 };

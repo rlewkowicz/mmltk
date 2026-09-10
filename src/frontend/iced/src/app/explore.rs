@@ -1,6 +1,22 @@
 use super::*;
 
 impl App {
+    fn handle_explore_send_error(
+        &mut self,
+        error: crate::transport_connection::OutboundSendError,
+    ) -> Task<Message> {
+        match error {
+            crate::transport_connection::OutboundSendError::Closed => {
+                self.retire_peer(UiError::transport(error.to_string()));
+            }
+            crate::transport_connection::OutboundSendError::Capacity => {}
+            crate::transport_connection::OutboundSendError::Allocation => {
+                self.retire_peer(UiError::transport("retained outbound allocation failed"));
+            }
+        }
+        Task::none()
+    }
+
     pub(super) fn classify_explore_reply(
         endpoint: Option<ApplicationIntentEndpoint>,
         decoded: &Result<crate::generated::ApplicationReply, crate::protocol::ApplicationError>,
@@ -348,17 +364,7 @@ impl App {
                     Task::none()
                 }
             }
-            Err(crate::transport_connection::OutboundSendError::Closed) => {
-                self.retire_peer(UiError::transport(
-                    crate::transport_connection::OutboundSendError::Closed.to_string(),
-                ));
-                Task::none()
-            }
-            Err(crate::transport_connection::OutboundSendError::Capacity) => Task::none(),
-            Err(crate::transport_connection::OutboundSendError::Allocation) => {
-                self.retire_peer(UiError::transport("retained outbound allocation failed"));
-                Task::none()
-            }
+            Err(error) => self.handle_explore_send_error(error),
         }
     }
 
@@ -560,17 +566,7 @@ impl App {
         self.workspace.explore_viewport_writable();
         match result {
             Ok(()) => self.dispatch_explore_viewport(),
-            Err(crate::transport_connection::OutboundSendError::Closed) => {
-                self.retire_peer(UiError::transport(
-                    crate::transport_connection::OutboundSendError::Closed.to_string(),
-                ));
-                Task::none()
-            }
-            Err(crate::transport_connection::OutboundSendError::Capacity) => Task::none(),
-            Err(crate::transport_connection::OutboundSendError::Allocation) => {
-                self.retire_peer(UiError::transport("retained outbound allocation failed"));
-                Task::none()
-            }
+            Err(error) => self.handle_explore_send_error(error),
         }
     }
 }

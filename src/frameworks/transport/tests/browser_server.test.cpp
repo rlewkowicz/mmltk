@@ -79,18 +79,23 @@ TEST_CASE("browser output epochs keep Bootstrap first on attach and reconnect", 
             CHECK(record->bytes.front() == marker);
         }
     };
+    const auto finish_open = [&](const std::uint64_t generation, const std::byte accepted, const std::byte progress,
+                                 const std::byte diagnostic, const std::byte worker) {
+        epoch.finish_open(generation);
+        require_markers({accepted});
+        REQUIRE(ring.push({.bytes = {progress}, .priority = BrowserRecordPriority::Progress}) == BrowserRecordPush::Enqueued);
+        REQUIRE(publish_diagnostic(diagnostic) == BrowserRecordPush::Enqueued);
+        REQUIRE(publish_worker(worker) == BrowserRecordPush::Enqueued);
+        require_markers({progress, diagnostic, worker});
+    };
 
     CHECK(publish_worker(std::byte{0x10}) == BrowserRecordPush::Dropped);
     epoch.begin_open(1U);
     ring.clear();
     CHECK_FALSE(epoch.admits(false));
     REQUIRE(publish(true, std::byte{0x11}) == BrowserRecordPush::Enqueued);
-    epoch.finish_open(1U);
-    require_markers({std::byte{0x11}});  // Accepted socket copy precedes activation, including backpressure.
-    REQUIRE(ring.push({.bytes = {std::byte{0x14}}, .priority = BrowserRecordPriority::Progress}) == BrowserRecordPush::Enqueued);
-    REQUIRE(publish_diagnostic(std::byte{0x12}) == BrowserRecordPush::Enqueued);
-    REQUIRE(publish_worker(std::byte{0x13}) == BrowserRecordPush::Enqueued);
-    require_markers({std::byte{0x14}, std::byte{0x12}, std::byte{0x13}});
+    // Accepted socket copy precedes activation, including backpressure.
+    finish_open(1U, std::byte{0x11}, std::byte{0x14}, std::byte{0x12}, std::byte{0x13});
 
     epoch.close();
     ring.clear();
@@ -100,12 +105,7 @@ TEST_CASE("browser output epochs keep Bootstrap first on attach and reconnect", 
     REQUIRE(publish(true, std::byte{0x21}) == BrowserRecordPush::Enqueued);
     epoch.finish_open(1U);
     CHECK_FALSE(epoch.admits(false));
-    epoch.finish_open(2U);
-    require_markers({std::byte{0x21}});
-    REQUIRE(ring.push({.bytes = {std::byte{0x24}}, .priority = BrowserRecordPriority::Progress}) == BrowserRecordPush::Enqueued);
-    REQUIRE(publish_diagnostic(std::byte{0x22}) == BrowserRecordPush::Enqueued);
-    REQUIRE(publish_worker(std::byte{0x23}) == BrowserRecordPush::Enqueued);
-    require_markers({std::byte{0x24}, std::byte{0x22}, std::byte{0x23}});
+    finish_open(2U, std::byte{0x21}, std::byte{0x24}, std::byte{0x22}, std::byte{0x23});
 }
 
 TEST_CASE("browser server rejects output without an active peer epoch", "[frameworks][transport][browser][lifecycle]") {

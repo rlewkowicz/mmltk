@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <inplace_vector>
+#include <limits>
 #include <meta>
 #include <optional>
 #include <span>
@@ -27,6 +28,15 @@ namespace mmltk::frameworks::reflection {
 
 template <class T>
 using RemoveCvRef = std::remove_cvref_t<T>;
+
+template <class T>
+inline constexpr bool kReflectedIntegerScalar =
+    std::same_as<RemoveCvRef<T>, bool> || std::same_as<RemoveCvRef<T>, std::uint8_t> || std::same_as<RemoveCvRef<T>, std::uint16_t> ||
+    std::same_as<RemoveCvRef<T>, std::uint32_t> || std::same_as<RemoveCvRef<T>, std::uint64_t> ||
+    std::same_as<RemoveCvRef<T>, std::int8_t> || std::same_as<RemoveCvRef<T>, std::int16_t> || std::same_as<RemoveCvRef<T>, std::int32_t> ||
+    std::same_as<RemoveCvRef<T>, std::int64_t> ||
+    (std::same_as<RemoveCvRef<T>, char> && std::is_signed_v<char> &&
+     std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits);
 
 struct OpaqueRelationStorage : Annotation {
     static constexpr bool is_opaque_relation_storage = true;

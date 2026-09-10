@@ -438,6 +438,19 @@ mod tests {
         pointer
     }
 
+    fn saturated_connection() -> (Connection, crate::transport_connection::Capture) {
+        let (mut connection, capture) = Connection::test_channel();
+        for _ in 0..64 {
+            assert_eq!(
+                connection
+                    .send_renderer_observation(RendererObservation::Ready)
+                    .unwrap(),
+                crate::transport_connection::SendDisposition::Queued
+            );
+        }
+        (connection, capture)
+    }
+
     fn stage_annotation_retirement(app: &mut App) {
         install_default_bootstrap(app);
         app.workspace.select(FeatureId::Annotate);
@@ -784,19 +797,7 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
-        let (sender, receiver) = Connection::test_channel();
-        let mut connection = sender;
-        assert_eq!(
-            connection
-                .send_renderer_observation(RendererObservation::Ready)
-                .unwrap(),
-            crate::transport_connection::SendDisposition::Queued
-        );
-        for _ in 1..64 {
-            connection
-                .send_renderer_observation(RendererObservation::Ready)
-                .unwrap();
-        }
+        let (connection, receiver) = saturated_connection();
         app.connection = Some(connection);
         assert!(
             !app.submit_intent(ApplicationIntentEndpoint::DatasetStop, |correlation| {
@@ -850,19 +851,7 @@ mod tests {
         let (mut app, task) = boot();
         drop(task);
         install_ready_annotation(&mut app);
-        let (sender, receiver) = Connection::test_channel();
-        let mut connection = sender;
-        assert_eq!(
-            connection
-                .send_renderer_observation(RendererObservation::Ready)
-                .unwrap(),
-            crate::transport_connection::SendDisposition::Queued
-        );
-        for _ in 1..64 {
-            connection
-                .send_renderer_observation(RendererObservation::Ready)
-                .unwrap();
-        }
+        let (connection, receiver) = saturated_connection();
         app.connection = Some(connection);
 
         let first = local_annotation_press(&mut app);

@@ -166,6 +166,7 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Lat
 // A frame may advance without changing UI. The matching full-state identity also
 // orders command admission/settlement when socket records arrive in either order.
 struct AnnotationFrameState final {
+    // CLEANUP-IGNORE: Compact frame identity is distinct from Live's full lifecycle snapshot.
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
     VisualFrame frame{};
@@ -191,7 +192,9 @@ class AnnotationSystem final {
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(AnnotationInputBatch);
-    void SetInputPeer(std::uint64_t, SystemEventSink<AnnotationInputProgress>);
+    void SetInputPeer(
+        std::uint64_t,
+        SystemEventSink<AnnotationInputProgress>);  // CLEANUP-IGNORE: Annotation input ownership is not an Explore intent sequence.
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
     // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
@@ -224,7 +227,7 @@ MMLTK_REFLECT_FIELDS(AnnotationSidebarEdit)
 // CLEANUP-IGNORE: These registrations identify distinct Annotation types; their projections already share reflection.
 MMLTK_REFLECT_FIELDS(AnnotationObjectEdit)
 MMLTK_REFLECT_FIELDS(AnnotationCategoryEdit)
-MMLTK_REFLECT_FIELDS(AnnotationClassEdit)
+MMLTK_REFLECT_FIELDS(AnnotationClassEdit)  // CLEANUP-IGNORE: Distinct canonical Annotation types require distinct reflection registrations.
 MMLTK_REFLECT_FIELDS(AnnotationSelectedObjectEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSplineEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSplineHandleEdit)

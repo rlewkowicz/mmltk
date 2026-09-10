@@ -1644,23 +1644,28 @@ template <class Sequence>
     }
 }
 
+[[nodiscard]] inline std::expected<void, wire::DecodeError> require_variant_key(wire::Reader& reader, const std::size_t depth,
+                                                                                const std::string_view expected) {
+    auto key = reader.read_object_key(depth);
+    if (!key) return std::unexpected(key.error());
+    if (*key == expected) return {};
+    auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
+    if (!error.path.empty()) error.path.push_back('.');
+    error.path.append(expected);
+    return std::unexpected(std::move(error));
+}
+
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_projected_variant(wire::Reader& reader, const std::size_t depth) {
     auto member_count = reader.begin_object_item(depth);
     if (!member_count) { return std::unexpected(member_count.error()); }
     if (*member_count != VariantEnvelope::field_count) { return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)); }
-    auto kind_key = reader.read_object_key(depth + 1U);
-    if (!kind_key) { return std::unexpected(kind_key.error()); }
-    if (*kind_key != VariantEnvelope::kind_key) {
-        auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
-        if (!error.path.empty()) { error.path.push_back('.'); }
-        error.path.append(VariantEnvelope::kind_key);
-        return std::unexpected(std::move(error));
-    }
+    auto kind_key = require_variant_key(reader, depth + 1U, VariantEnvelope::kind_key);
+    if (!kind_key) return std::unexpected(kind_key.error());
 
     std::string kind;
     {
-        auto scope = reader.enter_path(*kind_key);
+        auto scope = reader.enter_path(VariantEnvelope::kind_key);
         auto decoded = reader.read_scalar_item(depth + 1U);
         if (!decoded) return std::unexpected(decoded.error());
         auto converted = from_projected_scalar<std::string>(std::move(*decoded));
@@ -1668,19 +1673,13 @@ template <class Variant>
         kind = std::move(*converted);
     }
 
-    auto payload_key = reader.read_object_key(depth + 1U);
-    if (!payload_key) { return std::unexpected(payload_key.error()); }
-    if (*payload_key != VariantEnvelope::payload_key) {
-        auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
-        if (!error.path.empty()) { error.path.push_back('.'); }
-        error.path.append(VariantEnvelope::payload_key);
-        return std::unexpected(std::move(error));
-    }
+    auto payload_key = require_variant_key(reader, depth + 1U, VariantEnvelope::payload_key);
+    if (!payload_key) return std::unexpected(payload_key.error());
 
     std::optional<Variant> result;
     std::optional<wire::DecodeError> failure;
     {
-        auto scope = reader.enter_path(*payload_key);
+        auto scope = reader.enter_path(VariantEnvelope::payload_key);
         []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>, const std::string& expected_kind, wire::Reader& source,
                                   const std::size_t item_depth, std::optional<Variant>& destination,
                                   std::optional<wire::DecodeError>& error) {
@@ -1976,10 +1975,7 @@ enum class Shape { Unsupported, Scalar, Optional, Sequence, Enum, Object };
 template <class T>
 inline constexpr Shape shape = [] consteval {
     using U = std::remove_cvref_t<T>;
-    if constexpr (std::same_as<U, bool> || std::same_as<U, std::uint8_t> || std::same_as<U, std::uint16_t> ||
-                  std::same_as<U, std::uint32_t> || std::same_as<U, std::uint64_t> || std::same_as<U, std::int8_t> ||
-                  std::same_as<U, std::int16_t> || std::same_as<U, std::int32_t> || std::same_as<U, std::int64_t> ||
-                  (std::same_as<U, char> && std::is_signed_v<char>)) {
+    if constexpr (mmltk::frameworks::reflection::kReflectedIntegerScalar<U>) {
         return Shape::Scalar;
     } else if constexpr (std::same_as<U, float> || std::same_as<U, double>) {
         return Shape::Scalar;

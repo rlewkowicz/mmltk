@@ -40,7 +40,8 @@ static_assert(kMaxIntentValueDepth == wire::kMaximumNestingDepth);
 
 struct IntentField final {
     [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t field_id = 0U;
-    [[= field_policy::MaxBytes{kMaxIntentValueBytes}]][[= field_policy::MaxItems{kMaxIntentValueItems}]] wire::Value value{};
+    [[= field_policy::MaxBytes{kMaxIntentValueBytes}]][[= field_policy::MaxItems{kMaxIntentValueItems}]] wire::Value
+        value{};  // CLEANUP-IGNORE: Intent fields and System events are separate dynamic-value wire records.
     bool operator==(const IntentField&) const = default;
 };
 
