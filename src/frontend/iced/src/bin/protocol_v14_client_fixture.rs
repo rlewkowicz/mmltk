@@ -18,7 +18,8 @@ fn validate_generated_surfaces() -> io::Result<()> {
     require(
         !request_ids.is_empty()
             && request_ids.len() == mmltk_browser_app::generated::APPLICATION_REQUEST_FIELDS.len()
-            && !request_ids.contains(&0),
+            && !request_ids.contains(&0)
+            && mmltk_browser_app::generated::APPLICATION_REQUEST_FIELDS.iter().all(|field| field.endpoint_id != 0),
         "generated request-field identities are invalid",
     )?;
     let settings_ids: BTreeSet<_> = mmltk_browser_app::generated::SETTINGS_LEAVES
@@ -32,7 +33,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
             && mmltk_browser_app::generated::SETTINGS_LEAVES
                 .iter()
                 .all(|leaf| {
-                    (!leaf.finite
+                    !leaf.path.is_empty() && (!leaf.finite
                         || leaf
                             .minimum
                             .into_iter()
@@ -46,7 +47,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
                         && mmltk_browser_app::generated::REFLECTED_FIELD_FACTS
                             .iter()
                             .any(|field| {
-                                leaf.path.rsplit('.').next() == Some(field.name)
+                                leaf.owner == field.declaration_owner && leaf.member == field.name
                                     && leaf.finite == field.finite
                                     && leaf.minimum == field.minimum
                                     && leaf.maximum == field.maximum
@@ -75,6 +76,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
                 leaf.has_file_dialog
                     && leaf.path == dialog.field_path
                     && leaf.workflows == dialog.workflows
+                    && !dialog.title.is_empty() && !dialog.filter.is_empty() && !dialog.pattern.is_empty()
             }),
             "generated file-dialog projection does not match its settings leaf",
         )?;
@@ -82,6 +84,55 @@ fn validate_generated_surfaces() -> io::Result<()> {
     require(
         !mmltk_browser_app::generated::FILE_DIALOGS.is_empty(),
         "generated file-dialog projection is empty",
+    )?;
+    use mmltk_browser_app::generated as schema;
+    let dialog_ids: BTreeSet<_> = schema::FILE_DIALOGS
+        .iter()
+        .map(|dialog| dialog.stable_field_id)
+        .collect();
+    require(
+        dialog_ids.len() == schema::FILE_DIALOGS.len()
+            && dialog_ids == schema::SETTINGS_LEAVES.iter()
+                .filter(|leaf| leaf.has_file_dialog)
+                .map(|leaf| leaf.stable_field_id).collect(),
+        "file-dialog projection is incomplete",
+    )?;
+    let artifact_ids: BTreeSet<_> = schema::MODEL_ARTIFACT_DIALOGS
+        .iter()
+        .map(|dialog| (dialog.stable_field_id, dialog.field_path))
+        .collect();
+    require(
+        !artifact_ids.is_empty() && artifact_ids.len() == schema::MODEL_ARTIFACT_DIALOGS.len(),
+        "model-artifact identities are duplicated",
+    )?;
+    for dialog in schema::MODEL_ARTIFACT_DIALOGS {
+        require(
+            dialog.target.stableid == dialog.stable_field_id
+                && !dialog.title.is_empty()
+                && !dialog.filter.is_empty()
+                && !dialog.pattern.is_empty()
+                && schema::SETTINGS_LEAVES.iter().any(|leaf| {
+                    leaf.stable_field_id == dialog.stable_field_id && leaf.path == dialog.field_path
+                })
+                && [dialog.source_field_id, dialog.input_field_id, dialog.preset_field_id, dialog.resolution_field_id]
+                    .into_iter().chain(dialog.predicate_field_id).all(|id| settings_ids.contains(&id))
+                && schema::MODEL_SELECTION_COMPATIBILITY_CATALOG.iter().any(|row| {
+                    row.workflow == dialog.target.workflow
+                        && row.input == dialog.target.input
+                        && row.artifactfieldpath == dialog.field_path
+                }),
+            "model-artifact relation does not identify canonical settings",
+        )?;
+    }
+    require(
+        schema::MODEL_SELECTION_COMPATIBILITY_CATALOG.iter().all(|row| {
+            schema::MODEL_ARTIFACT_DIALOGS.iter().filter(|dialog| {
+                row.workflow == dialog.target.workflow
+                    && row.input == dialog.target.input
+                    && row.artifactfieldpath == dialog.field_path
+            }).count() == 1
+        }),
+        "model-artifact dialog projection is incomplete",
     )?;
     let provider_ids: BTreeSet<_> = mmltk_browser_app::generated::CATALOG_PROVIDERS
         .iter()
@@ -118,7 +169,8 @@ fn validate_generated_surfaces() -> io::Result<()> {
     )?;
     let typed_rows = mmltk_browser_app::generated::application_catalog_rows();
     require(
-        typed_rows.len() == mmltk_browser_app::generated::CATALOG_ROWS.len(),
+        typed_rows.len() == mmltk_browser_app::generated::CATALOG_ROWS.len()
+            && typed_rows.iter().map(|row| row.stable_id).collect::<BTreeSet<_>>() == row_ids,
         "generated typed catalog rows are incomplete",
     )?;
     for row in typed_rows {
@@ -144,6 +196,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
         mmltk_browser_app::generated::application_settings_defaults().map_err(io::Error::other)?;
     require(
         defaults.len() == mmltk_browser_app::generated::SETTINGS_LEAVES.len()
+            && defaults.iter().map(|default| default.stable_field_id).collect::<BTreeSet<_>>() == settings_ids
             && defaults.iter().all(|default| {
                 mmltk_browser_app::generated::SETTINGS_LEAVES
                     .iter()
@@ -154,7 +207,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
         "generated typed settings defaults are incomplete",
     )?;
     require(
-        mmltk_browser_app::generated::TRAIN_RECIPE_CATALOG_RELATION.len() == 11
+        !mmltk_browser_app::generated::TRAIN_RECIPE_CATALOG_RELATION.is_empty()
             && mmltk_browser_app::generated::TRAIN_RECIPE_CATALOG_RELATION
                 .iter()
                 .all(|relation| {
@@ -175,6 +228,30 @@ fn validate_generated_surfaces() -> io::Result<()> {
                 .all(|leaf| !leaf.path.contains("recipe_overrides")),
         "generated Train relation or opaque settings containment is invalid",
     )?;
+    let recipe_provider = schema::CATALOG_PROVIDERS
+        .iter()
+        .find(|provider| provider.name == "TrainRecipeCatalog")
+        .ok_or_else(|| io::Error::other("missing recipe catalog"))?;
+    let selectors: BTreeSet<_> = schema::SETTINGS_LEAVES
+        .iter()
+        .filter(|leaf| leaf.catalog_provider == Some(recipe_provider.name))
+        .map(|leaf| leaf.member)
+        .collect();
+    let recipe_members: BTreeSet<_> = schema::REFLECTED_FIELD_FACTS
+        .iter()
+        .filter(|field| field.owner == recipe_provider.row_type && !selectors.contains(field.name))
+        .map(|field| field.name)
+        .collect();
+    let relation_sources: BTreeSet<_> = schema::TRAIN_RECIPE_CATALOG_RELATION
+        .iter().map(|relation| relation.source_path).collect();
+    let relation_destinations: BTreeSet<_> = schema::TRAIN_RECIPE_CATALOG_RELATION
+        .iter().map(|relation| relation.stable_field_id).collect();
+    require(
+        !selectors.is_empty() && !recipe_members.is_empty() && relation_sources == recipe_members
+            && relation_sources.len() == schema::TRAIN_RECIPE_CATALOG_RELATION.len()
+            && relation_destinations.len() == relation_sources.len(),
+        "recipe relation does not cover its canonical row members",
+    )?;
     let snapshot_defaults =
         mmltk_browser_app::generated::application_snapshot_defaults().map_err(io::Error::other)?;
     let snapshots: Vec<_> = snapshot_defaults
@@ -191,6 +268,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
         !mmltk_browser_app::generated::application_bootstrap_complete(&missing),
         "generated bootstrap completeness accepted a missing snapshot",
     )?;
+    require(snapshots.len() >= 2, "bootstrap fixture needs distinct snapshot owners")?;
     let mut duplicate = snapshots;
     duplicate[0] = duplicate[1].clone();
     require(
@@ -201,6 +279,7 @@ fn validate_generated_surfaces() -> io::Result<()> {
         mmltk_browser_app::generated::application_request_defaults().map_err(io::Error::other)?;
     require(
         request_defaults.len() == mmltk_browser_app::generated::APPLICATION_REQUEST_FIELDS.len()
+            && request_defaults.iter().map(|default| default.field_id).collect::<BTreeSet<_>>() == request_ids
             && request_defaults.iter().all(|default| {
                 mmltk_browser_app::generated::APPLICATION_REQUEST_FIELDS
                     .iter()
@@ -211,8 +290,6 @@ fn validate_generated_surfaces() -> io::Result<()> {
             }),
         "generated typed request defaults are incomplete",
     )?;
-    let snapshot_defaults =
-        mmltk_browser_app::generated::application_snapshot_defaults().map_err(io::Error::other)?;
     let snapshot_ids: BTreeSet<_> = snapshot_defaults
         .iter()
         .map(|default| default.system_id)

@@ -128,6 +128,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Error(message) => task = app.on_error(message),
         Message::Diagnostics(message) => app.diagnostics.update(message),
         Message::Integration(message) => {
+            if app
+                .integration
+                .as_ref()
+                .is_none_or(|integration| !integration.accepts_message(&message))
+            {
+                return Task::none();
+            }
             if let Some(integration) = app.integration.as_mut()
                 && let Some(message) = integration.update(message)
             {
@@ -225,6 +232,25 @@ mod route_tests {
             correlation,
             result: Ok(snapshot.into_application_value()),
         });
+    }
+
+    #[test]
+    fn obsolete_integration_message_cannot_advance_the_current_scenario() {
+        let mut app = installed_app();
+        app.model.window_width = 640;
+        app.model.window_height = 480;
+        app.integration = Some(crate::integration_control::Controller::new(
+            true, false, "source".into(), "compiled".into(), "512".into(), "atlas".into(),
+        ));
+        let task = update(&mut app, Message::Integration(crate::integration_control::Message::Scoped {
+            generation: 0,
+            receipt: None,
+            message: Box::new(crate::integration_control::Message::Advance),
+        }));
+        assert_eq!(task.units(), 0);
+        // A current continuation does have work: the obsolete one must not run it.
+        let task = update(&mut app, Message::Integration(crate::integration_control::Message::Advance));
+        assert!(task.units() > 0);
     }
 
     #[test]

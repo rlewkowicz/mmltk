@@ -1981,7 +1981,13 @@ impl SurfaceRenderer {
             control_id,
         );
         trace_draw("draw_encoded", control_id, draw, image, clip);
+        crate::integration_control::notify_driver_draw(
+            control_id,
+            frame.content_sequence,
+            frame.presentation_revision,
+        );
         if draw.surface.integration {
+            crate::integration_control::record_probe_draw(control_id, draw.surface, bounds, image, clip);
             crate::integration_control::sample_boundary_pixels(
                 draw.surface,
                 control_id,
@@ -2781,47 +2787,7 @@ fn fs_main(input: Output) -> @location(0) vec4<f32> {
 mod tests {
     use super::*;
 
-    #[derive(Debug, PartialEq, Eq)]
-    enum GridTone {
-        Image,
-        Black,
-        White,
-    }
-
-    fn grid_tone(position: f32, extent: f32, cells: u32) -> GridTone {
-        let cell = extent / cells as f32;
-        let boundary = (position / cell).round() * cell;
-        let outer_center = 1.5_f32.min(extent * 0.5);
-        let center = (boundary + 0.5).clamp(outer_center, extent - outer_center);
-        let line_pixel = (position - center).round().abs();
-        if line_pixel < 0.5 {
-            GridTone::White
-        } else if line_pixel < 1.5 {
-            GridTone::Black
-        } else {
-            GridTone::Image
-        }
-    }
-
-    fn frame_ready(
-        content_session: u64,
-        content_sequence: u64,
-        presentation_revision: u64,
-        content_width: u32,
-        content_height: u32,
-    ) -> FrameReady {
-        FrameReady {
-            high: 1,
-            low: 2,
-            layer: 0,
-            slot: 0,
-            content_session,
-            content_sequence,
-            presentation_revision,
-            content_width,
-            content_height,
-        }
-    }
+    use crate::view_model::test_support::physical_frame as frame_ready;
 
     #[test]
     fn completion_authorization_matches_all_available_native_identity() {
@@ -2882,9 +2848,8 @@ mod tests {
 
     #[test]
     fn captured_predecessor_survives_every_causal_metadata_and_capture_order() {
-        use crate::generated::{ExploreMode, FeatureId, PresentationSourceKind};
         use crate::view_model::test_support::{
-            annotation_object, bootstrapped, physical_surface, visual_frame,
+            annotation_object, explore_presentation, physical_surface,
         };
 
         for replacement in [false, true] {
@@ -2900,19 +2865,11 @@ mod tests {
                     let physical_position = remaining[0];
                     let capture_position = remaining[1];
                     reset_test_releases();
-                    let mut model = bootstrapped();
-                    model.set_foreground_feature(FeatureId::Explore);
-                    let source = visual_frame(PresentationSourceKind::Explore, 1);
-                    let old = frame_ready(1, 1, 5, source.extent.width, source.extent.height);
+                    let (mut model, old) = explore_presentation();
                     let mut previous = physical_surface(old);
                     previous.viewer_identity = Some((9, 0));
                     let explore = model.explore.snapshot.as_mut().unwrap();
-                    explore.ready = true;
-                    explore.revision = 10;
-                    explore.mode = ExploreMode::Detail;
-                    explore.selectedimage = Some(0);
                     explore.dataset.identity = 9;
-                    explore.frame = source.clone();
                     explore.overlay.showlabels = true;
                     explore.scene.categories = vec![crate::generated::ArtifactClassName {
                         value: "predecessor".into(),
@@ -2924,9 +2881,6 @@ mod tests {
                     next_explore.scene.categories[0].value = "successor".into();
                     next_explore.scene.objects[0].box_.first.x += 17.0;
                     let snapshot = model.presentation.as_mut().unwrap();
-                    snapshot.completed = source;
-                    snapshot.completedsourcerevision = 10;
-                    snapshot.presentationrevision = 5;
                     let mut next = FrameReady {
                         content_sequence: 2,
                         presentation_revision: 6,
@@ -3903,19 +3857,6 @@ mod tests {
                     .is_none()
             );
         }
-    }
-
-    #[test]
-    fn gallery_grid_is_three_physical_pixels_with_a_white_core() {
-        assert_eq!(grid_tone(0.5, 40.0, 4), GridTone::Black);
-        assert_eq!(grid_tone(1.5, 40.0, 4), GridTone::White);
-        assert_eq!(grid_tone(2.5, 40.0, 4), GridTone::Black);
-        assert_eq!(grid_tone(3.5, 40.0, 4), GridTone::Image);
-        assert_eq!(grid_tone(8.5, 40.0, 4), GridTone::Image);
-        assert_eq!(grid_tone(9.5, 40.0, 4), GridTone::Black);
-        assert_eq!(grid_tone(10.5, 40.0, 4), GridTone::White);
-        assert_eq!(grid_tone(11.5, 40.0, 4), GridTone::Black);
-        assert_eq!(grid_tone(12.5, 40.0, 4), GridTone::Image);
     }
 
     #[test]

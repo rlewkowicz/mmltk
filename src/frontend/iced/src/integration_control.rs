@@ -10,12 +10,16 @@ use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
 use iced::{Rectangle, Task, Vector};
 
 thread_local! {
+    static DRIVER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static PIXEL_FIXTURE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static REPORTING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static COMPLETION_WITHOUT_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn initialize_reporting(enabled: bool, pixel_fixture: bool) {
+    if !enabled && reporting_enabled() {
+        reset_observer();
+    }
     PIXEL_FIXTURE_ENABLED.with(|flag| flag.set(enabled && pixel_fixture));
     #[cfg(target_arch = "wasm32")]
     initialize_js(enabled);
@@ -25,6 +29,16 @@ pub(crate) fn initialize_reporting(enabled: bool, pixel_fixture: bool) {
 
 pub(crate) fn reporting_enabled() -> bool {
     REPORTING_ENABLED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn notify_driver_draw(control: &'static str, source_revision: u64, presentation_revision: u64) {
+    if !DRIVER_ENABLED.with(std::cell::Cell::get) {
+        return;
+    }
+    #[cfg(target_arch = "wasm32")]
+    driver_draw_js(control, source_revision as f64, presentation_revision as f64);
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (control, source_revision, presentation_revision);
 }
 
 pub(crate) fn repeated_redraws_enabled() -> bool {
@@ -200,6 +214,11 @@ const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Scoped {
+        generation: u64,
+        receipt: Option<ProbeReceipt>,
+        message: Box<Message>,
+    },
     Advance,
     NumberWheelDelivered,
     #[cfg(target_arch = "wasm32")]
@@ -261,13 +280,55 @@ pub struct ViewerDraw {
     pub fit_revision: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeReceipt {
+    generation: u64,
+    control: &'static str,
+    surface: crate::presentation_surface::Surface,
+    bounds: Rectangle,
+    image: Rectangle,
+    clip: Rectangle,
+}
+
+#[derive(Clone)]
+struct ScenarioOutput {
+    generation: u64,
+    receipt: Option<ProbeReceipt>,
+    sender: iced::futures::channel::mpsc::Sender<Message>,
+}
+
+impl ScenarioOutput {
+    fn try_send(
+        &mut self,
+        message: Message,
+    ) -> Result<(), iced::futures::channel::mpsc::TrySendError<Message>> {
+        self.sender.try_send(Message::Scoped {
+            generation: self.generation,
+            receipt: self.receipt.clone(),
+            message: Box::new(message),
+        })
+    }
+}
+
 #[derive(Default)]
 struct SurfaceDrawObserver {
-    output: Option<iced::futures::channel::mpsc::Sender<Message>>,
+    generation: u64,
+    subscription: Option<std::sync::Arc<()>>,
+    receipts: std::collections::BTreeMap<&'static str, ProbeReceipt>,
+    output: Option<ScenarioOutput>,
     identity: (u64, u64),
     viewer: Option<(u64, u64, ViewerDraw)>,
     gallery: Option<(u64, u64)>,
     atlas: Option<AtlasDraw>,
+}
+
+impl SurfaceDrawObserver {
+    fn output_for(&mut self, control: &str) -> Option<&mut ScenarioOutput> {
+        let receipt = self.receipts.get(control)?.clone();
+        let output = self.output.as_mut()?;
+        output.receipt = Some(receipt);
+        Some(output)
+    }
 }
 
 thread_local! {
@@ -275,21 +336,115 @@ thread_local! {
         std::cell::RefCell::new(SurfaceDrawObserver::default());
 }
 
-struct SurfaceDrawSubscription;
+struct SurfaceDrawSubscription(std::sync::Arc<()>);
 
 impl Drop for SurfaceDrawSubscription {
     fn drop(&mut self) {
-        SURFACE_DRAW_OBSERVER
-            .with(|observer| *observer.borrow_mut() = SurfaceDrawObserver::default());
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            let mut observer = observer.borrow_mut();
+            if observer
+                .subscription
+                .as_ref()
+                .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &self.0))
+            {
+                let generation = observer.generation;
+                *observer = SurfaceDrawObserver {
+                    generation,
+                    ..Default::default()
+                };
+            }
+        });
     }
 }
 
 fn surface_draw_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(1, async move |output| {
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(output));
-        let _subscription = SurfaceDrawSubscription;
+    iced::stream::channel(1, async move |sender| {
+        let owner = std::sync::Arc::new(());
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            let mut observer = observer.borrow_mut();
+            observer.subscription = Some(owner.clone());
+            observer.output = Some(ScenarioOutput {
+                generation: observer.generation,
+                receipt: None,
+                sender,
+            });
+        });
+        let _subscription = SurfaceDrawSubscription(owner);
         std::future::pending::<()>().await;
     })
+}
+
+fn reset_observer() -> u64 {
+    SURFACE_DRAW_OBSERVER.with(|observer| {
+        let mut observer = observer.borrow_mut();
+        let generation = observer
+            .generation
+            .checked_add(1)
+            .expect("integration scenario generation exhausted");
+        let output = observer.output.take().map(|mut output| {
+            output.generation = generation;
+            output.receipt = None;
+            output
+        });
+        let subscription = observer.subscription.take();
+        *observer = SurfaceDrawObserver {
+            generation,
+            output,
+            subscription,
+            ..Default::default()
+        };
+        generation
+    })
+}
+
+fn current_receipt(control: &str) -> Option<ProbeReceipt> {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().receipts.get(control).cloned())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn probe_output(control: &str) -> Option<ScenarioOutput> {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output_for(control).cloned())
+}
+
+pub(crate) fn record_probe_draw(
+    control: &'static str,
+    surface: crate::presentation_surface::Surface,
+    bounds: Rectangle,
+    image: Rectangle,
+    clip: Rectangle,
+) {
+    if !surface.integration || !reporting_enabled() {
+        return;
+    }
+    SURFACE_DRAW_OBSERVER.with(|observer| {
+        let mut observer = observer.borrow_mut();
+        let receipt = ProbeReceipt {
+            generation: observer.generation,
+            control,
+            surface,
+            bounds,
+            image,
+            clip,
+        };
+        if observer.receipts.get(control) != Some(&receipt) {
+            #[cfg(target_arch = "wasm32")]
+            if let Some(frame) = surface.frame {
+                receipt_js(
+                    control,
+                    &format!("{receipt:?}"),
+                    frame.content_sequence as f64,
+                    frame.presentation_revision as f64,
+                );
+            }
+            match control {
+                EXPLORE_GALLERY => { observer.gallery = None; observer.atlas = None; }
+                explore::DETAIL_WORKSPACE_ID => observer.viewer = None,
+                crate::view::workspace::STABLE_ID => observer.identity = (0, 0),
+                _ => {}
+            }
+            observer.receipts.insert(control, receipt);
+        }
+    });
 }
 
 struct FindControl {
@@ -350,7 +505,7 @@ impl Operation<Rectangle> for FindControl {
     }
 }
 
-fn locate(control: String) -> Task<RootMessage> {
+fn locate(control: String, generation: u64) -> Task<RootMessage> {
     let target = control.clone();
     widget::operate(FindControl {
         target: Id::from(control),
@@ -359,10 +514,9 @@ fn locate(control: String) -> Task<RootMessage> {
         bounds: None,
     })
     .map(move |bounds| {
-        RootMessage::Integration(Message::Located {
-            control: target.clone(),
-            bounds,
-        })
+        RootMessage::Integration(Message::Scoped { generation, receipt: None, message: Box::new(Message::Located {
+            control: target.clone(), bounds,
+        }) })
     })
 }
 
@@ -426,716 +580,18 @@ fn sidebar_control_visible(pane: Rectangle, target: Rectangle) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
-let integrationState;
-
-export function mmltkIntegrationInitialize(enabled) {
-  if (!enabled) {
-    if (integrationState) {
-      for (const type of integrationState.inputTypes) {
-        window.removeEventListener(type, integrationState.onInput, true);
-      }
-      integrationState = undefined;
-    }
-    return;
-  }
-  if (integrationState) return;
-  integrationState = {
-    integrationSurfaceDraws: new Map(),
-    integrationPendingSurfaceClick: undefined,
-    initialAtlasWithoutInput: false,
-    initialAtlasInputCount: 0,
-    initialAtlasCompleted: false,
-    boundaryScratch: undefined,
-    boundaryPending: false,
-    boundaryLatest: undefined,
-    compositionPending: false,
-    annotationScratch: undefined,
-    annotationContext: undefined,
-    integrationRenderKey: 0,
-    integrationFullscreenSettled: false,
-    integrationAnnotationPointerEnd: null,
-    inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown'],
-    onInput: undefined,
-  };
-  integrationState.onInput = (event) => {
-    if (!integrationState.initialAtlasWithoutInput) return;
-    integrationState.initialAtlasInputCount++;
-    report({event: 'integration.failure', control: 'explore.gallery.workspace',
-      detail: `input during initial atlas completion: ${event.type}`,
-      a: String(integrationState.initialAtlasInputCount), b: '0', c: '0', d: '0'});
-  };
-  for (const type of integrationState.inputTypes) {
-    window.addEventListener(type, integrationState.onInput, true);
-  }
-}
-
-function integrationPointer(rect, x, y, type, buttons) {
-  const event = new PointerEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    clientX: rect.left + x,
-    clientY: rect.top + y,
-    pointerId: 1,
-    pointerType: 'mouse',
-    isPrimary: true,
-    button: type === 'pointerdown' || type === 'pointerup' ? 0 : -1,
-    buttons,
-  });
-  Object.defineProperties(event, {
-    offsetX: {value: x},
-    offsetY: {value: y},
-    getCoalescedEvents: {value: () => [event]},
-  });
-  return event;
-}
-
-function matchesIntegrationSurfaceClick(pending, drawn) {
-  return drawn && (pending.allowNewer ? drawn.sourceRevision >= pending.sourceRevision :
-    drawn.sourceRevision === pending.sourceRevision);
-}
-
-function dispatchIntegrationSurfaceClick(pending) {
-  queueMicrotask(() => {
-    const drawn = integrationState.integrationSurfaceDraws.get(pending.control);
-    if (!matchesIntegrationSurfaceClick(pending, drawn)) {
-      integrationState.integrationPendingSurfaceClick = pending;
-      return;
-    }
-    const canvas = document.querySelector('canvas');
-    if (!canvas) return;
-    report({
-      event: 'integration.surface_click_dispatched',
-      control: pending.control,
-      detail: 'real-canvas-pointer',
-      a: String(drawn.sourceRevision),
-      b: String(drawn.presentationRevision),
-      c: String(pending.x),
-      d: String(pending.y),
-    });
-    integrationClick(canvas, canvas.getBoundingClientRect(), pending.x, pending.y);
-  });
-}
-
-function releaseIntegrationSurfaceClick(record) {
-  if (record.event !== 'integration.surface_draw') return;
-  const sourceRevision = Number(record.b);
-  if (!Number.isSafeInteger(sourceRevision) || sourceRevision <= 0) return;
-  const drawn = {sourceRevision, presentationRevision: Number(record.a)};
-  integrationState.integrationSurfaceDraws.set(record.control, drawn);
-  const pending = integrationState.integrationPendingSurfaceClick;
-  if (!pending || pending.control !== record.control || !matchesIntegrationSurfaceClick(pending, drawn)) return;
-  integrationState.integrationPendingSurfaceClick = undefined;
-  dispatchIntegrationSurfaceClick(pending);
-}
-
-function report(record) {
-  if (!integrationState) return;
-  record.elapsed_ms = performance.now();
-  if (!integrationState.initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
-    integrationState.initialAtlasWithoutInput = true;
-    integrationState.initialAtlasInputCount = 0;
-  } else if (record.event === 'integration.initial_atlas_complete') {
-    integrationState.initialAtlasWithoutInput = false;
-    integrationState.initialAtlasCompleted = true;
-  }
-  const line = JSON.stringify(record);
-  if (typeof globalThis.dump === 'function') globalThis.dump(`${line}\n`);
-  else console.error(line);
-  releaseIntegrationSurfaceClick(record);
-}
-
-export function mmltkIntegrationReport(event, control, detail, a, b, c, d) {
-  if (!integrationState) return;
-  report({event, control, detail, a: String(a), b: String(b), c: String(c), d: String(d)});
-}
-
-export function mmltkIntegrationAtlasPixels(rectangles, sourceRevision, presentationRevision, completed) {
-  rectangles = rectangles.slice();
-  // The draw report is emitted while encoding Iced's current submission.
-  // Sample the actual canvas at its next presentation opportunity, without
-  // dispatching input, scheduling an Iced redraw, or introducing a timer.
-  requestAnimationFrame(() => {
-    try {
-      const canvas = document.querySelector('canvas');
-      if (!canvas) throw new Error('missing WebGPU canvas');
-      const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
-      if (!drawn || drawn.sourceRevision !== sourceRevision ||
-          drawn.presentationRevision !== presentationRevision || integrationState.initialAtlasInputCount !== 0) {
-        completed(0, 0);
-        return;
-      }
-      const probe = new OffscreenCanvas(8, 8);
-      const context = probe.getContext('2d', {willReadFrequently: true});
-      if (!context) throw new Error('missing diagnostic pixel reader');
-      let nonblack = 0;
-      for (let i = 0; i < rectangles.length; i += 4) {
-        context.clearRect(0, 0, 8, 8);
-        context.drawImage(canvas, rectangles[i], rectangles[i + 1],
-          rectangles[i + 2], rectangles[i + 3], 0, 0, 8, 8);
-        const pixels = context.getImageData(0, 0, 8, 8).data;
-        let colored = 0;
-        for (let p = 0; p < pixels.length; p += 4) {
-          if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8) {
-            colored++;
-          }
-        }
-        nonblack += Number(colored >= 32);
-      }
-      report({event: 'integration.atlas_canvas_sample', control: 'explore.gallery.workspace',
-        detail: 'javascript-pixel-counts', a: String(sourceRevision), b: String(presentationRevision),
-        c: String(rectangles.length / 4), d: String(nonblack)});
-      completed(rectangles.length / 4, nonblack);
-    } catch (error) {
-      report({event: 'integration.failure', control: 'explore.gallery.workspace',
-        detail: `initial atlas canvas read: ${error}`, a: '0', b: '0', c: '0', d: '0'});
-      completed(0, 0);
-    }
-  });
-}
-
-function annotationCanvasSnapshot(canvas) {
-  if (!integrationState.annotationScratch || integrationState.annotationScratch.width !== canvas.width || integrationState.annotationScratch.height !== canvas.height) {
-    integrationState.annotationScratch = new OffscreenCanvas(canvas.width, canvas.height);
-    integrationState.annotationContext = integrationState.annotationScratch.getContext('2d', {willReadFrequently:true});
-  }
-  if (!integrationState.annotationContext) throw new Error('missing annotation canvas pixel reader');
-  integrationState.annotationContext.clearRect(0, 0, canvas.width, canvas.height);
-  integrationState.annotationContext.drawImage(canvas, 0, 0);
-  return integrationState.annotationContext;
-}
-
-export function mmltkIntegrationAtlasComposition(points, cards, fields, source, presentation, columns, completed) {
-  if (integrationState.compositionPending) { completed(0,0); return; }
-  integrationState.compositionPending = true;
-  points = points.slice();
-  cards = Array.from(cards);
-  requestAnimationFrame(() => {
-    let matched = 0;
-    let emitted = 0;
-    try {
-      const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
-      if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
-      const canvas = document.querySelector('canvas');
-      if (!canvas) return;
-      integrationState.boundaryScratch ??= new OffscreenCanvas(1,1);
-      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
-      if (!context) return;
-      const identity = JSON.parse(fields);
-      for (let i = 0; i < points.length; i += 10) {
-        const [x,y,screenX,screenY,r,g,b,a,kind,card] = points.slice(i,i+10);
-        context.clearRect(0,0,1,1);
-        context.drawImage(canvas,Math.floor(screenX),Math.floor(screenY),1,1,0,0,1,1);
-        const observed = Array.from(context.getImageData(0,0,1,1).data);
-        const expected = [r,g,b,a];
-        const valid = observed.every((value,index)=>Math.abs(value-expected[index])<=4);
-        matched += Number(valid);
-        ++emitted;
-        report({event:'integration.atlas_composition',...identity,columns,card,kind,
-          sample_x:x,sample_y:y,canvas_x:screenX,canvas_y:screenY,expected,observed,
-          matched:valid});
-      }
-      report({event:'integration.atlas_composition_complete',...identity,columns,cards,emitted});
-    } finally { integrationState.compositionPending = false; completed(cards.length*4,matched); }
-  });
-}
-export function mmltkIntegrationBoundaryPixels(points, fields, control, source, presentation) {
-  const request = {points:points.slice(),fields,control,source,presentation};
-  if (integrationState.boundaryPending) { integrationState.boundaryLatest = request; return; }
-  runBoundaryPixels(request);
-}
-function runBoundaryPixels({points,fields,control,source,presentation}) {
-  integrationState.boundaryPending = true;
-  requestAnimationFrame(() => {
-    try {
-      const drawn = integrationState.integrationSurfaceDraws.get(control);
-      if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
-      const canvas = document.querySelector('canvas');
-      if (!canvas) return;
-      integrationState.boundaryScratch ??= new OffscreenCanvas(1, 1);
-      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
-      if (!context) return;
-      const identity = JSON.parse(fields);
-      for (let i = 0; i < points.length; i += 5) {
-        const [x,y,screenX,screenY,sample_index] = points.slice(i,i+5);
-        context.clearRect(0,0,1,1);
-        context.drawImage(canvas,Math.floor(screenX),Math.floor(screenY),1,1,0,0,1,1);
-        const rgba = context.getImageData(0,0,1,1).data;
-        report({event:'iced.surface.canvas_pixel',...identity,control,sample_index,sample_x:x,sample_y:y,
-          canvas_x:screenX,canvas_y:screenY,
-          sample_rgba:(rgba[0]|rgba[1]<<8|rgba[2]<<16|rgba[3]<<24)>>>0});
-      }
-    } finally {
-      integrationState.boundaryPending = false;
-      const next = integrationState.boundaryLatest;
-      integrationState.boundaryLatest = undefined;
-      if (next) runBoundaryPixels(next);
-    }
-  });
-}
-
-function canvasPixelBounds(canvas, cssBounds, control) {
-  const css = canvas.getBoundingClientRect();
-  if (![canvas.width, canvas.height, css.width, css.height].every(value => Number.isFinite(value) && value > 0) ||
-      cssBounds.length !== 4 || !cssBounds.every(Number.isFinite) || cssBounds[2] <= 0 || cssBounds[3] <= 0) {
-    throw new Error('invalid canvas or CSS probe dimensions');
-  }
-  const scaleX = canvas.width / css.width, scaleY = canvas.height / css.height;
-  const pixels = [cssBounds[0] * scaleX, cssBounds[1] * scaleY, cssBounds[2] * scaleX, cssBounds[3] * scaleY];
-  report({event: 'integration.canvas_probe_geometry', control, detail: 'css-to-backing-pixels',
-    canvas: [canvas.width, canvas.height], css: [css.width, css.height], css_bounds: cssBounds, pixel_bounds: pixels});
-  return pixels;
-}
-
-export function mmltkIntegrationAnnotationSwatch(cssBounds,color,control,detail,button,completed){
-  cssBounds = Array.from(cssBounds);
-  color = Array.from(color);
-  const canvas=document.querySelector('canvas');
-  if(canvas)canvas.dispatchEvent(integrationPointer(canvas.getBoundingClientRect(),0,0,'pointermove',0));
-  requestAnimationFrame(()=>requestAnimationFrame(()=>{
-    try{
-      const canvas=document.querySelector('canvas');
-      if (!canvas) throw new Error('missing annotation canvas');
-      const bounds = canvasPixelBounds(canvas, cssBounds, control);
-      const context=annotationCanvasSnapshot(canvas);
-      const pixel=context.getImageData(Math.floor(bounds[0]+bounds[2]*(button?0.9:0.5)),Math.floor(bounds[1]+bounds[3]/2),1,1).data;
-      const matched=color.every((channel,index)=>Math.abs(channel-pixel[index])<=3)&&pixel[3]>0;
-      report({event:button?'integration.annotation_capability':'integration.annotation_swatch',control,detail,expected:color,observed:Array.from(pixel),matched});
-      completed(1,Number(matched));
-    }catch(error){report({event:'integration.failure',detail:`annotation swatch read: ${error}`});completed(1,0);}
-  }));
-}
-
-export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sourceRevision, presentationRevision, completed) {
-  cssBounds = Array.from(cssBounds);
-  extent = Array.from(extent);
-  probes = Array.from(probes);
-  try {
-    const canvas=document.querySelector('canvas');
-    const drawn=integrationState.integrationSurfaceDraws.get('workflow.visual.workspace');
-    if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed(probes.length/7,0); return; }
-    const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
-    const context=annotationCanvasSnapshot(canvas);
-    const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
-    const ox=bounds[0]+(bounds[2]-extent[0]*scale)/2,oy=bounds[1]+(bounds[3]-extent[1]*scale)/2;
-    const colorError = (pixels, offset, expected, filteredPalette) => {
-      let gain = 1;
-      let minimum = 0;
-      const peak = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-      const low = Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-      // Filtered thin outlines mix with the background. Preserve class hue
-      // and require at least half native chroma; solid controls stay exact.
-      if (filteredPalette && peak - low >= 127.5) {
-        minimum = low;
-        gain = 255 / (peak - low);
-      }
-      return Math.max(Math.abs(expected[0] - (pixels[offset] - minimum) * gain),
-        Math.abs(expected[1] - (pixels[offset + 1] - minimum) * gain),
-        Math.abs(expected[2] - (pixels[offset + 2] - minimum) * gain));
-    };
-    let matched=0;
-    for(let i=0;i<probes.length;i+=7){
-      const expected = probes.slice(i+2,i+5);
-      const filteredPalette = scale < 1 && Math.max(...expected) === 255 && Math.min(...expected) === 0;
-      // A one-source-pixel outline clipped by the image boundary can retain
-      // strong class hue while downsampling mixes more of the underlying
-      // image than an interior two-sided outline.
-      const tolerance = filteredPalette ? Math.max(probes[i+5], 48) : probes[i+5];
-      const x=Math.round(ox+probes[i]*scale),y=Math.round(oy+probes[i+1]*scale);
-      const radius=Math.max(1,Math.ceil(probes[i+6]*scale));
-      const left=Math.max(0,x-radius),top=Math.max(0,y-radius),width=Math.min(canvas.width-left,2*radius+1),height=Math.min(canvas.height-top,2*radius+1);
-      let hit=false,best=[0,0,0],distance=Infinity;
-      if(width>0&&height>0){
-        const pixels=context.getImageData(left,top,width,height).data;
-        for(let p=0;p<pixels.length;p+=4){const error=colorError(pixels,p,expected,filteredPalette);
-          if(error<distance){distance=error;best=[pixels[p],pixels[p+1],pixels[p+2]];}
-          if(error<=tolerance&&pixels[p+3]>0)hit=true;
-        }
-      }
-      matched+=Number(hit);
-      report({event:'integration.annotation_pixel',control:'annotation.workspace.surface',detail:'completed-canvas',a:String(sourceRevision),b:String(presentationRevision),c:String(probes[i]),d:String(probes[i+1]),expected,observed:best,error:distance,source_to_screen:scale,matched:hit});
-    }
-    completed(probes.length/7,matched);
-  } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed(probes.length/7,0);}
-}
-
-export function mmltkIntegrationUpscalePixels(imagePixels, buttonCss, source, presentation, completed) {
-  imagePixels = Array.from(imagePixels);
-  buttonCss = Array.from(buttonCss);
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    try {
-      const canvas = document.querySelector('canvas');
-      const drawn = integrationState.integrationSurfaceDraws.get('explore.detail.workspace');
-      if (!canvas || !drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) {
-        completed(0, 0); return;
-      }
-      const buttonPixels = canvasPixelBounds(canvas, buttonCss, 'explore.detail.upscale');
-      const probe = new OffscreenCanvas(16, 16);
-      const context = probe.getContext('2d', {willReadFrequently: true});
-      if (!context) throw new Error('missing Upscale diagnostic pixel reader');
-      let checksum = 2166136261;
-      let nonblack = 0;
-      let blue = 0;
-      for (let region = 0; region < 2; ++region) {
-        context.clearRect(0, 0, 16, 16);
-        context.drawImage(canvas, ...(region === 0 ? imagePixels : buttonPixels), 0, 0, 16, 16);
-        const pixels = context.getImageData(0, 0, 16, 16).data;
-        for (let i = 0; i < pixels.length; i += 4) {
-          if (region === 0) {
-            for (let c = 0; c < 4; ++c) checksum = Math.imul(checksum ^ pixels[i+c], 16777619) >>> 0;
-            nonblack += Number(pixels[i+3] > 0 && Math.max(pixels[i], pixels[i+1], pixels[i+2]) > 8);
-          } else {
-            blue += Number(pixels[i+3] > 0 && pixels[i+2] > pixels[i] + 20 && pixels[i+2] > pixels[i+1] + 10);
-          }
-        }
-      }
-      completed(nonblack > 0 ? checksum : 0, blue);
-    } catch (error) {
-      report({event: 'integration.failure', control: 'explore.detail.workspace', detail: `Upscale canvas read: ${error}`, a:'0', b:'0', c:'0', d:'0'});
-      completed(0, 0);
-    }
-  }));
-}
-
-export function mmltkIntegrationRenderedStyle(control, semantic, red, green, blue, alpha, width, height) {
-  requestAnimationFrame(() => {
-    const renderKey = ++integrationState.integrationRenderKey;
-    report({
-      event: 'integration.rendered_style',
-      control,
-      detail: semantic,
-      a: String(red),
-      b: String(green),
-      c: String(blue),
-      d: String(alpha),
-      render_key: String(renderKey),
-    });
-    report({
-      event: 'integration.rendered_control',
-      control,
-      detail: semantic,
-      a: String(renderKey),
-      b: String(width),
-      c: String(height),
-      d: String(window.devicePixelRatio),
-      render_key: String(renderKey),
-    });
-  });
-}
-
-function integrationClick(canvas, rect, x, y) {
-    const moved = integrationPointer(rect, x, y, 'pointermove', 0);
-    const pressed = integrationPointer(rect, x, y, 'pointerdown', 1);
-    const released = integrationPointer(rect, x, y, 'pointerup', 0);
-    const moveAccepted = canvas.dispatchEvent(moved);
-    const pressAccepted = canvas.dispatchEvent(pressed);
-    const releaseAccepted = canvas.dispatchEvent(released);
-    report({
-      event: 'integration.pointer_delivered',
-      control: '',
-      detail: document.activeElement === canvas ? 'canvas-active' : 'canvas-inactive',
-      a: String(x),
-      b: String(y),
-      c: String(Number(moveAccepted) + Number(pressAccepted) + Number(releaseAccepted)),
-      d: String(Number(moved.defaultPrevented) + Number(pressed.defaultPrevented) +
-                Number(released.defaultPrevented)),
-    });
-}
-
-export function mmltkIntegrationFullscreen(enabled) {
-  integrationState.integrationFullscreenSettled = false;
-  const request = enabled ? document.documentElement.requestFullscreen() : document.exitFullscreen();
-  request.then(() => {
-    integrationState.integrationFullscreenSettled = true;
-    window.dispatchEvent(new Event('resize'));
-    const canvas = document.querySelector('canvas');
-    if (canvas) {
-      const rect = canvas.getBoundingClientRect();
-      canvas.dispatchEvent(new WheelEvent('wheel', {
-        bubbles: true,
-        cancelable: true,
-        clientX: rect.left + rect.width * 0.5,
-        clientY: rect.top + rect.height * 0.5,
-        deltaY: 0,
-        deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-      }));
-    }
-    report({event: 'integration.atlas_window', control: 'explore.gallery.workspace',
-      detail: enabled ? 'fullscreen' : 'restored', a: String(window.innerWidth),
-      b: String(window.innerHeight), c: String(window.devicePixelRatio), d: String(Number(!!document.fullscreenElement))});
-  }).catch(error => report({event: 'integration.failure', control: 'explore.gallery.workspace',
-    detail: String(error) + '; visibility=' + document.visibilityState +
-      '; focused=' + document.hasFocus() + '; enabled=' + document.fullscreenEnabled +
-      '; activation=' + (navigator.userActivation?.isActive ?? 'unavailable'),
-    a: '0', b: '0', c: '0', d: '0'}));
-}
-export function mmltkIntegrationFullscreenSettled(enabled) {
-  return integrationState.integrationFullscreenSettled && !!document.fullscreenElement === enabled;
-}
-
-export function mmltkIntegrationClick(x, y) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
-  const rect = canvas.getBoundingClientRect();
-  queueMicrotask(() => integrationClick(canvas, rect, x, y));
-  return 1;
-}
-
-export function mmltkIntegrationClickAfterSurfaceDraw(x, y, control, sourceRevision, allowNewer) {
-  if (!document.querySelector('canvas') || !Number.isFinite(x) || !Number.isFinite(y) ||
-      typeof control !== 'string' || control.length === 0 ||
-      !Number.isSafeInteger(sourceRevision) || sourceRevision <= 0) return 0;
-  const pending = {x, y, control, sourceRevision, allowNewer};
-  if (matchesIntegrationSurfaceClick(pending, integrationState.integrationSurfaceDraws.get(control))) {
-    dispatchIntegrationSurfaceClick(pending);
-  } else {
-    integrationState.integrationPendingSurfaceClick = pending;
-  }
-  return 1;
-}
-
-export function mmltkIntegrationSweep(x, y, width, height) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return 0;
-  const rect = canvas.getBoundingClientRect();
-  queueMicrotask(() => {
-    report({
-      event: 'integration.explore_sweep_dispatch',
-      control: 'explore.gallery.workspace',
-      detail: 'begin',
-      a: '64',
-      b: '8',
-      c: String(width),
-      d: String(height),
-    });
-    for (let sample = 0; sample < 64; ++sample) {
-      const ratio = sample / 63;
-      const localX = x + width * (0.25 + 0.5 * (sample & 1));
-      const localY = y + height * ratio;
-      canvas.dispatchEvent(integrationPointer(rect, localX, localY, 'pointermove', 0));
-      if ((sample & 7) === 7) {
-        canvas.dispatchEvent(new WheelEvent('wheel', {
-          bubbles: true,
-          cancelable: true,
-          clientX: rect.left + localX,
-          clientY: rect.top + localY,
-          deltaY: 96,
-          deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-        }));
-      }
-    }
-    report({
-      event: 'integration.explore_sweep_dispatch',
-      control: 'explore.gallery.workspace',
-      detail: 'complete',
-      a: '64',
-      b: '8',
-      c: String(width),
-      d: String(height),
-    });
-  });
-  return 1;
-}
-
-export function mmltkIntegrationWheel(x, y) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
-  const rect = canvas.getBoundingClientRect();
-  queueMicrotask(() => {
-    canvas.dispatchEvent(new WheelEvent('wheel', {
-      bubbles: true,
-      cancelable: true,
-      clientX: rect.left + x,
-      clientY: rect.top + y,
-      deltaY: -96,
-      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
-    }));
-  });
-  return 1;
-}
-
-export function mmltkIntegrationSliderDrag(x, y, width, height) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return 0;
-  const rect = canvas.getBoundingClientRect();
-  const localY = y + height - Math.min(10, height * 0.2);
-  const positions = [0.35, 0.5, 0.62];
-  queueMicrotask(() => {
-    canvas.dispatchEvent(integrationPointer(rect, x + width * positions[0], localY, 'pointermove', 0));
-    canvas.dispatchEvent(integrationPointer(rect, x + width * positions[0], localY, 'pointerdown', 1));
-    report({
-      event: 'integration.ui_scale_pointer',
-      control: 'settings.ui_scale',
-      detail: 'pressed',
-      a: String(positions[0]),
-      b: '1',
-      c: String(canvas.width),
-      d: String(rect.width),
-    });
-    requestAnimationFrame(() => {
-      canvas.dispatchEvent(integrationPointer(rect, x + width * positions[1], localY, 'pointermove', 1));
-      report({
-        event: 'integration.ui_scale_pointer',
-        control: 'settings.ui_scale',
-        detail: 'moved-1',
-        a: String(positions[1]),
-        b: '1',
-        c: String(canvas.width),
-        d: String(rect.width),
-      });
-      requestAnimationFrame(() => {
-        canvas.dispatchEvent(integrationPointer(rect, x + width * positions[2], localY, 'pointermove', 1));
-        report({
-          event: 'integration.ui_scale_pointer',
-          control: 'settings.ui_scale',
-          detail: 'moved-2',
-          a: String(positions[2]),
-          b: '1',
-          c: String(canvas.width),
-          d: String(rect.width),
-        });
-        requestAnimationFrame(() => {
-          canvas.dispatchEvent(integrationPointer(rect, x + width * positions[2], localY, 'pointerup', 0));
-          report({
-            event: 'integration.ui_scale_pointer',
-            control: 'settings.ui_scale',
-            detail: 'released',
-            a: String(positions[2]),
-            b: '0',
-            c: String(canvas.width),
-            d: String(rect.width),
-          });
-        });
-      });
-    });
-  });
-  return 1;
-}
-
-function integrationKey(canvas, type, key, code, control, shift) {
-  const event = new KeyboardEvent(type, {
-    bubbles: true,
-    cancelable: true,
-    composed: true,
-    key,
-    code,
-    ctrlKey: control,
-    shiftKey: shift,
-  });
-  const accepted = canvas.dispatchEvent(event);
-  return Number(accepted) + Number(event.defaultPrevented);
-}
-
-export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || !Number.isFinite(x) || !Number.isFinite(y) ||
-      typeof value !== 'string' || !Number.isInteger(selectionLength) || selectionLength <= 0) return 0;
-  const rect = canvas.getBoundingClientRect();
-  const observeKeyStage = (stage, result) => report({
-    event: 'integration.number_key_stage',
-    control: stage,
-    detail: document.visibilityState,
-    a: String(result),
-    b: String(document.hasFocus()),
-    c: String(document.activeElement === canvas),
-    d: value,
-  });
-  report({
-    event: 'integration.number_replace',
-    control: '',
-    detail: 'scheduled',
-    a: String(x),
-    b: String(y),
-    c: value,
-    d: String(document.activeElement === canvas),
-  });
-  queueMicrotask(() => {
-    const pointerEvents = [
-      integrationPointer(rect, x, y, 'pointermove', 0),
-      integrationPointer(rect, x, y, 'pointerdown', 1),
-      integrationPointer(rect, x, y, 'pointerup', 0),
-    ];
-    const pointerResult = pointerEvents.reduce(
-      (total, event) => total + Number(canvas.dispatchEvent(event)) + Number(event.defaultPrevented),
-      0,
-    );
-    report({
-      event: 'integration.number_replace',
-      control: '',
-      detail: 'focused',
-      a: String(pointerResult),
-      b: String(document.activeElement === canvas),
-      c: '0',
-      d: '0',
-    });
-    observeKeyStage('awaiting-control-down', pointerResult);
-    requestAnimationFrame(() => {
-      let keyResult = integrationKey(canvas, 'keydown', 'Control', 'ControlLeft', true, false);
-      observeKeyStage('control-down', keyResult);
-      requestAnimationFrame(() => {
-        keyResult += integrationKey(canvas, 'keydown', 'a', 'KeyA', true, false);
-        keyResult += integrationKey(canvas, 'keyup', 'a', 'KeyA', true, false);
-        observeKeyStage('select-all', keyResult);
-        requestAnimationFrame(() => {
-          keyResult += integrationKey(canvas, 'keyup', 'Control', 'ControlLeft', false, false);
-          observeKeyStage('control-up', keyResult);
-          requestAnimationFrame(() => {
-            for (const character of value) {
-              const code = character === '.' ? 'Period' :
-                character === '-' ? 'Minus' :
-                character === '+' ? 'Equal' :
-                character === 'e' || character === 'E' ? 'KeyE' : `Digit${character}`;
-              keyResult += integrationKey(canvas, 'keydown', character, code, false, false);
-              keyResult += integrationKey(canvas, 'keyup', character, code, false, false);
-            }
-            report({
-              event: 'integration.number_replace',
-              control: '',
-              detail: 'keyboard',
-              a: String(keyResult),
-              b: String(document.activeElement === canvas),
-              c: value,
-              d: String(selectionLength),
-            });
-          });
-        });
-      });
-    });
-  });
-  return 1;
-}
-
-export function mmltkIntegrationAnnotationRelease() {
-  const end=integrationState.integrationAnnotationPointerEnd;
-  if(end){end.canvas.dispatchEvent(integrationPointer(end.rect,end.x,end.y,'pointerup',0));integrationState.integrationAnnotationPointerEnd=null;}
-}
-export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, startY, endX, endY, hold) {
-  const canvas = document.querySelector('canvas');
-  if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return 0;
-  const rect = canvas.getBoundingClientRect();
-  const x0 = x + width * startX;
-  const y0 = y + height * startY;
-  const x1 = x + width * endX;
-  const y1 = y + height * endY;
-  queueMicrotask(() => {
-    canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointermove', 0));
-    canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointerdown', 1));
-    canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointermove', 1));
-    if(hold) integrationState.integrationAnnotationPointerEnd={canvas,rect,x:x1,y:y1};
-    else canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointerup', 0));
-  });
-  return 1;
-}
-
-export function mmltkIntegrationWindowClose() {
-  queueMicrotask(() => requestAnimationFrame(() => requestAnimationFrame(() => window.close())));
-  return 1;
-}
-"#)]
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/src/integration_control/browser.mjs")]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationInitialize)]
     fn initialize_js(enabled: bool);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationDriver)]
+    fn initialize_driver_js(enabled: bool);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationDriverDraw)]
+    fn driver_draw_js(control: &str, source: f64, presentation: f64);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationResetScenario)]
+    fn reset_scenario_js();
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReceipt)]
+    fn receipt_js(control: &str, receipt: &str, source: f64, presentation: f64);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationBoundaryPixels)]
     fn boundary_pixels_js(
         points: &[f32],
@@ -1335,7 +791,7 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
         };
         // The fixture is a constant clean image and a rectangular mask with a
         // central hole. Four isolated samples exclude all label geometry.
-        let mut points = [0.0f32; 256 * 4 * 10];
+        let mut points = [0.0f32; (256 * 4 + 9) * 10];
         let mut count = 0;
         let mut cards = [0u32; 256];
         let mut card_count = 0;
@@ -1462,8 +918,27 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
                 return;
             }
         }
+        // Nine physical shader samples replace the CPU grid-tone mirror:
+        // left outer, first interior, and right outer black/white/black lines.
+        // Pick a visible row interior so horizontal grid lines cannot mask a defect.
+        let cell = draw.image.width / columns as f32;
+        let first_row = ((draw.clip.y - draw.image.y) / cell - 0.5).ceil().max(0.0);
+        let y = draw.image.y + (first_row + 0.5) * cell;
+        let centers = [draw.image.x + 1.5, draw.image.x + cell + 0.5,
+            draw.image.x + draw.image.width - 1.5];
+        for center in centers {
+            for (offset, tone) in [(-1.0, 0.0), (0.0, 255.0), (1.0, 0.0)] {
+                let point = iced::Point::new(center + offset, y);
+                if !draw.clip.contains(point) || !draw.image.contains(point) { return; }
+                points[count..count + 10].copy_from_slice(&[
+                    point.x - draw.image.x, point.y - draw.image.y, point.x, point.y,
+                    tone, tone, tone, 255.0, 4.0, 0.0,
+                ]);
+                count += 10;
+            }
+        }
         let Some(mut output) =
-            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+            probe_output(EXPLORE_GALLERY)
         else {
             return;
         };
@@ -1504,8 +979,10 @@ fn pixel_fixture_enabled() -> bool {
 fn pixel_result_callback(completed: impl FnOnce(u32, u32) + 'static) -> wasm_bindgen::JsValue {
     // Keep the JavaScript boundary explicit: the optimized bindgen adapter can
     // share integer closure shims with externref closures.
+    let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
     wasm_bindgen::closure::Closure::once_into_js(
         move |first: wasm_bindgen::JsValue, second: wasm_bindgen::JsValue| {
+            if SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation) != generation || !reporting_enabled() { return; }
             let counts = [first, second].map(|value| {
                 value.as_f64().filter(|number| {
                     number.is_finite()
@@ -1536,17 +1013,9 @@ fn sample_upscale_pixels(
     source: u64,
     presentation: u64,
 ) {
+    let Some(mut output) = probe_output(explore::DETAIL_WORKSPACE_ID) else { return; };
     let completed = pixel_result_callback(move |checksum, blue| {
-        SURFACE_DRAW_OBSERVER.with(|observer| {
-            if let Some(output) = observer.borrow_mut().output.as_mut() {
-                let _ = output.try_send(Message::UpscalePixels {
-                    source,
-                    presentation,
-                    checksum,
-                    blue,
-                });
-            }
-        });
+        let _ = output.try_send(Message::UpscalePixels { source, presentation, checksum, blue });
     });
     upscale_pixels_js(
         &[
@@ -1698,7 +1167,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
                 && previous.snapshot.overlay == draw.snapshot.overlay
         });
         if !same_rendered_draw
-            && observer.output.as_mut().is_some_and(|output| {
+            && observer.output_for(EXPLORE_GALLERY).is_some_and(|output| {
                 output
                     .try_send(Message::AtlasDrawn {
                         source_revision: frame.content_sequence,
@@ -1733,7 +1202,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
 fn sample_atlas_pixels(draw: AtlasDraw) {
     let rectangles = atlas_pixel_rectangles(&draw);
     let frame = draw.surface.frame.expect("drawn atlas publication");
-    let Some(mut output) = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+    let Some(mut output) = probe_output(EXPLORE_GALLERY)
     else {
         return;
     };
@@ -1820,7 +1289,7 @@ pub(crate) fn report_surface_draw(
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision, viewer);
             if observer.viewer != Some(identity)
-                && let Some(output) = observer.output.as_mut()
+                && let Some(output) = observer.output_for(control)
             {
                 if output
                     .try_send(Message::SurfaceDrawn {
@@ -1851,7 +1320,7 @@ pub(crate) fn report_surface_draw(
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision);
             if observer.gallery != Some(identity)
-                && observer.output.as_mut().is_some_and(|output| {
+                && observer.output_for(control).is_some_and(|output| {
                     output
                         .try_send(Message::GalleryDrawn {
                             presentation_revision: revision,
@@ -1869,7 +1338,7 @@ pub(crate) fn report_surface_draw(
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision);
             if observer.identity != identity
-                && observer.output.as_mut().is_some_and(|output| {
+                && observer.output_for(control).is_some_and(|output| {
                     output
                         .try_send(Message::SurfaceDrawn {
                             presentation_revision: revision,
@@ -2699,6 +2168,7 @@ fn report_advanced_field(control: &str, detail: &str, bounds: Rectangle) {
 }
 
 pub struct Controller {
+    generation: u64,
     phase: Phase,
     reported_phase: Option<Phase>,
     location_pending: bool,
@@ -2708,8 +2178,9 @@ pub struct Controller {
     resolution: String,
     viewer_scenario: String,
     annotation_probe: Option<(u64, u64, u32, u32, Vec<f64>)>,
-    annotation_pixels_revision: u64,
-    annotation_pixels_pending: bool,
+    annotation_pixels_receipt: Option<ProbeReceipt>,
+    annotation_pixels_pending: Option<ProbeReceipt>,
+    control_probe_receipt: Option<ProbeReceipt>,
     copy_step: u8,
     copy_product: annotation_product::Pass,
     copy_product_gesture: Option<[f64; 4]>,
@@ -2740,7 +2211,7 @@ pub struct Controller {
     annotation_drawn: Option<(u64, u64)>,
     viewer_drawn: Option<(u64, u64, ViewerDraw)>,
     upscale_button: Option<Rectangle>,
-    upscale_pixel_pending: bool,
+    upscale_pixel_pending: Option<ProbeReceipt>,
     upscale_pixels: Option<(u64, u64, u32, u32)>,
     upscale_repeat_revision: Option<u64>,
     upscale_repeat_observed: bool,
@@ -2788,13 +2259,23 @@ impl Controller {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.running() {
             iced::Subscription::batch([
-                iced::Subscription::run(surface_draw_stream),
+                if reporting_enabled() {
+                    iced::Subscription::run(surface_draw_stream)
+                } else {
+                    iced::Subscription::none()
+                },
                 iced::event::listen_with(|event, _, _| {
                     matches!(
                         event,
                         iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. })
                     )
                     .then_some(Message::NumberWheelDelivered)
+                })
+                .with(self.generation)
+                .map(|(generation, message)| Message::Scoped {
+                    generation,
+                    receipt: None,
+                    message: Box::new(message),
                 }),
             ])
         } else {
@@ -2892,7 +2373,12 @@ impl Controller {
         resolution: String,
         viewer_scenario: String,
     ) -> Self {
+        DRIVER_ENABLED.with(|flag| flag.set(enabled));
+        #[cfg(target_arch = "wasm32")]
+        initialize_driver_js(enabled);
+        let generation = if enabled { reset_observer() } else { 0 };
         Self {
+            generation,
             phase: if enabled {
                 Phase::AwaitBootstrap
             } else {
@@ -2906,8 +2392,9 @@ impl Controller {
             resolution,
             viewer_scenario,
             annotation_probe: None,
-            annotation_pixels_revision: 0,
-            annotation_pixels_pending: false,
+            annotation_pixels_receipt: None,
+            annotation_pixels_pending: None,
+            control_probe_receipt: None,
             copy_step: 0,
             copy_product: annotation_product::Pass::default(),
             copy_product_gesture: None,
@@ -2938,7 +2425,7 @@ impl Controller {
             annotation_drawn: None,
             viewer_drawn: None,
             upscale_button: None,
-            upscale_pixel_pending: false,
+            upscale_pixel_pending: None,
             upscale_pixels: None,
             upscale_repeat_revision: None,
             upscale_repeat_observed: false,
@@ -2981,6 +2468,33 @@ impl Controller {
             resolved_benchmark: [0.0; 4],
             reported_style_bits: 0,
         }
+    }
+
+    pub(crate) fn reset_scenario(
+        &mut self,
+        dataset_source: String,
+        compiled_directory: String,
+        resolution: String,
+        viewer_scenario: String,
+    ) -> Result<(), &'static str> {
+        if self.running() || matches!(self.phase, Phase::Failed) {
+            return Err("scenario reset requires successful settlement");
+        }
+        let enabled = self.generation != 0;
+        *self = Self::new(
+            enabled,
+            self.window_close,
+            dataset_source,
+            compiled_directory,
+            resolution,
+            viewer_scenario,
+        );
+        COMPLETION_WITHOUT_INPUT.with(|flag| flag.set(false));
+        #[cfg(target_arch = "wasm32")]
+        if enabled {
+            reset_scenario_js();
+        }
+        Ok(())
     }
 
     fn observe_presentation(
@@ -3275,7 +2789,7 @@ impl Controller {
             return Task::none();
         }
         self.location_pending = true;
-        locate(control.into())
+        locate(control.into(), self.generation)
     }
 
     fn arm_scrolled(
@@ -3314,7 +2828,7 @@ impl Controller {
         } else {
             iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
         };
-        scroll.chain(locate(control))
+        scroll.chain(locate(control, self.generation))
     }
 
     fn arm_revealed(
@@ -3327,7 +2841,7 @@ impl Controller {
         }
         self.location_pending = true;
         iced::widget::operation::scroll_by(scrollable, self.reveal_offset)
-            .chain(locate(control.into()))
+            .chain(locate(control.into(), self.generation))
     }
 
     fn begin_advanced_numeric_edit(
@@ -3352,12 +2866,34 @@ impl Controller {
         self.arm_scrolled(advanced_field_id(index), RelativeOffset::END)
     }
 
-    pub fn update(&mut self, message: Message) -> Option<train::Message> {
+    pub(crate) fn accepts_message(&self, message: &Message) -> bool {
         if !self.running() {
+            return false;
+        }
+        match message {
+            Message::Scoped { generation, receipt, message } => {
+                *generation == self.generation
+                    && *generation == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+                    && match receipt {
+                        Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
+                        None => matches!(message.as_ref(), Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered),
+                    }
+            }
+            Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered => true,
+            _ => false,
+        }
+    }
+
+    pub fn update(&mut self, message: Message) -> Option<train::Message> {
+        if !self.accepts_message(&message) {
             return None;
         }
+        let message = match message {
+            Message::Scoped { message, .. } => *message,
+            message => message,
+        };
         let (control, bounds) = match message {
-            Message::Advance => return None,
+            Message::Scoped { .. } | Message::Advance => return None,
             Message::NumberWheelDelivered => {
                 if let Phase::AwaitAdvancedSpinnerWheel(index) = self.phase {
                     self.phase = Phase::AdvancedSpinnerWheelVerify(index);
@@ -3410,13 +2946,13 @@ impl Controller {
                 expected,
                 matched,
             } => {
-                self.annotation_pixels_pending = false;
+                self.annotation_pixels_pending = None;
                 if expected == 0 || expected != matched {
                     self.fail("Annotation pixels do not match source geometry and native palette");
                 } else if revision == 0 {
                     self.copy_swatch_ready = true;
                 } else {
-                    self.annotation_pixels_revision = revision;
+                    self.annotation_pixels_receipt = current_receipt("workflow.visual.workspace");
                 }
                 return None;
             }
@@ -3679,10 +3215,11 @@ impl Controller {
         let input_bounds = crate::presentation_surface::physical_bounds(bounds, self.input_scale);
         match self.phase.clone() {
             Phase::CopyCapability => {
+                self.control_probe_receipt = current_receipt("workflow.visual.workspace");
                 self.phase = Phase::CopyCapabilityWait;
                 #[cfg(target_arch = "wasm32")]
                 if let Some(mut output) =
-                    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+                    probe_output("workflow.visual.workspace")
                 {
                     let callback = pixel_result_callback(move |expected, matched| {
                         let _ =
@@ -3771,10 +3308,11 @@ impl Controller {
                 None
             }
             Phase::CopyLayout(_) => {
+                self.control_probe_receipt = current_receipt("workflow.visual.workspace");
                 self.phase = Phase::CopySwatchWait;
                 #[cfg(target_arch = "wasm32")]
                 if let Some(mut output) =
-                    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+                    probe_output("workflow.visual.workspace")
                 {
                     let callback = pixel_result_callback(move |expected, matched| {
                         let _ = output.try_send(Message::AnnotationPixels {
@@ -3805,7 +3343,7 @@ impl Controller {
                     self.annotation_probe.take()
                 {
                     if let Some(mut output) =
-                        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+                        probe_output("workflow.visual.workspace")
                     {
                         let callback = pixel_result_callback(move |expected, matched| {
                             let _ = output.try_send(Message::AnnotationPixels {
@@ -4363,7 +3901,7 @@ impl Controller {
                 presentation_revision,
             } => {
                 self.upscale_button = Some(input_bounds);
-                self.upscale_pixel_pending = false;
+                self.upscale_pixel_pending = None;
                 self.upscale_pixels = None;
                 self.upscale_repeat_revision = None;
                 self.upscale_repeat_observed = false;
@@ -4661,7 +4199,9 @@ impl Controller {
         self.phase = phase;
         // A completed local step has no pending native event to wake its
         // successor. Queue one continuation without requiring another draw.
-        let continuation = Task::done(RootMessage::Integration(Message::Advance));
+        let continuation = Task::done(RootMessage::Integration(Message::Scoped {
+            generation: self.generation, receipt: None, message: Box::new(Message::Advance),
+        }));
         if reveal_annotation {
             // The compact inspector scrolls the canvas offscreen. A pixel
             // assertion must reveal it before waiting for a completed draw.
@@ -7401,8 +6941,10 @@ impl Controller {
                 let Some(button) = self.upscale_button else {
                     return Task::none();
                 };
-                if !self.upscale_pixel_pending {
-                    self.upscale_pixel_pending = true;
+                let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else { return Task::none(); };
+                if self.upscale_pixel_pending.as_ref() != Some(&receipt) {
+                    self.upscale_pixels = None;
+                    self.upscale_pixel_pending = Some(receipt);
                     sample_upscale_pixels(viewer.image, button, source, drawn);
                     return Task::none();
                 }
@@ -7984,10 +7526,14 @@ impl Controller {
                         "annotation.inspector.scroll",
                         RelativeOffset::START,
                     ))
-                    .chain(locate("annotation.class.active.swatch".into()))
+                    .chain(locate("annotation.class.active.swatch".into(), self.generation))
                 }
             }
             Phase::CopySwatchWait => {
+                if self.control_probe_receipt != current_receipt("workflow.visual.workspace") {
+                    self.copy_swatch_ready = false;
+                    return self.advance_to(Phase::CopyLayout(2));
+                }
                 if self.copy_swatch_ready {
                     self.advance_to(Phase::CopyProductStart)
                 } else {
@@ -8036,6 +7582,10 @@ impl Controller {
                 )
             }
             Phase::CopyCapabilityWait => {
+                if self.control_probe_receipt != current_receipt("workflow.visual.workspace") {
+                    self.copy_capability_ready = false;
+                    return self.advance_to(Phase::CopyCapability);
+                }
                 if self.copy_capability_ready {
                     self.advance_to(Phase::CopyProductStart)
                 } else {
@@ -8373,13 +7923,13 @@ impl Controller {
                     self.copy_product_frame = snapshot.frame.revision;
                     return annotation_message(annotation::Message::CancelRequested);
                 }
+                let receipt = current_receipt("workflow.visual.workspace");
                 if self.viewer_scenario == "copy"
-                    && self.annotation_pixels_revision != snapshot.frame.revision
+                    && (receipt.is_none() || self.annotation_pixels_receipt != receipt)
                 {
-                    if self.annotation_pixels_pending {
-                        return Task::none();
-                    }
-                    self.annotation_pixels_pending = true;
+                    let Some(receipt) = receipt else { return Task::none(); };
+                    if self.annotation_pixels_pending.as_ref() == Some(&receipt) { return Task::none(); }
+                    self.annotation_pixels_pending = Some(receipt);
                     self.annotation_probe = Some((
                         snapshot.frame.revision,
                         presentation_revision,
@@ -8559,6 +8109,144 @@ mod tests {
     use super::*;
 
     #[test]
+    fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
+        initialize_reporting(false, false);
+        let mut driver = Controller::new(true, false, String::new(), String::new(), String::new(), String::new());
+        assert!(driver.running());
+        assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
+        assert!(!reporting_enabled());
+        assert!(!pixel_fixture_enabled());
+        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let mut surface = crate::view_model::test_support::physical_surface(frame);
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        // Even a diagnostic-marked surface cannot activate collection in a quiet driver.
+        surface.integration = true;
+        record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            let observer = observer.borrow();
+            assert!(observer.receipts.is_empty());
+            assert!(observer.output.is_none());
+            assert!(observer.subscription.is_none());
+            assert_eq!(observer.identity, (0, 0));
+        });
+        driver.phase = Phase::Complete;
+        driver.reset_scenario(String::new(), String::new(), String::new(), String::new()).unwrap();
+        assert!(driver.running());
+        assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
+        assert!(!reporting_enabled());
+        let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
+        let disabled = Controller::new(false, false, String::new(), String::new(), String::new(), String::new());
+        assert!(!disabled.running());
+        assert!(!DRIVER_ENABLED.with(std::cell::Cell::get));
+        notify_driver_draw(EXPLORE_GALLERY, frame.content_sequence, frame.presentation_revision);
+        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation), generation);
+    }
+
+    #[test]
+    fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_teardown() {
+        initialize_reporting(true, true);
+        let mut controller = Controller::new(true, false, "old-source".into(), "old-output".into(), "384".into(), "atlas".into());
+        let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
+        let old_subscription = std::sync::Arc::new(());
+        let mut old_output = ScenarioOutput { generation: controller.generation, receipt: None, sender };
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            let mut observer = observer.borrow_mut();
+            observer.subscription = Some(old_subscription.clone());
+            observer.output = Some(old_output.clone());
+            observer.identity = (3, 4);
+        });
+        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let mut surface = crate::view_model::test_support::physical_surface(frame);
+        surface.integration = true;
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+        let old_receipt = current_receipt(EXPLORE_GALLERY).unwrap();
+        old_output.try_send(Message::Located { control: EXPLORE_GALLERY.into(), bounds }).unwrap();
+        record_probe_draw(crate::view::workspace::STABLE_ID, surface, bounds, bounds, bounds);
+        let viewer = ViewerDraw { crop: surface.content_region(), container: bounds, image: bounds, fit_revision: 0 };
+        report_surface_draw(crate::view::workspace::STABLE_ID, 5, 1, false, 640, 480, 1, viewer);
+        controller.location_pending = true;
+        controller.atlas_baseline = Some((1, 5));
+        controller.reported_style_bits = 7;
+        controller.annotation_pixels_receipt = Some(old_receipt.clone());
+        controller.upscale_pixel_pending = Some(old_receipt);
+        assert!(controller.reset_scenario("new-source".into(), "new-output".into(), "512".into(), "upscale".into()).is_err());
+        controller.phase = Phase::Complete;
+        controller.reset_scenario("new-source".into(), "new-output".into(), "512".into(), "upscale".into()).unwrap();
+        assert!(!controller.location_pending);
+        assert!(controller.atlas_baseline.is_none());
+        assert!(controller.upscale_pixel_pending.is_none());
+        assert!(controller.annotation_pixels_receipt.is_none());
+        assert_eq!(controller.reported_style_bits, 0);
+        assert!(current_receipt(EXPLORE_GALLERY).is_none());
+        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().identity), (0, 0));
+        controller.location_pending = true; // Same widget may already be armed in the replacement.
+        while let Ok(message) = receiver.try_recv() { assert!(controller.update(message).is_none()); }
+        assert!(controller.location_pending);
+        assert!(controller.annotation_drawn.is_none());
+        // A late result retains the original sender/generation even after reset.
+        old_output.try_send(Message::SurfaceDrawn { presentation_revision: 5, source_revision: 1, viewer: None }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
+        assert!(controller.annotation_drawn.is_none());
+        for control in [EXPLORE_GALLERY, explore::DETAIL_WORKSPACE_ID, crate::view::workspace::STABLE_ID] {
+            assert!(probe_output(control).is_none(), "no physical receipt cannot schedule a probe");
+            report_surface_draw(control, 5, 1, false, 640, 480, 1, viewer);
+            assert!(receiver.try_recv().is_err(), "no physical receipt cannot enqueue a draw");
+            record_probe_draw(control, surface, bounds, bounds, bounds);
+            report_surface_draw(control, 5, 1, false, 640, 480, 1, viewer);
+            let queued = receiver.try_recv().unwrap();
+            let moved = Rectangle { x: 17.0, ..bounds };
+            record_probe_draw(control, surface, bounds, moved, bounds);
+            assert!(!controller.accepts_message(&queued));
+            controller.update(queued);
+            assert!(controller.annotation_drawn.is_none());
+            assert!(controller.viewer_drawn.is_none());
+            assert!(controller.gallery_drawn.is_none());
+            // Unchanged revisions and viewer fields must not suppress a new geometry receipt.
+            report_surface_draw(control, 5, 1, true, 640, 480, 2, viewer);
+            let queued = receiver.try_recv().unwrap();
+            assert!(controller.accepts_message(&queued));
+            controller.update(queued);
+            match control {
+                EXPLORE_GALLERY => assert_eq!(controller.gallery_drawn.take(), Some((5, 1))),
+                explore::DETAIL_WORKSPACE_ID => assert_eq!(controller.viewer_drawn.take(), Some((5, 1, viewer))),
+                _ => assert_eq!(controller.annotation_drawn.take(), Some((5, 1))),
+            }
+        }
+        let snapshot = std::sync::Arc::new(crate::view_model::test_support::explore_snapshot());
+        let draw = AtlasDraw { surface, snapshot, bounds, image: bounds, clip: bounds };
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().receipts.remove(EXPLORE_GALLERY));
+        report_atlas_draw(draw.clone(), true, 1.0);
+        assert!(receiver.try_recv().is_err());
+        record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+        report_atlas_draw(draw.clone(), true, 1.0);
+        let queued = receiver.try_recv().unwrap();
+        let moved_draw = AtlasDraw { image: Rectangle { x: 17.0, ..bounds }, ..draw };
+        record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds);
+        assert!(!controller.accepts_message(&queued));
+        controller.update(queued);
+        assert!(controller.atlas_receipt.is_none());
+        report_atlas_draw(moved_draw.clone(), true, 1.0);
+        let queued = receiver.try_recv().unwrap();
+        assert!(controller.accepts_message(&queued));
+        controller.update(queued);
+        assert_eq!(controller.atlas_receipt, Some(moved_draw));
+        old_output.generation = controller.generation;
+        old_output.try_send(Message::SurfaceDrawn { presentation_revision: 5, source_revision: 1, viewer: None }).unwrap();
+        assert!(!controller.accepts_message(&receiver.try_recv().unwrap()), "physical messages cannot use a generation-only output");
+        let replacement_subscription = std::sync::Arc::new(());
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().subscription = Some(replacement_subscription.clone()));
+        drop(SurfaceDrawSubscription(old_subscription));
+        assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.is_some()));
+        assert!(current_receipt(EXPLORE_GALLERY).is_some());
+        drop(SurfaceDrawSubscription(replacement_subscription));
+        assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.is_none()));
+        controller.phase = Phase::Failed;
+        assert!(controller.reset_scenario(String::new(), String::new(), String::new(), String::new()).is_err());
+        initialize_reporting(false, false);
+    }
+
+    #[test]
     fn integration_phases_assign_bounded_progress_deadline_classes() {
         assert_eq!(Phase::AwaitBootstrap.deadline_class(), "startup");
         assert_eq!(Phase::AwaitCompileCompletion.deadline_class(), "work");
@@ -8666,8 +8354,9 @@ mod tests {
         for (actual, expected) in rectangles.iter().zip([150.0, 150.0, 40.0, 30.0]) {
             assert!((actual - expected).abs() < 0.001);
         }
+        initialize_reporting(true, true);
         let mut controller = Controller::new(
-            false,
+            true,
             false,
             String::new(),
             String::new(),
@@ -8675,42 +8364,56 @@ mod tests {
             String::new(),
         );
         controller.phase = Phase::AwaitExploreReady;
-        let _ = controller.update(Message::AtlasPixels {
+        let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput {
+            generation: controller.generation, receipt: None, sender,
+        }));
+        record_probe_draw(EXPLORE_GALLERY, draw.surface, draw.bounds, draw.image, draw.clip);
+        let mut output = probe_output(EXPLORE_GALLERY).unwrap();
+        output.try_send(Message::AtlasPixels {
             receipt: draw.clone(),
             visible: 1,
             nonblack: 0,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        let _ = controller.update(Message::AtlasPixels {
+        output.try_send(Message::AtlasPixels {
             receipt: draw.clone(),
             visible: 0,
             nonblack: 0,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        let _ = controller.update(Message::AtlasPixels {
+        output.try_send(Message::AtlasPixels {
             receipt: draw.clone(),
             visible: 1,
             nonblack: 1,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_pixels, Some(draw.clone()));
-        let _ = controller.update(Message::AtlasComposition {
+        output.try_send(Message::AtlasComposition {
             receipt: draw.clone(),
             expected: 1,
             matched: 0,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        let _ = controller.update(Message::AtlasComposition {
+        output.try_send(Message::AtlasComposition {
             receipt: draw.clone(),
             expected: 0,
             matched: 0,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        let _ = controller.update(Message::AtlasComposition {
+        output.try_send(Message::AtlasComposition {
             receipt: draw.clone(),
             expected: 1,
             matched: 1,
-        });
+        }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_composition, Some(draw));
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
+        initialize_reporting(false, false);
     }
 
     #[test]

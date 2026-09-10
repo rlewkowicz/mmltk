@@ -37,6 +37,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         endif()
     endforeach()
 
+    find_program(MMLTK_FRONTEND_NODE_EXECUTABLE NAMES node REQUIRED)
     find_program(MMLTK_CARGO_EXECUTABLE NAMES cargo REQUIRED)
     find_program(MMLTK_RUSTC_EXECUTABLE NAMES rustc REQUIRED)
     find_program(MMLTK_RUSTFMT_EXECUTABLE NAMES rustfmt REQUIRED)
@@ -184,6 +185,8 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
     )
 
     add_custom_target(mmltk_frontend_iced_tests
+        COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
+            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
         COMMAND "${CMAKE_COMMAND}" -E env
             ${_mmltk_frontend_environment}
             "${MMLTK_CARGO_EXECUTABLE}" test

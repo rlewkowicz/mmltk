@@ -61,6 +61,57 @@ pub(crate) fn visual_frame(kind: PresentationSourceKind, revision: u64) -> Visua
     }
 }
 
+/// Coherent native Explore/control state and its exact physical publication.
+/// Owners may vary visual labels or allocation identity after construction.
+pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_surface::FrameReady) {
+    let mut model = bootstrapped();
+    model.set_foreground_feature(FeatureId::Explore);
+    let source = visual_frame(PresentationSourceKind::Explore, 1);
+    let frame = physical_frame(1, 1, 5, source.extent.width, source.extent.height);
+    let explore = model.explore.snapshot.as_mut().unwrap();
+    explore.ready = true;
+    explore.revision = 10;
+    explore.mode = crate::generated::ExploreMode::Detail;
+    explore.selectedimage = Some(0);
+    explore.frame = source.clone();
+    let control = model.presentation.as_mut().unwrap();
+    control.selected = source.source.clone();
+    control.completed = source;
+    control.presentationrevision = frame.presentation_revision;
+    control.completedsourcerevision = explore.revision;
+    control.capability = crate::generated::PresentationCapability {
+        surfacehigh: frame.high,
+        surfacelow: frame.low,
+        generation: 1,
+        extent: VisualExtent {
+            width: frame.content_width,
+            height: frame.content_height,
+        },
+        condition: crate::generated::PresentationCapabilityCondition::Ready,
+    };
+    (model, frame)
+}
+
+pub(crate) fn physical_frame(
+    content_session: u64,
+    content_sequence: u64,
+    presentation_revision: u64,
+    content_width: u32,
+    content_height: u32,
+) -> crate::presentation_surface::FrameReady {
+    crate::presentation_surface::FrameReady {
+        high: 1,
+        low: 2,
+        layer: 0,
+        slot: 0,
+        content_session,
+        content_sequence,
+        presentation_revision,
+        content_width,
+        content_height,
+    }
+}
+
 pub(crate) fn annotation_object(category: u16) -> crate::generated::AnnotationObject {
     use crate::generated::*;
     let point = AnnotationPoint { x: 1.0, y: 2.0 };

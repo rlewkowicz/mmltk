@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -84,6 +85,22 @@ static_assert(!std::constructible_from<wire::FlatValue, wire::ByteBuffer>);
 constexpr wire::Limits test_limits(const std::size_t max_bytes, const std::size_t max_items = 256U,
                                    const std::size_t max_depth = wire::kMaximumNestingDepth) {
     return {.max_bytes = max_bytes, .max_items = max_items, .max_depth = max_depth};
+}
+
+template <class Result>
+void require_decode_error(const Result& result, const wire::ErrorCode code) {
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().code == code);
+}
+
+template <std::size_t Size>
+void require_malformed_scalar(const std::array<std::byte, Size>& bytes, const wire::ErrorCode code) {
+    const auto limits = test_limits(Size, 8U, 4U);
+    require_decode_error(wire::decode({bytes, {}}, limits), code);
+    require_decode_error(wire::Reader({bytes, {}}, limits).read_flat(), code);
+    require_decode_error(wire::validate_raw_item({bytes, {}}, limits), code);
+    std::array<std::uint32_t, Size> scratch{};
+    require_decode_error(wire::validate_raw_item_structural(bytes, limits, {.key_offsets = scratch}), code);
 }
 
 template <class Value>
@@ -207,6 +224,7 @@ struct InheritedCborBase {
 
 struct InheritedCbor final : InheritedCborBase {
     std::uint32_t derived_count = 2U;
+    [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{9U}]] std::optional<std::uint16_t> optional_count;
 
     bool operator==(const InheritedCbor&) const = default;
 };
@@ -268,6 +286,47 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
     REQUIRE_FALSE(invalid.has_value());
     CHECK(invalid.error().code == wire::ErrorCode::LimitExceeded);
     CHECK(invalid.error().path == "inherited_limit");
+
+    // The owned path must enforce the same contract without wire-reader guards.
+    const auto check_owned = [&](wire::Value::Object fields, const bool valid, const std::optional<std::uint16_t> optional = {}) {
+        InheritedCbor destination = source;
+        destination.derived_count = 91U;
+        destination.optional_count = 8U;
+        const auto before = destination;
+        const wire::Value value(std::move(fields));
+        const auto result = mmltk::frameworks::serialization::decode_into(destination, value);
+        REQUIRE(result.has_value() == valid);
+        auto expected = source;
+        expected.optional_count = optional;
+        CHECK(destination == (valid ? expected : before));
+        if (valid) {
+            const auto decoded = decode_wire_object(value);
+            REQUIRE(decoded.has_value());
+            CHECK(*decoded == expected);
+        }
+    };
+    const wire::Value::Object reverse{
+        {"derived_count", wire::Value(std::uint64_t{5U})},
+        {"inherited_limit", wire::Value(std::int64_t{7})},
+    };
+    check_owned(reverse, true);  // Omitted optional clears a previously populated destination.
+    auto explicit_null = reverse;
+    explicit_null.insert(explicit_null.begin(), {"optional_count", wire::Value{}});
+    check_owned(std::move(explicit_null), true);
+    auto optional_present = reverse;
+    optional_present.emplace_back("optional_count", wire::Value(std::uint64_t{6U}));
+    check_owned(optional_present, true, 6U);
+    optional_present.back().second = wire::Value(std::uint64_t{10U});
+    check_owned(std::move(optional_present), false);
+    for (const auto& malformed : {missing_inherited, unknown_member, invalid_inherited}) {
+        check_owned(std::get<wire::Value::Object>(malformed.storage), false);
+    }
+    auto duplicate = reverse;
+    duplicate.emplace_back("inherited_limit", wire::Value(std::int64_t{7}));
+    check_owned(std::move(duplicate), false);
+    auto required_null = reverse;
+    required_null[1].second = wire::Value{};
+    check_owned(std::move(required_null), false);
 
     InheritedCbor invalid_source;
     invalid_source.inherited_limit = 0;
@@ -424,6 +483,26 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
     REQUIRE(mmltk::frameworks::serialization::decode_into(decoded_into, *reflected).has_value());
     CHECK(decoded_into == source);
 
+    auto reverse_owner = owner_object;
+    std::ranges::reverse(reverse_owner);
+    REQUIRE(mmltk::frameworks::serialization::decode_into(decoded_into, wire::Value(reverse_owner)));
+    CHECK(decoded_into == source);
+    for (const wire::Value::Object fields : {
+             wire::Value::Object{},
+             wire::Value::Object{{"unknown", wire::Value(std::uint64_t{1U})}},
+             wire::Value::Object{{"mask", wire::Value{}}},
+             wire::Value::Object{{"mask", wire::Value(std::uint64_t{1U})}, {"mask", wire::Value(std::uint64_t{1U})}},
+         }) {
+        auto malformed = reverse_owner;
+        malformed[0].second = wire::Value(fields);
+        Owner destination = source;
+        destination.value = 71U;
+        const auto before = destination;
+        const auto result = mmltk::frameworks::serialization::decode_into(destination, wire::Value(std::move(malformed)));
+        REQUIRE_FALSE(result.has_value());
+        CHECK(destination == before);
+    }
+
     std::array<std::byte, 128U> fixed{};
     const auto fixed_size = mmltk::frameworks::serialization::encode(source, fixed, test_limits(fixed.size()));
     REQUIRE(fixed_size.has_value());
@@ -437,11 +516,13 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
                       })},
     });
     Owner preserved = source;
+    preserved.value = 27U;
+    const auto before_invalid = preserved;
     const auto invalid_regular = mmltk::frameworks::serialization::decode_into(preserved, invalid_owner);
     REQUIRE_FALSE(invalid_regular.has_value());
     CHECK(invalid_regular.error().code == wire::ErrorCode::LimitExceeded);
     CHECK(invalid_regular.error().path.ends_with("mask"));
-    CHECK(preserved == source);
+    CHECK(preserved == before_invalid);
 
     const wire::Value projected(wire::Value::Object{
         {"owner", invalid_owner},
@@ -530,14 +611,6 @@ TEST_CASE("flat_dynamic_values_use_an_opaque_direct_reader_and_reject_recursive_
     const auto mapped = wire::Reader({object, {}}, test_limits(object.size(), 3U, 2U)).read_flat();
     REQUIRE_FALSE(mapped.has_value());
     CHECK(mapped.error().code == wire::ErrorCode::TypeMismatch);
-
-    const std::array nonminimal{std::byte{0x18}, std::byte{0x17}};
-    CHECK(wire::Reader({nonminimal, {}}, test_limits(nonminimal.size(), 1U, 0U)).read_flat().error().code == wire::ErrorCode::NonMinimal);
-    const std::array invalid_float{std::byte{0xf9}, std::byte{0x7e}, std::byte{0x00}};
-    CHECK(wire::Reader({invalid_float, {}}, test_limits(invalid_float.size(), 1U, 0U)).read_flat().error().code ==
-          wire::ErrorCode::InvalidFloat);
-    const std::array trailing{std::byte{0x07}, std::byte{0x00}};
-    CHECK(wire::Reader({trailing, {}}, test_limits(trailing.size(), 2U, 0U)).read_flat().error().code == wire::ErrorCode::TrailingData);
 }
 
 TEST_CASE("flat_reader_refuses_declared_capacity_before_allocating_an_array", "[frameworks][serialization]") {
@@ -623,7 +696,9 @@ TEST_CASE("raw_array_substitution_validates_and_splices_canonical_items", "[fram
 
 TEST_CASE("rejects_nonminimal_malformed_duplicate_and_invalid_utf8_values", "[frameworks][serialization]") {
     const std::array nonminimal{std::byte{0x18}, std::byte{0x17}};
-    REQUIRE(!wire::decode({nonminimal, {}}, {16U, 8U, 4U}).has_value());
+    require_malformed_scalar(nonminimal, wire::ErrorCode::NonMinimal);
+    const std::array invalid_float{std::byte{0xf9}, std::byte{0x7e}, std::byte{0x00}};
+    require_malformed_scalar(invalid_float, wire::ErrorCode::InvalidFloat);
     const std::array duplicate{std::byte{0xa2}, std::byte{0x61}, std::byte{'a'}, std::byte{0},
                                std::byte{0x61}, std::byte{'a'},  std::byte{0}};
     // CLEANUP-IGNORE: The root duplicate-key oracle and the later nested-map oracle are separate raw CBOR schemas
@@ -654,7 +729,7 @@ TEST_CASE("rejects_nonminimal_malformed_duplicate_and_invalid_utf8_values", "[fr
     REQUIRE_FALSE(nested_structural_duplicate.has_value());
     CHECK(nested_structural_duplicate.error().code == wire::ErrorCode::DuplicateKey);
     const std::array invalid_utf8{std::byte{0x61}, std::byte{0x80}};
-    REQUIRE(!wire::decode({invalid_utf8, {}}, {invalid_utf8.size(), 4U, 2U}).has_value());
+    require_malformed_scalar(invalid_utf8, wire::ErrorCode::InvalidUtf8);
     const std::array nested_invalid_utf8{std::byte{0xa1}, std::byte{0x65}, std::byte{'o'},  std::byte{'u'}, std::byte{'t'}, std::byte{'e'},
                                          std::byte{'r'},  std::byte{0xa1}, std::byte{0x65}, std::byte{'i'}, std::byte{'n'}, std::byte{'n'},
                                          std::byte{'e'},  std::byte{'r'},  std::byte{0x61}, std::byte{0x80}};
@@ -666,15 +741,15 @@ TEST_CASE("rejects_nonminimal_malformed_duplicate_and_invalid_utf8_values", "[fr
 
 TEST_CASE("rejects_trailing_indefinite_tagged_and_bounded_raw_items", "[frameworks][serialization]") {
     const std::array trailing{std::byte{0}, std::byte{0}};
-    REQUIRE(wire::decode({trailing, {}}, {trailing.size(), 4U, 2U}).error().code == wire::ErrorCode::TrailingData);
+    require_malformed_scalar(trailing, wire::ErrorCode::TrailingData);
     const std::array indefinite{std::byte{0x9f}, std::byte{0xff}};
-    REQUIRE(wire::decode({indefinite, {}}, {indefinite.size(), 4U, 2U}).error().code == wire::ErrorCode::IndefiniteContainer);
+    require_malformed_scalar(indefinite, wire::ErrorCode::IndefiniteContainer);
     const std::array tagged{std::byte{0xc0}, std::byte{0}};
-    REQUIRE(wire::decode({tagged, {}}, {tagged.size(), 4U, 2U}).error().code == wire::ErrorCode::InvalidMajorType);
+    require_malformed_scalar(tagged, wire::ErrorCode::InvalidMajorType);
     const std::array nested{std::byte{0x81}, std::byte{0x81}, std::byte{0}};
-    REQUIRE(wire::decode({nested, {}}, {nested.size(), 8U, 1U}).error().code == wire::ErrorCode::DepthExceeded);
-    REQUIRE(wire::decode({nested, {}}, {nested.size(), 2U, 8U}).error().code == wire::ErrorCode::LimitExceeded);
-    REQUIRE(wire::decode({nested, {}}, {nested.size() - 1U, 8U, 8U}).error().code == wire::ErrorCode::LimitExceeded);
+    require_decode_error(wire::decode({nested, {}}, {nested.size(), 8U, 1U}), wire::ErrorCode::DepthExceeded);
+    require_decode_error(wire::decode({nested, {}}, {nested.size(), 2U, 8U}), wire::ErrorCode::LimitExceeded);
+    require_decode_error(wire::decode({nested, {}}, {nested.size() - 1U, 8U, 8U}), wire::ErrorCode::LimitExceeded);
 }
 
 TEST_CASE("bounds_outbound_depth_and_item_counts_before_writing", "[frameworks][serialization]") {

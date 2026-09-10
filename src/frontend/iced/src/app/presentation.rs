@@ -424,7 +424,9 @@ impl App {
     }
 
     pub(super) fn sync_surface(&mut self) {
-        if let Err(error) = self.presentation.sync(&self.model, self.config.integration) {
+        let collect_integration =
+            self.config.integration && crate::integration_control::reporting_enabled();
+        if let Err(error) = self.presentation.sync(&self.model, collect_integration) {
             self.model.error = Some(UiError::presentation(error));
         }
         self.reconcile_surface_frame();
@@ -1275,44 +1277,10 @@ mod tests {
         reset_test_releases();
         let (mut app, task) = crate::app::boot();
         drop(task);
-        app.model = crate::view_model::test_support::bootstrapped();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
+        app.model = model;
         app.workspace.select(FeatureId::Explore);
-        app.model.set_foreground_feature(FeatureId::Explore);
-        let source =
-            crate::view_model::test_support::visual_frame(PresentationSourceKind::Explore, 1);
-        let explore = app.model.explore.snapshot.as_mut().unwrap();
-        explore.ready = true;
-        explore.revision = 10;
-        explore.mode = ExploreMode::Detail;
-        explore.selectedimage = Some(0);
-        explore.frame = source.clone();
-        let snapshot = app.model.presentation.as_mut().unwrap();
-        snapshot.selected = source.source.clone();
-        snapshot.completed = source;
-        snapshot.presentationrevision = 5;
-        snapshot.completedsourcerevision = 10;
-        snapshot.capability = crate::generated::PresentationCapability {
-            surfacehigh: 1,
-            surfacelow: 2,
-            generation: 1,
-            extent: VisualExtent {
-                width: 640,
-                height: 480,
-            },
-            condition: PresentationCapabilityCondition::Ready,
-        };
         app.sync_surface();
-        let frame = FrameReady {
-            high: 1,
-            low: 2,
-            layer: 0,
-            slot: 0,
-            content_session: 1,
-            content_sequence: 1,
-            presentation_revision: 5,
-            content_width: 640,
-            content_height: 480,
-        };
         (app, frame)
     }
 
@@ -1338,6 +1306,19 @@ mod tests {
             crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
         );
         (app, basic, start.correlation, receiver)
+    }
+
+    #[test]
+    fn quiet_integration_keeps_real_presentation_without_surface_instrumentation() {
+        let (mut app, frame) = viewer_app();
+        app.config.integration = true;
+        app.sync_surface();
+        assert!(!app.presentation.surface().unwrap().integration);
+        app.present_native_frame(frame);
+        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+        assert!(!app.presentation.surface().unwrap().integration);
+        app.presentation.discard();
+        assert_eq!(test_releases(), vec![frame]);
     }
 
     #[test]
@@ -1583,7 +1564,7 @@ mod tests {
     }
 
     #[test]
-    fn domain_control_publication_and_capture_reconcile_in_every_arrival_order() {
+    fn domain_control_publication_and_capture_reconcile_in_every_causal_order() {
         for domain_position in 0..4 {
             for control_position in (0..4).filter(|position| *position != domain_position) {
                 let remaining: Vec<_> = (0..4)
@@ -1591,38 +1572,53 @@ mod tests {
                         *position != domain_position && *position != control_position
                     })
                     .collect();
-                for physical_position in remaining {
-                    let (mut app, frame) = viewer_app();
-                    let next = FrameReady {
-                        content_sequence: 2,
-                        presentation_revision: 6,
-                        ..frame
-                    };
-                    for position in 0..4 {
-                        if position == domain_position {
-                            let explore = app.model.explore.snapshot.as_mut().unwrap();
-                            explore.frame.revision = 2;
-                            explore.revision = 20;
-                            app.reconcile_presentation(false);
-                        } else if position == control_position {
-                            let snapshot = app.model.presentation.as_mut().unwrap();
-                            snapshot.completed.revision = 2;
-                            snapshot.completedsourcerevision = 20;
-                            snapshot.presentationrevision = 6;
-                            app.reconcile_presentation(false);
-                        } else if position == physical_position {
-                            app.present_native_frame(next);
-                        } else {
-                            drop(app.on_presentation(Message::Surface(
-                                crate::presentation_surface::Notification::Completed(next),
-                            )));
-                        }
+                let physical_position = remaining[0];
+                let capture_position = remaining[1];
+                let (mut app, frame) = viewer_app();
+                let next = FrameReady {
+                    content_sequence: 2,
+                    presentation_revision: 6,
+                    ..frame
+                };
+                // Before-publication completion is an inert negative, never a successful schedule.
+                drop(app.on_presentation(Message::Surface(
+                    crate::presentation_surface::Notification::Completed(next),
+                )));
+                assert!(app.presentation.surface().unwrap().frame.is_none());
+                assert!(test_releases().is_empty());
+                for position in 0..4 {
+                    if position == domain_position {
+                        let explore = app.model.explore.snapshot.as_mut().unwrap();
+                        explore.frame.revision = 2;
+                        explore.revision = 20;
+                        app.reconcile_presentation(false);
+                    } else if position == control_position {
+                        let snapshot = app.model.presentation.as_mut().unwrap();
+                        snapshot.completed.revision = 2;
+                        snapshot.completedsourcerevision = 20;
+                        snapshot.presentationrevision = 6;
+                        app.reconcile_presentation(false);
+                    } else if position == physical_position {
+                        app.present_native_frame(next);
+                    } else {
+                        assert_eq!(position, capture_position);
+                        drop(app.on_presentation(Message::Surface(
+                            crate::presentation_surface::Notification::Completed(next),
+                        )));
                     }
-                    assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
-                    assert!(test_releases().is_empty());
-                    app.presentation.discard();
-                    assert_eq!(test_releases(), vec![next]);
+                    assert_eq!(
+                        app.presentation.surface().unwrap().frame,
+                        (position >= physical_position).then_some(next),
+                    );
+                    assert!(
+                        test_releases().is_empty(),
+                        "handoff retains physical custody at every intermediate step",
+                    );
                 }
+                assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
+                assert!(test_releases().is_empty());
+                app.presentation.discard();
+                assert_eq!(test_releases(), vec![next]);
             }
         }
     }
