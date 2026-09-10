@@ -93,6 +93,25 @@ pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_s
     (model, frame)
 }
 
+/// All twelve arrival orders in which publication precedes capture completion.
+/// The positions are domain metadata, control metadata, publication, and capture.
+pub(crate) fn presentation_arrival_orders() -> impl Iterator<Item = [usize; 4]> {
+    (0..4).flat_map(|domain| {
+        (0..4)
+            .filter(move |control| *control != domain)
+            .map(move |control| {
+                let mut remaining =
+                    (0..4).filter(|position| *position != domain && *position != control);
+                [
+                    domain,
+                    control,
+                    remaining.next().expect("publication position"),
+                    remaining.next().expect("capture position"),
+                ]
+            })
+    })
+}
+
 pub(crate) fn physical_frame(
     content_session: u64,
     content_sequence: u64,

@@ -321,6 +321,52 @@ struct ControlProbe {
     available: bool,
 }
 
+impl ControlProbe {
+    fn sample(self, bounds: Rectangle, control: &str, capability: bool) {
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (self, bounds, control, capability);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut output = self.output;
+            let canvas_probe = output.canvas_probe.clone();
+            let callback = pixel_result_callback(move |outcome| {
+                let message = if capability {
+                    Message::AnnotationControlPixels { outcome }
+                } else {
+                    Message::AnnotationPixels {
+                        revision: 0,
+                        outcome,
+                    }
+                };
+                let _ = output.try_send(message);
+            });
+            let detail = if capability {
+                if self.available {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            } else {
+                "native-hsv-completed-canvas"
+            };
+            annotation_swatch_js(
+                &canvas_probe,
+                &[
+                    f64::from(bounds.x),
+                    f64::from(bounds.y),
+                    f64::from(bounds.width),
+                    f64::from(bounds.height),
+                ],
+                &self.color,
+                control,
+                detail,
+                capability,
+                &callback,
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AnnotationProbe {
     output: ScenarioOutput,
@@ -3431,34 +3477,7 @@ impl Controller {
             Phase::CopyCapability => {
                 self.phase = Phase::CopyCapabilityWait;
                 if let Some(probe) = self.control_probe.take() {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let _ = probe;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let mut output = probe.output;
-                        let canvas_probe = output.canvas_probe.clone();
-                        let callback = pixel_result_callback(move |outcome| {
-                            let _ = output.try_send(Message::AnnotationControlPixels { outcome });
-                        });
-                        annotation_swatch_js(
-                            &canvas_probe,
-                            &[
-                                f64::from(input_bounds.x),
-                                f64::from(input_bounds.y),
-                                f64::from(input_bounds.width),
-                                f64::from(input_bounds.height),
-                            ],
-                            &probe.color,
-                            &control,
-                            if probe.available {
-                                "enabled"
-                            } else {
-                                "disabled"
-                            },
-                            true,
-                            &callback,
-                        );
-                    }
+                    probe.sample(input_bounds, &control, true);
                 }
                 None
             }
@@ -3531,33 +3550,7 @@ impl Controller {
             Phase::CopyLayout(_) => {
                 self.phase = Phase::CopySwatchWait;
                 if let Some(probe) = self.control_probe.take() {
-                    #[cfg(not(target_arch = "wasm32"))]
-                    let _ = probe;
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let mut output = probe.output;
-                        let canvas_probe = output.canvas_probe.clone();
-                        let callback = pixel_result_callback(move |outcome| {
-                            let _ = output.try_send(Message::AnnotationPixels {
-                                revision: 0,
-                                outcome,
-                            });
-                        });
-                        annotation_swatch_js(
-                            &canvas_probe,
-                            &[
-                                f64::from(input_bounds.x),
-                                f64::from(input_bounds.y),
-                                f64::from(input_bounds.width),
-                                f64::from(input_bounds.height),
-                            ],
-                            &probe.color,
-                            &control,
-                            "native-hsv-completed-canvas",
-                            false,
-                            &callback,
-                        );
-                    }
+                    probe.sample(input_bounds, &control, false);
                 }
                 None
             }
@@ -8393,6 +8386,50 @@ impl Controller {
 mod tests {
     use super::*;
 
+    struct ProbeFixture {
+        controller: Controller,
+        receiver: iced::futures::channel::mpsc::Receiver<Message>,
+        surface: crate::presentation_surface::Surface,
+        bounds: Rectangle,
+    }
+
+    impl ProbeFixture {
+        fn new(scenario: &str) -> Self {
+            initialize_reporting(true, true);
+            let controller = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                "512".into(),
+                scenario.into(),
+            );
+            let (sender, receiver) = iced::futures::channel::mpsc::channel(8);
+            SURFACE_DRAW_OBSERVER.with(|observer| {
+                observer.borrow_mut().output =
+                    Some(ScenarioOutput::new(controller.generation, sender))
+            });
+            let (_, frame) = crate::view_model::test_support::explore_presentation();
+            let surface = crate::presentation_surface::Surface {
+                integration: true,
+                ..crate::view_model::test_support::physical_surface(frame)
+            };
+            Self {
+                controller,
+                receiver,
+                surface,
+                bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0)),
+            }
+        }
+    }
+
+    impl Drop for ProbeFixture {
+        fn drop(&mut self) {
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
+            initialize_reporting(false, false);
+        }
+    }
+
     #[test]
     fn destructive_profile_continues_viewer_completion_into_annotation() {
         initialize_reporting(false, false);
@@ -8760,23 +8797,10 @@ mod tests {
 
     #[test]
     fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
-        initialize_reporting(true, true);
-        let mut controller = Controller::new(
-            true,
-            false,
-            String::new(),
-            String::new(),
-            "512".into(),
-            "atlas".into(),
-        );
-        let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| {
-            observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender))
-        });
-        let (_, frame) = crate::view_model::test_support::explore_presentation();
-        let mut surface = crate::view_model::test_support::physical_surface(frame);
-        surface.integration = true;
-        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        let mut fixture = ProbeFixture::new("atlas");
+        let surface = fixture.surface;
+        let bounds = fixture.bounds;
+        let (controller, receiver) = (&mut fixture.controller, &mut fixture.receiver);
         let draw = AtlasDraw {
             surface,
             bounds,
@@ -8844,8 +8868,6 @@ mod tests {
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_pixels, Some(draw.clone()));
         assert_eq!(controller.atlas_composition, Some(draw));
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
-        initialize_reporting(false, false);
     }
 
     #[test]
@@ -8879,24 +8901,11 @@ mod tests {
     #[test]
     fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence() {
         for consumer in 0..4 {
-            initialize_reporting(true, true);
-            let mut controller = Controller::new(
-                true,
-                false,
-                String::new(),
-                String::new(),
-                "512".into(),
-                "copy".into(),
-            );
-            let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-            SURFACE_DRAW_OBSERVER.with(|observer| {
-                observer.borrow_mut().output =
-                    Some(ScenarioOutput::new(controller.generation, sender))
-            });
-            let (_, frame) = crate::view_model::test_support::explore_presentation();
-            let mut surface = crate::view_model::test_support::physical_surface(frame);
-            surface.integration = true;
-            let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+            let mut fixture = ProbeFixture::new("copy");
+            let surface = fixture.surface;
+            let bounds = fixture.bounds;
+            let frame = surface.frame.unwrap();
+            let (controller, receiver) = (&mut fixture.controller, &mut fixture.receiver);
             let control = if consumer == 3 {
                 explore::DETAIL_WORKSPACE_ID
             } else {
@@ -8950,7 +8959,7 @@ mod tests {
                     outcome,
                 },
             };
-            let mut old = arm(&mut controller, bounds);
+            let mut old = arm(controller, bounds);
             let phase = controller.phase.clone();
             // JavaScript CSS/backing replacement may invalidate while this exact
             // Rust receipt is still current. Exercise the real message consumer.
@@ -8966,7 +8975,7 @@ mod tests {
                     && controller.upscale_pixels.is_none()
             );
 
-            let mut same_frame = arm(&mut controller, bounds);
+            let mut same_frame = arm(controller, bounds);
             old.try_send(message(ProbeOutcome::Invalidated)).unwrap();
             let stale = receiver.try_recv().unwrap();
             assert!(
@@ -8982,7 +8991,7 @@ mod tests {
 
             let moved = Rectangle { x: 17.0, ..bounds };
             record_probe_draw(control, surface, bounds, moved, bounds);
-            let mut replacement = arm(&mut controller, moved);
+            let mut replacement = arm(controller, moved);
             for outcome in [
                 ProbeOutcome::Invalidated,
                 ProbeOutcome::Failed,
@@ -9020,7 +9029,7 @@ mod tests {
             if consumer == 2 {
                 controller.annotation_pixels_pending = None;
             }
-            let mut current = arm(&mut controller, moved);
+            let mut current = arm(controller, moved);
             current
                 .try_send(message(ProbeOutcome::Observed(1, 0)))
                 .unwrap();
@@ -9030,12 +9039,12 @@ mod tests {
                     controller.upscale_pixels,
                     Some((frame.content_sequence, frame.presentation_revision, 1, 0))
                 );
-                let mut current = arm(&mut controller, moved);
+                let mut current = arm(controller, moved);
                 current.try_send(message(ProbeOutcome::Failed)).unwrap();
                 controller.update(receiver.try_recv().unwrap());
             }
             assert_eq!(controller.phase, Phase::Failed);
-            let mut malformed = arm(&mut controller, moved);
+            let mut malformed = arm(controller, moved);
             malformed
                 .try_send(message(ProbeOutcome::decode(
                     Some("observed"),
@@ -9044,30 +9053,16 @@ mod tests {
                 .unwrap();
             controller.update(receiver.try_recv().unwrap());
             assert_eq!(controller.phase, Phase::Failed);
-            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
-            initialize_reporting(false, false);
         }
     }
 
     #[test]
     fn probe_preparation_keeps_original_frame_through_widget_location() {
-        initialize_reporting(true, true);
-        let mut controller = Controller::new(
-            true,
-            false,
-            String::new(),
-            String::new(),
-            "512".into(),
-            "copy".into(),
-        );
-        let (sender, _receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| {
-            observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender))
-        });
-        let (_, frame) = crate::view_model::test_support::explore_presentation();
-        let mut surface = crate::view_model::test_support::physical_surface(frame);
-        surface.integration = true;
-        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        let mut fixture = ProbeFixture::new("copy");
+        let surface = fixture.surface;
+        let bounds = fixture.bounds;
+        let frame = surface.frame.unwrap();
+        let controller = &mut fixture.controller;
         for swatch in [false, true] {
             record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds);
             controller.phase = if swatch {
@@ -9118,8 +9113,6 @@ mod tests {
                     && controller.control_probe_receipt.is_none()
             );
         }
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
-        initialize_reporting(false, false);
     }
 
     #[test]

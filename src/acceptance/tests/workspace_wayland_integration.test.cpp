@@ -4462,11 +4462,12 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
               << "\nnative JSONL: " << diagnostics << "\nnative runtime log: " << runtime_log << "\nFirefox log: " << firefox_log << '\n'
               << std::flush;
 
-    // CLEANUP-IGNORE: This acceptance wait observes a test gate, while production monitors child-process custody.
     if (!logging) {
         // The acceptance socket reports entry into the real I/O gate. This
         // shutdown case needs neither diagnostic records nor a startup delay.
         std::uint64_t progress = 0U;
+        // CLEANUP-IGNORE: This wait combines acceptance commands, peer death and a phase deadline; production polls child custody, stop and
+        // escalation.
         for (;;) {
             std::array<pollfd, 3U> waits{{
                 {.fd = process.control_fd(), .events = POLLIN, .revents = 0},

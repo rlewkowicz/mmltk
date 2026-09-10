@@ -1590,6 +1590,17 @@ fn retained_draw_admitted(retained: Surface, requested: Surface, placement: Plac
 }
 
 impl SurfaceRenderer {
+    fn matching_import<'a>(
+        imported: &'a mut Option<Imported>,
+        pending: &'a mut Option<Imported>,
+        surface: Surface,
+    ) -> Option<&'a mut Imported> {
+        imported
+            .iter_mut()
+            .chain(pending.iter_mut())
+            .find(|candidate| same_allocation(candidate.image.surface, surface))
+    }
+
     fn reconcile_capture(
         &mut self,
         device: &wgpu::Device,
@@ -1597,31 +1608,18 @@ impl SurfaceRenderer {
         surface: Surface,
         placement: Placement,
     ) {
-        let imported_matches = self
-            .imported
-            .as_ref()
-            .is_some_and(|imported| same_allocation(imported.image.surface, surface));
-        let pending_matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| same_allocation(pending.image.surface, surface));
-        if imported_matches || pending_matches {
-            let selected = if imported_matches {
-                self.imported.as_mut()
-            } else {
-                self.pending.as_mut()
-            };
-            selected
-                .expect("matched imported surface")
-                .reconcile_capture(
-                    device,
-                    queue,
-                    &self.capture,
-                    &self.layout,
-                    &self.sampler,
-                    surface,
-                    placement,
-                );
+        if let Some(imported) =
+            Self::matching_import(&mut self.imported, &mut self.pending, surface)
+        {
+            imported.reconcile_capture(
+                device,
+                queue,
+                &self.capture,
+                &self.layout,
+                &self.sampler,
+                surface,
+                placement,
+            );
             return;
         }
         self.prepare(
@@ -1779,21 +1777,10 @@ impl SurfaceRenderer {
         {
             self.discard_pending();
         }
-        let imported_matches = self
-            .imported
-            .as_ref()
-            .is_some_and(|imported| same_allocation(imported.image.surface, surface));
-        let pending_matches = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| same_allocation(pending.image.surface, surface));
-        if imported_matches || pending_matches {
-            let selected = if imported_matches {
-                self.imported.as_mut()
-            } else {
-                self.pending.as_mut()
-            };
-            selected.expect("matched imported surface").prepare(
+        if let Some(imported) =
+            Self::matching_import(&mut self.imported, &mut self.pending, surface)
+        {
+            imported.prepare(
                 device,
                 queue,
                 &self.capture,
@@ -2859,250 +2846,241 @@ mod tests {
         };
 
         for replacement in [false, true] {
-            for domain_position in 0..4 {
-                for control_position in (0..4).filter(|position| *position != domain_position) {
-                    // A physical sample must exist before its receiver copy can
-                    // complete. Cover all twelve orders respecting that edge.
-                    let remaining: Vec<_> = (0..4)
-                        .filter(|position| {
-                            *position != domain_position && *position != control_position
-                        })
-                        .collect();
-                    let physical_position = remaining[0];
-                    let capture_position = remaining[1];
-                    reset_test_releases();
-                    let (mut model, old) = explore_presentation();
-                    let mut previous = physical_surface(old);
-                    previous.viewer_identity = Some((9, 0));
-                    let explore = model.explore.snapshot.as_mut().unwrap();
-                    explore.dataset.identity = 9;
-                    explore.overlay.showlabels = true;
-                    explore.scene.categories = vec![crate::generated::ArtifactClassName {
-                        value: "predecessor".into(),
-                    }];
-                    explore.scene.objects = vec![annotation_object(0)];
-                    let mut next_explore = explore.clone();
-                    next_explore.revision = 20;
-                    next_explore.frame.revision = 2;
-                    next_explore.scene.categories[0].value = "successor".into();
-                    next_explore.scene.objects[0].box_.first.x += 17.0;
-                    let snapshot = model.presentation.as_mut().unwrap();
-                    let mut next = FrameReady {
-                        content_sequence: 2,
-                        presentation_revision: 6,
-                        slot: 1,
-                        ..old
-                    };
-                    let mut target = previous;
-                    if replacement {
-                        next.low += 1;
-                        target.low = next.low;
-                        target.generation += 1;
-                        target.width *= 2;
-                        target.height *= 2;
-                    }
-                    target.frame = Some(next);
-                    // Capability B is already advertised while completion still
-                    // identifies A/F0. It cannot change the retained image.
-                    snapshot.capability.surfacehigh = target.high;
-                    snapshot.capability.surfacelow = target.low;
-                    snapshot.capability.generation = target.generation;
-                    snapshot.capability.extent.width = target.width;
-                    snapshot.capability.extent.height = target.height;
-                    snapshot.capability.condition = if replacement {
-                        crate::generated::PresentationCapabilityCondition::Admitted
-                    } else {
-                        crate::generated::PresentationCapabilityCondition::Ready
-                    };
-                    let mut next_control = snapshot.clone();
-                    next_control.completed = next_explore.frame.clone();
-                    next_control.completedsourcerevision = 20;
-                    next_control.presentationrevision = 6;
-                    next_control.capability.condition =
-                        crate::generated::PresentationCapabilityCondition::Ready;
-                    assert!(accept_publication(old));
-                    drop(CaptureBorrow::acquire(old).unwrap());
-                    let mut image = ImagePublication {
-                        surface: previous,
-                        owned_index: 0,
-                        pending_capture: None,
-                        captured: Some(old),
-                        gallery: None,
-                        detail: DetailContent::from_model(&model),
-                        placement: Placement::Contain,
-                    };
-                    record_drawn_detail(image.surface, image.surface.content_region());
-                    assert!(viewer_copy_matches(
-                        &model,
-                        image.detail.as_ref().unwrap().frame()
-                    ));
-                    assert_eq!(
-                        image.completed_content(
-                            image.detail.as_ref().unwrap().frame(),
-                            model.presentation.as_ref().unwrap(),
-                        ),
-                        Some(previous)
-                    );
-                    assert!(
-                        image
-                            .completed_content(
-                                &next_explore.frame,
-                                model.presentation.as_ref().unwrap()
-                            )
-                            .is_none()
-                    );
-                    let mut copy = None;
-                    let mut replacement_image: Option<ImagePublication> = None;
-                    let mut domain_arrived = false;
-                    let mut control_arrived = false;
-                    let mut capture_completed = false;
-                    for position in 0..4 {
-                        if position == domain_position {
-                            model.explore.snapshot = Some(next_explore.clone());
-                            domain_arrived = true;
-                        } else if position == control_position {
-                            model.presentation = Some(next_control.clone());
-                            control_arrived = true;
-                        } else if position == physical_position {
-                            assert!(accept_publication(next));
-                            copy = CaptureBorrow::acquire(next);
-                            assert!(copy.is_some());
-                            let pending = Some(PendingImage {
+            for [domain_position, control_position, physical_position, capture_position] in
+                crate::view_model::test_support::presentation_arrival_orders()
+            {
+                reset_test_releases();
+                let (mut model, old) = explore_presentation();
+                let mut previous = physical_surface(old);
+                previous.viewer_identity = Some((9, 0));
+                let explore = model.explore.snapshot.as_mut().unwrap();
+                explore.dataset.identity = 9;
+                explore.overlay.showlabels = true;
+                explore.scene.categories = vec![crate::generated::ArtifactClassName {
+                    value: "predecessor".into(),
+                }];
+                explore.scene.objects = vec![annotation_object(0)];
+                let mut next_explore = explore.clone();
+                next_explore.revision = 20;
+                next_explore.frame.revision = 2;
+                next_explore.scene.categories[0].value = "successor".into();
+                next_explore.scene.objects[0].box_.first.x += 17.0;
+                let snapshot = model.presentation.as_mut().unwrap();
+                let mut next = FrameReady {
+                    content_sequence: 2,
+                    presentation_revision: 6,
+                    slot: 1,
+                    ..old
+                };
+                let mut target = previous;
+                if replacement {
+                    next.low += 1;
+                    target.low = next.low;
+                    target.generation += 1;
+                    target.width *= 2;
+                    target.height *= 2;
+                }
+                target.frame = Some(next);
+                // Capability B is already advertised while completion still
+                // identifies A/F0. It cannot change the retained image.
+                snapshot.capability.surfacehigh = target.high;
+                snapshot.capability.surfacelow = target.low;
+                snapshot.capability.generation = target.generation;
+                snapshot.capability.extent.width = target.width;
+                snapshot.capability.extent.height = target.height;
+                snapshot.capability.condition = if replacement {
+                    crate::generated::PresentationCapabilityCondition::Admitted
+                } else {
+                    crate::generated::PresentationCapabilityCondition::Ready
+                };
+                let mut next_control = snapshot.clone();
+                next_control.completed = next_explore.frame.clone();
+                next_control.completedsourcerevision = 20;
+                next_control.presentationrevision = 6;
+                next_control.capability.condition =
+                    crate::generated::PresentationCapabilityCondition::Ready;
+                assert!(accept_publication(old));
+                drop(CaptureBorrow::acquire(old).unwrap());
+                let mut image = ImagePublication {
+                    surface: previous,
+                    owned_index: 0,
+                    pending_capture: None,
+                    captured: Some(old),
+                    gallery: None,
+                    detail: DetailContent::from_model(&model),
+                    placement: Placement::Contain,
+                };
+                record_drawn_detail(image.surface, image.surface.content_region());
+                assert!(viewer_copy_matches(
+                    &model,
+                    image.detail.as_ref().unwrap().frame()
+                ));
+                assert_eq!(
+                    image.completed_content(
+                        image.detail.as_ref().unwrap().frame(),
+                        model.presentation.as_ref().unwrap(),
+                    ),
+                    Some(previous)
+                );
+                assert!(
+                    image
+                        .completed_content(
+                            &next_explore.frame,
+                            model.presentation.as_ref().unwrap()
+                        )
+                        .is_none()
+                );
+                let mut copy = None;
+                let mut replacement_image: Option<ImagePublication> = None;
+                let mut domain_arrived = false;
+                let mut control_arrived = false;
+                let mut capture_completed = false;
+                for position in 0..4 {
+                    if position == domain_position {
+                        model.explore.snapshot = Some(next_explore.clone());
+                        domain_arrived = true;
+                    } else if position == control_position {
+                        model.presentation = Some(next_control.clone());
+                        control_arrived = true;
+                    } else if position == physical_position {
+                        assert!(accept_publication(next));
+                        copy = CaptureBorrow::acquire(next);
+                        assert!(copy.is_some());
+                        let pending = Some(PendingImage {
+                            surface: target,
+                            gallery: None,
+                            detail: None,
+                            placement: Placement::Contain,
+                            index: 1,
+                            complete: false,
+                            view_ready: false,
+                        });
+                        if replacement {
+                            replacement_image = Some(ImagePublication {
                                 surface: target,
+                                owned_index: 0,
+                                pending_capture: pending,
+                                captured: None,
                                 gallery: None,
                                 detail: None,
                                 placement: Placement::Contain,
-                                index: 1,
-                                complete: false,
-                                view_ready: false,
                             });
-                            if replacement {
-                                replacement_image = Some(ImagePublication {
-                                    surface: target,
-                                    owned_index: 0,
-                                    pending_capture: pending,
-                                    captured: None,
-                                    gallery: None,
-                                    detail: None,
-                                    placement: Placement::Contain,
-                                });
-                            } else {
-                                image.pending_capture = pending;
-                            }
                         } else {
-                            assert_eq!(position, capture_position);
-                            drop(copy.take());
-                            replacement_image
-                                .as_mut()
-                                .unwrap_or(&mut image)
-                                .complete(next);
-                            capture_completed = true;
+                            image.pending_capture = pending;
                         }
-                        if replacement {
-                            if replacement_image
-                                .as_mut()
-                                .is_some_and(|candidate| candidate.promote(next, &model))
-                            {
-                                image = replacement_image.take().unwrap();
-                            }
-                        } else {
-                            let _ = image.promote(next, &model);
-                        }
-                        let promoted = domain_arrived && control_arrived && capture_completed;
-                        assert_eq!(image.surface, if promoted { target } else { previous });
-                        assert_eq!(image.captured, Some(if promoted { next } else { old }));
-                        assert_eq!(image.owned_index, usize::from(promoted));
-                        let meaning = image.detail.as_ref().unwrap();
-                        assert_eq!(
-                            meaning.scene().categories[0].value,
-                            if promoted { "successor" } else { "predecessor" }
-                        );
-                        assert_eq!(
-                            meaning.scene().objects[0].box_.first.x,
-                            if promoted {
-                                next_explore.scene.objects[0].box_.first.x
-                            } else {
-                                next_explore.scene.objects[0].box_.first.x - 17.0
-                            }
-                        );
-                        assert!(meaning.overlay().showlabels);
-                        record_drawn_detail(image.surface, image.surface.content_region());
-                        let authorized = model
-                            .viewed_explore_frame()
-                            .is_some_and(|source| viewer_copy_matches(&model, &source));
-                        assert_eq!(
-                            authorized,
-                            promoted || (!domain_arrived && !control_arrived)
-                        );
-                        assert_eq!(
-                            test_releases(),
-                            if capture_completed {
-                                vec![old, next]
-                            } else {
-                                vec![old]
-                            }
-                        );
+                    } else {
+                        assert_eq!(position, capture_position);
+                        drop(copy.take());
+                        replacement_image
+                            .as_mut()
+                            .unwrap_or(&mut image)
+                            .complete(next);
+                        capture_completed = true;
                     }
-                    image.complete(next); // A duplicate completion cannot promote or release twice.
-                    assert!(!image.promote(next, &model));
-                    retire_publication(next);
-                    assert_eq!(test_releases(), vec![old, next]);
-                    // Label-only metadata advances no physical frame. Update
-                    // its coherent semantics without recapturing or releasing.
-                    let labels = model.explore.snapshot.as_mut().unwrap();
-                    labels.revision += 1;
-                    labels.overlay.showlabels = false;
+                    if replacement {
+                        if replacement_image
+                            .as_mut()
+                            .is_some_and(|candidate| candidate.promote(next, &model))
+                        {
+                            image = replacement_image.take().unwrap();
+                        }
+                    } else {
+                        let _ = image.promote(next, &model);
+                    }
+                    let promoted = domain_arrived && control_arrived && capture_completed;
+                    assert_eq!(image.surface, if promoted { target } else { previous });
+                    assert_eq!(image.captured, Some(if promoted { next } else { old }));
+                    assert_eq!(image.owned_index, usize::from(promoted));
+                    let meaning = image.detail.as_ref().unwrap();
                     assert_eq!(
-                        model.completed_presentation_reconciliation().unwrap(),
-                        crate::view_model::PresentationReconciliation::Matching
+                        meaning.scene().categories[0].value,
+                        if promoted { "successor" } else { "predecessor" }
                     );
-                    image.refresh_detail(&model);
-                    assert!(!image.detail.as_ref().unwrap().overlay().showlabels);
-                    assert_eq!(image.retained(), Some(target));
-                    assert_eq!(test_releases(), vec![old, next]);
-                    let obsolete = FrameReady {
-                        content_sequence: 3,
-                        presentation_revision: 7,
-                        ..next
-                    };
-                    assert!(accept_publication(obsolete));
-                    let unsettled = CaptureBorrow::acquire(obsolete).unwrap();
-                    image.pending_capture = Some(PendingImage {
-                        surface: Surface {
-                            frame: Some(obsolete),
-                            ..target
-                        },
-                        gallery: None,
-                        detail: None,
-                        placement: Placement::Contain,
-                        index: 0,
-                        complete: false,
-                        view_ready: false,
-                    });
-                    let current = model.explore.snapshot.as_mut().unwrap();
-                    current.revision = 40;
-                    current.frame.revision = 4;
-                    let completed = model.presentation.as_mut().unwrap();
-                    completed.completed.revision = 3;
-                    completed.completedsourcerevision = 30;
-                    completed.presentationrevision = 7;
                     assert_eq!(
-                        model.completed_presentation_reconciliation().unwrap(),
-                        crate::view_model::PresentationReconciliation::Superseded
+                        meaning.scene().objects[0].box_.first.x,
+                        if promoted {
+                            next_explore.scene.objects[0].box_.first.x
+                        } else {
+                            next_explore.scene.objects[0].box_.first.x - 17.0
+                        }
                     );
-                    image.discard(obsolete);
-                    retire_publication(obsolete);
-                    assert_eq!(test_releases(), vec![old, next]); // GPU custody still owns this release.
-                    drop(unsettled);
-                    image.complete(obsolete);
-                    assert!(!image.promote(obsolete, &model));
-                    assert_eq!(image.retained(), Some(target));
+                    assert!(meaning.overlay().showlabels);
+                    record_drawn_detail(image.surface, image.surface.content_region());
+                    let authorized = model
+                        .viewed_explore_frame()
+                        .is_some_and(|source| viewer_copy_matches(&model, &source));
                     assert_eq!(
-                        image.detail.as_ref().unwrap().scene().categories[0].value,
-                        "successor"
+                        authorized,
+                        promoted || (!domain_arrived && !control_arrived)
                     );
-                    assert_eq!(test_releases(), vec![old, next, obsolete]);
+                    assert_eq!(
+                        test_releases(),
+                        if capture_completed {
+                            vec![old, next]
+                        } else {
+                            vec![old]
+                        }
+                    );
                 }
+                image.complete(next); // A duplicate completion cannot promote or release twice.
+                assert!(!image.promote(next, &model));
+                retire_publication(next);
+                assert_eq!(test_releases(), vec![old, next]);
+                // Label-only metadata advances no physical frame. Update
+                // its coherent semantics without recapturing or releasing.
+                let labels = model.explore.snapshot.as_mut().unwrap();
+                labels.revision += 1;
+                labels.overlay.showlabels = false;
+                assert_eq!(
+                    model.completed_presentation_reconciliation().unwrap(),
+                    crate::view_model::PresentationReconciliation::Matching
+                );
+                image.refresh_detail(&model);
+                assert!(!image.detail.as_ref().unwrap().overlay().showlabels);
+                assert_eq!(image.retained(), Some(target));
+                assert_eq!(test_releases(), vec![old, next]);
+                let obsolete = FrameReady {
+                    content_sequence: 3,
+                    presentation_revision: 7,
+                    ..next
+                };
+                assert!(accept_publication(obsolete));
+                let unsettled = CaptureBorrow::acquire(obsolete).unwrap();
+                image.pending_capture = Some(PendingImage {
+                    surface: Surface {
+                        frame: Some(obsolete),
+                        ..target
+                    },
+                    gallery: None,
+                    detail: None,
+                    placement: Placement::Contain,
+                    index: 0,
+                    complete: false,
+                    view_ready: false,
+                });
+                let current = model.explore.snapshot.as_mut().unwrap();
+                current.revision = 40;
+                current.frame.revision = 4;
+                let completed = model.presentation.as_mut().unwrap();
+                completed.completed.revision = 3;
+                completed.completedsourcerevision = 30;
+                completed.presentationrevision = 7;
+                assert_eq!(
+                    model.completed_presentation_reconciliation().unwrap(),
+                    crate::view_model::PresentationReconciliation::Superseded
+                );
+                image.discard(obsolete);
+                retire_publication(obsolete);
+                assert_eq!(test_releases(), vec![old, next]); // GPU custody still owns this release.
+                drop(unsettled);
+                image.complete(obsolete);
+                assert!(!image.promote(obsolete, &model));
+                assert_eq!(image.retained(), Some(target));
+                assert_eq!(
+                    image.detail.as_ref().unwrap().scene().categories[0].value,
+                    "successor"
+                );
+                assert_eq!(test_releases(), vec![old, next, obsolete]);
             }
         }
     }

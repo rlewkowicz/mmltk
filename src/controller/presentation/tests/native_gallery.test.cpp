@@ -1272,15 +1272,41 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
 }
 
+class AcceptanceGateFixture final {
+   public:
+    explicit AcceptanceGateFixture(const int transport) : AcceptanceGateFixture(OpenSockets(transport)) {}
+    [[nodiscard]] ExploreAcceptanceGate& gate() noexcept { return gate_; }
+    [[nodiscard]] mmltk::common::io::ScopedFd& commands() noexcept { return commands_; }
+
+    template <class T>
+    T Await(std::future<T>& result) {
+        const auto status = result.wait_for(std::chrono::seconds{2});
+        if (status != std::future_status::ready) gate_.Stop();
+        REQUIRE(status == std::future_status::ready);
+        return result.get();
+    }
+
+   private:
+    using Sockets = std::array<mmltk::common::io::ScopedFd, 2U>;
+    [[nodiscard]] static Sockets OpenSockets(const int transport) {
+        std::array<int, 2U> sockets{};
+        REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+        return {mmltk::common::io::ScopedFd{sockets[0]}, mmltk::common::io::ScopedFd{sockets[1]}};
+    }
+    explicit AcceptanceGateFixture(Sockets sockets) : commands_(std::move(sockets[0])), gate_(sockets[1].release()) {}
+
+    mmltk::common::io::ScopedFd commands_;
+    ExploreAcceptanceGate gate_;
+};
+
 TEST_CASE("acceptance gate retains one reader across settled frontend workflows", "[explore][acceptance][control]") {
     using Kind = contracts::IntegrationControlKind;
     const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
-    std::array<int, 2U> sockets{};
-    REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
-    mmltk::common::io::ScopedFd commands{sockets[0]};
-    ExploreAcceptanceGate gate{sockets[1]};
     std::promise<contracts::IntegrationControlReceipt> advanced;
     auto delivered = advanced.get_future();
+    AcceptanceGateFixture fixture{transport};
+    auto& commands = fixture.commands();
+    auto& gate = fixture.gate();
     gate.SetFrontendCommand([&advanced](const auto receipt) {
         advanced.set_value(receipt);
         return true;
@@ -1289,10 +1315,7 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
     REQUIRE(::send(commands.get(), &release_held, sizeof(release_held), MSG_NOSIGNAL) == sizeof(release_held));
     REQUIRE(gate.ClaimHeldCompletion());
     auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(0U, 4U, 8U, 64U); });
-    const auto held_status = held.wait_for(std::chrono::seconds{2});
-    if (held_status != std::future_status::ready) gate.Stop();
-    REQUIRE(held_status == std::future_status::ready);
-    CHECK(held.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Proceed);
     CHECK_FALSE(gate.ClaimHeldCompletion());
     CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 2U}));
     CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
@@ -1302,10 +1325,7 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
     CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
     const std::uint8_t advance = 8U;
     REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
-    const auto status = delivered.wait_for(std::chrono::seconds{2});
-    if (status != std::future_status::ready) gate.Stop();
-    REQUIRE(status == std::future_status::ready);
-    CHECK((delivered.get() == contracts::IntegrationControlReceipt{.kind = Kind::Advance, .sequence = 2U}));
+    CHECK((fixture.Await(delivered) == contracts::IntegrationControlReceipt{.kind = Kind::Advance, .sequence = 2U}));
     CHECK(gate.ClaimHeldCompletion());
     CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
     CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 2U, .progress = 1U}));
@@ -1318,24 +1338,17 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
 
 TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits", "[explore][acceptance][control]") {
     const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
-    std::array<int, 2U> sockets{};
-    REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
-    mmltk::common::io::ScopedFd commands{sockets[0]};
-    ExploreAcceptanceGate gate{sockets[1]};
+    AcceptanceGateFixture fixture{transport};
+    auto& commands = fixture.commands();
+    auto& gate = fixture.gate();
     for (const auto command : std::array<std::uint8_t, 3U>{1U, 2U, 4U})
         REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
     gate.AdvanceGeneration(7U);
     auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
-    const auto status = initial.wait_for(std::chrono::seconds{2});
-    if (status != std::future_status::ready) gate.Stop();
-    REQUIRE(status == std::future_status::ready);
-    CHECK(initial.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    CHECK(fixture.Await(initial) == ExploreAcceptanceGate::WaitResult::Proceed);
     REQUIRE(gate.ClaimHeldCompletion());
     auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 4U, 8U, 64U); });
-    const auto held_status = held.wait_for(std::chrono::seconds{2});
-    if (held_status != std::future_status::ready) gate.Stop();
-    REQUIRE(held_status == std::future_status::ready);
-    CHECK(held.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Proceed);
     CHECK_FALSE(gate.ClaimHeldCompletion());
     gate.AdvanceGeneration(8U);
     CHECK(gate.AwaitInitialRelease(7U) == ExploreAcceptanceGate::WaitResult::Stale);
@@ -1345,12 +1358,11 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
 
 TEST_CASE("acceptance gate rejects premature advancement and unavailable callbacks", "[explore][acceptance][control]") {
     const unsigned terminal_path = GENERATE(0U, 1U, 2U, 3U, 4U);
-    std::array<int, 2U> sockets{};
-    REQUIRE(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets.data()) == 0);
-    mmltk::common::io::ScopedFd commands{sockets[0]};
-    ExploreAcceptanceGate gate{sockets[1]};
     std::promise<void> invoked;
     auto invocation = invoked.get_future();
+    AcceptanceGateFixture fixture{SOCK_SEQPACKET};
+    auto& commands = fixture.commands();
+    auto& gate = fixture.gate();
     gate.SetFrontendCommand([terminal_path, &invoked](auto) {
         invoked.set_value();
         return terminal_path == 4U;
@@ -1362,18 +1374,11 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
     const std::uint8_t advance = 8U;
     if (terminal_path < 2U || terminal_path == 4U)
         REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
-    if (terminal_path == 1U || terminal_path == 4U) {
-        const auto callback_status = invocation.wait_for(std::chrono::seconds{2});
-        if (callback_status != std::future_status::ready) gate.Stop();
-        REQUIRE(callback_status == std::future_status::ready);
-    }
+    if (terminal_path == 1U || terminal_path == 4U) fixture.Await(invocation);
     if (terminal_path == 4U) REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
     if (terminal_path == 3U) commands.reset();
     auto waiting = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(1U); });
-    const auto status = waiting.wait_for(std::chrono::seconds{2});
-    if (status != std::future_status::ready) gate.Stop();
-    REQUIRE(status == std::future_status::ready);
-    CHECK(waiting.get() == ExploreAcceptanceGate::WaitResult::Stale);
+    CHECK(fixture.Await(waiting) == ExploreAcceptanceGate::WaitResult::Stale);
     CHECK(gate.ClaimTerminalReport());
 }
 

@@ -1,5 +1,6 @@
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <atomic>
 #include <algorithm>
@@ -1644,6 +1645,14 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     CHECK(remote_training.snapshot().remote.revision > remote_admitted.remote.revision);
 }
 
+[[nodiscard]] auto release_training_publication_on_exit(TrainingSystem& system, StopGate& runtime, std::promise<void>& publication) {
+    return mmltk::testsupport::ScopedTestCleanup{[&system, &runtime, &publication] {
+        mmltk::testsupport::release_test_promise(publication);
+        runtime.Release();
+        static_cast<void>(system.Stop({}));
+    }};
+}
+
 TEST_CASE("training completion releases admission before observer publication returns", "[controller][systems][training][settlement]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-settlement");
     ApplicationDataFixture fixture{root};
@@ -1661,11 +1670,7 @@ TEST_CASE("training completion releases admission before observer publication re
                              local_publishing.set_value();
                              release_local.wait();
                          }};
-    mmltk::testsupport::ScopedTestCleanup release_local_on_exit{[&] {
-        mmltk::testsupport::release_test_promise(release_local_publication);
-        local_gate->Release();
-        static_cast<void>(local.Stop({}));
-    }};
+    auto release_local_on_exit = release_training_publication_on_exit(local, *local_gate, release_local_publication);
     static_cast<void>(local.Start({}));
     auto publishing = local_publishing.get_future();
     REQUIRE(publishing.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
@@ -1686,11 +1691,7 @@ TEST_CASE("training completion releases admission before observer publication re
                              query_publishing.set_value(changed->snapshot);
                              release_query.wait();
                          }};
-    mmltk::testsupport::ScopedTestCleanup release_query_on_exit{[&] {
-        mmltk::testsupport::release_test_promise(release_query_publication);
-        query_gate->Release();
-        static_cast<void>(query.Stop({}));
-    }};
+    auto release_query_on_exit = release_training_publication_on_exit(query, *query_gate, release_query_publication);
     static_cast<void>(query.Query({}));
     auto query_publication = query_publishing.get_future();
     REQUIRE(query_publication.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
@@ -1706,6 +1707,8 @@ TEST_CASE("training completion releases admission before observer publication re
 
 TEST_CASE("training admission and matching cancellation do not invert system and worker locks",
           "[controller][systems][training][admission]") {
+    const bool provider_query = GENERATE(false, true);
+    CAPTURE(provider_query);
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-admission");
     ApplicationDataFixture fixture{root};
     // CLEANUP-IGNORE: Admission-race setup selects local model facts; provider cancellation tests above deliberately
@@ -1713,77 +1716,52 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
 
-    auto local_gate = std::make_shared<StopGate>();
-    std::promise<void> local_done;
-    TrainingSystem local{settings, dataset, model, [local_gate] { return std::make_unique<FakeTrainingRuntime>(local_gate, false); },
-                         [&](TrainingSystem::event_type event) {
-                             if (!std::holds_alternative<TrainingProgress>(event)) local_done.set_value();
-                         }};
-    mmltk::testsupport::TestGate local_admission{"concurrent training Start and Stop admission"};
-    std::future<TrainingSnapshot> starting, stopping;
-    mmltk::testsupport::ScopedTestCleanup release_local{[&] {
-        local_admission.Release();
-        local_gate->Release();
+    auto runtime_gate = std::make_shared<StopGate>();
+    std::promise<void> done;
+    TrainingSystem system{settings, dataset, model, [runtime_gate] { return std::make_unique<FakeTrainingRuntime>(runtime_gate, false); },
+                          [&](TrainingSystem::event_type event) {
+                              if (!std::holds_alternative<TrainingProgress>(event)) done.set_value();
+                          }};
+    mmltk::testsupport::TestGate admission{provider_query ? "concurrent provider Query and Clear admission"
+                                                          : "concurrent training Start and Stop admission"};
+    std::future<TrainingSnapshot> starting;
+    std::future<void> cancelling;
+    mmltk::testsupport::ScopedTestCleanup release_runtime{[&] {
+        admission.Release();
+        runtime_gate->Release();
     }};
     starting = std::async(std::launch::async, [&] {
-        local_admission.receipt().ArriveAndWait();
-        return local.Start({});
+        admission.receipt().ArriveAndWait();
+        return provider_query ? system.Query({}) : system.Start({});
     });
-    stopping = std::async(std::launch::async, [&] {
-        local_admission.receipt().ArriveAndWait();
-        return local.Stop({});
+    cancelling = std::async(std::launch::async, [&] {
+        admission.receipt().ArriveAndWait();
+        if (provider_query) {
+            try {
+                static_cast<void>(system.Clear({}));
+            } catch (const contracts::BusyError&) {}
+        } else {
+            static_cast<void>(system.Stop({}));
+        }
     });
-    REQUIRE(local_admission.WaitEntered(std::chrono::seconds{2}, 2U));
-    local_admission.Release();
+    REQUIRE(admission.WaitEntered(std::chrono::seconds{2}, 2U));
+    admission.Release();
     const auto start_status = starting.wait_for(std::chrono::seconds{2});
-    const auto stop_status = stopping.wait_for(std::chrono::seconds{2});
-    if (start_status != std::future_status::ready || stop_status != std::future_status::ready) local_gate->Release();
+    const auto cancel_status = cancelling.wait_for(std::chrono::seconds{2});
+    if (start_status != std::future_status::ready || cancel_status != std::future_status::ready) runtime_gate->Release();
     REQUIRE(start_status == std::future_status::ready);
-    REQUIRE(stop_status == std::future_status::ready);
+    REQUIRE(cancel_status == std::future_status::ready);
     CHECK_NOTHROW(static_cast<void>(starting.get()));
-    CHECK_NOTHROW(static_cast<void>(stopping.get()));
-    static_cast<void>(local.Stop({}));
-    // CLEANUP-IGNORE: Local Stop and provider Clear are separate lock-order paths within the same sealed system.
-    auto local_terminal = local_done.get_future();
-    REQUIRE(local_terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
-    local_terminal.get();
-
-    auto query_gate = std::make_shared<StopGate>();
-    std::promise<void> query_done;
-    TrainingSystem query{settings, dataset, model, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
-                         [&](TrainingSystem::event_type event) {
-                             if (!std::holds_alternative<TrainingProgress>(event)) query_done.set_value();
-                         }};
-    mmltk::testsupport::TestGate query_admission{"concurrent provider Query and Clear admission"};
-    std::future<TrainingSnapshot> querying;
-    std::future<void> clearing;
-    mmltk::testsupport::ScopedTestCleanup release_query{[&] {
-        query_admission.Release();
-        query_gate->Release();
-    }};
-    querying = std::async(std::launch::async, [&] {
-        query_admission.receipt().ArriveAndWait();
-        return query.Query({});
-    });
-    clearing = std::async(std::launch::async, [&] {
-        query_admission.receipt().ArriveAndWait();
-        try {
-            static_cast<void>(query.Clear({}));
-        } catch (const contracts::BusyError&) {}
-    });
-    REQUIRE(query_admission.WaitEntered(std::chrono::seconds{2}, 2U));
-    query_admission.Release();
-    const auto query_status = querying.wait_for(std::chrono::seconds{2});
-    const auto clear_status = clearing.wait_for(std::chrono::seconds{2});
-    if (query_status != std::future_status::ready || clear_status != std::future_status::ready) query_gate->Release();
-    REQUIRE(query_status == std::future_status::ready);
-    REQUIRE(clear_status == std::future_status::ready);
-    CHECK_NOTHROW(static_cast<void>(querying.get()));
-    CHECK_NOTHROW(clearing.get());
-    static_cast<void>(query.Clear({}));
-    auto query_terminal = query_done.get_future();
-    REQUIRE(query_terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
-    query_terminal.get();
+    CHECK_NOTHROW(cancelling.get());
+    // Clear alone may reject busy provider work at admission. Local Stop must
+    // never acquire that exception policy; each generated case settles its own API.
+    if (provider_query)
+        static_cast<void>(system.Clear({}));
+    else
+        static_cast<void>(system.Stop({}));
+    auto terminal = done.get_future();
+    REQUIRE(terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+    terminal.get();
 }
 
 }  // namespace

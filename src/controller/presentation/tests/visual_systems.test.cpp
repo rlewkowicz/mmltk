@@ -1521,6 +1521,57 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
     return {};
 }
 
+[[nodiscard]] auto settle_visual_on_exit(detail::VisualRuntimeOwner& owner, std::promise<void>& release) {
+    return mmltk::testsupport::ScopedTestCleanup{[&owner, &release] {
+        mmltk::testsupport::release_test_promise(release);
+        owner.RequestStop();
+        owner.StopAndWait();
+    }};
+}
+
+[[nodiscard]] std::uint64_t borrowed_visual_revision(detail::VisualRuntimeOwner& owner) {
+    const auto borrowed = owner.Borrow();
+    REQUIRE(borrowed.valid());
+    return borrowed.plane(0U).revision();
+}
+
+[[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing,
+                                                             std::shared_future<void> release, const std::size_t ordinal) {
+    return [factory = std::move(factory), &constructing, release = std::move(release), ordinal,
+            constructions = std::size_t{0U}](auto revisions) mutable {
+        if (ordinal == 0U || ++constructions == ordinal) {
+            constructing.set_value();
+            release.wait();
+        }
+        return factory(std::move(revisions));
+    };
+}
+
+// The reader task owns both acquisition and destruction of its shared locks.
+// The test thread holds only the gate and the scalar completion result.
+class HeldVisualReader final {
+   public:
+    HeldVisualReader(detail::VisualRuntimeOwner& owner, std::string name)
+        : gate_(std::move(name)), reading_(std::async(std::launch::async, [&owner, receipt = gate_.receipt()] {
+              const auto held = owner.Borrow();
+              receipt.ArriveAndWait();
+              return held.valid() ? held.plane(0U).revision() : 0U;
+          })) {}
+    ~HeldVisualReader() {
+        gate_.Release();
+        if (reading_.valid()) reading_.wait();
+    }
+    [[nodiscard]] bool WaitEntered() const { return gate_.WaitEntered(2s); }
+    [[nodiscard]] std::uint64_t ReleaseAndWait() {
+        gate_.Release();
+        return mmltk::testsupport::await_test_future(reading_, gate_.name());
+    }
+
+   private:
+    mmltk::testsupport::TestGate gate_;
+    std::future<std::uint64_t> reading_;
+};
+
 void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std::uint64_t>& completed, const bool staged = false) {
     auto work = [&completed](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
@@ -1540,17 +1591,30 @@ void submit_visual_completion(detail::VisualRuntimeOwner& owner, std::promise<vo
     }));
 }
 
-[[nodiscard]] detail::VisualRuntimeOwner::Work record_visual_work(std::mutex& mutex, std::vector<int>& values, const int value,
-                                                                  std::promise<void>* completed = nullptr) {
-    return [&mutex, &values, value, completed](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
-        {
-            std::scoped_lock lock(mutex);
-            values.push_back(value);
-        }
-        if (completed != nullptr) completed->set_value();
-        return detail::VisualRuntimeOwner::Notification{};
-    };
-}
+// Declared before the runtime owner so recorded-work callbacks settle before
+// their result storage and completion promise are destroyed.
+class VisualWorkLog final {
+   public:
+    void Append(const int value) {
+        std::scoped_lock lock(mutex_);
+        values_.push_back(value);
+    }
+    [[nodiscard]] detail::VisualRuntimeOwner::Work Record(const int value, const bool completes = false) {
+        return [this, value, completes](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+            Append(value);
+            if (completes) completed_.set_value();
+            return detail::VisualRuntimeOwner::Notification{};
+        };
+    }
+    void AwaitCompletion() { mmltk::testsupport::await_test_promise(completed_, "recorded visual work completion", 2s); }
+    // The test reads only after stopping and joining its runtime owner.
+    [[nodiscard]] const std::vector<int>& values() const noexcept { return values_; }
+
+   private:
+    std::mutex mutex_;
+    std::vector<int> values_;
+    std::promise<void> completed_;
+};
 
 void submit_blocked_visual_work(detail::VisualRuntimeOwner& owner, std::promise<void>& entered, std::shared_future<void> release) {
     REQUIRE(owner.SubmitOrdered([&entered, release = std::move(release)](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -1686,6 +1750,13 @@ class PresentationScenario final {
 
 class TestPresentationWriter final : public PresentationNativeWriter {
    public:
+    [[nodiscard]] static PresentationNativeWriterFactory Factory(std::shared_ptr<FakeImageBackend> backend,
+                                                                 std::shared_ptr<TestPresentationWriterState> state) {
+        return [backend = std::move(backend), state = std::move(state)] {
+            return std::make_unique<TestPresentationWriter>(0, backend, state);
+        };
+    }
+
     TestPresentationWriter(const int device, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<TestPresentationWriterState> state)
         : context_(device, std::move(backend)),
           stream_(context_),
@@ -2049,6 +2120,15 @@ class ExploreScenario final {
         };
     }
 
+    [[nodiscard]] static ModelFactory GateAfterRender(std::shared_ptr<ExplorePostRenderGate> gate,
+                                                      std::shared_ptr<std::atomic_uint64_t> commits = {},
+                                                      std::shared_ptr<ExploreWorkProbe> work = {}) {
+        return [gate = std::move(gate), commits = std::move(commits), work = std::move(work)] {
+            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, nullptr, work,
+                                                          gate);
+        };
+    }
+
    private:
     [[nodiscard]] static ModelFactory DefaultModel() {
         return [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); };
@@ -2058,6 +2138,22 @@ class ExploreScenario final {
     EventGate events_;
     ExploreSystem explore_;
 };
+
+[[nodiscard]] auto settle_explore_on_exit(ExploreSystem& explore, std::promise<void>& release) {
+    return mmltk::testsupport::ScopedTestCleanup{[&explore, &release] {
+        mmltk::testsupport::release_test_promise(release);
+        static_cast<void>(explore.Stop());
+        explore.Shutdown();
+    }};
+}
+
+[[nodiscard]] auto settle_upscale_on_exit(UpscaleSystem& upscale, std::promise<void>& release) {
+    return mmltk::testsupport::ScopedTestCleanup{[&upscale, &release] {
+        mmltk::testsupport::release_test_promise(release);
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
+}
 
 [[nodiscard]] ExploreFilterPreferences select_explore_subset(LoadedSettings& settings, ExploreScenario& scenario,
                                                              const std::uint32_t class_index) {
@@ -2437,9 +2533,8 @@ class PresentationFailureProbe final {
 [[nodiscard]] PresentationSystem make_failure_presentation(const PresentationSourceFixture& source,
                                                            const std::shared_ptr<TestPresentationWriterState>& writer_state,
                                                            PresentationFailureProbe& failures) {
-    return PresentationSystem{
-        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        source.sources(), [&failures](PresentationSystem::event_type event) { failures.Observe(std::move(event)); }};
+    return PresentationSystem{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
+                              [&failures](PresentationSystem::event_type event) { failures.Observe(std::move(event)); }};
 }
 
 TEST_CASE("Presentation monotonic identities fail before wrap") {
@@ -2519,11 +2614,7 @@ TEST_CASE("Explore demand completes on another thread while publication owns fin
     EventGate events;
     ExploreSystem explore{settings.system(), kDevice, 2U, streaming_explore_runtime_factory(backend, probe),
                           [&events](ExploreSystem::event_type) { events.Advance(); }};
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, .compiled_source = "/test"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     entered.get();
@@ -3672,18 +3763,9 @@ TEST_CASE("Explore Open rejects a settings candidate made stale during rendering
     auto gate = std::make_shared<ExplorePostRenderGate>(0U);
     auto entered = gate->entered.get_future();
     auto failures = std::make_shared<std::atomic_uint64_t>(0U);
-    ExploreScenario scenario{settings, backend,
-                             [gate] {
-                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               nullptr, nullptr, nullptr, gate);
-                             },
-                             count_explore_failures(failures)};
+    ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate), count_explore_failures(failures)};
     auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     entered.get();
@@ -3726,6 +3808,7 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
                                                                                    nullptr, gate);
                                  }};
         auto& explore = scenario.system();
+        auto settle_explore = settle_explore_on_exit(explore, gate->release);
         scenario.OpenAndWait({.extent = {64U, 64U}});
         const auto before = select_explore_subset(settings, scenario, 0U);
 
@@ -3908,18 +3991,9 @@ TEST_CASE("Explore stale filter persistence discards the rendered candidate and 
     auto entered = gate->entered.get_future();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     auto failures = std::make_shared<std::atomic_uint64_t>(0U);
-    ExploreScenario scenario{settings, backend,
-                             [gate, commits] {
-                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               commits, nullptr, nullptr, gate);
-                             },
-                             count_explore_failures(failures)};
+    ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, commits), count_explore_failures(failures)};
     auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto committed = explore.snapshot();
     const auto admission = explore.UpdateFilter({.filter = {.minimum_instances = 1U}});
@@ -3950,11 +4024,7 @@ TEST_CASE("Explore successful persistence is settled before Stop can observe it"
     auto scenario = tracked_explore_scenario(settings, backend, commits);
     auto& explore = scenario.system();
     std::future<ExploreSnapshot> stopped;
-    mmltk::testsupport::ScopedTestCleanup settle_persistence{[&] {
-        mmltk::testsupport::release_test_promise(*release_persistence);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_persistence = settle_explore_on_exit(explore, *release_persistence);
     scenario.OpenAndWait({.extent = {64U, 64U}});
     static_cast<void>(explore.UpdateFilter({
         .filter = {.minimum_instances = 1U},
@@ -3987,11 +4057,7 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
                                                                                commits, gate);
                              }};
     auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     gate->Arm();
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
@@ -4029,11 +4095,7 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
         });
     auto& explore = scenario.system();
     std::future<ExploreSnapshot> stopped;
-    mmltk::testsupport::ScopedTestCleanup settle_persistence{[&] {
-        mmltk::testsupport::release_test_promise(*release_persistence);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_persistence = settle_explore_on_exit(explore, *release_persistence);
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
     static_cast<void>(select_explore_subset(settings, scenario, 1U));
@@ -4381,11 +4443,7 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         ExploreScenario scenario{settings, backend,
                                  [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
         auto& explore = scenario.system();
-        mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-            mmltk::testsupport::release_test_promise(gate->release);
-            static_cast<void>(explore.Stop());
-            explore.Shutdown();
-        }};
+        auto settle_explore = settle_explore_on_exit(explore, gate->release);
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
 
         explore.UpdateViewport({.viewport = {.extent = {48U, 16U}, .row_count = 1U, .columns = 3U}});
@@ -4432,11 +4490,7 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
                                  return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits);
                              }};
     auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto committed = explore.snapshot();
     explore.UpdateViewport({.viewport = {.extent = {48U, 48U}}});
@@ -4469,16 +4523,9 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
                                                        {
                                                            .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 19U},
                                                        });
-        ExploreScenario scenario{settings, backend, [gate, commits] {
-                                     return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                                   commits, nullptr, nullptr, gate);
-                                 }};
+        ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, commits)};
         auto& explore = scenario.system();
-        mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-            mmltk::testsupport::release_test_promise(gate->release);
-            static_cast<void>(explore.Stop());
-            explore.Shutdown();
-        }};
+        auto settle_explore = settle_explore_on_exit(explore, gate->release);
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
         const auto before = explore.snapshot();
         if (selection)
@@ -4672,11 +4719,7 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
                                  return std::make_unique<TestExploreAlgorithm>(observed_nproc, nullptr, nullptr, gate);
                              }};
     auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     scenario.OpenAndWait({.extent = {32U, 32U}});
     const auto before = explore.snapshot();
     const auto settings_revision = settings.system().snapshot().revision;
@@ -5031,11 +5074,7 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
                               return source.BorrowExact(frame);
                           },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics.sink()};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
     std::array<VisualFrame, 2U> cached;
     for (const auto method : {UpscaleKernel::Default, UpscaleKernel::ShiftLut}) {
         static_cast<void>(upscale.Start(test_upscale_request({source.frame(), method})));
@@ -5166,11 +5205,7 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
                                   ready_publications.fetch_add(1U, std::memory_order_acq_rel);
                               events.Advance();
                           }};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     entered.get();
@@ -5208,11 +5243,7 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
                           [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(gate.release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, gate.release);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(gate.copied, "gate.copied", 2s));
     upscale.Stop();
@@ -5261,11 +5292,7 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
                               return borrowed;
                           },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(gate.release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, gate.release);
     static_cast<void>(upscale.Start(test_upscale_request({source.frame(), UpscaleKernel::Default})));
     const auto entered = gate.entered.get_future().wait_for(2s);
     if (entered != std::future_status::ready) gate.release.set_value();
@@ -5559,11 +5586,7 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
                                                               }),
                           [&source](const VisualFrame& frame) { return source.Borrow(frame); },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }};
-    mmltk::testsupport::ScopedTestCleanup settle_native{[&] {
-        mmltk::testsupport::release_test_promise(release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_native = settle_upscale_on_exit(upscale, release);
     static_cast<void>(upscale.Start(test_upscale_request({source.frame, method})));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(admitted, "native Upscale admitted boundary", 120s));
     if (stop)
@@ -5995,11 +6018,7 @@ TEST_CASE("Upscale requests behind warmup retain identities without queued sourc
                               if (std::holds_alternative<UpscaleFailed>(event)) failures.fetch_add(1U);
                               events.Advance();
                           }};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(activation->warm_release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, activation->warm_release);
     upscale.Warm(source.frame().extent);
     const bool warming = warm_entered.wait_for(2s) == std::future_status::ready;
     if (!warming) activation->warm_release.set_value();
@@ -6078,11 +6097,7 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
                 changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
                 completed.set_value(changed->snapshot);
         }};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(activation->warm_release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, activation->warm_release);
     upscale.Warm({32U, 32U});
     const auto waiting = entered.wait_for(2s);
     if (waiting != std::future_status::ready) activation->warm_release.set_value();
@@ -6416,11 +6431,7 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [selected_kernel, gate] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel, gate); }, 4U),
                           borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
-    mmltk::testsupport::ScopedTestCleanup settle_upscale{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        upscale.Stop();
-        upscale.Shutdown();
-    }};
+    auto settle_upscale = settle_upscale_on_exit(upscale, gate->release);
     const auto admitted = upscale.Start(test_upscale_request({
         .source = explore.snapshot().frame,
         .kernel = UpscaleKernel::ShiftLut,
@@ -6524,9 +6535,8 @@ TEST_CASE("Published frames retain their physical allocation while a waiting can
     EventGate events;
     auto writer = std::make_shared<TestPresentationWriterState>();
     writer->advertise_waiting_candidate.store(true);
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
-        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
+                                    [&events](PresentationSystem::event_type) { events.Advance(); }};
     PresentationScenario scenario{presentation, writer};
     publish_first_presentation(presentation, source, *writer, events);
     const auto completed = presentation.snapshot();
@@ -6562,9 +6572,8 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
                                            }};
     auto writer = std::make_shared<TestPresentationWriterState>();
     writer->allow_publication.store(false, std::memory_order_release);
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
-        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
+                                    [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
     PresentationScenario scenario{presentation, writer};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
@@ -6594,19 +6603,18 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     std::atomic<std::uint64_t> last_completed_product{0U};
     std::atomic<std::uint64_t> last_completed_sample{0U};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        source.sources(),
-        [&events, &completed_events, &last_completed_revision, &last_completed_sample,
-         &last_completed_product](PresentationSystem::event_type event) {
-            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
-                last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
-                last_completed_sample.store(completed->snapshot.browser_completed_sample, std::memory_order_release);
-                completed_events.fetch_add(1U, std::memory_order_acq_rel);
-                last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
-            }
-            events.Advance();
-        }};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
+                                    [&events, &completed_events, &last_completed_revision, &last_completed_sample,
+                                     &last_completed_product](PresentationSystem::event_type event) {
+                                        if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
+                                            last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
+                                            last_completed_sample.store(completed->snapshot.browser_completed_sample,
+                                                                        std::memory_order_release);
+                                            completed_events.fetch_add(1U, std::memory_order_acq_rel);
+                                            last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
+                                        }
+                                        events.Advance();
+                                    }};
     PresentationScenario scenario{presentation, writer_state};
 
     publish_first_presentation(presentation, source, *writer_state, events);
@@ -6699,9 +6707,8 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
     EventGate events;
     auto writer = std::make_shared<TestPresentationWriterState>();
     writer->allow_publication.store(false);
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
-        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
+                                    [&events](PresentationSystem::event_type) { events.Advance(); }};
     PresentationScenario scenario{presentation, writer};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
@@ -6736,9 +6743,8 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
                 output.completed[output.count++] = fact;
         }};
     auto writer = std::make_shared<TestPresentationWriterState>();
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer] { return std::make_unique<TestPresentationWriter>(0, backend, writer); },
-        source.sources(), [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
+                                    [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
     PresentationScenario scenario{presentation, writer};
     const auto await_publication = [&](std::uint64_t revision) {
         writer->SignalReadiness();
@@ -6913,11 +6919,7 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
     std::atomic_bool owner_failed = false;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
                                      [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release_latest);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release_latest);
     owner.SubmitLatest(
         [&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
             std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
@@ -7030,11 +7032,7 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
     std::promise<void> settled;
     std::atomic_bool success_notified = false;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release);
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
         const auto revision = runtime.Completed().revision();
@@ -7084,16 +7082,10 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
                                              released.wait();
                                          }
                                      }};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release);
     submit_visual_completion(owner, first);
     mmltk::testsupport::await_test_promise(first, "first");
-    auto prior = owner.Borrow();
-    const auto prior_revision = prior.plane(0U).revision();
-    prior = {};
+    const auto prior_revision = borrowed_visual_revision(owner);
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
             if (producer_claims_completion && !owner.TryCompleteActiveWork())
@@ -7130,17 +7122,8 @@ TEST_CASE("runtime construction does not hold scheduler admission while stop is 
     std::promise<void> release;
     auto released = release.get_future().share();
     std::atomic_bool entered = false;
-    detail::VisualRuntimeOwner owner{[&, factory = std::move(factory)](auto revisions) {
-                                         constructing.set_value();
-                                         released.wait();
-                                         return factory(std::move(revisions));
-                                     },
-                                     [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    detail::VisualRuntimeOwner owner{gated_visual_construction(std::move(factory), constructing, released, 0U), [](std::exception_ptr) {}};
+    auto settle_owner = settle_visual_on_exit(owner, release);
     REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
         entered = true;
         return detail::VisualRuntimeOwner::Notification{};
@@ -7195,25 +7178,11 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
     std::promise<void> cancelled;
     auto released = release.get_future().share();
     std::atomic_bool entered = false;
-    std::size_t constructions = 0U;
-    detail::VisualRuntimeOwner owner{[&, factory = std::move(factory)](auto revisions) {
-                                         if (++constructions == 2U) {
-                                             constructing.set_value();
-                                             released.wait();
-                                         }
-                                         return factory(std::move(revisions));
-                                     },
-                                     [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    detail::VisualRuntimeOwner owner{gated_visual_construction(std::move(factory), constructing, released, 2U), [](std::exception_ptr) {}};
+    auto settle_owner = settle_visual_on_exit(owner, release);
     submit_visual_completion(owner, first);
     mmltk::testsupport::await_test_promise(first, "first");
-    auto incumbent = owner.Borrow();
-    const auto revision = incumbent.plane(0U).revision();
-    incumbent = {};
+    const auto revision = borrowed_visual_revision(owner);
     REQUIRE(owner.SubmitDiscrete(
         [&](auto&, std::stop_token) {
             entered = true;
@@ -7239,35 +7208,25 @@ TEST_CASE("ordered visual input retains boundaries and only the latest replaceab
     std::promise<void> boundary_entered;
     std::promise<void> release_boundary;
     auto release = release_boundary.get_future().share();
-    std::promise<void> complete;
-    std::mutex values_mutex;
-    std::vector<int> values;
+    VisualWorkLog work;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release_boundary);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
-    REQUIRE(owner.SubmitOrdered(
-        [&boundary_entered, release, &values_mutex, &values](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
-            {
-                std::scoped_lock lock(values_mutex);
-                values.push_back(1);
-            }
-            boundary_entered.set_value();
-            release.wait();
-            return detail::VisualRuntimeOwner::Notification{};
-        }));
+    auto settle_owner = settle_visual_on_exit(owner, release_boundary);
+    REQUIRE(owner.SubmitOrdered([&boundary_entered, release, &work](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
+        work.Append(1);
+        boundary_entered.set_value();
+        release.wait();
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
     mmltk::testsupport::await_test_promise(boundary_entered, "boundary_entered");
     // CLEANUP-IGNORE: Latest/discrete and continuation submissions exercise different queue contracts using shared
     // recording work.
-    owner.SubmitLatest(record_visual_work(values_mutex, values, 2));
-    owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
-    REQUIRE(owner.SubmitDiscrete(record_visual_work(values_mutex, values, 4, &complete)));
+    owner.SubmitLatest(work.Record(2));
+    owner.SubmitLatest(work.Record(3));
+    REQUIRE(owner.SubmitDiscrete(work.Record(4, true)));
     release_boundary.set_value();
-    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(complete, "complete", 2s));
+    REQUIRE_NOTHROW(work.AwaitCompletion());
     owner.StopAndWait();
-    CHECK(values == std::vector<int>{1, 3, 4});
+    CHECK(work.values() == std::vector<int>{1, 3, 4});
 }
 
 // CLEANUP-IGNORE: Coalescing owns a boundary gate distinct from the blocked-borrow concurrency scenario.
@@ -7277,31 +7236,24 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     std::promise<void> boundary_entered;
     std::promise<void> release_boundary;
     const auto release = release_boundary.get_future().share();
-    std::promise<void> completed;
-    std::mutex values_mutex;
-    std::vector<int> values;
+    VisualWorkLog work;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release_boundary);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release_boundary);
     REQUIRE(owner.SubmitOrdered([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         boundary_entered.set_value();
         release.wait();
-        std::scoped_lock lock(values_mutex);
-        values.push_back(1);
+        work.Append(1);
         return detail::VisualRuntimeOwner::Notification{};
     }));
     mmltk::testsupport::await_test_promise(boundary_entered, "boundary_entered");
-    owner.RegisterContinuation(record_visual_work(values_mutex, values, 4, &completed));
+    owner.RegisterContinuation(work.Record(4, true));
     REQUIRE(owner.NotifyContinuation());
-    owner.SubmitLatest(record_visual_work(values_mutex, values, 3));
+    owner.SubmitLatest(work.Record(3));
     REQUIRE(owner.NotifyContinuation());
     release_boundary.set_value();
-    REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(completed, "completed", 2s));
+    REQUIRE_NOTHROW(work.AwaitCompletion());
     owner.StopAndWait();
-    CHECK(values == std::vector<int>{1, 3, 4});
+    CHECK(work.values() == std::vector<int>{1, 3, 4});
 
     EventGate retry_events;
     std::atomic_uint32_t retry_calls{0U}, cycles{0U};
@@ -7328,14 +7280,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
             return detail::VisualRuntimeOwner::Notification{};
         },
         {}, true);
-    mmltk::testsupport::TestGate unarmed_reader_gate{"unarmed output retry reader"};
-    mmltk::testsupport::TestGate armed_reader_gate{"armed output retry reader"};
-    std::future<std::uint64_t> unarmed_reader, armed_reader;
     mmltk::testsupport::ScopedTestCleanup settle_retry{[&] {
-        unarmed_reader_gate.Release();
-        armed_reader_gate.Release();
-        if (unarmed_reader.valid()) unarmed_reader.wait();
-        if (armed_reader.valid()) armed_reader.wait();
         retry_owner.RequestStop();
         retry_owner.StopAndWait();
     }};
@@ -7344,27 +7289,18 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
         return detail::VisualRuntimeOwner::Notification{};
     }));
     REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 1U; }));
-    unarmed_reader = std::async(std::launch::async, [&] {
-        auto held = retry_owner.Borrow();
-        unarmed_reader_gate.receipt().ArriveAndWait();
-        return held.valid() ? held.plane(0U).revision() : 0U;
-    });
-    REQUIRE(unarmed_reader_gate.WaitEntered(2s));
+    HeldVisualReader unarmed_reader{retry_owner, "unarmed output retry reader"};
+    REQUIRE(unarmed_reader.WaitEntered());
     CHECK(wake_again.load(std::memory_order_acquire) == 0U);
     CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
-    unarmed_reader_gate.Release();
-    CHECK(mmltk::testsupport::await_test_future(unarmed_reader, "unarmed reader release") == 1U);
+    CHECK(unarmed_reader.ReleaseAndWait() == 1U);
     // Settle an ordinary cycle after release to prove it did not arm a retry.
     REQUIRE(retry_owner.SubmitOrdered([](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{}; }));
     REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 2U; }));
     CHECK(wake_again.load(std::memory_order_acquire) == 0U);
     CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
-    armed_reader = std::async(std::launch::async, [&] {
-        auto held = retry_owner.Borrow();
-        armed_reader_gate.receipt().ArriveAndWait();
-        return held.valid() ? held.plane(0U).revision() : 0U;
-    });
-    REQUIRE(armed_reader_gate.WaitEntered(2s));
+    HeldVisualReader armed_reader{retry_owner, "armed output retry reader"};
+    REQUIRE(armed_reader.WaitEntered());
     REQUIRE(retry_owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         baseline = runtime.Completed();
         retry_owner.SetOutputRetry(true);
@@ -7379,8 +7315,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     REQUIRE(retry_events.Wait([&] { return retry_calls.load(std::memory_order_acquire) == 1U; }));
     CHECK(failed_try.load(std::memory_order_acquire));
     CHECK_FALSE(reserved.load(std::memory_order_acquire));
-    armed_reader_gate.Release();
-    CHECK(mmltk::testsupport::await_test_future(armed_reader, "armed reader release") == 1U);
+    CHECK(armed_reader.ReleaseAndWait() == 1U);
     REQUIRE(retry_events.Wait([&] { return reserved.load(std::memory_order_acquire); }));
     retry_owner.StopAndWait();
     CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
@@ -7453,11 +7388,7 @@ TEST_CASE("visual continuation arrivals while draining survive without later inp
     std::promise<void> completed;
     std::atomic_uint32_t drains = 0U;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release_drain);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release_drain);
     owner.RegisterContinuation([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         if (drains.fetch_add(1U) == 0U) {
             entered.set_value();
@@ -7487,11 +7418,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     const auto release = release_boundary.get_future().share();
     std::promise<void> terminal_completed;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_owner{[&] {
-        mmltk::testsupport::release_test_promise(release_boundary);
-        owner.RequestStop();
-        owner.StopAndWait();
-    }};
+    auto settle_owner = settle_visual_on_exit(owner, release_boundary);
     submit_blocked_visual_work(owner, boundary_entered, release);
     submit_counting_continuation(owner, continuations);
     REQUIRE(owner.SubmitTerminalBarrier([&](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -7508,11 +7435,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     std::promise<void> release_failure_boundary;
     const auto failure_release = release_failure_boundary.get_future().share();
     detail::VisualRuntimeOwner failing{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
-    mmltk::testsupport::ScopedTestCleanup settle_failing{[&] {
-        mmltk::testsupport::release_test_promise(release_failure_boundary);
-        failing.RequestStop();
-        failing.StopAndWait();
-    }};
+    auto settle_failing = settle_visual_on_exit(failing, release_failure_boundary);
     submit_blocked_visual_work(failing, failure_boundary_entered, failure_release);
     REQUIRE(
         failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
@@ -7528,11 +7451,7 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     std::promise<void> release_stop_boundary;
     const auto stop_release = release_stop_boundary.get_future().share();
     detail::VisualRuntimeOwner stopping{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
-    mmltk::testsupport::ScopedTestCleanup settle_stopping{[&] {
-        mmltk::testsupport::release_test_promise(release_stop_boundary);
-        stopping.RequestStop();
-        stopping.StopAndWait();
-    }};
+    auto settle_stopping = settle_visual_on_exit(stopping, release_stop_boundary);
     submit_blocked_visual_work(stopping, stop_boundary_entered, stop_release);
     submit_counting_continuation(stopping, continuations);
     stopping.RequestStop();
@@ -8004,9 +7923,7 @@ TEST_CASE("Presentation control remains available during a native wait") {
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     writer_state->block_pump.store(true, std::memory_order_release);
     auto pump_entered = writer_state->pump_entered.get_future();
-    PresentationSystem presentation{
-        kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        source.sources()};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources()};
     PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(pump_entered.wait_for(2s) == std::future_status::ready);
@@ -8164,13 +8081,10 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
     initial.updates.push_back(
         {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{initial_h2d}});
     static_cast<void>(settings.system().Update(std::move(initial)));
-    ExploreScenario scenario{settings, backend,
-                             [gate, work] {
-                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               nullptr, nullptr, work, gate);
-                             },
-                             count_explore_failures(failures)};
-    active = &scenario.system();
+    ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, {}, work), count_explore_failures(failures)};
+    auto& explore = scenario.system();
+    active = &explore;
+    auto settle_explore = settle_explore_on_exit(explore, gate->release);
     scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
     const auto current = active->snapshot();
     auto overlay = current.overlay;

@@ -401,6 +401,8 @@ class SemanticOracleBuffers final {
     REQUIRE(render_explore_detail(detail, semantics(boxes, masks_with_boxes), scratch_view, target, stream.address()) ==
             kExploreStorageSuccess);
     REQUIRE(count_explore_nonzero_alpha(target, count(), stream.address()) == kExploreStorageSuccess);
+    // CLEANUP-IGNORE: CPD spans the detail result and the separate atlas signature; these independent raster entry points share only
+    // argument types.
     return download(target_device, kPixelCount);
 }
 

@@ -1160,6 +1160,15 @@ TEST_CASE("scalar receiver copies settle an enqueued read before event-record fa
     CHECK(receiver.CopyFrom(stream, source.Borrow()) == ImageCopyPath::SameDevice);
 }
 
+void check_deferred_source_custody(SystemImageRuntime& source, const mmltk::testsupport::TestGate& event_gate) {
+    REQUIRE(event_gate.WaitEntered(std::chrono::seconds{1}));
+    CHECK(source.OutputFacts().revision == 1U);
+    SystemImageRuntime::CompletedOutput baseline;
+    // The reader acquired its borrow on the asynchronous task. This thread
+    // probes reservation without recursively acquiring that task's locks.
+    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
+}
+
 TEST_CASE("external image readers await a delayed producer while retaining its exact product") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -1178,10 +1187,7 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
         event_gate->Release();
         backend->CompleteEvents();
     }};
-    REQUIRE(event_gate->WaitEntered(1s));
-    CHECK(source.OutputFacts().revision == 1U);
-    SystemImageRuntime::CompletedOutput baseline;
-    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
+    check_deferred_source_custody(source, *event_gate);
     event_gate->Release();
     backend->CompleteEvents();
     CHECK(mmltk::testsupport::await_test_future(reading, "external reader completion") == 1U);
@@ -1318,10 +1324,7 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
         event_gate->Release();
         backend->CompleteEvents();
     }};
-    REQUIRE(event_gate->WaitEntered(1s));
-    CHECK(source.OutputFacts().revision == 1U);
-    SystemImageRuntime::CompletedOutput baseline;
-    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
+    check_deferred_source_custody(source, *event_gate);
     event_gate->Release();
     backend->CompleteEvents();
     static_cast<void>(mmltk::testsupport::await_test_future(copy, "deferred receiver copy"));

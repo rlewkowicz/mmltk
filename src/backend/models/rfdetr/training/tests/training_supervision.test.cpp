@@ -1027,6 +1027,8 @@ void test_native_augmentation_preview_target_support_parity() {
                 CHECK(area[i] == preview[i].visible_area_pixels);
                 CHECK(label[i] == preview[i].class_id);
             }
+            // CLEANUP-IGNORE: CPD crosses an independent preview oracle assertion into the next CUDA fixture; its stream guard must remain
+            // test-scoped.
             CHECK(preview.empty() == erase_all);
         }
 }

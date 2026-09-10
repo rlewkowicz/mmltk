@@ -1567,61 +1567,54 @@ mod tests {
 
     #[test]
     fn domain_control_publication_and_capture_reconcile_in_every_causal_order() {
-        for domain_position in 0..4 {
-            for control_position in (0..4).filter(|position| *position != domain_position) {
-                let remaining: Vec<_> = (0..4)
-                    .filter(|position| {
-                        *position != domain_position && *position != control_position
-                    })
-                    .collect();
-                let physical_position = remaining[0];
-                let capture_position = remaining[1];
-                let (mut app, frame) = viewer_app();
-                let next = FrameReady {
-                    content_sequence: 2,
-                    presentation_revision: 6,
-                    ..frame
-                };
-                // Before-publication completion is an inert negative, never a successful schedule.
-                drop(app.on_presentation(Message::Surface(
-                    crate::presentation_surface::Notification::Completed(next),
-                )));
-                assert!(app.presentation.surface().unwrap().frame.is_none());
-                assert!(test_releases().is_empty());
-                for position in 0..4 {
-                    if position == domain_position {
-                        let explore = app.model.explore.snapshot.as_mut().unwrap();
-                        explore.frame.revision = 2;
-                        explore.revision = 20;
-                        app.reconcile_presentation(false);
-                    } else if position == control_position {
-                        let snapshot = app.model.presentation.as_mut().unwrap();
-                        snapshot.completed.revision = 2;
-                        snapshot.completedsourcerevision = 20;
-                        snapshot.presentationrevision = 6;
-                        app.reconcile_presentation(false);
-                    } else if position == physical_position {
-                        app.present_native_frame(next);
-                    } else {
-                        assert_eq!(position, capture_position);
-                        drop(app.on_presentation(Message::Surface(
-                            crate::presentation_surface::Notification::Completed(next),
-                        )));
-                    }
-                    assert_eq!(
-                        app.presentation.surface().unwrap().frame,
-                        (position >= physical_position).then_some(next),
-                    );
-                    assert!(
-                        test_releases().is_empty(),
-                        "handoff retains physical custody at every intermediate step",
-                    );
+        for [domain_position, control_position, physical_position, capture_position] in
+            crate::view_model::test_support::presentation_arrival_orders()
+        {
+            let (mut app, frame) = viewer_app();
+            let next = FrameReady {
+                content_sequence: 2,
+                presentation_revision: 6,
+                ..frame
+            };
+            // Before-publication completion is an inert negative, never a successful schedule.
+            drop(app.on_presentation(Message::Surface(
+                crate::presentation_surface::Notification::Completed(next),
+            )));
+            assert!(app.presentation.surface().unwrap().frame.is_none());
+            assert!(test_releases().is_empty());
+            for position in 0..4 {
+                if position == domain_position {
+                    let explore = app.model.explore.snapshot.as_mut().unwrap();
+                    explore.frame.revision = 2;
+                    explore.revision = 20;
+                    app.reconcile_presentation(false);
+                } else if position == control_position {
+                    let snapshot = app.model.presentation.as_mut().unwrap();
+                    snapshot.completed.revision = 2;
+                    snapshot.completedsourcerevision = 20;
+                    snapshot.presentationrevision = 6;
+                    app.reconcile_presentation(false);
+                } else if position == physical_position {
+                    app.present_native_frame(next);
+                } else {
+                    assert_eq!(position, capture_position);
+                    drop(app.on_presentation(Message::Surface(
+                        crate::presentation_surface::Notification::Completed(next),
+                    )));
                 }
-                assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
-                assert!(test_releases().is_empty());
-                app.presentation.discard();
-                assert_eq!(test_releases(), vec![next]);
+                assert_eq!(
+                    app.presentation.surface().unwrap().frame,
+                    (position >= physical_position).then_some(next),
+                );
+                assert!(
+                    test_releases().is_empty(),
+                    "handoff retains physical custody at every intermediate step",
+                );
             }
+            assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
+            assert!(test_releases().is_empty());
+            app.presentation.discard();
+            assert_eq!(test_releases(), vec![next]);
         }
     }
 

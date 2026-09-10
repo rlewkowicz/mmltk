@@ -59,6 +59,14 @@ struct DiagnosticCountingClock final {
 };
 using mmltk::common::io::ScopedFd;
 
+[[nodiscard]] std::pair<ScopedFd, ScopedFd> make_diagnostic_pipe(const int flags = 0, const int capacity = 0) {
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC | flags) == 0);
+    std::pair<ScopedFd, ScopedFd> pipe{ScopedFd{descriptors[0]}, ScopedFd{descriptors[1]}};
+    if (capacity != 0) REQUIRE(::fcntl(pipe.second.get(), F_SETPIPE_SZ, capacity) > 0);
+    return pipe;
+}
+
 class ScopedEnvironmentVariable final {
    public:
     explicit ScopedEnvironmentVariable(const std::string_view name) : name_(name) {
@@ -447,11 +455,7 @@ TEST_CASE("diagnostic span overflow and shutdown lose effects only", "[gui][serv
 }
 
 TEST_CASE("runtime trace overflow never waits for a stalled background writer", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    ScopedFd writer{descriptors[1]};
-    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+    auto [reader, writer] = make_diagnostic_pipe(0, 4096);
     DiagnosticsClient diagnostics{std::move(writer)};
     const auto operation = diagnostics.producer().acquire();
     const std::string record = maximum_diagnostic_record();
@@ -574,10 +578,7 @@ TEST_CASE("diagnostics writer failure publishes a failed terminal and releases i
 }
 
 TEST_CASE("diagnostics manual flush close makes a full descriptor terminal without blocking", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) == 0);
-    ScopedFd reader{descriptors[0]};
-    ScopedFd writer{descriptors[1]};
+    auto [reader, writer] = make_diagnostic_pipe(O_NONBLOCK);
     std::array<char, 4096U> fill{};
     while (::write(writer.get(), fill.data(), fill.size()) > 0) {}
     REQUIRE((errno == EAGAIN || errno == EWOULDBLOCK));
@@ -601,11 +602,7 @@ TEST_CASE("diagnostics manual flush close makes a full descriptor terminal witho
 }
 
 TEST_CASE("diagnostics manual flush publishes one terminal after a partial write", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC | O_NONBLOCK) == 0);
-    ScopedFd reader{descriptors[0]};
-    ScopedFd writer{descriptors[1]};
-    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+    auto [reader, writer] = make_diagnostic_pipe(O_NONBLOCK, 4096);
 
     DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
     const std::string record = maximum_diagnostic_record();
@@ -769,11 +766,7 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
     const int outcome = GENERATE(0, 1, 2);
     const bool batch = GENERATE(false, true);
     const std::size_t record_count = batch ? 2U : 1U;
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    ScopedFd writer{descriptors[1]};
-    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+    auto [reader, writer] = make_diagnostic_pipe(0, 4096);
     DiagnosticsClient diagnostics{std::move(writer)};
     RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
     const auto operation = diagnostics.producer().acquire();
@@ -937,10 +930,7 @@ TEST_CASE("diagnostics moves release replaced owners without terminal waits", "[
 }
 
 TEST_CASE("diagnostics destruction releases an active detached writer after its terminal", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    ScopedFd writer{descriptors[1]};
+    auto [reader, writer] = make_diagnostic_pipe();
     const std::string record = maximum_diagnostic_record();
     REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
 
