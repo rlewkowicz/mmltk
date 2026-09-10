@@ -215,7 +215,7 @@ impl GestureState {
 
     pub(super) fn pointer_from_gesture(
         &mut self,
-        model: &crate::view_model::AnnotationModel,
+        ui: &AnnotationUiState,
         gesture: crate::presentation_surface::SurfaceGesture,
     ) -> Option<crate::generated::AnnotationPointer> {
         let x = gesture.sample.content_x as f32;
@@ -223,7 +223,12 @@ impl GestureState {
         let target = if self.pointer_active {
             self.gesture_target.clone()?
         } else {
-            let target = target(&model.snapshot.as_ref()?.ui, x, y);
+            if gesture.kind != crate::presentation_surface::SurfaceGestureKind::Pointer
+                || !gesture.sample.pressed
+            {
+                return None;
+            }
+            let target = target(ui, x, y);
             self.gesture_target = Some(target.clone());
             target
         };
@@ -245,10 +250,16 @@ impl GestureState {
     }
 }
 
+struct InputState {
+    ui_revision: u64,
+    input_document_epoch: u64,
+    ui: AnnotationUiState,
+}
+
 #[derive(Default)]
 struct Retained {
     gesture: GestureState,
-    model: crate::view_model::AnnotationModel,
+    input: Option<InputState>,
     available: bool,
     radius: u16,
     connection: Option<crate::transport_connection::Connection>,
@@ -261,19 +272,29 @@ impl Component {
     pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
         let mut retained = self.retained.lock().expect("annotation canvas");
         retained.gesture.clear_pointer_lifecycle();
+        retained.input = None;
         retained.connection = connection;
     }
     pub fn clear_pointer_lifecycle(&self) { self.retained.lock().expect("annotation canvas").gesture.clear_pointer_lifecycle(); }
     pub fn cancel_pointer(&self) -> Option<crate::generated::AnnotationPointer> { self.retained.lock().expect("annotation canvas").gesture.cancel_pointer() }
-    pub fn pointer_from_gesture(&self, model: &crate::view_model::AnnotationModel, gesture: crate::presentation_surface::SurfaceGesture) -> Option<crate::generated::AnnotationPointer> {
-        self.retained.lock().expect("annotation canvas").gesture.pointer_from_gesture(model, gesture)
+    pub fn pointer_from_gesture(&self, ui: &AnnotationUiState, gesture: crate::presentation_surface::SurfaceGesture) -> Option<crate::generated::AnnotationPointer> {
+        self.retained.lock().expect("annotation canvas").gesture.pointer_from_gesture(ui, gesture)
     }
     pub fn dispatch(&self, model: &crate::view_model::ApplicationModel, radius: u16, keyboard: std::sync::Arc<std::sync::atomic::AtomicBool>)
         -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<super::Message> + Send + Sync> {
         {
             let mut retained = self.retained.lock().expect("annotation canvas");
-            if retained.model.snapshot.as_ref().map(|value| value.revision) != model.annotation.snapshot.as_ref().map(|value| value.revision) {
-                retained.model = model.annotation.clone();
+            if retained.input.as_ref().map(|input| {
+                (input.ui_revision, input.input_document_epoch)
+            }) != model.annotation.snapshot.as_ref().map(|snapshot| {
+                (snapshot.uirevision, snapshot.inputdocumentepoch)
+            })
+            {
+                retained.input = model.annotation.snapshot.as_ref().map(|snapshot| InputState {
+                    ui_revision: snapshot.uirevision,
+                    input_document_epoch: snapshot.inputdocumentepoch,
+                    ui: snapshot.ui.clone(),
+                });
             }
             retained.available = model.annotation_edit_available();
             retained.radius = radius;
@@ -284,12 +305,13 @@ impl Component {
             if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
                 keyboard.store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            let Retained { gesture: lifecycle, model, available, radius, connection } = &mut *retained;
+            let Retained { gesture: lifecycle, input, available, radius, connection } = &mut *retained;
             if !*available { lifecycle.clear_pointer_lifecycle(); return None; }
-            let mut pointer = lifecycle.pointer_from_gesture(model, gesture)?;
+            let input = input.as_ref()?;
+            let mut pointer = lifecycle.pointer_from_gesture(&input.ui, gesture)?;
             pointer.brushradius = *radius;
             let result = connection.as_mut().ok_or(crate::transport_connection::OutboundSendError::Closed)
-                .and_then(|connection| connection.send_annotation_pointer(pointer, model.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch)));
+                .and_then(|connection| connection.send_annotation_pointer(pointer, input.input_document_epoch));
             result.err().map(|error| super::Message::InputFailed(error))
         })
     }
