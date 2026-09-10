@@ -1,3 +1,4 @@
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/common/system/cpu_affinity.h"
@@ -312,14 +313,16 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
     backend->defer_events = true;
     auto event_gate = backend->HoldEventWaits("receiver source event wait");
     source.Publish(8U, 8U, [](auto, auto, auto) {});
-    auto borrowed = source.Borrow();
-    REQUIRE(borrowed.valid());
+    const auto source_revision = source.Completed().revision();
 
-    std::future<void> copy;
+    std::future<std::uint64_t> copy;
     std::future<void> superseding_publish;
     mmltk::testsupport::ScopedTestCleanup release_wait{[&] { event_gate->Release(); backend->CompleteEvents(); }};
-    copy = std::async(std::launch::async, [&receiver, product = std::move(borrowed)]() mutable {
+    copy = std::async(std::launch::async, [&receiver, &source] {
+        auto product = source.Borrow();
+        const auto revision = product.plane(0U).revision();
         static_cast<void>(receiver.CopyFrom(std::move(product)));
+        return revision;
     });
     REQUIRE(event_gate->WaitEntered(2s));
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
@@ -328,10 +331,8 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
 
     event_gate->Release();
     backend->CompleteEvents();
-    REQUIRE(copy.wait_for(2s) == std::future_status::ready);
-    copy.get();
-    REQUIRE(superseding_publish.wait_for(2s) == std::future_status::ready);
-    superseding_publish.get();
+    CHECK(mmltk::testsupport::await_test_future(copy, "receiver-owned source copy") == source_revision);
+    mmltk::testsupport::await_test_future(superseding_publish, "superseding source publication");
 }
 
 void Fill(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::uint8_t value) {
@@ -5107,7 +5108,8 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     // must not mask an incorrectly writable reader-owned slot.
     REQUIRE(readers.size() == 4U);
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
-    REQUIRE_FALSE(runtime->TryAcquireOutput(baseline).valid());
+    auto reservation = std::async(std::launch::async, [&] { return runtime->TryAcquireOutput(baseline).valid(); });
+    REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "four held Upscale readers"));
     if (preempt_warm)
         upscale.Warm({16U, 8U});
     else {
@@ -7293,7 +7295,6 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     std::atomic_uint32_t retry_calls{0U}, cycles{0U};
     std::atomic_uint64_t wake_again{0U};
     std::atomic_bool reserved{false}, failed_try{false};
-    mmltk::frameworks::gpu::BorrowedImageProductReadView held;
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
     detail::VisualRuntimeOwner retry_owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
                                            [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t value) noexcept {
@@ -7315,23 +7316,46 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
             return detail::VisualRuntimeOwner::Notification{};
         },
         {}, true);
+    mmltk::testsupport::TestGate unarmed_reader_gate{"unarmed output retry reader"};
+    mmltk::testsupport::TestGate armed_reader_gate{"armed output retry reader"};
+    std::future<std::uint64_t> unarmed_reader, armed_reader;
+    mmltk::testsupport::ScopedTestCleanup settle_retry{[&] {
+        unarmed_reader_gate.Release();
+        armed_reader_gate.Release();
+        if (unarmed_reader.valid()) unarmed_reader.wait();
+        if (armed_reader.valid()) armed_reader.wait();
+        retry_owner.RequestStop();
+        retry_owner.StopAndWait();
+    }};
     REQUIRE(retry_owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-        held = retry_owner.Borrow();
         return detail::VisualRuntimeOwner::Notification{};
     }));
     REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 1U; }));
+    unarmed_reader = std::async(std::launch::async, [&] {
+        auto held = retry_owner.Borrow();
+        unarmed_reader_gate.receipt().ArriveAndWait();
+        return held.valid() ? held.plane(0U).revision() : 0U;
+    });
+    REQUIRE(unarmed_reader_gate.WaitEntered(2s));
     CHECK(wake_again.load(std::memory_order_acquire) == 0U);
     CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
-    REQUIRE(retry_owner.SubmitOrdered([&](auto&, std::stop_token) {
-        held = {};
+    unarmed_reader_gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(unarmed_reader, "unarmed reader release") == 1U);
+    // Settle an ordinary cycle after release to prove it did not arm a retry.
+    REQUIRE(retry_owner.SubmitOrdered([](auto&, std::stop_token) {
         return detail::VisualRuntimeOwner::Notification{};
     }));
     REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 2U; }));
     CHECK(wake_again.load(std::memory_order_acquire) == 0U);
     CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
+    armed_reader = std::async(std::launch::async, [&] {
+        auto held = retry_owner.Borrow();
+        armed_reader_gate.receipt().ArriveAndWait();
+        return held.valid() ? held.plane(0U).revision() : 0U;
+    });
+    REQUIRE(armed_reader_gate.WaitEntered(2s));
     REQUIRE(retry_owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        held = retry_owner.Borrow();
         baseline = runtime.Completed();
         retry_owner.SetOutputRetry(true);
         failed_try.store(!runtime.TryAcquireOutput(baseline).valid(), std::memory_order_release);
@@ -7345,7 +7369,8 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     REQUIRE(retry_events.Wait([&] { return retry_calls.load(std::memory_order_acquire) == 1U; }));
     CHECK(failed_try.load(std::memory_order_acquire));
     CHECK_FALSE(reserved.load(std::memory_order_acquire));
-    held = {};
+    armed_reader_gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(armed_reader, "armed reader release") == 1U);
     REQUIRE(retry_events.Wait([&] { return reserved.load(std::memory_order_acquire); }));
     retry_owner.StopAndWait();
     CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
@@ -7372,7 +7397,7 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
         owner.RequestStop();
         owner.StopAndWait();
     }};
-    std::future<mmltk::frameworks::gpu::BorrowedImageProductReadView> borrow;
+    std::future<std::uint64_t> borrow;
     std::future<bool> notification;
     mmltk::testsupport::ScopedTestCleanup release_futures{[&] {
         mmltk::testsupport::release_test_promise(release_publish);
@@ -7391,7 +7416,10 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
         return detail::VisualRuntimeOwner::Notification{};
     }));
     mmltk::testsupport::await_test_promise(publish_entered, "publish_entered");
-    borrow = std::async(std::launch::async, [&] { return owner.Borrow(); });
+    borrow = std::async(std::launch::async, [&] {
+        const auto view = owner.Borrow();
+        return view.valid() ? view.plane(0U).revision() : 0U;
+    });
     mmltk::testsupport::await_test_promise(borrow_locked, "borrow_locked");
 
     notification = std::async(std::launch::async, [&] { return owner.NotifyContinuation(); });
@@ -7401,10 +7429,7 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
     CHECK(mmltk::testsupport::await_test_future(notification, "continuation notification during held publication"));
     release_publish.set_value();
     release_work.set_value();
-    auto view = mmltk::testsupport::await_test_future(borrow, "released product borrow");
-    REQUIRE(view.valid());
-    CHECK(view.plane(0U).revision() == 1U);
-    view = {};
+    CHECK(mmltk::testsupport::await_test_future(borrow, "released product borrow") == 1U);
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(notified, "notified", 2s));
     owner.StopAndWait();
 }

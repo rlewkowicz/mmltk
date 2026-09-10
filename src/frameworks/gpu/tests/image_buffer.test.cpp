@@ -414,17 +414,48 @@ TEST_CASE("output storage sums every physical plane and slot at retained high wa
 TEST_CASE("borrowed image storage remains stable until receiver completion") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{.device = 0, .backend = backend}};
-    runtime.Publish(8U, 8U, [](auto, auto, auto) {});
-    auto borrowed = runtime.Borrow();
+    {
+        SystemImageRuntime runtime{{.device = 0, .backend = backend}};
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        auto borrowed = runtime.Borrow();
 
-    SystemImageRuntime::CompletedOutput baseline;
-    REQUIRE_FALSE(runtime.TryAcquireOutput(baseline).valid());
-    auto writer = std::async(std::launch::async, [&runtime] { runtime.Publish(16U, 16U, [](auto, auto, auto) {}); });
-    mmltk::testsupport::ScopedTestCleanup release_borrow{[&] { borrowed = {}; }};
-    borrowed = {};
-    REQUIRE(writer.wait_for(1s) == std::future_status::ready);
-    writer.get();
+        SystemImageRuntime::CompletedOutput baseline;
+        auto reservation = std::async(std::launch::async, [&] { return runtime.TryAcquireOutput(baseline).valid(); });
+        REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "held-reader reservation"));
+        auto writer = std::async(std::launch::async, [&runtime] { runtime.Publish(16U, 16U, [](auto, auto, auto) {}); });
+        mmltk::testsupport::ScopedTestCleanup release_borrow{[&] { borrowed = {}; }};
+        borrowed = {};
+        mmltk::testsupport::await_test_future(writer, "released single-slot writer");
+
+        std::atomic_bool reader_released{false};
+        bool caught = false;
+        try {
+            mmltk::testsupport::TestGate reader_gate{"test-side exception with physical read held"};
+            std::promise<std::uint64_t> reader_ready;
+            auto reader = std::async(std::launch::async, [&] {
+                {
+                    auto read = runtime.Borrow();
+                    reader_ready.set_value(read.valid() ? read.plane(0U).revision() : 0U);
+                    reader_gate.receipt().ArriveAndWait();
+                }
+                reader_released.store(true, std::memory_order_release);
+            });
+            mmltk::testsupport::ScopedTestCleanup release_reader{[&] { reader_gate.Release(); }};
+            REQUIRE(reader_gate.WaitEntered(1s));
+            CHECK(mmltk::testsupport::await_test_promise(reader_ready, "exception reader revision") == runtime.OutputFacts().revision);
+            CHECK_FALSE(reader_released.load(std::memory_order_acquire));
+            throw std::runtime_error("test-side read failure");
+        } catch (const std::runtime_error& error) {
+            CHECK(std::string_view{error.what()} == "test-side read failure");
+            caught = true;
+        }
+        CHECK(caught);
+        CHECK(reader_released.load(std::memory_order_acquire));
+        CHECK(runtime.TryAcquireOutput(baseline).valid());
+    }
+    CHECK(backend->planes_freed.load() == backend->planes_allocated.load());
+    CHECK(backend->streams_destroyed == 1U);
+    CHECK(backend->contexts_destroyed == 1U);
 }
 
 TEST_CASE("multi-plane products copy atomically and reject self copy") {
@@ -448,12 +479,13 @@ TEST_CASE("multi-plane products copy atomically and reject self copy") {
     const auto paths = receiver.CopyFrom(source.Borrow());
     CHECK(paths[0U] == ImageCopyPath::SameDevice);
     CHECK(paths[1U] == ImageCopyPath::SameDevice);
-    const auto product = receiver.Borrow();
+    auto product = receiver.Borrow();
     REQUIRE(product.valid());
     CHECK(product.plane_count() == 2U);
     CHECK(product.plane(1U).plane().descriptor.kind == ImagePlaneKind::Semantic);
     CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 0x31U);
     CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(1U).plane().data) == 0x72U);
+    product = {};
     CHECK_THROWS_AS(receiver.CopyFrom(receiver.Borrow()), std::invalid_argument);
 }
 
@@ -545,9 +577,18 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
         std::memset(reinterpret_cast<void*>(clean.data), 0x21, clean.descriptor.pitch_bytes * clean.descriptor.height);
         std::memset(reinterpret_cast<void*>(semantic.data), 0x43, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
     });
-    auto incumbent = runtime.Borrow();
-    REQUIRE(incumbent.valid());
-    const auto incumbent_revision = incumbent.plane(0U).revision();
+    mmltk::testsupport::TestGate incumbent_gate{"incumbent product reader"};
+    std::promise<std::uint64_t> incumbent_ready;
+    auto incumbent = std::async(std::launch::async, [&] {
+        auto read = runtime.Borrow();
+        incumbent_ready.set_value(read.valid() ? read.plane(0U).revision() : 0U);
+        incumbent_gate.receipt().ArriveAndWait();
+        return *reinterpret_cast<const std::uint8_t*>(read.plane(1U).plane().data);
+    });
+    mmltk::testsupport::ScopedTestCleanup release_incumbent{[&] { incumbent_gate.Release(); }};
+    const auto incumbent_revision = mmltk::testsupport::await_test_promise(incumbent_ready, "incumbent revision");
+    REQUIRE(incumbent_revision != 0U);
+    REQUIRE(incumbent_gate.WaitEntered(1s));
 
     auto candidate = runtime.AcquireOutput({}, runtime.Completed());
     REQUIRE(candidate.valid());
@@ -564,14 +605,15 @@ TEST_CASE("product candidates preserve exact committed planes until readers rele
     CHECK(committed.plane(0U).revision() == candidate_revision);
     CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(0U).plane().data) == 0x21U);
     CHECK(*reinterpret_cast<const std::uint8_t*>(committed.plane(1U).plane().data) == 0x65U);
-    CHECK(*reinterpret_cast<const std::uint8_t*>(incumbent.plane(1U).plane().data) == 0x43U);
 
     SystemImageRuntime::CompletedOutput unavailable_baseline;
-    REQUIRE_FALSE(runtime.TryAcquireOutput(unavailable_baseline).valid());
+    auto reservation = std::async(std::launch::async, [&] { return runtime.TryAcquireOutput(unavailable_baseline).valid(); });
+    REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "two-product reader reservation"));
     std::stop_source stop;
     auto admission = std::async(std::launch::async, [&runtime, token = stop.get_token()] { return runtime.AcquireOutput(token); });
     mmltk::testsupport::ScopedTestCleanup stop_admission{[&] { stop.request_stop(); }};
-    incumbent = {};
+    incumbent_gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(incumbent, "incumbent reader release") == 0x43U);
     REQUIRE(admission.wait_for(1s) == std::future_status::ready);
     CHECK(admission.get().valid());
 }
@@ -611,8 +653,8 @@ TEST_CASE("completed products retain exact pixels and can be selected again") {
     REQUIRE(later.valid());
     CHECK(*reinterpret_cast<const std::uint8_t*>(later.plane(0U).plane().data) == 0x52U);
 
-    auto remaining = runtime.AcquireOutput();
-    CHECK(remaining.valid());
+    auto remaining = std::async(std::launch::async, [&] { return runtime.AcquireOutput(); });
+    CHECK(mmltk::testsupport::await_test_future(remaining, "remaining product slot").valid());
 }
 
 TEST_CASE("failed candidate growth retains the committed product and later initializes every plane") {
@@ -703,8 +745,17 @@ TEST_CASE("clean-only candidate preservation excludes invalid semantics and roll
         std::memset(reinterpret_cast<void*>(semantic.data), 0x29, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
     });
     auto baseline = runtime.Completed();
-    auto reader = baseline.Borrow();
-    backend->watched_copy_source.store(reader.plane(1U).plane().data);
+    mmltk::testsupport::TestGate reader_gate{"clean-only rollback reader"};
+    std::promise<void> reader_ready;
+    auto reader = std::async(std::launch::async, [&] {
+        auto read = baseline.Borrow();
+        backend->watched_copy_source.store(read.plane(1U).plane().data);
+        reader_ready.set_value();
+        reader_gate.receipt().ArriveAndWait();
+        return *reinterpret_cast<const std::uint8_t*>(read.plane(1U).plane().data);
+    });
+    mmltk::testsupport::ScopedTestCleanup release_reader{[&] { reader_gate.Release(); }};
+    mmltk::testsupport::await_test_promise(reader_ready, "clean-only source custody");
     const auto copied = backend->same_copies.load();
     {
         auto candidate = runtime.AcquireOutput({}, baseline, ImagePlanePreservation::Clean);
@@ -726,7 +777,8 @@ TEST_CASE("clean-only candidate preservation excludes invalid semantics and roll
     auto completed = runtime.CommitOutput(std::move(candidate)).Borrow();
     CHECK(backend->same_copies.load() == copied + 2U);
     CHECK(backend->watched_source_copies.load() == 0U);
-    CHECK(*reinterpret_cast<const std::uint8_t*>(reader.plane(1U).plane().data) == 0x29U);
+    reader_gate.Release();
+    CHECK(mmltk::testsupport::await_test_future(reader, "clean-only reader release") == 0x29U);
     CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(0U).plane().data) == 0x17U);
     CHECK(*reinterpret_cast<const std::uint8_t*>(completed.plane(1U).plane().data) == 0x68U);
 }
@@ -817,7 +869,8 @@ TEST_CASE("single-slot semantic replacement reuses clean pixels after its detach
     auto borrowed = baseline.Borrow();
     auto plane = std::move(borrowed).TakePlane(0U);
     borrowed = {};
-    REQUIRE_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    auto reservation = std::async(std::launch::async, [&] { return runtime.TryAcquireOutput(baseline).valid(); });
+    REQUIRE_FALSE(mmltk::testsupport::await_test_future(reservation, "held-reader reservation"));
     std::stop_source stop;
     auto admission = std::async(std::launch::async, [&runtime, baseline = std::move(baseline), token = stop.get_token()]() mutable {
         return runtime.AcquireOutput(token, std::move(baseline));
@@ -1116,17 +1169,19 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     DeviceContext context{0, backend};
     ImageStream stream{context};
-    auto borrowed = source.Borrow();
-    auto reading = std::async(std::launch::async, [&stream, product = std::move(borrowed)] {
+    auto reading = std::async(std::launch::async, [&stream, &source] {
+        auto product = source.Borrow();
         stream.Await(product);
         return product.plane(0U).revision();
     });
     mmltk::testsupport::ScopedTestCleanup release_reader{[&] { event_gate->Release(); backend->CompleteEvents(); }};
     REQUIRE(event_gate->WaitEntered(1s));
+    CHECK(source.OutputFacts().revision == 1U);
+    SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
     event_gate->Release();
     backend->CompleteEvents();
-    REQUIRE(reading.wait_for(1s) == std::future_status::ready);
-    CHECK(reading.get() == 1U);
+    CHECK(mmltk::testsupport::await_test_future(reading, "external reader completion") == 1U);
     CHECK_THROWS_AS(stream.Await({}), std::invalid_argument);
     auto other = make_clean_semantic_runtime(std::make_shared<FakeImageBackend>());
     other.Publish(8U, 8U, [](auto, auto, auto) {});
@@ -1164,14 +1219,16 @@ TEST_CASE("receiver completion releases product access across threads but retain
     std::atomic<unsigned> available{0U};
     source->SetOutputAvailableSink([&] { available.fetch_add(1U); });
     std::optional<ImageProductReadCompletion> completion;
+    std::future<void> writer, callback;
+    mmltk::testsupport::ScopedTestCleanup release_completion{[&] { if (completion) completion->Complete(); }};
+    // Conversion unlocks this thread's shared locks; the callback owns only
+    // the counted receiver access, so completing it on another thread is valid.
     completion.emplace(source->Borrow());
     CHECK(completion->pending());
     const auto before = available.load();
     SystemImageRuntime::CompletedOutput baseline;
     REQUIRE_FALSE(source->TryAcquireOutput(baseline).valid());
-    auto writer = std::async(std::launch::async, [&] { source->Publish(8U, 8U, [](auto, auto, auto) {}); });
-    std::future<void> callback;
-    mmltk::testsupport::ScopedTestCleanup release_completion{[&] { if (completion) completion->Complete(); }};
+    writer = std::async(std::launch::async, [&] { source->Publish(8U, 8U, [](auto, auto, auto) {}); });
     callback = std::async(std::launch::async, [&] { completion->Complete(); });
     mmltk::testsupport::await_test_future(callback, "receiver completion callback");
     CHECK_FALSE(completion->pending());
@@ -1254,10 +1311,12 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
     auto copy = std::async(std::launch::async, [&] { return receiver.CopyFrom(source.Borrow()); });
     mmltk::testsupport::ScopedTestCleanup release_copy{[&] { event_gate->Release(); backend->CompleteEvents(); }};
     REQUIRE(event_gate->WaitEntered(1s));
+    CHECK(source.OutputFacts().revision == 1U);
+    SystemImageRuntime::CompletedOutput baseline;
+    REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
     event_gate->Release();
     backend->CompleteEvents();
-    REQUIRE(copy.wait_for(1s) == std::future_status::ready);
-    static_cast<void>(copy.get());
+    static_cast<void>(mmltk::testsupport::await_test_future(copy, "deferred receiver copy"));
     CHECK(receiver.OutputFacts().revision == 1U);
 }
 
