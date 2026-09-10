@@ -219,14 +219,17 @@ pub enum Message {
         receipt: Option<ProbeReceipt>,
         message: Box<Message>,
     },
+    // A physical receipt can be resampled; only its current request owns settlement.
+    ProbeCompleted {
+        owner: std::sync::Arc<()>,
+        message: Box<Message>,
+    },
     Advance,
     NumberWheelDelivered,
-    #[cfg(target_arch = "wasm32")]
     UpscalePixels {
         source: u64,
         presentation: u64,
-        checksum: u32,
-        blue: u32,
+        outcome: ProbeOutcome,
     },
     Located {
         control: String,
@@ -249,27 +252,61 @@ pub enum Message {
         presentation_revision: u64,
         source_revision: u64,
     },
-    #[cfg(target_arch = "wasm32")]
     AnnotationPixels {
         revision: u64,
-        expected: u32,
-        matched: u32,
+        outcome: ProbeOutcome,
     },
-    #[cfg(target_arch = "wasm32")]
     AnnotationControlPixels {
-        expected: u32,
-        matched: u32,
+        outcome: ProbeOutcome,
     },
     AtlasPixels {
         receipt: AtlasDraw,
-        visible: u32,
-        nonblack: u32,
+        outcome: ProbeOutcome,
     },
     AtlasComposition {
         receipt: AtlasDraw,
-        expected: u32,
-        matched: u32,
+        outcome: ProbeOutcome,
     },
+}
+
+/// Invalidation is request retirement, never measured pixel evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Invalidated,
+    Observed(u32, u32),
+    Failed,
+}
+
+impl ProbeOutcome {
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn decode(status: Option<&str>, values: [Option<f64>; 2]) -> Self {
+        let [Some(first), Some(second)] = values else { return Self::Failed; };
+        if ![first, second].into_iter().all(|value| value.is_finite() && value >= 0.0
+            && value <= f64::from(u32::MAX) && value.fract() == 0.0) {
+            return Self::Failed;
+        }
+        match status {
+            Some("invalidated") if first == 0.0 && second == 0.0 => Self::Invalidated,
+            Some("observed") => Self::Observed(first as u32, second as u32),
+            _ => Self::Failed,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ControlProbe {
+    output: ScenarioOutput,
+    color: [f64; 3],
+    available: bool,
+}
+
+#[derive(Clone)]
+struct AnnotationProbe {
+    output: ScenarioOutput,
+    source: u64,
+    presentation: u64,
+    extent: [u32; 2],
+    pixels: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -294,14 +331,32 @@ pub struct ProbeReceipt {
 struct ScenarioOutput {
     generation: u64,
     receipt: Option<ProbeReceipt>,
+    probe: Option<std::sync::Arc<()>>,
+    // Captured with the Rust receipt, before any widget-location task.
+    #[cfg(target_arch = "wasm32")]
+    canvas_probe: wasm_bindgen::JsValue,
     sender: iced::futures::channel::mpsc::Sender<Message>,
 }
 
 impl ScenarioOutput {
+    fn new(generation: u64, sender: iced::futures::channel::mpsc::Sender<Message>) -> Self {
+        Self {
+            generation,
+            receipt: None,
+            probe: None,
+            #[cfg(target_arch = "wasm32")]
+            canvas_probe: wasm_bindgen::JsValue::UNDEFINED,
+            sender,
+        }
+    }
+
     fn try_send(
         &mut self,
         message: Message,
     ) -> Result<(), iced::futures::channel::mpsc::TrySendError<Message>> {
+        let message = if let Some(owner) = &self.probe {
+            Message::ProbeCompleted { owner: owner.clone(), message: Box::new(message) }
+        } else { message };
         self.sender.try_send(Message::Scoped {
             generation: self.generation,
             receipt: self.receipt.clone(),
@@ -320,6 +375,8 @@ struct SurfaceDrawObserver {
     viewer: Option<(u64, u64, ViewerDraw)>,
     gallery: Option<(u64, u64)>,
     atlas: Option<AtlasDraw>,
+    atlas_pixels_owner: Option<std::sync::Arc<()>>,
+    atlas_composition_owner: Option<std::sync::Arc<()>>,
 }
 
 impl SurfaceDrawObserver {
@@ -363,11 +420,7 @@ fn surface_draw_stream() -> impl iced::futures::Stream<Item = Message> {
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             observer.subscription = Some(owner.clone());
-            observer.output = Some(ScenarioOutput {
-                generation: observer.generation,
-                receipt: None,
-                sender,
-            });
+            observer.output = Some(ScenarioOutput::new(observer.generation, sender));
         });
         let _subscription = SurfaceDrawSubscription(owner);
         std::future::pending::<()>().await;
@@ -384,6 +437,9 @@ fn reset_observer() -> u64 {
         let output = observer.output.take().map(|mut output| {
             output.generation = generation;
             output.receipt = None;
+            output.probe = None;
+            #[cfg(target_arch = "wasm32")]
+            { output.canvas_probe = wasm_bindgen::JsValue::UNDEFINED; }
             output
         });
         let subscription = observer.subscription.take();
@@ -401,9 +457,30 @@ fn current_receipt(control: &str) -> Option<ProbeReceipt> {
     SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().receipts.get(control).cloned())
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
 fn probe_output(control: &str) -> Option<ScenarioOutput> {
-    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output_for(control).cloned())
+    let mut output = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output_for(control).cloned())?;
+    output.probe = Some(std::sync::Arc::new(()));
+    #[cfg(target_arch = "wasm32")]
+    { output.canvas_probe = capture_probe_js(control); }
+    Some(output)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn atlas_probe_output(composition: bool) -> Option<ScenarioOutput> {
+    let output = probe_output(EXPLORE_GALLERY)?;
+    SURFACE_DRAW_OBSERVER.with(|observer| {
+        let mut observer = observer.borrow_mut();
+        let pending = if composition { &mut observer.atlas_composition_owner } else { &mut observer.atlas_pixels_owner };
+        *pending = output.probe.clone();
+    });
+    Some(output)
+}
+
+fn same_probe(owner: &Option<std::sync::Arc<()>>, request: Option<&std::sync::Arc<()>>) -> bool {
+    match (owner, request) {
+        (Some(owner), Some(request)) => std::sync::Arc::ptr_eq(owner, request),
+        _ => false,
+    }
 }
 
 pub(crate) fn record_probe_draw(
@@ -426,16 +503,12 @@ pub(crate) fn record_probe_draw(
             image,
             clip,
         };
+        #[cfg(target_arch = "wasm32")]
+        if let Some(frame) = surface.frame {
+            receipt_js(control, &format!("{receipt:?}"), frame.content_sequence as f64,
+                frame.presentation_revision as f64);
+        }
         if observer.receipts.get(control) != Some(&receipt) {
-            #[cfg(target_arch = "wasm32")]
-            if let Some(frame) = surface.frame {
-                receipt_js(
-                    control,
-                    &format!("{receipt:?}"),
-                    frame.content_sequence as f64,
-                    frame.presentation_revision as f64,
-                );
-            }
             match control {
                 EXPLORE_GALLERY => { observer.gallery = None; observer.atlas = None; }
                 explore::DETAIL_WORKSPACE_ID => observer.viewer = None,
@@ -592,6 +665,8 @@ extern "C" {
     fn reset_scenario_js();
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReceipt)]
     fn receipt_js(control: &str, receipt: &str, source: f64, presentation: f64);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationProbe)]
+    fn capture_probe_js(control: &str) -> wasm_bindgen::JsValue;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationBoundaryPixels)]
     fn boundary_pixels_js(
         points: &[f32],
@@ -602,6 +677,7 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAtlasComposition)]
     fn atlas_composition_js(
+        receipt: &wasm_bindgen::JsValue,
         points: &[f32],
         cards: &[u32],
         fields: &str,
@@ -612,6 +688,7 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAnnotationSwatch)]
     fn annotation_swatch_js(
+        receipt: &wasm_bindgen::JsValue,
         css_bounds: &[f64],
         color: &[f64],
         control: &str,
@@ -621,6 +698,7 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAnnotationPixels)]
     fn annotation_pixels_js(
+        receipt: &wasm_bindgen::JsValue,
         css_bounds: &[f64],
         extent: &[f64],
         probes: &[f64],
@@ -630,6 +708,7 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAtlasPixels)]
     fn atlas_pixels_js(
+        receipt: &wasm_bindgen::JsValue,
         rectangles: &[f32],
         source_revision: f64,
         presentation_revision: f64,
@@ -643,6 +722,7 @@ extern "C" {
     fn report_js(event: &str, control: &str, detail: &str, a: f64, b: f64, c: f64, d: f64);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationUpscalePixels)]
     fn upscale_pixels_js(
+        receipt: &wasm_bindgen::JsValue,
         image_pixels: &[f32],
         button_css: &[f32],
         source: f64,
@@ -769,190 +849,219 @@ pub(crate) fn sample_boundary_pixels(
     let _ = (surface, control, image, clip);
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+const ATLAS_GRID_SAMPLES: usize = 13;
+#[cfg(any(target_arch = "wasm32", test))]
+const ATLAS_COMPOSITION_SAMPLES: usize = 256 * 4 + ATLAS_GRID_SAMPLES;
+
+#[cfg(any(target_arch = "wasm32", test))]
+struct AtlasCompositionSamples {
+    points: [f32; ATLAS_COMPOSITION_SAMPLES * 10],
+    count: usize,
+    cards: [u32; 256],
+    card_count: usize,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples> {
+    let snapshot = &draw.snapshot;
+    if !pixel_fixture_enabled()
+        || snapshot.augmentation.enabled
+        || snapshot.overlay.showlabels
+        || !snapshot.overlay.showmasks
+        || !snapshot.overlay.showboxes
+        || !matches!(snapshot.viewport.columns, 4 | 10)
+        || snapshot.gallery.slots.iter().any(|ready| !*ready)
+    {
+        return None;
+    }
+    let Some(frame) = draw.surface.frame else {
+        return None;
+    };
+    // The fixture is a constant clean image and a rectangular mask with a
+    // central hole. Four isolated samples exclude all label geometry.
+    let mut points = [0.0f32; ATLAS_COMPOSITION_SAMPLES * 10];
+    let mut count = 0;
+    let mut cards = [0u32; 256];
+    let mut card_count = 0;
+    let columns = snapshot.viewport.columns.max(1);
+    let side = frame.content_width as f32 / columns as f32;
+    for label in &snapshot.labels {
+        let slot = (label.box_.first.y / side) as usize * columns as usize
+            + (label.box_.first.x / side) as usize;
+        if snapshot.order.visibleindices.get(slot) != Some(&label.compiledindex) {
+            continue;
+        }
+        if !snapshot.gallery.slots.get(slot).copied().unwrap_or(false) {
+            continue;
+        }
+        let card_origin = iced::Point::new(
+            draw.image.x
+                + (slot % columns as usize) as f32 * side * draw.image.width
+                    / frame.content_width as f32,
+            draw.image.y
+                + (slot / columns as usize) as f32 * side * draw.image.height
+                    / frame.content_height as f32,
+        );
+        let card_end = iced::Point::new(
+            card_origin.x + side * draw.image.width / frame.content_width as f32 - 1.0,
+            card_origin.y + side * draw.image.height / frame.content_height as f32 - 1.0,
+        );
+        // Eligibility is independent of whether individual probes succeed:
+        // all ready annotated cards fully inside the visible clip.
+        if !draw.clip.contains(card_origin) || !draw.clip.contains(card_end) {
+            continue;
+        }
+        let Some(color) = snapshot.dataset.palette.get(label.category as usize) else {
+            continue;
+        };
+        let color = crate::presentation_surface::labels::class_color(color);
+        let rgb = [color.r, color.g, color.b].map(|value| (value * 255.0).round());
+        let width = label.box_.second.x - label.box_.first.x;
+        let height = label.box_.second.y - label.box_.first.y;
+        if cards[..card_count].contains(&label.compiledindex) {
+            continue;
+        }
+        if card_count == cards.len() {
+            return None;
+        }
+        cards[card_count] = label.compiledindex;
+        card_count += 1;
+        let start = count;
+        for (kind, (relative_x, relative_y)) in
+            [(0.2, 0.7), (0.5, 0.5), (0.0, 0.7), (-0.25, 0.7)]
+                .into_iter()
+                .enumerate()
+        {
+            if count + 10 > points.len() {
+                break;
+            }
+            let x = (label.box_.first.x + width * relative_x).floor()
+                + if kind == 2 { -0.5 } else { 0.5 };
+            let y = (label.box_.first.y + height * relative_y).floor() + 0.5;
+            let screen = iced::Point::new(
+                draw.image.x + x * draw.image.width / frame.content_width as f32,
+                draw.image.y + y * draw.image.height / frame.content_height as f32,
+            );
+            if !draw.clip.contains(screen) {
+                continue;
+            }
+            let base = [48.0, 80.0, 112.0];
+            // Canvas pixel centers generally do not coincide with source
+            // texel centers. Follow the existing linear sampler, including
+            // the one-pixel stroke's clean/mask neighbours.
+            let texel_x = (screen.x.floor() + 0.5 - draw.image.x) * frame.content_width as f32
+                / draw.image.width
+                - 0.5;
+            let texel_y = (screen.y.floor() + 0.5 - draw.image.y) * frame.content_height as f32
+                / draw.image.height
+                - 0.5;
+            let alpha_at = |px: f32, py: f32| {
+                let left = label.box_.first.x.floor() - 1.0;
+                let top = label.box_.first.y.floor() - 1.0;
+                let right = label.box_.second.x.ceil();
+                let bottom = label.box_.second.y.ceil();
+                if ((px == left || px == right) && py >= top && py <= bottom)
+                    || ((py == top || py == bottom) && px >= left && px <= right)
+                {
+                    return 1.0;
+                }
+                let center_x = px + 0.5;
+                let center_y = py + 0.5;
+                let inside = center_x >= label.box_.first.x
+                    && center_x < label.box_.second.x
+                    && center_y >= label.box_.first.y
+                    && center_y < label.box_.second.y;
+                let hole = center_x >= label.box_.first.x + width * 0.375
+                    && center_x < label.box_.first.x + width * 0.625
+                    && center_y >= label.box_.first.y + height * 0.375
+                    && center_y < label.box_.first.y + height * 0.625;
+                if inside && !hole { 0.36 } else { 0.0 }
+            };
+            let tx = texel_x.fract();
+            let ty = texel_y.fract();
+            let expected: [f32; 3] = std::array::from_fn(|channel| {
+                let color_at = |dx: f32, dy: f32| {
+                    let alpha = alpha_at(texel_x.floor() + dx, texel_y.floor() + dy);
+                    (base[channel] * (1.0 - alpha) + rgb[channel] * alpha).round()
+                };
+                ((color_at(0.0, 0.0) * (1.0 - tx) + color_at(1.0, 0.0) * tx) * (1.0 - ty)
+                    + (color_at(0.0, 1.0) * (1.0 - tx) + color_at(1.0, 1.0) * tx) * ty)
+                    .round()
+            });
+            points[count..count + 10].copy_from_slice(&[
+                x,
+                y,
+                screen.x,
+                screen.y,
+                expected[0],
+                expected[1],
+                expected[2],
+                255.0,
+                kind as f32,
+                label.compiledindex as f32,
+            ]);
+            count += 10;
+        }
+        if count - start != 40 {
+            return None;
+        }
+    }
+    // Real canvas samples bound each black/white/black line by adjacent
+    // clean fixture pixels. The outer edges have one image-side neighbor;
+    // the interior boundary has two. No CPU shader implementation is used.
+    // Pick a visible row interior so horizontal grid lines cannot mask a defect.
+    let cell = draw.image.width / columns as f32;
+    let first_row = ((draw.clip.y - draw.image.y) / cell - 0.5).ceil().max(0.0);
+    let y = draw.image.y + (first_row + 0.5) * cell;
+    let centers = [draw.image.x + 1.5, draw.image.x + cell + 0.5,
+        draw.image.x + draw.image.width - 1.5];
+    for (edge, center) in centers.into_iter().enumerate() {
+        let offsets: &[f32] = match edge {
+            0 => &[-1.0, 0.0, 1.0, 2.0],
+            1 => &[-2.0, -1.0, 0.0, 1.0, 2.0],
+            _ => &[-2.0, -1.0, 0.0, 1.0],
+        };
+        for &offset in offsets {
+            let point = iced::Point::new(center + offset, y);
+            if !draw.clip.contains(point) || !draw.image.contains(point) { return None; }
+            let color = if offset.abs() == 2.0 { [48.0, 80.0, 112.0] }
+                else if offset == 0.0 { [255.0; 3] } else { [0.0; 3] };
+            points[count..count + 10].copy_from_slice(&[
+                point.x - draw.image.x, point.y - draw.image.y, point.x, point.y,
+                color[0], color[1], color[2], 255.0, 4.0, 0.0,
+            ]);
+            count += 10;
+        }
+    }
+    Some(AtlasCompositionSamples { points, count, cards, card_count })
+}
+
 fn sample_atlas_composition(draw: &AtlasDraw) {
     #[cfg(target_arch = "wasm32")]
     {
         if !crate::presentation_surface::pixel_trace::enabled() {
             return;
         }
-        let snapshot = &draw.snapshot;
-        if !pixel_fixture_enabled()
-            || snapshot.augmentation.enabled
-            || snapshot.overlay.showlabels
-            || !snapshot.overlay.showmasks
-            || !snapshot.overlay.showboxes
-            || !matches!(snapshot.viewport.columns, 4 | 10)
-            || snapshot.gallery.slots.iter().any(|ready| !*ready)
-        {
-            return;
-        }
-        let Some(frame) = draw.surface.frame else {
-            return;
-        };
-        // The fixture is a constant clean image and a rectangular mask with a
-        // central hole. Four isolated samples exclude all label geometry.
-        let mut points = [0.0f32; (256 * 4 + 9) * 10];
-        let mut count = 0;
-        let mut cards = [0u32; 256];
-        let mut card_count = 0;
-        let columns = snapshot.viewport.columns.max(1);
-        let side = frame.content_width as f32 / columns as f32;
-        for label in &snapshot.labels {
-            let slot = (label.box_.first.y / side) as usize * columns as usize
-                + (label.box_.first.x / side) as usize;
-            if snapshot.order.visibleindices.get(slot) != Some(&label.compiledindex) {
-                continue;
-            }
-            if !snapshot.gallery.slots.get(slot).copied().unwrap_or(false) {
-                continue;
-            }
-            let card_origin = iced::Point::new(
-                draw.image.x
-                    + (slot % columns as usize) as f32 * side * draw.image.width
-                        / frame.content_width as f32,
-                draw.image.y
-                    + (slot / columns as usize) as f32 * side * draw.image.height
-                        / frame.content_height as f32,
-            );
-            let card_end = iced::Point::new(
-                card_origin.x + side * draw.image.width / frame.content_width as f32 - 1.0,
-                card_origin.y + side * draw.image.height / frame.content_height as f32 - 1.0,
-            );
-            // Eligibility is independent of whether individual probes succeed:
-            // all ready annotated cards fully inside the visible clip.
-            if !draw.clip.contains(card_origin) || !draw.clip.contains(card_end) {
-                continue;
-            }
-            let Some(color) = snapshot.dataset.palette.get(label.category as usize) else {
-                continue;
-            };
-            let color = crate::presentation_surface::labels::class_color(color);
-            let rgb = [color.r, color.g, color.b].map(|value| (value * 255.0).round());
-            let width = label.box_.second.x - label.box_.first.x;
-            let height = label.box_.second.y - label.box_.first.y;
-            if cards[..card_count].contains(&label.compiledindex) {
-                continue;
-            }
-            if card_count == cards.len() {
-                return;
-            }
-            cards[card_count] = label.compiledindex;
-            card_count += 1;
-            let start = count;
-            for (kind, (relative_x, relative_y)) in
-                [(0.2, 0.7), (0.5, 0.5), (0.0, 0.7), (-0.25, 0.7)]
-                    .into_iter()
-                    .enumerate()
-            {
-                if count + 10 > points.len() {
-                    break;
-                }
-                let x = (label.box_.first.x + width * relative_x).floor()
-                    + if kind == 2 { -0.5 } else { 0.5 };
-                let y = (label.box_.first.y + height * relative_y).floor() + 0.5;
-                let screen = iced::Point::new(
-                    draw.image.x + x * draw.image.width / frame.content_width as f32,
-                    draw.image.y + y * draw.image.height / frame.content_height as f32,
-                );
-                if !draw.clip.contains(screen) {
-                    continue;
-                }
-                let base = [48.0, 80.0, 112.0];
-                // Canvas pixel centers generally do not coincide with source
-                // texel centers. Follow the existing linear sampler, including
-                // the one-pixel stroke's clean/mask neighbours.
-                let texel_x = (screen.x.floor() + 0.5 - draw.image.x) * frame.content_width as f32
-                    / draw.image.width
-                    - 0.5;
-                let texel_y = (screen.y.floor() + 0.5 - draw.image.y) * frame.content_height as f32
-                    / draw.image.height
-                    - 0.5;
-                let alpha_at = |px: f32, py: f32| {
-                    let left = label.box_.first.x.floor() - 1.0;
-                    let top = label.box_.first.y.floor() - 1.0;
-                    let right = label.box_.second.x.ceil();
-                    let bottom = label.box_.second.y.ceil();
-                    if ((px == left || px == right) && py >= top && py <= bottom)
-                        || ((py == top || py == bottom) && px >= left && px <= right)
-                    {
-                        return 1.0;
-                    }
-                    let center_x = px + 0.5;
-                    let center_y = py + 0.5;
-                    let inside = center_x >= label.box_.first.x
-                        && center_x < label.box_.second.x
-                        && center_y >= label.box_.first.y
-                        && center_y < label.box_.second.y;
-                    let hole = center_x >= label.box_.first.x + width * 0.375
-                        && center_x < label.box_.first.x + width * 0.625
-                        && center_y >= label.box_.first.y + height * 0.375
-                        && center_y < label.box_.first.y + height * 0.625;
-                    if inside && !hole { 0.36 } else { 0.0 }
-                };
-                let tx = texel_x.fract();
-                let ty = texel_y.fract();
-                let expected: [f32; 3] = std::array::from_fn(|channel| {
-                    let color_at = |dx: f32, dy: f32| {
-                        let alpha = alpha_at(texel_x.floor() + dx, texel_y.floor() + dy);
-                        (base[channel] * (1.0 - alpha) + rgb[channel] * alpha).round()
-                    };
-                    ((color_at(0.0, 0.0) * (1.0 - tx) + color_at(1.0, 0.0) * tx) * (1.0 - ty)
-                        + (color_at(0.0, 1.0) * (1.0 - tx) + color_at(1.0, 1.0) * tx) * ty)
-                        .round()
-                });
-                points[count..count + 10].copy_from_slice(&[
-                    x,
-                    y,
-                    screen.x,
-                    screen.y,
-                    expected[0],
-                    expected[1],
-                    expected[2],
-                    255.0,
-                    kind as f32,
-                    label.compiledindex as f32,
-                ]);
-                count += 10;
-            }
-            if count - start != 40 {
-                return;
-            }
-        }
-        // Nine physical shader samples replace the CPU grid-tone mirror:
-        // left outer, first interior, and right outer black/white/black lines.
-        // Pick a visible row interior so horizontal grid lines cannot mask a defect.
-        let cell = draw.image.width / columns as f32;
-        let first_row = ((draw.clip.y - draw.image.y) / cell - 0.5).ceil().max(0.0);
-        let y = draw.image.y + (first_row + 0.5) * cell;
-        let centers = [draw.image.x + 1.5, draw.image.x + cell + 0.5,
-            draw.image.x + draw.image.width - 1.5];
-        for center in centers {
-            for (offset, tone) in [(-1.0, 0.0), (0.0, 255.0), (1.0, 0.0)] {
-                let point = iced::Point::new(center + offset, y);
-                if !draw.clip.contains(point) || !draw.image.contains(point) { return; }
-                points[count..count + 10].copy_from_slice(&[
-                    point.x - draw.image.x, point.y - draw.image.y, point.x, point.y,
-                    tone, tone, tone, 255.0, 4.0, 0.0,
-                ]);
-                count += 10;
-            }
-        }
+        let Some(samples) = atlas_composition_samples(draw) else { return; };
+        let frame = draw.surface.frame.expect("sampleable atlas composition");
         let Some(mut output) =
-            probe_output(EXPLORE_GALLERY)
+            atlas_probe_output(true)
         else {
             return;
         };
         let receipt = draw.clone();
-        let completed = pixel_result_callback(move |expected, matched| {
+        let canvas_probe = output.canvas_probe.clone();
+        let completed = pixel_result_callback(move |outcome| {
             let _ = output.try_send(Message::AtlasComposition {
                 receipt,
-                expected,
-                matched,
+                outcome,
             });
         });
         atlas_composition_js(
-            &points[..count],
-            &cards[..card_count],
+            &canvas_probe,
+            &samples.points[..samples.count],
+            &samples.cards[..samples.card_count],
             &format!(
                 "{{{},\"image_x\":{},\"image_y\":{},\"image_width\":{},\"image_height\":{}}}",
                 crate::presentation_surface::surface_trace_fields(draw.surface, draw.surface),
@@ -963,7 +1072,7 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
             ),
             frame.content_sequence as f64,
             frame.presentation_revision as f64,
-            snapshot.viewport.columns,
+            draw.snapshot.viewport.columns,
             &completed,
         );
     }
@@ -976,48 +1085,36 @@ fn pixel_fixture_enabled() -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn pixel_result_callback(completed: impl FnOnce(u32, u32) + 'static) -> wasm_bindgen::JsValue {
-    // Keep the JavaScript boundary explicit: the optimized bindgen adapter can
-    // share integer closure shims with externref closures.
+fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'static) -> wasm_bindgen::JsValue {
+    // JsValue parameters keep malformed adapter values observable before conversion.
     let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
     wasm_bindgen::closure::Closure::once_into_js(
-        move |first: wasm_bindgen::JsValue, second: wasm_bindgen::JsValue| {
+        move |status: wasm_bindgen::JsValue, first: wasm_bindgen::JsValue, second: wasm_bindgen::JsValue| {
             if SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation) != generation || !reporting_enabled() { return; }
-            let counts = [first, second].map(|value| {
-                value.as_f64().filter(|number| {
-                    number.is_finite()
-                        && *number >= 0.0
-                        && *number <= f64::from(u32::MAX)
-                        && number.fract() == 0.0
-                })
-            });
-            if let [Some(first), Some(second)] = counts {
-                completed(first as u32, second as u32);
-            } else {
-                report(
-                    "integration.failure",
-                    "",
-                    "pixel callback returned invalid counts",
-                    [0.0; 4],
-                );
-                completed(0, 0);
+            let status = status.as_string();
+            let outcome = ProbeOutcome::decode(status.as_deref(), [first.as_f64(), second.as_f64()]);
+            if outcome == ProbeOutcome::Failed && status.as_deref() != Some("failed") {
+                report("integration.failure", "", "pixel callback returned invalid counts", [0.0; 4]);
             }
+            completed(outcome);
         },
     )
 }
 
 #[cfg(target_arch = "wasm32")]
 fn sample_upscale_pixels(
+    mut output: ScenarioOutput,
     image_pixels: Rectangle,
     button_css: Rectangle,
     source: u64,
     presentation: u64,
 ) {
-    let Some(mut output) = probe_output(explore::DETAIL_WORKSPACE_ID) else { return; };
-    let completed = pixel_result_callback(move |checksum, blue| {
-        let _ = output.try_send(Message::UpscalePixels { source, presentation, checksum, blue });
+    let canvas_probe = output.canvas_probe.clone();
+    let completed = pixel_result_callback(move |outcome| {
+        let _ = output.try_send(Message::UpscalePixels { source, presentation, outcome });
     });
     upscale_pixels_js(
+        &canvas_probe,
         &[
             image_pixels.x,
             image_pixels.y,
@@ -1037,7 +1134,7 @@ fn sample_upscale_pixels(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn sample_upscale_pixels(_image: Rectangle, _button: Rectangle, _source: u64, _presentation: u64) {}
+fn sample_upscale_pixels(_output: ScenarioOutput, _image: Rectangle, _button: Rectangle, _source: u64, _presentation: u64) {}
 
 #[cfg(target_arch = "wasm32")]
 fn report(event: &str, control: &str, detail: &str, values: [f64; 4]) {
@@ -1202,18 +1299,19 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
 fn sample_atlas_pixels(draw: AtlasDraw) {
     let rectangles = atlas_pixel_rectangles(&draw);
     let frame = draw.surface.frame.expect("drawn atlas publication");
-    let Some(mut output) = probe_output(EXPLORE_GALLERY)
+    let Some(mut output) = atlas_probe_output(false)
     else {
         return;
     };
-    let completed = pixel_result_callback(move |visible, nonblack| {
+    let canvas_probe = output.canvas_probe.clone();
+    let completed = pixel_result_callback(move |outcome| {
         let _ = output.try_send(Message::AtlasPixels {
             receipt: draw,
-            visible,
-            nonblack,
+            outcome,
         });
     });
     atlas_pixels_js(
+        &canvas_probe,
         &rectangles,
         frame.content_sequence as f64,
         frame.presentation_revision as f64,
@@ -2177,10 +2275,13 @@ pub struct Controller {
     compiled_directory: String,
     resolution: String,
     viewer_scenario: String,
-    annotation_probe: Option<(u64, u64, u32, u32, Vec<f64>)>,
+    annotation_probe: Option<AnnotationProbe>,
     annotation_pixels_receipt: Option<ProbeReceipt>,
     annotation_pixels_pending: Option<ProbeReceipt>,
+    annotation_pixels_owner: Option<std::sync::Arc<()>>,
     control_probe_receipt: Option<ProbeReceipt>,
+    control_probe_owner: Option<std::sync::Arc<()>>,
+    control_probe: Option<ControlProbe>,
     copy_step: u8,
     copy_product: annotation_product::Pass,
     copy_product_gesture: Option<[f64; 4]>,
@@ -2212,6 +2313,7 @@ pub struct Controller {
     viewer_drawn: Option<(u64, u64, ViewerDraw)>,
     upscale_button: Option<Rectangle>,
     upscale_pixel_pending: Option<ProbeReceipt>,
+    upscale_pixel_owner: Option<std::sync::Arc<()>>,
     upscale_pixels: Option<(u64, u64, u32, u32)>,
     upscale_repeat_revision: Option<u64>,
     upscale_repeat_observed: bool,
@@ -2394,7 +2496,10 @@ impl Controller {
             annotation_probe: None,
             annotation_pixels_receipt: None,
             annotation_pixels_pending: None,
+            annotation_pixels_owner: None,
             control_probe_receipt: None,
+            control_probe_owner: None,
+            control_probe: None,
             copy_step: 0,
             copy_product: annotation_product::Pass::default(),
             copy_product_gesture: None,
@@ -2426,6 +2531,7 @@ impl Controller {
             viewer_drawn: None,
             upscale_button: None,
             upscale_pixel_pending: None,
+            upscale_pixel_owner: None,
             upscale_pixels: None,
             upscale_repeat_revision: None,
             upscale_repeat_observed: false,
@@ -2866,17 +2972,68 @@ impl Controller {
         self.arm_scrolled(advanced_field_id(index), RelativeOffset::END)
     }
 
+    fn prepare_upscale_probe(&mut self, image: Rectangle, source: u64, presentation: u64) -> Option<ScenarioOutput> {
+        let output = probe_output(explore::DETAIL_WORKSPACE_ID)?;
+        let receipt = output.receipt.as_ref()?;
+        let frame = receipt.surface.frame?;
+        if receipt.image != image || frame.content_sequence != source || frame.presentation_revision != presentation {
+            return None;
+        }
+        self.upscale_pixel_owner = output.probe.clone();
+        self.upscale_pixel_pending = output.receipt.clone();
+        self.upscale_pixels = None;
+        Some(output)
+    }
+
+    fn prepare_control_probe(&mut self) -> bool {
+        if self.location_pending { return false; }
+        let Some(output) = probe_output("workflow.visual.workspace") else { return false; };
+        self.control_probe_owner = output.probe.clone();
+        self.control_probe_receipt = output.receipt.clone();
+        self.control_probe = Some(ControlProbe {
+            output, color: self.copy_swatch_color, available: self.copy_capability_available,
+        });
+        true
+    }
+
+    fn prepare_annotation_probe(&mut self, source: u64, presentation: u64, extent: [u32; 2], pixels: Vec<f64>) -> bool {
+        if self.location_pending { return false; }
+        let Some(output) = probe_output("workflow.visual.workspace") else { return false; };
+        if self.annotation_pixels_pending == output.receipt { return false; }
+        self.annotation_pixels_owner = output.probe.clone();
+        self.annotation_pixels_pending = output.receipt.clone();
+        self.annotation_probe = Some(AnnotationProbe { output, source, presentation, extent, pixels });
+        true
+    }
+
+    fn invalidate_atlas_draw(&mut self) {
+        // The next ordinary physical draw can arm the same frame at settled geometry.
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None);
+    }
+
     pub(crate) fn accepts_message(&self, message: &Message) -> bool {
         if !self.running() {
             return false;
         }
         match message {
             Message::Scoped { generation, receipt, message } => {
+                let (probe, message) = match message.as_ref() {
+                    Message::ProbeCompleted { owner, message } => (Some(owner), message.as_ref()),
+                    message => (None, message),
+                };
                 *generation == self.generation
                     && *generation == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+                    && match message {
+                        Message::UpscalePixels { .. } => same_probe(&self.upscale_pixel_owner, probe),
+                        Message::AnnotationControlPixels { .. } | Message::AnnotationPixels { revision: 0, .. } => same_probe(&self.control_probe_owner, probe),
+                        Message::AnnotationPixels { .. } => same_probe(&self.annotation_pixels_owner, probe),
+                        Message::AtlasPixels { .. } => SURFACE_DRAW_OBSERVER.with(|observer| same_probe(&observer.borrow().atlas_pixels_owner, probe)),
+                        Message::AtlasComposition { .. } => SURFACE_DRAW_OBSERVER.with(|observer| same_probe(&observer.borrow().atlas_composition_owner, probe)),
+                        _ => probe.is_none(),
+                    }
                     && match receipt {
                         Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
-                        None => matches!(message.as_ref(), Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered),
+                        None => matches!(message, Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered),
                     }
             }
             Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered => true,
@@ -2888,12 +3045,16 @@ impl Controller {
         if !self.accepts_message(&message) {
             return None;
         }
+        let (message, request_receipt) = match message {
+            Message::Scoped { message, receipt, .. } => (*message, receipt),
+            message => (message, None),
+        };
         let message = match message {
-            Message::Scoped { message, .. } => *message,
+            Message::ProbeCompleted { message, .. } => *message,
             message => message,
         };
         let (control, bounds) = match message {
-            Message::Scoped { .. } | Message::Advance => return None,
+            Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => return None,
             Message::NumberWheelDelivered => {
                 if let Phase::AwaitAdvancedSpinnerWheel(index) = self.phase {
                     self.phase = Phase::AdvancedSpinnerWheelVerify(index);
@@ -2906,14 +3067,14 @@ impl Controller {
                 }
                 return None;
             }
-            #[cfg(target_arch = "wasm32")]
-            Message::UpscalePixels {
-                source,
-                presentation,
-                checksum,
-                blue,
-            } => {
-                self.upscale_pixels = Some((source, presentation, checksum, blue));
+            Message::UpscalePixels { source, presentation, outcome } => {
+                if self.upscale_pixel_pending != request_receipt { return None; }
+                self.upscale_pixel_owner = None;
+                match outcome {
+                    ProbeOutcome::Invalidated => self.upscale_pixel_pending = None,
+                    ProbeOutcome::Observed(checksum, blue) => self.upscale_pixels = Some((source, presentation, checksum, blue)),
+                    ProbeOutcome::Failed => self.fail("Upscale canvas sampling failed"),
+                }
                 return None;
             }
             Message::Located { control, bounds } => (control, bounds),
@@ -2931,64 +3092,57 @@ impl Controller {
                 self.atlas_drawn = Some((source_revision, visibility));
                 return None;
             }
-            #[cfg(target_arch = "wasm32")]
-            Message::AnnotationControlPixels { expected, matched } => {
-                if expected != 1 || matched != 1 {
-                    self.fail("Rendered tool availability differs from the native capability");
-                } else {
-                    self.copy_capability_ready = true;
+            Message::AnnotationControlPixels { outcome } => {
+                if self.control_probe_receipt != request_receipt { return None; }
+                self.control_probe_owner = None;
+                match outcome {
+                    ProbeOutcome::Invalidated => self.control_probe_receipt = None,
+                    ProbeOutcome::Observed(1, 1) => self.copy_capability_ready = true,
+                    _ => self.fail("Rendered tool availability differs from the native capability"),
                 }
                 return None;
             }
-            #[cfg(target_arch = "wasm32")]
-            Message::AnnotationPixels {
-                revision,
-                expected,
-                matched,
-            } => {
-                self.annotation_pixels_pending = None;
-                if expected == 0 || expected != matched {
-                    self.fail("Annotation pixels do not match source geometry and native palette");
-                } else if revision == 0 {
-                    self.copy_swatch_ready = true;
-                } else {
-                    self.annotation_pixels_receipt = current_receipt("workflow.visual.workspace");
+            Message::AnnotationPixels { revision, outcome } => {
+                let pending = if revision == 0 { &mut self.control_probe_receipt } else { &mut self.annotation_pixels_pending };
+                if *pending != request_receipt { return None; }
+                *pending = None;
+                if revision == 0 { self.control_probe_owner = None; } else { self.annotation_pixels_owner = None; }
+                match outcome {
+                    ProbeOutcome::Invalidated => {}
+                    ProbeOutcome::Observed(expected, matched) if expected != 0 && expected == matched => {
+                        if revision == 0 {
+                            self.control_probe_receipt = request_receipt;
+                            self.copy_swatch_ready = true;
+                        } else {
+                            self.annotation_pixels_receipt = request_receipt;
+                        }
+                    }
+                    _ => self.fail("Annotation pixels do not match source geometry and native palette"),
                 }
                 return None;
             }
-            Message::AtlasComposition {
-                receipt,
-                expected,
-                matched,
-            } => {
-                if expected != 0 && expected == matched {
-                    self.atlas_composition = Some(receipt);
+            Message::AtlasComposition { receipt, outcome } => {
+                SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas_composition_owner = None);
+                match outcome {
+                    ProbeOutcome::Invalidated => self.invalidate_atlas_draw(),
+                    ProbeOutcome::Observed(expected, matched) if expected != 0 && expected == matched => self.atlas_composition = Some(receipt),
+                    ProbeOutcome::Failed => self.fail("Atlas composition canvas sampling failed"),
+                    _ => {}
                 }
                 return None;
             }
-            Message::AtlasPixels {
-                receipt,
-                visible,
-                nonblack,
-            } => {
-                let snapshot = &receipt.snapshot;
-                report(
-                    "integration.atlas_canvas_pixels",
-                    EXPLORE_GALLERY,
-                    "visible-tile-interiors",
-                    [
-                        snapshot.frame.revision as f64,
-                        receipt
-                            .surface
-                            .frame
-                            .map_or(0, |frame| frame.presentation_revision)
-                            as f64,
-                        visible as f64,
-                        nonblack as f64,
-                    ],
-                );
-                if visible != 0 && visible == nonblack {
-                    self.atlas_pixels = Some(receipt);
+            Message::AtlasPixels { receipt, outcome } => {
+                SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas_pixels_owner = None);
+                match outcome {
+                    ProbeOutcome::Invalidated => self.invalidate_atlas_draw(),
+                    ProbeOutcome::Observed(visible, nonblack) => {
+                        report("integration.atlas_canvas_pixels", EXPLORE_GALLERY, "visible-tile-interiors",
+                            [receipt.snapshot.frame.revision as f64,
+                             receipt.surface.frame.map_or(0, |frame| frame.presentation_revision) as f64,
+                             visible as f64, nonblack as f64]);
+                        if visible != 0 && visible == nonblack { self.atlas_pixels = Some(receipt); }
+                    }
+                    ProbeOutcome::Failed => self.fail("Atlas canvas sampling failed"),
                 }
                 return None;
             }
@@ -3030,6 +3184,26 @@ impl Controller {
             }
         };
         self.location_pending = false;
+        if let Some(probe) = &self.annotation_probe {
+            if probe.output.receipt != current_receipt("workflow.visual.workspace") {
+                if self.annotation_pixels_pending == probe.output.receipt {
+                    self.annotation_pixels_pending = None;
+                    self.annotation_pixels_owner = None;
+                }
+                self.annotation_probe = None;
+                return None;
+            }
+        }
+        if let Some(probe) = &self.control_probe {
+            if probe.output.receipt != current_receipt("workflow.visual.workspace") {
+                if self.control_probe_receipt == probe.output.receipt {
+                    self.control_probe_receipt = None;
+                    self.control_probe_owner = None;
+                }
+                self.control_probe = None;
+                return None;
+            }
+        }
         if matches!(self.phase, Phase::ViewerNoAspect) {
             if bounds.width > 0.0 || bounds.height > 0.0 {
                 self.fail("Explore still renders an aspect-ratio selector");
@@ -3215,33 +3389,37 @@ impl Controller {
         let input_bounds = crate::presentation_surface::physical_bounds(bounds, self.input_scale);
         match self.phase.clone() {
             Phase::CopyCapability => {
-                self.control_probe_receipt = current_receipt("workflow.visual.workspace");
                 self.phase = Phase::CopyCapabilityWait;
-                #[cfg(target_arch = "wasm32")]
-                if let Some(mut output) =
-                    probe_output("workflow.visual.workspace")
-                {
-                    let callback = pixel_result_callback(move |expected, matched| {
-                        let _ =
-                            output.try_send(Message::AnnotationControlPixels { expected, matched });
-                    });
-                    annotation_swatch_js(
-                        &[
-                            f64::from(input_bounds.x),
-                            f64::from(input_bounds.y),
-                            f64::from(input_bounds.width),
-                            f64::from(input_bounds.height),
-                        ],
-                        &self.copy_swatch_color,
-                        &control,
-                        if self.copy_capability_available {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        },
-                        true,
-                        &callback,
-                    );
+                if let Some(probe) = self.control_probe.take() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = probe;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let mut output = probe.output;
+                        let canvas_probe = output.canvas_probe.clone();
+                        let callback = pixel_result_callback(move |outcome| {
+                            let _ =
+                                output.try_send(Message::AnnotationControlPixels { outcome });
+                        });
+                        annotation_swatch_js(
+                            &canvas_probe,
+                            &[
+                                f64::from(input_bounds.x),
+                                f64::from(input_bounds.y),
+                                f64::from(input_bounds.width),
+                                f64::from(input_bounds.height),
+                            ],
+                            &probe.color,
+                            &control,
+                            if probe.available {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            true,
+                            &callback,
+                        );
+                    }
                 }
                 None
             }
@@ -3308,62 +3486,56 @@ impl Controller {
                 None
             }
             Phase::CopyLayout(_) => {
-                self.control_probe_receipt = current_receipt("workflow.visual.workspace");
                 self.phase = Phase::CopySwatchWait;
-                #[cfg(target_arch = "wasm32")]
-                if let Some(mut output) =
-                    probe_output("workflow.visual.workspace")
-                {
-                    let callback = pixel_result_callback(move |expected, matched| {
-                        let _ = output.try_send(Message::AnnotationPixels {
-                            revision: 0,
-                            expected,
-                            matched,
-                        });
-                    });
-                    annotation_swatch_js(
-                        &[
-                            f64::from(input_bounds.x),
-                            f64::from(input_bounds.y),
-                            f64::from(input_bounds.width),
-                            f64::from(input_bounds.height),
-                        ],
-                        &self.copy_swatch_color,
-                        &control,
-                        "native-hsv-completed-canvas",
-                        false,
-                        &callback,
-                    );
-                }
-                None
-            }
-            Phase::AwaitPointer(_) | Phase::CopyProductWait if self.annotation_probe.is_some() => {
-                #[cfg(target_arch = "wasm32")]
-                if let Some((source, presentation, width, height, probes)) =
-                    self.annotation_probe.take()
-                {
-                    if let Some(mut output) =
-                        probe_output("workflow.visual.workspace")
+                if let Some(probe) = self.control_probe.take() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = probe;
+                    #[cfg(target_arch = "wasm32")]
                     {
-                        let callback = pixel_result_callback(move |expected, matched| {
+                        let mut output = probe.output;
+                        let canvas_probe = output.canvas_probe.clone();
+                        let callback = pixel_result_callback(move |outcome| {
                             let _ = output.try_send(Message::AnnotationPixels {
-                                revision: source,
-                                expected,
-                                matched,
+                                revision: 0,
+                                outcome,
                             });
                         });
-                        annotation_pixels_js(
+                        annotation_swatch_js(
+                            &canvas_probe,
                             &[
                                 f64::from(input_bounds.x),
                                 f64::from(input_bounds.y),
                                 f64::from(input_bounds.width),
                                 f64::from(input_bounds.height),
                             ],
-                            &[f64::from(width), f64::from(height)],
-                            &probes,
-                            source as f64,
-                            presentation as f64,
+                            &probe.color,
+                            &control,
+                            "native-hsv-completed-canvas",
+                            false,
                             &callback,
+                        );
+                    }
+                }
+                None
+            }
+            Phase::AwaitPointer(_) | Phase::CopyProductWait if self.annotation_probe.is_some() => {
+                if let Some(probe) = self.annotation_probe.take() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let _ = probe;
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let mut output = probe.output;
+                        let source = probe.source;
+                        let canvas_probe = output.canvas_probe.clone();
+                        let callback = pixel_result_callback(move |outcome| {
+                            let _ = output.try_send(Message::AnnotationPixels { revision: source, outcome });
+                        });
+                        annotation_pixels_js(
+                            &canvas_probe,
+                            &[f64::from(input_bounds.x), f64::from(input_bounds.y),
+                              f64::from(input_bounds.width), f64::from(input_bounds.height)],
+                            &probe.extent.map(f64::from), &probe.pixels,
+                            source as f64, probe.presentation as f64, &callback,
                         );
                     }
                 }
@@ -6943,9 +7115,9 @@ impl Controller {
                 };
                 let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else { return Task::none(); };
                 if self.upscale_pixel_pending.as_ref() != Some(&receipt) {
-                    self.upscale_pixels = None;
-                    self.upscale_pixel_pending = Some(receipt);
-                    sample_upscale_pixels(viewer.image, button, source, drawn);
+                    if let Some(output) = self.prepare_upscale_probe(viewer.image, source, drawn) {
+                        sample_upscale_pixels(output, viewer.image, button, source, drawn);
+                    }
                     return Task::none();
                 }
                 let Some((pixel_source, pixel_presentation, checksum, blue)) = self.upscale_pixels
@@ -6953,8 +7125,9 @@ impl Controller {
                     return Task::none();
                 };
                 if pixel_source != source || pixel_presentation != drawn {
-                    self.upscale_pixels = None;
-                    sample_upscale_pixels(viewer.image, button, source, drawn);
+                    if let Some(output) = self.prepare_upscale_probe(viewer.image, source, drawn) {
+                        sample_upscale_pixels(output, viewer.image, button, source, drawn);
+                    }
                     return Task::none();
                 }
                 if checksum == 0 || blue < 32 {
@@ -7509,6 +7682,7 @@ impl Controller {
                     if self.location_pending {
                         return Task::none();
                     }
+                    if !self.prepare_control_probe() { return Task::none(); }
                     self.location_pending = true;
                     self.copy_swatch_ready = false;
                     iced::widget::operation::snap_to(
@@ -7575,6 +7749,7 @@ impl Controller {
                     f64::from(color.g) * 255.0,
                     f64::from(color.b) * 255.0,
                 ];
+                if !self.prepare_control_probe() { return Task::none(); }
                 self.copy_capability_ready = false;
                 self.arm_scrolled(
                     annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
@@ -7927,16 +8102,11 @@ impl Controller {
                 if self.viewer_scenario == "copy"
                     && (receipt.is_none() || self.annotation_pixels_receipt != receipt)
                 {
-                    let Some(receipt) = receipt else { return Task::none(); };
-                    if self.annotation_pixels_pending.as_ref() == Some(&receipt) { return Task::none(); }
-                    self.annotation_pixels_pending = Some(receipt);
-                    self.annotation_probe = Some((
-                        snapshot.frame.revision,
-                        presentation_revision,
-                        snapshot.frame.extent.width,
-                        snapshot.frame.extent.height,
-                        annotation_checks::probes(&snapshot.ui),
-                    ));
+                    if self.location_pending || self.annotation_pixels_pending == receipt { return Task::none(); }
+                    if !self.prepare_annotation_probe(snapshot.frame.revision, presentation_revision,
+                        [snapshot.frame.extent.width, snapshot.frame.extent.height], annotation_checks::probes(&snapshot.ui)) {
+                        return Task::none();
+                    }
                     return self.arm(ANNOTATION_SURFACE);
                 }
                 report(
@@ -8148,7 +8318,7 @@ mod tests {
         let mut controller = Controller::new(true, false, "old-source".into(), "old-output".into(), "384".into(), "atlas".into());
         let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
         let old_subscription = std::sync::Arc::new(());
-        let mut old_output = ScenarioOutput { generation: controller.generation, receipt: None, sender };
+        let mut old_output = ScenarioOutput::new(controller.generation, sender);
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             observer.subscription = Some(old_subscription.clone());
@@ -8243,6 +8413,266 @@ mod tests {
         assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.is_none()));
         controller.phase = Phase::Failed;
         assert!(controller.reset_scenario(String::new(), String::new(), String::new(), String::new()).is_err());
+        initialize_reporting(false, false);
+    }
+
+    #[test]
+    fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
+        initialize_reporting(true, true);
+        let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "atlas".into());
+        let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let mut surface = crate::view_model::test_support::physical_surface(frame);
+        surface.integration = true;
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        let draw = AtlasDraw { surface, bounds, image: bounds, clip: bounds,
+            snapshot: std::sync::Arc::new(crate::view_model::test_support::explore_snapshot()) };
+        record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
+        report_atlas_draw(draw.clone(), false, 1.0);
+        controller.update(receiver.try_recv().unwrap());
+        let mut old_pixels = atlas_probe_output(false).unwrap();
+        let mut old_composition = atlas_probe_output(true).unwrap();
+        old_pixels.try_send(Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
+        assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.is_none()));
+        // A normal draw rearms the same physical frame after CSS/backing settles.
+        report_atlas_draw(draw.clone(), false, 1.0);
+        controller.update(receiver.try_recv().unwrap());
+        let mut pixels = atlas_probe_output(false).unwrap();
+        let mut composition = atlas_probe_output(true).unwrap();
+        for (output, message) in [
+            (&mut old_pixels, Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }),
+            (&mut old_composition, Message::AtlasComposition { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }),
+        ] {
+            output.try_send(message).unwrap();
+            let stale = receiver.try_recv().unwrap();
+            assert!(!controller.accepts_message(&stale));
+            controller.update(stale);
+        }
+        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.clone()), Some(draw.clone()));
+        assert!(controller.atlas_pixels.is_none() && controller.atlas_composition.is_none());
+        pixels.try_send(Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Observed(1, 1) }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
+        composition.try_send(Message::AtlasComposition { receipt: draw.clone(), outcome: ProbeOutcome::Observed(13, 13) }).unwrap();
+        controller.update(receiver.try_recv().unwrap());
+        assert_eq!(controller.atlas_pixels, Some(draw.clone()));
+        assert_eq!(controller.atlas_composition, Some(draw));
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
+        initialize_reporting(false, false);
+    }
+
+    #[test]
+    fn pixel_outcome_adapter_preserves_invalidated_observed_and_failed() {
+        assert_eq!(ProbeOutcome::decode(Some("invalidated"), [Some(0.0); 2]), ProbeOutcome::Invalidated);
+        assert_eq!(ProbeOutcome::decode(Some("observed"), [Some(1.0), Some(0.0)]), ProbeOutcome::Observed(1, 0));
+        for (status, values) in [
+            (None, [Some(0.0); 2]),
+            (Some("invalidated"), [Some(1.0), Some(0.0)]),
+            (Some("observed"), [None, Some(0.0)]),
+            (Some("observed"), [Some(f64::NAN), Some(0.0)]),
+            (Some("observed"), [Some(f64::INFINITY), Some(0.0)]),
+            (Some("observed"), [Some(-1.0), Some(0.0)]),
+            (Some("observed"), [Some(0.5), Some(0.0)]),
+            (Some("observed"), [Some(f64::from(u32::MAX) + 1.0), Some(0.0)]),
+            (Some("failed"), [Some(0.0); 2]),
+        ] {
+            assert_eq!(ProbeOutcome::decode(status, values), ProbeOutcome::Failed);
+        }
+    }
+
+    #[test]
+    fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence() {
+        for consumer in 0..4 {
+            initialize_reporting(true, true);
+            let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "copy".into());
+            let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+            let (_, frame) = crate::view_model::test_support::explore_presentation();
+            let mut surface = crate::view_model::test_support::physical_surface(frame);
+            surface.integration = true;
+            let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+            let control = if consumer == 3 { explore::DETAIL_WORKSPACE_ID } else { "workflow.visual.workspace" };
+            record_probe_draw(control, surface, bounds, bounds, bounds);
+            let arm = |controller: &mut Controller, image| {
+                match consumer {
+                    0 | 1 => {
+                        controller.phase = if consumer == 0 { Phase::CopyCapabilityWait } else { Phase::CopySwatchWait };
+                        assert!(controller.prepare_control_probe());
+                        controller.control_probe.take().unwrap().output
+                    }
+                    2 => {
+                        controller.phase = Phase::CopyProductWait;
+                        assert!(controller.prepare_annotation_probe(frame.content_sequence, frame.presentation_revision,
+                            [frame.content_width, frame.content_height], vec![1.0; 7]));
+                        controller.annotation_probe.take().unwrap().output
+                    }
+                    _ => {
+                        controller.phase = Phase::AwaitExploreReady;
+                        controller.prepare_upscale_probe(image, frame.content_sequence, frame.presentation_revision).unwrap()
+                    }
+                }
+            };
+            let message = |outcome| match consumer {
+                0 => Message::AnnotationControlPixels { outcome },
+                1 => Message::AnnotationPixels { revision: 0, outcome },
+                2 => Message::AnnotationPixels { revision: frame.content_sequence, outcome },
+                _ => Message::UpscalePixels { source: frame.content_sequence, presentation: frame.presentation_revision, outcome },
+            };
+            let mut old = arm(&mut controller, bounds);
+            let phase = controller.phase.clone();
+            // JavaScript CSS/backing replacement may invalidate while this exact
+            // Rust receipt is still current. Exercise the real message consumer.
+            old.try_send(message(ProbeOutcome::Invalidated)).unwrap();
+            controller.update(receiver.try_recv().unwrap());
+            assert_eq!(controller.phase, phase);
+            assert!(controller.annotation_pixels_pending.is_none());
+            assert!(controller.control_probe_receipt.is_none());
+            assert!(controller.upscale_pixel_pending.is_none());
+            assert!(!controller.copy_capability_ready && !controller.copy_swatch_ready);
+            assert!(controller.annotation_pixels_receipt.is_none() && controller.upscale_pixels.is_none());
+
+            let mut same_frame = arm(&mut controller, bounds);
+            old.try_send(message(ProbeOutcome::Invalidated)).unwrap();
+            let stale = receiver.try_recv().unwrap();
+            assert!(!controller.accepts_message(&stale), "a new request can own the same physical receipt");
+            controller.update(stale);
+            same_frame.try_send(message(ProbeOutcome::Invalidated)).unwrap();
+            controller.update(receiver.try_recv().unwrap());
+            assert_eq!(controller.phase, phase);
+
+            let moved = Rectangle { x: 17.0, ..bounds };
+            record_probe_draw(control, surface, bounds, moved, bounds);
+            let mut replacement = arm(&mut controller, moved);
+            for outcome in [ProbeOutcome::Invalidated, ProbeOutcome::Failed, ProbeOutcome::Observed(1, 1)] {
+                old.try_send(message(outcome)).unwrap();
+                let stale = receiver.try_recv().unwrap();
+                assert!(!controller.accepts_message(&stale));
+                controller.update(stale);
+            }
+            assert_eq!(controller.phase, phase);
+            let pending = if consumer == 3 { &controller.upscale_pixel_pending }
+                else if consumer == 2 { &controller.annotation_pixels_pending } else { &controller.control_probe_receipt };
+            assert_eq!(*pending, replacement.receipt);
+            replacement.try_send(message(ProbeOutcome::Observed(1, 1))).unwrap();
+            controller.update(receiver.try_recv().unwrap());
+            match consumer {
+                0 => assert!(controller.copy_capability_ready),
+                1 => assert!(controller.copy_swatch_ready),
+                2 => assert_eq!(controller.annotation_pixels_receipt, replacement.receipt),
+                _ => assert_eq!(controller.upscale_pixels, Some((frame.content_sequence, frame.presentation_revision, 1, 1))),
+            }
+            // A new current observation must retain both measured and adapter
+            // failures. Upscale's wait phase owns checksum/color validation.
+            if consumer == 2 { controller.annotation_pixels_pending = None; }
+            let mut current = arm(&mut controller, moved);
+            current.try_send(message(ProbeOutcome::Observed(1, 0))).unwrap();
+            controller.update(receiver.try_recv().unwrap());
+            if consumer == 3 {
+                assert_eq!(controller.upscale_pixels, Some((frame.content_sequence, frame.presentation_revision, 1, 0)));
+                let mut current = arm(&mut controller, moved);
+                current.try_send(message(ProbeOutcome::Failed)).unwrap();
+                controller.update(receiver.try_recv().unwrap());
+            }
+            assert_eq!(controller.phase, Phase::Failed);
+            let mut malformed = arm(&mut controller, moved);
+            malformed.try_send(message(ProbeOutcome::decode(Some("observed"), [None, Some(1.0)]))).unwrap();
+            controller.update(receiver.try_recv().unwrap());
+            assert_eq!(controller.phase, Phase::Failed);
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
+            initialize_reporting(false, false);
+        }
+    }
+
+    #[test]
+    fn probe_preparation_keeps_original_frame_through_widget_location() {
+        initialize_reporting(true, true);
+        let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "copy".into());
+        let (sender, _receiver) = iced::futures::channel::mpsc::channel(8);
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let mut surface = crate::view_model::test_support::physical_surface(frame);
+        surface.integration = true;
+        let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
+        for swatch in [false, true] {
+            record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds);
+            controller.phase = if swatch { Phase::CopyCapability } else { Phase::CopyProductWait };
+            if swatch {
+                controller.copy_swatch_color = [48.0, 80.0, 112.0];
+                controller.copy_capability_available = true;
+                assert!(controller.prepare_control_probe());
+                let prepared = controller.control_probe.as_ref().unwrap();
+                assert_eq!(prepared.color, controller.copy_swatch_color);
+                assert!(prepared.available);
+            } else {
+                assert!(controller.prepare_annotation_probe(frame.content_sequence, frame.presentation_revision,
+                    [frame.content_width, frame.content_height], vec![1.0; 7]));
+                let prepared = controller.annotation_probe.as_ref().unwrap();
+                assert_eq!(prepared.source, frame.content_sequence);
+                assert_eq!(prepared.presentation, frame.presentation_revision);
+                assert_eq!(prepared.extent, [frame.content_width, frame.content_height]);
+                assert_eq!(prepared.pixels, vec![1.0; 7]);
+            }
+            controller.location_pending = true;
+            let moved = Rectangle { x: 17.0, ..bounds };
+            record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds);
+            assert!(!controller.prepare_annotation_probe(999, 999, [1, 1], Vec::new()), "pending location cannot be overwritten");
+            assert!(!controller.prepare_control_probe());
+            let phase = controller.phase.clone();
+            // The obsolete location cannot validate bounds or stamp a new
+            // output onto the saved old frame. Normal advance can now rearm.
+            controller.update(Message::Located { control: ANNOTATION_SURFACE.into(), bounds: Rectangle::default() });
+            assert_eq!(controller.phase, phase);
+            assert!(!controller.location_pending);
+            assert!(controller.annotation_probe.is_none() && controller.control_probe.is_none());
+            assert!(controller.annotation_pixels_pending.is_none() && controller.control_probe_receipt.is_none());
+        }
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
+        initialize_reporting(false, false);
+    }
+
+    #[test]
+    fn atlas_composition_samples_bound_all_three_grid_lines_at_required_columns_and_dpi() {
+        initialize_reporting(true, true);
+        PIXEL_FIXTURE_ENABLED.with(|enabled| enabled.set(true));
+        for columns in [4, 10] {
+            for dpi in [1.0, 1.5] {
+                let mut snapshot = crate::view_model::test_support::explore_snapshot();
+                snapshot.viewport.columns = columns;
+                snapshot.augmentation.enabled = false;
+                snapshot.overlay.showlabels = false;
+                snapshot.overlay.showmasks = true;
+                snapshot.overlay.showboxes = true;
+                snapshot.labels.clear(); // Background row, no annotation or source padding.
+                snapshot.gallery.slots = vec![true; columns as usize];
+                let (_, frame) = crate::view_model::test_support::explore_presentation();
+                let surface = crate::view_model::test_support::physical_surface(frame);
+                let width = 800.0 * dpi;
+                let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, width));
+                let draw = AtlasDraw { surface, snapshot: std::sync::Arc::new(snapshot), bounds, image: bounds, clip: bounds };
+                let samples = atlas_composition_samples(&draw).unwrap();
+                assert_eq!(samples.count, ATLAS_GRID_SAMPLES * 10);
+                assert_eq!(samples.card_count, 0);
+                assert_eq!(samples.cards.len(), 256);
+                let cell = width / columns as f32;
+                // Independent raster strips at known physical positions, not
+                // the shader's rounding/distance algorithm.
+                let positions = [0.5, 1.5, 2.5, 3.5,
+                    cell - 1.5, cell - 0.5, cell + 0.5, cell + 1.5, cell + 2.5,
+                    width - 3.5, width - 2.5, width - 1.5, width - 0.5];
+                let clean_indices = [3, 4, 8, 9];
+                let white_indices = [1, 6, 11];
+                for (index, point) in samples.points[..samples.count].chunks_exact(10).enumerate() {
+                    assert_eq!(point[2], positions[index]);
+                    assert_eq!(point[3], cell / 2.0);
+                    let expected = if clean_indices.contains(&index) { [48.0, 80.0, 112.0] }
+                        else if white_indices.contains(&index) { [255.0; 3] } else { [0.0; 3] };
+                    assert_eq!(point[4..7], expected);
+                    assert_eq!(point[7], 255.0);
+                    assert_eq!(point[8], 4.0);
+                }
+            }
+        }
         initialize_reporting(false, false);
     }
 
@@ -8365,50 +8795,41 @@ mod tests {
         );
         controller.phase = Phase::AwaitExploreReady;
         let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput {
-            generation: controller.generation, receipt: None, sender,
-        }));
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
         record_probe_draw(EXPLORE_GALLERY, draw.surface, draw.bounds, draw.image, draw.clip);
-        let mut output = probe_output(EXPLORE_GALLERY).unwrap();
-        output.try_send(Message::AtlasPixels {
+        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
             receipt: draw.clone(),
-            visible: 1,
-            nonblack: 0,
+            outcome: ProbeOutcome::Observed(1, 0),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        output.try_send(Message::AtlasPixels {
+        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
             receipt: draw.clone(),
-            visible: 0,
-            nonblack: 0,
+            outcome: ProbeOutcome::Observed(0, 0),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        output.try_send(Message::AtlasPixels {
+        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
             receipt: draw.clone(),
-            visible: 1,
-            nonblack: 1,
+            outcome: ProbeOutcome::Observed(1, 1),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_pixels, Some(draw.clone()));
-        output.try_send(Message::AtlasComposition {
+        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
             receipt: draw.clone(),
-            expected: 1,
-            matched: 0,
+            outcome: ProbeOutcome::Observed(1, 0),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        output.try_send(Message::AtlasComposition {
+        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
             receipt: draw.clone(),
-            expected: 0,
-            matched: 0,
+            outcome: ProbeOutcome::Observed(0, 0),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        output.try_send(Message::AtlasComposition {
+        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
             receipt: draw.clone(),
-            expected: 1,
-            matched: 1,
+            outcome: ProbeOutcome::Observed(1, 1),
         }).unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_composition, Some(draw));

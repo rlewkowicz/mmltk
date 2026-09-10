@@ -15,7 +15,7 @@ export function mmltkIntegrationInitialize(enabled) {
       }
       const retired = integrationState;
       integrationState = undefined;
-      for (const complete of retired.completions) complete(0, 0);
+      for (const complete of retired.completions) complete('invalidated', 0, 0);
     }
     return;
   }
@@ -68,14 +68,14 @@ function integrationMicrotask(callback) {
 function integrationCompletion(callback) {
   const owner = integrationState;
   let pending = true;
-  const complete = (first, second) => {
+  const complete = (outcome, first = 0, second = 0) => {
     if (!pending) return;
     pending = false;
     owner?.completions.delete(complete);
-    callback(first, second);
+    callback(outcome, first, second);
   };
   if (owner) owner.completions.add(complete);
-  else complete(0, 0);
+  else complete('invalidated', 0, 0);
   return complete;
 }
 export function mmltkIntegrationResetScenario() {
@@ -85,26 +85,30 @@ export function mmltkIntegrationResetScenario() {
   mmltkIntegrationDriver(driver);
   mmltkIntegrationInitialize(enabled);
 }
-export function mmltkIntegrationReceipt(control, key, sourceRevision, presentationRevision) {
-  if (!integrationState) return;
-  const previous = integrationState.integrationSurfaceDraws.get(control);
-  if (previous?.key !== key) {
-    integrationState.integrationSurfaceDraws.set(control, {key, sourceRevision, presentationRevision});
-  }
-}
-function captureProbe(control) {
-  const canvas = document.querySelector('canvas');
-  const css = canvas?.getBoundingClientRect();
-  return {owner: integrationState, control, drawn: integrationState?.integrationSurfaceDraws.get(control),
-    canvas, width: canvas?.width, height: canvas?.height,
+function canvasGeometry() {
+  const canvas = document.querySelector('canvas'), css = canvas?.getBoundingClientRect();
+  return {canvas, width: canvas?.width, height: canvas?.height,
     css: css && [css.x, css.y, css.width, css.height]};
 }
+function sameGeometry(left, right) {
+  return !!left.canvas && left.canvas === right.canvas && left.width === right.width &&
+    left.height === right.height && left.css.every((value, index) => value === right.css[index]);
+}
+export function mmltkIntegrationReceipt(control, key, sourceRevision, presentationRevision) {
+  if (!integrationState) return;
+  const previous = integrationState.integrationSurfaceDraws.get(control), geometry = canvasGeometry();
+  if (previous?.key !== key || !sameGeometry(previous.geometry, geometry)) {
+    integrationState.integrationSurfaceDraws.set(control, {key, sourceRevision, presentationRevision, geometry});
+  }
+}
+export function mmltkIntegrationProbe(control) {
+  if (!integrationState) return undefined;
+  return {owner: integrationState, control, drawn: integrationState?.integrationSurfaceDraws.get(control)};
+}
 function probeCurrent(receipt) {
-  if (!receipt.owner || !receipt.drawn || integrationState !== receipt.owner ||
-      integrationState.integrationSurfaceDraws.get(receipt.control) !== receipt.drawn) return false;
-  const canvas = document.querySelector('canvas'), css = canvas?.getBoundingClientRect();
-  return !!canvas && canvas === receipt.canvas && canvas.width === receipt.width && canvas.height === receipt.height &&
-    [css.x, css.y, css.width, css.height].every((value, index) => value === receipt.css[index]);
+  return !!receipt?.owner && !!receipt.drawn && integrationState === receipt.owner &&
+    integrationState.integrationSurfaceDraws.get(receipt.control) === receipt.drawn &&
+    sameGeometry(receipt.drawn.geometry, canvasGeometry());
 }
 
 function integrationPointer(rect, x, y, type, buttons) {
@@ -188,26 +192,26 @@ export function mmltkIntegrationReport(event, control, detail, a, b, c, d) {
   report({event, control, detail, a: String(a), b: String(b), c: String(c), d: String(d)});
 }
 
-export function mmltkIntegrationAtlasPixels(rectangles, sourceRevision, presentationRevision, completed) {
+export function mmltkIntegrationAtlasPixels(receipt, rectangles, sourceRevision, presentationRevision, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
-  const receipt = captureProbe('explore.gallery.workspace');
-  if (!probeCurrent(receipt)) { completed(0, 0); return; }
+  if (!probeCurrent(receipt)) { completed('invalidated'); return; }
   rectangles = rectangles.slice();
   // The draw report is emitted while encoding Iced's current submission.
   // Sample the actual canvas at its next presentation opportunity, without
   // dispatching input, scheduling an Iced redraw, or introducing a timer.
   integrationFrame(() => {
     try {
-      if (!probeCurrent(receipt)) { completed(0, 0); return; }
+      if (!probeCurrent(receipt)) { completed('invalidated'); return; }
       const canvas = document.querySelector('canvas');
       if (!canvas) throw new Error('missing WebGPU canvas');
       const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
       if (!drawn || drawn.sourceRevision !== sourceRevision ||
-          drawn.presentationRevision !== presentationRevision || integrationState.initialAtlasInputCount !== 0) {
-        completed(0, 0);
+          drawn.presentationRevision !== presentationRevision) {
+        completed('invalidated');
         return;
       }
+      if (integrationState.initialAtlasInputCount !== 0) { completed('failed'); return; }
       const probe = new OffscreenCanvas(8, 8);
       const context = probe.getContext('2d', {willReadFrequently: true});
       if (!context) throw new Error('missing diagnostic pixel reader');
@@ -228,11 +232,11 @@ export function mmltkIntegrationAtlasPixels(rectangles, sourceRevision, presenta
       report({event: 'integration.atlas_canvas_sample', control: 'explore.gallery.workspace',
         detail: 'javascript-pixel-counts', a: String(sourceRevision), b: String(presentationRevision),
         c: String(rectangles.length / 4), d: String(nonblack)});
-      completed(rectangles.length / 4, nonblack);
+      completed('observed', rectangles.length / 4, nonblack);
     } catch (error) {
       report({event: 'integration.failure', control: 'explore.gallery.workspace',
         detail: `initial atlas canvas read: ${error}`, a: '0', b: '0', c: '0', d: '0'});
-      completed(0, 0);
+      completed('failed');
     }
   });
 }
@@ -248,12 +252,11 @@ function annotationCanvasSnapshot(canvas) {
   return integrationState.annotationContext;
 }
 
-export function mmltkIntegrationAtlasComposition(points, cards, fields, source, presentation, columns, completed) {
+export function mmltkIntegrationAtlasComposition(receipt, points, cards, fields, source, presentation, columns, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
-  const receipt = captureProbe('explore.gallery.workspace');
-  if (!probeCurrent(receipt)) { completed(0, 0); return; }
-  if (integrationState.compositionPending?.drawn === receipt.drawn) { completed(0,0); return; }
+  if (!probeCurrent(receipt)) { completed('invalidated'); return; }
+  if (integrationState.compositionPending?.drawn === receipt.drawn) { completed('invalidated'); return; }
   integrationState.compositionPending = receipt;
   points = points.slice();
   cards = Array.from(cards);
@@ -261,14 +264,14 @@ export function mmltkIntegrationAtlasComposition(points, cards, fields, source, 
     let matched = 0;
     let emitted = 0;
     try {
-      if (!probeCurrent(receipt)) { completed(0, 0); return; }
+      if (!probeCurrent(receipt)) { completed('invalidated'); return; }
       const drawn = integrationState.integrationSurfaceDraws.get('explore.gallery.workspace');
-      if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
+      if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) { completed('invalidated'); return; }
       const canvas = document.querySelector('canvas');
-      if (!canvas) return;
+      if (!canvas) throw new Error('missing composition canvas');
       integrationState.boundaryScratch ??= new OffscreenCanvas(1,1);
       const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
-      if (!context) return;
+      if (!context) throw new Error('missing composition pixel reader');
       const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 10) {
         const [x,y,screenX,screenY,r,g,b,a,kind,card] = points.slice(i,i+10);
@@ -284,15 +287,18 @@ export function mmltkIntegrationAtlasComposition(points, cards, fields, source, 
           matched:valid});
       }
       report({event:'integration.atlas_composition_complete',...identity,columns,cards,emitted});
+      completed('observed', points.length/10,matched);
+    } catch (error) {
+      report({event:'integration.failure', detail:`atlas composition read: ${error}`});
+      completed('failed');
     } finally {
       if (integrationState === receipt.owner && integrationState.compositionPending === receipt) integrationState.compositionPending = undefined;
-      completed(points.length/10,matched);
     }
   });
 }
 export function mmltkIntegrationBoundaryPixels(points, fields, control, source, presentation) {
   if (!integrationState) return;
-  const receipt = captureProbe(control);
+  const receipt = mmltkIntegrationProbe(control);
   if (!probeCurrent(receipt)) return;
   const request = {points:points.slice(),fields,control,source,presentation,receipt};
   if (integrationState.boundaryPending) { integrationState.boundaryLatest = request; return; }
@@ -344,18 +350,17 @@ function canvasPixelBounds(canvas, cssBounds, control) {
   return pixels;
 }
 
-export function mmltkIntegrationAnnotationSwatch(cssBounds,color,control,detail,button,completed){
+export function mmltkIntegrationAnnotationSwatch(receipt, cssBounds,color,control,detail,button,completed){
   completed = integrationCompletion(completed);
   if (!integrationState) return;
-  const receipt = captureProbe('workflow.visual.workspace');
-  if (!probeCurrent(receipt)) { completed(0, 0); return; }
+  if (!probeCurrent(receipt)) { completed('invalidated'); return; }
   cssBounds = Array.from(cssBounds);
   color = Array.from(color);
   const canvas=document.querySelector('canvas');
   if(canvas)canvas.dispatchEvent(integrationPointer(canvas.getBoundingClientRect(),0,0,'pointermove',0));
   integrationFrame(()=>integrationFrame(()=>{
     try{
-      if (!probeCurrent(receipt)) { completed(0, 0); return; }
+      if (!probeCurrent(receipt)) { completed('invalidated'); return; }
       const canvas=document.querySelector('canvas');
       if (!canvas) throw new Error('missing annotation canvas');
       const bounds = canvasPixelBounds(canvas, cssBounds, control);
@@ -363,21 +368,22 @@ export function mmltkIntegrationAnnotationSwatch(cssBounds,color,control,detail,
       const pixel=context.getImageData(Math.floor(bounds[0]+bounds[2]*(button?0.9:0.5)),Math.floor(bounds[1]+bounds[3]/2),1,1).data;
       const matched=color.every((channel,index)=>Math.abs(channel-pixel[index])<=3)&&pixel[3]>0;
       report({event:button?'integration.annotation_capability':'integration.annotation_swatch',control,detail,expected:color,observed:Array.from(pixel),matched});
-      completed(1,Number(matched));
-    }catch(error){report({event:'integration.failure',detail:`annotation swatch read: ${error}`});completed(1,0);}
+      completed('observed', 1,Number(matched));
+    }catch(error){report({event:'integration.failure',detail:`annotation swatch read: ${error}`});completed('failed');}
   }));
 }
 
-export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sourceRevision, presentationRevision, completed) {
+export function mmltkIntegrationAnnotationPixels(receipt, cssBounds, extent, probes, sourceRevision, presentationRevision, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
+  if (!probeCurrent(receipt)) { completed('invalidated'); return; }
   cssBounds = Array.from(cssBounds);
   extent = Array.from(extent);
   probes = Array.from(probes);
   try {
     const canvas=document.querySelector('canvas');
     const drawn=integrationState.integrationSurfaceDraws.get('workflow.visual.workspace');
-    if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed(probes.length/7,0); return; }
+    if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed('invalidated'); return; }
     const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
     const context=annotationCanvasSnapshot(canvas);
     const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
@@ -419,24 +425,23 @@ export function mmltkIntegrationAnnotationPixels(cssBounds, extent, probes, sour
       matched+=Number(hit);
       report({event:'integration.annotation_pixel',control:'annotation.workspace.surface',detail:'completed-canvas',a:String(sourceRevision),b:String(presentationRevision),c:String(probes[i]),d:String(probes[i+1]),expected,observed:best,error:distance,source_to_screen:scale,matched:hit});
     }
-    completed(probes.length/7,matched);
-  } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed(probes.length/7,0);}
+    completed('observed', probes.length/7,matched);
+  } catch(error){report({event:'integration.failure',detail:`annotation canvas read: ${error}`});completed('failed');}
 }
 
-export function mmltkIntegrationUpscalePixels(imagePixels, buttonCss, source, presentation, completed) {
+export function mmltkIntegrationUpscalePixels(receipt, imagePixels, buttonCss, source, presentation, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
-  const receipt = captureProbe('explore.detail.workspace');
-  if (!probeCurrent(receipt)) { completed(0, 0); return; }
+  if (!probeCurrent(receipt)) { completed('invalidated'); return; }
   imagePixels = Array.from(imagePixels);
   buttonCss = Array.from(buttonCss);
   integrationFrame(() => integrationFrame(() => {
     try {
-      if (!probeCurrent(receipt)) { completed(0, 0); return; }
+      if (!probeCurrent(receipt)) { completed('invalidated'); return; }
       const canvas = document.querySelector('canvas');
       const drawn = integrationState.integrationSurfaceDraws.get('explore.detail.workspace');
       if (!canvas || !drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) {
-        completed(0, 0); return;
+        completed('invalidated'); return;
       }
       const buttonPixels = canvasPixelBounds(canvas, buttonCss, 'explore.detail.upscale');
       const probe = new OffscreenCanvas(16, 16);
@@ -458,10 +463,10 @@ export function mmltkIntegrationUpscalePixels(imagePixels, buttonCss, source, pr
           }
         }
       }
-      completed(nonblack > 0 ? checksum : 0, blue);
+      completed('observed', nonblack > 0 ? checksum : 0, blue);
     } catch (error) {
       report({event: 'integration.failure', control: 'explore.detail.workspace', detail: `Upscale canvas read: ${error}`, a:'0', b:'0', c:'0', d:'0'});
-      completed(0, 0);
+      completed('failed');
     }
   }));
 }
