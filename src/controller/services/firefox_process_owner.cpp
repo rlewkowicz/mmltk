@@ -45,8 +45,8 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
 }
 
 [[nodiscard]] std::vector<std::string> firefox_environment(const std::filesystem::path& runtime_root,
-                                                           const std::filesystem::path& workspace_import_socket,
-                                                           const bool integration, const bool integration_high_dpi) {
+                                                           const std::filesystem::path& workspace_import_socket, const bool integration,
+                                                           const bool integration_high_dpi) {
     static constexpr std::array<std::string_view, 12U> kOverridden{"DISPLAY",
                                                                    "GDK_BACKEND",
                                                                    "LD_LIBRARY_PATH",
@@ -84,8 +84,8 @@ constexpr std::uint32_t kInitialFirefoxWindowHeight = 1'125U;
             "pref(\"full-screen-api.allow-trusted-requests-only\", false);\n"
             "pref(\"permissions.fullscreen.allowed\", true);\n"
             "pref(\"full-screen-api.warning.timeout\", 0);\n";
-        default_preferences += integration_high_dpi ? "pref(\"layout.css.devPixelsPerPx\", \"1.5\");\n"
-                                                                     : "pref(\"layout.css.devPixelsPerPx\", \"1\");\n";
+        default_preferences +=
+            integration_high_dpi ? "pref(\"layout.css.devPixelsPerPx\", \"1.5\");\n" : "pref(\"layout.css.devPixelsPerPx\", \"1\");\n";
     }
     result.emplace_back("MOZ_DEFAULT_PREFS=" + std::move(default_preferences));
     std::string library_path = "LD_LIBRARY_PATH=" + runtime_root.string();
@@ -292,7 +292,8 @@ class FirefoxProcessOwner::Implementation final {
                                 "--height",
                                 std::to_string(kInitialFirefoxWindowHeight),
                                 page_url_};
-            environment_storage = firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
+            environment_storage =
+                firefox_environment(executable_.parent_path(), workspace_import_socket_, integration_, integration_high_dpi_);
             environment.reserve(environment_storage.size() + 1U);
             for (auto& entry : environment_storage)
                 environment.push_back(entry.data());

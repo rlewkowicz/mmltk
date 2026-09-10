@@ -723,7 +723,10 @@ impl<Message> shader::Program<Message> for Program<Message> {
         cursor: mouse::Cursor,
     ) -> Option<shader::Action<Message>> {
         let dispatch = |gesture| {
-            let message = self.local.as_ref().map_or_else(|| self.publish.map(|publish| publish(gesture)), |local| local(gesture));
+            let message = self.local.as_ref().map_or_else(
+                || self.publish.map(|publish| publish(gesture)),
+                |local| local(gesture),
+            );
             message.map_or_else(shader::Action::capture, shader::Action::publish)
         };
         state.update(
@@ -732,7 +735,8 @@ impl<Message> shader::Program<Message> for Program<Message> {
             cursor,
             self.surface,
             self.placement,
-            (self.publish.is_some() || self.local.is_some()).then_some(&dispatch as &dyn Fn(SurfaceGesture) -> shader::Action<Message>),
+            (self.publish.is_some() || self.local.is_some())
+                .then_some(&dispatch as &dyn Fn(SurfaceGesture) -> shader::Action<Message>),
         )
     }
 
@@ -961,9 +965,7 @@ impl ViewportOwner {
             {
                 let sample = self.sample(bounds, cursor, surface, placement, false);
                 Some(match (publish, self.finish_pointer(sample)) {
-                    (Some(publish), Some(gesture)) => {
-                        publish(gesture).and_capture()
-                    }
+                    (Some(publish), Some(gesture)) => publish(gesture).and_capture(),
                     _ => shader::Action::capture(),
                 })
             }
@@ -1156,8 +1158,8 @@ impl shader::Primitive for Primitive {
             let mut renderer = renderer.borrow_mut();
             // Explicit application retirement can remove the owner while Iced
             // retains its installed wrapper. Restore only that absent owner.
-            let renderer =
-                renderer.get_or_insert_with(|| SurfaceRenderer::new(device, queue, pipeline.format));
+            let renderer = renderer
+                .get_or_insert_with(|| SurfaceRenderer::new(device, queue, pipeline.format));
             renderer.prepare(
                 device,
                 queue,
@@ -1262,17 +1264,19 @@ pub(crate) fn retained_detail() -> Option<(Surface, DetailContent)> {
 }
 
 pub(crate) fn drawable_detail(requested: Surface) -> Option<(Surface, DetailContent)> {
-    RENDERER.with(|renderer| {
-        let renderer = renderer.borrow();
-        let renderer = renderer.as_ref()?;
-        [&renderer.pending, &renderer.imported]
-            .into_iter()
-            .flatten()
-            .find_map(|imported| {
-                let pending = imported.image.submitted_draw(requested)?;
-                Some((requested, pending.detail.clone()?))
-            })
-    }).or_else(retained_detail)
+    RENDERER
+        .with(|renderer| {
+            let renderer = renderer.borrow();
+            let renderer = renderer.as_ref()?;
+            [&renderer.pending, &renderer.imported]
+                .into_iter()
+                .flatten()
+                .find_map(|imported| {
+                    let pending = imported.image.submitted_draw(requested)?;
+                    Some((requested, pending.detail.clone()?))
+                })
+        })
+        .or_else(retained_detail)
 }
 
 pub(crate) struct Pipeline {
@@ -1584,16 +1588,25 @@ impl SurfaceRenderer {
             .into_iter()
             .flatten()
             .find_map(|imported| {
-                imported.image.submitted_draw(requested).map(|pending| (imported, pending))
+                imported
+                    .image
+                    .submitted_draw(requested)
+                    .map(|pending| (imported, pending))
             });
         let Some(imported) = submitted.map(|(imported, _)| imported).or_else(|| {
-            self.imported.as_ref().filter(|value| value.image.retained().is_some())
+            self.imported
+                .as_ref()
+                .filter(|value| value.image.retained().is_some())
         }) else {
             self.draws.remove(control);
             return;
         };
         let (surface, owned_index, gallery) = submitted.map_or(
-            (imported.image.surface, imported.image.owned_index, imported.image.gallery.as_ref()),
+            (
+                imported.image.surface,
+                imported.image.owned_index,
+                imported.image.gallery.as_ref(),
+            ),
             |(_, pending)| (pending.surface, pending.index, pending.gallery.as_ref()),
         );
         if !retained_draw_admitted(surface, requested, placement) {
@@ -1610,12 +1623,9 @@ impl SurfaceRenderer {
             bounds.y += gallery::row_offset(placement, snapshot, bounds.width);
             placement = gallery::placement(snapshot);
         }
-        let Some(geometry) = placement_geometry(
-            bounds,
-            surface.content_extent(),
-            placement,
-            transform,
-        ) else {
+        let Some(geometry) =
+            placement_geometry(bounds, surface.content_extent(), placement, transform)
+        else {
             trace_image(
                 "owned_draw_rejected",
                 control,
@@ -1859,15 +1869,21 @@ impl SurfaceRenderer {
             trace_draw("owned_draw_clipped", control_id, draw, image, clip);
             return;
         }
-        let Some(imported) = [&self.imported, &self.pending]
-            .into_iter()
-            .flatten()
-            .find(|imported| {
-                (imported.image.captured == Some(frame) && imported.image.owned_index == draw.owned_index)
-                    || imported.image.submitted_draw(draw.requested).is_some_and(|pending| {
-                        pending.surface.frame == Some(frame) && pending.index == draw.owned_index
-                    })
-            })
+        let Some(imported) =
+            [&self.imported, &self.pending]
+                .into_iter()
+                .flatten()
+                .find(|imported| {
+                    (imported.image.captured == Some(frame)
+                        && imported.image.owned_index == draw.owned_index)
+                        || imported
+                            .image
+                            .submitted_draw(draw.requested)
+                            .is_some_and(|pending| {
+                                pending.surface.frame == Some(frame)
+                                    && pending.index == draw.owned_index
+                            })
+                })
         else {
             trace_draw("owned_draw_rejected", control_id, draw, image, clip);
             return;
@@ -2028,7 +2044,9 @@ pub(crate) fn discard_capture(frame: FrameReady) {
 }
 
 pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::ApplicationModel) {
-    let Some(frame) = surface.frame else { return; };
+    let Some(frame) = surface.frame else {
+        return;
+    };
     if model.completed_presentation_reconciliation().ok()
         != Some(crate::view_model::PresentationReconciliation::Matching)
         || model
@@ -2048,11 +2066,22 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         // both this queue-ordered capture and its exact native metadata.
         let device = renderer.device.clone();
         let queue = renderer.queue.clone();
-        let placement = gallery::matching(Some(frame)).as_ref()
+        let placement = gallery::matching(Some(frame))
+            .as_ref()
             .map_or(Placement::Contain, |snapshot| gallery::placement(snapshot));
-        renderer.prepare(&device, &queue, surface, renderer.bounds, renderer.scale_factor,
-                         placement, ViewTransform::FIT);
-        for imported in [&mut renderer.imported, &mut renderer.pending].into_iter().flatten() {
+        renderer.prepare(
+            &device,
+            &queue,
+            surface,
+            renderer.bounds,
+            renderer.scale_factor,
+            placement,
+            ViewTransform::FIT,
+        );
+        for imported in [&mut renderer.imported, &mut renderer.pending]
+            .into_iter()
+            .flatten()
+        {
             imported.image.reconcile_pending(frame, model);
         }
         if let Some(imported) = renderer.imported.as_mut()
@@ -2090,17 +2119,32 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
 }
 
 impl ImagePublication {
-    fn reconcile_pending(&mut self, frame: FrameReady, model: &crate::view_model::ApplicationModel) {
-        let Some(pending) = self.pending_capture.as_mut().filter(|pending| pending.surface.frame == Some(frame)) else {
+    fn reconcile_pending(
+        &mut self,
+        frame: FrameReady,
+        model: &crate::view_model::ApplicationModel,
+    ) {
+        let Some(pending) = self
+            .pending_capture
+            .as_mut()
+            .filter(|pending| pending.surface.frame == Some(frame))
+        else {
             return;
         };
         pending.view_ready = true;
         if let Some(current) = gallery::matching(Some(frame))
-            && pending.gallery.as_ref().is_none_or(|previous| previous.dataset.identity == current.dataset.identity)
+            && pending
+                .gallery
+                .as_ref()
+                .is_none_or(|previous| previous.dataset.identity == current.dataset.identity)
         {
             pending.gallery = Some(current);
         }
-        if pending.detail.as_ref().is_none_or(|detail| !detail.matches_model(model)) {
+        if pending
+            .detail
+            .as_ref()
+            .is_none_or(|detail| !detail.matches_model(model))
+        {
             pending.detail = DetailContent::from_model(model)
                 .filter(|detail| frame.matches_content(detail.frame()));
         }
@@ -2112,8 +2156,12 @@ impl ImagePublication {
                 && pending.surface.frame.is_some()
                 && pending.surface.frame == requested.frame
                 && same_allocation(pending.surface, requested)
-                && DRAW_AUTHORIZATION.with(|authorization| authorization.get() == pending.surface.frame)
-                && pending.gallery.as_ref().is_none_or(|snapshot| gallery::current_source(snapshot))
+                && DRAW_AUTHORIZATION
+                    .with(|authorization| authorization.get() == pending.surface.frame)
+                && pending
+                    .gallery
+                    .as_ref()
+                    .is_none_or(|snapshot| gallery::current_source(snapshot))
         })
     }
 
@@ -2123,8 +2171,11 @@ impl ImagePublication {
             .as_ref()
             .is_none_or(|detail| !detail.matches_model(model))
         {
-            self.detail = DetailContent::from_model(model)
-                .filter(|detail| self.surface.frame.is_some_and(|frame| frame.matches_content(detail.frame())));
+            self.detail = DetailContent::from_model(model).filter(|detail| {
+                self.surface
+                    .frame
+                    .is_some_and(|frame| frame.matches_content(detail.frame()))
+            });
         }
     }
 

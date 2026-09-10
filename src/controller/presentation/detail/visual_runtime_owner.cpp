@@ -97,7 +97,16 @@ bool VisualRuntimeOwner::NotifyOrderedDrain() {
         if (!ordered_drain_ || stopping_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
         if (drain_queued_) return true;
         FlushLatest();
-        ordered_.push_back(ScheduledWork{.stop = drain_stop_, .ordered_drain = true});
+        ordered_.push_back(ScheduledWork{
+            .run = {},
+            .cancellation = {},
+            .dispatched = {},
+            .stop = drain_stop_,
+            .ordered_drain = true,
+            .discrete = false,
+            .terminal_barrier = false,
+            .reconstruct = false,
+        });
         drain_queued_ = true;
     }
     worker_.Wake();
@@ -145,8 +154,7 @@ bool VisualRuntimeOwner::SubmitLatest(Work work) {
 void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available) {
     if (!work) throw std::invalid_argument("visual continuation work is empty");
     std::scoped_lock lock(mutex_);
-    if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ ||
-        (wake_on_output_available && runtime_))
+    if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ || (wake_on_output_available && runtime_))
         throw std::logic_error("visual continuation registration is unavailable");
     if (wake_on_output_available) {
         output_wake_ = std::make_shared<OutputWake>();
@@ -268,16 +276,17 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         if (replacement_active_) RestorePolicy();
         auto created = factory_(product_revision_sequence_);
         if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
-        if (output_wake_) created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
-            if (const auto gate = wake.lock()) {
-                std::scoped_lock lock(gate->mutex);
-                if (gate->owner && gate->retry_armed) {
-                    const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
-                    if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
-                        gate->owner->worker_.Wake();
+        if (output_wake_)
+            created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
+                if (const auto gate = wake.lock()) {
+                    std::scoped_lock lock(gate->mutex);
+                    if (gate->owner && gate->retry_armed) {
+                        const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
+                        if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
+                            gate->owner->worker_.Wake();
+                    }
                 }
-            }
-        });
+            });
         {
             std::scoped_lock lock(mutex_);
             if (!stopping_ && !stopped()) destination = std::move(created);
@@ -331,8 +340,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_stop_ = ordered_work ? ordered_work->stop : std::stop_source{};
         active_outcome_ = ActiveOutcome::Running;
         active_discrete_ = discrete;
-        active_preserves_input_ = (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
-                                  (continuation_work && output_wake_);
+        active_preserves_input_ =
+            (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) || (continuation_work && output_wake_);
         operation_stop = active_stop_.get_token();
     }
     Observe(ActivityStage::WorkSelected, ordered_work ? 1U : (latest_work ? 2U : (continuation_work ? 3U : 0U)));
@@ -369,8 +378,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         } else {
             if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
                 runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
-                notification = ordered_work->ordered_drain ? ordered_drain_(*runtime, operation_stop)
-                                                           : ordered_work->run(*runtime, operation_stop);
+                notification =
+                    ordered_work->ordered_drain ? ordered_drain_(*runtime, operation_stop) : ordered_work->run(*runtime, operation_stop);
             else
                 notification = std::move(ordered_work->cancellation);
         }

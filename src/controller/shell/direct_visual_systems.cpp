@@ -17,9 +17,8 @@ SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(Appli
                                                                            UpscaleSystem& upscale,
                                                                            ApplicationSystemStorage::ContinuitySink continuity,
                                                                            std::function<void(PresentationSourceIdentity)> source) {
-    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity),
-                                                                                               std::move(source))](
-               ExploreSystem::event_type event) noexcept {
+    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(
+                          sink, std::move(continuity), std::move(source))](ExploreSystem::event_type event) noexcept {
         if (const auto* changed = std::get_if<ExploreChanged>(&event);
             changed != nullptr && changed->snapshot.ready && !changed->snapshot.busy &&
             (changed->snapshot.mode != ExploreMode::Gallery ||
@@ -101,9 +100,9 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     annotation_ = std::make_unique<AnnotationSystem>(
         configuration.output_visual, make_native_annotation_runtime_factory(configuration.output_visual), borrow_exact,
         browser::ApplicationEventPublisher<&ApplicationSystems::annotation>(events_, continuity_, source_changed), diagnostics);
-    live_ = std::make_unique<LiveSystem>(configuration.base_visual,
-                                         make_native_live_runtime_factory(configuration.base_visual, std::move(configuration.live)),
-                                         browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_, source_changed), diagnostics);
+    live_ = std::make_unique<LiveSystem>(
+        configuration.base_visual, make_native_live_runtime_factory(configuration.base_visual, std::move(configuration.live)),
+        browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_, source_changed), diagnostics);
 
     systems_.settings = settings_.get();
     systems_.file_dialog = file_dialog_.get();
@@ -133,9 +132,7 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView ApplicationSystemStorage::B
     return borrow_matching_visual_product(frame, found->borrow());
 }
 
-ApplicationSystemStorage::~ApplicationSystemStorage() {
-    presentation_notifications_.store(nullptr, std::memory_order_release);
-}
+ApplicationSystemStorage::~ApplicationSystemStorage() { presentation_notifications_.store(nullptr, std::memory_order_release); }
 VisualDocumentRead ApplicationSystemStorage::BorrowDocument(const VisualFrame& frame) const {
     if (frame.source.kind == PresentationSourceKind::Explore) return explore_->BorrowDocument(frame);
     if (frame.source.kind == PresentationSourceKind::Upscale) return upscale_->BorrowDocument(frame);

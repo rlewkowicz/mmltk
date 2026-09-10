@@ -73,7 +73,9 @@ pub struct Component {
 }
 
 impl Component {
-    pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) { self.canvas.set_connection(connection); }
+    pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
+        self.canvas.set_connection(connection);
+    }
     pub fn rebase(&mut self, model: &ApplicationModel) {
         if !model.annotation_edit_available() {
             self.canvas.clear_pointer_lifecycle();
@@ -91,23 +93,29 @@ impl Component {
             &message,
             Message::OutputDirectoryChanged(_) | Message::Sidebar(_) | Message::DialogRequested(_)
         ) {
-            self.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
+            self.keyboard_canvas
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         let outcome = match message {
             Message::TextFocused => {
-                self.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
+                self.keyboard_canvas
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 return Ok(None);
             }
             Message::Shortcut(shortcut) => {
                 return Ok(self
-                    .keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed)
+                    .keyboard_canvas
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     .then_some(Outcome::ShortcutRequested(shortcut)));
             }
             Message::ShortcutResolved { shortcut, focused } => {
                 if focused {
                     return Ok(None);
                 }
-                if !self.keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed) {
+                if !self
+                    .keyboard_canvas
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     return Ok(None);
                 }
                 let command = match shortcut {
@@ -122,7 +130,8 @@ impl Component {
                     Shortcut::Fit => Message::FitRequested,
                 };
                 let result = self.update(application, settings, command);
-                self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.keyboard_canvas
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return result;
             }
             Message::FitRequested => {
@@ -171,7 +180,8 @@ impl Component {
             Message::Workspace(message) => match workspace::update(message) {
                 workspace::Outcome::Gesture(gesture) => {
                     if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
-                        self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.keyboard_canvas
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     if !application.annotation_edit_available() {
                         self.canvas.clear_pointer_lifecycle();
@@ -180,9 +190,7 @@ impl Component {
                     let Some(snapshot) = application.annotation.snapshot.as_ref() else {
                         return Ok(None);
                     };
-                    let Some(mut pointer) = self
-                        .canvas
-                        .pointer_from_gesture(&snapshot.ui, gesture)
+                    let Some(mut pointer) = self.canvas.pointer_from_gesture(&snapshot.ui, gesture)
                     else {
                         return Ok(None);
                     };
@@ -309,9 +317,20 @@ impl Component {
             crate::generated::WorkspaceAspectRatio::Widescreen,
             |draft| draft.ui.workspaceaspectratio,
         );
-        let workspace: Element<'a, Message> = container(
-            canvas::view(surface, aspect, settings_edit_available, canvas_width, self.canvas.dispatch(model, settings.draft.as_ref().map_or_else(|| crate::generated::default_uiannotationbrushradius().unwrap(), |draft| draft.ui.annotationbrushradius) as u16, self.keyboard_canvas.clone())),
-        )
+        let workspace: Element<'a, Message> = container(canvas::view(
+            surface,
+            aspect,
+            settings_edit_available,
+            canvas_width,
+            self.canvas.dispatch(
+                model,
+                settings.draft.as_ref().map_or_else(
+                    || crate::generated::default_uiannotationbrushradius().unwrap(),
+                    |draft| draft.ui.annotationbrushradius,
+                ) as u16,
+                self.keyboard_canvas.clone(),
+            ),
+        ))
         .into();
         let advanced = self
             .timeline
@@ -552,40 +571,37 @@ mod tests {
         use crate::generated::AnnotationPointerPhase as Phase;
         use crate::presentation_surface::SurfaceGestureKind as Kind;
         use crate::transport_connection::{Capture, CapturedRecord, Connection};
-        let assert_batch = |connection: &Connection,
-                            capture: &mut Capture,
-                            sequence,
-                            documentepoch,
-                            samples| {
-            let CapturedRecord::Other(actual) = capture.try_recv().unwrap() else {
-                panic!("direct annotation interaction")
-            };
-            let expected = crate::generated::encode_annotation_Input(
-                crate::generated::AnnotationInputBatch {
-                    epoch: 1,
-                    documentepoch,
-                    sequence,
-                    samples,
-                },
-            )
-            .unwrap()
-            .encode()
-            .unwrap();
-            assert_eq!(actual, crate::protocol::decode_envelope(&expected).unwrap());
-            connection
-                .observe(&crate::protocol::ServerRecord::InputProgress(
-                    crate::generated::InputProgress {
-                        protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                        progress: crate::generated::AnnotationInputProgress {
-                            epoch: 1,
-                            consumedsequence: sequence,
-                            rejection: None,
-                        },
-                        error: None,
+        let assert_batch =
+            |connection: &Connection, capture: &mut Capture, sequence, documentepoch, samples| {
+                let CapturedRecord::Other(actual) = capture.try_recv().unwrap() else {
+                    panic!("direct annotation interaction")
+                };
+                let expected = crate::generated::encode_annotation_Input(
+                    crate::generated::AnnotationInputBatch {
+                        epoch: 1,
+                        documentepoch,
+                        sequence,
+                        samples,
                     },
-                ))
+                )
+                .unwrap()
+                .encode()
                 .unwrap();
-        };
+                assert_eq!(actual, crate::protocol::decode_envelope(&expected).unwrap());
+                connection
+                    .observe(&crate::protocol::ServerRecord::InputProgress(
+                        crate::generated::InputProgress {
+                            protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
+                            progress: crate::generated::AnnotationInputProgress {
+                                epoch: 1,
+                                consumedsequence: sequence,
+                                rejection: None,
+                            },
+                            error: None,
+                        },
+                    ))
+                    .unwrap();
+            };
         let (connection, mut capture) = Connection::test_channel();
         component.set_connection(Some(connection.clone()));
         let mut object = mask_object();
@@ -596,28 +612,39 @@ mod tests {
         snapshot.ui.editor.tool = crate::generated::AnnotationTool::Select;
         snapshot.ui.editor.selectedobject = Some(0);
         let dispatch = |model: &ApplicationModel, radius| {
-            component.canvas.dispatch(model, radius, component.keyboard_canvas.clone())
+            component
+                .canvas
+                .dispatch(model, radius, component.keyboard_canvas.clone())
         };
         let mut expected = pointer;
         expected.interactionid += 1;
-        expected.target = canvas::target(&model.annotation.snapshot.as_ref().unwrap().ui, 20.0, 30.0);
+        expected.target =
+            canvas::target(&model.annotation.snapshot.as_ref().unwrap().ui, 20.0, 30.0);
         expected.brushradius = 9;
-        component.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
+        component
+            .keyboard_canvas
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(dispatch(&model, 9)(gesture(Kind::Pointer)).is_none());
-        assert!(component.keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            component
+                .keyboard_canvas
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         let mut samples = vec![expected.clone()];
 
         let mut frame = model.annotation.snapshot.as_ref().unwrap().frame.clone();
         frame.revision += 1;
-        model.reduce_event(crate::view_model::ApplicationEvent::AnnotationAnnotationFrameChanged(
-            crate::generated::AnnotationFrameChanged {
-                snapshot: crate::generated::AnnotationFrameState {
-                    revision: 2,
-                    uirevision: 1,
-                    frame: frame.clone(),
+        model.reduce_event(
+            crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(
+                crate::generated::AnnotationFrameChanged {
+                    snapshot: crate::generated::AnnotationFrameState {
+                        revision: 2,
+                        uirevision: 1,
+                        frame: frame.clone(),
+                    },
                 },
-            },
-        ));
+            ),
+        );
         assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame, frame);
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.phase = Phase::Update;
@@ -649,7 +676,12 @@ mod tests {
         assert_batch(&connection, &mut capture, 1, 1, samples);
 
         // An input epoch change must refresh even when full UI identity repeats.
-        model.annotation.snapshot.as_mut().unwrap().inputdocumentepoch = 2;
+        model
+            .annotation
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .inputdocumentepoch = 2;
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.phase = Phase::Begin;
         expected.interactionid += 1;
@@ -673,15 +705,28 @@ mod tests {
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.interactionid += 1;
         assert_batch(&connection, &mut capture, 4, 2, vec![expected.clone()]);
-        component.keyboard_canvas.store(false, std::sync::atomic::Ordering::Relaxed);
+        component
+            .keyboard_canvas
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(dispatch(&model, 11)(gesture(Kind::Viewport)).is_none());
-        assert!(!component.keyboard_canvas.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !component
+                .keyboard_canvas
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         assert!(capture.try_recv().is_err());
 
         // Replacement may bootstrap identical numeric identities with new UI.
         let (replacement, mut replacement_capture) = Connection::test_channel();
         component.set_connection(Some(replacement.clone()));
-        model.annotation.snapshot.as_mut().unwrap().ui.editor.selectedobject = Some(1);
+        model
+            .annotation
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .ui
+            .editor
+            .selectedobject = Some(1);
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.interactionid += 1;
         expected.target.object = Some(1);
@@ -690,7 +735,9 @@ mod tests {
         component.set_connection(None);
         assert!(matches!(
             dispatch(&model, 11)(gesture(Kind::Pointer)),
-            Some(Message::InputFailed(crate::transport_connection::OutboundSendError::Closed))
+            Some(Message::InputFailed(
+                crate::transport_connection::OutboundSendError::Closed
+            ))
         ));
     }
 

@@ -558,8 +558,7 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
     CHECK_FALSE(accepted.error.has_value());
     CHECK(counter.snapshot().value == 9);
 
-    const auto unknown = dispatch_interaction(
-        systems, Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}});
+    const auto unknown = dispatch_interaction(systems, Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}});
     CHECK(unknown.disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK_FALSE(unknown.error.has_value());
 
@@ -759,8 +758,10 @@ TEST_CASE("protocol-14 fingerprint is deterministic and covers stable compositio
         return sink.words();
     };
     CHECK(structural.template operator()<std::string>() == structural.template operator()<std::filesystem::path>());
-    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint16_t, 3U>>());
-    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint32_t, 2U>>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() !=
+          structural.template operator()<std::array<std::uint16_t, 3U>>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() !=
+          structural.template operator()<std::array<std::uint32_t, 2U>>());
     CHECK(structural.template operator()<std::inplace_vector<std::uint16_t, 0U>>() !=
           structural.template operator()<std::vector<std::uint16_t>>());
     application_schema_detail::FingerprintSink default_value;
@@ -797,7 +798,8 @@ TEST_CASE("protocol-14 fingerprint is deterministic and covers stable compositio
         sink.append("type");
         sink.append("object");
         sink.append_number(fields.size());
-        for (const auto& append : fields) append(sink);
+        for (const auto& append : fields)
+            append(sink);
         sink.append("end-type");
         return sink.words();
     };
@@ -1274,7 +1276,7 @@ TEST_CASE("protocol-14 Bootstrap contains fingerprint and current snapshots only
     TestSettingsSystem settings;
     const auto bootstrap = materialize_bootstrap(TestSettingsSystems{.settings = &settings, .counter = &counter});
     CHECK(bootstrap.protocol_version == 14U);
-    CHECK(bootstrap.input_epoch == 0U); // The physical host installs the peer identity before encoding.
+    CHECK(bootstrap.input_epoch == 0U);  // The physical host installs the peer identity before encoding.
     CHECK(bootstrap.schema_fingerprint == application_schema_fingerprint<TestSettingsSystems>().words);
     REQUIRE(bootstrap.snapshots.size() == 2U);
     CHECK(bootstrap.snapshots[0].system_id == application_stable_id("settings"));

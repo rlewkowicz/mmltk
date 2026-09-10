@@ -60,7 +60,8 @@ void report_integration_failure(const bool integration, const std::string_view s
     std::fflush(stderr);
 }
 
-[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const bool integration, const std::string_view stage) noexcept {
+[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const bool integration,
+                              const std::string_view stage) noexcept {
     report_integration_failure(integration, stage);
     shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
     static_cast<void>(shell.shutdown());
@@ -171,9 +172,7 @@ int main(int argc, char** argv) {
                 logging_config.log_file.reset();
                 if (!logging_config.level) logging_config.level = spdlog::level::info;
             }
-            if (logging_config.enabled()) {
-                logging_config.app_name = "mmltk-browser-host";
-            }
+            if (logging_config.enabled()) { logging_config.app_name = "mmltk-browser-host"; }
             mmltk::common::logging::initialize(logging_config);
             mmltk::common::logging::trace([](auto& logger) { logger.trace("workspace Wayland native runtime logging initialized"); });
         }

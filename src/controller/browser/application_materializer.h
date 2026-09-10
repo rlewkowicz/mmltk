@@ -136,7 +136,11 @@ template <class Composition>
                 found = true;
                 result.endpoint_name = Endpoint::name;
                 typename Endpoint::request_type request{};
-                if (!mmltk::frameworks::serialization::decode_compact_into(request, interaction.Get<&Interaction::value>(), {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth})) { return; }
+                if (!mmltk::frameworks::serialization::decode_compact_into(
+                        request, interaction.Get<&Interaction::value>(),
+                        {.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth})) {
+                    return;
+                }
                 try {
                     auto* system = systems.*Endpoint::system_cell::pointer;
                     if (system == nullptr) throw mmltk::controller::contracts::UnavailableError("application system is unavailable");
@@ -196,12 +200,15 @@ template <class Composition>
         if (system == nullptr) throw std::logic_error("visual source is unavailable during application construction");
         readers[index++] = {
             .source = {Projection::kind, 1U},
-            .observe = [system] {
-                if constexpr (requires { { system->ObserveSource() } -> std::same_as<VisualSourceObservation>; })
-                    return system->ObserveSource();
-                else
-                    return Projection::Observe(std::invoke(&[:Snapshot:], *system));
-            },
+            .observe =
+                [system] {
+                    if constexpr (requires {
+                                      { system->ObserveSource() } -> std::same_as<VisualSourceObservation>;
+                                  })
+                        return system->ObserveSource();
+                    else
+                        return Projection::Observe(std::invoke(&[:Snapshot:], *system));
+                },
             .borrow = [system] { return system->BorrowFrame(); },
         };
     });

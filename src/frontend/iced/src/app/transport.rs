@@ -9,7 +9,9 @@ impl App {
         }
         self.presentation
             .suspend_viewer(&self.model, self.workspace.active());
-        if let Some(connection) = &self.connection { connection.close(); }
+        if let Some(connection) = &self.connection {
+            connection.close();
+        }
         self.workspace.set_annotation_connection(None);
         self.connection = None;
         self.model.peer_disconnected(error);
@@ -72,7 +74,8 @@ impl App {
                     ));
                     return Task::none();
                 }
-                self.workspace.set_annotation_connection(Some(connection.clone()));
+                self.workspace
+                    .set_annotation_connection(Some(connection.clone()));
                 self.connection = Some(connection);
                 self.send_surface_observation();
             }
@@ -82,7 +85,9 @@ impl App {
             TransportEvent::Disconnected(reason) => {
                 self.retire_peer(UiError::transport(reason));
             }
-            TransportEvent::Rejected(error) => { self.model.error = Some(UiError::invalid(error)); }
+            TransportEvent::Rejected(error) => {
+                self.model.error = Some(UiError::invalid(error));
+            }
             TransportEvent::ProtocolError(error) => {
                 self.retire_peer(UiError::protocol(error));
             }
@@ -92,7 +97,11 @@ impl App {
 
     pub(super) fn install_bootstrap(&mut self, bootstrap: Bootstrap) {
         #[cfg(test)]
-        if let Some(connection) = &self.connection { connection.observe(&crate::protocol::ServerRecord::Bootstrap(bootstrap.clone())).expect("test transport observation"); }
+        if let Some(connection) = &self.connection {
+            connection
+                .observe(&crate::protocol::ServerRecord::Bootstrap(bootstrap.clone()))
+                .expect("test transport observation");
+        }
         self.presentation.reset_failure();
         if let Err(error) = self
             .model
@@ -113,7 +122,11 @@ impl App {
 
     pub(super) fn reduce_reply(&mut self, reply: IntentReply) {
         #[cfg(test)]
-        if let Some(connection) = &self.connection { connection.observe(&crate::protocol::ServerRecord::IntentReply(reply.clone())).expect("test transport observation"); }
+        if let Some(connection) = &self.connection {
+            connection
+                .observe(&crate::protocol::ServerRecord::IntentReply(reply.clone()))
+                .expect("test transport observation");
+        }
         let Some(endpoint_id) = self.model.pending_endpoint(reply.correlation) else {
             self.model.error = Some(UiError::protocol("unknown or duplicate IntentReply"));
             return;
@@ -172,7 +185,11 @@ impl App {
 
     pub(super) fn reduce_event(&mut self, event: SystemEvent) {
         #[cfg(test)]
-        if let Some(connection) = &self.connection { connection.observe(&crate::protocol::ServerRecord::SystemEvent(event.clone())).expect("test transport observation"); }
+        if let Some(connection) = &self.connection {
+            connection
+                .observe(&crate::protocol::ServerRecord::SystemEvent(event.clone()))
+                .expect("test transport observation");
+        }
         let failure_snapshot = match &event.event {
             crate::generated::ApplicationEvent::PresentationPresentationFailed(failure) => {
                 Some(failure.snapshot.clone())
@@ -189,7 +206,10 @@ impl App {
             system,
             crate::generated::ApplicationSystem::Explore
                 | crate::generated::ApplicationSystem::Annotation
-        ) && !matches!(&event.event, crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(_));
+        ) && !matches!(
+            &event.event,
+            crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(_)
+        );
         let reconcile_explore = system == crate::generated::ApplicationSystem::Explore;
         let explore_failed = Self::explore_event_failed(&event.event);
         let _ = self.model.reduce_event(event.event);

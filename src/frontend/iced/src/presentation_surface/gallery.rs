@@ -62,7 +62,9 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
                     .is_some_and(|current| current.dataset.identity == value.dataset.identity)
         }) {
             if let Some(snapshot) = snapshot
-                && selected.as_ref().is_some_and(|value| snapshot.revision > value.revision)
+                && selected
+                    .as_ref()
+                    .is_some_and(|value| snapshot.revision > value.revision)
             {
                 *selected = Some(Arc::new(snapshot.clone()));
             }
@@ -114,7 +116,9 @@ pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreSnapshot>)> {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
         if let Some(submitted) = [&renderer.pending, &renderer.imported]
-            .into_iter().flatten().find_map(|imported| {
+            .into_iter()
+            .flatten()
+            .find_map(|imported| {
                 let pending = imported.image.pending_capture.as_ref()?;
                 let pending = imported.image.submitted_draw(pending.surface)?;
                 Some((pending.surface, pending.gallery.clone()?))
@@ -340,8 +344,14 @@ mod tests {
         assert_eq!(matching(Some(frame)).unwrap().revision, snapshot.revision);
         image.reconcile_pending(frame, &model);
         let pending = image.pending_capture.as_ref().unwrap();
-        assert_eq!(pending.gallery.as_ref().unwrap().revision, snapshot.revision);
-        assert_eq!(pending.gallery.as_ref().unwrap().overlay.showlabels, snapshot.overlay.showlabels);
+        assert_eq!(
+            pending.gallery.as_ref().unwrap().revision,
+            snapshot.revision
+        );
+        assert_eq!(
+            pending.gallery.as_ref().unwrap().overlay.showlabels,
+            snapshot.overlay.showlabels
+        );
         assert!(!pending.complete);
         assert!(image.retained().is_none());
         assert!(!image.promote(frame, &model));
@@ -350,8 +360,18 @@ mod tests {
         select(Some(&other_dataset), &other_dataset.frame);
         confirm(frame, &other_dataset.frame, Some(&other_dataset));
         image.reconcile_pending(frame, &model);
-        assert_eq!(image.pending_capture.as_ref().unwrap().gallery.as_ref().unwrap().dataset.identity,
-                   snapshot.dataset.identity);
+        assert_eq!(
+            image
+                .pending_capture
+                .as_ref()
+                .unwrap()
+                .gallery
+                .as_ref()
+                .unwrap()
+                .dataset
+                .identity,
+            snapshot.dataset.identity
+        );
         select(Some(&snapshot), &snapshot.frame);
         confirm(frame, &snapshot.frame, Some(&snapshot));
         image.complete(frame);

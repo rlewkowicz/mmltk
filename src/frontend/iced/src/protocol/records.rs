@@ -4,10 +4,7 @@ use super::{
     validate_client_dynamic_value, validate_server_dynamic_value,
 };
 use crate::application_codec::{FromApplicationValue, Value};
-use crate::generated::{
-    EventDelivery, ServerRecordKind, MAX_INTENT_FIELDS,
-    MAX_SNAPSHOT_COUNT,
-};
+use crate::generated::{EventDelivery, MAX_INTENT_FIELDS, MAX_SNAPSHOT_COUNT, ServerRecordKind};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RendererObservation {
@@ -219,7 +216,12 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
         ServerRecordKind::Bootstrap => {
             let mut fields = into_required_object(
                 envelope.payload,
-                &["protocol_version", "schema_fingerprint", "input_epoch", "snapshots"],
+                &[
+                    "protocol_version",
+                    "schema_fingerprint",
+                    "input_epoch",
+                    "snapshots",
+                ],
             )?;
             let Value::Array(fingerprint) = take_required(&mut fields, "schema_fingerprint") else {
                 return Err(ProtocolError("schema fingerprint must be an array".into()));
@@ -257,7 +259,10 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             }
             Ok(ServerRecord::Bootstrap(Bootstrap {
                 schema_fingerprint,
-                input_epoch: take_required(&mut fields, "input_epoch").integer_u64().filter(|epoch| *epoch != 0).ok_or_else(|| ProtocolError("invalid input epoch".into()))?,
+                input_epoch: take_required(&mut fields, "input_epoch")
+                    .integer_u64()
+                    .filter(|epoch| *epoch != 0)
+                    .ok_or_else(|| ProtocolError("invalid input epoch".into()))?,
                 snapshots: snapshots
                     .into_iter()
                     .map(|(_, snapshot)| snapshot)
@@ -265,13 +270,20 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             }))
         }
         ServerRecordKind::InteractionRejected => {
-            let record = crate::generated::InteractionRejected::from_application_value(envelope.payload).map_err(ProtocolError)?;
-            if record.endpointid == 0 { return Err(ProtocolError("invalid rejected endpoint".into())); }
+            let record =
+                crate::generated::InteractionRejected::from_application_value(envelope.payload)
+                    .map_err(ProtocolError)?;
+            if record.endpointid == 0 {
+                return Err(ProtocolError("invalid rejected endpoint".into()));
+            }
             Ok(ServerRecord::InteractionRejected(record))
         }
         ServerRecordKind::InputProgress => {
-            let record = crate::generated::InputProgress::from_application_value(envelope.payload).map_err(ProtocolError)?;
-            if record.progress.epoch == 0 { return Err(ProtocolError("invalid progress epoch".into())); }
+            let record = crate::generated::InputProgress::from_application_value(envelope.payload)
+                .map_err(ProtocolError)?;
+            if record.progress.epoch == 0 {
+                return Err(ProtocolError("invalid progress epoch".into()));
+            }
             Ok(ServerRecord::InputProgress(record))
         }
 
@@ -351,7 +363,11 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             validate_server_dynamic_value(&value)?;
             let event = crate::generated::decode_application_event(system_id, event_id, value)
                 .map_err(ProtocolError)?;
-            Ok(ServerRecord::SystemEvent(SystemEvent { delivery, state_revision, event }))
+            Ok(ServerRecord::SystemEvent(SystemEvent {
+                delivery,
+                state_revision,
+                event,
+            }))
         }
     }
 }
@@ -660,40 +676,83 @@ mod tests {
             crate::generated::SCHEMA_FINGERPRINT
         );
         assert_eq!(bootstrap.input_epoch, 1);
-        assert!(matches!(decode_server(native[4]).unwrap(), ServerRecord::InputProgress(crate::generated::InputProgress { progress, error: None , .. })
-            if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none()));
-        assert!(matches!(decode_server(native[5]).unwrap(), ServerRecord::InteractionRejected(record)
-            if record.endpointid == crate::generated::ENDPOINT_Explore_UpdateViewport && record.error.category == crate::generated::ApplicationErrorCategory::Unavailable && record.error.detail == "fixture unavailable"));
-        let limit = crate::generated::ReflectedRecordPath::AnnotationInputProgress.map_child(b"rejection").max_leaf_bytes();
-        let ServerRecord::InputProgress(present) = decode_server(native[6]).unwrap() else { panic!("native optional progress") };
+        assert!(
+            matches!(decode_server(native[4]).unwrap(), ServerRecord::InputProgress(crate::generated::InputProgress { progress, error: None , .. })
+            if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none())
+        );
+        assert!(
+            matches!(decode_server(native[5]).unwrap(), ServerRecord::InteractionRejected(record)
+            if record.endpointid == crate::generated::ENDPOINT_Explore_UpdateViewport && record.error.category == crate::generated::ApplicationErrorCategory::Unavailable && record.error.detail == "fixture unavailable")
+        );
+        let limit = crate::generated::ReflectedRecordPath::AnnotationInputProgress
+            .map_child(b"rejection")
+            .max_leaf_bytes();
+        let ServerRecord::InputProgress(present) = decode_server(native[6]).unwrap() else {
+            panic!("native optional progress")
+        };
         assert_eq!(present.progress.rejection.as_ref().unwrap().len(), limit);
-        assert_eq!(present.error.as_ref().unwrap().category, crate::generated::ApplicationErrorCategory::Busy);
+        assert_eq!(
+            present.error.as_ref().unwrap().category,
+            crate::generated::ApplicationErrorCategory::Busy
+        );
         let mut excessive = decode_envelope(native[6]).unwrap().payload;
-        let Value::Object(fields) = &mut excessive else { panic!("progress envelope") };
-        let Value::Object(progress) = &mut fields.iter_mut().find(|(name, _)| name == "progress").unwrap().1 else { panic!("progress") };
-        progress.iter_mut().find(|(name, _)| name == "rejection").unwrap().1 = Value::Text("r".repeat(limit + 1));
-        assert!(crate::generated::InputProgress::from_application_value(excessive.clone()).is_err());
+        let Value::Object(fields) = &mut excessive else {
+            panic!("progress envelope")
+        };
+        let Value::Object(progress) = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name == "progress")
+            .unwrap()
+            .1
+        else {
+            panic!("progress")
+        };
+        progress
+            .iter_mut()
+            .find(|(name, _)| name == "rejection")
+            .unwrap()
+            .1 = Value::Text("r".repeat(limit + 1));
+        assert!(
+            crate::generated::InputProgress::from_application_value(excessive.clone()).is_err()
+        );
         assert!(decode_server(&encode_envelope("InputProgress", &excessive).unwrap()).is_err());
         for kind in ["InputProgress", "InteractionRejected"] {
             let index = if kind == "InputProgress" { 4 } else { 5 };
             let original = decode_envelope(native[index]).unwrap().payload;
-            let Value::Object(original_fields) = original else { panic!("reflected record") };
+            let Value::Object(original_fields) = original else {
+                panic!("reflected record")
+            };
             for mutation in 0..3 {
                 let mut fields = original_fields.clone();
                 match mutation {
-                    0 => { fields.pop(); }
-                    1 => { fields[0].0 = "unknown".into(); }
-                    _ => { fields[0].0 = fields[1].0.clone(); }
+                    0 => {
+                        fields.pop();
+                    }
+                    1 => {
+                        fields[0].0 = "unknown".into();
+                    }
+                    _ => {
+                        fields[0].0 = fields[1].0.clone();
+                    }
                 }
                 let payload = Value::Object(fields);
                 let decoded = if kind == "InputProgress" {
                     crate::generated::InputProgress::from_application_value(payload).map(|_| ())
-                } else { crate::generated::InteractionRejected::from_application_value(payload).map(|_| ()) };
+                } else {
+                    crate::generated::InteractionRejected::from_application_value(payload)
+                        .map(|_| ())
+                };
                 assert!(decoded.is_err());
             }
         }
         let mut zero_epoch = decode_envelope(native[0]).unwrap().payload;
-        if let Value::Object(fields) = &mut zero_epoch { fields.iter_mut().find(|(name, _)| name == "input_epoch").unwrap().1 = Value::Unsigned(0); }
+        if let Value::Object(fields) = &mut zero_epoch {
+            fields
+                .iter_mut()
+                .find(|(name, _)| name == "input_epoch")
+                .unwrap()
+                .1 = Value::Unsigned(0);
+        }
         assert!(decode_server(&encode_envelope("Bootstrap", &zero_epoch).unwrap()).is_err());
         for (index, selected) in [(1, false), (2, true)] {
             let ServerRecord::IntentReply(reply) =

@@ -599,7 +599,9 @@ bool BrowserServer::close() noexcept {
 void BrowserServer::close_peer() noexcept { impl_->request_peer_close(); }
 
 BrowserRecordPush BrowserServer::publish(BrowserOutputRecord record) noexcept { return impl_->publish(std::move(record)); }
-mmltk::frameworks::serialization::wire::ByteBuffer BrowserServer::acquire_progress_storage() { return impl_->output.acquire_progress_storage(); }
+mmltk::frameworks::serialization::wire::ByteBuffer BrowserServer::acquire_progress_storage() {
+    return impl_->output.acquire_progress_storage();
+}
 
 bool BrowserServer::running() const noexcept { return impl_->running.load(std::memory_order_acquire); }
 

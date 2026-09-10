@@ -64,8 +64,7 @@ impl App {
                 let local_edits = self.settings.has_local_edits();
                 let open_available = self.model.explore_open_available();
                 if let Some(integration) = self.integration.as_mut() {
-                    integration
-                        .observe_explore_open_request(local_edits, open_available);
+                    integration.observe_explore_open_request(local_edits, open_available);
                 }
                 if local_edits || !open_available {
                     self.model.error = Some(UiError::busy(
@@ -326,7 +325,10 @@ impl App {
         };
         let interaction = match crate::generated::encode_explore_UpdateViewport(request.clone()) {
             Ok(interaction) => interaction,
-            Err(error) => { self.retire_peer(UiError::transport(error.to_string())); return Task::none(); }
+            Err(error) => {
+                self.retire_peer(UiError::transport(error.to_string()));
+                return Task::none();
+            }
         };
         match connection.send_interaction(interaction) {
             Ok(crate::transport_connection::SendDisposition::Queued) => {
@@ -398,8 +400,7 @@ impl App {
                 |correlation| crate::generated::encode_explore_UpdateFilter(correlation, request),
             );
             if let Some(integration) = self.integration.as_mut() {
-                integration
-                    .observe_explore_filter_submission(submitted);
+                integration.observe_explore_filter_submission(submitted);
             }
             if submitted {
                 self.model.explore.desired_filter = None;

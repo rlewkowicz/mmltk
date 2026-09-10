@@ -17,8 +17,7 @@ impl App {
             crate::view::router::Outcome::FeatureSelected(feature) => {
                 let task = self.transition_page(feature);
                 if let Some(integration) = self.integration.as_mut() {
-                    integration
-                        .observe_navigation_outcome(feature, self.workspace.active());
+                    integration.observe_navigation_outcome(feature, self.workspace.active());
                 }
                 task
             }

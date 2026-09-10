@@ -367,7 +367,7 @@ fn gallery_viewport<'a>(
         |surface| {
             crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
-                local: None,
+                    local: None,
                     surface,
                     publish: Some(Message::Surface),
                     placement: crate::presentation_surface::Placement::GalleryGrid {

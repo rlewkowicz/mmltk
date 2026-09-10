@@ -59,7 +59,6 @@ struct Interaction final {
     bool operator==(const Interaction&) const = default;
 };
 
-
 enum class RendererObservationKind : std::uint8_t {
     Ready,
     Surface,

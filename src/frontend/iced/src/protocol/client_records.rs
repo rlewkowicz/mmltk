@@ -25,13 +25,29 @@ pub struct Interaction {
 pub trait Compact {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError>;
 }
-pub(crate) fn reserve(bytes: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), super::ProtocolError> {
-    if bytes.len().checked_add(additional).is_none_or(|length| length > limit) {
-        return Err(super::ProtocolError("compact encoding exceeds byte capacity".into()));
+pub(crate) fn reserve(
+    bytes: &mut Vec<u8>,
+    additional: usize,
+    limit: usize,
+) -> Result<(), super::ProtocolError> {
+    if bytes
+        .len()
+        .checked_add(additional)
+        .is_none_or(|length| length > limit)
+    {
+        return Err(super::ProtocolError(
+            "compact encoding exceeds byte capacity".into(),
+        ));
     }
-    bytes.try_reserve(additional).map_err(|_| super::ProtocolError("compact encoding allocation failed".into()))
+    bytes
+        .try_reserve(additional)
+        .map_err(|_| super::ProtocolError("compact encoding allocation failed".into()))
 }
-pub fn compact_head(major: u8, value: u64, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
+pub fn compact_head(
+    major: u8,
+    value: u64,
+    bytes: &mut Vec<u8>,
+) -> Result<(), super::ProtocolError> {
     reserve(bytes, 9, crate::generated::MAX_INTENT_VALUE_BYTES)?;
     super::cbor::head(major, value, bytes);
     Ok(())
@@ -60,7 +76,9 @@ impl Compact for bool {
     }
 }
 impl Compact for f32 {
-    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> { (*self as f64).compact(bytes) }
+    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
+        (*self as f64).compact(bytes)
+    }
 }
 impl Compact for f64 {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
@@ -70,36 +88,59 @@ impl Compact for f64 {
 }
 impl<T: Compact> Compact for Option<T> {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
-        match self { Some(value) => value.compact(bytes), None => {
-            reserve(bytes, 1, crate::generated::MAX_INTENT_VALUE_BYTES)?;
-            bytes.push(0xf6);
-            Ok(())
-        } }
+        match self {
+            Some(value) => value.compact(bytes),
+            None => {
+                reserve(bytes, 1, crate::generated::MAX_INTENT_VALUE_BYTES)?;
+                bytes.push(0xf6);
+                Ok(())
+            }
+        }
     }
 }
 impl<T: Compact> Compact for [T] {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
         compact_head(4, self.len() as u64, bytes)?;
-        for item in self { item.compact(bytes)?; }
+        for item in self {
+            item.compact(bytes)?;
+        }
         Ok(())
     }
 }
 impl<T: Compact> Compact for Vec<T> {
-    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> { self.as_slice().compact(bytes) }
+    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
+        self.as_slice().compact(bytes)
+    }
 }
 impl<T: Compact, const N: usize> Compact for [T; N] {
-    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> { self.as_slice().compact(bytes) }
+    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
+        self.as_slice().compact(bytes)
+    }
 }
 pub fn compact_bytes(value: &impl Compact) -> Result<Vec<u8>, super::ProtocolError> {
     let mut bytes = Vec::new();
     value.compact(&mut bytes)?;
     Ok(bytes)
 }
-pub fn encode_compact_interaction(endpoint: u64, value: &impl Compact, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
+pub fn encode_compact_interaction(
+    endpoint: u64,
+    value: &impl Compact,
+    scratch: &mut Vec<u8>,
+    output: &mut Vec<u8>,
+) -> Result<(), super::ProtocolError> {
     scratch.clear();
     value.compact(scratch)?;
     encode_interaction_bytes(endpoint, scratch, output)
 }
-pub fn encode_interaction_bytes(endpoint: u64, payload: &[u8], output: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
-    crate::generated::encode_interaction_record(crate::generated::BROWSER_PROTOCOL_VERSION, endpoint, payload, output)
+pub fn encode_interaction_bytes(
+    endpoint: u64,
+    payload: &[u8],
+    output: &mut Vec<u8>,
+) -> Result<(), super::ProtocolError> {
+    crate::generated::encode_interaction_record(
+        crate::generated::BROWSER_PROTOCOL_VERSION,
+        endpoint,
+        payload,
+        output,
+    )
 }

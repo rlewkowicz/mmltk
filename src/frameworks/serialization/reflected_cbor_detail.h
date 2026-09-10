@@ -843,7 +843,8 @@ template <class Variant>
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_variant(const wire::Value& value) {
     const auto* object = std::get_if<wire::Value::Object>(&value.storage);
-    if (object == nullptr || object->size() != VariantEnvelope::field_count || (*object)[0].first != VariantEnvelope::kind_key || (*object)[1].first != VariantEnvelope::payload_key) {
+    if (object == nullptr || object->size() != VariantEnvelope::field_count || (*object)[0].first != VariantEnvelope::kind_key ||
+        (*object)[1].first != VariantEnvelope::payload_key) {
         auto error = decode_error(wire::ErrorCode::TypeMismatch);
         prepend_path(error, VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
@@ -1874,7 +1875,8 @@ template <class T>
         static_assert(kUniqueVariantAlternatives<U>, "Reflected CBOR variant alternatives require unique type identifiers.");
         return std::visit(
             [&writer](const auto& alternative) {
-                return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) && writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
+                return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) &&
+                       writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
                        writer.text(VariantEnvelope::payload_key) && encode_fixed_projection(writer, alternative);
             },
             value);
@@ -2008,10 +2010,13 @@ template <class T>
         return detail::cbor_maximum(1U, maximum_bytes<typename detail::IsOptional<T>::value_type>());
     } else if constexpr (shape<T> == Shape::Sequence) {
         constexpr std::size_t count = [] consteval {
-            if constexpr (detail::kIsArray<T>) return detail::IsArray<T>::size;
-            else return detail::IsInplaceVector<T>::capacity;
+            if constexpr (detail::kIsArray<T>)
+                return detail::IsArray<T>::size;
+            else
+                return detail::IsInplaceVector<T>::capacity;
         }();
-        return detail::cbor_size_add(wire::head_size(count), detail::cbor_size_multiply(count, maximum_bytes<detail::SequenceElementT<T>>()));
+        return detail::cbor_size_add(wire::head_size(count),
+                                     detail::cbor_size_multiply(count, maximum_bytes<detail::SequenceElementT<T>>()));
     } else if constexpr (shape<T> == Shape::Enum) {
         std::size_t result = 0U;
         for (const auto enumerator : detail::enumerators<T>()) {
@@ -2028,9 +2033,9 @@ template <class T>
     } else if constexpr (shape<T> == Shape::Object) {
         detail::audit_object<T>();
         return detail::cbor_size_add(wire::head_size(detail::flattened_member_count<T>()),
-            detail::reflected_object_member_sum<T>([]<class, class Declaration>(const auto&) {
-                return maximum_bytes<typename Declaration::member_type>();
-            }));
+                                     detail::reflected_object_member_sum<T>([]<class, class Declaration>(const auto&) {
+                                         return maximum_bytes<typename Declaration::member_type>();
+                                     }));
     } else {
         return detail::maximum_cbor_bytes<T>();
     }
@@ -2043,9 +2048,8 @@ void visit_fields(T& value, Visitor& visitor) {
         using QualifiedBase = std::conditional_t<std::is_const_v<T>, const Base, Base>;
         visit_fields(static_cast<QualifiedBase&>(value), visitor);
     });
-    detail::visit_members<U>([&]<class Declaration>(const auto&) {
-        visitor.template operator()<Declaration>(value.*Declaration::pointer);
-    });
+    detail::visit_members<U>(
+        [&]<class Declaration>(const auto&) { visitor.template operator()<Declaration>(value.*Declaration::pointer); });
 }
 template <class T>
 [[nodiscard]] bool encode(FixedCborEncoder& writer, const T& value) {
@@ -2055,7 +2059,8 @@ template <class T>
         return value ? encode(writer, *value) : writer.null();
     } else if constexpr (shape<T> == Shape::Sequence) {
         if (!writer.array(value.size())) return false;
-        for (const auto& item : value) if (!encode(writer, item)) return false;
+        for (const auto& item : value)
+            if (!encode(writer, item)) return false;
         return true;
     } else if constexpr (shape<T> == Shape::Enum) {
         return mmltk::frameworks::reflection::enum_contains(value) && encode(writer, static_cast<std::underlying_type_t<T>>(value));
@@ -2078,7 +2083,10 @@ template <class T>
     if constexpr (shape<T> == Shape::Optional) {
         auto absent = reader.next_is_null();
         if (!absent) return false;
-        if (*absent) { value.reset(); return reader.read_scalar_item(depth).has_value(); }
+        if (*absent) {
+            value.reset();
+            return reader.read_scalar_item(depth).has_value();
+        }
         value.emplace();
         return decode(reader, *value, depth);
     } else if constexpr (shape<T> == Shape::Sequence) {
@@ -2090,7 +2098,8 @@ template <class T>
             if (*count > value.capacity()) return false;
             value.resize(*count);
         }
-        for (auto& item : value) if (!decode(reader, item, depth + 1U)) return false;
+        for (auto& item : value)
+            if (!decode(reader, item, depth + 1U)) return false;
         return true;
     } else if constexpr (shape<T> == Shape::Enum) {
         std::underlying_type_t<T> raw{};
@@ -2114,7 +2123,6 @@ template <class T>
         return true;
     }
 }
-} // namespace compact_detail
-
+}  // namespace compact_detail
 
 }  // namespace mmltk::frameworks::serialization::implementation

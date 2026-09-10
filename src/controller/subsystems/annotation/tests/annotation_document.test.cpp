@@ -235,7 +235,8 @@ TEST_CASE("Annotation import capacity failure leaves the open editable document 
     auto& malformed = const_cast<contracts::AnnotationUiState&>(editor.ui());
     malformed.editor.selected_object = 0U;
     const auto invalid = malformed;
-    CHECK(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("refused")}}).outcome == document::DocumentOutcome::Rejected);
+    CHECK(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("refused")}}).outcome ==
+          document::DocumentOutcome::Rejected);
     mmltk::testsupport::ScopedTempDir directory{"annotation-invalid-current"};
     const auto destination = directory.path() / "invalid.cbor";
     CHECK(editor.Save(destination.string()).outcome == document::DocumentOutcome::Rejected);
@@ -243,7 +244,6 @@ TEST_CASE("Annotation import capacity failure leaves the open editable document 
     CHECK(editor.ui() == invalid);
     malformed = kept;
     CHECK(editor.ui() == kept);
-
 }
 
 TEST_CASE("The native maximum object scene fits the bounded editable snapshot and persistence policy") {

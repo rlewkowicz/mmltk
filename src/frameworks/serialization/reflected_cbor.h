@@ -81,17 +81,17 @@ template <class T>
 // writers and the borrowed projection. Alternative membership remains exhaustive.
 template <class Variant, class Alternative>
 struct ReflectedVariantEnvelope final {
-    static_assert([]<class... T>(std::type_identity<std::variant<T...>>) {
-        return (std::same_as<Alternative, T> || ...);
-    }(std::type_identity<Variant>{}), "borrowed alternative must belong to its canonical variant");
+    static_assert([]<class... T>(std::type_identity<std::variant<T...>>) { return (std::same_as<Alternative, T> || ...); }(
+                      std::type_identity<Variant>{}),
+                  "borrowed alternative must belong to its canonical variant");
     static constexpr auto kind_key = implementation::detail::VariantEnvelope::kind_key;
     static constexpr auto payload_key = implementation::detail::VariantEnvelope::payload_key;
     static constexpr auto field_count = implementation::detail::VariantEnvelope::field_count;
     static constexpr std::string_view kind = implementation::detail::static_variant_name<Alternative>();
     [[nodiscard]] static bool Read(wire::Reader& reader) {
         auto count = reader.begin_object_item(0U);
-        return count && *count == field_count && reader.expect_text_item(1U, kind_key) &&
-               reader.expect_text_item(1U, kind) && reader.expect_text_item(1U, payload_key);
+        return count && *count == field_count && reader.expect_text_item(1U, kind_key) && reader.expect_text_item(1U, kind) &&
+               reader.expect_text_item(1U, payload_key);
     }
 };
 
@@ -103,26 +103,31 @@ class BorrowedByteRecord final {
    public:
     template <auto Member>
     [[nodiscard]] const auto& Get() const noexcept {
-        if constexpr (std::meta::reflect_constant(Member) == std::meta::reflect_constant(BytesMember)) return bytes_;
-        else return record_.*Member;
+        if constexpr (std::meta::reflect_constant(Member) == std::meta::reflect_constant(BytesMember))
+            return bytes_;
+        else
+            return record_.*Member;
     }
     BorrowedByteRecord() = default;
     explicit BorrowedByteRecord(const Record& record) {
         implementation::detail::visit_members<Record>([&]<class Declaration>(const auto&) {
             if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember))
                 bytes_.first = record.*BytesMember;
-            else record_.*Declaration::pointer = record.*Declaration::pointer;
+            else
+                record_.*Declaration::pointer = record.*Declaration::pointer;
         });
     }
     template <class Variant>
     [[nodiscard]] bool Decode(wire::Reader& reader) {
         namespace d = implementation::detail;
         d::audit_object<Record>();
-        static_assert([] consteval {
-            bool direct = true;
-            d::visit_bases<Record>([&]<class>() { direct = false; });
-            return direct;
-        }(), "borrowed byte records require direct reflected fields");
+        static_assert(
+            [] consteval {
+                bool direct = true;
+                d::visit_bases<Record>([&]<class>() { direct = false; });
+                return direct;
+            }(),
+            "borrowed byte records require direct reflected fields");
         static_assert(std::same_as<std::remove_cvref_t<decltype(record_.*BytesMember)>, wire::ByteBuffer>,
                       "borrowed byte projection requires a declaration-bounded byte buffer");
         constexpr auto names = [] consteval {

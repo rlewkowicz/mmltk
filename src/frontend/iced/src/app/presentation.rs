@@ -598,10 +598,7 @@ impl Controller {
             && let Some(retained) =
                 crate::presentation_surface::completed_content(&snapshot.completed, snapshot)
         {
-            crate::presentation_surface::reconcile_completed(
-                retained,
-                model,
-            );
+            crate::presentation_surface::reconcile_completed(retained, model);
             self.retained = Some(retained);
             self.incumbent = Some(retained);
         }
@@ -631,7 +628,10 @@ impl Controller {
                     &snapshot.completed,
                     model.explore.snapshot.as_ref(),
                 );
-                crate::presentation_surface::reconcile_completed(self.pending.expect("matching pending surface"), model);
+                crate::presentation_surface::reconcile_completed(
+                    self.pending.expect("matching pending surface"),
+                    model,
+                );
                 if let Some(retained) = crate::presentation_surface::retained_surface()
                     .filter(|surface| surface.frame == Some(frame))
                 {
@@ -800,7 +800,7 @@ mod tests {
             let (sender, mut receiver) = Connection::test_channel();
             drop(app.on_transport(TransportEvent::Connected(sender)));
             drop(app.on_transport(TransportEvent::Bootstrap(Bootstrap {
-            input_epoch: 1,
+                input_epoch: 1,
                 schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
                 snapshots,
             })));

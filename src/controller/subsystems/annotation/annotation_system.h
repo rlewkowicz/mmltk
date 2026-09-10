@@ -44,8 +44,9 @@ struct AnnotationInputBatch final {
     std::uint64_t epoch = 0U;
     std::uint64_t document_epoch = 0U;
     std::uint64_t sequence = 0U;
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationInputBatchCapacity}]]
-    std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity> samples{};
+    [[= mmltk::frameworks::reflection::MaxItems{
+        kAnnotationInputBatchCapacity}]] std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity>
+        samples{};
 };
 struct AnnotationInputProgress final {
     bool operator==(const AnnotationInputProgress&) const = default;

@@ -350,7 +350,8 @@ class BindingEmitter final {
                 << ";\npub const ANNOTATION_INPUT_ADMISSION_SLOTS: usize = " << mmltk::controller::kAnnotationInputAdmissionSlots << ";\n";
         symbols_.Reserve("module", "ANNOTATION_INPUT_ENCODED_CAPACITY", "native annotation input wire bound");
         constexpr auto input_wire_bound = cbor::compact_maximum_cbor_bytes<mmltk::controller::AnnotationInputBatch>();
-        constexpr auto interaction_overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() - mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
+        constexpr auto interaction_overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() -
+                                              mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
         static_assert(input_wire_bound <= kMaxIntentValueBytes);
         output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << input_wire_bound + interaction_overhead << ";\n";
         EmitInteractionEnvelope();
@@ -620,7 +621,8 @@ class BindingEmitter final {
             EmitConstraint<typename schema::Optional<Type>::value_type>("(*present)", constraint);
             output_ << "}\n";
         } else {
-            if (constraint.finite) output_ << "if !" << member << ".is_finite() { return Err(\"non-finite field " << member << "\".into()) }\n";
+            if (constraint.finite)
+                output_ << "if !" << member << ".is_finite() { return Err(\"non-finite field " << member << "\".into()) }\n";
             if (constraint.has_minimum) {
                 output_ << "if " << member << " < ";
                 EmitRustFloatLiteral(output_, constraint.minimum);
@@ -804,12 +806,15 @@ class BindingEmitter final {
         namespace cbor = mmltk::frameworks::serialization;
         using Envelope = cbor::ReflectedVariantEnvelope<ClientRecord, Interaction>;
         symbols_.Reserve("module", "encode_interaction_record", "canonical retained interaction envelope");
-        constexpr auto overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() - mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
+        constexpr auto overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() -
+                                  mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
         output_ << "pub fn encode_interaction_record(";
         VisitRustFields<Interaction>([&]<class Field, class>(const auto&, const std::string& member) {
             output_ << member << ": ";
-            if constexpr (cbor::reflected_byte_sequence<Field>) output_ << "&[u8]";
-            else output_ << rust_type<Field>();
+            if constexpr (cbor::reflected_byte_sequence<Field>)
+                output_ << "&[u8]";
+            else
+                output_ << rust_type<Field>();
             output_ << ", ";
         });
         output_ << "output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> {\n";
@@ -831,11 +836,20 @@ class BindingEmitter final {
         });
         output_ << "crate::protocol::client_records::reserve(output, capacity, MAX_RECORD_WIRE_BYTES)?;\n"
                    "use crate::protocol::cbor::{head, encode_text_item};\n"
-                   "head(5, " << Envelope::field_count << ", output);\n"
-                   "encode_text_item(" << std::quoted(Envelope::kind_key) << ", output);\n"
-                   "encode_text_item(" << std::quoted(Envelope::kind) << ", output);\n"
-                   "encode_text_item(" << std::quoted(Envelope::payload_key) << ", output);\n"
-                   "head(5, " << cbor::reflected_cbor_member_count<Interaction>() << ", output);\n";
+                   "head(5, "
+                << Envelope::field_count
+                << ", output);\n"
+                   "encode_text_item("
+                << std::quoted(Envelope::kind_key)
+                << ", output);\n"
+                   "encode_text_item("
+                << std::quoted(Envelope::kind)
+                << ", output);\n"
+                   "encode_text_item("
+                << std::quoted(Envelope::payload_key)
+                << ", output);\n"
+                   "head(5, "
+                << cbor::reflected_cbor_member_count<Interaction>() << ", output);\n";
         VisitRustFields<Interaction>([&]<class Field, class>(const auto& fact, const std::string& member) {
             output_ << "encode_text_item(" << std::quoted(fact.member_name) << ", output);\n";
             if constexpr (cbor::reflected_byte_sequence<Field>) {
@@ -872,22 +886,22 @@ class BindingEmitter final {
                         self.template operator()<Leaf>();
                         fields << rust_type<Leaf>();
                     } else {
-                        static_assert((Builtin<Leaf> || std::is_enum_v<Leaf>) &&
-                                      !std::same_as<Leaf, wire::Value> && !std::same_as<Leaf, wire::FlatValue>,
-                                      "unsupported reflected server-record preflight leaf; alternative is identified by this instantiation");
+                        static_assert(
+                            (Builtin<Leaf> || std::is_enum_v<Leaf>) && !std::same_as<Leaf, wire::Value> &&
+                                !std::same_as<Leaf, wire::FlatValue>,
+                            "unsupported reflected server-record preflight leaf; alternative is identified by this instantiation");
                         std::size_t maximum_bytes = fact.constraint.maximum_bytes;
                         if constexpr (std::same_as<Leaf, std::string> || std::same_as<Leaf, std::filesystem::path> ||
                                       std::same_as<Leaf, std::string_view>) {
-                            static_assert(
-                                mmltk::frameworks::reflection::materialized_member_declaration<Declaration::pointer>()
-                                        .constraint.maximum_bytes > 0U,
-                                "reflected server-record text/path leaf requires positive MaxBytes; owning field is identified by this instantiation");
+                            static_assert(mmltk::frameworks::reflection::materialized_member_declaration<Declaration::pointer>()
+                                                  .constraint.maximum_bytes > 0U,
+                                          "reflected server-record text/path leaf requires positive MaxBytes; owning field is identified "
+                                          "by this instantiation");
                         } else if constexpr (std::is_enum_v<Leaf>) {
                             for (const auto enumerator : mmltk::frameworks::reflection::enum_entries<Leaf>())
                                 maximum_bytes = std::max(maximum_bytes, enumerator.name.size());
                         }
-                        fields << "Leaf { maximum_bytes: " << maximum_bytes
-                               << ", maximum_items: " << fact.constraint.maximum_items << " }";
+                        fields << "Leaf { maximum_bytes: " << maximum_bytes << ", maximum_items: " << fact.constraint.maximum_items << " }";
                     }
                     fields << ",\n";
                 });
@@ -901,8 +915,7 @@ class BindingEmitter final {
         std::ostringstream all;
         schema::Variant<ServerRecord>::Visit([&]<class Alternative>() {
             using Envelope = mmltk::frameworks::serialization::ReflectedVariantEnvelope<ServerRecord, Alternative>;
-            static_assert(Envelope::kind.size() <= 23U,
-                          "native server-record kind exceeds the protocol preflight discriminator bound");
+            static_assert(Envelope::kind.size() <= 23U, "native server-record kind exceeds the protocol preflight discriminator bound");
             const auto variant = rust_identifier(Envelope::kind, true);
             symbols_.Reserve("enum ServerRecordKind", variant, "native server record " + std::string(Envelope::kind));
             alternatives << variant << ",\n";
@@ -926,26 +939,37 @@ class BindingEmitter final {
         });
         symbols_.Reserve("module", "ServerRecordKind", "canonical server record discriminator");
         output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ServerRecordKind {\n"
-                << alternatives.str() << "}\nimpl ServerRecordKind {\n"
-                   "pub const ALL: [Self; " << std::variant_size_v<ServerRecord> << "] = [" << all.str() << "];\n"
-                   "pub fn parse(kind: &[u8]) -> Option<Self> { match kind {\n" << parsers.str() << "_ => None, } }\n"
-                   "pub fn wire_name(self) -> &'static str { match self {\n" << names.str() << "} }\n"
-                   "pub fn reflected_preflight(self) -> Option<ReflectedRecordPath> { match self {\n" << roots.str() << "} } }\n";
+                << alternatives.str()
+                << "}\nimpl ServerRecordKind {\n"
+                   "pub const ALL: [Self; "
+                << std::variant_size_v<ServerRecord> << "] = [" << all.str()
+                << "];\n"
+                   "pub fn parse(kind: &[u8]) -> Option<Self> { match kind {\n"
+                << parsers.str()
+                << "_ => None, } }\n"
+                   "pub fn wire_name(self) -> &'static str { match self {\n"
+                << names.str()
+                << "} }\n"
+                   "pub fn reflected_preflight(self) -> Option<ReflectedRecordPath> { match self {\n"
+                << roots.str() << "} } }\n";
         symbols_.Reserve("module", "ReflectedRecordPath", "canonical server record preflight");
         output_ << "#[derive(Clone, Copy)]\npub enum ReflectedRecordPath {\n";
-        for (const auto& [name, entry] : records) output_ << name << ",\n";
+        for (const auto& [name, entry] : records)
+            output_ << name << ",\n";
         output_ << "Leaf { maximum_bytes: usize, maximum_items: usize } }\n"
                    "impl ReflectedRecordPath { pub fn max_collection_items(self) -> usize { match self {\n";
-        for (const auto& [name, entry] : records) output_ << "Self::" << name << " => " << entry.count << ",\n";
+        for (const auto& [name, entry] : records)
+            output_ << "Self::" << name << " => " << entry.count << ",\n";
         output_ << "Self::Leaf { maximum_items, .. } => maximum_items, } }\n"
                    "pub fn max_key_bytes(self) -> usize { match self {\n";
-        for (const auto& [name, entry] : records) output_ << "Self::" << name << " => " << entry.key_bytes << ",\n";
+        for (const auto& [name, entry] : records)
+            output_ << "Self::" << name << " => " << entry.key_bytes << ",\n";
         output_ << "Self::Leaf { .. } => 0, } }\n"
                    "pub fn max_leaf_bytes(self) -> usize { match self { Self::Leaf { maximum_bytes, .. } => maximum_bytes, _ => 0 } }\n"
                    "pub fn map_child(self, key: &[u8]) -> Self { match self {\n";
         for (const auto& [name, entry] : records)
-            output_ << "Self::" << name << " => match key {\n" << entry.fields
-                    << "_ => Self::Leaf { maximum_bytes: 0, maximum_items: 0 }, },\n";
+            output_ << "Self::" << name << " => match key {\n"
+                    << entry.fields << "_ => Self::Leaf { maximum_bytes: 0, maximum_items: 0 }, },\n";
         output_ << "leaf => leaf, } } }\n";
     }
 
@@ -981,14 +1005,14 @@ class BindingEmitter final {
                              "endpoint encoder " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name));
             if constexpr (Endpoint::interaction) {
                 output_ << "pub fn " << function << "(request: " << rust_type<typename Endpoint::request_type>()
-                        << ") -> Result<Interaction, crate::protocol::ProtocolError> { Ok(Interaction { endpoint_id: " << Endpoint::stable_id
-                        << ", replaceable: " << (Endpoint::replaceable ? "true" : "false")
+                        << ") -> Result<Interaction, crate::protocol::ProtocolError> { Ok(Interaction { endpoint_id: "
+                        << Endpoint::stable_id << ", replaceable: " << (Endpoint::replaceable ? "true" : "false")
                         << ", value: crate::protocol::client_records::compact_bytes(&request)? }) }\n";
                 symbols_.Reserve("module", function + "_into", "retained compact endpoint encoder " + std::string(Endpoint::name));
                 output_ << "pub fn " << function << "_into(request: &" << rust_type<typename Endpoint::request_type>()
                         << ", scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "
-                           "crate::protocol::client_records::encode_compact_interaction(" << Endpoint::stable_id
-                        << ", request, scratch, output) }\n";
+                           "crate::protocol::client_records::encode_compact_interaction("
+                        << Endpoint::stable_id << ", request, scratch, output) }\n";
             } else {
                 output_ << "pub fn " << function << "(correlation: u64";
                 if constexpr (Endpoint::signature::has_request) output_ << ", request: " << rust_type<typename Endpoint::request_type>();
@@ -1025,17 +1049,24 @@ class BindingEmitter final {
                     << (std::is_signed_v<std::underlying_type_t<Type>> ? "i64" : "u64") << " = match self {\n";
             for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>()) {
                 output_ << "Self::" << rust_identifier(entry.name, true) << " => ";
-                if constexpr (std::is_signed_v<std::underlying_type_t<Type>>) output_ << static_cast<std::int64_t>(entry.value);
-                else output_ << static_cast<std::uint64_t>(entry.value);
+                if constexpr (std::is_signed_v<std::underlying_type_t<Type>>)
+                    output_ << static_cast<std::int64_t>(entry.value);
+                else
+                    output_ << static_cast<std::uint64_t>(entry.value);
                 output_ << ",\n";
             }
             output_ << "}; crate::protocol::client_records::Compact::compact(&value, bytes) } }\n";
         } else if constexpr (shape == cbor::CompactShape::Object) {
             if (!compact_types_.insert(NativeSource<Type>()).second) return;
             std::size_t count = 0U;
-            VisitRustFields<Type>([&]<class Field, class>(const auto&, const std::string&) { ++count; EmitCompactType<Field>(); });
+            VisitRustFields<Type>([&]<class Field, class>(const auto&, const std::string&) {
+                ++count;
+                EmitCompactType<Field>();
+            });
             output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()
-                    << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { crate::protocol::client_records::compact_head(4, " << count << ", bytes)?;\n";
+                    << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "
+                       "crate::protocol::client_records::compact_head(4, "
+                    << count << ", bytes)?;\n";
             VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
                 if (fact.constraint != mmltk::frameworks::reflection::FieldConstraint{}) {
                     output_ << "(|| -> Result<(), String> {\n";

@@ -99,8 +99,7 @@ spdlog::level::level_enum default_runtime_level() {
 }
 
 void install_logger_locked(const LoggingConfig& config) {
-    const spdlog::level::level_enum runtime_level =
-        config.enabled() ? config.level.value_or(default_runtime_level()) : spdlog::level::off;
+    const spdlog::level::level_enum runtime_level = config.enabled() ? config.level.value_or(default_runtime_level()) : spdlog::level::off;
 
     g_level.store(spdlog::level::off, std::memory_order_relaxed);
     if (g_root_logger != nullptr) {
@@ -199,9 +198,7 @@ LoggingConfig merge(LoggingConfig config, const CliOverrides& overrides) {
 }
 
 void initialize(const LoggingConfig& config) {
-    if (config.enabled() && config.app_name.empty()) {
-        throw std::runtime_error("logging initialization requires a non-empty app name");
-    }
+    if (config.enabled() && config.app_name.empty()) { throw std::runtime_error("logging initialization requires a non-empty app name"); }
     std::lock_guard<std::mutex> lock(g_mutex);
     install_logger_locked(config);
 }

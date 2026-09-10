@@ -113,15 +113,14 @@ int main(const int argument_count, char* const* const arguments) {
         InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U}},
         InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
-        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U,
-                                   .rejection = std::string(kVisualFailureByteCapacity, 'r')},
+        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U, .rejection = std::string(kVisualFailureByteCapacity, 'r')},
                       .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
     };
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {
-            return std::holds_alternative<Alternative>(record);
-        });
+                                      return std::holds_alternative<Alternative>(record);
+                                  });
     });
     if (!complete_record_surface) return EXIT_FAILURE;
     std::ofstream output(arguments[1], std::ios::binary | std::ios::trunc);

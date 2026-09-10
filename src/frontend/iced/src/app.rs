@@ -39,7 +39,10 @@ pub struct App {
 pub fn boot() -> (App, Task<Message>) {
     let config = TransportConfig::from_page();
     crate::presentation_surface::initialize_diagnostics(config.surface_trace, config.pixel_trace);
-    crate::integration_control::initialize_reporting(config.integration, config.integration_pixel_fixture);
+    crate::integration_control::initialize_reporting(
+        config.integration,
+        config.integration_pixel_fixture,
+    );
     let integration = config.integration.then(|| {
         crate::integration_control::Controller::new(
             true,
@@ -86,9 +89,11 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         crate::presentation_surface::subscription()
             .map(presentation::Message::Surface)
             .map(Message::Presentation),
-        app.integration.as_ref().map_or_else(Subscription::none, |integration| {
-            integration.subscription().map(Message::Integration)
-        }),
+        app.integration
+            .as_ref()
+            .map_or_else(Subscription::none, |integration| {
+                integration.subscription().map(Message::Integration)
+            }),
         if app.workspace.active() == crate::generated::FeatureId::Annotate
             && !app.settings.state().open
         {
@@ -114,8 +119,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         } => task = app.on_explore_writable(peer_generation, result),
         Message::Workspace(message) => {
             if let Some(integration) = app.integration.as_ref() {
-                integration
-                    .observe_workspace_message(&message, app.workspace.active());
+                integration.observe_workspace_message(&message, app.workspace.active());
             }
             task = app.on_workspace(message);
         }
@@ -724,7 +728,11 @@ mod tests {
             let (sender, receiver) = Connection::test_channel();
             let mut connection = sender;
             if failure == "capacity" {
-                for _ in 0..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
+                for _ in 0..64 {
+                    connection
+                        .send_renderer_observation(RendererObservation::Ready)
+                        .unwrap();
+                }
             }
             if failure != "disconnected" {
                 app.connection = Some(connection);
@@ -784,7 +792,11 @@ mod tests {
                 .unwrap(),
             crate::transport_connection::SendDisposition::Queued
         );
-        for _ in 1..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
+        for _ in 1..64 {
+            connection
+                .send_renderer_observation(RendererObservation::Ready)
+                .unwrap();
+        }
         app.connection = Some(connection);
         assert!(
             !app.submit_intent(ApplicationIntentEndpoint::DatasetStop, |correlation| {
@@ -846,7 +858,11 @@ mod tests {
                 .unwrap(),
             crate::transport_connection::SendDisposition::Queued
         );
-        for _ in 1..64 { connection.send_renderer_observation(RendererObservation::Ready).unwrap(); }
+        for _ in 1..64 {
+            connection
+                .send_renderer_observation(RendererObservation::Ready)
+                .unwrap();
+        }
         app.connection = Some(connection);
 
         let first = local_annotation_press(&mut app);
@@ -931,12 +947,29 @@ mod tests {
             crate::generated::AnnotationPointerPhase::Update,
             2,
         ));
-        for sequence in 3..=130 { app.submit_annotation_pointer(annotation_pointer(if sequence == 130 { crate::generated::AnnotationPointerPhase::End } else { crate::generated::AnnotationPointerPhase::Update }, sequence)); }
+        for sequence in 3..=130 {
+            app.submit_annotation_pointer(annotation_pointer(
+                if sequence == 130 {
+                    crate::generated::AnnotationPointerPhase::End
+                } else {
+                    crate::generated::AnnotationPointerPhase::Update
+                },
+                sequence,
+            ));
+        }
         assert!(app.connection.is_some());
         let mut receiver = receiver;
         let mut batches = 0;
-        while let Ok(record) = receiver.try_recv() { if let crate::transport_connection::CapturedRecord::Other(envelope) = record { assert_eq!(envelope.kind, "Interaction"); batches += 1; } }
-        assert_eq!(batches, 2, "all remaining samples await consumption credits");
+        while let Ok(record) = receiver.try_recv() {
+            if let crate::transport_connection::CapturedRecord::Other(envelope) = record {
+                assert_eq!(envelope.kind, "Interaction");
+                batches += 1;
+            }
+        }
+        assert_eq!(
+            batches, 2,
+            "all remaining samples await consumption credits"
+        );
         drop(receiver);
     }
 

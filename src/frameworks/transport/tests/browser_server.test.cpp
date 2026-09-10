@@ -86,7 +86,7 @@ TEST_CASE("browser output epochs keep Bootstrap first on attach and reconnect", 
     CHECK_FALSE(epoch.admits(false));
     REQUIRE(publish(true, std::byte{0x11}) == BrowserRecordPush::Enqueued);
     epoch.finish_open(1U);
-    require_markers({std::byte{0x11}}); // Accepted socket copy precedes activation, including backpressure.
+    require_markers({std::byte{0x11}});  // Accepted socket copy precedes activation, including backpressure.
     REQUIRE(ring.push({.bytes = {std::byte{0x14}}, .priority = BrowserRecordPriority::Progress}) == BrowserRecordPush::Enqueued);
     REQUIRE(publish_diagnostic(std::byte{0x12}) == BrowserRecordPush::Enqueued);
     REQUIRE(publish_worker(std::byte{0x13}) == BrowserRecordPush::Enqueued);

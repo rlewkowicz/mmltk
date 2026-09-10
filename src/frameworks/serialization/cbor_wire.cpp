@@ -602,9 +602,7 @@ std::expected<std::string, DecodeError> Reader::read_object_key(const std::size_
     return std::move(*key);
 }
 
-std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::size_t depth) {
-    return borrow_string_item(depth, 2U);
-}
+std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::size_t depth) { return borrow_string_item(depth, 2U); }
 
 std::expected<ByteSegments, DecodeError> Reader::borrow_string_item(const std::size_t depth, const std::uint8_t major) {
     auto head = item_head(depth);

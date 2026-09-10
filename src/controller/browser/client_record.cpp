@@ -120,7 +120,8 @@ std::optional<InteractionView> decode_interaction_view(const std::span<const std
     wire::Reader reader({.first = bytes}, decoding_limits({.first = bytes}));
     InteractionView result;
     if (!result.Decode<ClientRecord>(reader) || result.Get<&Interaction::protocol_version>() != kBrowserProtocolVersion ||
-        result.Get<&Interaction::endpoint_id>() == 0U) return std::nullopt;
+        result.Get<&Interaction::endpoint_id>() == 0U)
+        return std::nullopt;
     return result;
 }
 

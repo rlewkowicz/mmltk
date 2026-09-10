@@ -312,7 +312,8 @@ template <std::meta::info Member>
     });
     constexpr bool numeric = std::is_arithmetic_v<MemberType> && !std::is_same_v<MemberType, bool>;
     constexpr bool dynamic_value = kBoundedDynamicLeaf<MemberType>;
-    constexpr bool minimum_byte_bounded = std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
+    constexpr bool minimum_byte_bounded =
+        std::is_same_v<MemberType, std::string> || std::is_same_v<MemberType, std::filesystem::path> || kByteSequence<MemberType>;
     constexpr bool byte_bounded = minimum_byte_bounded || dynamic_value;
     constexpr bool item_bounded = (requires(const MemberType& value) {
                                       typename MemberType::value_type;
@@ -609,9 +610,9 @@ template <class Value>
         if (constraint.maximum_bytes != 0U && value.size() > constraint.maximum_bytes) return Violation::TooManyBytes;
         return satisfies_item_count(value, constraint) ? std::nullopt : std::optional{Violation::TooManyItems};
     } else if constexpr (requires {
-                      typename V::value_type;
-                      value.size();
-                  } && !std::is_same_v<V, std::string> && !std::is_same_v<V, std::filesystem::path>) {
+                             typename V::value_type;
+                             value.size();
+                         } && !std::is_same_v<V, std::string> && !std::is_same_v<V, std::filesystem::path>) {
         return satisfies_item_count(value, constraint) ? std::nullopt : std::optional{Violation::TooManyItems};
     } else if constexpr (std::is_same_v<V, std::string>) {
         if (value.size() < constraint.minimum_bytes) return Violation::TooFewBytes;

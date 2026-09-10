@@ -6,7 +6,9 @@ impl App {
         outcome: crate::view::annotation::Outcome,
     ) -> Task<Message> {
         match outcome {
-            crate::view::annotation::Outcome::InputFailed(error) => { self.retire_peer(UiError::transport(error.to_string())); }
+            crate::view::annotation::Outcome::InputFailed(error) => {
+                self.retire_peer(UiError::transport(error.to_string()));
+            }
             crate::view::annotation::Outcome::ShortcutRequested(shortcut) => {
                 return iced::widget::operation::is_focused(
                     crate::generated::constraint_uiannotationbrushradius()
@@ -152,7 +154,14 @@ impl App {
             ));
             return;
         };
-        let result = connection.send_annotation_pointer(pointer, self.model.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch));
+        let result = connection.send_annotation_pointer(
+            pointer,
+            self.model
+                .annotation
+                .snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.inputdocumentepoch),
+        );
         if let Err(error) = result {
             self.retire_peer(UiError::transport(error.to_string()));
         }

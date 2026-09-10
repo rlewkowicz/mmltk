@@ -37,7 +37,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (result.outcome == AnnotationOperationOutcome::Applied) {
             crop_ = crop;
             source_ = source;
-            for (auto& geometry : geometry_) geometry.scene_revision = 0U;
+            for (auto& geometry : geometry_)
+                geometry.scene_revision = 0U;
         }
         return result;
     }
@@ -60,7 +61,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             return AnnotationPointerResult{
                 .detail = std::move(result.detail),
                 .outcome = result.outcome == document::DocumentOutcome::Applied ? AnnotationOperationOutcome::Applied
-                                                                              : AnnotationOperationOutcome::Rejected,
+                                                                                : AnnotationOperationOutcome::Rejected,
                 .ui_changed = document_.ui().scene_revision != before,
             };
         };
@@ -121,11 +122,14 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
                 const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
         auto stream = reinterpret_cast<cudaStream_t>(stream_value);
-        cudaError_t status = source.valid() ? cudaMemcpy2DAsync(
-            reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
-            reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
-            // CLEANUP-IGNORE: Annotation copies its private source before semantic rendering.
-            source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height, cudaMemcpyDeviceToDevice, stream) : cudaSuccess;
+        cudaError_t status =
+            source.valid()
+                ? cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
+                                    reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
+                                    // CLEANUP-IGNORE: Annotation copies its private source before semantic rendering.
+                                    source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
+                                    cudaMemcpyDeviceToDevice, stream)
+                : cudaSuccess;
         if (status == cudaSuccess)
             status = cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data), semantic.descriptor.pitch_bytes, 0,
                                        semantic.descriptor.row_bytes(), semantic.descriptor.height, stream);
@@ -233,7 +237,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             palette_source_ = scene.palette;
             for (std::size_t index = 0U; index < scene.categories.size(); ++index)
                 raster::detail::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value,
-                                                palette_[index].r, palette_[index].g, palette_[index].b);
+                                                  palette_[index].r, palette_[index].g, palette_[index].b);
         }
         for (std::size_t index = 0; index < document_.RenderObjectCount(); ++index) {
             const auto& object = document_.RenderObjectAt(index);
@@ -266,12 +270,12 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 draw_status = raster::raster_skeleton_rgba(
                     {overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream});
             if (draw_status != 0) throw std::runtime_error("Annotation geometry rendering failed");
-            if (geometry.handles &&
-                raster::raster_points_rgba({overlay,
-                                            {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
-                                            4,
-                                            {color.r, color.g, color.b, 255},
-                                            native_stream}) != 0)
+            if (geometry.handles && raster::raster_points_rgba(
+                                        {overlay,
+                                         {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
+                                         4,
+                                         {color.r, color.g, color.b, 255},
+                                         native_stream}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
             if (document_.ui().editor.selected_object == index &&

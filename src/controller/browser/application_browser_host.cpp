@@ -15,7 +15,8 @@ namespace mmltk::controller::browser {
 namespace {
 
 namespace transport = mmltk::frameworks::transport;
-inline constexpr auto kInputProgressWireCapacity = mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<std::variant<InputProgress>>();
+inline constexpr auto kInputProgressWireCapacity =
+    mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<std::variant<InputProgress>>();
 
 [[nodiscard]] constexpr transport::BrowserRecordPriority priority(const contracts::reflection::EventDelivery delivery) noexcept {
     return delivery != contracts::reflection::EventDelivery::Transient ? transport::BrowserRecordPriority::Critical
@@ -66,13 +67,16 @@ struct ApplicationBrowserHost::Impl final {
 
     [[nodiscard]] bool publish_record(const ServerRecord& record, const transport::BrowserRecordPriority record_priority) noexcept {
         try {
-            auto encoded = record_priority == transport::BrowserRecordPriority::Progress ? server->acquire_progress_storage() : wire::ByteBuffer{};
-            encoded.reserve(record_priority == transport::BrowserRecordPriority::Progress ? kInputProgressWireCapacity : kMaxIntentValueBytes);
+            auto encoded =
+                record_priority == transport::BrowserRecordPriority::Progress ? server->acquire_progress_storage() : wire::ByteBuffer{};
+            encoded.reserve(record_priority == transport::BrowserRecordPriority::Progress ? kInputProgressWireCapacity
+                                                                                          : kMaxIntentValueBytes);
             const auto encoding = [&]() -> std::expected<void, RecordCodecError> {
                 if (record_priority != transport::BrowserRecordPriority::Progress) return encode_server_record(record, encoded);
                 encoded.resize(kInputProgressWireCapacity);
                 mmltk::frameworks::serialization::FixedCborEncoder writer(encoded);
-                if (!mmltk::frameworks::serialization::encode_fixed(writer, record)) return std::unexpected(RecordCodecError{writer.error()});
+                if (!mmltk::frameworks::serialization::encode_fixed(writer, record))
+                    return std::unexpected(RecordCodecError{writer.error()});
                 encoded.resize(writer.size());
                 return {};
             }();
@@ -136,7 +140,8 @@ struct ApplicationBrowserHost::Impl final {
                 std::uint64_t epoch;
                 {
                     std::scoped_lock lock(input_mutex);
-                    if (input_epoch == std::numeric_limits<std::uint64_t>::max()) throw contracts::UnavailableError("input epoch exhausted");
+                    if (input_epoch == std::numeric_limits<std::uint64_t>::max())
+                        throw contracts::UnavailableError("input epoch exhausted");
                     epoch = ++input_epoch;
                     consumed_sequence = 0U;
                     input_active = true;
@@ -154,14 +159,19 @@ struct ApplicationBrowserHost::Impl final {
         auto* installed = systems.load(std::memory_order_acquire);
         if (!admission.load(std::memory_order_acquire) || !installed) return;
         std::uint64_t epoch;
-        { std::scoped_lock lock(input_mutex); epoch = input_epoch; }
+        {
+            std::scoped_lock lock(input_mutex);
+            epoch = input_epoch;
+        }
         try {
-                if (installed->annotation) installed->annotation->SetInputPeer(epoch, [this](AnnotationInputProgress value) {
+            if (installed->annotation)
+                installed->annotation->SetInputPeer(epoch, [this](AnnotationInputProgress value) {
                     std::scoped_lock progress_lock(input_mutex);
                     if (value.epoch != input_epoch || !input_active) return;
                     consumed_sequence = value.consumed_sequence;
                     InputProgress progress{.progress = std::move(value)};
-                    (void)publish_record(progress, progress.progress.rejection ? transport::BrowserRecordPriority::Critical : transport::BrowserRecordPriority::Progress);
+                    (void)publish_record(progress, progress.progress.rejection ? transport::BrowserRecordPriority::Critical
+                                                                               : transport::BrowserRecordPriority::Progress);
                 });
         } catch (...) { continuity_lost(); }
     }
@@ -300,8 +310,9 @@ struct ApplicationBrowserHost::Impl final {
             const auto& error = result.error.value();
             if (result.endpoint_id == application_stable_id("annotation", "Input")) {
                 std::scoped_lock lock(input_mutex);
-                (void)publish_record(InputProgress{.progress = {.epoch = input_epoch, .consumed_sequence = consumed_sequence}, .error = error},
-                                     transport::BrowserRecordPriority::Critical);
+                (void)publish_record(
+                    InputProgress{.progress = {.epoch = input_epoch, .consumed_sequence = consumed_sequence}, .error = error},
+                    transport::BrowserRecordPriority::Critical);
             } else {
                 (void)publish_record(InteractionRejected{.endpoint_id = result.endpoint_id, .error = error},
                                      transport::BrowserRecordPriority::Critical);
@@ -351,7 +362,10 @@ struct ApplicationBrowserHost::Impl final {
         return static_cast<Impl*>(context)->record(bytes);
     }
     void closed() noexcept {
-        { std::scoped_lock lock(input_mutex); input_active = false; }
+        {
+            std::scoped_lock lock(input_mutex);
+            input_active = false;
+        }
         if (!admission.load(std::memory_order_acquire)) return;
         auto* installed = systems.load(std::memory_order_acquire);
         if (installed != nullptr && installed->annotation != nullptr) installed->annotation->PeerClosed();

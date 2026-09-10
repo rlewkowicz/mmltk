@@ -90,9 +90,8 @@ class ApplicationSystemStorage final {
     // CLEANUP-ON
 };
 
-[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&,
-                                                                                         UpscaleSystem&,
-                                                                                         ApplicationSystemStorage::ContinuitySink = {},
-                                                                                         std::function<void(PresentationSourceIdentity)> = {});
+[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(
+    ApplicationSystemStorage::EventSink&, UpscaleSystem&, ApplicationSystemStorage::ContinuitySink = {},
+    std::function<void(PresentationSourceIdentity)> = {});
 
 }  // namespace mmltk::controller::shell

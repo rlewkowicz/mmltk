@@ -2,9 +2,9 @@ use std::fmt;
 
 use crate::application_codec::Value;
 use crate::generated::{
-    MAX_ERROR_DETAIL_BYTES, MAX_INTENT_VALUE_BYTES, ReflectedRecordPath, ServerRecordKind, MAX_INTENT_VALUE_DEPTH, MAX_INTENT_VALUE_ITEMS,
+    MAX_ERROR_DETAIL_BYTES, MAX_INTENT_VALUE_BYTES, MAX_INTENT_VALUE_DEPTH, MAX_INTENT_VALUE_ITEMS,
     MAX_OUTPUT_VALUE_BYTES, MAX_OUTPUT_VALUE_ITEMS, MAX_RECORD_WIRE_BYTES, MAX_SNAPSHOT_COUNT,
-    SYSTEM_EVENT_FIELD_COUNT,
+    ReflectedRecordPath, SYSTEM_EVENT_FIELD_COUNT, ServerRecordKind,
 };
 
 #[derive(Clone, Copy)]
@@ -118,17 +118,20 @@ fn preflight_protocol_record(bytes: &[u8]) -> Result<(), ProtocolError> {
     let kind = bytes
         .get(KIND_PREFIX.len() + 1..KIND_PREFIX.len() + 1 + kind_length)
         .ok_or_else(|| ProtocolError("truncated browser protocol record kind".into()))?;
-    let record = match ServerRecordKind::parse(kind) {
-        Some(kind) => match kind {
-            ServerRecordKind::Bootstrap => RecordKind::Bootstrap,
-            ServerRecordKind::IntentReply => RecordKind::IntentReply,
-            ServerRecordKind::SystemEvent => RecordKind::SystemEvent,
-            ServerRecordKind::InputProgress | ServerRecordKind::InteractionRejected => {
-                RecordKind::Reflected(kind.reflected_preflight().ok_or_else(|| ProtocolError("missing reflected server preflight".into()))?)
-            }
-        },
-        None => RecordKind::Unknown,
-    };
+    let record =
+        match ServerRecordKind::parse(kind) {
+            Some(kind) => match kind {
+                ServerRecordKind::Bootstrap => RecordKind::Bootstrap,
+                ServerRecordKind::IntentReply => RecordKind::IntentReply,
+                ServerRecordKind::SystemEvent => RecordKind::SystemEvent,
+                ServerRecordKind::InputProgress | ServerRecordKind::InteractionRejected => {
+                    RecordKind::Reflected(kind.reflected_preflight().ok_or_else(|| {
+                        ProtocolError("missing reflected server preflight".into())
+                    })?)
+                }
+            },
+            None => RecordKind::Unknown,
+        };
     ciborium_walk_complete_item(bytes, PROTOCOL_ITEM_BUDGET, PreflightPath::Envelope(record))
 }
 
@@ -161,7 +164,9 @@ impl PreflightPath {
             Self::Envelope(_) => 2,
             Self::Payload(RecordKind::Bootstrap) => 4,
             Self::Payload(RecordKind::IntentReply) => 4,
-            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => path.max_collection_items(),
+            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => {
+                path.max_collection_items()
+            }
             Self::Payload(RecordKind::SystemEvent) => SYSTEM_EVENT_FIELD_COUNT,
             Self::BootstrapSnapshots => MAX_SNAPSHOT_COUNT,
             Self::BootstrapSnapshot | Self::ReplyError => 2,
@@ -175,7 +180,9 @@ impl PreflightPath {
     fn max_leaf_bytes(self) -> usize {
         match self {
             Self::ReplyErrorDetail => MAX_ERROR_DETAIL_BYTES,
-            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => path.max_leaf_bytes(),
+            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => {
+                path.max_leaf_bytes()
+            }
             Self::BootstrapSnapshotValue | Self::OrdinaryDynamic => MAX_OUTPUT_VALUE_BYTES,
             _ => MAX_INTENT_VALUE_BYTES,
         }
@@ -183,7 +190,9 @@ impl PreflightPath {
 
     fn max_key_bytes(self) -> usize {
         match self {
-            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => path.max_key_bytes(),
+            Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path) => {
+                path.max_key_bytes()
+            }
             _ => self.max_leaf_bytes(),
         }
     }
@@ -204,7 +213,9 @@ impl PreflightPath {
             (Self::Payload(RecordKind::IntentReply), b"result") => Self::OrdinaryDynamic,
             (Self::Payload(RecordKind::IntentReply), b"error") => Self::ReplyError,
             (Self::ReplyError, b"detail") => Self::ReplyErrorDetail,
-            (Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path), key) => Self::Reflected(path.map_child(key)),
+            (Self::Payload(RecordKind::Reflected(path)) | Self::Reflected(path), key) => {
+                Self::Reflected(path.map_child(key))
+            }
             (Self::Payload(RecordKind::SystemEvent), b"value") => Self::OrdinaryDynamic,
             (Self::BootstrapSnapshotValue | Self::OrdinaryDynamic, _) => Self::OrdinaryDynamic,
             _ => Self::Other,

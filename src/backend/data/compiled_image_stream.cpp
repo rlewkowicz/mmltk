@@ -378,15 +378,14 @@ CompiledImageStream::~CompiledImageStream() {
                     try {
                         std::rethrow_exception(failure);
                     } catch (const std::exception& error) {
-                        log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}", retention_->state->config.device,
-                                     error.what());
+                        log.critical("compiled image stream retained unsafe CUDA resources on device {}: {}",
+                                     retention_->state->config.device, error.what());
                     } catch (...) { log.critical("compiled image stream retained unsafe CUDA resources after an unknown failure"); }
                 });
                 return;
             }
         } catch (...) {}
-        mmltk::common::io::write_all_noexcept(STDERR_FILENO,
-            "fatal: compiled image stream retained unsafe CUDA resources\n");
+        mmltk::common::io::write_all_noexcept(STDERR_FILENO, "fatal: compiled image stream retained unsafe CUDA resources\n");
     }
 }
 void CompiledImageStream::close() {

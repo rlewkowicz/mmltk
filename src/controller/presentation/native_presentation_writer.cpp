@@ -136,9 +136,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     Retirement BrowserPeerLost() noexcept override {
         if (ready_span_) ready_span_->Finish(contracts::DiagnosticSpanOutcome::Exception);
         if (release_span_) release_span_->Finish(contracts::DiagnosticSpanOutcome::Exception);
-        if (terminal_retired_)
-            return {.all_released = terminal_release_succeeded_,
-                    .safe_to_destroy = !NeedsSettlement()};
+        if (terminal_retired_) return {.all_released = terminal_release_succeeded_, .safe_to_destroy = !NeedsSettlement()};
         bool context_bound = true;
         try {
             context_.Bind();
@@ -147,8 +145,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         channel_.reset_peer();
         browser_terminal_ = true;
         terminal_release_succeeded_ = RetirePhysical() && context_bound;
-        return {.all_released = terminal_release_succeeded_,
-                .safe_to_destroy = !NeedsSettlement()};
+        return {.all_released = terminal_release_succeeded_, .safe_to_destroy = !NeedsSettlement()};
     }
 
    private:
@@ -173,12 +170,15 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         // callback submission reports a failure from earlier asynchronous work.
         completion_settlement_pending_ = true;
         // Unlike a host function, this callback also wakes on device failure.
-        return cudaStreamAddCallback(stream, [](cudaStream_t, const cudaError_t status, void* context) {
-                auto& completion = *static_cast<Completion*>(context);
-                completion.status = status;
-                completion.ready.store(true, std::memory_order_release);
-                static_cast<void>(mmltk::common::io::signal_event_fd(completion.fd));
-            }, std::addressof(signal), 0U) == cudaSuccess;
+        return cudaStreamAddCallback(
+                   stream,
+                   [](cudaStream_t, const cudaError_t status, void* context) {
+                       auto& completion = *static_cast<Completion*>(context);
+                       completion.status = status;
+                       completion.ready.store(true, std::memory_order_release);
+                       static_cast<void>(mmltk::common::io::signal_event_fd(completion.fd));
+                   },
+                   std::addressof(signal), 0U) == cudaSuccess;
     }
 
     void DrainCompletion() {
@@ -627,10 +627,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         // The worker publishes its exact metadata when completion wakes it.
         allocation.timeline->SignalReady(stream, ready);
         if (diagnostics_.valid())
-            ready_span_.emplace(diagnostics_, [&] {
-                return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation),
-                                                  VisualDiagnosticOperation::PresentationReadySyncCompleted);
-            }, allocation.latest->diagnostic_link);
+            ready_span_.emplace(
+                diagnostics_,
+                [&] {
+                    return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReadySyncStarted, allocation),
+                                                      VisualDiagnosticOperation::PresentationReadySyncCompleted);
+                },
+                allocation.latest->diagnostic_link);
         transfer_target_ = std::addressof(allocation);
         if (!EnqueueCompletion(stream, completion_)) throw std::runtime_error("presentation completion submission failed");
         return ready;
@@ -654,10 +657,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (written != static_cast<ssize_t>(sizeof(edge))) throw std::runtime_error("presentation frame edge publication failed");
         DiagnoseAllocation(VisualDiagnosticOperation::PresentationFrameEdge, allocation, ready);
         if (diagnostics_.valid())
-            release_span_.emplace(diagnostics_, [&] {
-                return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, allocation),
-                                                  VisualDiagnosticOperation::PresentationReleaseWaitCompleted);
-            }, allocation.latest->diagnostic_link);
+            release_span_.emplace(
+                diagnostics_,
+                [&] {
+                    return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationReleaseWaitStarted, allocation),
+                                                      VisualDiagnosticOperation::PresentationReleaseWaitCompleted);
+                },
+                allocation.latest->diagnostic_link);
         auto stream = reinterpret_cast<cudaStream_t>(stream_.native_handle());
         allocation.timeline->WaitForRelease(stream, ready + 1U);
         release_wait_pending_ = true;

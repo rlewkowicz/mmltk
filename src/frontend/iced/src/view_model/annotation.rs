@@ -12,17 +12,25 @@ impl AnnotationModel {
         mut incoming: crate::generated::AnnotationSnapshot,
     ) -> Result<Observation, UiError> {
         if incoming.uirevision > incoming.revision {
-            return Err(UiError::protocol("invalid Annotation full-state UI revision"));
+            return Err(UiError::protocol(
+                "invalid Annotation full-state UI revision",
+            ));
         }
-        if self.snapshot.as_ref().is_some_and(|installed| installed.revision == incoming.revision && *installed != incoming) {
-            return Err(UiError::protocol("inconsistent Annotation snapshot revision"));
+        if self.snapshot.as_ref().is_some_and(|installed| {
+            installed.revision == incoming.revision && *installed != incoming
+        }) {
+            return Err(UiError::protocol(
+                "inconsistent Annotation snapshot revision",
+            ));
         }
         let mut keep_pending = false;
         if let Some(frame) = self.pending_frame.as_ref() {
             if frame.revision == incoming.revision
                 && (frame.uirevision != incoming.uirevision || frame.frame != incoming.frame)
             {
-                return Err(UiError::protocol("inconsistent Annotation frame and full-state revision"));
+                return Err(UiError::protocol(
+                    "inconsistent Annotation frame and full-state revision",
+                ));
             }
             if frame.revision > incoming.revision {
                 if frame.uirevision == incoming.uirevision {
@@ -34,9 +42,15 @@ impl AnnotationModel {
             }
         }
         let observation = match self.snapshot.as_ref() {
-            Some(installed) if incoming.revision < installed.revision => return Ok(Observation::Stale),
-            Some(installed) if incoming.revision == installed.revision && incoming != *installed => {
-                return Err(UiError::protocol("inconsistent Annotation snapshot revision"));
+            Some(installed) if incoming.revision < installed.revision => {
+                return Ok(Observation::Stale);
+            }
+            Some(installed)
+                if incoming.revision == installed.revision && incoming != *installed =>
+            {
+                return Err(UiError::protocol(
+                    "inconsistent Annotation snapshot revision",
+                ));
             }
             Some(installed) if incoming == *installed => Observation::Current,
             _ => {
@@ -44,7 +58,9 @@ impl AnnotationModel {
                 Observation::Installed
             }
         };
-        if !keep_pending { self.pending_frame = None; }
+        if !keep_pending {
+            self.pending_frame = None;
+        }
         Ok(observation)
     }
 
@@ -57,22 +73,31 @@ impl AnnotationModel {
         }
         if let Some(pending) = self.pending_frame.as_ref() {
             if pending.revision == incoming.revision && *pending != incoming {
-                return Err(UiError::protocol("inconsistent pending Annotation frame revision"));
+                return Err(UiError::protocol(
+                    "inconsistent pending Annotation frame revision",
+                ));
             }
         }
         if let Some(installed) = self.snapshot.as_mut() {
             if incoming.revision == installed.revision {
-                return if incoming.uirevision == installed.uirevision && incoming.frame == installed.frame {
+                return if incoming.uirevision == installed.uirevision
+                    && incoming.frame == installed.frame
+                {
                     Ok(Observation::Current)
                 } else {
                     Err(UiError::protocol("inconsistent Annotation frame revision"))
                 };
             }
-            if incoming.revision < installed.revision || incoming.uirevision < installed.uirevision {
+            if incoming.revision < installed.revision || incoming.uirevision < installed.uirevision
+            {
                 return Ok(Observation::Stale);
             }
             if incoming.uirevision == installed.uirevision {
-                if self.pending_frame.as_ref().is_some_and(|pending| pending.revision <= incoming.revision) {
+                if self
+                    .pending_frame
+                    .as_ref()
+                    .is_some_and(|pending| pending.revision <= incoming.revision)
+                {
                     self.pending_frame = None;
                 }
                 installed.revision = incoming.revision;
@@ -80,7 +105,11 @@ impl AnnotationModel {
                 return Ok(Observation::Installed);
             }
         }
-        if self.pending_frame.as_ref().is_some_and(|pending| pending.revision > incoming.revision) {
+        if self
+            .pending_frame
+            .as_ref()
+            .is_some_and(|pending| pending.revision > incoming.revision)
+        {
             return Ok(Observation::Stale);
         }
         self.pending_frame = Some(incoming);
@@ -122,7 +151,9 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
                 if self.presentation_model.foreground()
                     == Some(crate::generated::PresentationSourceKind::Annotation)
                 {
-                    self.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Annotation));
+                    self.set_foreground_visual(Some(
+                        crate::generated::PresentationSourceKind::Annotation,
+                    ));
                 }
             }
             Ok(Observation::Current | Observation::Stale) => {}
