@@ -99,8 +99,8 @@ class DiagnosticsProducer final {
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit_terminal_encoded(DiagnosticRecord record) const noexcept;
         using EncodedBatchWriter = bool (*)(void*, std::size_t, std::span<char>, std::size_t&) noexcept;
-        [[nodiscard]] DiagnosticSubmitResult submit_encoded_batch(std::size_t count, void* context,
-                                                                      EncodedBatchWriter writer, bool complete) const noexcept;
+        [[nodiscard]] DiagnosticSubmitResult submit_encoded_batch(std::size_t count, void* context, EncodedBatchWriter writer,
+                                                                  bool complete) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit_encoded(DiagnosticRecord record, bool complete) const noexcept {
             return submit(record, complete, false);
         }

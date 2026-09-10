@@ -16,7 +16,8 @@ namespace {
 TEST_CASE("browser output ring has exactly sixty-four FIFO records", "[frameworks][transport][browser]") {
     BrowserRecordRing ring;
     for (std::size_t index = 0U; index < kBrowserRecordRingCapacity; ++index)
-        REQUIRE(ring.push({.bytes = {static_cast<std::byte>(index)}, .priority = BrowserRecordPriority::Transient}) == BrowserRecordPush::Enqueued);
+        REQUIRE(ring.push({.bytes = {static_cast<std::byte>(index)}, .priority = BrowserRecordPriority::Transient}) ==
+                BrowserRecordPush::Enqueued);
     CHECK(ring.size() == kBrowserRecordRingCapacity);
     CHECK(ring.push(record()) == BrowserRecordPush::Dropped);
     CHECK(ring.push(record(BrowserRecordPriority::Critical)) == BrowserRecordPush::ClosePeer);

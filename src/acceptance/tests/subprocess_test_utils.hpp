@@ -58,10 +58,14 @@ namespace {
 
 inline void set_nonblocking(int fd) {
     int flags;
-    do { flags = ::fcntl(fd, F_GETFL, 0); } while (flags < 0 && errno == EINTR);
+    do {
+        flags = ::fcntl(fd, F_GETFL, 0);
+    } while (flags < 0 && errno == EINTR);
     if (flags < 0) { throw std::runtime_error(make_errno_message("fcntl(F_GETFL) failed")); }
     int result;
-    do { result = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK); } while (result < 0 && errno == EINTR);
+    do {
+        result = ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    } while (result < 0 && errno == EINTR);
     if (result < 0) { throw std::runtime_error(make_errno_message("fcntl(F_SETFL) failed")); }
 }
 
@@ -91,7 +95,8 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
 
     std::vector<char*> raw_args;
     raw_args.reserve(args.size() + 1);
-    for (const auto& arg : args) raw_args.push_back(const_cast<char*>(arg.c_str()));
+    for (const auto& arg : args)
+        raw_args.push_back(const_cast<char*>(arg.c_str()));
     raw_args.push_back(nullptr);
 
     std::array<int, 2> stdout_pipe{-1, -1};
@@ -108,7 +113,9 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
         ::close(stderr_pipe[0]);
         const auto duplicate = [](int source, int destination) {
             int result;
-            do { result = ::dup2(source, destination); } while (result < 0 && errno == EINTR);
+            do {
+                result = ::dup2(source, destination);
+            } while (result < 0 && errno == EINTR);
             return result;
         };
         if (duplicate(stdout_pipe[1], STDOUT_FILENO) < 0 || duplicate(stderr_pipe[1], STDERR_FILENO) < 0) {

@@ -34,7 +34,10 @@ TEST_CASE("Registered local storage preserves portable high-water registration",
         REQUIRE(cuCtxPushCurrent(context) == CUDA_SUCCESS);
         bool bound = true;
         mmltk::testsupport::ScopedTestCleanup pop_context{[&] {
-            if (bound) { CUcontext ignored{}; (void)cuCtxPopCurrent(&ignored); }
+            if (bound) {
+                CUcontext ignored{};
+                (void)cuCtxPopCurrent(&ignored);
+            }
         }};
         unsigned flags{};
         REQUIRE(cuMemHostGetFlags(&flags, storage) == CUDA_SUCCESS);

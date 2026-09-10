@@ -112,16 +112,17 @@ struct HighWaterReleaseProbe final {
 
 class CudaBuffer final {
    public:
-    explicit CudaBuffer(const std::size_t bytes = 0U) { if (bytes != 0U) ensure(bytes); }
+    explicit CudaBuffer(const std::size_t bytes = 0U) {
+        if (bytes != 0U) ensure(bytes);
+    }
     void ensure(const std::size_t bytes) {
         const auto retired = allocation_.RetryPending(&cudaFree);
         REQUIRE(retired.failure == cudaSuccess);
         REQUIRE(allocation_.replacement_available());
         if (bytes <= capacity_ && allocation_.active() != nullptr) return;
         const auto next_capacity = std::max<std::size_t>(bytes, 1U);
-        const auto allocated = allocation_.AllocateCandidate([next_capacity](void*& replacement) noexcept {
-            return cudaMalloc(&replacement, next_capacity);
-        });
+        const auto allocated =
+            allocation_.AllocateCandidate([next_capacity](void*& replacement) noexcept { return cudaMalloc(&replacement, next_capacity); });
         REQUIRE(allocated.failure == cudaSuccess);
         const auto promoted = allocation_.PromoteCandidate(&cudaFree);
         REQUIRE(promoted.failure == cudaSuccess);
@@ -140,7 +141,8 @@ class CudaBuffer final {
         ensure(values.size_bytes());
         const auto bytes = std::as_bytes(values);
         if (uploaded_.size() == bytes.size() && std::equal(bytes.begin(), bytes.end(), uploaded_.begin())) return;
-        if (!values.empty()) REQUIRE(cudaMemcpy(allocation_.active(), values.data(), values.size_bytes(), cudaMemcpyHostToDevice) == cudaSuccess);
+        if (!values.empty())
+            REQUIRE(cudaMemcpy(allocation_.active(), values.data(), values.size_bytes(), cudaMemcpyHostToDevice) == cudaSuccess);
         uploaded_.assign(bytes.begin(), bytes.end());
     }
     [[nodiscard]] void* data() const noexcept { return allocation_.active(); }
@@ -240,23 +242,21 @@ struct PixelOracleGeometry final {
 
 class SemanticOracleBuffers final {
    public:
-    [[nodiscard]] SemanticOracleResult RenderDetail(
-        std::span<const ExploreRenderAnnotationDescriptor> annotations,
-        std::span<const mmltk::backend::data::RLEPair> runs,
-        std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
-        mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-        PixelOracleGeometry geometry = {}, bool masks_with_boxes = false);
-    [[nodiscard]] SemanticOracleResult RenderAtlas(
-        std::span<const ExploreRenderAnnotationDescriptor> annotations,
-        std::span<const mmltk::backend::data::RLEPair> runs,
-        std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
-        mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
-        PixelOracleGeometry geometry = {.width = 4U, .height = 2U}, bool masks_with_boxes = false);
+    [[nodiscard]] SemanticOracleResult RenderDetail(std::span<const ExploreRenderAnnotationDescriptor> annotations,
+                                                    std::span<const mmltk::backend::data::RLEPair> runs,
+                                                    std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
+                                                    mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
+                                                    PixelOracleGeometry geometry = {}, bool masks_with_boxes = false);
+    [[nodiscard]] SemanticOracleResult RenderAtlas(std::span<const ExploreRenderAnnotationDescriptor> annotations,
+                                                   std::span<const mmltk::backend::data::RLEPair> runs,
+                                                   std::span<const ExploreRenderClassDescriptor> classes, bool boxes = false,
+                                                   mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure = {},
+                                                   PixelOracleGeometry geometry = {.width = 4U, .height = 2U},
+                                                   bool masks_with_boxes = false);
 
    private:
     void prepare(const std::span<const ExploreRenderAnnotationDescriptor> annotations,
-                 const std::span<const mmltk::backend::data::RLEPair> runs,
-                 const std::span<const ExploreRenderClassDescriptor> classes,
+                 const std::span<const mmltk::backend::data::RLEPair> runs, const std::span<const ExploreRenderClassDescriptor> classes,
                  const std::uint32_t width, const std::uint32_t height, const std::uint32_t extent, const bool blue) {
         annotation_count_ = static_cast<std::uint32_t>(annotations.size());
         run_count_ = static_cast<std::uint32_t>(runs.size());
@@ -308,8 +308,7 @@ class SemanticOracleBuffers final {
     [[nodiscard]] SemanticOracleResult download(CudaBuffer& pixels, const std::size_t pixel_count) {
         readback_.resize(pixel_count);
         readback_alpha_ = 0U;
-        REQUIRE(cudaMemcpyAsync(readback_.data(), pixels.data(), pixel_count * 4U, cudaMemcpyDeviceToHost, stream.get()) ==
-                cudaSuccess);
+        REQUIRE(cudaMemcpyAsync(readback_.data(), pixels.data(), pixel_count * 4U, cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
         REQUIRE(cudaMemcpyAsync(&readback_alpha_, count_.data(), sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream.get()) ==
                 cudaSuccess);
         REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -373,8 +372,8 @@ class SemanticOracleBuffers final {
 [[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderDetail(
     const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
     const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
-    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
-    const PixelOracleGeometry geometry, const bool masks_with_boxes) {
+    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure, const PixelOracleGeometry geometry,
+    const bool masks_with_boxes) {
     const auto kExtent = geometry.extent;
     const std::size_t kPixelCount = kExtent * kExtent;
     prepare(annotations, runs, classes, geometry.width, geometry.height, kExtent, false);
@@ -408,8 +407,8 @@ class SemanticOracleBuffers final {
 [[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderAtlas(
     const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
     const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
-    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure,
-    const PixelOracleGeometry geometry, const bool masks_with_boxes) {
+    const mmltk::backend::models::rfdetr::AugmentationSpatialErasure erasure, const PixelOracleGeometry geometry,
+    const bool masks_with_boxes) {
     namespace raster = mmltk::backend::imaging::raster;
     const auto kSourceWidth = geometry.width;
     const auto kSourceHeight = geometry.height;
@@ -501,19 +500,16 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
                 for (const bool atlas : {false, true}) {
                     CAPTURE(extent, atlas);
                     const auto render = [&](const bool boxes) {
-                        return atlas
-                                   ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure,
-                                                                     geometry, true)
-                                   : oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure, geometry, true);
+                        return atlas ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure, geometry, true)
+                                     : oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes, boxes, plan.erasure, geometry, true);
                     };
                     const auto masks = render(false);
                     const auto combined = render(true);
                     auto hidden_classes = classes;
                     hidden_classes[0].visible = 0U;
-                    const auto hidden = atlas ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, hidden_classes, true,
-                                                                                plan.erasure, geometry, true)
-                                              : oracle.RenderDetail(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure,
-                                                                       geometry, true);
+                    const auto hidden =
+                        atlas ? oracle.RenderAtlas(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure, geometry, true)
+                              : oracle.RenderDetail(std::span{&annotation, 1U}, runs, hidden_classes, true, plan.erasure, geometry, true);
                     const auto image = atlas ? make_explore_contain_rect(width, height, extent)
                                              : decltype(make_explore_contain_rect(width, height, extent)){0, 0, extent, extent};
                     const int left =
@@ -879,8 +875,7 @@ TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition
 
     classes[0].visible = 1U;
     annotation.rle_count = 0U;
-    CHECK(oracle.RenderDetail(std::span{&annotation, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes).nonzero_alpha ==
-          0U);
+    CHECK(oracle.RenderDetail(std::span{&annotation, 1U}, std::span<const mmltk::backend::data::RLEPair>{}, classes).nonzero_alpha == 0U);
     annotation.rle_offset = 1U;
     annotation.rle_count = 1U;
     CHECK(oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes).nonzero_alpha == 0U);

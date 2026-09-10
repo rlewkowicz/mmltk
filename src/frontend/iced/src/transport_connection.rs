@@ -87,11 +87,17 @@ pub struct Connection {
 
 impl Connection {
     pub(crate) fn observe_integration_pressure(&self, sequence: u64) {
-        self.retained.lock().expect("connection output").pressure_observation = Some((sequence, false));
+        self.retained
+            .lock()
+            .expect("connection output")
+            .pressure_observation = Some((sequence, false));
     }
     pub(crate) fn integration_pressure_settled(&self) -> bool {
         let retained = self.retained.lock().expect("connection output");
-        retained.pressure_observation.is_some_and(|(_, entered)| entered) && retained.input.settled()
+        retained
+            .pressure_observation
+            .is_some_and(|(_, entered)| entered)
+            && retained.input.settled()
     }
     pub(crate) fn new(outbound: mpsc::Sender<OutboundRecord>) -> Self {
         Self {
@@ -439,7 +445,11 @@ mod tests {
                 .collect()
         }
 
-        fn assert_samples(&self, samples: &[crate::generated::AnnotationPointer], first_sequence: u64) {
+        fn assert_samples(
+            &self,
+            samples: &[crate::generated::AnnotationPointer],
+            first_sequence: u64,
+        ) {
             let input: Vec<_> = self
                 .wire
                 .iter()
@@ -452,7 +462,9 @@ mod tests {
                 .collect();
             assert_eq!(
                 input.len(),
-                samples.len().div_ceil(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
+                samples
+                    .len()
+                    .div_ceil(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
             );
             for (index, batch) in samples
                 .chunks(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
@@ -469,7 +481,10 @@ mod tests {
                 .unwrap()
                 .encode()
                 .unwrap();
-                assert_eq!(*input[index], expected, "every accepted sample remains ordered");
+                assert_eq!(
+                    *input[index], expected,
+                    "every accepted sample remains ordered"
+                );
             }
         }
 
@@ -606,7 +621,7 @@ mod tests {
             );
         }
         let (sender, _receiver) = mpsc::channel(0);
-        let mut connection = Connection::new(sender);
+        let connection = Connection::new(sender);
         assert!(
             connection
                 .observe(&crate::protocol::ServerRecord::InputProgress(
@@ -638,34 +653,96 @@ mod tests {
                 sample
             })
             .collect();
-        for terminal in [crate::generated::AnnotationPointerPhase::End, crate::generated::AnnotationPointerPhase::Cancel] {
+        for terminal in [
+            crate::generated::AnnotationPointerPhase::End,
+            crate::generated::AnnotationPointerPhase::Cancel,
+        ] {
             let mut fixture = PointerTransport::new();
             fixture.connection.enable_integration(true);
-            assert!(!fixture.connection.integration, "quiet driver constructs no gesture diagnostics");
+            assert!(
+                !fixture.connection.integration,
+                "quiet driver constructs no gesture diagnostics"
+            );
             let mut accepted = samples.clone();
             accepted.last_mut().unwrap().phase = terminal;
             // Exhaust both credits before accepting the terminal edge and tail.
-            for sample in &accepted[..64] { fixture.connection.send_annotation_pointer(sample.clone(), 1).unwrap(); }
+            for sample in &accepted[..64] {
+                fixture
+                    .connection
+                    .send_annotation_pointer(sample.clone(), 1)
+                    .unwrap();
+            }
             fixture.flush();
             assert_eq!(fixture.wire.len(), 2);
-            assert!(!fixture.connection.retained.lock().unwrap().input.pressure_entered());
-            for sample in &accepted[64..] { fixture.connection.send_annotation_pointer(sample.clone(), 1).unwrap(); }
+            assert!(
+                !fixture
+                    .connection
+                    .retained
+                    .lock()
+                    .unwrap()
+                    .input
+                    .pressure_entered()
+            );
+            for sample in &accepted[64..] {
+                fixture
+                    .connection
+                    .send_annotation_pointer(sample.clone(), 1)
+                    .unwrap();
+            }
             fixture.flush();
-            assert_eq!(fixture.wire.len(), 2, "terminal input remains retained under exhausted credits");
-            assert!(fixture.connection.retained.lock().unwrap().input.pressure_entered());
+            assert_eq!(
+                fixture.wire.len(),
+                2,
+                "terminal input remains retained under exhausted credits"
+            );
+            assert!(
+                fixture
+                    .connection
+                    .retained
+                    .lock()
+                    .unwrap()
+                    .input
+                    .pressure_entered()
+            );
             assert!(!fixture.connection.retained.lock().unwrap().input.settled());
-            fixture.connection.send_renderer_observation(RendererObservation::Ready).unwrap();
-            fixture.connection.send_intent(Intent { correlation: 90, endpoint_id: crate::generated::ENDPOINT_Settings_Update, fields: Vec::new() }).unwrap();
-            fixture.connection.send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter, value: vec![7] }).unwrap();
+            fixture
+                .connection
+                .send_renderer_observation(RendererObservation::Ready)
+                .unwrap();
+            fixture
+                .connection
+                .send_intent(Intent {
+                    correlation: 90,
+                    endpoint_id: crate::generated::ENDPOINT_Settings_Update,
+                    fields: Vec::new(),
+                })
+                .unwrap();
+            fixture
+                .connection
+                .send_interaction(Interaction {
+                    replaceable: false,
+                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter,
+                    value: vec![7],
+                })
+                .unwrap();
             fixture.flush();
-            let ordinary: Vec<_> = fixture.decoded().into_iter().skip(2).map(|record| record.kind).collect();
+            let ordinary: Vec<_> = fixture
+                .decoded()
+                .into_iter()
+                .skip(2)
+                .map(|record| record.kind)
+                .collect();
             assert_eq!(ordinary, ["RendererObservation", "Intent", "Interaction"]);
             fixture.credit(1);
             fixture.flush();
             assert_eq!(fixture.wire.len(), 6);
             fixture.credit(3);
             fixture.flush();
-            assert_eq!(fixture.wire.len(), 8, "partial final batch sends immediately");
+            assert_eq!(
+                fixture.wire.len(),
+                8,
+                "partial final batch sends immediately"
+            );
             fixture.assert_samples(&accepted, 1);
             fixture.credit(5);
             fixture.flush();
@@ -673,20 +750,44 @@ mod tests {
             assert_eq!(fixture.wire.len(), 8);
             assert!(fixture.connection.observe(&consumed(6)).is_err());
             fixture.credit(5); // Duplicate cumulative progress consumes no second prefix.
-            let stale = crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
-                protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                progress: crate::generated::AnnotationInputProgress { epoch: 99, consumedsequence: u64::MAX, rejection: Some("old peer failure".into()) },
-                error: Some(crate::protocol::ApplicationError { category: crate::generated::ApplicationErrorCategory::Busy, detail: "old rejection".into() }),
-            });
+            let stale =
+                crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
+                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
+                    progress: crate::generated::AnnotationInputProgress {
+                        epoch: 99,
+                        consumedsequence: u64::MAX,
+                        rejection: Some("old peer failure".into()),
+                    },
+                    error: Some(crate::protocol::ApplicationError {
+                        category: crate::generated::ApplicationErrorCategory::Busy,
+                        detail: "old rejection".into(),
+                    }),
+                });
             fixture.connection.observe(&stale).unwrap();
-            let rejected = crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
-                protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                progress: crate::generated::AnnotationInputProgress { epoch: 1, consumedsequence: 5, rejection: None },
-                error: Some(crate::protocol::ApplicationError { category: crate::generated::ApplicationErrorCategory::Busy, detail: "invalid admission".into() }),
-            });
-            assert!(fixture.connection.observe(&rejected).is_err(), "unidentified rejection is terminal, never a rewind");
+            let rejected =
+                crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
+                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
+                    progress: crate::generated::AnnotationInputProgress {
+                        epoch: 1,
+                        consumedsequence: 5,
+                        rejection: None,
+                    },
+                    error: Some(crate::protocol::ApplicationError {
+                        category: crate::generated::ApplicationErrorCategory::Busy,
+                        detail: "invalid admission".into(),
+                    }),
+                });
+            assert!(
+                fixture.connection.observe(&rejected).is_err(),
+                "unidentified rejection is terminal, never a rewind"
+            );
             fixture.connection.close();
-            assert_eq!(fixture.connection.send_annotation_pointer(accepted[0].clone(), 1), Err(OutboundSendError::Closed));
+            assert_eq!(
+                fixture
+                    .connection
+                    .send_annotation_pointer(accepted[0].clone(), 1),
+                Err(OutboundSendError::Closed)
+            );
         }
         let annotation_snapshot = PointerTransport::annotation_snapshot;
         for endpoint in [
@@ -699,23 +800,28 @@ mod tests {
                 for failed in [false, true] {
                     use crate::application_codec::IntoApplicationValue;
                     let mut fixture = PointerTransport::new();
-                    fixture.connection
+                    fixture
+                        .connection
                         .send_annotation_pointer(samples[0].clone(), 1)
                         .unwrap();
-                    fixture.connection
+                    fixture
+                        .connection
                         .send_intent(Intent {
                             correlation: 17,
                             endpoint_id: endpoint,
                             fields: Vec::new(),
                         })
                         .unwrap();
-                    fixture.connection
+                    fixture
+                        .connection
                         .send_annotation_pointer(samples[0].clone(), 1)
                         .unwrap();
                     fixture.flush();
                     assert_eq!(fixture.wire.len(), 1);
                     assert_eq!(
-                        crate::protocol::decode_envelope(&fixture.wire[0]).unwrap().kind,
+                        crate::protocol::decode_envelope(&fixture.wire[0])
+                            .unwrap()
+                            .kind,
                         "Interaction"
                     );
                     fixture.assert_samples(&samples[..1], 1);
@@ -730,8 +836,14 @@ mod tests {
 
                     let command = crate::protocol::decode_envelope(&fixture.wire[0]).unwrap();
                     assert_eq!(command.kind, "Intent");
-                    assert_eq!(command.payload.field("endpoint_id").unwrap().integer_u64(), Some(endpoint));
-                    assert_eq!(command.payload.field("correlation").unwrap().integer_u64(), Some(17));
+                    assert_eq!(
+                        command.payload.field("endpoint_id").unwrap().integer_u64(),
+                        Some(endpoint)
+                    );
+                    assert_eq!(
+                        command.payload.field("correlation").unwrap().integer_u64(),
+                        Some(17)
+                    );
 
                     let mut snapshot = annotation_snapshot();
                     snapshot.revision = 10;
@@ -778,27 +890,32 @@ mod tests {
                     );
                     fixture.connection.observe(&reply).unwrap();
                     if !event_first {
-                        fixture.connection
+                        fixture
+                            .connection
                             .send_annotation_pointer(samples[1].clone(), 1)
                             .unwrap();
-                        fixture.connection
+                        fixture
+                            .connection
                             .send_intent(Intent {
                                 correlation: 18,
                                 endpoint_id: crate::generated::ENDPOINT_Annotation_Stop,
                                 fields: Vec::new(),
                             })
                             .unwrap();
-                        fixture.connection
+                        fixture
+                            .connection
                             .send_renderer_observation(RendererObservation::Ready)
                             .unwrap();
-                        fixture.connection
+                        fixture
+                            .connection
                             .send_intent(Intent {
                                 correlation: 19,
                                 endpoint_id: crate::generated::ENDPOINT_Settings_Update,
                                 fields: Vec::new(),
                             })
                             .unwrap();
-                        fixture.connection
+                        fixture
+                            .connection
                             .send_interaction(Interaction {
                                 replaceable: false,
                                 endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter,
@@ -811,15 +928,23 @@ mod tests {
                             5,
                             "Stop and ordinary traffic pass the active document barrier"
                         );
-                        let stop = fixture.wire.iter().map(|bytes| crate::protocol::decode_envelope(bytes).unwrap())
-                            .find(|record| record.kind == "Intent" && record.payload.field("correlation").unwrap().integer_u64() == Some(18))
+                        let stop = fixture
+                            .wire
+                            .iter()
+                            .map(|bytes| crate::protocol::decode_envelope(bytes).unwrap())
+                            .find(|record| {
+                                record.kind == "Intent"
+                                    && record.payload.field("correlation").unwrap().integer_u64()
+                                        == Some(18)
+                            })
                             .expect("Stop bypasses the unsettled command");
                         assert_eq!(
                             stop.payload.field("correlation").unwrap().integer_u64(),
                             Some(18)
                         );
                         fixture.wire.truncate(1);
-                        fixture.connection
+                        fixture
+                            .connection
                             .observe(&crate::protocol::ServerRecord::IntentReply(
                                 crate::protocol::IntentReply {
                                     correlation: 18,

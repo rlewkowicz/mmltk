@@ -31,8 +31,7 @@ struct DiagnosticsClient::State final {
 
     explicit State(mmltk::common::io::ScopedFd adopted, DiagnosticsExecutionPolicy next_policy) noexcept;
 
-    [[nodiscard]] DiagnosticSubmitResult admit_locked(std::unique_lock<std::mutex>& lock, std::size_t count,
-                                                       bool wait) noexcept;
+    [[nodiscard]] DiagnosticSubmitResult admit_locked(std::unique_lock<std::mutex>& lock, std::size_t count, bool wait) noexcept;
     void signal_locked() noexcept;
     void discard_locked() noexcept;
     [[nodiscard]] bool flush_locked() noexcept;
@@ -106,7 +105,7 @@ DiagnosticsClient::State::State(mmltk::common::io::ScopedFd adopted, const Diagn
     : descriptor(std::move(adopted)), policy(next_policy) {}
 
 DiagnosticSubmitResult DiagnosticsClient::State::admit_locked(std::unique_lock<std::mutex>& lock, const std::size_t count,
-                                                               const bool wait) noexcept {
+                                                              const bool wait) noexcept {
     const auto closed = [&] { return closing || failed || terminal_pending || descriptor.get() < 0; };
     if (closed()) return DiagnosticSubmitResult::Closed;
     if (count > kQueueCapacity - size) {
@@ -488,8 +487,10 @@ void DiagnosticsProducer::Operation::fail_delivery() const noexcept {
     state_->discard = true;
     state_->enabled.store(false, std::memory_order_release);
     state_->drained.notify_all();
-    if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter) state_->signal_locked();
-    else state_->publish_terminal_locked();
+    if (state_->policy == DiagnosticsExecutionPolicy::BackgroundWriter)
+        state_->signal_locked();
+    else
+        state_->publish_terminal_locked();
 }
 
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record) const noexcept { return submit(record, true); }
@@ -505,7 +506,8 @@ bool DiagnosticsClient::wait_for_capacity_waiter_for_test() noexcept {
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit(const DiagnosticRecord record, const bool wait_for_capacity,
                                                               const bool validate) const noexcept {
     if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
-    if (wait_for_capacity && !validate && state_->policy == DiagnosticsExecutionPolicy::CallerDriven) return DiagnosticSubmitResult::Capacity;
+    if (wait_for_capacity && !validate && state_->policy == DiagnosticsExecutionPolicy::CallerDriven)
+        return DiagnosticSubmitResult::Capacity;
     if (record.json.size() > DiagnosticsClient::kRecordCapacity) {
         state_->dropped.fetch_add(1U, std::memory_order_relaxed);
         return DiagnosticSubmitResult::RecordTooLarge;
@@ -558,7 +560,8 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_terminal_encoded(c
 }
 
 DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_encoded_batch(const std::size_t count, void* const context,
-                                                                                const EncodedBatchWriter writer, const bool complete) const noexcept {
+                                                                            const EncodedBatchWriter writer,
+                                                                            const bool complete) const noexcept {
     if (state_ == nullptr || !state_->enabled.load(std::memory_order_acquire)) return DiagnosticSubmitResult::Disabled;
     if (count == 0U) return DiagnosticSubmitResult::Accepted;
     if (writer == nullptr || count > DiagnosticsClient::kQueueCapacity) {
@@ -566,8 +569,7 @@ DiagnosticSubmitResult DiagnosticsProducer::Operation::submit_encoded_batch(cons
         return DiagnosticSubmitResult::RecordTooLarge;
     }
     std::unique_lock lock(state_->mutex);
-    if (complete && state_->policy == DiagnosticsExecutionPolicy::CallerDriven)
-        return DiagnosticSubmitResult::Capacity;
+    if (complete && state_->policy == DiagnosticsExecutionPolicy::CallerDriven) return DiagnosticSubmitResult::Capacity;
     const auto admission = state_->admit_locked(lock, count, complete);
     if (admission != DiagnosticSubmitResult::Accepted) return admission;
     for (std::size_t index = 0U; index < count; ++index) {

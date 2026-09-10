@@ -88,7 +88,9 @@ class SignalWaiter final {
                               {.fd = diagnostics_terminal, .events = POLLIN, .revents = 0}};
               int ready = -1;
               if (signal_fd.get() >= 0) {
-                  do { ready = ::poll(events, 2U, -1); } while (ready < 0 && errno == EINTR);
+                  do {
+                      ready = ::poll(events, 2U, -1);
+                  } while (ready < 0 && errno == EINTR);
               }
               if (stop.stop_requested()) return;
               signalfd_siginfo signal{};
@@ -98,7 +100,7 @@ class SignalWaiter final {
                   return;
               }
               shell.request_shutdown(signal.ssi_signo == SIGINT ? mmltk::controller::services::ApplicationShutdownReason::SignalInterrupt
-                                                               : mmltk::controller::services::ApplicationShutdownReason::SignalTerminate);
+                                                                : mmltk::controller::services::ApplicationShutdownReason::SignalTerminate);
           }) {}
 
     ~SignalWaiter() {
@@ -224,7 +226,8 @@ int main(int argc, char** argv) {
         }
         config.settings_location = production_settings_location();
         const int diagnostics_terminal = config.diagnostic_delivery == mmltk::controller::services::RuntimeDiagnosticDelivery::Complete
-                                             ? config.diagnostics.terminal_fd() : -1;
+                                             ? config.diagnostics.terminal_fd()
+                                             : -1;
         mmltk::controller::shell::ApplicationShell shell{std::move(config)};
         try {
             const std::filesystem::path assets = configured_root("MMLTK_BROWSER_APP_ASSET_ROOT_OVERRIDE", MMLTK_BROWSER_APP_ASSET_ROOT);

@@ -217,9 +217,7 @@ struct GatedRevisionSnapshotProbe final {
         auto& probe = *static_cast<GatedRevisionSnapshotProbe*>(context);
         const std::size_t call = probe.calls.fetch_add(1U, std::memory_order_acq_rel);
         const PhysicalFrameRevision checked = probe.revision;
-        if (call == 0U) {
-            probe.checked.receipt().ArriveAndWait();
-        }
+        if (call == 0U) { probe.checked.receipt().ArriveAndWait(); }
         return checked.valid() ? std::optional<PhysicalFrameRevision>{checked} : std::nullopt;
     }
 };
@@ -234,7 +232,7 @@ class GatedRevisionWait final {
     }
     void Start() {
         result = std::async(std::launch::async,
-                           [this] { return revisions.Wait(stop.get_token(), &probe, &GatedRevisionSnapshotProbe::Snapshot); });
+                            [this] { return revisions.Wait(stop.get_token(), &probe, &GatedRevisionSnapshotProbe::Snapshot); });
         REQUIRE(probe.checked.WaitEntered(std::chrono::seconds{2}));
     }
     LiveRevisionWait revisions;

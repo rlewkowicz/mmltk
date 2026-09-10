@@ -287,7 +287,9 @@ struct RuntimeDiagnosticTarget::State final {
     explicit State(DiagnosticsProducer producer_in, const bool probes, RuntimeDiagnosticDelivery delivery) noexcept
         : producer(std::move(producer_in)), pixel_probes(probes), complete(delivery == RuntimeDiagnosticDelivery::Complete) {}
 
-    void fail_delivery() const noexcept { if (complete) producer.acquire().fail_delivery(); }
+    void fail_delivery() const noexcept {
+        if (complete) producer.acquire().fail_delivery();
+    }
     void submitted(DiagnosticSubmitResult result) const noexcept {
         if (result != DiagnosticSubmitResult::Accepted) fail_delivery();
     }
@@ -387,8 +389,14 @@ void RuntimeDiagnosticTarget::State::write(const RuntimeDiagnosticFact fact, con
 void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation& operation, const RuntimeDiagnosticFact fact,
                                            const bool required) const noexcept {
     const std::string_view owner = owner_name(fact.owner);
-    if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant))) { fail_delivery(); return; }
-    if (fact.message.size() > 1024U) { fail_delivery(); return; }
+    if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant))) {
+        fail_delivery();
+        return;
+    }
+    if (fact.message.size() > 1024U) {
+        fail_delivery();
+        return;
+    }
     try {
         const auto steady_ns =
             std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -397,7 +405,8 @@ void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation&
         if (writer.runtime_event(fact, steady_ns))
             submitted(required ? operation.submit_terminal_encoded({.json = writer.view()})
                                : operation.submit_encoded({.json = writer.view()}, complete));
-        else fail_delivery();
+        else
+            fail_delivery();
     } catch (...) { fail_delivery(); }
 }
 
@@ -412,7 +421,10 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
     for (const auto& fact : facts) {
         const std::string_view owner = owner_name(fact.owner);
         if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant)) ||
-            fact.message.size() > 1024U) { fail_delivery(); return; }
+            fact.message.size() > 1024U) {
+            fail_delivery();
+            return;
+        }
     }
     try {
         struct BatchContext final {
@@ -431,7 +443,8 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
                 if (!writer.runtime_event(batch.facts[index], batch.steady_ns)) return false;
                 size = writer.view().size();
                 return true;
-            }, complete));
+            },
+            complete));
     } catch (...) { fail_delivery(); }
 }
 
@@ -439,13 +452,22 @@ void RuntimeDiagnosticTarget::State::write_browser_event(const std::string_view 
                                                          const mmltk::frameworks::serialization::wire::Value& fields) const noexcept {
     const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
     if (!operation.enabled()) return;
-    if (!valid_event_name(event)) { fail_delivery(); return; }
+    if (!valid_event_name(event)) {
+        fail_delivery();
+        return;
+    }
     const auto* const object = std::get_if<mmltk::frameworks::serialization::wire::Value::Object>(&fields.storage);
-    if (object == nullptr) { fail_delivery(); return; }
+    if (object == nullptr) {
+        fail_delivery();
+        return;
+    }
 
     std::array<char, DiagnosticsClient::kRecordCapacity> record{};
     BoundedJsonWriter writer{record};
-    if (!writer.browser_event(event, *object)) { fail_delivery(); return; }
+    if (!writer.browser_event(event, *object)) {
+        fail_delivery();
+        return;
+    }
     submitted(operation.submit_encoded({.json = writer.view()}, complete));
 }
 
@@ -453,15 +475,23 @@ void RuntimeDiagnosticTarget::State::write_benchmark_trace(const std::string_vie
                                                            const std::string_view json_fields) const noexcept {
     const DiagnosticsProducer::Operation operation = complete ? producer.acquire_complete() : producer.acquire();
     if (!operation.enabled()) return;
-    if (!valid_event_name(event) || json_fields.empty() ||
-        json_fields.size() > DiagnosticsClient::kRecordCapacity || json_fields.find_first_of("\r\n") != std::string_view::npos)
-        { fail_delivery(); return; }
+    if (!valid_event_name(event) || json_fields.empty() || json_fields.size() > DiagnosticsClient::kRecordCapacity ||
+        json_fields.find_first_of("\r\n") != std::string_view::npos) {
+        fail_delivery();
+        return;
+    }
     try {
         const auto parsed = nlohmann::json::parse(json_fields, nullptr, false);
-        if (parsed.is_discarded() || !parsed.is_object()) { fail_delivery(); return; }
+        if (parsed.is_discarded() || !parsed.is_object()) {
+            fail_delivery();
+            return;
+        }
         std::array<char, DiagnosticsClient::kRecordCapacity> record;
         BoundedJsonWriter writer{record};
-        if (!writer.benchmark_event(event, json_fields)) { fail_delivery(); return; }
+        if (!writer.benchmark_event(event, json_fields)) {
+            fail_delivery();
+            return;
+        }
         submitted(operation.submit_encoded({.json = writer.view()}, complete));
     } catch (...) { fail_delivery(); }
 }

@@ -1987,7 +1987,13 @@ impl SurfaceRenderer {
             frame.presentation_revision,
         );
         if draw.surface.integration {
-            crate::integration_control::record_probe_draw(control_id, draw.surface, bounds, image, clip);
+            crate::integration_control::record_probe_draw(
+                control_id,
+                draw.surface,
+                bounds,
+                image,
+                clip,
+            );
             crate::integration_control::sample_boundary_pixels(
                 draw.surface,
                 control_id,

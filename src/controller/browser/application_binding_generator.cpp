@@ -732,8 +732,8 @@ class BindingEmitter final {
         ReserveGeneratedStruct("ReflectedTypeFact", "generated reflected type metadata", {"name", "feature_scope", "progress_work"});
         symbols_.Reserve("module", "REFLECTED_TYPE_FACTS", "generated reflected type metadata");
         ReserveGeneratedStruct("ReflectedFieldFact", "generated reflected field metadata",
-                               {"owner", "declaration_owner", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items", "presentation",
-                                "operation_state", "progress", "catalog_provider"});
+                               {"owner", "declaration_owner", "name", "finite", "minimum", "maximum", "min_bytes", "max_bytes", "max_items",
+                                "presentation", "operation_state", "progress", "catalog_provider"});
         symbols_.Reserve("module", "REFLECTED_FIELD_FACTS", "generated reflected field metadata");
         output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n"
                    "pub struct ReflectedTypeFact { pub name: &'static str, "
@@ -1104,8 +1104,8 @@ class BindingEmitter final {
 
     void EmitSettingsHelpers() {
         ReserveGeneratedStruct("SettingsLeafFact", "generated settings-leaf metadata",
-                               {"stable_field_id", "path", "owner", "member", "mutable_leaf", "workflows", "catalog_provider", "has_file_dialog", "finite",
-                                "minimum", "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
+                               {"stable_field_id", "path", "owner", "member", "mutable_leaf", "workflows", "catalog_provider",
+                                "has_file_dialog", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
         ReserveGeneratedStruct("SettingsLeafConstraint", "generated typed settings constraint",
                                {"stable_field_id", "finite", "minimum", "maximum", "minimum_bytes", "maximum_bytes", "maximum_items"});
         symbols_.Reserve("module", "SETTINGS_LEAVES", "generated settings-leaf metadata");
@@ -1131,9 +1131,9 @@ class BindingEmitter final {
                    "pub static SETTINGS_LEAVES: &[SettingsLeafFact] = &[\n";
         Schema::VisitApplicationSettingsLeaves(
             [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& fact) {
-                output_ << "SettingsLeafFact { stable_field_id: " << fact.stable_id << ", path: \"" << fact.path
-                        << "\", owner: \"" << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>()
-                        << "\", member: \"" << mmltk::frameworks::reflection::materialized_member_name<Declaration::pointer>()
+                output_ << "SettingsLeafFact { stable_field_id: " << fact.stable_id << ", path: \"" << fact.path << "\", owner: \""
+                        << mmltk::frameworks::serialization::reflected_schema_type_name<Owner>() << "\", member: \""
+                        << mmltk::frameworks::reflection::materialized_member_name<Declaration::pointer>()
                         << "\", mutable_leaf: " << (fact.mutable_leaf ? "true" : "false") << ", workflows: &[";
                 for (std::size_t index = 0U; index < fact.workflows.count; ++index) {
                     if (index != 0U) output_ << ", ";

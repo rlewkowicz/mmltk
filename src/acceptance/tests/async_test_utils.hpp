@@ -14,14 +14,15 @@
 namespace mmltk::testsupport {
 
 inline void release_test_promise(std::promise<void>& promise) noexcept {
-    try { promise.set_value(); } catch (const std::future_error&) {}
+    try {
+        promise.set_value();
+    } catch (const std::future_error&) {}
 }
 
 // The future stays with its domain owner so a deadline unwinds through that
 // scenario's release/stop guard before any joining future is destroyed.
 template <class T>
-T await_test_future(std::future<T>& future, std::string_view name,
-                    std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
+T await_test_future(std::future<T>& future, std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
     if (future.wait_for(timeout) != std::future_status::ready)
         throw std::runtime_error(std::string(name) + ": settlement deadline expired");
     return future.get();
@@ -29,8 +30,7 @@ T await_test_future(std::future<T>& future, std::string_view name,
 
 // Promise futures never join on destruction; their lifetime remains local.
 template <class T>
-T await_test_promise(std::promise<T>& promise, std::string_view name,
-                     std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
+T await_test_promise(std::promise<T>& promise, std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
     auto future = promise.get_future();
     return await_test_future(future, name, timeout);
 }
@@ -53,7 +53,7 @@ class ScopedTestCleanup final {
 // never reset a previous engagement, and never assert from a worker thread.
 class TestGate final {
     struct State {
-        explicit State(std::string name) : name(std::move(name)) {}
+        explicit State(std::string gate_name) : name(std::move(gate_name)) {}
         std::string name;
         std::mutex mutex;
         std::condition_variable changed;
@@ -73,6 +73,7 @@ class TestGate final {
             ++state_->settled;
             state_->changed.notify_all();
         }
+
        private:
         friend class TestGate;
         explicit Receipt(std::shared_ptr<State> state) : state_(std::move(state)) {}

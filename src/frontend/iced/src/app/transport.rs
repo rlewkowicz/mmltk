@@ -93,12 +93,16 @@ impl App {
                         self.model.error = Some(UiError::protocol(detail));
                     }
                 } else {
-                    self.retire_peer(UiError::protocol("integration control without an integration driver"));
+                    self.retire_peer(UiError::protocol(
+                        "integration control without an integration driver",
+                    ));
                 }
             }
             TransportEvent::IntegrationInputSettled => {
                 if self.integration.is_none() {
-                    self.retire_peer(UiError::protocol("integration input settlement without a driver"));
+                    self.retire_peer(UiError::protocol(
+                        "integration input settlement without a driver",
+                    ));
                 }
             }
             TransportEvent::Disconnected(reason) => {

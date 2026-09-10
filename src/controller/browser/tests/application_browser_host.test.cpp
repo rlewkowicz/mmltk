@@ -404,7 +404,9 @@ class LoopbackWebSocket final {
         while (response.find("\r\n\r\n") == std::string::npos) {
             char byte = '\0';
             ssize_t received;
-            do { received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0); } while (received < 0 && errno == EINTR);
+            do {
+                received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0);
+            } while (received < 0 && errno == EINTR);
             if (received == 0) {
                 REQUIRE(response.empty());
                 REQUIRE(handshake == HandshakePolicy::AllowPeerClose);
@@ -441,9 +443,7 @@ class LoopbackWebSocket final {
         return frame;
     }
 
-    void send_binary(const std::span<const std::byte> payload) {
-        write_exact(mmltk::testsupport::masked_websocket_frame(2U, payload));
-    }
+    void send_binary(const std::span<const std::byte> payload) { write_exact(mmltk::testsupport::masked_websocket_frame(2U, payload)); }
 
    private:
     void write_exact(std::string_view bytes) {
@@ -560,10 +560,9 @@ TEST_CASE("ordinary browser host rejects explicit integration control", "[contro
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
     wire::ByteBuffer encoded;
-    REQUIRE(encode_client_record(
-        ClientRecord{IntegrationControl{.receipt = {.kind = mmltk::controller::contracts::IntegrationControlKind::Settled,
-                                                    .sequence = 1U}}},
-        encoded));
+    REQUIRE(encode_client_record(ClientRecord{IntegrationControl{
+                                     .receipt = {.kind = mmltk::controller::contracts::IntegrationControlKind::Settled, .sequence = 1U}}},
+                                 encoded));
     peer.send_binary(encoded);
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));

@@ -140,8 +140,7 @@ inline void regenerate_file_atomically(const fs::path& output_path, const std::s
 
 template <typename MakeCommand>
 inline void regenerate_file_atomically(const fs::path& output_path, const std::string_view step_name, MakeCommand&& make_command) {
-    regenerate_file_atomically(
-        output_path, step_name, std::forward<MakeCommand>(make_command), [](const fs::path&) {});
+    regenerate_file_atomically(output_path, step_name, std::forward<MakeCommand>(make_command), [](const fs::path&) {});
 }
 
 inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAsset& asset) {
@@ -206,21 +205,19 @@ inline void ensure_exported_onnx(const fs::path& native_checkpoint_path, const f
 inline void ensure_built_tensorrt_engine(const fs::path& onnx_path, const fs::path& tensorrt_path) {
     if (is_nonempty_regular_file_newer_than(tensorrt_path, onnx_path) && validate_tensorrt_engine(tensorrt_path)) { return; }
 
-    regenerate_file_atomically(
-        tensorrt_path, "RF-DETR TensorRT build",
-        [&onnx_path](const fs::path& temp_path) {
-            return std::vector<std::string>{
-                mmltk::testsupport::mmltk_cli_path(),
-                "rfdetr",
-                "build-engine",
-                "--onnx",
-                onnx_path.string(),
-                "--output",
-                temp_path.string(),
-                "--device-id",
-                "0",
-            };
-        });
+    regenerate_file_atomically(tensorrt_path, "RF-DETR TensorRT build", [&onnx_path](const fs::path& temp_path) {
+        return std::vector<std::string>{
+            mmltk::testsupport::mmltk_cli_path(),
+            "rfdetr",
+            "build-engine",
+            "--onnx",
+            onnx_path.string(),
+            "--output",
+            temp_path.string(),
+            "--device-id",
+            "0",
+        };
+    });
 }
 
 inline CachedModelAssets ensure_cached_model_assets(std::string_view preset_name = "rf-detr-nano") {

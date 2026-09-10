@@ -101,7 +101,9 @@ TEST_CASE("WorkerPool clamps and pins worker threads", "[common][concurrency][wo
     futures.reserve(pool.size());
     mmltk::testsupport::ScopedTestCleanup release_workers{[&] {
         gate.Release();
-        try { pool.wait_idle(); } catch (...) {}
+        try {
+            pool.wait_idle();
+        } catch (...) {}
     }};
     for (std::size_t index = 0; index < pool.size(); ++index) {
         futures.push_back(pool.enqueue([&] {
@@ -152,13 +154,15 @@ TEST_CASE("WorkerPool detached failures wake waiters and close admission", "[com
 TEST_CASE("WorkerPool preserves FIFO across queue wrap and high-water growth", "[common][concurrency][worker_pool]") {
     WorkerPool pool(1U, {}, "queue-order", 3U);
     std::vector<int> observed;
-    mmltk::testsupport::ScopedTestCleanup settle_fifo{[&] { try { pool.wait_idle(); } catch (...) {} }};
+    mmltk::testsupport::ScopedTestCleanup settle_fifo{[&] {
+        try {
+            pool.wait_idle();
+        } catch (...) {}
+    }};
     std::vector<int> expected;
     for (int round = 0; round < 4; ++round) {
         mmltk::testsupport::TestGate gate{"FIFO worker admission"};
-        pool.enqueue_detached([receipt = gate.receipt()] {
-            receipt.ArriveAndWait();
-        });
+        pool.enqueue_detached([receipt = gate.receipt()] { receipt.ArriveAndWait(); });
         REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
         const int count = round == 1 ? 19 : 7;
         for (int index = 0; index < count; ++index) {

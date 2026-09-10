@@ -1174,7 +1174,10 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
         stream.Await(product);
         return product.plane(0U).revision();
     });
-    mmltk::testsupport::ScopedTestCleanup release_reader{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    mmltk::testsupport::ScopedTestCleanup release_reader{[&] {
+        event_gate->Release();
+        backend->CompleteEvents();
+    }};
     REQUIRE(event_gate->WaitEntered(1s));
     CHECK(source.OutputFacts().revision == 1U);
     SystemImageRuntime::CompletedOutput baseline;
@@ -1220,7 +1223,9 @@ TEST_CASE("receiver completion releases product access across threads but retain
     source->SetOutputAvailableSink([&] { available.fetch_add(1U); });
     std::optional<ImageProductReadCompletion> completion;
     std::future<void> writer, callback;
-    mmltk::testsupport::ScopedTestCleanup release_completion{[&] { if (completion) completion->Complete(); }};
+    mmltk::testsupport::ScopedTestCleanup release_completion{[&] {
+        if (completion) completion->Complete();
+    }};
     // Conversion unlocks this thread's shared locks; the callback owns only
     // the counted receiver access, so completing it on another thread is valid.
     completion.emplace(source->Borrow());
@@ -1309,7 +1314,10 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     auto receiver = make_clean_semantic_runtime(backend);
     auto copy = std::async(std::launch::async, [&] { return receiver.CopyFrom(source.Borrow()); });
-    mmltk::testsupport::ScopedTestCleanup release_copy{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    mmltk::testsupport::ScopedTestCleanup release_copy{[&] {
+        event_gate->Release();
+        backend->CompleteEvents();
+    }};
     REQUIRE(event_gate->WaitEntered(1s));
     CHECK(source.OutputFacts().revision == 1U);
     SystemImageRuntime::CompletedOutput baseline;

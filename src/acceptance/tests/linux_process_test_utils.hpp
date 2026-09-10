@@ -32,11 +32,14 @@ class ScopedTestChild final {
     [[nodiscard]] int Wait() {
         int status;
         pid_t result;
-        do { result = ::waitpid(child_, &status, 0); } while (result < 0 && errno == EINTR);
+        do {
+            result = ::waitpid(child_, &status, 0);
+        } while (result < 0 && errno == EINTR);
         if (result < 0) throw std::runtime_error(std::string{"waitpid failed: "} + std::strerror(errno));
         child_ = -1;
         return status;
     }
+
    private:
     pid_t child_;
 };
@@ -59,7 +62,9 @@ inline void arm_timerfd(const int descriptor, const std::chrono::nanoseconds dur
 [[nodiscard]] inline bool consume_timerfd(const int descriptor) noexcept {
     std::uint64_t expirations = 0U;
     ssize_t received;
-    do { received = ::read(descriptor, &expirations, sizeof(expirations)); } while (received < 0 && errno == EINTR);
+    do {
+        received = ::read(descriptor, &expirations, sizeof(expirations));
+    } while (received < 0 && errno == EINTR);
     return received == static_cast<ssize_t>(sizeof(expirations)) && expirations == 1U;
 }
 

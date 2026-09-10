@@ -63,7 +63,8 @@ pub(crate) fn visual_frame(kind: PresentationSourceKind, revision: u64) -> Visua
 
 /// Coherent native Explore/control state and its exact physical publication.
 /// Owners may vary visual labels or allocation identity after construction.
-pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_surface::FrameReady) {
+pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_surface::FrameReady)
+{
     let mut model = bootstrapped();
     model.set_foreground_feature(FeatureId::Explore);
     let source = visual_frame(PresentationSourceKind::Explore, 1);

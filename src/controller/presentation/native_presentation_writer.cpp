@@ -624,9 +624,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             services::RuntimeDiagnosticSpan probe_span{
                 diagnostics_,
                 [&] {
-                    return visual_diagnostic_boundary(
-                        AllocationFact(VisualDiagnosticOperation::PresentationPixelProbeStarted, allocation),
-                        VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
+                    return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationPixelProbeStarted, allocation),
+                                                      VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
                 },
                 allocation.latest->diagnostic_link};
             if (SamplePixels(allocation, stream)) {

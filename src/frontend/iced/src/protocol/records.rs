@@ -59,7 +59,11 @@ fn protocol_payload(values: impl IntoIterator<Item = (&'static str, Value)>) -> 
 }
 
 #[cfg(test)]
-fn bootstrap_payload(input_epoch: u64, schema_fingerprint: [u64; 2], snapshots: Vec<Value>) -> Value {
+fn bootstrap_payload(
+    input_epoch: u64,
+    schema_fingerprint: [u64; 2],
+    snapshots: Vec<Value>,
+) -> Value {
     protocol_payload([
         ("input_epoch", Value::Unsigned(input_epoch)),
         (
@@ -317,8 +321,9 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             Ok(ServerRecord::InputProgress(record))
         }
         ServerRecordKind::IntegrationControl => {
-            let record = crate::generated::IntegrationControl::from_application_value(envelope.payload)
-                .map_err(ProtocolError)?;
+            let record =
+                crate::generated::IntegrationControl::from_application_value(envelope.payload)
+                    .map_err(ProtocolError)?;
             if record.receipt.sequence == 0
                 || record.receipt.kind != crate::generated::IntegrationControlKind::Advance
             {
@@ -521,11 +526,8 @@ mod tests {
             decode_server(&valid),
             Ok(ServerRecord::Bootstrap(_))
         ));
-        let mismatched = encode_envelope(
-            "Bootstrap",
-            &bootstrap_payload(1, [1, 2], Vec::new()),
-        )
-        .expect("mismatched Bootstrap");
+        let mismatched = encode_envelope("Bootstrap", &bootstrap_payload(1, [1, 2], Vec::new()))
+            .expect("mismatched Bootstrap");
         assert!(decode_server(&mismatched).is_err());
         let mut trailing = valid;
         trailing.push(0xf6);
@@ -672,8 +674,10 @@ mod tests {
     fn bootstrap_reply_and_event_decode_without_session_state() {
         let native = native_server_fixtures();
         assert_eq!(native.len(), 8);
-        assert!(matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
-            if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2));
+        assert!(
+            matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
+            if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2)
+        );
         let Ok(ServerRecord::Bootstrap(bootstrap)) = decode_server(native[0]) else {
             panic!("native Bootstrap");
         };

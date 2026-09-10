@@ -154,28 +154,23 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         .presentation
         .redraw(previous_surface)
         .map(Message::Presentation);
-    let integration_task =
-        if let Some(integration) = app.integration.as_mut() {
-            let task = integration.advance(
-                &app.model,
-                app.settings.state(),
-                app.settings.applied_scale(),
-                &app.workspace,
-                app.workspace.active(),
-                frame,
-            );
-            if let Some(connection) = app.connection.as_mut() {
-                integration.publish_control(connection);
-            }
-            task
-        } else {
-            Task::none()
-        };
-    Task::batch([
-        task,
-        presentation_task,
-        integration_task,
-    ])
+    let integration_task = if let Some(integration) = app.integration.as_mut() {
+        let task = integration.advance(
+            &app.model,
+            app.settings.state(),
+            app.settings.applied_scale(),
+            &app.workspace,
+            app.workspace.active(),
+            frame,
+        );
+        if let Some(connection) = app.connection.as_mut() {
+            integration.publish_control(connection);
+        }
+        task
+    } else {
+        Task::none()
+    };
+    Task::batch([task, presentation_task, integration_task])
 }
 #[cfg(test)]
 mod route_tests {
@@ -252,16 +247,27 @@ mod route_tests {
         app.model.window_width = 640;
         app.model.window_height = 480;
         app.integration = Some(crate::integration_control::Controller::new(
-            true, false, "source".into(), "compiled".into(), "512".into(), "atlas".into(),
+            true,
+            false,
+            "source".into(),
+            "compiled".into(),
+            "512".into(),
+            "atlas".into(),
         ));
-        let task = update(&mut app, Message::Integration(crate::integration_control::Message::Scoped {
-            generation: 0,
-            receipt: None,
-            message: Box::new(crate::integration_control::Message::Advance),
-        }));
+        let task = update(
+            &mut app,
+            Message::Integration(crate::integration_control::Message::Scoped {
+                generation: 0,
+                receipt: None,
+                message: Box::new(crate::integration_control::Message::Advance),
+            }),
+        );
         assert_eq!(task.units(), 0);
         // A current continuation does have work: the obsolete one must not run it.
-        let task = update(&mut app, Message::Integration(crate::integration_control::Message::Advance));
+        let task = update(
+            &mut app,
+            Message::Integration(crate::integration_control::Message::Advance),
+        );
         assert!(task.units() > 0);
     }
 
@@ -739,26 +745,39 @@ mod tests {
         assert!(intent.connection.is_none());
         assert_eq!(intent.model.pending_count(), 0);
 
-        let (mut protocol, task) = boot();
-        drop(task);
-        install_default_bootstrap(&mut protocol);
-        protocol.workspace.select(FeatureId::Export);
-        drop(protocol.on_transport(TransportEvent::ProtocolError("invalid record".into())));
-        assert!(protocol.connection.is_none());
-        assert_eq!(protocol.workspace.active(), FeatureId::Train);
-        assert_eq!(
-            protocol.model.connection,
-            crate::view_model::ConnectionState::Reconnecting
-        );
-        assert_eq!(
-            protocol.model.error.as_ref().unwrap().kind,
-            crate::view_model::UiErrorKind::Protocol
-        );
-        drop(protocol.on_transport(TransportEvent::Disconnected("worker stopped".into())));
-        assert_eq!(
-            protocol.model.error.as_ref().unwrap().kind,
-            crate::view_model::UiErrorKind::Protocol
-        );
+        for (event, detail) in [
+            (
+                TransportEvent::ProtocolError("invalid record".into()),
+                "invalid record",
+            ),
+            (
+                TransportEvent::IntegrationInputSettled,
+                "integration input settlement without a driver",
+            ),
+        ] {
+            let (mut protocol, task) = boot();
+            drop(task);
+            install_default_bootstrap(&mut protocol);
+            protocol.workspace.select(FeatureId::Export);
+            drop(protocol.on_transport(event));
+            assert!(protocol.connection.is_none());
+            assert_eq!(protocol.workspace.active(), FeatureId::Train);
+            assert_eq!(
+                protocol.model.connection,
+                crate::view_model::ConnectionState::Reconnecting
+            );
+            assert_eq!(
+                protocol.model.error.as_ref().unwrap().kind,
+                crate::view_model::UiErrorKind::Protocol
+            );
+            drop(protocol.on_transport(TransportEvent::IntegrationInputSettled));
+            drop(protocol.on_transport(TransportEvent::Disconnected("worker stopped".into())));
+            assert_eq!(
+                protocol.model.error.as_ref().unwrap().kind,
+                crate::view_model::UiErrorKind::Protocol
+            );
+            assert_eq!(protocol.model.error.as_ref().unwrap().detail, detail);
+        }
     }
 
     #[test]

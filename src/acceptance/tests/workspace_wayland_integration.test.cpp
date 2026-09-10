@@ -263,18 +263,18 @@ class BrowserHostProcess final {
                 runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 &&
                 ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
                 ::chdir(working_directory.c_str()) == 0 &&
-                (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
-                            ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 &&
-                            ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
-                            ::setenv("MOZ_LOG",
-                                     "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
-                                     "nsRefreshDriver:5,PresShell:5,rotate:16",
-                                     1) == 0 &&
-                            ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 &&
-                            ::setenv("RUST_BACKTRACE", "full", 1) == 0)
-                         : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
-                            ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 &&
-                            ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
+                (logging
+                     ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
+                        ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 &&
+                        ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
+                        ::setenv("MOZ_LOG",
+                                 "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
+                                 "nsRefreshDriver:5,PresShell:5,rotate:16",
+                                 1) == 0 &&
+                        ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 && ::setenv("RUST_BACKTRACE", "full", 1) == 0)
+                     : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
+                        ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 &&
+                        ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
@@ -529,8 +529,9 @@ struct SurfaceAudit final {
             const auto& state = existing->second;
             if (state.source_steps.size() < kAcceptanceRecordLimit && state.publication_steps.size() < kAcceptanceRecordLimit &&
                 state.ended_spans.size() < kAcceptanceRecordLimit && state.samples.size() < kAcceptanceRecordLimit &&
-                state.failed_source_operations.size() < kAcceptanceRecordLimit && state.failed_publications.size() < kAcceptanceRecordLimit &&
-                state.forwarded_publications.size() < kAcceptanceRecordLimit && draws.size() < kAcceptanceRecordLimit)
+                state.failed_source_operations.size() < kAcceptanceRecordLimit &&
+                state.failed_publications.size() < kAcceptanceRecordLimit && state.forwarded_publications.size() < kAcceptanceRecordLimit &&
+                draws.size() < kAcceptanceRecordLimit)
                 return true;
         }
         reject("physical lifecycle evidence exceeded its bounded acceptance capacity");
@@ -771,8 +772,7 @@ struct SurfaceAudit final {
                 draws.push_back({id, record.value("requested_surface", ""), browser_ordinal});
             }
         } else if (event == "iced.surface.pending_discarded") {
-            if (state.created == 0U || state.discarded != 0U)
-                reject("Iced pending discard does not name a unique live import");
+            if (state.created == 0U || state.discarded != 0U) reject("Iced pending discard does not name a unique live import");
             state.discarded = browser_ordinal;
         } else if (event == "iced.surface.renderer_reconstructed") {
             const std::string requested = record.value("requested_surface", "");
@@ -804,34 +804,34 @@ struct SurfaceAudit final {
     }
 
     [[nodiscard]] std::string joined_surface_failure(const std::string& id, const SurfaceState& state) const {
-            if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) return {};
-            if (state.firefox_import_failed) {
-                const bool native_rejection = state.native_stage == 4U && state.import_failed;
-                if (!native_rejection || state.generation != state.iced_generation || state.width != state.browser_width ||
-                    state.height != state.browser_height || !state.native_retired)
-                    return "rejected import " + id + " lacks matching native admission and retirement";
-                if (state.firefox_stage != 2U || state.created == 0U || state.captured != 0U || state.discarded <= state.created ||
-                    state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
-                    return "rejected import " + id + " lacks exact receiver discard and texture retirement";
-                return {};
-            }
-            if (state.native_stage != 4U || state.generation != state.iced_generation || state.width != state.browser_width ||
+        if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) return {};
+        if (state.firefox_import_failed) {
+            const bool native_rejection = state.native_stage == 4U && state.import_failed;
+            if (!native_rejection || state.generation != state.iced_generation || state.width != state.browser_width ||
                 state.height != state.browser_height || !state.native_retired)
-                return "surface " + id + " lacks matching native/browser import and retirement";
-            if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
-                return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
-            if (state.import_failed && state.samples.empty()) return {};
-            if (state.import_failed || state.firefox_stage != 5U) return "surface " + id + " sampled or withdrew an incomplete import";
-            if ((!state.firefox_retired || state.retired == 0U) && !(native_shutdown && browser_shutdown))
-                return "surface " + id + " lacks receiver retirement";
-            for (const auto& [publication, frame] : state.samples) {
-                const auto native = state.publications.find(publication);
-                const bool native_match = native != state.publications.end() && native->second == frame;
-                if (publication == 0U || frame == 0U || !native_match)
-                    return "sampled surface " + id + " lacks matching native frame publication";
-            }
-            if (state.discarded != 0U && (state.retired == 0U || (!state.withdrawn && !state.firefox_withdrawn)))
-                return "discarded pending surface " + id + " lacks withdrawal and texture retirement";
+                return "rejected import " + id + " lacks matching native admission and retirement";
+            if (state.firefox_stage != 2U || state.created == 0U || state.captured != 0U || state.discarded <= state.created ||
+                state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
+                return "rejected import " + id + " lacks exact receiver discard and texture retirement";
+            return {};
+        }
+        if (state.native_stage != 4U || state.generation != state.iced_generation || state.width != state.browser_width ||
+            state.height != state.browser_height || !state.native_retired)
+            return "surface " + id + " lacks matching native/browser import and retirement";
+        if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
+            return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
+        if (state.import_failed && state.samples.empty()) return {};
+        if (state.import_failed || state.firefox_stage != 5U) return "surface " + id + " sampled or withdrew an incomplete import";
+        if ((!state.firefox_retired || state.retired == 0U) && !(native_shutdown && browser_shutdown))
+            return "surface " + id + " lacks receiver retirement";
+        for (const auto& [publication, frame] : state.samples) {
+            const auto native = state.publications.find(publication);
+            const bool native_match = native != state.publications.end() && native->second == frame;
+            if (publication == 0U || frame == 0U || !native_match)
+                return "sampled surface " + id + " lacks matching native frame publication";
+        }
+        if (state.discarded != 0U && (state.retired == 0U || (!state.withdrawn && !state.firefox_withdrawn)))
+            return "discarded pending surface " + id + " lacks withdrawal and texture retirement";
         return {};
     }
 
@@ -879,8 +879,7 @@ struct SurfaceAudit final {
             if (!pending.candidate_withdrawn || pending.created == 0U || pending.captured != 0U || !pending.publications.empty() ||
                 pending.discarded <= pending.created || pending.retired <= pending.discarded || !pending.reconstruction ||
                 pending.reconstruction->requested != b || pending.reconstruction->ordinal <= pending.created ||
-                pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired ||
-                !pending.native_retired)
+                pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired || !pending.native_retired)
                 continue;
             const auto& active_identity = pending.reconstruction->completed;
             const auto& active = surfaces.at(active_identity);
@@ -1155,8 +1154,7 @@ struct PixelBoundaryAudit final {
         // Independent streams can arrive in either order. Settlement requires
         // the native publication, even after a complete receiver probe batch.
         if (source.publication_fact.empty()) return;
-        if (fact != source.publication_fact)
-            reject("native pixels differ from the canonical publication fact");
+        if (fact != source.publication_fact) reject("native pixels differ from the canonical publication fact");
         const auto width = scalar(fact, "source_width"), height = scalar(fact, "source_height");
         if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") || height > scalar(fact, "capacity_height") ||
             scalar(fact, "source_session") == 0U || scalar(fact, "source_instance") == 0U || scalar(fact, "source_revision") == 0U ||
@@ -2670,8 +2668,7 @@ struct AtlasDrawAudit final {
         valid = valid && matching;
         if (matching) {
             seen = true;
-            if (staged_allocation)
-                observe_staged_rows(allocation_key(record), rows);
+            if (staged_allocation) observe_staged_rows(allocation_key(record), rows);
             last_draw = record;
             drawn_rows.emplace(scalar(record, "first_row"));
         } else {
@@ -4023,8 +4020,8 @@ class JsonLineCursor final {
     void consume_line(Audit& audit, Observer& observer) {
         const std::string_view line{pending_};
         if (format_ == Format::FirefoxText &&
-            ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) ||
-             line.contains("XPCOMGlueLoad error") || line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
+            ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) || line.contains("XPCOMGlueLoad error") ||
+             line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
             const nlohmann::json failure{{"event", "integration.failed"}, {"detail", std::string{line}}};
             audit.consume(failure);
             observer(failure);
@@ -4033,8 +4030,7 @@ class JsonLineCursor final {
         if (start == std::string_view::npos) return;
         const auto record = nlohmann::json::parse(line.substr(start), nullptr, false);
         if (!record.is_object()) {
-            if (format_ == Format::NativeJson)
-                throw std::runtime_error("malformed native JSONL evidence: " + path_.string());
+            if (format_ == Format::NativeJson) throw std::runtime_error("malformed native JSONL evidence: " + path_.string());
             return;
         }
         audit.consume(record);
@@ -4056,7 +4052,10 @@ TEST_CASE("acceptance artifacts have independent writers and one process-family 
     const auto mozilla = artifact_sibling(native, "-mozilla-child.12.log.child-4.moz_log.0");
     const auto mozilla_parent = artifact_sibling(native, "-mozilla-main.11.log.moz_log.3");
     const auto adjacent = temporary.path() / "capture-other-mozilla-child.13.log.child-5.moz_log.0";
-    { std::ofstream output{adjacent}; output << "adjacent capture\n"; }
+    {
+        std::ofstream output{adjacent};
+        output << "adjacent capture\n";
+    }
     for (const auto& path : {native, parent, application, mozilla, mozilla_parent}) {
         std::ofstream output{path};
         output << "{\"event\":\"previous\"}\n";
@@ -4072,8 +4071,8 @@ TEST_CASE("acceptance artifacts have independent writers and one process-family 
     prepare_latest_log(parent, "acceptance", "17-123");
     rotate_process_log_family(native, "17-123");
     for (const auto& path : {native, parent, application, mozilla, mozilla_parent}) {
-        const auto archive = std::filesystem::path{path.string() + ".history"} /
-                             (path.extension() == ".jsonl" ? "17-123.jsonl" : "17-123.log");
+        const auto archive =
+            std::filesystem::path{path.string() + ".history"} / (path.extension() == ".jsonl" ? "17-123.jsonl" : "17-123.log");
         CHECK(read_tail(archive) == "{\"event\":\"previous\"}\n");
     }
     CHECK_FALSE(std::filesystem::exists(application));
@@ -4093,21 +4092,30 @@ TEST_CASE("native evidence cursors reject malformed truncated oversized and inco
     ScopedTempDir temporary{"mmltk-evidence-cursor"};
     const auto path = temporary.path() / "native.jsonl";
     const auto observer = [](const auto&) {};
-    for (const std::string content : {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"},
-                                      std::string(64U * 1024U + 1U, 'x')}) {
-        { std::ofstream output{path, std::ios::binary | std::ios::trunc}; output << content; }
+    for (const std::string& content :
+         {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"}, std::string(64U * 1024U + 1U, 'x')}) {
+        {
+            std::ofstream output{path, std::ios::binary | std::ios::trunc};
+            output << content;
+        }
         Count audit;
         JsonLineCursor cursor{path, 0U};
         CHECK_THROWS_AS(cursor.consume(audit, observer), std::runtime_error);
         CHECK(audit.records == 0U);
     }
-    { std::ofstream output{path, std::ios::binary | std::ios::trunc}; output << "{\"event\":\"partial"; }
+    {
+        std::ofstream output{path, std::ios::binary | std::ios::trunc};
+        output << "{\"event\":\"partial";
+    }
     Count audit;
     JsonLineCursor cursor{path, 0U};
     cursor.consume(audit, observer);
     CHECK(audit.records == 0U);
     CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
-    { std::ofstream output{path, std::ios::binary | std::ios::app}; output << "\"}\n"; }
+    {
+        std::ofstream output{path, std::ios::binary | std::ios::app};
+        output << "\"}\n";
+    }
     cursor.consume(audit, observer);
     cursor.finish();
     CHECK(audit.records == 1U);
@@ -4125,18 +4133,28 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
     ScopedTempDir temporary{"mmltk-evidence-chunks"};
     const auto path = temporary.path() / "native.jsonl";
     constexpr std::size_t count = 12000U;
-    { std::ofstream output{path}; for (std::size_t index = 0U; index != count; ++index) output << "{\"event\":\"chunk\"}\n"; }
+    {
+        std::ofstream output{path};
+        for (std::size_t index = 0U; index != count; ++index)
+            output << "{\"event\":\"chunk\"}\n";
+    }
     Count audit;
     JsonLineCursor cursor{path, 0U};
     cursor.consume(audit, [](const auto&) {});
     cursor.finish();
     CHECK(audit.records == count);
-    { std::ofstream output{path, std::ios::app}; output << "FINAL TAIL\n"; }
+    {
+        std::ofstream output{path, std::ios::app};
+        output << "FINAL TAIL\n";
+    }
     const auto tail = read_tail(path);
     CHECK(tail.size() == 96U * 1024U);
     CHECK(tail.ends_with("FINAL TAIL\n"));
     const auto firefox = temporary.path() / "firefox.log";
-    { std::ofstream output{firefox}; output << "intentional Firefox text\nprefix {\"event\":\"browser\"}\n"; }
+    {
+        std::ofstream output{firefox};
+        output << "intentional Firefox text\nprefix {\"event\":\"browser\"}\n";
+    }
     Count browser;
     JsonLineCursor browser_cursor{firefox, 0U, JsonLineCursor::Format::FirefoxText};
     browser_cursor.consume(browser, [](const auto&) {});
@@ -4154,7 +4172,11 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
     for (const bool viewer : {false, true}) {
         const nlohmann::json completion{
             {"event", viewer ? "integration.viewer_complete" : "integration.complete"},
-            {"detail", viewer ? "square" : "typed-mvc-wayland"}, {"a", 1U}, {"b", 1U}, {"c", 1U}, {"d", 1U},
+            {"detail", viewer ? "square" : "typed-mvc-wayland"},
+            {"a", 1U},
+            {"b", 1U},
+            {"c", 1U},
+            {"d", 1U},
         };
         for (const auto* failure : failures) {
             for (const std::string_view order : {"failure-first", "completion-first", "final-drain", "older-than-tail"}) {
@@ -4163,7 +4185,8 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
                     std::ofstream output{firefox, std::ios::trunc};
                     if (order == "failure-first" || order == "older-than-tail") output << failure << '\n';
                     if (order == "older-than-tail")
-                        for (std::size_t index = 0U; index != count; ++index) output << "Firefox ordinary text\n";
+                        for (std::size_t index = 0U; index != count; ++index)
+                            output << "Firefox ordinary text\n";
                     output << completion.dump() << '\n';
                     if (order == "completion-first") output << failure << '\n';
                 }
@@ -4173,7 +4196,10 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
                 CHECK((viewer ? evidence.viewer_complete : evidence.complete));
                 if (order == "final-drain") {
                     CHECK_FALSE(evidence.failed_before_termination());
-                    { std::ofstream output{firefox, std::ios::app}; output << failure; }
+                    {
+                        std::ofstream output{firefox, std::ios::app};
+                        output << failure;
+                    }
                     // Final Firefox text need not have a newline. Ordinary reads
                     // retain it until terminal settlement supplies the last extent.
                     evidence_cursor.consume(evidence, [](const auto&) {});
@@ -4272,10 +4298,20 @@ class PreparedWaylandInputs final {
    public:
     PreparedWaylandInputs()
         : root_("mmltk-wayland-inputs"),
-          square_{.root_dir = (root_.path() / "square").string(), .split = "train", .width = 768, .height = 384,
-                  .num_images = 128, .background_images = 10, .pixel_evidence = true},
-          mixed_{.root_dir = (root_.path() / "mixed").string(), .split = "train", .width = 768, .height = 384,
-                 .num_images = 300, .background_images = 10, .pixel_evidence = true} {
+          square_{.root_dir = (root_.path() / "square").string(),
+                  .split = "train",
+                  .width = 768,
+                  .height = 384,
+                  .num_images = 128,
+                  .background_images = 10,
+                  .pixel_evidence = true},
+          mixed_{.root_dir = (root_.path() / "mixed").string(),
+                 .split = "train",
+                 .width = 768,
+                 .height = 384,
+                 .num_images = 300,
+                 .background_images = 10,
+                 .pixel_evidence = true} {
         using namespace mmltk::backend::data::testsupport;
         for (const auto* fixture : {&square_, &mixed_}) {
             create_synthetic_dataset(*fixture);
@@ -4283,8 +4319,7 @@ class PreparedWaylandInputs final {
             replace_synthetic_image(*fixture, 9, 384, 192);
             replace_synthetic_image(*fixture, 11, 192, 384);
             const auto split = std::filesystem::path(dataset_dir(*fixture)) / fixture->split;
-            std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl",
-                                       std::filesystem::copy_options::overwrite_existing);
+            std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
             std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
             if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
             dropped_instance
@@ -4294,9 +4329,13 @@ class PreparedWaylandInputs final {
         replace_synthetic_image(square_, 1, 384, 384);
         // This small prerequisite is compiled once. The primary browser owns
         // the one real 512-pixel compile/control/error workflow.
-        const auto plan = mmltk::backend::data::DatasetCompiler::prepare(
-            {.source_dir = dataset_dir(square_), .output_dir = compiled_dir(square_), .split = "train",
-             .target_width = 384U, .target_height = 384U}, {"train"});
+        const auto plan = mmltk::backend::data::DatasetCompiler::prepare({.source_dir = dataset_dir(square_),
+                                                                          .output_dir = compiled_dir(square_),
+                                                                          .split = "train",
+                                                                          .target_width = 384U,
+                                                                          .target_height = 384U,
+                                                                          .worker_cpus = {}},
+                                                                         {"train"});
         mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
     }
     [[nodiscard]] const auto& square() const noexcept { return square_; }
@@ -4353,15 +4392,24 @@ class WaylandSession final {
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
                                const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault,
                                const bool pixels_enabled)
-    : inputs_(std::move(inputs)), termination(terminal), profile_(std::move(profile)), logging(diagnostics_enabled), high_dpi(dpi),
-      h2d(host_to_device), pixel_probes(logging && pixels_enabled), pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
-      probe_failure(std::move(fault)), pixel_audit(pixel_probes) {
-    diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
-    runtime_log = !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
-    firefox_log = !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
+    : inputs_(std::move(inputs)),
+      termination(terminal),
+      profile_(std::move(profile)),
+      logging(diagnostics_enabled),
+      high_dpi(dpi),
+      h2d(host_to_device),
+      pixel_probes(logging && pixels_enabled),
+      pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
+      probe_failure(std::move(fault)),
+      pixel_audit(pixel_probes) {
+    diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl"
+                           : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
+    runtime_log = !logging ? quiet_artifacts.path() / "runtime.log"
+                           : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
+    firefox_log = !logging ? quiet_artifacts.path() / "firefox.log"
+                           : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
     acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
-    const auto rotation_id = std::to_string(::getpid()) + "-" +
-                             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto rotation_id = std::to_string(::getpid()) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     if (logging) {
         const std::array owned_artifacts{diagnostics, acceptance_log, runtime_log, firefox_log,
                                          artifact_sibling(diagnostics, "-application.log")};
@@ -4385,20 +4433,9 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     settings_file << mmltk::controller::contracts::snapshot_gui_settings(initial_settings).dump();
     settings_file.close();
     notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
-    process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER,
-                               diagnostics,
-                               runtime_log,
-                               firefox_log,
-                               working.path(),
-                               termination,
-                               inputs_->mixed(),
-                               profile_ == "blocked" ? "quiet" : profile_,
-                               logging,
-                               high_dpi,
-                               h2d,
-                               pixel_probes,
-                               probe_failure,
-                               &inputs_->square());
+    process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(),
+                                                    termination, inputs_->mixed(), profile_ == "blocked" ? "quiet" : profile_, logging,
+                                                    high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
     deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
     if (deadline.get() < 0)
         throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
@@ -4406,8 +4443,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     browser_cursor_ = std::make_unique<JsonLineCursor>(firefox_log, 0U, JsonLineCursor::Format::FirefoxText);
 }
 
-void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark,
-                                 const bool pending_reconstruction) {
+void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
     const auto permitted_cpus = permitted_cpu_count();
     const auto& fixture = viewer_scenario == "square" ? inputs_->square() : inputs_->mixed();
     auto& process = *process_;
@@ -4468,7 +4504,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     REQUIRE(entered->compiled_index > progress);
                     progress = entered->compiled_index;
                     arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline,
-                                             "quiet typed workflow progress");
+                                            "quiet typed workflow progress");
                 } else {
                     FAIL("invalid quiet integration control direction");
                 }
@@ -4611,40 +4647,37 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     const auto record_acceptance_state = [&](const std::string_view event, const bool terminal) {
         if (!logging) return;
         append_acceptance_record(acceptance_log, {{"event", event},
-                                               {"terminal", terminal},
-                                               {"termination", termination_label(termination)},
-                                               {"deadline_stage", deadline_stage},
-                                               {"deadline_seconds", deadline_duration.count()},
-                                               {"work_progress_revision", browser.work_progress_revision},
-                                               {"blockers", acceptance_blockers()},
-                                               {"final_material_generation", final_generations.material},
-                                               {"final_cursor_generation", final_generations.cursor},
-                                               {"browser_final_generation", browser.final_cursor_generation},
-                                               {"browser_final_frame_revision", browser.final_cursor_frame_revision},
-                                               {"browser_final_slot_count", browser.final_cursor_slot_count},
-                                               {"held_generation", native.held_generation},
-                                               {"held_slot", native.held_slot},
-                                               {"held_compiled_index", native.held_compiled_index},
-                                               {"held_staging_bytes", native.held_capacity}});
+                                                  {"terminal", terminal},
+                                                  {"termination", termination_label(termination)},
+                                                  {"deadline_stage", deadline_stage},
+                                                  {"deadline_seconds", deadline_duration.count()},
+                                                  {"work_progress_revision", browser.work_progress_revision},
+                                                  {"blockers", acceptance_blockers()},
+                                                  {"final_material_generation", final_generations.material},
+                                                  {"final_cursor_generation", final_generations.cursor},
+                                                  {"browser_final_generation", browser.final_cursor_generation},
+                                                  {"browser_final_frame_revision", browser.final_cursor_frame_revision},
+                                                  {"browser_final_slot_count", browser.final_cursor_slot_count},
+                                                  {"held_generation", native.held_generation},
+                                                  {"held_slot", native.held_slot},
+                                                  {"held_compiled_index", native.held_compiled_index},
+                                                  {"held_staging_bytes", native.held_capacity}});
     };
     const auto terminal_annotation_ready = [&] {
-        return viewer_scenario != "terminal" ||
-               (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
-                browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer && browser.complete &&
-                browser.surface_draws.contains(browser.presentation_receipt) &&
-                browser.surface_redraws.contains(browser.presentation_receipt));
+        return viewer_scenario != "terminal" || (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
+                                                 browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer &&
+                                                 browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
+                                                 browser.surface_redraws.contains(browser.presentation_receipt));
     };
     bool readiness_reached = false;
     for (;;) {
         consume_records();
         if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
-        if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() &&
-            browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
-            native.presentation_ready && native.explore_rendered && surface_audit.failure.empty() && pixel_audit.failure.empty() &&
+        if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() && browser.viewer_complete &&
+            browser.surface_draws.contains(browser.viewer_presentation) && native.presentation_ready && native.explore_rendered &&
+            surface_audit.failure.empty() && pixel_audit.failure.empty() &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-            pixel_audit.probe_failure_complete(probe_failure) &&
-            surface_audit.evidence_settled() &&
-            terminal_annotation_ready() &&
+            pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && terminal_annotation_ready() &&
             (!pixel_fixture || pixel_audit.composition_complete()) &&
             ((viewer_scenario != "copy" && viewer_scenario != "semantics") || pixel_audit.continuity_complete(false)) &&
             (!pending_reconstruction || surface_audit.pending_supersession_completed()) &&
@@ -4658,7 +4691,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 final_generations = *identified;
         }
         if (!released_one_lane && browser.explore_ready) {
-            const auto rendered_placeholder = std::ranges::find_if(native.placeholder_slots, [&native, &browser](const auto& placeholder) {
+            const auto rendered_placeholder = std::ranges::find_if(native.placeholder_slots, [this](const auto& placeholder) {
                 const auto cardinality = native.placeholder_cardinalities.find(placeholder.first);
                 return cardinality != native.placeholder_cardinalities.end() && cardinality->second == placeholder.second.size() &&
                        !placeholder.second.empty() && browser.rendered_frame_for_slots(placeholder.second, 0U, 0U);
@@ -4716,8 +4749,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             browser.product_ready() && rendered_probe_exported &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
             pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() &&
-            (!pixel_fixture || pixel_audit.composition_complete()) &&
-            pixel_audit.continuity_complete(true) &&
+            (!pixel_fixture || pixel_audit.composition_complete()) && pixel_audit.continuity_complete(true) &&
             (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
             readiness_reached = true;
             break;
@@ -4808,10 +4840,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     : event->event == ExploreAcceptanceGate::ControlEvent::HeldStale   ? "acceptance.control.held_stale"
                                                                                        : "acceptance.control.initial_wait";
                 append_acceptance_record(acceptance_log, {{"event", control_event},
-                                                       {"sequence", event->generation},
-                                                       {"value", event->slot},
-                                                       {"detail", event->compiled_index},
-                                                       {"staging_bytes", event->staging_bytes}});
+                                                          {"sequence", event->generation},
+                                                          {"value", event->slot},
+                                                          {"detail", event->compiled_index},
+                                                          {"staging_bytes", event->staging_bytes}});
             }
             if (native.causal_inconsistent) {
                 record_acceptance_state("acceptance.control.failed", true);
@@ -4862,8 +4894,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             REQUIRE(process.command_explore(8U));
         arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
     }
-    const auto terminal_result = !last ? std::optional<int>{0}
-                                     : process.active() ? await_shutdown(process, deadline.get()) : std::optional<int>{process.status()};
+    const auto terminal_result = !last              ? std::optional<int>{0}
+                                 : process.active() ? await_shutdown(process, deadline.get())
+                                                    : std::optional<int>{process.status()};
     if (!terminal_result) {
         consume_records();
         std::cerr << "workspace-wayland shutdown made no progress within " << deadline_duration.count() << " seconds"
@@ -5085,7 +5118,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     REQUIRE(native.placeholder_slots.contains(native.partial_generation));
     REQUIRE(native.patched_slots.contains(native.partial_generation));
     CHECK_FALSE(native.patched_slots.at(native.partial_generation).empty());
-    CHECK(std::ranges::any_of(browser.explore_slots, [&native](const auto& rendered) {
+    CHECK(std::ranges::any_of(browser.explore_slots, [this](const auto& rendered) {
         return rendered.second == native.placeholder_slots.at(native.partial_generation);
     }));
     CHECK(native.exact_partial_slot_identity());
@@ -5147,9 +5180,7 @@ void WaylandSession::AdvanceScenario() {
 
     AtlasDrawAudit retained_atlas;
     retained_atlas.captures = std::move(browser.atlas_draws.captures);
-    std::erase_if(retained_atlas.captures, [&](const auto& entry) {
-        return !surface_audit.surfaces.contains(std::get<0>(entry.first));
-    });
+    std::erase_if(retained_atlas.captures, [&](const auto& entry) { return !surface_audit.surfaces.contains(std::get<0>(entry.first)); });
     std::set<AtlasDrawAudit::SourceKey> retained_sources;
     for (const auto& [_, capture] : retained_atlas.captures)
         retained_sources.insert(AtlasDrawAudit::source_key(capture));
@@ -5159,7 +5190,8 @@ void WaylandSession::AdvanceScenario() {
         auto [found, inserted] = latest_sources.try_emplace(owner, key);
         if (!inserted && key[3] > found->second[3]) found->second = key;
     }
-    for (const auto& [_, key] : latest_sources) retained_sources.insert(key);
+    for (const auto& [_, key] : latest_sources)
+        retained_sources.insert(key);
     retained_atlas.sources = std::move(browser.atlas_draws.sources);
     retained_atlas.sessions = std::move(browser.atlas_draws.sessions);
     std::erase_if(retained_atlas.sources, [&](const auto& entry) { return !retained_sources.contains(entry.first); });
@@ -5192,10 +5224,14 @@ void WaylandSession::AdvanceScenario() {
     static const auto inputs = std::make_shared<PreparedWaylandInputs>();
     const auto& fixture = inputs->mixed();
     if (require_compiled && !std::filesystem::is_regular_file(mmltk::backend::data::testsupport::compiled_bin_path(fixture))) {
-        const auto plan = mmltk::backend::data::DatasetCompiler::prepare(
-            {.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
-             .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture), .split = "train",
-             .target_width = kCompiledResolution, .target_height = kCompiledResolution}, {"train"});
+        const auto plan =
+            mmltk::backend::data::DatasetCompiler::prepare({.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
+                                                            .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture),
+                                                            .split = "train",
+                                                            .target_width = kCompiledResolution,
+                                                            .target_height = kCompiledResolution,
+                                                            .worker_cpus = {}},
+                                                           {"train"});
         mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
     }
     return inputs;
@@ -5222,8 +5258,7 @@ void workspace_wayland_dpi() {
 
 void workspace_wayland_terminal() {
     const auto terminal = GENERATE(TerminationMode::WindowClose, TerminationMode::AbruptPeerLoss);
-    WaylandSession session{wayland_inputs(true), terminal, "terminal", true, false, true, {},
-                           terminal != TerminationMode::WindowClose};
+    WaylandSession session{wayland_inputs(true), terminal, "terminal", true, false, true, {}, terminal != TerminationMode::WindowClose};
     session.RunScenario("terminal", true);
 }
 
@@ -5432,7 +5467,6 @@ MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][pr
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][gdr]", workspace_wayland_gdr);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][quiet]", workspace_wayland_quiet);
 MMLTK_REGISTER_TEST_CASE("[workspace_wayland_integration][rendered_probe_audit]", rendered_probe_audit_rejects_mismatched_identity);
-
 
 }  // namespace
 namespace {
@@ -5715,8 +5749,7 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         const std::string_view omitted{missing};
         material.consume_explore_evidence("placeholder.published", 2U);
         material.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U);
-        if (omitted != "slot")
-            material.consume_explore_evidence("acceptance.placeholder.slot", 1U, omitted == "conflict" ? 12U : 11U);
+        if (omitted != "slot") material.consume_explore_evidence("acceptance.placeholder.slot", 1U, omitted == "conflict" ? 12U : 11U);
         if (omitted != "summary") material.consume_explore_evidence("acceptance.placeholder.complete", 2U);
         material.consume_explore_evidence("acceptance.slot.patched", 0U, 10U);
         if (omitted != "patch") material.consume_explore_evidence("acceptance.slot.patched", 1U, omitted == "identity" ? 12U : 11U);
@@ -5730,8 +5763,8 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         const auto final = material.final_generations_for(rendered_slots, 2U, 7U);
         CHECK(final.has_value() == (omitted != "summary" && omitted != "slot" && omitted != "frame" && omitted != "conflict"));
         const bool complete_material = final && material.patched_slots.at(2U) == rendered_slots &&
-                                       material.published_tiles.at(2U) == rendered_slots.size() &&
-                                       !material.explore_stale_patch && !material.causal_inconsistent;
+                                       material.published_tiles.at(2U) == rendered_slots.size() && !material.explore_stale_patch &&
+                                       !material.causal_inconsistent;
         CHECK(complete_material == (omitted == "none"));
         if (final) {
             CHECK(final->material == 2U);
@@ -6206,8 +6239,7 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
         draw["event"] = "iced.surface.scroll_stage";
         draw["control"] = names[index];
         between_stages.consume(draw);
-        if (index == 0U)
-            publish(between_stages, atlas_draw_record(80U, 0U, 5U, -37.25));
+        if (index == 0U) publish(between_stages, atlas_draw_record(80U, 0U, 5U, -37.25));
     }
     CHECK(between_stages.valid);
     CHECK(between_stages.grid_round_trip);

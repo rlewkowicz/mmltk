@@ -550,8 +550,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
     using namespace mmltk::backend::models::rfdetr;
     const bool selected_h2d = GENERATE(true, false);
     const int group = GENERATE(1, 2);
-    if (mmltk::testsupport::checked_cuda_device_count() == 0)
-        SKIP("CUDA unavailable; criterion transport parity remains unverified");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; criterion transport parity remains unverified");
     c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(0));
     if (!selected_h2d) {
         int mmap = 0;

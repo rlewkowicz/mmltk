@@ -250,7 +250,7 @@ template <class Declaration>
             using Provider = typename A::provider_type;
             static_assert(Provider::valid(), "reflected catalog provider is invalid");
             static_assert(std::meta::has_identifier(^^Provider), "catalog providers require canonical declaration identifiers");
-            result.catalog_provider = std::meta::identifier_of(^^Provider);
+            result.catalog_provider = mmltk::frameworks::reflection::type_name<Provider>();
         }
     });
     if (workflow_count > 1U) throw "settings declaration has duplicate feature scopes";

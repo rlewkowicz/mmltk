@@ -1721,7 +1721,10 @@ TEST_CASE("training admission and matching cancellation do not invert system and
                          }};
     mmltk::testsupport::TestGate local_admission{"concurrent training Start and Stop admission"};
     std::future<TrainingSnapshot> starting, stopping;
-    mmltk::testsupport::ScopedTestCleanup release_local{[&] { local_admission.Release(); local_gate->Release(); }};
+    mmltk::testsupport::ScopedTestCleanup release_local{[&] {
+        local_admission.Release();
+        local_gate->Release();
+    }};
     starting = std::async(std::launch::async, [&] {
         local_admission.receipt().ArriveAndWait();
         return local.Start({});
@@ -1754,7 +1757,10 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     mmltk::testsupport::TestGate query_admission{"concurrent provider Query and Clear admission"};
     std::future<TrainingSnapshot> querying;
     std::future<void> clearing;
-    mmltk::testsupport::ScopedTestCleanup release_query{[&] { query_admission.Release(); query_gate->Release(); }};
+    mmltk::testsupport::ScopedTestCleanup release_query{[&] {
+        query_admission.Release();
+        query_gate->Release();
+    }};
     querying = std::async(std::launch::async, [&] {
         query_admission.receipt().ArriveAndWait();
         return query.Query({});

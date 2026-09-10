@@ -705,8 +705,7 @@ void decode_reflected_object_fields(T& result, const wire::Value::Object& object
             if (!failure) {
                 constexpr auto member = Declaration::pointer;
                 const std::string_view name = fact.member_name;
-                const auto source =
-                    std::ranges::find_if(object, [name](const auto& field) { return field.first == name; });
+                const auto source = std::ranges::find_if(object, [name](const auto& field) { return field.first == name; });
                 if (source != object.end()) {
                     const auto duplicate =
                         std::ranges::find_if(std::next(source), object.end(), [name](const auto& field) { return field.first == name; });
@@ -770,8 +769,7 @@ template <class T>
         std::optional<wire::DecodeError> failure;
         decode_reflected_object_fields(result, *object, failure);
         if (failure) return std::unexpected(std::move(*failure));
-        const auto unknown =
-            std::ranges::find_if(*object, [](const auto& field) { return !reflected_object_has_member<T>(field.first); });
+        const auto unknown = std::ranges::find_if(*object, [](const auto& field) { return !reflected_object_has_member<T>(field.first); });
         if (unknown != object->end()) {
             auto error = decode_error(wire::ErrorCode::UnknownKey);
             prepend_path(error, unknown->first);

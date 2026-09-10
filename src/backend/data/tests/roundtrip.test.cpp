@@ -463,7 +463,7 @@ void test_roundtrip_end_to_end() {
     const int NUM_IMAGES = fixture.num_images;
     ensure_cuda_ok(cudaSetDevice(0), "cudaSetDevice");
     const mmltk::frameworks::gpu::DeviceContext context(0, mmltk::frameworks::gpu::cuda_image_copy_backend(),
-                                                       mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
+                                                        mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
     mmltk::frameworks::gpu::ImageStream owned_stream(context);
     const auto compute_stream = reinterpret_cast<cudaStream_t>(owned_stream.native_handle());
 
@@ -490,8 +490,9 @@ void test_roundtrip_end_to_end() {
     printf("Compiled file: %zu bytes\n", static_cast<size_t>(fs::file_size(bin_path)));
     // Run every H2D assertion before probing the optional GDR transport.
     for (const bool h2d : {true, false}) {
-        try { exercise_roundtrip_transport(fixture, h2d, compute_stream); }
-        catch (const mmltk::frameworks::gpu::GdrTransportUnavailable& error) {
+        try {
+            exercise_roundtrip_transport(fixture, h2d, compute_stream);
+        } catch (const mmltk::frameworks::gpu::GdrTransportUnavailable& error) {
             if (h2d) throw;
             SKIP("GDR hardware unavailable after complete H2D coverage: " << error.what());
         }

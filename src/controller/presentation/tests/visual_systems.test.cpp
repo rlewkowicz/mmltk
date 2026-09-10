@@ -317,7 +317,10 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
 
     std::future<std::uint64_t> copy;
     std::future<void> superseding_publish;
-    mmltk::testsupport::ScopedTestCleanup release_wait{[&] { event_gate->Release(); backend->CompleteEvents(); }};
+    mmltk::testsupport::ScopedTestCleanup release_wait{[&] {
+        event_gate->Release();
+        backend->CompleteEvents();
+    }};
     copy = std::async(std::launch::async, [&receiver, &source] {
         auto product = source.Borrow();
         const auto revision = product.plane(0U).revision();
@@ -1675,6 +1678,7 @@ class PresentationScenario final {
     }
     PresentationScenario(const PresentationScenario&) = delete;
     PresentationScenario& operator=(const PresentationScenario&) = delete;
+
    private:
     PresentationSystem& system_;
     std::shared_ptr<TestPresentationWriterState> state_;
@@ -3266,16 +3270,16 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
         kDevice,
         RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                        [document_revision, annotation_order, save_applied, pointer_gate, &ui_gate_mutex, &next_ui_gate] {
-                           return std::make_unique<TestAnnotationAlgorithm>(document_revision, annotation_order, save_applied, nullptr,
-                                                                            nullptr, pointer_gate, nullptr, nullptr,
-                                                                            [&ui_gate_mutex, &next_ui_gate] {
-                                                                                std::optional<mmltk::testsupport::TestGate::Receipt> receipt;
-                                                                                {
-                                                                                    std::scoped_lock lock(ui_gate_mutex);
-                                                                                    receipt = std::exchange(next_ui_gate, std::nullopt);
-                                                                                }
-                                                                                if (receipt) receipt->ArriveAndWait();
-                                                                            });
+                           return std::make_unique<TestAnnotationAlgorithm>(
+                               document_revision, annotation_order, save_applied, nullptr, nullptr, pointer_gate, nullptr, nullptr,
+                               [&ui_gate_mutex, &next_ui_gate] {
+                                   std::optional<mmltk::testsupport::TestGate::Receipt> receipt;
+                                   {
+                                       std::scoped_lock lock(ui_gate_mutex);
+                                       receipt = std::exchange(next_ui_gate, std::nullopt);
+                                   }
+                                   if (receipt) receipt->ArriveAndWait();
+                               });
                        }),
         borrow_exactly_from(explore), [&annotation_events, &frame_records, save_failures](AnnotationSystem::event_type event) {
             if (std::holds_alternative<AnnotationFailed>(event)) save_failures->fetch_add(1U, std::memory_order_acq_rel);
@@ -3295,7 +3299,9 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     mmltk::testsupport::ScopedTestCleanup settle_annotation{[&] {
         pointer_ui.Release();
         command_entry.Release();
-        try { pointer_gate->release.set_value(); } catch (...) {}
+        try {
+            pointer_gate->release.set_value();
+        } catch (...) {}
         static_cast<void>(annotation.Stop());
         annotation.Shutdown();
     }};
@@ -4375,11 +4381,11 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         ExploreScenario scenario{settings, backend,
                                  [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
         auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+        mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+            mmltk::testsupport::release_test_promise(gate->release);
+            static_cast<void>(explore.Stop());
+            explore.Shutdown();
+        }};
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
 
         explore.UpdateViewport({.viewport = {.extent = {48U, 16U}, .row_count = 1U, .columns = 3U}});
@@ -4468,11 +4474,11 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
                                                                                    commits, nullptr, nullptr, gate);
                                  }};
         auto& explore = scenario.system();
-    mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
-        mmltk::testsupport::release_test_promise(gate->release);
-        static_cast<void>(explore.Stop());
-        explore.Shutdown();
-    }};
+        mmltk::testsupport::ScopedTestCleanup settle_explore{[&] {
+            mmltk::testsupport::release_test_promise(gate->release);
+            static_cast<void>(explore.Stop());
+            explore.Shutdown();
+        }};
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
         const auto before = explore.snapshot();
         if (selection)
@@ -5087,7 +5093,8 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     EventGate events;
     std::atomic<mmltk::frameworks::gpu::SystemImageRuntime*> output_runtime{nullptr};
     const auto factory = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs);
-    UpscaleSystem upscale{kDevice, [&, factory](auto revisions) {
+    UpscaleSystem upscale{kDevice,
+                          [&, factory](auto revisions) {
                               auto runtime = factory(std::move(revisions));
                               output_runtime.store(runtime.get(), std::memory_order_release);
                               return runtime;
@@ -6152,7 +6159,11 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
     auto& events = subject.events;
     auto& upscale = subject.upscale;
     const auto admitted_frame = source.frame();
-    mmltk::testsupport::ScopedTestCleanup settle_copy{[&] { copy_gate->Release(); upscale.Stop(); upscale.Shutdown(); }};
+    mmltk::testsupport::ScopedTestCleanup settle_copy{[&] {
+        copy_gate->Release();
+        upscale.Stop();
+        upscale.Shutdown();
+    }};
 
     static_cast<void>(upscale.Start(test_upscale_request({.source = admitted_frame})));
     const bool copy_entered = copy_gate->WaitEntered(2s);
@@ -6586,7 +6597,8 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     PresentationSystem presentation{
         kDevice, [backend = source.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
         source.sources(),
-        [&events, &completed_events, &last_completed_revision, &last_completed_sample, &last_completed_product](PresentationSystem::event_type event) {
+        [&events, &completed_events, &last_completed_revision, &last_completed_sample,
+         &last_completed_product](PresentationSystem::event_type event) {
             if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
                 last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
                 last_completed_sample.store(completed->snapshot.browser_completed_sample, std::memory_order_release);
@@ -7343,9 +7355,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     unarmed_reader_gate.Release();
     CHECK(mmltk::testsupport::await_test_future(unarmed_reader, "unarmed reader release") == 1U);
     // Settle an ordinary cycle after release to prove it did not arm a retry.
-    REQUIRE(retry_owner.SubmitOrdered([](auto&, std::stop_token) {
-        return detail::VisualRuntimeOwner::Notification{};
-    }));
+    REQUIRE(retry_owner.SubmitOrdered([](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{}; }));
     REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 2U; }));
     CHECK(wake_again.load(std::memory_order_acquire) == 0U);
     CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
@@ -8003,7 +8013,11 @@ TEST_CASE("Presentation control remains available during a native wait") {
     pump_entered.get();
 
     auto admission_closed = std::async(std::launch::async, [&presentation] { presentation.CloseAdmission(); });
-    mmltk::testsupport::ScopedTestCleanup release_wait{[&] { try { writer_state->release_pump.set_value(); } catch (...) {} }};
+    mmltk::testsupport::ScopedTestCleanup release_wait{[&] {
+        try {
+            writer_state->release_pump.set_value();
+        } catch (...) {}
+    }};
     CHECK(admission_closed.wait_for(2s) == std::future_status::ready);
     writer_state->release_pump.set_value();
     mmltk::testsupport::await_test_future(admission_closed, "released Presentation admission close");
@@ -8040,7 +8054,7 @@ TEST_CASE("Presentation retains an unprovable native source read through termina
     PresentationFailureProbe failures;
     {
         auto presentation = make_failure_presentation(source, writer_state, failures);
-    PresentationScenario scenario{presentation, writer_state};
+        PresentationScenario scenario{presentation, writer_state};
         presentation.CloseAdmission();
         presentation.BrowserPeerLost();
         CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);

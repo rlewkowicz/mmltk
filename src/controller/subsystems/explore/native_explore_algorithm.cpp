@@ -53,11 +53,8 @@ class ExploreAcceptanceGate::Impl final {
     void (*read_observer)(void*, std::uint64_t, std::uint32_t) = nullptr;
     mutable std::atomic<PublicationStage> publication_failure{PublicationStage::None};
     mutable std::atomic_bool probe_failure{false};
-    explicit Impl(const int command_descriptor)
-        : command_(command_descriptor),
-          stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
-        if (command_.get() < 0 || stop_.get() < 0)
-            throw std::invalid_argument("invalid Explore acceptance gate descriptor");
+    explicit Impl(const int command_descriptor) : command_(command_descriptor), stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
+        if (command_.get() < 0 || stop_.get() < 0) throw std::invalid_argument("invalid Explore acceptance gate descriptor");
         reader_ = std::jthread([this] { ReadCommands(); });
     }
     ~Impl() {
@@ -76,13 +73,10 @@ class ExploreAcceptanceGate::Impl final {
         if (terminal_ || generation != current_generation_) return WaitResult::Stale;
         if (!release_all_ && !release_one_ && !std::exchange(initial_wait_announced_, true)) {
             const std::uint8_t waiting = 0x80U;
-            if (::send(command_.get(), &waiting, sizeof(waiting), MSG_NOSIGNAL | MSG_DONTWAIT) != sizeof(waiting))
-                terminal_ = true;
+            if (::send(command_.get(), &waiting, sizeof(waiting), MSG_NOSIGNAL | MSG_DONTWAIT) != sizeof(waiting)) terminal_ = true;
         }
         ++waiters_;
-        changed_.wait(lock, [this, generation] {
-            return terminal_ || generation != current_generation_ || release_all_ || release_one_;
-        });
+        changed_.wait(lock, [this, generation] { return terminal_ || generation != current_generation_ || release_all_ || release_one_; });
         --waiters_;
         if (terminal_ || generation != current_generation_) return WaitResult::Stale;
         if (!release_all_) {
@@ -138,8 +132,7 @@ class ExploreAcceptanceGate::Impl final {
     [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
         std::scoped_lock lock(mutex_);
         using Kind = contracts::IntegrationControlKind;
-        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ ||
-            receipt.kind == Kind::Advance)
+        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ || receipt.kind == Kind::Advance)
             return false;
         if (receipt.kind == Kind::Progress) {
             if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;

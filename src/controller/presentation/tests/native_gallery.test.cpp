@@ -1322,7 +1322,7 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
     REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
     mmltk::common::io::ScopedFd commands{sockets[0]};
     ExploreAcceptanceGate gate{sockets[1]};
-    for (const std::uint8_t command : {1U, 2U, 4U})
+    for (const auto command : std::array<std::uint8_t, 3U>{1U, 2U, 4U})
         REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
     gate.AdvanceGeneration(7U);
     auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
@@ -1357,8 +1357,7 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
     });
     if (terminal_path == 1U || terminal_path == 4U)
         REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Settled, .sequence = 1U}));
-    if (terminal_path == 2U)
-        REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U}));
+    if (terminal_path == 2U) REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U}));
     gate.AdvanceGeneration(1U);
     const std::uint8_t advance = 8U;
     if (terminal_path < 2U || terminal_path == 4U)
@@ -1368,8 +1367,7 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
         if (callback_status != std::future_status::ready) gate.Stop();
         REQUIRE(callback_status == std::future_status::ready);
     }
-    if (terminal_path == 4U)
-        REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
+    if (terminal_path == 4U) REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
     if (terminal_path == 3U) commands.reset();
     auto waiting = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(1U); });
     const auto status = waiting.wait_for(std::chrono::seconds{2});

@@ -28,7 +28,8 @@ constexpr mmltk::entrypoints::tools::OnnxToolMainConfig kTestConfig{
     .error_prefix = "onnx-info-test: ",
 };
 
-[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments, mmltk::entrypoints::tools::OnnxToolOperation operation = &capture_model_path) {
+[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments,
+                                mmltk::entrypoints::tools::OnnxToolOperation operation = &capture_model_path) {
     std::vector<char*> argv;
     argv.reserve(arguments.size());
     for (std::string& argument : arguments)
@@ -73,8 +74,10 @@ void test_onnx_failure_diagnostics_are_lazy() {
     const mmltk::testsupport::ScopedTestCleanup restore([&] {
         logging::initialize(logging::default_config("onnx-test"));
         for (std::size_t i = 0; i < names.size(); ++i) {
-            if (inherited[i]) ::setenv(names[i], inherited[i]->c_str(), 1);
-            else ::unsetenv(names[i]);
+            if (inherited[i])
+                ::setenv(names[i], inherited[i]->c_str(), 1);
+            else
+                ::unsetenv(names[i]);
         }
     });
     for (std::size_t i = 0; i < names.size(); ++i) {

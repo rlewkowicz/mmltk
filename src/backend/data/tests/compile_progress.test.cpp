@@ -308,7 +308,10 @@ void test_compile_progress_reports_monotonic_updates() {
 
     const std::thread::id main_thread_id = std::this_thread::get_id();
     struct ProgressRecorder final {
-        struct Entry { CompileProgress progress; std::thread::id thread; };
+        struct Entry {
+            CompileProgress progress;
+            std::thread::id thread;
+        };
         std::array<Entry, 1024U> entries{};
         std::size_t size = 0U;
         std::mutex mutex;
@@ -319,8 +322,10 @@ void test_compile_progress_reports_monotonic_updates() {
             if (active.fetch_add(1U, std::memory_order_acq_rel) != 0U) overlap.store(true, std::memory_order_relaxed);
             {
                 std::scoped_lock lock(mutex);
-                if (size == entries.size()) overflow = true;
-                else entries[size++] = {progress, std::this_thread::get_id()};
+                if (size == entries.size())
+                    overflow = true;
+                else
+                    entries[size++] = {progress, std::this_thread::get_id()};
                 g_compile_elapsed_seconds.fetch_add(1U, std::memory_order_relaxed);
             }
             active.fetch_sub(1U, std::memory_order_release);
@@ -333,10 +338,12 @@ void test_compile_progress_reports_monotonic_updates() {
     REQUIRE(plan.splits.front().image_count == static_cast<uint32_t>(fixture.num_images));
     REQUIRE(plan.total_steps() == expected_total);
     g_compile_elapsed_seconds.store(0U, std::memory_order_relaxed);
-    CompileTelemetry telemetry{plan.splits[0].image_count,
-                               {.context = &state, .report = [](void* context, const CompileProgress& progress) noexcept {
-                                    static_cast<ProgressRecorder*>(context)->Record(progress);
-                                }}, &compile_test_now};
+    CompileTelemetry telemetry{
+        plan.splits[0].image_count,
+        {.context = &state,
+         .report = [](void* context,
+                      const CompileProgress& progress) noexcept { static_cast<ProgressRecorder*>(context)->Record(progress); }},
+        &compile_test_now};
     DatasetCompiler::compile(plan, 0U, &telemetry);
 
     REQUIRE_FALSE(state.overflow);

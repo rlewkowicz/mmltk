@@ -308,7 +308,10 @@ TEST_CASE("effect-only submission drops on queue-lock contention while complete 
         held.receipt().ArriveAndWait();
     }};
     std::future<void> reliable;
-    ScopedTestCleanup release{[&] { held.Release(); diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    ScopedTestCleanup release{[&] {
+        held.Release();
+        diagnostics.close(DiagnosticsCloseMode::Discard);
+    }};
     REQUIRE(held.WaitEntered(std::chrono::seconds{2}));
     CHECK(diagnostics.producer().acquire().try_submit({"{\"event\":\"lossy\"}"}) == DiagnosticSubmitResult::Contended);
     reliable = std::async(std::launch::async, [target = complete.target()] { target.write({.event = "reliable"}); });
@@ -728,7 +731,8 @@ TEST_CASE("complete background diagnostics preserve unique concurrent single and
             }
         });
     }
-    for (auto& submitter : submitters) await_test_future(submitter, "complete diagnostic producer", std::chrono::seconds{5});
+    for (auto& submitter : submitters)
+        await_test_future(submitter, "complete diagnostic producer", std::chrono::seconds{5});
     runtime.target().write_required({.event = "shutdown.complete"});
     diagnostics.close();
     require_one_terminal_wake(diagnostics);
@@ -746,7 +750,8 @@ TEST_CASE("complete background diagnostics preserve unique concurrent single and
         const auto record = nlohmann::json::parse(line);
         if (record.at("event") == "shutdown.complete") {
             ++terminal;
-            for (const auto count : next) CHECK(count == kRecordsPerProducer);
+            for (const auto count : next)
+                CHECK(count == kRecordsPerProducer);
         } else {
             CHECK(terminal == 0U);
             const auto producer = record.at("value").get<std::size_t>();
@@ -755,7 +760,8 @@ TEST_CASE("complete background diagnostics preserve unique concurrent single and
         }
     }
     CHECK(terminal == 1U);
-    for (const auto count : next) CHECK(count == kRecordsPerProducer);
+    for (const auto count : next)
+        CHECK(count == kRecordsPerProducer);
 }
 
 TEST_CASE("complete diagnostic records and batches wait atomically and settle on drain closure or writer loss", "[gui][services]") {
@@ -782,8 +788,10 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
     auto submission = std::async(std::launch::async, [target = runtime.target(), batch] {
         const std::array facts{RuntimeDiagnosticFact{.event = "batch", .sequence = 1U},
                                RuntimeDiagnosticFact{.event = "batch", .sequence = 2U}};
-        if (batch) target.write_batch(facts);
-        else target.write(facts.front());
+        if (batch)
+            target.write_batch(facts);
+        else
+            target.write(facts.front());
     });
     ScopedTestCleanup close{[&] { diagnostics.close(DiagnosticsCloseMode::Discard); }};
     REQUIRE(DiagnosticsClientTestAccess::WaitForCapacityWaiter(diagnostics));
@@ -801,8 +809,10 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
             }
             return bytes;
         });
-    } else if (outcome == 1) diagnostics.close(DiagnosticsCloseMode::Discard);
-    else reader.reset();
+    } else if (outcome == 1)
+        diagnostics.close(DiagnosticsCloseMode::Discard);
+    else
+        reader.reset();
     await_test_future(submission, "complete batch settlement");
     diagnostics.close();
     require_one_terminal_wake(diagnostics);
@@ -836,7 +846,10 @@ TEST_CASE("complete lazy factories reserve delivery before closure or terminal s
             return {.event = "lazy.fact"};
         });
     });
-    ScopedTestCleanup cleanup{[&] { factory.Release(); diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    ScopedTestCleanup cleanup{[&] {
+        factory.Release();
+        diagnostics.close(DiagnosticsCloseMode::Discard);
+    }};
     REQUIRE(factory.WaitEntered(std::chrono::seconds{2}));
     if (seal) runtime.target().write_required({.event = "shutdown.complete"});
     diagnostics.close(DiagnosticsCloseMode::Flush);
@@ -861,16 +874,20 @@ TEST_CASE("complete diagnostics reject unavailable sinks and encoding or impossi
     DiagnosticsClient diagnostics{temporary.path() / "trace.jsonl"};
     RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
     const auto target = runtime.target();
-    if (failure == 0) target.write({.event = "invalid event"});
-    else if (failure == 1) target.write({.event = "invalid", .message = "\xc0\x80"});
+    if (failure == 0)
+        target.write({.event = "invalid event"});
+    else if (failure == 1)
+        target.write({.event = "invalid", .message = "\xc0\x80"});
     else if (failure == 2) {
         std::array<RuntimeDiagnosticFact, DiagnosticsClient::kQueueCapacity + 1U> facts{};
-        for (auto& fact : facts) fact.event = "too_many";
+        for (auto& fact : facts)
+            fact.event = "too_many";
         target.write_batch(facts);
     } else if (failure == 3) {
         const std::array facts{RuntimeDiagnosticFact{.event = "valid"}, RuntimeDiagnosticFact{.event = "invalid", .message = "\xc0\x80"}};
         target.write_batch(facts);
-    } else target.Emit([]() -> RuntimeDiagnosticFact { throw std::runtime_error("factory failure"); });
+    } else
+        target.Emit([]() -> RuntimeDiagnosticFact { throw std::runtime_error("factory failure"); });
     require_one_terminal_wake(diagnostics);
     CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
     CHECK(diagnostics.counters().accepted == 0U);

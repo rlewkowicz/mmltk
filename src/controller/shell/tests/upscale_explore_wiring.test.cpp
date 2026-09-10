@@ -157,8 +157,8 @@ TEST_CASE("shell keeps Explore ready when warm publishes an isolated Upscale fai
     std::promise<void> methods_settled;
     auto failed = failure_published.get_future();
     auto settled = methods_settled.get_future();
-    auto upscale = shell_upscale(
-        backend, probe, [&upscale_failures, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
+    auto upscale =
+        shell_upscale(backend, probe, [&upscale_failures, &failure_published, &methods_settled](UpscaleSystem::event_type event) {
             if (std::holds_alternative<UpscaleFailed>(event)) {
                 upscale_failures.fetch_add(1U, std::memory_order_acq_rel);
                 failure_published.set_value();

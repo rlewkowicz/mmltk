@@ -178,7 +178,7 @@ template <class Owner>
 concept PublicRawCborValueDecode =
     requires(Owner& destination, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
         mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, object, failure);
-};
+    };
 
 template <class Owner>
 concept PublicRawCborProjectedDecode = requires(Owner& destination, wire::Reader& reader) {
@@ -487,7 +487,7 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
     std::ranges::reverse(reverse_owner);
     REQUIRE(mmltk::frameworks::serialization::decode_into(decoded_into, wire::Value(reverse_owner)));
     CHECK(decoded_into == source);
-    for (const wire::Value::Object fields : {
+    for (const wire::Value::Object& fields : {
              wire::Value::Object{},
              wire::Value::Object{{"unknown", wire::Value(std::uint64_t{1U})}},
              wire::Value::Object{{"mask", wire::Value{}}},

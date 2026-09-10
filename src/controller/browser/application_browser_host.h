@@ -9,7 +9,7 @@
 namespace mmltk::controller {
 struct ApplicationSystems;
 class ExploreAcceptanceGate;
-}
+}  // namespace mmltk::controller
 
 namespace mmltk::controller::browser {
 

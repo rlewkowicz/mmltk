@@ -448,7 +448,10 @@ TEST_CASE("Cancellation cannot relinquish an active mapped CPU writer", "[framew
     mmltk::testsupport::TestGate gate{"cancel active mapped CPU copy"};
     api->copy_gate = gate.receipt();
     auto writing = std::async(std::launch::async, [&] { return buffer.write(0, bytes, cancellation.get_token()); });
-    mmltk::testsupport::ScopedTestCleanup release{[&] { cancellation.request_stop(); gate.Release(); }};
+    mmltk::testsupport::ScopedTestCleanup release{[&] {
+        cancellation.request_stop();
+        gate.Release();
+    }};
     REQUIRE(gate.WaitEntered(std::chrono::seconds{2}));
     cancellation.request_stop();
     CHECK(api->freed == 0);

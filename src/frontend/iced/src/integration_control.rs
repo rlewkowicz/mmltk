@@ -1,6 +1,6 @@
-mod reporting;
 mod annotation_checks;
 mod annotation_product;
+mod reporting;
 use crate::generated::FeatureId;
 use crate::message::Message as RootMessage;
 use crate::view::{annotation, explore, train};
@@ -32,12 +32,20 @@ pub(crate) fn reporting_enabled() -> bool {
     REPORTING_ENABLED.with(std::cell::Cell::get)
 }
 
-pub(crate) fn notify_driver_draw(control: &'static str, source_revision: u64, presentation_revision: u64) {
+pub(crate) fn notify_driver_draw(
+    control: &'static str,
+    source_revision: u64,
+    presentation_revision: u64,
+) {
     if !DRIVER_ENABLED.with(std::cell::Cell::get) {
         return;
     }
     #[cfg(target_arch = "wasm32")]
-    driver_draw_js(control, source_revision as f64, presentation_revision as f64);
+    driver_draw_js(
+        control,
+        source_revision as f64,
+        presentation_revision as f64,
+    );
     #[cfg(not(target_arch = "wasm32"))]
     let _ = (control, source_revision, presentation_revision);
 }
@@ -119,43 +127,49 @@ pub(crate) fn report_viewer_label(
     frame: crate::presentation_surface::FrameReady,
     detail: bool,
 ) {
-    reporting::emit(|sink| sink.record(
-        "integration.viewer_label_rgb",
-        explore::DETAIL_LABELS_ID,
-        "actual-iced-label",
-        [
-            f64::from(category),
-            f64::from(color.r),
-            f64::from(color.g),
-            f64::from(color.b),
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.viewer_label_catalog",
-        explore::DETAIL_LABELS_ID,
-        "full-native-catalog",
-        [
-            f64::from(category),
-            catalog_count as f64,
-            f64::from(u8::from(overlay.showboxes)),
-            f64::from(u8::from(overlay.showmasks)),
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.viewer_label_frame",
-        explore::DETAIL_LABELS_ID,
-        if detail {
-            "exact-scene-product"
-        } else {
-            "gallery-atlas"
-        },
-        [
-            frame.presentation_revision as f64,
-            frame.content_sequence as f64,
-            frame.content_session as f64,
-            f64::from(u8::from(overlay.showboxes)),
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.viewer_label_rgb",
+            explore::DETAIL_LABELS_ID,
+            "actual-iced-label",
+            [
+                f64::from(category),
+                f64::from(color.r),
+                f64::from(color.g),
+                f64::from(color.b),
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.viewer_label_catalog",
+            explore::DETAIL_LABELS_ID,
+            "full-native-catalog",
+            [
+                f64::from(category),
+                catalog_count as f64,
+                f64::from(u8::from(overlay.showboxes)),
+                f64::from(u8::from(overlay.showmasks)),
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.viewer_label_frame",
+            explore::DETAIL_LABELS_ID,
+            if detail {
+                "exact-scene-product"
+            } else {
+                "gallery-atlas"
+            },
+            [
+                frame.presentation_revision as f64,
+                frame.content_sequence as f64,
+                frame.content_session as f64,
+                f64::from(u8::from(overlay.showboxes)),
+            ],
+        )
+    });
 }
 pub const EXPLORE_AUGMENTATION_TOGGLE: &str = explore::AUGMENTATION_TOGGLE_ID;
 pub const EXPLORE_AUGMENTATION_REROLL: &str = explore::AUGMENTATION_REROLL_ID;
@@ -281,9 +295,15 @@ pub enum ProbeOutcome {
 impl ProbeOutcome {
     #[cfg(any(target_arch = "wasm32", test))]
     fn decode(status: Option<&str>, values: [Option<f64>; 2]) -> Self {
-        let [Some(first), Some(second)] = values else { return Self::Failed; };
-        if ![first, second].into_iter().all(|value| value.is_finite() && value >= 0.0
-            && value <= f64::from(u32::MAX) && value.fract() == 0.0) {
+        let [Some(first), Some(second)] = values else {
+            return Self::Failed;
+        };
+        if ![first, second].into_iter().all(|value| {
+            value.is_finite()
+                && value >= 0.0
+                && value <= f64::from(u32::MAX)
+                && value.fract() == 0.0
+        }) {
             return Self::Failed;
         }
         match status {
@@ -356,8 +376,13 @@ impl ScenarioOutput {
         message: Message,
     ) -> Result<(), iced::futures::channel::mpsc::TrySendError<Message>> {
         let message = if let Some(owner) = &self.probe {
-            Message::ProbeCompleted { owner: owner.clone(), message: Box::new(message) }
-        } else { message };
+            Message::ProbeCompleted {
+                owner: owner.clone(),
+                message: Box::new(message),
+            }
+        } else {
+            message
+        };
         self.sender.try_send(Message::Scoped {
             generation: self.generation,
             receipt: self.receipt.clone(),
@@ -440,7 +465,9 @@ fn reset_observer() -> u64 {
             output.receipt = None;
             output.probe = None;
             #[cfg(target_arch = "wasm32")]
-            { output.canvas_probe = wasm_bindgen::JsValue::UNDEFINED; }
+            {
+                output.canvas_probe = wasm_bindgen::JsValue::UNDEFINED;
+            }
             output
         });
         let subscription = observer.subscription.take();
@@ -459,10 +486,13 @@ fn current_receipt(control: &str) -> Option<ProbeReceipt> {
 }
 
 fn probe_output(control: &str) -> Option<ScenarioOutput> {
-    let mut output = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output_for(control).cloned())?;
+    let mut output = SURFACE_DRAW_OBSERVER
+        .with(|observer| observer.borrow_mut().output_for(control).cloned())?;
     output.probe = Some(std::sync::Arc::new(()));
     #[cfg(target_arch = "wasm32")]
-    { output.canvas_probe = capture_probe_js(control); }
+    {
+        output.canvas_probe = capture_probe_js(control);
+    }
     Some(output)
 }
 
@@ -471,7 +501,11 @@ fn atlas_probe_output(composition: bool) -> Option<ScenarioOutput> {
     let output = probe_output(EXPLORE_GALLERY)?;
     SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
-        let pending = if composition { &mut observer.atlas_composition_owner } else { &mut observer.atlas_pixels_owner };
+        let pending = if composition {
+            &mut observer.atlas_composition_owner
+        } else {
+            &mut observer.atlas_pixels_owner
+        };
         *pending = output.probe.clone();
     });
     Some(output)
@@ -506,12 +540,19 @@ pub(crate) fn record_probe_draw(
         };
         #[cfg(target_arch = "wasm32")]
         if let Some(frame) = surface.frame {
-            receipt_js(control, &format!("{receipt:?}"), frame.content_sequence as f64,
-                frame.presentation_revision as f64);
+            receipt_js(
+                control,
+                &format!("{receipt:?}"),
+                frame.content_sequence as f64,
+                frame.presentation_revision as f64,
+            );
         }
         if observer.receipts.get(control) != Some(&receipt) {
             match control {
-                EXPLORE_GALLERY => { observer.gallery = None; observer.atlas = None; }
+                EXPLORE_GALLERY => {
+                    observer.gallery = None;
+                    observer.atlas = None;
+                }
                 explore::DETAIL_WORKSPACE_ID => observer.viewer = None,
                 crate::view::workspace::STABLE_ID => observer.identity = (0, 0),
                 _ => {}
@@ -588,9 +629,14 @@ fn locate(control: String, generation: u64) -> Task<RootMessage> {
         bounds: None,
     })
     .map(move |bounds| {
-        RootMessage::Integration(Message::Scoped { generation, receipt: None, message: Box::new(Message::Located {
-            control: target.clone(), bounds,
-        }) })
+        RootMessage::Integration(Message::Scoped {
+            generation,
+            receipt: None,
+            message: Box::new(Message::Located {
+                control: target.clone(),
+                bounds,
+            }),
+        })
     })
 }
 
@@ -919,10 +965,9 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
         cards[card_count] = label.compiledindex;
         card_count += 1;
         let start = count;
-        for (kind, (relative_x, relative_y)) in
-            [(0.2, 0.7), (0.5, 0.5), (0.0, 0.7), (-0.25, 0.7)]
-                .into_iter()
-                .enumerate()
+        for (kind, (relative_x, relative_y)) in [(0.2, 0.7), (0.5, 0.5), (0.0, 0.7), (-0.25, 0.7)]
+            .into_iter()
+            .enumerate()
         {
             if count + 10 > points.len() {
                 break;
@@ -1005,8 +1050,11 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
     let cell = draw.image.width / columns as f32;
     let first_row = ((draw.clip.y - draw.image.y) / cell - 0.5).ceil().max(0.0);
     let y = draw.image.y + (first_row + 0.5) * cell;
-    let centers = [draw.image.x + 1.5, draw.image.x + cell + 0.5,
-        draw.image.x + draw.image.width - 1.5];
+    let centers = [
+        draw.image.x + 1.5,
+        draw.image.x + cell + 0.5,
+        draw.image.x + draw.image.width - 1.5,
+    ];
     for (edge, center) in centers.into_iter().enumerate() {
         let offsets: &[f32] = match edge {
             0 => &[-1.0, 0.0, 1.0, 2.0],
@@ -1015,17 +1063,37 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
         };
         for &offset in offsets {
             let point = iced::Point::new(center + offset, y);
-            if !draw.clip.contains(point) || !draw.image.contains(point) { return None; }
-            let color = if offset.abs() == 2.0 { [48.0, 80.0, 112.0] }
-                else if offset == 0.0 { [255.0; 3] } else { [0.0; 3] };
+            if !draw.clip.contains(point) || !draw.image.contains(point) {
+                return None;
+            }
+            let color = if offset.abs() == 2.0 {
+                [48.0, 80.0, 112.0]
+            } else if offset == 0.0 {
+                [255.0; 3]
+            } else {
+                [0.0; 3]
+            };
             points[count..count + 10].copy_from_slice(&[
-                point.x - draw.image.x, point.y - draw.image.y, point.x, point.y,
-                color[0], color[1], color[2], 255.0, 4.0, 0.0,
+                point.x - draw.image.x,
+                point.y - draw.image.y,
+                point.x,
+                point.y,
+                color[0],
+                color[1],
+                color[2],
+                255.0,
+                4.0,
+                0.0,
             ]);
             count += 10;
         }
     }
-    Some(AtlasCompositionSamples { points, count, cards, card_count })
+    Some(AtlasCompositionSamples {
+        points,
+        count,
+        cards,
+        card_count,
+    })
 }
 
 fn sample_atlas_composition(draw: &AtlasDraw) {
@@ -1034,20 +1102,17 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
         if !crate::presentation_surface::pixel_trace::enabled() {
             return;
         }
-        let Some(samples) = atlas_composition_samples(draw) else { return; };
+        let Some(samples) = atlas_composition_samples(draw) else {
+            return;
+        };
         let frame = draw.surface.frame.expect("sampleable atlas composition");
-        let Some(mut output) =
-            atlas_probe_output(true)
-        else {
+        let Some(mut output) = atlas_probe_output(true) else {
             return;
         };
         let receipt = draw.clone();
         let canvas_probe = output.canvas_probe.clone();
         let completed = pixel_result_callback(move |outcome| {
-            let _ = output.try_send(Message::AtlasComposition {
-                receipt,
-                outcome,
-            });
+            let _ = output.try_send(Message::AtlasComposition { receipt, outcome });
         });
         atlas_composition_js(
             &canvas_probe,
@@ -1080,12 +1145,26 @@ fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'static) -> wasm
     // JsValue parameters keep malformed adapter values observable before conversion.
     let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
     wasm_bindgen::closure::Closure::once_into_js(
-        move |status: wasm_bindgen::JsValue, first: wasm_bindgen::JsValue, second: wasm_bindgen::JsValue| {
-            if SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation) != generation || !reporting_enabled() { return; }
+        move |status: wasm_bindgen::JsValue,
+              first: wasm_bindgen::JsValue,
+              second: wasm_bindgen::JsValue| {
+            if SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation) != generation
+                || !reporting_enabled()
+            {
+                return;
+            }
             let status = status.as_string();
-            let outcome = ProbeOutcome::decode(status.as_deref(), [first.as_f64(), second.as_f64()]);
+            let outcome =
+                ProbeOutcome::decode(status.as_deref(), [first.as_f64(), second.as_f64()]);
             if outcome == ProbeOutcome::Failed && status.as_deref() != Some("failed") {
-                reporting::emit(|sink| sink.record("integration.failure", "", "pixel callback returned invalid counts", [0.0; 4]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.failure",
+                        "",
+                        "pixel callback returned invalid counts",
+                        [0.0; 4],
+                    )
+                });
             }
             completed(outcome);
         },
@@ -1102,7 +1181,11 @@ fn sample_upscale_pixels(
 ) {
     let canvas_probe = output.canvas_probe.clone();
     let completed = pixel_result_callback(move |outcome| {
-        let _ = output.try_send(Message::UpscalePixels { source, presentation, outcome });
+        let _ = output.try_send(Message::UpscalePixels {
+            source,
+            presentation,
+            outcome,
+        });
     });
     upscale_pixels_js(
         &canvas_probe,
@@ -1125,15 +1208,24 @@ fn sample_upscale_pixels(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn sample_upscale_pixels(_output: ScenarioOutput, _image: Rectangle, _button: Rectangle, _source: u64, _presentation: u64) {}
+fn sample_upscale_pixels(
+    _output: ScenarioOutput,
+    _image: Rectangle,
+    _button: Rectangle,
+    _source: u64,
+    _presentation: u64,
+) {
+}
 
 pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str) {
-    reporting::emit(|sink| sink.record(
-        "integration.snapshot_conflict",
-        family,
-        fields,
-        [revision as f64, 0.0, 0.0, 0.0],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.snapshot_conflict",
+            family,
+            fields,
+            [revision as f64, 0.0, 0.0, 0.0],
+        )
+    });
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1155,55 +1247,63 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
     let visibility = u8::from(snapshot.overlay.showboxes)
         | (u8::from(snapshot.overlay.showmasks) << 1)
         | (u8::from(snapshot.overlay.showlabels) << 2);
-    reporting::emit(|sink| sink.record(
-        "integration.atlas_geometry",
-        EXPLORE_GALLERY,
-        "uniform-square",
-        [
-            frame.presentation_revision as f64,
-            frame.content_sequence as f64,
-            (image.width / snapshot.viewport.columns.max(1) as f32) as f64,
-            (image.height / snapshot.viewport.rowcount.max(1) as f32) as f64,
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.atlas_scale",
-        EXPLORE_GALLERY,
-        "source-to-screen",
-        [
-            frame.presentation_revision as f64,
-            frame.content_sequence as f64,
-            (image.width / frame.content_width.max(1) as f32) as f64,
-            (image.height / frame.content_height.max(1) as f32) as f64,
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.atlas_clip",
-        EXPLORE_GALLERY,
-        "scrollable-clip",
-        [
-            frame.presentation_revision as f64,
-            frame.content_sequence as f64,
-            (clip.y - image.y) as f64,
-            (image.y + image.height - clip.y - clip.height) as f64,
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.atlas_visibility",
-        EXPLORE_GALLERY,
-        if dark { "dark" } else { "light" },
-        [
-            frame.content_sequence as f64,
-            visibility as f64,
-            snapshot
-                .gallery
-                .slots
-                .iter()
-                .filter(|ready| **ready)
-                .count() as f64,
-            snapshot.gallery.slots.len() as f64,
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.atlas_geometry",
+            EXPLORE_GALLERY,
+            "uniform-square",
+            [
+                frame.presentation_revision as f64,
+                frame.content_sequence as f64,
+                (image.width / snapshot.viewport.columns.max(1) as f32) as f64,
+                (image.height / snapshot.viewport.rowcount.max(1) as f32) as f64,
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.atlas_scale",
+            EXPLORE_GALLERY,
+            "source-to-screen",
+            [
+                frame.presentation_revision as f64,
+                frame.content_sequence as f64,
+                (image.width / frame.content_width.max(1) as f32) as f64,
+                (image.height / frame.content_height.max(1) as f32) as f64,
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.atlas_clip",
+            EXPLORE_GALLERY,
+            "scrollable-clip",
+            [
+                frame.presentation_revision as f64,
+                frame.content_sequence as f64,
+                (clip.y - image.y) as f64,
+                (image.y + image.height - clip.y - clip.height) as f64,
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.atlas_visibility",
+            EXPLORE_GALLERY,
+            if dark { "dark" } else { "light" },
+            [
+                frame.content_sequence as f64,
+                visibility as f64,
+                snapshot
+                    .gallery
+                    .slots
+                    .iter()
+                    .filter(|ready| **ready)
+                    .count() as f64,
+                snapshot.gallery.slots.len() as f64,
+            ],
+        )
+    });
     let new_draw = SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
         let same_rendered_draw = observer.atlas.as_ref().is_some_and(|previous| {
@@ -1249,8 +1349,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
 fn sample_atlas_pixels(draw: AtlasDraw) {
     let rectangles = atlas_pixel_rectangles(&draw);
     let frame = draw.surface.frame.expect("drawn atlas publication");
-    let Some(mut output) = atlas_probe_output(false)
-    else {
+    let Some(mut output) = atlas_probe_output(false) else {
         return;
     };
     let canvas_probe = output.canvas_probe.clone();
@@ -1310,29 +1409,33 @@ pub(crate) fn report_surface_draw(
     count: u64,
     viewer: ViewerDraw,
 ) {
-    reporting::emit(|sink| sink.record(
-        "integration.surface_draw",
-        control,
-        if redraw { "redraw" } else { "draw" },
-        [
-            revision as f64,
-            source_revision as f64,
-            content_width as f64,
-            content_height as f64,
-        ],
-    ));
-    if control == explore::DETAIL_WORKSPACE_ID {
-        reporting::emit(|sink| sink.record(
-            "integration.viewer_sample",
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_draw",
             control,
-            "actual-draw",
+            if redraw { "redraw" } else { "draw" },
             [
-                viewer.crop[2] as f64,
-                viewer.crop[3] as f64,
-                viewer.image.width as f64,
-                viewer.image.height as f64,
+                revision as f64,
+                source_revision as f64,
+                content_width as f64,
+                content_height as f64,
             ],
-        ));
+        )
+    });
+    if control == explore::DETAIL_WORKSPACE_ID {
+        reporting::emit(|sink| {
+            sink.record(
+                "integration.viewer_sample",
+                control,
+                "actual-draw",
+                [
+                    viewer.crop[2] as f64,
+                    viewer.crop[3] as f64,
+                    viewer.image.width as f64,
+                    viewer.image.height as f64,
+                ],
+            )
+        });
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             let identity = (revision, source_revision, viewer);
@@ -1352,17 +1455,19 @@ pub(crate) fn report_surface_draw(
             }
         });
     }
-    reporting::emit(|sink| sink.record(
-        "integration.surface_draw_ordinal",
-        control,
-        if redraw { "redraw" } else { "draw" },
-        [
-            revision as f64,
-            source_revision as f64,
-            count as f64,
-            if redraw { 1.0 } else { 0.0 },
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_draw_ordinal",
+            control,
+            if redraw { "redraw" } else { "draw" },
+            [
+                revision as f64,
+                source_revision as f64,
+                count as f64,
+                if redraw { 1.0 } else { 0.0 },
+            ],
+        )
+    });
     if control == EXPLORE_GALLERY {
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
@@ -1415,17 +1520,19 @@ pub(crate) fn report_surface_sync(
             |surface| format!("{:016x}{:016x}", surface.high, surface.low),
         )
     };
-    reporting::emit(|sink| sink.record(
-        "integration.surface_sync",
-        &identity(current),
-        &identity(updated),
-        [
-            current.map_or(0.0, |surface| surface.generation as f64),
-            updated.map_or(0.0, |surface| surface.generation as f64),
-            updated.map_or(0.0, |surface| surface.width as f64),
-            updated.map_or(0.0, |surface| surface.height as f64),
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_sync",
+            &identity(current),
+            &identity(updated),
+            [
+                current.map_or(0.0, |surface| surface.generation as f64),
+                updated.map_or(0.0, |surface| surface.generation as f64),
+                updated.map_or(0.0, |surface| surface.width as f64),
+                updated.map_or(0.0, |surface| surface.height as f64),
+            ],
+        )
+    });
 }
 
 pub(crate) fn report_surface_geometry(
@@ -1434,17 +1541,19 @@ pub(crate) fn report_surface_geometry(
     source_revision: u64,
     geometry: Rectangle,
 ) {
-    reporting::emit(|sink| sink.record(
-        "integration.surface_geometry",
-        control,
-        "shader-viewport",
-        [
-            revision as f64,
-            source_revision as f64,
-            f64::from(geometry.width),
-            f64::from(geometry.height),
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_geometry",
+            control,
+            "shader-viewport",
+            [
+                revision as f64,
+                source_revision as f64,
+                f64::from(geometry.width),
+                f64::from(geometry.height),
+            ],
+        )
+    });
 }
 
 pub(crate) fn report_surface_container(
@@ -1455,28 +1564,32 @@ pub(crate) fn report_surface_container(
     content_width: u32,
     content_height: u32,
 ) {
-    reporting::emit(|sink| sink.record(
-        "integration.surface_container",
-        control,
-        "rendered-contain-container",
-        [
-            revision as f64,
-            source_revision as f64,
-            f64::from(bounds.width),
-            f64::from(bounds.height),
-        ],
-    ));
-    reporting::emit(|sink| sink.record(
-        "integration.surface_content",
-        control,
-        "exported-native-frame",
-        [
-            revision as f64,
-            source_revision as f64,
-            content_width as f64,
-            content_height as f64,
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_container",
+            control,
+            "rendered-contain-container",
+            [
+                revision as f64,
+                source_revision as f64,
+                f64::from(bounds.width),
+                f64::from(bounds.height),
+            ],
+        )
+    });
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_content",
+            control,
+            "exported-native-frame",
+            [
+                revision as f64,
+                source_revision as f64,
+                content_width as f64,
+                content_height as f64,
+            ],
+        )
+    });
 }
 
 pub(crate) fn report_surface_scale(
@@ -1485,26 +1598,30 @@ pub(crate) fn report_surface_scale(
     source_revision: u64,
     scale: f32,
 ) {
-    reporting::emit(|sink| sink.record(
-        "integration.surface_scale",
-        control,
-        "physical-to-logical",
-        [
-            revision as f64,
-            source_revision as f64,
-            f64::from(scale),
-            f64::from(scale),
-        ],
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.surface_scale",
+            control,
+            "physical-to-logical",
+            [
+                revision as f64,
+                source_revision as f64,
+                f64::from(scale),
+                f64::from(scale),
+            ],
+        )
+    });
 }
 
 pub(crate) fn report_annotation_gesture(detail: &str, values: [f64; 4]) {
-    reporting::emit(|sink| sink.record(
-        "integration.annotation_gesture",
-        ANNOTATION_SURFACE,
-        detail,
-        values,
-    ));
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.annotation_gesture",
+            ANNOTATION_SURFACE,
+            detail,
+            values,
+        )
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2215,10 +2332,20 @@ impl SessionInputs {
     fn scenario(&self, index: usize) -> Option<(&'static str, bool)> {
         match self.profile.as_str() {
             "retained" => [
-                ("square", false), ("", false), ("wide", false), ("tall", false),
-                ("semantics", false), ("copy", false), ("copy", true), ("rapid", false),
-            ].get(index).copied(),
-            "dpi" => [("copy", false), ("copy", true), ("rapid", true)].get(index).copied(),
+                ("square", false),
+                ("", false),
+                ("wide", false),
+                ("tall", false),
+                ("semantics", false),
+                ("copy", false),
+                ("copy", true),
+                ("rapid", false),
+            ]
+            .get(index)
+            .copied(),
+            "dpi" => [("copy", false), ("copy", true), ("rapid", true)]
+                .get(index)
+                .copied(),
             "terminal" => [("terminal", false)].get(index).copied(),
             _ => None,
         }
@@ -2508,7 +2635,12 @@ impl Controller {
         Ok(())
     }
 
-    pub(crate) fn configure_session(&mut self, profile: &str, square_source: String, square_compiled: String) {
+    pub(crate) fn configure_session(
+        &mut self,
+        profile: &str,
+        square_source: String,
+        square_compiled: String,
+    ) {
         self.session = SessionInputs {
             profile: profile.into(),
             source: self.dataset_source.clone(),
@@ -2528,7 +2660,10 @@ impl Controller {
         }
     }
 
-    pub(crate) fn receive_control(&mut self, receipt: crate::generated::IntegrationControlReceipt) -> Result<(), &'static str> {
+    pub(crate) fn receive_control(
+        &mut self,
+        receipt: crate::generated::IntegrationControlReceipt,
+    ) -> Result<(), &'static str> {
         if receipt.kind != crate::generated::IntegrationControlKind::Advance
             || self.control_sequence.checked_add(1) != Some(receipt.sequence)
             || !matches!(self.phase, Phase::Complete)
@@ -2552,7 +2687,12 @@ impl Controller {
             return Err("advance beyond the configured workflow");
         };
         let session = self.session.clone();
-        self.reset_scenario(session.source.clone(), session.compiled.clone(), "512".into(), scenario.into())?;
+        self.reset_scenario(
+            session.source.clone(),
+            session.compiled.clone(),
+            "512".into(),
+            scenario.into(),
+        )?;
         self.session = session;
         self.control_sequence = receipt.sequence;
         self.desired_dark = Some(dark);
@@ -2560,11 +2700,15 @@ impl Controller {
         Ok(())
     }
 
-    pub(crate) fn publish_control(&mut self, connection: &mut crate::transport_connection::Connection) {
+    pub(crate) fn publish_control(
+        &mut self,
+        connection: &mut crate::transport_connection::Connection,
+    ) {
         if self.generation == 0 || self.control_phase.as_ref() == Some(&self.phase) {
             return;
         }
-        if self.viewer_scenario == "quiet" && matches!(self.phase, Phase::Complete)
+        if self.viewer_scenario == "quiet"
+            && matches!(self.phase, Phase::Complete)
             && !connection.integration_pressure_settled()
         {
             return;
@@ -2581,12 +2725,18 @@ impl Controller {
             "work" => 2,
             _ => 3,
         };
-        let Some(progress) = self.control_progress.checked_add(4).and_then(|value| value.checked_add(class)) else {
+        let Some(progress) = self
+            .control_progress
+            .checked_add(4)
+            .and_then(|value| value.checked_add(class))
+        else {
             self.fail("integration progress identity exhausted");
             return;
         };
         match connection.send_integration_control(crate::generated::IntegrationControlReceipt {
-            kind, sequence: self.control_sequence, progress,
+            kind,
+            sequence: self.control_sequence,
+            progress,
         }) {
             Ok(_) => {
                 self.control_phase = Some(self.phase.clone());
@@ -2797,11 +2947,19 @@ impl Controller {
         self.arm_scrolled(advanced_field_id(index), RelativeOffset::END)
     }
 
-    fn prepare_upscale_probe(&mut self, image: Rectangle, source: u64, presentation: u64) -> Option<ScenarioOutput> {
+    fn prepare_upscale_probe(
+        &mut self,
+        image: Rectangle,
+        source: u64,
+        presentation: u64,
+    ) -> Option<ScenarioOutput> {
         let output = probe_output(explore::DETAIL_WORKSPACE_ID)?;
         let receipt = output.receipt.as_ref()?;
         let frame = receipt.surface.frame?;
-        if receipt.image != image || frame.content_sequence != source || frame.presentation_revision != presentation {
+        if receipt.image != image
+            || frame.content_sequence != source
+            || frame.presentation_revision != presentation
+        {
             return None;
         }
         self.upscale_pixel_owner = output.probe.clone();
@@ -2811,23 +2969,47 @@ impl Controller {
     }
 
     fn prepare_control_probe(&mut self) -> bool {
-        if self.location_pending { return false; }
-        let Some(output) = probe_output("workflow.visual.workspace") else { return false; };
+        if self.location_pending {
+            return false;
+        }
+        let Some(output) = probe_output("workflow.visual.workspace") else {
+            return false;
+        };
         self.control_probe_owner = output.probe.clone();
         self.control_probe_receipt = output.receipt.clone();
         self.control_probe = Some(ControlProbe {
-            output, color: self.copy_swatch_color, available: self.copy_capability_available,
+            output,
+            color: self.copy_swatch_color,
+            available: self.copy_capability_available,
         });
         true
     }
 
-    fn prepare_annotation_probe(&mut self, source: u64, presentation: u64, extent: [u32; 2], pixels: Vec<f64>) -> bool {
-        if self.location_pending { return false; }
-        let Some(output) = probe_output("workflow.visual.workspace") else { return false; };
-        if self.annotation_pixels_pending == output.receipt { return false; }
+    fn prepare_annotation_probe(
+        &mut self,
+        source: u64,
+        presentation: u64,
+        extent: [u32; 2],
+        pixels: Vec<f64>,
+    ) -> bool {
+        if self.location_pending {
+            return false;
+        }
+        let Some(output) = probe_output("workflow.visual.workspace") else {
+            return false;
+        };
+        if self.annotation_pixels_pending == output.receipt {
+            return false;
+        }
         self.annotation_pixels_owner = output.probe.clone();
         self.annotation_pixels_pending = output.receipt.clone();
-        self.annotation_probe = Some(AnnotationProbe { output, source, presentation, extent, pixels });
+        self.annotation_probe = Some(AnnotationProbe {
+            output,
+            source,
+            presentation,
+            extent,
+            pixels,
+        });
         true
     }
 
@@ -2841,24 +3023,47 @@ impl Controller {
             return false;
         }
         match message {
-            Message::Scoped { generation, receipt, message } => {
+            Message::Scoped {
+                generation,
+                receipt,
+                message,
+            } => {
                 let (probe, message) = match message.as_ref() {
                     Message::ProbeCompleted { owner, message } => (Some(owner), message.as_ref()),
                     message => (None, message),
                 };
                 *generation == self.generation
-                    && *generation == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+                    && *generation
+                        == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
                     && match message {
-                        Message::UpscalePixels { .. } => same_probe(&self.upscale_pixel_owner, probe),
-                        Message::AnnotationControlPixels { .. } | Message::AnnotationPixels { revision: 0, .. } => same_probe(&self.control_probe_owner, probe),
-                        Message::AnnotationPixels { .. } => same_probe(&self.annotation_pixels_owner, probe),
-                        Message::AtlasPixels { .. } => SURFACE_DRAW_OBSERVER.with(|observer| same_probe(&observer.borrow().atlas_pixels_owner, probe)),
-                        Message::AtlasComposition { .. } => SURFACE_DRAW_OBSERVER.with(|observer| same_probe(&observer.borrow().atlas_composition_owner, probe)),
+                        Message::UpscalePixels { .. } => {
+                            same_probe(&self.upscale_pixel_owner, probe)
+                        }
+                        Message::AnnotationControlPixels { .. }
+                        | Message::AnnotationPixels { revision: 0, .. } => {
+                            same_probe(&self.control_probe_owner, probe)
+                        }
+                        Message::AnnotationPixels { .. } => {
+                            same_probe(&self.annotation_pixels_owner, probe)
+                        }
+                        Message::AtlasPixels { .. } => SURFACE_DRAW_OBSERVER.with(|observer| {
+                            same_probe(&observer.borrow().atlas_pixels_owner, probe)
+                        }),
+                        Message::AtlasComposition { .. } => {
+                            SURFACE_DRAW_OBSERVER.with(|observer| {
+                                same_probe(&observer.borrow().atlas_composition_owner, probe)
+                            })
+                        }
                         _ => probe.is_none(),
                     }
                     && match receipt {
                         Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
-                        None => matches!(message, Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered),
+                        None => matches!(
+                            message,
+                            Message::Advance
+                                | Message::Located { .. }
+                                | Message::NumberWheelDelivered
+                        ),
                     }
             }
             Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered => true,
@@ -2871,7 +3076,9 @@ impl Controller {
             return None;
         }
         let (message, request_receipt) = match message {
-            Message::Scoped { message, receipt, .. } => (*message, receipt),
+            Message::Scoped {
+                message, receipt, ..
+            } => (*message, receipt),
             message => (message, None),
         };
         let message = match message {
@@ -2879,25 +3086,37 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
-            Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => return None,
+            Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {
+                return None;
+            }
             Message::NumberWheelDelivered => {
                 if let Phase::AwaitAdvancedSpinnerWheel(index) = self.phase {
                     self.phase = Phase::AdvancedSpinnerWheelVerify(index);
-                    reporting::emit(|sink| sink.record(
-                        "integration.number_wheel_delivered",
-                        &advanced_field_id(index),
-                        "iced-widget-update-complete",
-                        [0.0; 4],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.number_wheel_delivered",
+                            &advanced_field_id(index),
+                            "iced-widget-update-complete",
+                            [0.0; 4],
+                        )
+                    });
                 }
                 return None;
             }
-            Message::UpscalePixels { source, presentation, outcome } => {
-                if self.upscale_pixel_pending != request_receipt { return None; }
+            Message::UpscalePixels {
+                source,
+                presentation,
+                outcome,
+            } => {
+                if self.upscale_pixel_pending != request_receipt {
+                    return None;
+                }
                 self.upscale_pixel_owner = None;
                 match outcome {
                     ProbeOutcome::Invalidated => self.upscale_pixel_pending = None,
-                    ProbeOutcome::Observed(checksum, blue) => self.upscale_pixels = Some((source, presentation, checksum, blue)),
+                    ProbeOutcome::Observed(checksum, blue) => {
+                        self.upscale_pixels = Some((source, presentation, checksum, blue))
+                    }
                     ProbeOutcome::Failed => self.fail("Upscale canvas sampling failed"),
                 }
                 return None;
@@ -2918,7 +3137,9 @@ impl Controller {
                 return None;
             }
             Message::AnnotationControlPixels { outcome } => {
-                if self.control_probe_receipt != request_receipt { return None; }
+                if self.control_probe_receipt != request_receipt {
+                    return None;
+                }
                 self.control_probe_owner = None;
                 match outcome {
                     ProbeOutcome::Invalidated => self.control_probe_receipt = None,
@@ -2928,13 +3149,25 @@ impl Controller {
                 return None;
             }
             Message::AnnotationPixels { revision, outcome } => {
-                let pending = if revision == 0 { &mut self.control_probe_receipt } else { &mut self.annotation_pixels_pending };
-                if *pending != request_receipt { return None; }
+                let pending = if revision == 0 {
+                    &mut self.control_probe_receipt
+                } else {
+                    &mut self.annotation_pixels_pending
+                };
+                if *pending != request_receipt {
+                    return None;
+                }
                 *pending = None;
-                if revision == 0 { self.control_probe_owner = None; } else { self.annotation_pixels_owner = None; }
+                if revision == 0 {
+                    self.control_probe_owner = None;
+                } else {
+                    self.annotation_pixels_owner = None;
+                }
                 match outcome {
                     ProbeOutcome::Invalidated => {}
-                    ProbeOutcome::Observed(expected, matched) if expected != 0 && expected == matched => {
+                    ProbeOutcome::Observed(expected, matched)
+                        if expected != 0 && expected == matched =>
+                    {
                         if revision == 0 {
                             self.control_probe_receipt = request_receipt;
                             self.copy_swatch_ready = true;
@@ -2942,30 +3175,52 @@ impl Controller {
                             self.annotation_pixels_receipt = request_receipt;
                         }
                     }
-                    _ => self.fail("Annotation pixels do not match source geometry and native palette"),
+                    _ => self
+                        .fail("Annotation pixels do not match source geometry and native palette"),
                 }
                 return None;
             }
             Message::AtlasComposition { receipt, outcome } => {
-                SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas_composition_owner = None);
+                SURFACE_DRAW_OBSERVER
+                    .with(|observer| observer.borrow_mut().atlas_composition_owner = None);
                 match outcome {
                     ProbeOutcome::Invalidated => self.invalidate_atlas_draw(),
-                    ProbeOutcome::Observed(expected, matched) if expected != 0 && expected == matched => self.atlas_composition = Some(receipt),
+                    ProbeOutcome::Observed(expected, matched)
+                        if expected != 0 && expected == matched =>
+                    {
+                        self.atlas_composition = Some(receipt)
+                    }
                     ProbeOutcome::Failed => self.fail("Atlas composition canvas sampling failed"),
                     _ => {}
                 }
                 return None;
             }
             Message::AtlasPixels { receipt, outcome } => {
-                SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas_pixels_owner = None);
+                SURFACE_DRAW_OBSERVER
+                    .with(|observer| observer.borrow_mut().atlas_pixels_owner = None);
                 match outcome {
                     ProbeOutcome::Invalidated => self.invalidate_atlas_draw(),
                     ProbeOutcome::Observed(visible, nonblack) => {
-                        reporting::emit(|sink| sink.record("integration.atlas_canvas_pixels", EXPLORE_GALLERY, "visible-tile-interiors",
-                            [receipt.snapshot.frame.revision as f64,
-                             receipt.surface.frame.map_or(0, |frame| frame.presentation_revision) as f64,
-                             visible as f64, nonblack as f64]));
-                        if visible != 0 && visible == nonblack { self.atlas_pixels = Some(receipt); }
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.atlas_canvas_pixels",
+                                EXPLORE_GALLERY,
+                                "visible-tile-interiors",
+                                [
+                                    receipt.snapshot.frame.revision as f64,
+                                    receipt
+                                        .surface
+                                        .frame
+                                        .map_or(0, |frame| frame.presentation_revision)
+                                        as f64,
+                                    visible as f64,
+                                    nonblack as f64,
+                                ],
+                            )
+                        });
+                        if visible != 0 && visible == nonblack {
+                            self.atlas_pixels = Some(receipt);
+                        }
                     }
                     ProbeOutcome::Failed => self.fail("Atlas canvas sampling failed"),
                 }
@@ -2980,17 +3235,19 @@ impl Controller {
                     frame_revision,
                 } = &self.phase
                 {
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_reopen_draw",
-                        EXPLORE_GALLERY,
-                        "physical-gallery-draw",
-                        [
-                            *revision as f64,
-                            *frame_revision as f64,
-                            source_revision as f64,
-                            presentation_revision as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_reopen_draw",
+                            EXPLORE_GALLERY,
+                            "physical-gallery-draw",
+                            [
+                                *revision as f64,
+                                *frame_revision as f64,
+                                source_revision as f64,
+                                presentation_revision as f64,
+                            ],
+                        )
+                    });
                 }
                 self.gallery_drawn = Some((presentation_revision, source_revision));
                 return None;
@@ -3033,12 +3290,14 @@ impl Controller {
             if bounds.width > 0.0 || bounds.height > 0.0 {
                 self.fail("Explore still renders an aspect-ratio selector");
             } else if let Some((presentation, source, _)) = self.viewer_drawn {
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_complete",
-                    "explore.detail.aspect",
-                    &self.viewer_scenario,
-                    [presentation as f64, source as f64, 1.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_complete",
+                        "explore.detail.aspect",
+                        &self.viewer_scenario,
+                        [presentation as f64, source as f64, 1.0, 0.0],
+                    )
+                });
                 self.phase = if self.viewer_scenario == "terminal" {
                     Phase::OpenAnnotation
                 } else {
@@ -3048,16 +3307,19 @@ impl Controller {
             return None;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
-            reporting::emit(|sink| sink.record(
-                "integration.locate_failed",
-                &control,
-                "stable identity absent from rendered tree",
-                [0.0; 4],
-            ));
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.locate_failed",
+                    &control,
+                    "stable identity absent from rendered tree",
+                    [0.0; 4],
+                )
+            });
             self.fail("Iced widget operation could not locate the stable identity");
             return None;
         }
-        self.reporting.observe(|reporting| reporting.located(&self.phase, &control, bounds));
+        self.reporting
+            .observe(|reporting| reporting.located(&self.phase, &control, bounds));
         let expected = match self.phase {
             Phase::SettingsOpen => "navigation.settings".to_owned(),
             Phase::SettingsModal => SETTINGS_MODAL.to_owned(),
@@ -3162,7 +3424,8 @@ impl Controller {
             self.fail("Iced widget operation returned the wrong stable identity");
             return None;
         }
-        self.reporting.observe(|reporting| reporting.style(&control, bounds));
+        self.reporting
+            .observe(|reporting| reporting.style(&control, bounds));
         let input_bounds = crate::presentation_surface::physical_bounds(bounds, self.input_scale);
         match self.phase.clone() {
             Phase::CopyCapability => {
@@ -3175,8 +3438,7 @@ impl Controller {
                         let mut output = probe.output;
                         let canvas_probe = output.canvas_probe.clone();
                         let callback = pixel_result_callback(move |outcome| {
-                            let _ =
-                                output.try_send(Message::AnnotationControlPixels { outcome });
+                            let _ = output.try_send(Message::AnnotationControlPixels { outcome });
                         });
                         annotation_swatch_js(
                             &canvas_probe,
@@ -3219,44 +3481,48 @@ impl Controller {
                 } else {
                     bounds.x >= image.x + image.width && (bounds.y - image.y).abs() <= 1.0
                 };
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_layout_viewport",
-                    "annotation.inspector.scroll",
-                    if self.copy_compact { "compact" } else { "wide" },
-                    [
-                        f64::from(self.copy_viewport_width),
-                        f64::from(self.input_scale),
-                        f64::from(self.copy_requested_scale),
-                        if !bounded {
-                            1.0
-                        } else if !placed {
-                            2.0
-                        } else if stacked != self.copy_compact {
-                            3.0
-                        } else {
-                            0.0
-                        },
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_layout_viewport",
+                        "annotation.inspector.scroll",
+                        if self.copy_compact { "compact" } else { "wide" },
+                        [
+                            f64::from(self.copy_viewport_width),
+                            f64::from(self.input_scale),
+                            f64::from(self.copy_requested_scale),
+                            if !bounded {
+                                1.0
+                            } else if !placed {
+                                2.0
+                            } else if stacked != self.copy_compact {
+                                3.0
+                            } else {
+                                0.0
+                            },
+                        ],
+                    )
+                });
                 if !bounded || !placed || stacked != self.copy_compact {
                     self.fail("Annotation canvas and inspector do not fit the actual viewport");
                     return None;
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_layout",
-                    "annotation.inspector.scroll",
-                    if stacked { "compact" } else { "wide" },
-                    [
-                        f64::from(image.width),
-                        f64::from(bounds.width),
-                        f64::from(self.copy_viewport_width),
-                        f64::from(if stacked {
-                            bounds.y - image.y - image.height
-                        } else {
-                            bounds.x - image.x - image.width
-                        }),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_layout",
+                        "annotation.inspector.scroll",
+                        if stacked { "compact" } else { "wide" },
+                        [
+                            f64::from(image.width),
+                            f64::from(bounds.width),
+                            f64::from(self.copy_viewport_width),
+                            f64::from(if stacked {
+                                bounds.y - image.y - image.height
+                            } else {
+                                bounds.x - image.x - image.width
+                            }),
+                        ],
+                    )
+                });
                 self.copy_inspector_offset =
                     (bounds.y - crate::view::NAVIGATION_HEIGHT - 10.0).max(0.0);
                 self.phase = Phase::CopyLayout(2);
@@ -3305,14 +3571,24 @@ impl Controller {
                         let source = probe.source;
                         let canvas_probe = output.canvas_probe.clone();
                         let callback = pixel_result_callback(move |outcome| {
-                            let _ = output.try_send(Message::AnnotationPixels { revision: source, outcome });
+                            let _ = output.try_send(Message::AnnotationPixels {
+                                revision: source,
+                                outcome,
+                            });
                         });
                         annotation_pixels_js(
                             &canvas_probe,
-                            &[f64::from(input_bounds.x), f64::from(input_bounds.y),
-                              f64::from(input_bounds.width), f64::from(input_bounds.height)],
-                            &probe.extent.map(f64::from), &probe.pixels,
-                            source as f64, probe.presentation as f64, &callback,
+                            &[
+                                f64::from(input_bounds.x),
+                                f64::from(input_bounds.y),
+                                f64::from(input_bounds.width),
+                                f64::from(input_bounds.height),
+                            ],
+                            &probe.extent.map(f64::from),
+                            &probe.pixels,
+                            source as f64,
+                            probe.presentation as f64,
+                            &callback,
                         );
                     }
                 }
@@ -3411,17 +3687,19 @@ impl Controller {
                 None
             }
             Phase::PageRegion { page, index } => {
-                reporting::emit(|sink| sink.record(
-                    "integration.page_region",
-                    region_id(page, index),
-                    crate::view::navigation::label(page),
-                    [
-                        f64::from(bounds.x),
-                        f64::from(bounds.y),
-                        f64::from(bounds.width),
-                        f64::from(bounds.height),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.page_region",
+                        region_id(page, index),
+                        crate::view::navigation::label(page),
+                        [
+                            f64::from(bounds.x),
+                            f64::from(bounds.y),
+                            f64::from(bounds.width),
+                            f64::from(bounds.height),
+                        ],
+                    )
+                });
                 let composition = crate::view::workflow::Composition::new(page, 0.0);
                 if index + 1 < composition.audit_regions().len() {
                     self.phase = Phase::PageRegion {
@@ -3782,17 +4060,19 @@ impl Controller {
                 None
             }
             Phase::AtlasCapacity | Phase::AtlasEmpty => {
-                reporting::emit(|sink| sink.record(
-                    "integration.atlas_notice",
-                    &control,
-                    "rendered-local-outcome",
-                    [
-                        bounds.x as f64,
-                        bounds.y as f64,
-                        bounds.width as f64,
-                        bounds.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_notice",
+                        &control,
+                        "rendered-local-outcome",
+                        [
+                            bounds.x as f64,
+                            bounds.y as f64,
+                            bounds.width as f64,
+                            bounds.height as f64,
+                        ],
+                    )
+                });
                 self.phase = if matches!(self.phase, Phase::AtlasCapacity) {
                     Phase::AtlasRestoreColumns
                 } else {
@@ -3905,17 +4185,19 @@ impl Controller {
                     return None;
                 };
                 let selected = gallery_slot_bounds(input_bounds, columns, slot, self.atlas_clip.0);
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_pointer_scheduled",
-                    EXPLORE_GALLERY,
-                    "reopened-grid-slot",
-                    [
-                        revision as f64,
-                        slot as f64,
-                        f64::from(selected.center_x()),
-                        f64::from(selected.center_y()),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_pointer_scheduled",
+                        EXPLORE_GALLERY,
+                        "reopened-grid-slot",
+                        [
+                            revision as f64,
+                            slot as f64,
+                            f64::from(selected.center_x()),
+                            f64::from(selected.center_y()),
+                        ],
+                    )
+                });
                 self.phase = Phase::AwaitDetailAgain;
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, false) {
                     self.fail("Firefox reopened-gallery click dispatch failed");
@@ -4011,7 +4293,11 @@ impl Controller {
                     gesture[2],
                     gesture[3],
                     self.copy_product_cancel,
-                    if self.viewer_scenario == "quiet" { 160 } else { 1 },
+                    if self.viewer_scenario == "quiet" {
+                        160
+                    } else {
+                        1
+                    },
                 ) == 1;
                 #[cfg(not(target_arch = "wasm32"))]
                 let dispatched = false;
@@ -4087,28 +4373,34 @@ impl Controller {
                 };
                 let selected =
                     gallery_slot_bounds(bounds, columns, expected_slot, self.atlas_clip.0);
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_pointer_inverse",
-                    EXPLORE_GALLERY,
-                    "rendered-grid-slot",
-                    [
-                        expected_slot as f64,
-                        (rows / 2).saturating_mul(columns).saturating_add(columns / 2) as f64,
-                        index as f64,
-                        snapshot_revision as f64,
-                    ],
-                ));
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_pointer_scheduled",
-                    EXPLORE_GALLERY,
-                    "real-canvas-pointer",
-                    [
-                        frame_revision as f64,
-                        expected_slot as f64,
-                        f64::from(selected.x + selected.width * 0.5),
-                        f64::from(selected.y + selected.height * 0.5),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_pointer_inverse",
+                        EXPLORE_GALLERY,
+                        "rendered-grid-slot",
+                        [
+                            expected_slot as f64,
+                            (rows / 2)
+                                .saturating_mul(columns)
+                                .saturating_add(columns / 2) as f64,
+                            index as f64,
+                            snapshot_revision as f64,
+                        ],
+                    )
+                });
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_pointer_scheduled",
+                        EXPLORE_GALLERY,
+                        "real-canvas-pointer",
+                        [
+                            frame_revision as f64,
+                            expected_slot as f64,
+                            f64::from(selected.x + selected.width * 0.5),
+                            f64::from(selected.y + selected.height * 0.5),
+                        ],
+                    )
+                });
                 self.phase = Phase::AwaitDetail(index);
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, frame_revision, false) {
                     self.fail("Firefox click dispatch failed");
@@ -4136,18 +4428,22 @@ impl Controller {
     }
 
     fn advance_to(&mut self, phase: Phase) -> Task<RootMessage> {
-        reporting::emit(|sink| sink.record(
-            "integration.phase_advanced",
-            "",
-            &format!("{phase:?}"),
-            [0.0; 4],
-        ));
+        reporting::emit(|sink| {
+            sink.record(
+                "integration.phase_advanced",
+                "",
+                &format!("{phase:?}"),
+                [0.0; 4],
+            )
+        });
         let reveal_annotation = matches!(phase, Phase::CopyProductWait);
         self.phase = phase;
         // A completed local step has no pending native event to wake its
         // successor. Queue one continuation without requiring another draw.
         let continuation = Task::done(RootMessage::Integration(Message::Scoped {
-            generation: self.generation, receipt: None, message: Box::new(Message::Advance),
+            generation: self.generation,
+            receipt: None,
+            message: Box::new(Message::Advance),
         }));
         if reveal_annotation {
             // The compact inspector scrolls the canvas offscreen. A pixel
@@ -4160,7 +4456,8 @@ impl Controller {
     }
 
     fn report_phase_progress(&self) {
-        self.reporting.observe(|reporting| reporting.phase_progress(&self.phase));
+        self.reporting
+            .observe(|reporting| reporting.phase_progress(&self.phase));
     }
 
     pub fn advance(
@@ -4177,16 +4474,23 @@ impl Controller {
             return Task::none();
         }
         if let Some(dark) = self.desired_dark {
-            let Some(snapshot) = model.settings_snapshot.as_ref() else { return Task::none(); };
-            if settings.has_local_edits() { return Task::none(); }
+            let Some(snapshot) = model.settings_snapshot.as_ref() else {
+                return Task::none();
+            };
+            if settings.has_local_edits() {
+                return Task::none();
+            }
             if snapshot.settingsstate.ui.darkmode != dark {
-                return Task::done(RootMessage::Settings(crate::view::settings::Message::DarkModeChanged(dark)));
+                return Task::done(RootMessage::Settings(
+                    crate::view::settings::Message::DarkModeChanged(dark),
+                ));
             }
             self.desired_dark = None;
         }
         self.input_scale = applied_scale;
         self.observe_presentation(model, frame);
-        self.reporting.observe(|reporting| reporting.explore_snapshot(model, settings));
+        self.reporting
+            .observe(|reporting| reporting.explore_snapshot(model, settings));
         if let Some(error) = model.error.as_ref()
             && !matches!(
                 self.phase,
@@ -4311,28 +4615,33 @@ impl Controller {
                         ),
                     ));
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_settings_preserved",
-                    explore::DETAIL_WORKSPACE_ID,
-                    "confirmed-native-settings",
-                    [snapshot.revision as f64, 1.0, 0.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_settings_preserved",
+                        explore::DETAIL_WORKSPACE_ID,
+                        "confirmed-native-settings",
+                        [snapshot.revision as f64, 1.0, 0.0, 0.0],
+                    )
+                });
                 self.viewer_route_persistence =
                     settings.draft.is_some() && model.settings_edit_available();
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_departure_started",
-                    explore::DETAIL_WORKSPACE_ID,
-                    "upscale-observation",
-                    [
-                        model
-                            .upscale_snapshot
-                            .as_ref()
-                            .map_or(0, |state| state.revision) as f64,
-                        u8::from(self.viewer_route_persistence) as f64,
-                        snapshot.revision as f64,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_departure_started",
+                        explore::DETAIL_WORKSPACE_ID,
+                        "upscale-observation",
+                        [
+                            model
+                                .upscale_snapshot
+                                .as_ref()
+                                .map_or(0, |state| state.revision)
+                                as f64,
+                            u8::from(self.viewer_route_persistence) as f64,
+                            snapshot.revision as f64,
+                            0.0,
+                        ],
+                    )
+                });
                 self.phase = Phase::ViewerDepart;
                 Task::done(RootMessage::Settings(crate::view::settings::Message::Close)).chain(
                     Task::done(RootMessage::Workspace(
@@ -4367,32 +4676,37 @@ impl Controller {
                     .as_ref()
                     .map_or(0, |snapshot| snapshot.revision);
                 if crate::presentation_surface::pixel_trace::enabled() {
-                    reporting::emit(|sink| sink.record(
-                        "integration.viewer_route_confirmed",
-                        "navigation.train",
-                        "None",
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.viewer_route_confirmed",
+                            "navigation.train",
+                            "None",
+                            [
+                                self.viewer_continuity_settings_revision as f64,
+                                u8::from(self.viewer_route_persistence) as f64,
+                                1.0,
+                                0.0,
+                            ],
+                        )
+                    });
+                }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_abandoned",
+                        explore::DETAIL_WORKSPACE_ID,
+                        "mapped-route-departure",
                         [
-                            self.viewer_continuity_settings_revision as f64,
-                            u8::from(self.viewer_route_persistence) as f64,
-                            1.0,
+                            model
+                                .upscale_snapshot
+                                .as_ref()
+                                .map_or(0, |state| state.revision)
+                                as f64,
+                            0.0,
+                            0.0,
                             0.0,
                         ],
-                    ));
-                }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_abandoned",
-                    explore::DETAIL_WORKSPACE_ID,
-                    "mapped-route-departure",
-                    [
-                        model
-                            .upscale_snapshot
-                            .as_ref()
-                            .map_or(0, |state| state.revision) as f64,
-                        0.0,
-                        0.0,
-                        0.0,
-                    ],
-                ));
+                    )
+                });
                 self.phase = Phase::ViewerReenter;
                 self.viewer_drawn = None;
                 SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None);
@@ -4461,39 +4775,43 @@ impl Controller {
                     return Task::none();
                 }
                 if crate::presentation_surface::pixel_trace::enabled() {
-                    reporting::emit(|sink| sink.record(
-                        "integration.viewer_route_confirmed",
-                        "navigation.explore",
-                        if model.foreground_visual()
-                            == Some(crate::generated::PresentationSourceKind::Upscale)
-                        {
-                            "Upscale"
-                        } else {
-                            "Explore"
-                        },
-                        [
-                            model
-                                .settings_snapshot
-                                .as_ref()
-                                .map_or(0, |snapshot| snapshot.revision)
-                                as f64,
-                            u8::from(self.viewer_route_persistence) as f64,
-                            1.0,
-                            0.0,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.viewer_route_confirmed",
+                            "navigation.explore",
+                            if model.foreground_visual()
+                                == Some(crate::generated::PresentationSourceKind::Upscale)
+                            {
+                                "Upscale"
+                            } else {
+                                "Explore"
+                            },
+                            [
+                                model
+                                    .settings_snapshot
+                                    .as_ref()
+                                    .map_or(0, |snapshot| snapshot.revision)
+                                    as f64,
+                                u8::from(self.viewer_route_persistence) as f64,
+                                1.0,
+                                0.0,
+                            ],
+                        )
+                    });
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_basic_reentry",
-                    explore::DETAIL_WORKSPACE_ID,
-                    "automatic-completed-draw",
-                    [
-                        upscale.frame.revision as f64,
-                        sampleable.presentation_revision as f64,
-                        upscale.frame.source.instance as f64,
-                        upscale.frame.cleanrevision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_basic_reentry",
+                        explore::DETAIL_WORKSPACE_ID,
+                        "automatic-completed-draw",
+                        [
+                            upscale.frame.revision as f64,
+                            sampleable.presentation_revision as f64,
+                            upscale.frame.source.instance as f64,
+                            upscale.frame.cleanrevision as f64,
+                        ],
+                    )
+                });
                 self.viewer_continuity_request = Some(request.clone());
                 self.phase = Phase::ViewerAwaitDisconnect;
                 // Retiring the real outbound owner closes the worker's socket;
@@ -4545,17 +4863,19 @@ impl Controller {
                 if drawn != sampleable.presentation_revision {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_reconnected",
-                    explore::DETAIL_WORKSPACE_ID,
-                    "matching-completed-draw",
-                    [
-                        source as f64,
-                        drawn as f64,
-                        upscale.frame.source.instance as f64,
-                        upscale.frame.cleanrevision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_reconnected",
+                        explore::DETAIL_WORKSPACE_ID,
+                        "matching-completed-draw",
+                        [
+                            source as f64,
+                            drawn as f64,
+                            upscale.frame.source.instance as f64,
+                            upscale.frame.cleanrevision as f64,
+                        ],
+                    )
+                });
                 self.annotation_sample_baseline = drawn;
                 let (next, control) = match self.viewer_scenario.as_str() {
                     "copy" => (Phase::OpenAnnotation, EXPLORE_ANNOTATE),
@@ -4585,22 +4905,25 @@ impl Controller {
                     && !self.compiled_directory.is_empty()
                     && !self.resolution.is_empty() =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.bootstrap",
-                    "",
-                    "typed-bootstrap",
-                    [
-                        model.window_width.into(),
-                        model.window_height.into(),
-                        0.0,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.bootstrap",
+                        "",
+                        "typed-bootstrap",
+                        [
+                            model.window_width.into(),
+                            model.window_height.into(),
+                            0.0,
+                            0.0,
+                        ],
+                    )
+                });
                 if !self.viewer_scenario.is_empty() {
                     self.phase = Phase::TrainNavigation;
                     return self.arm(crate::view::navigation::stable_id(FeatureId::Train));
                 }
-                self.reporting.observe(|reporting| reporting.bootstrap(model, settings));
+                self.reporting
+                    .observe(|reporting| reporting.bootstrap(model, settings));
                 self.phase = Phase::SettingsOpen;
                 self.arm("navigation.settings")
             }
@@ -4634,17 +4957,19 @@ impl Controller {
                 }
                 if self.ui_scale_first.is_none() {
                     self.ui_scale_first = Some(current);
-                    reporting::emit(|sink| sink.record(
-                        "integration.ui_scale_drag",
-                        SETTINGS_NUMERIC_CONTROLS[0],
-                        "first-position",
-                        [
-                            f64::from(self.ui_scale_baseline),
-                            f64::from(current),
-                            f64::from(applied_scale),
-                            1.0,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.ui_scale_drag",
+                            SETTINGS_NUMERIC_CONTROLS[0],
+                            "first-position",
+                            [
+                                f64::from(self.ui_scale_baseline),
+                                f64::from(current),
+                                f64::from(applied_scale),
+                                1.0,
+                            ],
+                        )
+                    });
                     return Task::none();
                 }
                 if self
@@ -4657,17 +4982,19 @@ impl Controller {
                     self.fail("UI-scale drag did not move the draft beyond 0.85");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.ui_scale_drag",
-                    SETTINGS_NUMERIC_CONTROLS[0],
-                    "second-position",
-                    [
-                        f64::from(self.ui_scale_baseline),
-                        f64::from(current),
-                        f64::from(applied_scale),
-                        2.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.ui_scale_drag",
+                        SETTINGS_NUMERIC_CONTROLS[0],
+                        "second-position",
+                        [
+                            f64::from(self.ui_scale_baseline),
+                            f64::from(current),
+                            f64::from(applied_scale),
+                            2.0,
+                        ],
+                    )
+                });
                 self.phase = Phase::AwaitSettingsScaleRelease;
                 Task::none()
             }
@@ -4691,12 +5018,14 @@ impl Controller {
                             )
                     }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.ui_scale_drag",
-                    SETTINGS_NUMERIC_CONTROLS[0],
-                    "released-and-settled",
-                    ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.ui_scale_drag",
+                        SETTINGS_NUMERIC_CONTROLS[0],
+                        "released-and-settled",
+                        ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
+                    )
+                });
                 self.settings_revision = model
                     .settings_snapshot
                     .as_ref()
@@ -4731,12 +5060,14 @@ impl Controller {
                         )
                     }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.ui_scale_restored",
-                    SETTINGS_NUMERIC_CONTROLS[0],
-                    "baseline",
-                    ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.ui_scale_restored",
+                        SETTINGS_NUMERIC_CONTROLS[0],
+                        "baseline",
+                        ui_scale_evidence(model, settings, self.ui_scale_baseline, applied_scale),
+                    )
+                });
                 self.phase = Phase::SettingsShowFps;
                 self.arm(SETTINGS_SHOW_FPS)
             }
@@ -4787,20 +5118,22 @@ impl Controller {
                         snapshot.settingsstate.ui.showworkspaceperformance == self.show_fps_baseline
                     }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.show_fps",
-                    SETTINGS_SHOW_FPS,
-                    "round-trip",
-                    [
-                        1.0,
-                        1.0,
-                        self.settings_revision as f64,
-                        model
-                            .settings_snapshot
-                            .as_ref()
-                            .map_or(0.0, |snapshot| snapshot.revision as f64),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.show_fps",
+                        SETTINGS_SHOW_FPS,
+                        "round-trip",
+                        [
+                            1.0,
+                            1.0,
+                            self.settings_revision as f64,
+                            model
+                                .settings_snapshot
+                                .as_ref()
+                                .map_or(0.0, |snapshot| snapshot.revision as f64),
+                        ],
+                    )
+                });
                 self.phase = Phase::SettingsNumeric { index: 0, part: 0 };
                 self.arm(settings_numeric_id(0, 0))
             }
@@ -4842,12 +5175,14 @@ impl Controller {
             }
             Phase::AwaitReturnTrain if active == FeatureId::Train => {
                 self.phase = Phase::AdvancedField(0);
-                reporting::emit(|sink| sink.record(
-                    "integration.phase",
-                    &advanced_field_id(0),
-                    "advanced-field-0",
-                    [0.0; 4],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.phase",
+                        &advanced_field_id(0),
+                        "advanced-field-0",
+                        [0.0; 4],
+                    )
+                });
                 self.arm_scrolled(advanced_field_id(0), RelativeOffset::END)
             }
             Phase::AdvancedField(index) => {
@@ -4881,16 +5216,18 @@ impl Controller {
                     self.fail("numeric field allowed wheel mutation");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.spinnerless",
-                    &advanced_field_id(index),
-                    if index == 2 {
-                        "integer-upper-lower-edges"
-                    } else {
-                        "floating-upper-lower-edges"
-                    },
-                    [value, 1.0, 1.0, 1.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.spinnerless",
+                        &advanced_field_id(index),
+                        if index == 2 {
+                            "integer-upper-lower-edges"
+                        } else {
+                            "floating-upper-lower-edges"
+                        },
+                        [value, 1.0, 1.0, 1.0],
+                    )
+                });
                 self.begin_advanced_numeric_edit(model, settings, index)
             }
             Phase::AdvancedNumericEdit(index) => self.arm(advanced_field_id(index)),
@@ -4910,20 +5247,22 @@ impl Controller {
                             .is_some_and(|value| same_numeric_value(value, self.numeric_target))
                     }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.advanced_edit",
-                    &advanced_field_id(index),
-                    if index == 2 { "integer" } else { "floating" },
-                    [
-                        self.numeric_target,
-                        self.settings_revision as f64,
-                        model
-                            .settings_snapshot
-                            .as_ref()
-                            .map_or(0.0, |snapshot| snapshot.revision as f64),
-                        1.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.advanced_edit",
+                        &advanced_field_id(index),
+                        if index == 2 { "integer" } else { "floating" },
+                        [
+                            self.numeric_target,
+                            self.settings_revision as f64,
+                            model
+                                .settings_snapshot
+                                .as_ref()
+                                .map_or(0.0, |snapshot| snapshot.revision as f64),
+                            1.0,
+                        ],
+                    )
+                });
                 self.phase = Phase::AdvancedField(index + 1);
                 self.arm(advanced_field_id(index + 1))
             }
@@ -5036,12 +5375,14 @@ impl Controller {
             }
             Phase::ErrorDismiss => self.arm(ERROR_DISMISS),
             Phase::AwaitErrorDismissed if model.error.is_none() => {
-                reporting::emit(|sink| sink.record(
-                    "integration.error_modal",
-                    ERROR_MODAL,
-                    "copy-and-dismiss",
-                    [1.0, 1.0, 1.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.error_modal",
+                        ERROR_MODAL,
+                        "copy-and-dismiss",
+                        [1.0, 1.0, 1.0, 0.0],
+                    )
+                });
                 self.phase = Phase::TrainCard;
                 self.arm_scrolled(TRAIN_CARD, RelativeOffset::START)
             }
@@ -5104,20 +5445,22 @@ impl Controller {
                             == self.benchmark_baseline
                     }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.benchmark_override",
-                    BENCHMARK_OVERRIDE,
-                    "round-trip",
-                    [
-                        1.0,
-                        1.0,
-                        self.settings_revision as f64,
-                        model
-                            .settings_snapshot
-                            .as_ref()
-                            .map_or(0.0, |snapshot| snapshot.revision as f64),
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.benchmark_override",
+                        BENCHMARK_OVERRIDE,
+                        "round-trip",
+                        [
+                            1.0,
+                            1.0,
+                            self.settings_revision as f64,
+                            model
+                                .settings_snapshot
+                                .as_ref()
+                                .map_or(0.0, |snapshot| snapshot.revision as f64),
+                        ],
+                    )
+                });
                 self.phase = Phase::DatasetSource;
                 self.arm(DATASET_SOURCE)
             }
@@ -5180,12 +5523,14 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.dataset_configured",
-                    COMPILE_RESOLUTION,
-                    "typed-settings",
-                    [snapshot.revision as f64, 1.0, 0.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.dataset_configured",
+                        COMPILE_RESOLUTION,
+                        "typed-settings",
+                        [snapshot.revision as f64, 1.0, 0.0, 0.0],
+                    )
+                });
                 if self.reuse_compiled {
                     self.phase = Phase::ExploreNavigation;
                     self.arm(crate::view::navigation::stable_id(FeatureId::Explore))
@@ -5206,44 +5551,50 @@ impl Controller {
                     && (!dataset.progress.activity.is_empty() || dataset.progress.total != 0)
                     && dataset.progress.droppedinstances != 0
                 {
-                    reporting::emit(|sink| sink.record(
-                        "integration.compile_progress",
-                        COMPILE_PROGRESS,
-                        &dataset.progress.activity,
-                        [
-                            dataset.generation as f64,
-                            dataset.progress.completed as f64,
-                            dataset.progress.total as f64,
-                            dataset.progress.droppedinstances as f64,
-                        ],
-                    ));
-                    reporting::emit(|sink| sink.record(
-                        "integration.compile_metrics",
-                        COMPILE_PROGRESS,
-                        "elapsed-eta-throughput-dropped",
-                        [
-                            dataset.progress.elapsedseconds as f64,
-                            dataset.progress.remainingseconds as f64,
-                            dataset.progress.throughputpersecond as f64,
-                            dataset.progress.droppedinstances as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.compile_progress",
+                            COMPILE_PROGRESS,
+                            &dataset.progress.activity,
+                            [
+                                dataset.generation as f64,
+                                dataset.progress.completed as f64,
+                                dataset.progress.total as f64,
+                                dataset.progress.droppedinstances as f64,
+                            ],
+                        )
+                    });
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.compile_metrics",
+                            COMPILE_PROGRESS,
+                            "elapsed-eta-throughput-dropped",
+                            [
+                                dataset.progress.elapsedseconds as f64,
+                                dataset.progress.remainingseconds as f64,
+                                dataset.progress.throughputpersecond as f64,
+                                dataset.progress.droppedinstances as f64,
+                            ],
+                        )
+                    });
                     self.phase = Phase::CompileProgress;
                     return self.arm(COMPILE_PROGRESS);
                 }
                 if compile_succeeded {
                     let split = dataset.inspection.splits.first();
-                    reporting::emit(|sink| sink.record(
-                        "integration.dataset_complete",
-                        DATASET_STATUS,
-                        &dataset.terminal.artifact,
-                        [
-                            dataset.generation as f64,
-                            split.map_or(0.0, |value| value.imagecount as f64),
-                            split.map_or(0.0, |value| value.width as f64),
-                            split.map_or(0.0, |value| value.height as f64),
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.dataset_complete",
+                            DATASET_STATUS,
+                            &dataset.terminal.artifact,
+                            [
+                                dataset.generation as f64,
+                                split.map_or(0.0, |value| value.imagecount as f64),
+                                split.map_or(0.0, |value| value.width as f64),
+                                split.map_or(0.0, |value| value.height as f64),
+                            ],
+                        )
+                    });
                     self.phase = Phase::DatasetStatus;
                     return self.arm(DATASET_STATUS);
                 }
@@ -5293,34 +5644,41 @@ impl Controller {
                         return Task::none();
                     };
                     if measured.extent != snapshot.viewport.extent {
-                        reporting::emit(|sink| sink.record(
-                            "integration.explore_extent_pending",
-                            EXPLORE_GALLERY,
-                            "measured-native-convergence",
-                            [
-                                measured.extent.width as f64,
-                                measured.extent.height as f64,
-                                snapshot.viewport.extent.width as f64,
-                                snapshot.viewport.extent.height as f64,
-                            ],
-                        ));
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.explore_extent_pending",
+                                EXPLORE_GALLERY,
+                                "measured-native-convergence",
+                                [
+                                    measured.extent.width as f64,
+                                    measured.extent.height as f64,
+                                    snapshot.viewport.extent.width as f64,
+                                    snapshot.viewport.extent.height as f64,
+                                ],
+                            )
+                        });
                         return Task::none();
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_ready",
-                        "",
-                        "",
-                        [
-                            snapshot.dataset.imagecount as f64,
-                            snapshot.dataset.imagewidth as f64,
-                            snapshot.dataset.imageheight as f64,
-                            snapshot.dataset.classnames.len() as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_ready",
+                            "",
+                            "",
+                            [
+                                snapshot.dataset.imagecount as f64,
+                                snapshot.dataset.imagewidth as f64,
+                                snapshot.dataset.imageheight as f64,
+                                snapshot.dataset.classnames.len() as f64,
+                            ],
+                        )
+                    });
                     if self.viewer_scenario == "quiet" {
                         self.selection_grid = Some((
-                            snapshot.viewport.columns, snapshot.viewport.rowcount, 0,
-                            snapshot.revision, snapshot.frame.revision,
+                            snapshot.viewport.columns,
+                            snapshot.viewport.rowcount,
+                            0,
+                            snapshot.revision,
+                            snapshot.frame.revision,
                         ));
                         COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
                         self.phase = Phase::ViewerSelect;
@@ -5339,34 +5697,38 @@ impl Controller {
                     }) else {
                         return Task::none();
                     };
-                    reporting::emit(|sink| sink.record(
-                        "integration.initial_atlas_identity",
-                        EXPLORE_GALLERY,
-                        &format!(
-                            "{:016x}:{:016x}{:016x}",
-                            snapshot.dataset.identity, draw.surface.high, draw.surface.low
-                        ),
-                        [
-                            snapshot.viewport.firstrow as f64,
-                            snapshot.viewport.columns as f64,
-                            snapshot.viewport.extent.width as f64,
-                            snapshot.viewport.extent.height as f64,
-                        ],
-                    ));
-                    reporting::emit(|sink| sink.record(
-                        "integration.initial_atlas_complete",
-                        EXPLORE_GALLERY,
-                        "no-input-canvas-pixels",
-                        [
-                            snapshot.dataset.identity as f64,
-                            snapshot.gallery.generation as f64,
-                            snapshot.frame.revision as f64,
-                            draw.surface
-                                .frame
-                                .map_or(0, |frame| frame.presentation_revision)
-                                as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.initial_atlas_identity",
+                            EXPLORE_GALLERY,
+                            &format!(
+                                "{:016x}:{:016x}{:016x}",
+                                snapshot.dataset.identity, draw.surface.high, draw.surface.low
+                            ),
+                            [
+                                snapshot.viewport.firstrow as f64,
+                                snapshot.viewport.columns as f64,
+                                snapshot.viewport.extent.width as f64,
+                                snapshot.viewport.extent.height as f64,
+                            ],
+                        )
+                    });
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.initial_atlas_complete",
+                            EXPLORE_GALLERY,
+                            "no-input-canvas-pixels",
+                            [
+                                snapshot.dataset.identity as f64,
+                                snapshot.gallery.generation as f64,
+                                snapshot.frame.revision as f64,
+                                draw.surface
+                                    .frame
+                                    .map_or(0, |frame| frame.presentation_revision)
+                                    as f64,
+                            ],
+                        )
+                    });
                     COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
                     if pixel_fixture_enabled() && !self.atlas_fixture_checked {
                         self.atlas_fixture_checked = true;
@@ -5420,21 +5782,23 @@ impl Controller {
                         }
                         return self.arm(EXPLORE_GALLERY);
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_policy",
-                        explore::ORDER_CONTROL_ID,
-                        if snapshot.filter.order == crate::generated::ExploreOrder::Shuffled {
-                            "shuffled"
-                        } else {
-                            "sequential"
-                        },
-                        [
-                            snapshot.filter.minimumcompiledindex as f64,
-                            snapshot.filter.maximumcompiledindex as f64,
-                            snapshot.overlay.classselection.classes.len() as f64,
-                            snapshot.order.shuffleseed as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_policy",
+                            explore::ORDER_CONTROL_ID,
+                            if snapshot.filter.order == crate::generated::ExploreOrder::Shuffled {
+                                "shuffled"
+                            } else {
+                                "sequential"
+                            },
+                            [
+                                snapshot.filter.minimumcompiledindex as f64,
+                                snapshot.filter.maximumcompiledindex as f64,
+                                snapshot.overlay.classselection.classes.len() as f64,
+                                snapshot.order.shuffleseed as f64,
+                            ],
+                        )
+                    });
                     self.sweep_baseline = Some((
                         snapshot.revision,
                         snapshot.viewport.clone(),
@@ -5477,29 +5841,34 @@ impl Controller {
                     snapshot.frame.revision,
                 );
                 if initial_patch {
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_patch_wait",
-                        EXPLORE_GALLERY,
-                        "revision-labels-busy-publication",
-                        [
-                            f64::from(u8::from(revision_pending)),
-                            f64::from(u8::from(initial_overlays_pending)),
-                            f64::from(u8::from(snapshot.busy)),
-                            f64::from(u8::from(sampleable.is_none())),
-                        ],
-                    ));
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_patch_draw",
-                        EXPLORE_GALLERY,
-                        "drawn-and-sampleable-publication",
-                        [
-                            self.gallery_drawn
-                                .map_or(0.0, |(presentation, _)| presentation as f64),
-                            self.gallery_drawn.map_or(0.0, |(_, source)| source as f64),
-                            sampleable.map_or(0.0, |sample| sample.presentation_revision as f64),
-                            sampleable.map_or(0.0, |sample| sample.source_revision as f64),
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_patch_wait",
+                            EXPLORE_GALLERY,
+                            "revision-labels-busy-publication",
+                            [
+                                f64::from(u8::from(revision_pending)),
+                                f64::from(u8::from(initial_overlays_pending)),
+                                f64::from(u8::from(snapshot.busy)),
+                                f64::from(u8::from(sampleable.is_none())),
+                            ],
+                        )
+                    });
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_patch_draw",
+                            EXPLORE_GALLERY,
+                            "drawn-and-sampleable-publication",
+                            [
+                                self.gallery_drawn
+                                    .map_or(0.0, |(presentation, _)| presentation as f64),
+                                self.gallery_drawn.map_or(0.0, |(_, source)| source as f64),
+                                sampleable
+                                    .map_or(0.0, |sample| sample.presentation_revision as f64),
+                                sampleable.map_or(0.0, |sample| sample.source_revision as f64),
+                            ],
+                        )
+                    });
                 }
                 if revision_pending
                     || initial_overlays_pending
@@ -5516,17 +5885,19 @@ impl Controller {
                     self.phase = Phase::ExploreDatasetPane;
                     return self.arm(EXPLORE_DATASET_PANE);
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_initial_patch",
-                    EXPLORE_GALLERY,
-                    "stable-gallery-generation",
-                    [
-                        revision as f64,
-                        snapshot.revision as f64,
-                        frame_revision as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_initial_patch",
+                        EXPLORE_GALLERY,
+                        "stable-gallery-generation",
+                        [
+                            revision as f64,
+                            snapshot.revision as f64,
+                            frame_revision as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 let columns = snapshot.viewport.columns.max(1);
                 let capacity = snapshot.maximumatlasextent.clone();
                 self.oversized_capacity = Some(capacity.clone());
@@ -5566,28 +5937,32 @@ impl Controller {
                     self.fail("oversized Explore measurement did not produce an exact square grid");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_exact_grid",
-                    EXPLORE_GALLERY,
-                    "oversized-logical-fill",
-                    [
-                        snapshot.viewport.extent.width as f64,
-                        snapshot.viewport.extent.height as f64,
-                        columns as f64,
-                        rows as f64,
-                    ],
-                ));
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_exact_grid_capacity",
-                    EXPLORE_GALLERY,
-                    "measured-revision-capacity",
-                    [
-                        snapshot.revision as f64,
-                        snapshot.frame.revision as f64,
-                        capacity.width as f64,
-                        capacity.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_exact_grid",
+                        EXPLORE_GALLERY,
+                        "oversized-logical-fill",
+                        [
+                            snapshot.viewport.extent.width as f64,
+                            snapshot.viewport.extent.height as f64,
+                            columns as f64,
+                            rows as f64,
+                        ],
+                    )
+                });
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_exact_grid_capacity",
+                        EXPLORE_GALLERY,
+                        "measured-revision-capacity",
+                        [
+                            snapshot.revision as f64,
+                            snapshot.frame.revision as f64,
+                            capacity.width as f64,
+                            capacity.height as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::AwaitExploreExactGridPatch {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -5600,21 +5975,23 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_policy_order_arm",
-                    explore::ORDER_SHUFFLED_ID,
-                    "model-availability",
-                    [
-                        snapshot.revision as f64,
-                        if snapshot.busy { 1.0 } else { 0.0 },
-                        if settings.has_local_edits() { 1.0 } else { 0.0 },
-                        if model.explore_mutation_available() {
-                            1.0
-                        } else {
-                            0.0
-                        },
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_policy_order_arm",
+                        explore::ORDER_SHUFFLED_ID,
+                        "model-availability",
+                        [
+                            snapshot.revision as f64,
+                            if snapshot.busy { 1.0 } else { 0.0 },
+                            if settings.has_local_edits() { 1.0 } else { 0.0 },
+                            if model.explore_mutation_available() {
+                                1.0
+                            } else {
+                                0.0
+                            },
+                        ],
+                    )
+                });
                 self.phase = Phase::ExplorePolicyOrder(snapshot.revision);
                 self.arm(explore::ORDER_SHUFFLED_ID)
             }
@@ -5758,17 +6135,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_augmentation",
-                    EXPLORE_AUGMENTATION_TOGGLE,
-                    "enabled-rendered-seed-zero",
-                    [
-                        revision as f64,
-                        snapshot.revision as f64,
-                        frame_revision as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_augmentation",
+                        EXPLORE_AUGMENTATION_TOGGLE,
+                        "enabled-rendered-seed-zero",
+                        [
+                            revision as f64,
+                            snapshot.revision as f64,
+                            frame_revision as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::ExploreAugmentationReroll {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -5791,17 +6170,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_augmentation",
-                    EXPLORE_AUGMENTATION_REROLL,
-                    "rerolled-distinct-seed",
-                    [
-                        revision as f64,
-                        snapshot.revision as f64,
-                        frame_revision as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_augmentation",
+                        EXPLORE_AUGMENTATION_REROLL,
+                        "rerolled-distinct-seed",
+                        [
+                            revision as f64,
+                            snapshot.revision as f64,
+                            frame_revision as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::ExploreReshuffle {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -5839,28 +6220,32 @@ impl Controller {
                     self.fail("Reshuffle did not change the visible gallery order");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_reshuffle",
-                    EXPLORE_RESHUFFLE,
-                    "order-only",
-                    [
-                        shuffle_seed as f64,
-                        snapshot.order.shuffleseed as f64,
-                        augmentation_seed as f64,
-                        snapshot.augmentation.seed as f64,
-                    ],
-                ));
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_patch_baseline",
-                    EXPLORE_CARD,
-                    "reshuffle-placeholder",
-                    [
-                        snapshot.revision as f64,
-                        snapshot.frame.revision as f64,
-                        0.0,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_reshuffle",
+                        EXPLORE_RESHUFFLE,
+                        "order-only",
+                        [
+                            shuffle_seed as f64,
+                            snapshot.order.shuffleseed as f64,
+                            augmentation_seed as f64,
+                            snapshot.augmentation.seed as f64,
+                        ],
+                    )
+                });
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_patch_baseline",
+                        EXPLORE_CARD,
+                        "reshuffle-placeholder",
+                        [
+                            snapshot.revision as f64,
+                            snapshot.frame.revision as f64,
+                            0.0,
+                            0.0,
+                        ],
+                    )
+                });
                 self.phase = Phase::ExploreCard {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
@@ -5888,17 +6273,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_patch_observed",
-                    EXPLORE_CARD,
-                    "post-placeholder-frame",
-                    [
-                        revision as f64,
-                        snapshot.revision as f64,
-                        frame_revision as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_patch_observed",
+                        EXPLORE_CARD,
+                        "post-placeholder-frame",
+                        [
+                            revision as f64,
+                            snapshot.revision as f64,
+                            frame_revision as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.sweep_baseline = Some((
                     snapshot.revision,
                     snapshot.viewport.clone(),
@@ -5924,17 +6311,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_sweep_observed",
-                    EXPLORE_GALLERY,
-                    "typed-viewport",
-                    [
-                        *revision as f64,
-                        snapshot.revision as f64,
-                        snapshot.viewport.extent.width as f64,
-                        snapshot.viewport.extent.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_sweep_observed",
+                        EXPLORE_GALLERY,
+                        "typed-viewport",
+                        [
+                            *revision as f64,
+                            snapshot.revision as f64,
+                            snapshot.viewport.extent.width as f64,
+                            snapshot.viewport.extent.height as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::GalleryLaterReady;
                 Task::none()
             }
@@ -5961,7 +6350,8 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                self.reporting.observe(|reporting| reporting.scroll_placeholder(snapshot));
+                self.reporting
+                    .observe(|reporting| reporting.scroll_placeholder(snapshot));
                 if sampleable_presentation(
                     model,
                     frame,
@@ -5990,17 +6380,19 @@ impl Controller {
                     snapshot.revision,
                     snapshot.frame.revision,
                 ));
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_scrolled",
-                    EXPLORE_GALLERY,
-                    "",
-                    [
-                        baseline as f64,
-                        snapshot.viewport.firstrow as f64,
-                        index as f64,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_scrolled",
+                        EXPLORE_GALLERY,
+                        "",
+                        [
+                            baseline as f64,
+                            snapshot.viewport.firstrow as f64,
+                            index as f64,
+                            0.0,
+                        ],
+                    )
+                });
                 self.phase = Phase::GalleryImage(index);
                 self.arm(EXPLORE_GALLERY)
             }
@@ -6020,39 +6412,45 @@ impl Controller {
                     return Task::none();
                 };
                 if selected != expected {
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_pointer_mismatch",
-                        EXPLORE_GALLERY,
-                        "selected-image",
-                        [
-                            expected as f64,
-                            selected as f64,
-                            snapshot.revision as f64,
-                            snapshot.frame.revision as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_pointer_mismatch",
+                            EXPLORE_GALLERY,
+                            "selected-image",
+                            [
+                                expected as f64,
+                                selected as f64,
+                                snapshot.revision as f64,
+                                snapshot.frame.revision as f64,
+                            ],
+                        )
+                    });
                     self.fail("gallery pointer selection did not match the rendered grid slot");
                     return Task::none();
                 }
                 if let Some((_, _, slot, revision, _)) = self.selection_grid {
-                    reporting::emit(|sink| sink.record(
-                        "integration.explore_pointer_selected",
-                        EXPLORE_GALLERY,
-                        "selected-from-dispatched-pointer",
-                        [
-                            revision as f64,
-                            slot as f64,
-                            f64::from(expected),
-                            f64::from(selected),
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_pointer_selected",
+                            EXPLORE_GALLERY,
+                            "selected-from-dispatched-pointer",
+                            [
+                                revision as f64,
+                                slot as f64,
+                                f64::from(expected),
+                                f64::from(selected),
+                            ],
+                        )
+                    });
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_detail",
-                    "",
-                    "",
-                    [selected as f64, snapshot.frame.revision as f64, 0.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_detail",
+                        "",
+                        "",
+                        [selected as f64, snapshot.frame.revision as f64, 0.0, 0.0],
+                    )
+                });
                 if snapshot.detail.showoriginaldimensions
                     || snapshot.frame.extent.width != snapshot.dataset.imagewidth
                     || snapshot.frame.extent.height != snapshot.dataset.imageheight
@@ -6135,17 +6533,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_detail_source",
-                    EXPLORE_DETAIL_ORIGINAL,
-                    "padded-to-original-sampling",
-                    [
-                        padded_width as f64,
-                        padded_height as f64,
-                        content.width as f64,
-                        content.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_detail_source",
+                        EXPLORE_DETAIL_ORIGINAL,
+                        "padded-to-original-sampling",
+                        [
+                            padded_width as f64,
+                            padded_height as f64,
+                            content.width as f64,
+                            content.height as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::DetailFit;
                 self.arm(explore::DETAIL_FIT_ID)
             }
@@ -6164,12 +6564,14 @@ impl Controller {
                                 == crate::generated::ExploreViewportOutcome::VisibleCapacityExceeded
                         }) =>
             {
-                reporting::emit(|sink| sink.record(
-                    "integration.atlas_capacity",
-                    explore::GALLERY_CAPACITY_ID,
-                    "native-visible-capacity-exceeded",
-                    [1.0, 0.0, 0.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_capacity",
+                        explore::GALLERY_CAPACITY_ID,
+                        "native-visible-capacity-exceeded",
+                        [1.0, 0.0, 0.0, 0.0],
+                    )
+                });
                 self.phase = Phase::AtlasCapacity;
                 self.arm(explore::GALLERY_CAPACITY_ID)
             }
@@ -6255,30 +6657,34 @@ impl Controller {
                     || !gallery_matches
                     || !viewport_matches
                 {
-                    reporting::emit(|sink| sink.record(
-                        "integration.atlas_window_wait",
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.atlas_window_wait",
+                            EXPLORE_GALLERY,
+                            if fullscreen { "fullscreen" } else { "restored" },
+                            [
+                                settled as u8 as f64,
+                                (snapshot.busy || model.has_explore_pending()) as u8 as f64,
+                                gallery_matches as u8 as f64,
+                                viewport_matches as u8 as f64,
+                            ],
+                        )
+                    });
+                    return Task::none();
+                }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_window_draw",
                         EXPLORE_GALLERY,
                         if fullscreen { "fullscreen" } else { "restored" },
                         [
-                            settled as u8 as f64,
-                            (snapshot.busy || model.has_explore_pending()) as u8 as f64,
-                            gallery_matches as u8 as f64,
-                            viewport_matches as u8 as f64,
+                            snapshot.frame.revision as f64,
+                            model.window_width as f64,
+                            model.window_height as f64,
+                            snapshot.viewport.columns as f64,
                         ],
-                    ));
-                    return Task::none();
-                }
-                reporting::emit(|sink| sink.record(
-                    "integration.atlas_window_draw",
-                    EXPLORE_GALLERY,
-                    if fullscreen { "fullscreen" } else { "restored" },
-                    [
-                        snapshot.frame.revision as f64,
-                        model.window_width as f64,
-                        model.window_height as f64,
-                        snapshot.viewport.columns as f64,
-                    ],
-                ));
+                    )
+                });
                 if fullscreen {
                     self.phase = Phase::AwaitAtlasWindow(false);
                     #[cfg(target_arch = "wasm32")]
@@ -6361,17 +6767,19 @@ impl Controller {
                     ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
                     receipt,
                 );
-                reporting::emit(|sink| sink.record(
-                    "integration.atlas_scroll",
-                    EXPLORE_GALLERY,
-                    ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
-                    [
-                        snapshot.frame.revision as f64,
-                        snapshot.viewport.firstrow as f64,
-                        self.atlas_clip.0 as f64,
-                        self.atlas_clip.1 as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_scroll",
+                        EXPLORE_GALLERY,
+                        ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
+                        [
+                            snapshot.frame.revision as f64,
+                            snapshot.viewport.firstrow as f64,
+                            self.atlas_clip.0 as f64,
+                            self.atlas_clip.1 as f64,
+                        ],
+                    )
+                });
                 match stage {
                     0 | 1 => {
                         let rows = 5 - u32::from(stage);
@@ -6440,17 +6848,19 @@ impl Controller {
                         return Task::none();
                     }
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.atlas_checkbox",
-                    overlay_control(index, false),
-                    "rendered-saved-visibility",
-                    [
-                        index as f64,
-                        expected as f64,
-                        snapshot.frame.revision as f64,
-                        snapshot.augmentation.seed as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_checkbox",
+                        overlay_control(index, false),
+                        "rendered-saved-visibility",
+                        [
+                            index as f64,
+                            expected as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.augmentation.seed as f64,
+                        ],
+                    )
+                });
                 self.atlas_baseline = Some((snapshot.frame.revision, snapshot.augmentation.seed));
                 if index == 7 {
                     self.phase = Phase::AwaitAtlasRows {
@@ -6491,17 +6901,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_overlay",
-                    overlay_control(index, true),
-                    "actual-draw",
-                    [
-                        index as f64,
-                        actual as f64,
-                        snapshot.frame.revision as f64,
-                        snapshot.frame.cleanrevision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_overlay",
+                        overlay_control(index, true),
+                        "actual-draw",
+                        [
+                            index as f64,
+                            actual as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.frame.cleanrevision as f64,
+                        ],
+                    )
+                });
                 if index == 8 {
                     self.begin_upscale_series(model, &snapshot.frame)
                 } else {
@@ -6575,17 +6987,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.gallery_no_input_complete",
-                    EXPLORE_GALLERY,
-                    "matching-pixels-and-semantics",
-                    [
-                        snapshot.gallery.generation as f64,
-                        snapshot.gallery.slots.len() as f64,
-                        snapshot.frame.revision as f64,
-                        snapshot.augmentation.seed as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.gallery_no_input_complete",
+                        EXPLORE_GALLERY,
+                        "matching-pixels-and-semantics",
+                        [
+                            snapshot.gallery.generation as f64,
+                            snapshot.gallery.slots.len() as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.augmentation.seed as f64,
+                        ],
+                    )
+                });
                 COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
                 self.selection_grid = Some((
                     snapshot.viewport.columns,
@@ -6631,17 +7045,19 @@ impl Controller {
                     );
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_detail_fit",
-                    explore::DETAIL_FIT_ID,
-                    "centered-contained",
-                    [
-                        drawn.container.width as f64,
-                        drawn.container.height as f64,
-                        drawn.image.width as f64,
-                        drawn.image.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_detail_fit",
+                        explore::DETAIL_FIT_ID,
+                        "centered-contained",
+                        [
+                            drawn.container.width as f64,
+                            drawn.container.height as f64,
+                            drawn.image.width as f64,
+                            drawn.image.height as f64,
+                        ],
+                    )
+                });
                 if self.viewer_scenario == "square" {
                     return self.advance_to(Phase::ViewerSquareBasic);
                 }
@@ -6677,17 +7093,19 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                reporting::emit(|sink| sink.record(
-                    "integration.upscale_action_arm",
-                    EXPLORE_UPSCALE_ACTIONS[0],
-                    "after-detail-fit",
-                    [
-                        0.0,
-                        snapshot.frame.extent.width as f64,
-                        snapshot.frame.extent.height as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.upscale_action_arm",
+                        EXPLORE_UPSCALE_ACTIONS[0],
+                        "after-detail-fit",
+                        [
+                            0.0,
+                            snapshot.frame.extent.width as f64,
+                            snapshot.frame.extent.height as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 self.begin_upscale_series(model, &snapshot.frame)
             }
             Phase::StartUpscale { kernel, .. } => self.arm(EXPLORE_UPSCALE_ACTIONS[kernel]),
@@ -6735,17 +7153,19 @@ impl Controller {
                     self.fail("Upscale did not publish the exact four-times output extent");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.upscale_growth",
-                    EXPLORE_UPSCALE_ACTIONS[kernel],
-                    upscale_acceptance_label(crate::generated::UPSCALE_KERNEL_VALUES[kernel]),
-                    [
-                        source_width as f64,
-                        source_height as f64,
-                        upscale.frame.extent.width as f64,
-                        upscale.frame.extent.height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.upscale_growth",
+                        EXPLORE_UPSCALE_ACTIONS[kernel],
+                        upscale_acceptance_label(crate::generated::UPSCALE_KERNEL_VALUES[kernel]),
+                        [
+                            source_width as f64,
+                            source_height as f64,
+                            upscale.frame.extent.width as f64,
+                            upscale.frame.extent.height as f64,
+                        ],
+                    )
+                });
                 if sampleable.content_width != expected_width
                     || sampleable.content_height != expected_height
                     || sampleable.capability_width < expected_width
@@ -6754,17 +7174,19 @@ impl Controller {
                     self.fail("Presentation did not import the exact Upscale output capability");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.upscale_presentation",
-                    EXPLORE_UPSCALE_ACTIONS[kernel],
-                    "complete-four-times-exported-frame",
-                    [
-                        sampleable.content_width as f64,
-                        sampleable.content_height as f64,
-                        sampleable.capability_width as f64,
-                        sampleable.capability_height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.upscale_presentation",
+                        EXPLORE_UPSCALE_ACTIONS[kernel],
+                        "complete-four-times-exported-frame",
+                        [
+                            sampleable.content_width as f64,
+                            sampleable.content_height as f64,
+                            sampleable.capability_width as f64,
+                            sampleable.capability_height as f64,
+                        ],
+                    )
+                });
                 if model.displayed_upscale_kernel() != Some(upscale.kernel) {
                     return Task::none();
                 }
@@ -6779,7 +7201,9 @@ impl Controller {
                 let Some(button) = self.upscale_button else {
                     return Task::none();
                 };
-                let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else { return Task::none(); };
+                let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else {
+                    return Task::none();
+                };
                 if self.upscale_pixel_pending.as_ref() != Some(&receipt) {
                     if let Some(output) = self.prepare_upscale_probe(viewer.image, source, drawn) {
                         sample_upscale_pixels(output, viewer.image, button, source, drawn);
@@ -6800,12 +7224,14 @@ impl Controller {
                     self.fail("Upscale actual canvas image or completed blue method did not match its displayed result");
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.upscale_completed_pixels",
-                    EXPLORE_UPSCALE_ACTIONS[kernel],
-                    "exact-completed-blue",
-                    [source as f64, drawn as f64, checksum as f64, blue as f64],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.upscale_completed_pixels",
+                        EXPLORE_UPSCALE_ACTIONS[kernel],
+                        "exact-completed-blue",
+                        [source as f64, drawn as f64, checksum as f64, blue as f64],
+                    )
+                });
                 if let Some(revision) = self.upscale_repeat_revision {
                     if !self.upscale_repeat_observed {
                         return Task::none();
@@ -6816,12 +7242,14 @@ impl Controller {
                         );
                         return Task::none();
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.upscale_same_method",
-                        EXPLORE_UPSCALE_ACTIONS[kernel],
-                        "same-completed-result",
-                        [source as f64, drawn as f64, revision as f64, 1.0],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.upscale_same_method",
+                            EXPLORE_UPSCALE_ACTIONS[kernel],
+                            "same-completed-result",
+                            [source as f64, drawn as f64, revision as f64, 1.0],
+                        )
+                    });
                 } else {
                     self.upscale_repeat_revision = Some(upscale.revision);
                     if !click(button) {
@@ -6834,17 +7262,19 @@ impl Controller {
                         self.fail("cached method changed its completed physical product");
                         return Task::none();
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.upscale_cached",
-                        EXPLORE_UPSCALE_ACTIONS[kernel],
-                        "same-resident-product-drawn",
-                        [
-                            source as f64,
-                            drawn as f64,
-                            kernel as f64,
-                            upscale.revision as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.upscale_cached",
+                            EXPLORE_UPSCALE_ACTIONS[kernel],
+                            "same-resident-product-drawn",
+                            [
+                                source as f64,
+                                drawn as f64,
+                                kernel as f64,
+                                upscale.revision as f64,
+                            ],
+                        )
+                    });
                     if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len()
                         && self.viewer_continuity_request.is_none()
                     {
@@ -6916,33 +7346,37 @@ impl Controller {
                     }) {
                         return Task::none();
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.viewer_complete",
-                        EXPLORE_UPSCALE_ACTIONS[kernel],
-                        "rapid",
-                        [
-                            sampleable.presentation_revision as f64,
-                            upscale.frame.revision as f64,
-                            1.0,
-                            kernel as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.viewer_complete",
+                            EXPLORE_UPSCALE_ACTIONS[kernel],
+                            "rapid",
+                            [
+                                sampleable.presentation_revision as f64,
+                                upscale.frame.revision as f64,
+                                1.0,
+                                kernel as f64,
+                            ],
+                        )
+                    });
                     self.phase = Phase::Complete;
                     return Task::none();
                 }
                 if kernel + 1 < EXPLORE_UPSCALE_ACTIONS.len() {
                     let next_kernel = kernel + 1;
-                    reporting::emit(|sink| sink.record(
-                        "integration.upscale_action_arm",
-                        EXPLORE_UPSCALE_ACTIONS[next_kernel],
-                        "after-upscale-publication",
-                        [
-                            next_kernel as f64,
-                            upscale.revision as f64,
-                            upscale.frame.revision as f64,
-                            sampleable.presentation_revision as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.upscale_action_arm",
+                            EXPLORE_UPSCALE_ACTIONS[next_kernel],
+                            "after-upscale-publication",
+                            [
+                                next_kernel as f64,
+                                upscale.revision as f64,
+                                upscale.frame.revision as f64,
+                                sampleable.presentation_revision as f64,
+                            ],
+                        )
+                    });
                     self.phase = Phase::StartUpscale {
                         kernel: next_kernel,
                         source_width,
@@ -6991,17 +7425,19 @@ impl Controller {
                 if sampleable.presentation_revision <= self.annotation_sample_baseline {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.upscale_later_frame",
-                    EXPLORE_GALLERY,
-                    "distinct-imported-frame",
-                    [
-                        self.annotation_sample_baseline as f64,
-                        sampleable.presentation_revision as f64,
-                        sampleable.content_width as f64,
-                        sampleable.content_height as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.upscale_later_frame",
+                        EXPLORE_GALLERY,
+                        "distinct-imported-frame",
+                        [
+                            self.annotation_sample_baseline as f64,
+                            sampleable.presentation_revision as f64,
+                            sampleable.content_width as f64,
+                            sampleable.content_height as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::DetailPrevious(selected);
                 self.arm(EXPLORE_PREVIOUS)
             }
@@ -7047,10 +7483,17 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                self.reporting.observe(|reporting| reporting.reopen_wait(
-                    model, frame, snapshot, revision, frame_revision,
-                    self.selection_grid.is_some(), self.gallery_drawn,
-                ));
+                self.reporting.observe(|reporting| {
+                    reporting.reopen_wait(
+                        model,
+                        frame,
+                        snapshot,
+                        revision,
+                        frame_revision,
+                        self.selection_grid.is_some(),
+                        self.gallery_drawn,
+                    )
+                });
                 if !snapshot.ready
                     || snapshot.busy
                     || snapshot.revision <= revision
@@ -7087,28 +7530,32 @@ impl Controller {
                 }) {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_reopened",
-                    EXPLORE_OPEN,
-                    "usable-after-reopen",
-                    [
-                        snapshot.revision as f64,
-                        snapshot.frame.revision as f64,
-                        snapshot.order.visibleindices.len() as f64,
-                        snapshot.dataset.imagecount as f64,
-                    ],
-                ));
-                reporting::emit(|sink| sink.record(
-                    "integration.explore_final_cursor",
-                    EXPLORE_GALLERY,
-                    "coherent-placeholder",
-                    [
-                        snapshot.revision as f64,
-                        snapshot.frame.revision as f64,
-                        snapshot.gallery.generation as f64,
-                        snapshot.order.visibleindices.len() as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_reopened",
+                        EXPLORE_OPEN,
+                        "usable-after-reopen",
+                        [
+                            snapshot.revision as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.order.visibleindices.len() as f64,
+                            snapshot.dataset.imagecount as f64,
+                        ],
+                    )
+                });
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.explore_final_cursor",
+                        EXPLORE_GALLERY,
+                        "coherent-placeholder",
+                        [
+                            snapshot.revision as f64,
+                            snapshot.frame.revision as f64,
+                            snapshot.gallery.generation as f64,
+                            snapshot.order.visibleindices.len() as f64,
+                        ],
+                    )
+                });
                 let columns = snapshot.viewport.columns;
                 let slot = (snapshot.viewport.rowcount / 2)
                     .saturating_mul(columns)
@@ -7184,23 +7631,25 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_import_edit",
-                    ANNOTATION_SURFACE,
-                    match self.copy_step {
-                        0 => "box-move-undo-redo",
-                        1 => "box-resize-undo-redo",
-                        2 => "mask-paint-undo-redo",
-                        3 => "mask-erase-undo-redo",
-                        _ => "class-undo-redo",
-                    },
-                    [
-                        index as f64,
-                        snapshot.ui.scene.objects.len() as f64,
-                        snapshot.ui.documentrevision as f64,
-                        snapshot.frame.revision as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_import_edit",
+                        ANNOTATION_SURFACE,
+                        match self.copy_step {
+                            0 => "box-move-undo-redo",
+                            1 => "box-resize-undo-redo",
+                            2 => "mask-paint-undo-redo",
+                            3 => "mask-erase-undo-redo",
+                            _ => "class-undo-redo",
+                        },
+                        [
+                            index as f64,
+                            snapshot.ui.scene.objects.len() as f64,
+                            snapshot.ui.documentrevision as f64,
+                            snapshot.frame.revision as f64,
+                        ],
+                    )
+                });
                 if self.copy_step == 3 && snapshot.ui.scene.categories.len() > 1 {
                     self.copy_step = 4;
                     self.copy_before = Some(snapshot.ui.scene.objects[index as usize].clone());
@@ -7296,7 +7745,9 @@ impl Controller {
                     if self.location_pending {
                         return Task::none();
                     }
-                    if !self.prepare_control_probe() { return Task::none(); }
+                    if !self.prepare_control_probe() {
+                        return Task::none();
+                    }
                     self.location_pending = true;
                     self.copy_swatch_ready = false;
                     iced::widget::operation::snap_to(
@@ -7314,7 +7765,10 @@ impl Controller {
                         "annotation.inspector.scroll",
                         RelativeOffset::START,
                     ))
-                    .chain(locate("annotation.class.active.swatch".into(), self.generation))
+                    .chain(locate(
+                        "annotation.class.active.swatch".into(),
+                        self.generation,
+                    ))
                 }
             }
             Phase::CopySwatchWait => {
@@ -7363,7 +7817,9 @@ impl Controller {
                     f64::from(color.g) * 255.0,
                     f64::from(color.b) * 255.0,
                 ];
-                if !self.prepare_control_probe() { return Task::none(); }
+                if !self.prepare_control_probe() {
+                    return Task::none();
+                }
                 self.copy_capability_ready = false;
                 self.arm_scrolled(
                     annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
@@ -7509,12 +7965,14 @@ impl Controller {
                 let Some((presentation, source)) = self.annotation_drawn else {
                     return Task::none();
                 };
-                reporting::emit(|sink| sink.record(
-                    "integration.viewer_complete",
-                    VIEWER_SAVE,
-                    "copy",
-                    [presentation as f64, source as f64, 1.0, 0.0],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.viewer_complete",
+                        VIEWER_SAVE,
+                        "copy",
+                        [presentation as f64, source as f64, 1.0, 0.0],
+                    )
+                });
                 self.phase = Phase::Complete;
                 Task::none()
             }
@@ -7529,17 +7987,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_ready",
-                    "",
-                    "receiver-owned",
-                    [
-                        snapshot.frame.revision as f64,
-                        snapshot.ui.documentrevision as f64,
-                        snapshot.ui.interactionrevision as f64,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_ready",
+                        "",
+                        "receiver-owned",
+                        [
+                            snapshot.frame.revision as f64,
+                            snapshot.ui.documentrevision as f64,
+                            snapshot.ui.interactionrevision as f64,
+                            0.0,
+                        ],
+                    )
+                });
                 if matches!(self.viewer_scenario.as_str(), "quiet" | "terminal") {
                     self.bounded_document_revision = snapshot.ui.documentrevision;
                     self.bounded_object_count = snapshot.ui.scene.objects.len();
@@ -7547,7 +8007,10 @@ impl Controller {
                         revision: snapshot.ui.interactionrevision,
                         tool: crate::generated::AnnotationTool::Box,
                     };
-                    return self.arm_scrolled(annotation::tool_id(crate::generated::AnnotationTool::Box), RelativeOffset::START);
+                    return self.arm_scrolled(
+                        annotation::tool_id(crate::generated::AnnotationTool::Box),
+                        RelativeOffset::START,
+                    );
                 }
                 if self.viewer_scenario == "copy" {
                     let scene = &snapshot.ui.scene;
@@ -7635,17 +8098,19 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_tool_observed",
-                    &annotation::tool_id(tool),
-                    "typed-tool",
-                    [
-                        revision as f64,
-                        snapshot.ui.interactionrevision as f64,
-                        0.0,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_tool_observed",
+                        &annotation::tool_id(tool),
+                        "typed-tool",
+                        [
+                            revision as f64,
+                            snapshot.ui.interactionrevision as f64,
+                            0.0,
+                            0.0,
+                        ],
+                    )
+                });
                 if self.copy_step == 8 {
                     self.advance_to(Phase::CopyProductWait)
                 } else {
@@ -7724,17 +8189,19 @@ impl Controller {
                     return Task::none();
                 }
                 if self.copy_step == 8 && self.copy_product_cancel && !self.copy_product_cancelled {
-                    reporting::emit(|sink| sink.record(
-                        "integration.annotation_preview",
-                        ANNOTATION_SURFACE,
-                        "visible-before-cancel",
-                        [
-                            self.copy_product_frame as f64,
-                            snapshot.frame.revision as f64,
-                            presentation_revision as f64,
-                            0.0,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.annotation_preview",
+                            ANNOTATION_SURFACE,
+                            "visible-before-cancel",
+                            [
+                                self.copy_product_frame as f64,
+                                snapshot.frame.revision as f64,
+                                presentation_revision as f64,
+                                0.0,
+                            ],
+                        )
+                    });
                     self.copy_product_cancelled = true;
                     self.copy_product_frame = snapshot.frame.revision;
                     return annotation_message(annotation::Message::CancelRequested);
@@ -7743,24 +8210,32 @@ impl Controller {
                 if self.viewer_scenario == "copy"
                     && (receipt.is_none() || self.annotation_pixels_receipt != receipt)
                 {
-                    if self.location_pending || self.annotation_pixels_pending == receipt { return Task::none(); }
-                    if !self.prepare_annotation_probe(snapshot.frame.revision, presentation_revision,
-                        [snapshot.frame.extent.width, snapshot.frame.extent.height], annotation_checks::probes(&snapshot.ui)) {
+                    if self.location_pending || self.annotation_pixels_pending == receipt {
+                        return Task::none();
+                    }
+                    if !self.prepare_annotation_probe(
+                        snapshot.frame.revision,
+                        presentation_revision,
+                        [snapshot.frame.extent.width, snapshot.frame.extent.height],
+                        annotation_checks::probes(&snapshot.ui),
+                    ) {
                         return Task::none();
                     }
                     return self.arm(ANNOTATION_SURFACE);
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_pointer_observed",
-                    ANNOTATION_SURFACE,
-                    "typed-interaction",
-                    [
-                        revision as f64,
-                        snapshot.ui.interactionrevision as f64,
-                        presentation_revision as f64,
-                        0.0,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_pointer_observed",
+                        ANNOTATION_SURFACE,
+                        "typed-interaction",
+                        [
+                            revision as f64,
+                            snapshot.ui.interactionrevision as f64,
+                            presentation_revision as f64,
+                            0.0,
+                        ],
+                    )
+                });
                 if self.viewer_scenario == "copy" && self.copy_step == 8 {
                     #[cfg(target_arch = "wasm32")]
                     if self.copy_product_cancel {
@@ -7768,22 +8243,24 @@ impl Controller {
                     }
                     match self.copy_product.observe(&snapshot.ui) {
                         Ok(step) => {
-                            reporting::emit(|sink| sink.record(
-                                "integration.annotation_product",
-                                ANNOTATION_SURFACE,
-                                &step.detail(),
-                                [
-                                    snapshot.frame.revision as f64,
-                                    presentation_revision as f64,
-                                    snapshot.ui.documentrevision as f64,
-                                    snapshot
-                                        .ui
-                                        .toolcapabilities
-                                        .iter()
-                                        .filter(|fact| fact.available)
-                                        .count() as f64,
-                                ],
-                            ));
+                            reporting::emit(|sink| {
+                                sink.record(
+                                    "integration.annotation_product",
+                                    ANNOTATION_SURFACE,
+                                    &step.detail(),
+                                    [
+                                        snapshot.frame.revision as f64,
+                                        presentation_revision as f64,
+                                        snapshot.ui.documentrevision as f64,
+                                        snapshot
+                                            .ui
+                                            .toolcapabilities
+                                            .iter()
+                                            .filter(|fact| fact.available)
+                                            .count() as f64,
+                                    ],
+                                )
+                            });
                             return self.advance_to(match step {
                                 annotation_product::Step::Select(_) => Phase::CopyCapability,
                                 _ => Phase::CopyProductStart,
@@ -7819,17 +8296,19 @@ impl Controller {
                         self.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
                         return self.arm_scrolled(ANNOTATION_SURFACE, RelativeOffset::START);
                     }
-                    reporting::emit(|sink| sink.record(
-                        "integration.annotation_shape",
-                        ANNOTATION_SURFACE,
-                        &format!("{:?}", object.shape),
-                        [
-                            index as f64,
-                            snapshot.frame.revision as f64,
-                            object.splineknots.len() as f64,
-                            object.skeletonnodes.len() as f64,
-                        ],
-                    ));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.annotation_shape",
+                            ANNOTATION_SURFACE,
+                            &format!("{:?}", object.shape),
+                            [
+                                index as f64,
+                                snapshot.frame.revision as f64,
+                                object.splineknots.len() as f64,
+                                object.skeletonnodes.len() as f64,
+                            ],
+                        )
+                    });
                     if self.copy_step == 7 {
                         if let Err(detail) =
                             self.copy_product.start(&snapshot.ui, self.copy_objects)
@@ -7888,17 +8367,19 @@ impl Controller {
                     self.phase = Phase::CopyUndo { index, mask };
                     return self.arm_scrolled("annotation.undo", RelativeOffset::END);
                 }
-                reporting::emit(|sink| sink.record(
-                    "integration.complete",
-                    "",
-                    "typed-mvc-wayland",
-                    [
-                        snapshot.frame.revision as f64,
-                        presentation_revision as f64,
-                        presentation_revision as f64,
-                        presentation.browsercompletedsample as f64,
-                    ],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.complete",
+                        "",
+                        "typed-mvc-wayland",
+                        [
+                            snapshot.frame.revision as f64,
+                            presentation_revision as f64,
+                            presentation_revision as f64,
+                            presentation.browsercompletedsample as f64,
+                        ],
+                    )
+                });
                 self.phase = Phase::Complete;
                 self.report_phase_progress();
                 Task::none()
@@ -7916,34 +8397,59 @@ mod tests {
     fn destructive_profile_continues_viewer_completion_into_annotation() {
         initialize_reporting(false, false);
         for window_close in [false, true] {
-            let mut driver = Controller::new(true, window_close, "source".into(), "compiled".into(), "512".into(), "terminal".into());
+            let mut driver = Controller::new(
+                true,
+                window_close,
+                "source".into(),
+                "compiled".into(),
+                "512".into(),
+                "terminal".into(),
+            );
             driver.configure_session("terminal", String::new(), String::new());
             assert_eq!(driver.session.scenario(0), Some(("terminal", false)));
             assert_eq!(driver.session.scenario(1), None);
             assert!(driver.reuse_compiled);
             driver.phase = Phase::ViewerNoAspect;
-            driver.viewer_drawn = Some((7, 3, ViewerDraw {
-                crop: [0, 0, 512, 512],
-                container: Rectangle::default(),
-                image: Rectangle::default(),
-                fit_revision: 1,
-            }));
+            driver.viewer_drawn = Some((
+                7,
+                3,
+                ViewerDraw {
+                    crop: [0, 0, 512, 512],
+                    container: Rectangle::default(),
+                    image: Rectangle::default(),
+                    fit_revision: 1,
+                },
+            ));
             driver.update(Message::Located {
                 control: "explore.detail.aspect".into(),
                 bounds: Rectangle::default(),
             });
             assert!(matches!(driver.phase, Phase::OpenAnnotation));
             assert!(driver.running());
-            assert!(driver.receive_control(crate::generated::IntegrationControlReceipt {
-                kind: crate::generated::IntegrationControlKind::Advance, sequence: 2, progress: 0,
-            }).is_err(), "viewer evidence cannot settle a destructive Annotation workflow");
+            assert!(
+                driver
+                    .receive_control(crate::generated::IntegrationControlReceipt {
+                        kind: crate::generated::IntegrationControlKind::Advance,
+                        sequence: 2,
+                        progress: 0,
+                    })
+                    .is_err(),
+                "viewer evidence cannot settle a destructive Annotation workflow"
+            );
         }
     }
 
     #[test]
     fn retained_workflows_require_the_unique_settled_control_owner() {
         initialize_reporting(false, false);
-        let mut driver = Controller::new(true, false, "mixed-source".into(), "mixed-output".into(), "512".into(), "retained".into());
+        let mut driver = Controller::new(
+            true,
+            false,
+            "mixed-source".into(),
+            "mixed-output".into(),
+            "512".into(),
+            "retained".into(),
+        );
         driver.configure_session("retained", "square-source".into(), "square-output".into());
         assert_eq!(driver.viewer_scenario, "square");
         assert_eq!(driver.resolution, "384");
@@ -7967,18 +8473,39 @@ mod tests {
         assert!(driver.receive_control(advance).is_err());
         assert!(matches!(driver.phase, Phase::Failed));
 
-        let mut premature = Controller::new(true, false, String::new(), String::new(), "512".into(), "dpi".into());
+        let mut premature = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            "dpi".into(),
+        );
         premature.configure_session("dpi", String::new(), String::new());
         premature.phase = Phase::Complete;
-        assert!(premature.receive_control(crate::generated::IntegrationControlReceipt {
-            kind: crate::generated::IntegrationControlKind::Advance, sequence: 2, progress: 0,
-        }).is_err(), "local completion is insufficient before the typed receipt was admitted");
+        assert!(
+            premature
+                .receive_control(crate::generated::IntegrationControlReceipt {
+                    kind: crate::generated::IntegrationControlKind::Advance,
+                    sequence: 2,
+                    progress: 0,
+                })
+                .is_err(),
+            "local completion is insufficient before the typed receipt was admitted"
+        );
     }
 
     #[test]
     fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
         initialize_reporting(false, false);
-        let mut driver = Controller::new(true, false, String::new(), String::new(), String::new(), String::new());
+        let mut driver = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
         assert!(driver.running());
         assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
         assert!(!reporting_enabled());
@@ -7998,23 +8525,46 @@ mod tests {
             assert_eq!(observer.identity, (0, 0));
         });
         driver.phase = Phase::Complete;
-        driver.reset_scenario(String::new(), String::new(), String::new(), String::new()).unwrap();
+        driver
+            .reset_scenario(String::new(), String::new(), String::new(), String::new())
+            .unwrap();
         assert!(driver.running());
         assert!(DRIVER_ENABLED.with(std::cell::Cell::get));
         assert!(!reporting_enabled());
         assert!(driver.reporting.state_is_absent());
         let generation = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation);
-        let disabled = Controller::new(false, false, String::new(), String::new(), String::new(), String::new());
+        let disabled = Controller::new(
+            false,
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
         assert!(!disabled.running());
         assert!(!DRIVER_ENABLED.with(std::cell::Cell::get));
-        notify_driver_draw(EXPLORE_GALLERY, frame.content_sequence, frame.presentation_revision);
-        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation), generation);
+        notify_driver_draw(
+            EXPLORE_GALLERY,
+            frame.content_sequence,
+            frame.presentation_revision,
+        );
+        assert_eq!(
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation),
+            generation
+        );
     }
 
     #[test]
     fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_teardown() {
         initialize_reporting(true, true);
-        let mut controller = Controller::new(true, false, "old-source".into(), "old-output".into(), "384".into(), "atlas".into());
+        let mut controller = Controller::new(
+            true,
+            false,
+            "old-source".into(),
+            "old-output".into(),
+            "384".into(),
+            "atlas".into(),
+        );
         let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
         let old_subscription = std::sync::Arc::new(());
         let mut old_output = ScenarioOutput::new(controller.generation, sender);
@@ -8030,37 +8580,103 @@ mod tests {
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         let old_receipt = current_receipt(EXPLORE_GALLERY).unwrap();
-        old_output.try_send(Message::Located { control: EXPLORE_GALLERY.into(), bounds }).unwrap();
-        record_probe_draw(crate::view::workspace::STABLE_ID, surface, bounds, bounds, bounds);
-        let viewer = ViewerDraw { crop: surface.content_region(), container: bounds, image: bounds, fit_revision: 0 };
-        report_surface_draw(crate::view::workspace::STABLE_ID, 5, 1, false, 640, 480, 1, viewer);
+        old_output
+            .try_send(Message::Located {
+                control: EXPLORE_GALLERY.into(),
+                bounds,
+            })
+            .unwrap();
+        record_probe_draw(
+            crate::view::workspace::STABLE_ID,
+            surface,
+            bounds,
+            bounds,
+            bounds,
+        );
+        let viewer = ViewerDraw {
+            crop: surface.content_region(),
+            container: bounds,
+            image: bounds,
+            fit_revision: 0,
+        };
+        report_surface_draw(
+            crate::view::workspace::STABLE_ID,
+            5,
+            1,
+            false,
+            640,
+            480,
+            1,
+            viewer,
+        );
         controller.location_pending = true;
         controller.atlas_baseline = Some((1, 5));
-        controller.reporting.observe(|reporting| reporting.reported_style_bits = 7);
+        controller
+            .reporting
+            .observe(|reporting| reporting.reported_style_bits = 7);
         controller.annotation_pixels_receipt = Some(old_receipt.clone());
         controller.upscale_pixel_pending = Some(old_receipt);
-        assert!(controller.reset_scenario("new-source".into(), "new-output".into(), "512".into(), "upscale".into()).is_err());
+        assert!(
+            controller
+                .reset_scenario(
+                    "new-source".into(),
+                    "new-output".into(),
+                    "512".into(),
+                    "upscale".into()
+                )
+                .is_err()
+        );
         controller.phase = Phase::Complete;
-        controller.reset_scenario("new-source".into(), "new-output".into(), "512".into(), "upscale".into()).unwrap();
+        controller
+            .reset_scenario(
+                "new-source".into(),
+                "new-output".into(),
+                "512".into(),
+                "upscale".into(),
+            )
+            .unwrap();
         assert!(!controller.location_pending);
         assert!(controller.atlas_baseline.is_none());
         assert!(controller.upscale_pixel_pending.is_none());
         assert!(controller.annotation_pixels_receipt.is_none());
-        controller.reporting.observe(|reporting| assert_eq!(reporting.reported_style_bits, 0));
+        controller
+            .reporting
+            .observe(|reporting| assert_eq!(reporting.reported_style_bits, 0));
         assert!(current_receipt(EXPLORE_GALLERY).is_none());
-        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().identity), (0, 0));
+        assert_eq!(
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().identity),
+            (0, 0)
+        );
         controller.location_pending = true; // Same widget may already be armed in the replacement.
-        while let Ok(message) = receiver.try_recv() { assert!(controller.update(message).is_none()); }
+        while let Ok(message) = receiver.try_recv() {
+            assert!(controller.update(message).is_none());
+        }
         assert!(controller.location_pending);
         assert!(controller.annotation_drawn.is_none());
         // A late result retains the original sender/generation even after reset.
-        old_output.try_send(Message::SurfaceDrawn { presentation_revision: 5, source_revision: 1, viewer: None }).unwrap();
+        old_output
+            .try_send(Message::SurfaceDrawn {
+                presentation_revision: 5,
+                source_revision: 1,
+                viewer: None,
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.annotation_drawn.is_none());
-        for control in [EXPLORE_GALLERY, explore::DETAIL_WORKSPACE_ID, crate::view::workspace::STABLE_ID] {
-            assert!(probe_output(control).is_none(), "no physical receipt cannot schedule a probe");
+        for control in [
+            EXPLORE_GALLERY,
+            explore::DETAIL_WORKSPACE_ID,
+            crate::view::workspace::STABLE_ID,
+        ] {
+            assert!(
+                probe_output(control).is_none(),
+                "no physical receipt cannot schedule a probe"
+            );
             report_surface_draw(control, 5, 1, false, 640, 480, 1, viewer);
-            assert!(receiver.try_recv().is_err(), "no physical receipt cannot enqueue a draw");
+            assert!(
+                receiver.try_recv().is_err(),
+                "no physical receipt cannot enqueue a draw"
+            );
             record_probe_draw(control, surface, bounds, bounds, bounds);
             report_surface_draw(control, 5, 1, false, 640, 480, 1, viewer);
             let queued = receiver.try_recv().unwrap();
@@ -8078,19 +8694,31 @@ mod tests {
             controller.update(queued);
             match control {
                 EXPLORE_GALLERY => assert_eq!(controller.gallery_drawn.take(), Some((5, 1))),
-                explore::DETAIL_WORKSPACE_ID => assert_eq!(controller.viewer_drawn.take(), Some((5, 1, viewer))),
+                explore::DETAIL_WORKSPACE_ID => {
+                    assert_eq!(controller.viewer_drawn.take(), Some((5, 1, viewer)))
+                }
                 _ => assert_eq!(controller.annotation_drawn.take(), Some((5, 1))),
             }
         }
         let snapshot = std::sync::Arc::new(crate::view_model::test_support::explore_snapshot());
-        let draw = AtlasDraw { surface, snapshot, bounds, image: bounds, clip: bounds };
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().receipts.remove(EXPLORE_GALLERY));
+        let draw = AtlasDraw {
+            surface,
+            snapshot,
+            bounds,
+            image: bounds,
+            clip: bounds,
+        };
+        SURFACE_DRAW_OBSERVER
+            .with(|observer| observer.borrow_mut().receipts.remove(EXPLORE_GALLERY));
         report_atlas_draw(draw.clone(), true, 1.0);
         assert!(receiver.try_recv().is_err());
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         report_atlas_draw(draw.clone(), true, 1.0);
         let queued = receiver.try_recv().unwrap();
-        let moved_draw = AtlasDraw { image: Rectangle { x: 17.0, ..bounds }, ..draw };
+        let moved_draw = AtlasDraw {
+            image: Rectangle { x: 17.0, ..bounds },
+            ..draw
+        };
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds);
         assert!(!controller.accepts_message(&queued));
         controller.update(queued);
@@ -8101,38 +8729,72 @@ mod tests {
         controller.update(queued);
         assert_eq!(controller.atlas_receipt, Some(moved_draw));
         old_output.generation = controller.generation;
-        old_output.try_send(Message::SurfaceDrawn { presentation_revision: 5, source_revision: 1, viewer: None }).unwrap();
-        assert!(!controller.accepts_message(&receiver.try_recv().unwrap()), "physical messages cannot use a generation-only output");
+        old_output
+            .try_send(Message::SurfaceDrawn {
+                presentation_revision: 5,
+                source_revision: 1,
+                viewer: None,
+            })
+            .unwrap();
+        assert!(
+            !controller.accepts_message(&receiver.try_recv().unwrap()),
+            "physical messages cannot use a generation-only output"
+        );
         let replacement_subscription = std::sync::Arc::new(());
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().subscription = Some(replacement_subscription.clone()));
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            observer.borrow_mut().subscription = Some(replacement_subscription.clone())
+        });
         drop(SurfaceDrawSubscription(old_subscription));
         assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.is_some()));
         assert!(current_receipt(EXPLORE_GALLERY).is_some());
         drop(SurfaceDrawSubscription(replacement_subscription));
         assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.is_none()));
         controller.phase = Phase::Failed;
-        assert!(controller.reset_scenario(String::new(), String::new(), String::new(), String::new()).is_err());
+        assert!(
+            controller
+                .reset_scenario(String::new(), String::new(), String::new(), String::new())
+                .is_err()
+        );
         initialize_reporting(false, false);
     }
 
     #[test]
     fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
         initialize_reporting(true, true);
-        let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "atlas".into());
+        let mut controller = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            "atlas".into(),
+        );
         let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender))
+        });
         let (_, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
         surface.integration = true;
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
-        let draw = AtlasDraw { surface, bounds, image: bounds, clip: bounds,
-            snapshot: std::sync::Arc::new(crate::view_model::test_support::explore_snapshot()) };
+        let draw = AtlasDraw {
+            surface,
+            bounds,
+            image: bounds,
+            clip: bounds,
+            snapshot: std::sync::Arc::new(crate::view_model::test_support::explore_snapshot()),
+        };
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         report_atlas_draw(draw.clone(), false, 1.0);
         controller.update(receiver.try_recv().unwrap());
         let mut old_pixels = atlas_probe_output(false).unwrap();
         let mut old_composition = atlas_probe_output(true).unwrap();
-        old_pixels.try_send(Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }).unwrap();
+        old_pixels
+            .try_send(Message::AtlasPixels {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Invalidated,
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.is_none()));
         // A normal draw rearms the same physical frame after CSS/backing settles.
@@ -8141,19 +8803,44 @@ mod tests {
         let mut pixels = atlas_probe_output(false).unwrap();
         let mut composition = atlas_probe_output(true).unwrap();
         for (output, message) in [
-            (&mut old_pixels, Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }),
-            (&mut old_composition, Message::AtlasComposition { receipt: draw.clone(), outcome: ProbeOutcome::Invalidated }),
+            (
+                &mut old_pixels,
+                Message::AtlasPixels {
+                    receipt: draw.clone(),
+                    outcome: ProbeOutcome::Invalidated,
+                },
+            ),
+            (
+                &mut old_composition,
+                Message::AtlasComposition {
+                    receipt: draw.clone(),
+                    outcome: ProbeOutcome::Invalidated,
+                },
+            ),
         ] {
             output.try_send(message).unwrap();
             let stale = receiver.try_recv().unwrap();
             assert!(!controller.accepts_message(&stale));
             controller.update(stale);
         }
-        assert_eq!(SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.clone()), Some(draw.clone()));
+        assert_eq!(
+            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.clone()),
+            Some(draw.clone())
+        );
         assert!(controller.atlas_pixels.is_none() && controller.atlas_composition.is_none());
-        pixels.try_send(Message::AtlasPixels { receipt: draw.clone(), outcome: ProbeOutcome::Observed(1, 1) }).unwrap();
+        pixels
+            .try_send(Message::AtlasPixels {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(1, 1),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
-        composition.try_send(Message::AtlasComposition { receipt: draw.clone(), outcome: ProbeOutcome::Observed(13, 13) }).unwrap();
+        composition
+            .try_send(Message::AtlasComposition {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(13, 13),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_pixels, Some(draw.clone()));
         assert_eq!(controller.atlas_composition, Some(draw));
@@ -8163,8 +8850,14 @@ mod tests {
 
     #[test]
     fn pixel_outcome_adapter_preserves_invalidated_observed_and_failed() {
-        assert_eq!(ProbeOutcome::decode(Some("invalidated"), [Some(0.0); 2]), ProbeOutcome::Invalidated);
-        assert_eq!(ProbeOutcome::decode(Some("observed"), [Some(1.0), Some(0.0)]), ProbeOutcome::Observed(1, 0));
+        assert_eq!(
+            ProbeOutcome::decode(Some("invalidated"), [Some(0.0); 2]),
+            ProbeOutcome::Invalidated
+        );
+        assert_eq!(
+            ProbeOutcome::decode(Some("observed"), [Some(1.0), Some(0.0)]),
+            ProbeOutcome::Observed(1, 0)
+        );
         for (status, values) in [
             (None, [Some(0.0); 2]),
             (Some("invalidated"), [Some(1.0), Some(0.0)]),
@@ -8173,7 +8866,10 @@ mod tests {
             (Some("observed"), [Some(f64::INFINITY), Some(0.0)]),
             (Some("observed"), [Some(-1.0), Some(0.0)]),
             (Some("observed"), [Some(0.5), Some(0.0)]),
-            (Some("observed"), [Some(f64::from(u32::MAX) + 1.0), Some(0.0)]),
+            (
+                Some("observed"),
+                [Some(f64::from(u32::MAX) + 1.0), Some(0.0)],
+            ),
             (Some("failed"), [Some(0.0); 2]),
         ] {
             assert_eq!(ProbeOutcome::decode(status, values), ProbeOutcome::Failed);
@@ -8184,39 +8880,75 @@ mod tests {
     fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence() {
         for consumer in 0..4 {
             initialize_reporting(true, true);
-            let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "copy".into());
+            let mut controller = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                "512".into(),
+                "copy".into(),
+            );
             let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-            SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+            SURFACE_DRAW_OBSERVER.with(|observer| {
+                observer.borrow_mut().output =
+                    Some(ScenarioOutput::new(controller.generation, sender))
+            });
             let (_, frame) = crate::view_model::test_support::explore_presentation();
             let mut surface = crate::view_model::test_support::physical_surface(frame);
             surface.integration = true;
             let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
-            let control = if consumer == 3 { explore::DETAIL_WORKSPACE_ID } else { "workflow.visual.workspace" };
+            let control = if consumer == 3 {
+                explore::DETAIL_WORKSPACE_ID
+            } else {
+                "workflow.visual.workspace"
+            };
             record_probe_draw(control, surface, bounds, bounds, bounds);
-            let arm = |controller: &mut Controller, image| {
-                match consumer {
-                    0 | 1 => {
-                        controller.phase = if consumer == 0 { Phase::CopyCapabilityWait } else { Phase::CopySwatchWait };
-                        assert!(controller.prepare_control_probe());
-                        controller.control_probe.take().unwrap().output
-                    }
-                    2 => {
-                        controller.phase = Phase::CopyProductWait;
-                        assert!(controller.prepare_annotation_probe(frame.content_sequence, frame.presentation_revision,
-                            [frame.content_width, frame.content_height], vec![1.0; 7]));
-                        controller.annotation_probe.take().unwrap().output
-                    }
-                    _ => {
-                        controller.phase = Phase::AwaitExploreReady;
-                        controller.prepare_upscale_probe(image, frame.content_sequence, frame.presentation_revision).unwrap()
-                    }
+            let arm = |controller: &mut Controller, image| match consumer {
+                0 | 1 => {
+                    controller.phase = if consumer == 0 {
+                        Phase::CopyCapabilityWait
+                    } else {
+                        Phase::CopySwatchWait
+                    };
+                    assert!(controller.prepare_control_probe());
+                    controller.control_probe.take().unwrap().output
+                }
+                2 => {
+                    controller.phase = Phase::CopyProductWait;
+                    assert!(controller.prepare_annotation_probe(
+                        frame.content_sequence,
+                        frame.presentation_revision,
+                        [frame.content_width, frame.content_height],
+                        vec![1.0; 7]
+                    ));
+                    controller.annotation_probe.take().unwrap().output
+                }
+                _ => {
+                    controller.phase = Phase::AwaitExploreReady;
+                    controller
+                        .prepare_upscale_probe(
+                            image,
+                            frame.content_sequence,
+                            frame.presentation_revision,
+                        )
+                        .unwrap()
                 }
             };
             let message = |outcome| match consumer {
                 0 => Message::AnnotationControlPixels { outcome },
-                1 => Message::AnnotationPixels { revision: 0, outcome },
-                2 => Message::AnnotationPixels { revision: frame.content_sequence, outcome },
-                _ => Message::UpscalePixels { source: frame.content_sequence, presentation: frame.presentation_revision, outcome },
+                1 => Message::AnnotationPixels {
+                    revision: 0,
+                    outcome,
+                },
+                2 => Message::AnnotationPixels {
+                    revision: frame.content_sequence,
+                    outcome,
+                },
+                _ => Message::UpscalePixels {
+                    source: frame.content_sequence,
+                    presentation: frame.presentation_revision,
+                    outcome,
+                },
             };
             let mut old = arm(&mut controller, bounds);
             let phase = controller.phase.clone();
@@ -8229,53 +8961,87 @@ mod tests {
             assert!(controller.control_probe_receipt.is_none());
             assert!(controller.upscale_pixel_pending.is_none());
             assert!(!controller.copy_capability_ready && !controller.copy_swatch_ready);
-            assert!(controller.annotation_pixels_receipt.is_none() && controller.upscale_pixels.is_none());
+            assert!(
+                controller.annotation_pixels_receipt.is_none()
+                    && controller.upscale_pixels.is_none()
+            );
 
             let mut same_frame = arm(&mut controller, bounds);
             old.try_send(message(ProbeOutcome::Invalidated)).unwrap();
             let stale = receiver.try_recv().unwrap();
-            assert!(!controller.accepts_message(&stale), "a new request can own the same physical receipt");
+            assert!(
+                !controller.accepts_message(&stale),
+                "a new request can own the same physical receipt"
+            );
             controller.update(stale);
-            same_frame.try_send(message(ProbeOutcome::Invalidated)).unwrap();
+            same_frame
+                .try_send(message(ProbeOutcome::Invalidated))
+                .unwrap();
             controller.update(receiver.try_recv().unwrap());
             assert_eq!(controller.phase, phase);
 
             let moved = Rectangle { x: 17.0, ..bounds };
             record_probe_draw(control, surface, bounds, moved, bounds);
             let mut replacement = arm(&mut controller, moved);
-            for outcome in [ProbeOutcome::Invalidated, ProbeOutcome::Failed, ProbeOutcome::Observed(1, 1)] {
+            for outcome in [
+                ProbeOutcome::Invalidated,
+                ProbeOutcome::Failed,
+                ProbeOutcome::Observed(1, 1),
+            ] {
                 old.try_send(message(outcome)).unwrap();
                 let stale = receiver.try_recv().unwrap();
                 assert!(!controller.accepts_message(&stale));
                 controller.update(stale);
             }
             assert_eq!(controller.phase, phase);
-            let pending = if consumer == 3 { &controller.upscale_pixel_pending }
-                else if consumer == 2 { &controller.annotation_pixels_pending } else { &controller.control_probe_receipt };
+            let pending = if consumer == 3 {
+                &controller.upscale_pixel_pending
+            } else if consumer == 2 {
+                &controller.annotation_pixels_pending
+            } else {
+                &controller.control_probe_receipt
+            };
             assert_eq!(*pending, replacement.receipt);
-            replacement.try_send(message(ProbeOutcome::Observed(1, 1))).unwrap();
+            replacement
+                .try_send(message(ProbeOutcome::Observed(1, 1)))
+                .unwrap();
             controller.update(receiver.try_recv().unwrap());
             match consumer {
                 0 => assert!(controller.copy_capability_ready),
                 1 => assert!(controller.copy_swatch_ready),
                 2 => assert_eq!(controller.annotation_pixels_receipt, replacement.receipt),
-                _ => assert_eq!(controller.upscale_pixels, Some((frame.content_sequence, frame.presentation_revision, 1, 1))),
+                _ => assert_eq!(
+                    controller.upscale_pixels,
+                    Some((frame.content_sequence, frame.presentation_revision, 1, 1))
+                ),
             }
             // A new current observation must retain both measured and adapter
             // failures. Upscale's wait phase owns checksum/color validation.
-            if consumer == 2 { controller.annotation_pixels_pending = None; }
+            if consumer == 2 {
+                controller.annotation_pixels_pending = None;
+            }
             let mut current = arm(&mut controller, moved);
-            current.try_send(message(ProbeOutcome::Observed(1, 0))).unwrap();
+            current
+                .try_send(message(ProbeOutcome::Observed(1, 0)))
+                .unwrap();
             controller.update(receiver.try_recv().unwrap());
             if consumer == 3 {
-                assert_eq!(controller.upscale_pixels, Some((frame.content_sequence, frame.presentation_revision, 1, 0)));
+                assert_eq!(
+                    controller.upscale_pixels,
+                    Some((frame.content_sequence, frame.presentation_revision, 1, 0))
+                );
                 let mut current = arm(&mut controller, moved);
                 current.try_send(message(ProbeOutcome::Failed)).unwrap();
                 controller.update(receiver.try_recv().unwrap());
             }
             assert_eq!(controller.phase, Phase::Failed);
             let mut malformed = arm(&mut controller, moved);
-            malformed.try_send(message(ProbeOutcome::decode(Some("observed"), [None, Some(1.0)]))).unwrap();
+            malformed
+                .try_send(message(ProbeOutcome::decode(
+                    Some("observed"),
+                    [None, Some(1.0)],
+                )))
+                .unwrap();
             controller.update(receiver.try_recv().unwrap());
             assert_eq!(controller.phase, Phase::Failed);
             SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
@@ -8286,16 +9052,29 @@ mod tests {
     #[test]
     fn probe_preparation_keeps_original_frame_through_widget_location() {
         initialize_reporting(true, true);
-        let mut controller = Controller::new(true, false, String::new(), String::new(), "512".into(), "copy".into());
+        let mut controller = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            "copy".into(),
+        );
         let (sender, _receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender))
+        });
         let (_, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
         surface.integration = true;
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         for swatch in [false, true] {
             record_probe_draw("workflow.visual.workspace", surface, bounds, bounds, bounds);
-            controller.phase = if swatch { Phase::CopyCapability } else { Phase::CopyProductWait };
+            controller.phase = if swatch {
+                Phase::CopyCapability
+            } else {
+                Phase::CopyProductWait
+            };
             if swatch {
                 controller.copy_swatch_color = [48.0, 80.0, 112.0];
                 controller.copy_capability_available = true;
@@ -8304,8 +9083,12 @@ mod tests {
                 assert_eq!(prepared.color, controller.copy_swatch_color);
                 assert!(prepared.available);
             } else {
-                assert!(controller.prepare_annotation_probe(frame.content_sequence, frame.presentation_revision,
-                    [frame.content_width, frame.content_height], vec![1.0; 7]));
+                assert!(controller.prepare_annotation_probe(
+                    frame.content_sequence,
+                    frame.presentation_revision,
+                    [frame.content_width, frame.content_height],
+                    vec![1.0; 7]
+                ));
                 let prepared = controller.annotation_probe.as_ref().unwrap();
                 assert_eq!(prepared.source, frame.content_sequence);
                 assert_eq!(prepared.presentation, frame.presentation_revision);
@@ -8315,16 +9098,25 @@ mod tests {
             controller.location_pending = true;
             let moved = Rectangle { x: 17.0, ..bounds };
             record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds);
-            assert!(!controller.prepare_annotation_probe(999, 999, [1, 1], Vec::new()), "pending location cannot be overwritten");
+            assert!(
+                !controller.prepare_annotation_probe(999, 999, [1, 1], Vec::new()),
+                "pending location cannot be overwritten"
+            );
             assert!(!controller.prepare_control_probe());
             let phase = controller.phase.clone();
             // The obsolete location cannot validate bounds or stamp a new
             // output onto the saved old frame. Normal advance can now rearm.
-            controller.update(Message::Located { control: ANNOTATION_SURFACE.into(), bounds: Rectangle::default() });
+            controller.update(Message::Located {
+                control: ANNOTATION_SURFACE.into(),
+                bounds: Rectangle::default(),
+            });
             assert_eq!(controller.phase, phase);
             assert!(!controller.location_pending);
             assert!(controller.annotation_probe.is_none() && controller.control_probe.is_none());
-            assert!(controller.annotation_pixels_pending.is_none() && controller.control_probe_receipt.is_none());
+            assert!(
+                controller.annotation_pixels_pending.is_none()
+                    && controller.control_probe_receipt.is_none()
+            );
         }
         SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
         initialize_reporting(false, false);
@@ -8348,7 +9140,13 @@ mod tests {
                 let surface = crate::view_model::test_support::physical_surface(frame);
                 let width = 800.0 * dpi;
                 let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, width));
-                let draw = AtlasDraw { surface, snapshot: std::sync::Arc::new(snapshot), bounds, image: bounds, clip: bounds };
+                let draw = AtlasDraw {
+                    surface,
+                    snapshot: std::sync::Arc::new(snapshot),
+                    bounds,
+                    image: bounds,
+                    clip: bounds,
+                };
                 let samples = atlas_composition_samples(&draw).unwrap();
                 assert_eq!(samples.count, ATLAS_GRID_SAMPLES * 10);
                 assert_eq!(samples.card_count, 0);
@@ -8356,16 +9154,33 @@ mod tests {
                 let cell = width / columns as f32;
                 // Independent raster strips at known physical positions, not
                 // the shader's rounding/distance algorithm.
-                let positions = [0.5, 1.5, 2.5, 3.5,
-                    cell - 1.5, cell - 0.5, cell + 0.5, cell + 1.5, cell + 2.5,
-                    width - 3.5, width - 2.5, width - 1.5, width - 0.5];
+                let positions = [
+                    0.5,
+                    1.5,
+                    2.5,
+                    3.5,
+                    cell - 1.5,
+                    cell - 0.5,
+                    cell + 0.5,
+                    cell + 1.5,
+                    cell + 2.5,
+                    width - 3.5,
+                    width - 2.5,
+                    width - 1.5,
+                    width - 0.5,
+                ];
                 let clean_indices = [3, 4, 8, 9];
                 let white_indices = [1, 6, 11];
                 for (index, point) in samples.points[..samples.count].chunks_exact(10).enumerate() {
                     assert_eq!(point[2], positions[index]);
                     assert_eq!(point[3], cell / 2.0);
-                    let expected = if clean_indices.contains(&index) { [48.0, 80.0, 112.0] }
-                        else if white_indices.contains(&index) { [255.0; 3] } else { [0.0; 3] };
+                    let expected = if clean_indices.contains(&index) {
+                        [48.0, 80.0, 112.0]
+                    } else if white_indices.contains(&index) {
+                        [255.0; 3]
+                    } else {
+                        [0.0; 3]
+                    };
                     assert_eq!(point[4..7], expected);
                     assert_eq!(point[7], 255.0);
                     assert_eq!(point[8], 4.0);
@@ -8494,42 +9309,68 @@ mod tests {
         );
         controller.phase = Phase::AwaitExploreReady;
         let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
-        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender)));
-        record_probe_draw(EXPLORE_GALLERY, draw.surface, draw.bounds, draw.image, draw.clip);
-        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(1, 0),
-        }).unwrap();
+        SURFACE_DRAW_OBSERVER.with(|observer| {
+            observer.borrow_mut().output = Some(ScenarioOutput::new(controller.generation, sender))
+        });
+        record_probe_draw(
+            EXPLORE_GALLERY,
+            draw.surface,
+            draw.bounds,
+            draw.image,
+            draw.clip,
+        );
+        atlas_probe_output(false)
+            .unwrap()
+            .try_send(Message::AtlasPixels {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(1, 0),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(0, 0),
-        }).unwrap();
+        atlas_probe_output(false)
+            .unwrap()
+            .try_send(Message::AtlasPixels {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(0, 0),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_pixels.is_none());
-        atlas_probe_output(false).unwrap().try_send(Message::AtlasPixels {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(1, 1),
-        }).unwrap();
+        atlas_probe_output(false)
+            .unwrap()
+            .try_send(Message::AtlasPixels {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(1, 1),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_pixels, Some(draw.clone()));
-        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(1, 0),
-        }).unwrap();
+        atlas_probe_output(true)
+            .unwrap()
+            .try_send(Message::AtlasComposition {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(1, 0),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(0, 0),
-        }).unwrap();
+        atlas_probe_output(true)
+            .unwrap()
+            .try_send(Message::AtlasComposition {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(0, 0),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert!(controller.atlas_composition.is_none());
-        atlas_probe_output(true).unwrap().try_send(Message::AtlasComposition {
-            receipt: draw.clone(),
-            outcome: ProbeOutcome::Observed(1, 1),
-        }).unwrap();
+        atlas_probe_output(true)
+            .unwrap()
+            .try_send(Message::AtlasComposition {
+                receipt: draw.clone(),
+                outcome: ProbeOutcome::Observed(1, 1),
+            })
+            .unwrap();
         controller.update(receiver.try_recv().unwrap());
         assert_eq!(controller.atlas_composition, Some(draw));
         SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);

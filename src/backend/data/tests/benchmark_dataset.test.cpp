@@ -129,7 +129,8 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
 
 class HttpServer {
    public:
-    explicit HttpServer(std::span<const std::uint8_t> payload) : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+    explicit HttpServer(std::span<const std::uint8_t> payload)
+        : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
         require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
         const int reuse = 1;
         require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0,
@@ -146,7 +147,9 @@ class HttpServer {
                           "failed to inspect benchmark HTTP socket");
         port_ = ntohs(address.sin_port);
         worker_ = std::jthread([this] {
-            try { run(); } catch (...) { failure_ = std::current_exception(); }
+            try {
+                run();
+            } catch (...) { failure_ = std::current_exception(); }
         });
     }
 
@@ -324,9 +327,9 @@ void test_benchmark_download_cache_lifecycle() {
     auto download = std::async(std::launch::async, [&] {
         try {
             (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
-                [&](const DownloadProgress& progress) {
-                    if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
-                });
+                                     [&](const DownloadProgress& progress) {
+                                         if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
+                                     });
             return false;
         } catch (const std::exception&) { return true; }
     });

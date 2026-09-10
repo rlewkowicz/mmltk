@@ -160,7 +160,8 @@ fn worker(
                 return;
             }
             let mut pending_events = std::collections::VecDeque::with_capacity(64);
-            let mut quiet_settlement_pending = config.integration && config.integration_viewer_scenario == "quiet";
+            let mut quiet_settlement_pending =
+                config.integration && config.integration_viewer_scenario == "quiet";
             let reason = loop {
                 let has_pending = !pending_events.is_empty();
                 let event = {
@@ -198,7 +199,10 @@ fn worker(
                         }
                         if quiet_settlement_pending && connection.integration_pressure_settled() {
                             quiet_settlement_pending = false;
-                            if let Err(error) = retain_event(&mut pending_events, TransportEvent::IntegrationInputSettled) {
+                            if let Err(error) = retain_event(
+                                &mut pending_events,
+                                TransportEvent::IntegrationInputSettled,
+                            ) {
                                 break error;
                             }
                         }
@@ -253,7 +257,9 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
         ServerRecord::IntentReply(record) => Some(TransportEvent::IntentReply(record)),
         ServerRecord::SystemEvent(record) => Some(TransportEvent::SystemEvent(record)),
         ServerRecord::InputProgress(_) => None,
-        ServerRecord::IntegrationControl(record) => Some(TransportEvent::IntegrationControl(record.receipt)),
+        ServerRecord::IntegrationControl(record) => {
+            Some(TransportEvent::IntegrationControl(record.receipt))
+        }
         ServerRecord::InteractionRejected(record) => {
             Some(TransportEvent::Rejected(record.error.detail))
         }

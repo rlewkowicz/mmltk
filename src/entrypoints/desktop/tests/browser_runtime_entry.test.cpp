@@ -100,10 +100,11 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
             ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", integration ? "1" : "0", 1) != 0)
             std::_Exit(126);
         if (integration && (::fcntl(control_child.get(), F_SETFD, 0) != 0 ||
-            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_text.c_str(), 1) != 0 ||
-            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", working_directory.c_str(), 1) != 0 ||
-            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", working_directory.c_str(), 1) != 0 ||
-            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", "512", 1) != 0)) std::_Exit(126);
+                            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_text.c_str(), 1) != 0 ||
+                            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", working_directory.c_str(), 1) != 0 ||
+                            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", working_directory.c_str(), 1) != 0 ||
+                            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", "512", 1) != 0))
+            std::_Exit(126);
         if (::chdir(working_directory.c_str()) != 0) std::_Exit(126);
         if ((tracing == 0 ? ::unsetenv("MMLTK_GUI_TRACE_FILE") : ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_path.c_str(), 1)) != 0 ||
             ::setenv("MMLTK_GUI_PIXEL_TRACE", tracing == 2 ? "1" : "0", 1) != 0)

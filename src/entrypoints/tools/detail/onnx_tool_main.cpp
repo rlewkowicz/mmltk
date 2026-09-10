@@ -38,7 +38,8 @@ int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& co
         return 0;
     } catch (const std::exception& error) {
         try {
-            mmltk::common::logging::error(config.logger_name, [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
+            mmltk::common::logging::error(config.logger_name,
+                                          [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
         } catch (...) {}
         return 1;
     }
