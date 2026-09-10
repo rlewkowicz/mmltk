@@ -57,6 +57,7 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
     };
     const VisualDiagnosticSink diagnostics = visual_diagnostic_sink(visual_diagnostic_target_);
     auto explore_configuration = std::move(config.explore);
+    if (explore_configuration.acceptance) browser_host_.install_integration(explore_configuration.acceptance);
     explore_configuration.diagnostics = diagnostics;
     systems_ = std::make_unique<ApplicationSystemStorage>(
         ApplicationSystemConfiguration{.base_visual = base_visual,

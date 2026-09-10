@@ -236,6 +236,10 @@ int main(int argc, char** argv) {
                     page_query += "&mmltk_integration_pixel_fixture=1";
                 if (const char* scenario = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO"); scenario != nullptr)
                     page_query += "&mmltk_integration_viewer_scenario=" + query_value(scenario);
+                if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE"); square != nullptr)
+                    page_query += "&mmltk_integration_square_source=" + query_value(square);
+                if (const char* square = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED"); square != nullptr)
+                    page_query += "&mmltk_integration_square_compiled=" + query_value(square);
                 const char* const window_close = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_WINDOW_CLOSE");
                 if (window_close != nullptr && std::string_view{window_close} == "1") page_query += "&mmltk_integration_window_close=1";
                 const char* const source = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE");

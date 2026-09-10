@@ -3,7 +3,7 @@ use super::{
     ProtocolError, decode_envelope, encode_envelope, object, reject_unknown_fields,
     validate_client_dynamic_value, validate_server_dynamic_value,
 };
-use crate::application_codec::{FromApplicationValue, Value};
+use crate::application_codec::{FromApplicationValue, IntoApplicationValue, Value};
 use crate::generated::{EventDelivery, MAX_INTENT_FIELDS, MAX_SNAPSHOT_COUNT, ServerRecordKind};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,6 +42,7 @@ pub enum ServerRecord {
     SystemEvent(SystemEvent),
     InteractionRejected(crate::generated::InteractionRejected),
     InputProgress(crate::generated::InputProgress),
+    IntegrationControl(crate::generated::IntegrationControl),
 }
 
 fn protocol_payload(values: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
@@ -154,6 +155,18 @@ impl RendererObservation {
                 ("sample_revision", Value::Unsigned(revision)),
             ]),
         )
+    }
+}
+
+impl crate::generated::IntegrationControl {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        if self.protocolversion != crate::generated::BROWSER_PROTOCOL_VERSION
+            || self.receipt.sequence == 0
+            || self.receipt.kind == crate::generated::IntegrationControlKind::Advance
+        {
+            return Err(ProtocolError("invalid integration receipt".into()));
+        }
+        encode_envelope("IntegrationControl", &self.clone().into_application_value())
     }
 }
 
@@ -302,6 +315,16 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
                 return Err(ProtocolError("invalid progress epoch".into()));
             }
             Ok(ServerRecord::InputProgress(record))
+        }
+        ServerRecordKind::IntegrationControl => {
+            let record = crate::generated::IntegrationControl::from_application_value(envelope.payload)
+                .map_err(ProtocolError)?;
+            if record.receipt.sequence == 0
+                || record.receipt.kind != crate::generated::IntegrationControlKind::Advance
+            {
+                return Err(ProtocolError("invalid integration advance".into()));
+            }
+            Ok(ServerRecord::IntegrationControl(record))
         }
 
         ServerRecordKind::IntentReply => {
@@ -648,7 +671,9 @@ mod tests {
     #[test]
     fn bootstrap_reply_and_event_decode_without_session_state() {
         let native = native_server_fixtures();
-        assert_eq!(native.len(), 7);
+        assert_eq!(native.len(), 8);
+        assert!(matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
+            if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2));
         let Ok(ServerRecord::Bootstrap(bootstrap)) = decode_server(native[0]) else {
             panic!("native Bootstrap");
         };

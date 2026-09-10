@@ -13,6 +13,7 @@ struct Outbound {
     input: crate::annotation_input::AnnotationInput,
     writable: Option<std::task::Waker>,
     adjacent_record: bool,
+    pressure_observation: Option<(u64, bool)>,
 }
 impl Default for Outbound {
     fn default() -> Self {
@@ -21,6 +22,7 @@ impl Default for Outbound {
             input: Default::default(),
             writable: None,
             adjacent_record: false,
+            pressure_observation: None,
         }
     }
 }
@@ -36,6 +38,7 @@ pub(crate) enum OutboundRecord {
     Intent(Intent),
     Interaction(Interaction),
     RendererObservation(RendererObservation),
+    IntegrationControl(crate::generated::IntegrationControl),
 }
 
 impl OutboundRecord {
@@ -45,6 +48,7 @@ impl OutboundRecord {
             Self::Intent(value) => value.encode(),
             Self::Interaction(value) => value.encode(),
             Self::RendererObservation(value) => value.encode(),
+            Self::IntegrationControl(value) => value.encode(),
         }
     }
 }
@@ -82,6 +86,13 @@ pub struct Connection {
 }
 
 impl Connection {
+    pub(crate) fn observe_integration_pressure(&self, sequence: u64) {
+        self.retained.lock().expect("connection output").pressure_observation = Some((sequence, false));
+    }
+    pub(crate) fn integration_pressure_settled(&self) -> bool {
+        let retained = self.retained.lock().expect("connection output");
+        retained.pressure_observation.is_some_and(|(_, entered)| entered) && retained.input.settled()
+    }
     pub(crate) fn new(outbound: mpsc::Sender<OutboundRecord>) -> Self {
         Self {
             outbound,
@@ -166,6 +177,19 @@ impl Connection {
         self.send(OutboundRecord::RendererObservation(observation), true)
     }
 
+    pub(crate) fn send_integration_control(
+        &mut self,
+        receipt: crate::generated::IntegrationControlReceipt,
+    ) -> Result<SendDisposition, OutboundSendError> {
+        self.send(
+            OutboundRecord::IntegrationControl(crate::generated::IntegrationControl {
+                protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
+                receipt,
+            }),
+            false,
+        )
+    }
+
     pub async fn writable(self) -> Result<(), OutboundSendError> {
         self.require_open()?;
         iced::futures::future::poll_fn(|context| {
@@ -198,7 +222,22 @@ impl Connection {
             while let Some(record) = retained.records.pop_front() {
                 send(&record.encode().map_err(|error| error.to_string())?)?;
             }
-            retained.input.flush(send)
+            retained.input.flush(&mut send)?;
+            if let Some((sequence, false)) = retained.pressure_observation
+                && retained.input.pressure_entered()
+            {
+                let record = crate::generated::IntegrationControl {
+                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
+                    receipt: crate::generated::IntegrationControlReceipt {
+                        kind: crate::generated::IntegrationControlKind::PressureEntered,
+                        sequence,
+                        progress: 0,
+                    },
+                };
+                send(&record.encode().map_err(|error| error.to_string())?)?;
+                retained.pressure_observation = Some((sequence, true));
+            }
+            Ok(())
         })();
         if retained.record_count() < before {
             if let Some(waker) = retained.writable.take() {
@@ -609,9 +648,12 @@ mod tests {
             for sample in &accepted[..64] { fixture.connection.send_annotation_pointer(sample.clone(), 1).unwrap(); }
             fixture.flush();
             assert_eq!(fixture.wire.len(), 2);
+            assert!(!fixture.connection.retained.lock().unwrap().input.pressure_entered());
             for sample in &accepted[64..] { fixture.connection.send_annotation_pointer(sample.clone(), 1).unwrap(); }
             fixture.flush();
             assert_eq!(fixture.wire.len(), 2, "terminal input remains retained under exhausted credits");
+            assert!(fixture.connection.retained.lock().unwrap().input.pressure_entered());
+            assert!(!fixture.connection.retained.lock().unwrap().input.settled());
             fixture.connection.send_renderer_observation(RendererObservation::Ready).unwrap();
             fixture.connection.send_intent(Intent { correlation: 90, endpoint_id: crate::generated::ENDPOINT_Settings_Update, fields: Vec::new() }).unwrap();
             fixture.connection.send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter, value: vec![7] }).unwrap();
@@ -627,6 +669,7 @@ mod tests {
             fixture.assert_samples(&accepted, 1);
             fixture.credit(5);
             fixture.flush();
+            assert!(fixture.connection.retained.lock().unwrap().input.settled());
             assert_eq!(fixture.wire.len(), 8);
             assert!(fixture.connection.observe(&consumed(6)).is_err());
             fixture.credit(5); // Duplicate cumulative progress consumes no second prefix.

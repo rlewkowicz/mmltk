@@ -555,6 +555,20 @@ TEST_CASE("direct host closes a real peer on malformed Protocol-14 input") {
     CHECK((!terminal || terminal->opcode == 8U));
 }
 
+TEST_CASE("ordinary browser host rejects explicit integration control", "[controller][browser][protocol]") {
+    RunningHost server{OpenPressure::None};
+    LoopbackWebSocket peer{server.websocket()};
+    REQUIRE(peer.receive());
+    wire::ByteBuffer encoded;
+    REQUIRE(encode_client_record(
+        ClientRecord{IntegrationControl{.receipt = {.kind = mmltk::controller::contracts::IntegrationControlKind::Settled,
+                                                    .sequence = 1U}}},
+        encoded));
+    peer.send_binary(encoded);
+    const auto terminal = peer.receive();
+    CHECK((!terminal || terminal->opcode == 8U));
+}
+
 TEST_CASE("direct host keeps a real peer after decoded application interaction rejection") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};

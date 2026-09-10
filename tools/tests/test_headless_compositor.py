@@ -88,7 +88,7 @@ append_native_logging_environment() { :; }
 append_explicit_test_environment() { :; }
 run_owned_docker_command() { printf '%s\\n' "$@"; }
 """
-        for argument in ("--list-tests", "workspace_wayland_product_sigint"):
+        for argument in ("--list-tests", "workspace_wayland_retained"):
             script = setup + "\nrun_workspace_wayland_test_executable() {" + function
             script += f"\nrun_workspace_wayland_test_executable /packaged/test {argument}\n"
             result = subprocess.run(("bash", "-c", script), check=True, capture_output=True, text=True)

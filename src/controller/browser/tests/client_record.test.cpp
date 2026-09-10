@@ -173,11 +173,40 @@ TEST_CASE("browser client records are one complete canonical CBOR item", "[contr
     CHECK_FALSE(decode_client_record(wire::ByteSegments{.first = encoded, .second = {}}));
 }
 
+TEST_CASE("integration control retains typed direction and sequence validation", "[controller][browser][protocol]") {
+    using Kind = mmltk::controller::contracts::IntegrationControlKind;
+    wire::ByteBuffer encoded;
+    for (const auto kind : {Kind::Settled, Kind::Failed, Kind::Progress, Kind::PressureEntered}) {
+        const ClientRecord source = IntegrationControl{.receipt = {.kind = kind, .sequence = 3U, .progress = 5U}};
+        REQUIRE(encode_client_record(source, encoded));
+        const auto decoded = decode_client_record({.first = encoded, .second = {}});
+        REQUIRE(decoded);
+        CHECK(*decoded == source);
+        CHECK_FALSE(encode_server_record(ServerRecord{std::get<IntegrationControl>(source)}, encoded));
+    }
+    const IntegrationControl advance{.receipt = {.kind = Kind::Advance, .sequence = 2U}};
+    REQUIRE(encode_server_record(ServerRecord{advance}, encoded));
+    const auto decoded = decode_server_record({.first = encoded, .second = {}});
+    REQUIRE(decoded);
+    CHECK(std::get<IntegrationControl>(*decoded) == advance);
+    CHECK_FALSE(decode_client_record({.first = encoded, .second = {}}));
+    CHECK_FALSE(encode_client_record(ClientRecord{advance}, encoded));
+    CHECK_FALSE(encode_client_record(ClientRecord{IntegrationControl{.receipt = {.kind = Kind::Settled}}}, encoded));
+    CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
+}
+
 TEST_CASE("Rust Protocol-14 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
     STATIC_REQUIRE(kBrowserProtocolVersion == 14U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
-    REQUIRE(fixtures.size() == 6U + annotation_alternatives);
+    REQUIRE(fixtures.size() == 7U + annotation_alternatives);
+    const auto& control_fixture = fixture_named(fixtures, "IntegrationControl");
+    const auto control = decode_client_record(wire::ByteSegments{.first = control_fixture.bytes, .second = {}});
+    REQUIRE(control);
+    const auto* receipt = std::get_if<IntegrationControl>(&*control);
+    REQUIRE(receipt);
+    CHECK(receipt->receipt.kind == mmltk::controller::contracts::IntegrationControlKind::Settled);
+    CHECK(receipt->receipt.sequence == 1U);
     const auto& dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open");
     const auto& model_dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open.model_artifact");
     const auto& settings_fixture = fixture_named(fixtures, "Intent:settings.Update");

@@ -3267,9 +3267,12 @@ run_tests() {
         fi
         local workspace_wayland_inventory=""
         local -a workspace_wayland_expected_cases=(
-            workspace_wayland_product_sigint
-            workspace_wayland_product_window_close
-            workspace_wayland_product_peer_loss
+            workspace_wayland_retained
+            workspace_wayland_dpi
+            workspace_wayland_terminal
+            workspace_wayland_probe_recovery
+            workspace_wayland_gdr
+            workspace_wayland_quiet
         )
         if (( ! gui_diagnostics_quiet )); then log "enumerating ${executables[0]} hardware cases"; fi
         if ! workspace_wayland_inventory="$(

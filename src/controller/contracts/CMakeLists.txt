@@ -8,6 +8,7 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         application_boundary.h
+        integration_control.h
         visual_source.h)
 target_link_libraries(mmltk_controller_application_boundary INTERFACE
     mmltk::frameworks::reflection)

@@ -17,6 +17,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 
 #include "src/controller/contracts/application_boundary.h"
+#include "src/controller/contracts/integration_control.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/frameworks/serialization/serialization.h"
 
@@ -132,8 +133,15 @@ struct InputProgress final {
 };
 MMLTK_REFLECT_FIELDS(InputProgress)
 
-using ClientRecord = std::variant<Intent, Interaction, RendererObservation>;
-using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InputProgress, InteractionRejected>;
+struct IntegrationControl final {
+    std::uint64_t protocol_version = kBrowserProtocolVersion;
+    contracts::IntegrationControlReceipt receipt{};
+    bool operator==(const IntegrationControl&) const = default;
+};
+MMLTK_REFLECT_FIELDS(IntegrationControl)
+
+using ClientRecord = std::variant<Intent, Interaction, RendererObservation, IntegrationControl>;
+using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InputProgress, InteractionRejected, IntegrationControl>;
 
 MMLTK_REFLECT_ENUM(RendererObservationKind)
 MMLTK_REFLECT_FIELDS(IntentField)

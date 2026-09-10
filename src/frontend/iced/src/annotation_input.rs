@@ -117,6 +117,16 @@ impl AnnotationInput {
     pub fn is_closed(&self) -> bool {
         self.closed
     }
+    pub(crate) fn pressure_entered(&self) -> bool {
+        let frontier = self.commands.front().map_or(self.accepted_samples, |command| command.after_samples);
+        !self.closed && self.barrier.is_none() && self.epoch != 0 && self.epoch == self.ready_epoch
+            && self.flights.len() == generated::ANNOTATION_INPUT_ADMISSION_SLOTS
+            && frontier > self.consumed_samples + self.sent_samples as u64
+    }
+    pub(crate) fn settled(&self) -> bool {
+        !self.closed && self.samples.is_empty() && self.flights.is_empty()
+            && self.commands.is_empty() && self.barrier.is_none()
+    }
     pub fn close(&mut self) {
         self.closed = true;
         self.samples.clear();

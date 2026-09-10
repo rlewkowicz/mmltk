@@ -769,6 +769,7 @@ extern "C" {
         end_x: f64,
         end_y: f64,
         hold: bool,
+        steps: u32,
     ) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAnnotationRelease)]
     fn annotation_release_js();
@@ -1456,6 +1457,9 @@ pub(crate) fn report_surface_sync(
     current: Option<crate::presentation_surface::Surface>,
     updated: Option<crate::presentation_surface::Surface>,
 ) {
+    if !reporting_enabled() {
+        return;
+    }
     let identity = |surface: Option<crate::presentation_surface::Surface>| {
         surface.map_or_else(
             || "none".to_string(),
@@ -2265,6 +2269,27 @@ fn report_advanced_field(control: &str, detail: &str, bounds: Rectangle) {
     );
 }
 
+#[derive(Clone, Default)]
+struct SessionInputs {
+    profile: String,
+    source: String,
+    compiled: String,
+}
+
+impl SessionInputs {
+    fn scenario(&self, index: usize) -> Option<(&'static str, bool)> {
+        match self.profile.as_str() {
+            "retained" => [
+                ("square", false), ("", false), ("wide", false), ("tall", false),
+                ("semantics", false), ("copy", false), ("copy", true), ("rapid", false),
+            ].get(index).copied(),
+            "dpi" => [("copy", false), ("copy", true), ("rapid", true)].get(index).copied(),
+            "terminal" => [("terminal", false)].get(index).copied(),
+            _ => None,
+        }
+    }
+}
+
 pub struct Controller {
     generation: u64,
     phase: Phase,
@@ -2275,6 +2300,14 @@ pub struct Controller {
     compiled_directory: String,
     resolution: String,
     viewer_scenario: String,
+    session: SessionInputs,
+    control_sequence: u64,
+    control_phase: Option<Phase>,
+    control_progress: u64,
+    desired_dark: Option<bool>,
+    reuse_compiled: bool,
+    bounded_document_revision: u64,
+    bounded_object_count: usize,
     annotation_probe: Option<AnnotationProbe>,
     annotation_pixels_receipt: Option<ProbeReceipt>,
     annotation_pixels_pending: Option<ProbeReceipt>,
@@ -2397,7 +2430,7 @@ impl Controller {
         message: &crate::view::router::Message,
         active: FeatureId,
     ) {
-        if !self.running() {
+        if !reporting_enabled() || !self.running() {
             return;
         }
         if let crate::view::router::Message::Navigation(
@@ -2493,6 +2526,14 @@ impl Controller {
             compiled_directory,
             resolution,
             viewer_scenario,
+            session: SessionInputs::default(),
+            control_sequence: 1,
+            control_phase: None,
+            control_progress: 0,
+            desired_dark: None,
+            reuse_compiled: false,
+            bounded_document_revision: 0,
+            bounded_object_count: 0,
             annotation_probe: None,
             annotation_pixels_receipt: None,
             annotation_pixels_pending: None,
@@ -2601,6 +2642,95 @@ impl Controller {
             reset_scenario_js();
         }
         Ok(())
+    }
+
+    pub(crate) fn configure_session(&mut self, profile: &str, square_source: String, square_compiled: String) {
+        self.session = SessionInputs {
+            profile: profile.into(),
+            source: self.dataset_source.clone(),
+            compiled: self.compiled_directory.clone(),
+        };
+        if let Some((scenario, dark)) = self.session.scenario(0) {
+            self.viewer_scenario = scenario.into();
+            self.desired_dark = Some(dark);
+            self.reuse_compiled = true;
+            if scenario == "square" {
+                self.dataset_source = square_source;
+                self.compiled_directory = square_compiled;
+                self.resolution = "384".into();
+            }
+        } else {
+            self.reuse_compiled = profile != "compile";
+        }
+    }
+
+    pub(crate) fn receive_control(&mut self, receipt: crate::generated::IntegrationControlReceipt) -> Result<(), &'static str> {
+        if receipt.kind != crate::generated::IntegrationControlKind::Advance
+            || self.control_sequence.checked_add(1) != Some(receipt.sequence)
+            || !matches!(self.phase, Phase::Complete)
+            || self.control_phase.as_ref() != Some(&Phase::Complete)
+        {
+            self.fail("premature, duplicate or stale scenario advance");
+            return Err("premature, duplicate or stale scenario advance");
+        }
+        let index = usize::try_from(receipt.sequence - 1).map_err(|_| "scenario index overflow")?;
+        let Some((scenario, dark)) = self.session.scenario(index) else {
+            if self.window_close {
+                #[cfg(target_arch = "wasm32")]
+                if window_close_js() != 1 {
+                    self.fail("Firefox window close dispatch failed");
+                    return Err("Firefox window close dispatch failed");
+                }
+                self.control_sequence = receipt.sequence;
+                return Ok(());
+            }
+            self.fail("advance beyond the configured workflow");
+            return Err("advance beyond the configured workflow");
+        };
+        let session = self.session.clone();
+        self.reset_scenario(session.source.clone(), session.compiled.clone(), "512".into(), scenario.into())?;
+        self.session = session;
+        self.control_sequence = receipt.sequence;
+        self.desired_dark = Some(dark);
+        self.reuse_compiled = !scenario.is_empty();
+        Ok(())
+    }
+
+    pub(crate) fn publish_control(&mut self, connection: &mut crate::transport_connection::Connection) {
+        if self.generation == 0 || self.control_phase.as_ref() == Some(&self.phase) {
+            return;
+        }
+        if self.viewer_scenario == "quiet" && matches!(self.phase, Phase::Complete)
+            && !connection.integration_pressure_settled()
+        {
+            return;
+        }
+        use crate::generated::IntegrationControlKind as Kind;
+        let kind = match self.phase {
+            Phase::Disabled => return,
+            Phase::Complete => Kind::Settled,
+            Phase::Failed => Kind::Failed,
+            _ => Kind::Progress,
+        };
+        let class = match self.phase.deadline_class() {
+            "startup" => 1,
+            "work" => 2,
+            _ => 3,
+        };
+        let Some(progress) = self.control_progress.checked_add(4).and_then(|value| value.checked_add(class)) else {
+            self.fail("integration progress identity exhausted");
+            return;
+        };
+        match connection.send_integration_control(crate::generated::IntegrationControlReceipt {
+            kind, sequence: self.control_sequence, progress,
+        }) {
+            Ok(_) => {
+                self.control_phase = Some(self.phase.clone());
+                self.control_progress = progress & !3;
+            }
+            Err(crate::transport_connection::OutboundSendError::Capacity) => {}
+            Err(_) => self.fail("integration control delivery failed"),
+        }
     }
 
     fn observe_presentation(
@@ -3214,7 +3344,11 @@ impl Controller {
                     &self.viewer_scenario,
                     [presentation as f64, source as f64, 1.0, 0.0],
                 );
-                self.phase = Phase::Complete;
+                self.phase = if self.viewer_scenario == "terminal" {
+                    Phase::OpenAnnotation
+                } else {
+                    Phase::Complete
+                };
             }
             return None;
         }
@@ -3990,13 +4124,15 @@ impl Controller {
                 let Some((columns, _rows, _, _, revision)) = self.selection_grid else {
                     return None;
                 };
+                let index = if self.viewer_scenario == "tall" { 7 } else { 0 };
+                let side = input_bounds.width / columns as f32;
                 let selected = Rectangle {
-                    x: input_bounds.x,
-                    y: input_bounds.y,
-                    width: input_bounds.width / columns as f32,
-                    height: input_bounds.width / columns as f32,
+                    x: input_bounds.x + (index % columns) as f32 * side,
+                    y: input_bounds.y + (index / columns) as f32 * side,
+                    width: side,
+                    height: side,
                 };
-                self.phase = Phase::AwaitDetail(0);
+                self.phase = Phase::AwaitDetail(index);
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, true) {
                     self.fail("viewer first-image click failed");
                 }
@@ -4232,6 +4368,7 @@ impl Controller {
                     gesture[2],
                     gesture[3],
                     self.copy_product_cancel,
+                    if self.viewer_scenario == "quiet" { 160 } else { 1 },
                 ) == 1;
                 #[cfg(not(target_arch = "wasm32"))]
                 let dispatched = false;
@@ -4361,12 +4498,14 @@ impl Controller {
     }
 
     fn advance_to(&mut self, phase: Phase) -> Task<RootMessage> {
-        report(
-            "integration.phase_advanced",
-            "",
-            &format!("{phase:?}"),
-            [0.0; 4],
-        );
+        if reporting_enabled() {
+            report(
+                "integration.phase_advanced",
+                "",
+                &format!("{phase:?}"),
+                [0.0; 4],
+            );
+        }
         let reveal_annotation = matches!(phase, Phase::CopyProductWait);
         self.phase = phase;
         // A completed local step has no pending native event to wake its
@@ -4391,12 +4530,14 @@ impl Controller {
         if self.reported_phase.as_ref() == Some(&self.phase) {
             return;
         }
-        report(
-            "integration.phase_progress",
-            self.phase.deadline_class(),
-            &format!("{:?}", self.phase),
-            [0.0; 4],
-        );
+        if reporting_enabled() {
+            report(
+                "integration.phase_progress",
+                self.phase.deadline_class(),
+                &format!("{:?}", self.phase),
+                [0.0; 4],
+            );
+        }
         self.reported_phase = Some(self.phase.clone());
     }
 
@@ -4412,6 +4553,14 @@ impl Controller {
         self.report_phase_progress();
         if !self.running() {
             return Task::none();
+        }
+        if let Some(dark) = self.desired_dark {
+            let Some(snapshot) = model.settings_snapshot.as_ref() else { return Task::none(); };
+            if settings.has_local_edits() { return Task::none(); }
+            if snapshot.settingsstate.ui.darkmode != dark {
+                return Task::done(RootMessage::Settings(crate::view::settings::Message::DarkModeChanged(dark)));
+            }
+            self.desired_dark = None;
         }
         self.input_scale = applied_scale;
         self.observe_presentation(model, frame);
@@ -4499,7 +4648,11 @@ impl Controller {
                     | Phase::ViewerReconnect
             )
         {
-            self.fail(&format!("{}: {}", error.title, error.detail));
+            if reporting_enabled() {
+                self.fail(&format!("{}: {}", error.title, error.detail));
+            } else {
+                self.fail("application reported an error");
+            }
             return Task::none();
         }
         match self.phase.clone() {
@@ -5500,13 +5653,12 @@ impl Controller {
                 self.phase = Phase::AwaitDatasetSettings(revision);
                 Task::none()
             }
-            Phase::AwaitDatasetSettings(revision) => {
+            Phase::AwaitDatasetSettings(_) => {
                 let Some(snapshot) = model.settings_snapshot.as_ref() else {
                     return Task::none();
                 };
                 let train = &snapshot.settingsstate.workflows.train;
-                if snapshot.revision <= revision
-                    || train.datasetsourcedir != self.dataset_source
+                if train.datasetsourcedir != self.dataset_source
                     || train.compileddatasetdir != self.compiled_directory
                     || train.request.resolution.to_string() != self.resolution
                     || !train.compiledimensions
@@ -5525,8 +5677,13 @@ impl Controller {
                     "typed-settings",
                     [snapshot.revision as f64, 1.0, 0.0, 0.0],
                 );
-                self.phase = Phase::Compile;
-                self.arm_scrolled(COMPILE_DATASET, RelativeOffset::END)
+                if self.reuse_compiled {
+                    self.phase = Phase::ExploreNavigation;
+                    self.arm(crate::view::navigation::stable_id(FeatureId::Explore))
+                } else {
+                    self.phase = Phase::Compile;
+                    self.arm_scrolled(COMPILE_DATASET, RelativeOffset::END)
+                }
             }
             Phase::Compile => self.arm_scrolled(COMPILE_DATASET, RelativeOffset::END),
             phase @ (Phase::AwaitCompileProgress | Phase::AwaitCompileCompletion) => {
@@ -5651,6 +5808,15 @@ impl Controller {
                             snapshot.dataset.classnames.len() as f64,
                         ],
                     );
+                    if self.viewer_scenario == "quiet" {
+                        self.selection_grid = Some((
+                            snapshot.viewport.columns, snapshot.viewport.rowcount, 0,
+                            snapshot.revision, snapshot.frame.revision,
+                        ));
+                        COMPLETION_WITHOUT_INPUT.with(|active| active.set(false));
+                        self.phase = Phase::ViewerSelect;
+                        return self.arm(EXPLORE_GALLERY);
+                    }
                     let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
                         draw.snapshot.dataset.identity == snapshot.dataset.identity
                             && draw.snapshot.gallery.generation == snapshot.gallery.generation
@@ -6407,6 +6573,10 @@ impl Controller {
                 .is_none()
                 {
                     return Task::none();
+                }
+                if self.viewer_scenario == "quiet" {
+                    self.phase = Phase::OpenAnnotation;
+                    return self.arm(EXPLORE_ANNOTATE);
                 }
                 self.phase = Phase::DetailOriginal {
                     revision: snapshot.revision,
@@ -7926,6 +8096,15 @@ impl Controller {
                         0.0,
                     ],
                 );
+                if matches!(self.viewer_scenario.as_str(), "quiet" | "terminal") {
+                    self.bounded_document_revision = snapshot.ui.documentrevision;
+                    self.bounded_object_count = snapshot.ui.scene.objects.len();
+                    self.phase = Phase::AnnotationTool {
+                        revision: snapshot.ui.interactionrevision,
+                        tool: crate::generated::AnnotationTool::Box,
+                    };
+                    return self.arm_scrolled(annotation::tool_id(crate::generated::AnnotationTool::Box), RelativeOffset::START);
+                }
                 if self.viewer_scenario == "copy" {
                     let scene = &snapshot.ui.scene;
                     let Some((index, object)) =
@@ -8060,6 +8239,24 @@ impl Controller {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                     return Task::none();
                 };
+                if matches!(self.viewer_scenario.as_str(), "quiet" | "terminal") {
+                    let edited = model.annotation_edit_available()
+                        && snapshot.ui.documentrevision > self.bounded_document_revision
+                        && snapshot.ui.scene.objects.len() == self.bounded_object_count + 1
+                        && snapshot.ui.canundo
+                        && snapshot.ui.scene.objects.last().is_some_and(|object| {
+                            object.shape == crate::generated::AnnotationShape::Box
+                                && object.box_.second.x > object.box_.first.x
+                                && object.box_.second.y > object.box_.first.y
+                        });
+                    if !edited {
+                        return Task::none();
+                    }
+                    if self.viewer_scenario == "quiet" {
+                        self.phase = Phase::Complete;
+                        return Task::none();
+                    }
+                }
                 let Some(presentation) = model.presentation.as_ref() else {
                     return Task::none();
                 };
@@ -8261,12 +8458,6 @@ impl Controller {
                 );
                 self.phase = Phase::Complete;
                 self.report_phase_progress();
-                if self.window_close {
-                    #[cfg(target_arch = "wasm32")]
-                    if window_close_js() != 1 {
-                        self.fail("Firefox window close dispatch failed");
-                    }
-                }
                 Task::none()
             }
             _ => Task::none(),
@@ -8277,6 +8468,69 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn destructive_profile_continues_viewer_completion_into_annotation() {
+        initialize_reporting(false, false);
+        for window_close in [false, true] {
+            let mut driver = Controller::new(true, window_close, "source".into(), "compiled".into(), "512".into(), "terminal".into());
+            driver.configure_session("terminal", String::new(), String::new());
+            assert_eq!(driver.session.scenario(0), Some(("terminal", false)));
+            assert_eq!(driver.session.scenario(1), None);
+            assert!(driver.reuse_compiled);
+            driver.phase = Phase::ViewerNoAspect;
+            driver.viewer_drawn = Some((7, 3, ViewerDraw {
+                crop: [0, 0, 512, 512],
+                container: Rectangle::default(),
+                image: Rectangle::default(),
+                fit_revision: 1,
+            }));
+            driver.update(Message::Located {
+                control: "explore.detail.aspect".into(),
+                bounds: Rectangle::default(),
+            });
+            assert!(matches!(driver.phase, Phase::OpenAnnotation));
+            assert!(driver.running());
+            assert!(driver.receive_control(crate::generated::IntegrationControlReceipt {
+                kind: crate::generated::IntegrationControlKind::Advance, sequence: 2, progress: 0,
+            }).is_err(), "viewer evidence cannot settle a destructive Annotation workflow");
+        }
+    }
+
+    #[test]
+    fn retained_workflows_require_the_unique_settled_control_owner() {
+        initialize_reporting(false, false);
+        let mut driver = Controller::new(true, false, "mixed-source".into(), "mixed-output".into(), "512".into(), "retained".into());
+        driver.configure_session("retained", "square-source".into(), "square-output".into());
+        assert_eq!(driver.viewer_scenario, "square");
+        assert_eq!(driver.resolution, "384");
+        assert_eq!(driver.dataset_source, "square-source");
+        let generation = driver.generation;
+        let advance = crate::generated::IntegrationControlReceipt {
+            kind: crate::generated::IntegrationControlKind::Advance,
+            sequence: 2,
+            progress: 0,
+        };
+        driver.phase = Phase::Complete;
+        driver.control_phase = Some(Phase::Complete);
+        driver.receive_control(advance.clone()).unwrap();
+        assert_ne!(driver.generation, generation);
+        assert_eq!(driver.control_sequence, 2);
+        assert_eq!(driver.dataset_source, "mixed-source");
+        assert_eq!(driver.compiled_directory, "mixed-output");
+        assert_eq!(driver.resolution, "512");
+        assert!(driver.viewer_scenario.is_empty());
+        assert!(!driver.reuse_compiled);
+        assert!(driver.receive_control(advance).is_err());
+        assert!(matches!(driver.phase, Phase::Failed));
+
+        let mut premature = Controller::new(true, false, String::new(), String::new(), "512".into(), "dpi".into());
+        premature.configure_session("dpi", String::new(), String::new());
+        premature.phase = Phase::Complete;
+        assert!(premature.receive_control(crate::generated::IntegrationControlReceipt {
+            kind: crate::generated::IntegrationControlKind::Advance, sequence: 2, progress: 0,
+        }).is_err(), "local completion is insufficient before the typed receipt was admitted");
+    }
 
     #[test]
     fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {

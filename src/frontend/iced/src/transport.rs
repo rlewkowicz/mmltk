@@ -18,6 +18,8 @@ pub struct TransportConfig {
     pub integration_compiled_directory: String,
     pub integration_resolution: String,
     pub integration_viewer_scenario: String,
+    pub integration_square_source: String,
+    pub integration_square_compiled: String,
 }
 
 impl TransportConfig {
@@ -64,6 +66,14 @@ impl TransportConfig {
                 .as_ref()
                 .and_then(|params| params.get("mmltk_integration_viewer_scenario"))
                 .unwrap_or_default(),
+            integration_square_source: params
+                .as_ref()
+                .and_then(|params| params.get("mmltk_integration_square_source"))
+                .unwrap_or_default(),
+            integration_square_compiled: params
+                .as_ref()
+                .and_then(|params| params.get("mmltk_integration_square_compiled"))
+                .unwrap_or_default(),
         }
     }
 
@@ -80,6 +90,8 @@ impl TransportConfig {
             integration_compiled_directory: String::new(),
             integration_resolution: String::new(),
             integration_viewer_scenario: String::new(),
+            integration_square_source: String::new(),
+            integration_square_compiled: String::new(),
         }
     }
 }
@@ -90,6 +102,8 @@ pub enum TransportEvent {
     Bootstrap(protocol::Bootstrap),
     IntentReply(protocol::IntentReply),
     SystemEvent(protocol::SystemEvent),
+    IntegrationControl(crate::generated::IntegrationControlReceipt),
+    IntegrationInputSettled,
     Disconnected(String),
     ProtocolError(String),
     Rejected(String),
@@ -146,6 +160,7 @@ fn worker(
                 return;
             }
             let mut pending_events = std::collections::VecDeque::with_capacity(64);
+            let mut quiet_settlement_pending = config.integration && config.integration_viewer_scenario == "quiet";
             let reason = loop {
                 let has_pending = !pending_events.is_empty();
                 let event = {
@@ -180,6 +195,12 @@ fn worker(
                         };
                         if let Err(error) = connection.observe(&record) {
                             break error;
+                        }
+                        if quiet_settlement_pending && connection.integration_pressure_settled() {
+                            quiet_settlement_pending = false;
+                            if let Err(error) = retain_event(&mut pending_events, TransportEvent::IntegrationInputSettled) {
+                                break error;
+                            }
                         }
                         // Credits are reduced independently of the consumer. Every
                         // ordinary event enters the coalescer before the sole handoff.
@@ -232,6 +253,7 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
         ServerRecord::IntentReply(record) => Some(TransportEvent::IntentReply(record)),
         ServerRecord::SystemEvent(record) => Some(TransportEvent::SystemEvent(record)),
         ServerRecord::InputProgress(_) => None,
+        ServerRecord::IntegrationControl(record) => Some(TransportEvent::IntegrationControl(record.receipt)),
         ServerRecord::InteractionRejected(record) => {
             Some(TransportEvent::Rejected(record.error.detail))
         }

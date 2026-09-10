@@ -8,6 +8,7 @@
 
 namespace mmltk::controller {
 struct ApplicationSystems;
+class ExploreAcceptanceGate;
 }
 
 namespace mmltk::controller::browser {
@@ -19,6 +20,7 @@ class ApplicationBrowserHost final {
     ApplicationBrowserHost& operator=(const ApplicationBrowserHost&) = delete;
 
     [[nodiscard]] bool install(ApplicationSystems&) noexcept;
+    void install_integration(std::shared_ptr<ExploreAcceptanceGate>);
     [[nodiscard]] mmltk::frameworks::transport::BrowserServer::Callbacks callbacks() const noexcept;
     void publish(SystemEvent) noexcept;
     void continuity_lost() noexcept;

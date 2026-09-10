@@ -26,6 +26,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <ranges>
@@ -233,7 +234,8 @@ class BrowserHostProcess final {
                        const std::filesystem::path& working_directory, const TerminationMode termination,
                        const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::string& viewer_scenario,
                        const bool logging = true, const bool high_dpi = false, const bool h2d = true, const bool pixel_probes = false,
-                       const std::string& probe_failure = {}) {
+                       const std::string& probe_failure = {},
+                       const mmltk::backend::data::testsupport::FixtureSpec* square_fixture = nullptr) {
         const std::string executable_text = executable.string();
         const std::string diagnostics_text = diagnostics.string();
         const std::string runtime_log_text = runtime_log.string();
@@ -243,6 +245,8 @@ class BrowserHostProcess final {
         const std::string dataset_source = mmltk::backend::data::testsupport::dataset_dir(fixture);
         const std::string compiled_directory = mmltk::backend::data::testsupport::compiled_dir(fixture);
         const std::string resolution = std::to_string(viewer_scenario == "square" ? 384 : kCompiledResolution);
+        const std::string square_source = square_fixture ? mmltk::backend::data::testsupport::dataset_dir(*square_fixture) : "";
+        const std::string square_compiled = square_fixture ? mmltk::backend::data::testsupport::compiled_dir(*square_fixture) : "";
         std::array<int, 2U> control_pipe{};
         if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, control_pipe.data()) != 0)
             throw std::runtime_error("failed to create Explore acceptance control channel");
@@ -276,8 +280,12 @@ class BrowserHostProcess final {
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PROBE_FAILURE", probe_failure.c_str(), 1) == 0 &&
-                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE", fixture.pixel_evidence ? "1" : "0", 1) == 0 &&
-                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", viewer_scenario == "rapid" && logging ? "1" : "0", 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE",
+                         fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION",
+                         logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE", square_source.c_str(), 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED", square_compiled.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", compiled_directory.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", resolution.c_str(), 1) == 0 &&
@@ -505,12 +513,28 @@ struct SurfaceAudit final {
     std::vector<Draw> draws;
     std::string failure;
     std::size_t browser_ordinal = 0U;
-    std::uint64_t newest_replacement_generation = 0U;
     bool native_shutdown = false;
     bool browser_shutdown = false;
 
     void reject(const std::string_view why) {
         if (failure.empty()) failure = why;
+    }
+
+    [[nodiscard]] bool admit(const std::string& id) {
+        if (!failure.empty()) return false;
+        const auto existing = surfaces.find(id);
+        if (existing == surfaces.end()) {
+            if (surfaces.size() < kAcceptanceGenerationLimit) return true;
+        } else {
+            const auto& state = existing->second;
+            if (state.source_steps.size() < kAcceptanceRecordLimit && state.publication_steps.size() < kAcceptanceRecordLimit &&
+                state.ended_spans.size() < kAcceptanceRecordLimit && state.samples.size() < kAcceptanceRecordLimit &&
+                state.failed_source_operations.size() < kAcceptanceRecordLimit && state.failed_publications.size() < kAcceptanceRecordLimit &&
+                state.forwarded_publications.size() < kAcceptanceRecordLimit && draws.size() < kAcceptanceRecordLimit)
+                return true;
+        }
+        reject("physical lifecycle evidence exceeded its bounded acceptance capacity");
+        return false;
     }
 
     static std::string native_identity(const nlohmann::json& record) {
@@ -546,6 +570,7 @@ struct SurfaceAudit final {
             reject("native lifecycle record has no physical identity");
             return;
         }
+        if (!admit(id)) return;
         auto& state = surfaces[id];
         const auto generation = scalar(record, "sequence");
         const auto width = scalar(record, "capacity_width");
@@ -557,7 +582,6 @@ struct SurfaceAudit final {
         state.generation = generation;
         state.width = width;
         state.height = height;
-        if (event == "presentation.replacement") newest_replacement_generation = std::max(newest_replacement_generation, generation);
         const bool copying = event == "presentation.source_borrow.started" || event == "presentation.source_borrow.completed" ||
                              event == "presentation.source.copy";
         const bool transferred = event == "presentation.ready_sync.started" || event == "presentation.ready_sync.completed" ||
@@ -575,7 +599,7 @@ struct SurfaceAudit final {
         }
         if (state.native_retired) reject("native transition after physical retirement");
         const auto advance = [&](const unsigned next) {
-            if (state.native_stage >= next)
+            if (state.native_stage + 1U != next)
                 reject("native admission stages are missing, duplicate, or reordered");
             else
                 state.native_stage = next;
@@ -585,21 +609,11 @@ struct SurfaceAudit final {
         else if (event == "presentation.admission.enqueued")
             advance(2U);
         else if (event == "presentation.admission.written") {
-            if (state.native_stage >= 3U)
-                reject("native admission stages are missing, duplicate, or reordered");
-            else
-                state.native_stage = 3U;
+            advance(3U);
         } else if (event == "presentation.import.outcome") {
-            if (state.native_stage >= 4U)
-                reject("native admission stages are missing, duplicate, or reordered");
-            else
-                state.native_stage = 4U;
+            advance(4U);
             state.import_failed = scalar(record, "value") != 1U;
         } else if (event == "presentation.active.withdrawal" || event == "presentation.candidate.withdrawal") {
-            // A receiver-confirmed withdrawal and physical retirement
-            // corroborate a successful import when its bounded diagnostic was
-            // dropped.
-            if (state.native_stage < 4U && !state.import_failed) state.native_stage = 4U;
             if (state.native_stage != 4U || state.import_failed || state.withdrawn) reject("withdrawal lacks a unique completed import");
             state.withdrawn = true;
             state.candidate_withdrawn = event == "presentation.candidate.withdrawal";
@@ -607,11 +621,6 @@ struct SurfaceAudit final {
             if (scalar(record, "outcome") != 1U) reject("native physical retirement failed");
             state.native_retired = true;
         } else {
-            // Admission records are bounded nonblocking diagnostics. The
-            // import outcome, or the first exact physical operation when that
-            // outcome was also dropped, authoritatively corroborates the
-            // omitted prefix. Any later prefix record still fails above.
-            if ((copying || transferred) && state.native_stage < 4U && !state.import_failed) state.native_stage = 4U;
             const bool span_end = event == "presentation.source_borrow.completed" || event == "presentation.ready_sync.completed" ||
                                   event == "presentation.release_wait.completed";
             if (span_end) {
@@ -631,7 +640,7 @@ struct SurfaceAudit final {
             const auto publication_key = std::pair{scalar(record, "value"), scalar(record, "transfer_sequence")};
             auto& steps = state.source_steps[source_operation];
             const auto observe = [&](unsigned& stage, const unsigned next) {
-                if (state.native_stage != 4U || state.import_failed || stage >= next)
+                if (state.native_stage != 4U || state.import_failed || stage + 1U != next)
                     reject("native source/copy/ready stages are incomplete or reordered");
                 else
                     stage = next;
@@ -647,25 +656,18 @@ struct SurfaceAudit final {
                 else
                     observe(steps, 3U);
             } else if (event == "presentation.ready_sync.started") {
+                if (steps != 3U) reject("native ready synchronization lacks its completed source copy");
                 auto& publication = state.publication_steps[publication_key];
                 if (state.failed_publications.erase(publication_key) != 0U) publication = 0U;
                 observe(publication, 1U);
             } else if (event == "presentation.ready_sync.completed") {
                 auto& publication = state.publication_steps[publication_key];
-                // Span starts are bounded nonblocking diagnostics. A unique
-                // successful completion is authoritative when its start was
-                // dropped, while a later start or duplicate completion still
-                // fails the monotonic observed-order check.
                 observe(publication, 2U);
             } else if (event == "presentation.frame.edge") {
                 auto& publication = state.publication_steps[publication_key];
                 if (state.failed_publications.contains(publication_key)) {
                     reject("native frame publication followed a failed ready synchronization");
                 } else {
-                    // The published physical edge is the authoritative end of
-                    // ready synchronization. Intermediate diagnostics may be
-                    // absent, but any observed late or duplicate stage remains
-                    // an ordering failure.
                     observe(publication, 3U);
                     const auto publication_revision = scalar(record, "value");
                     const auto frame_revision = scalar(record, "frame_revision");
@@ -696,6 +698,7 @@ struct SurfaceAudit final {
             reject("browser lifecycle record has malformed physical identity");
             return;
         }
+        if (!admit(id)) return;
         auto& state = surfaces[id];
         if ((event == "firefox.workspace.admitted" || event == "firefox.workspace.claim_outcome") &&
             (!record.contains("width") || !record.contains("height")))
@@ -778,6 +781,7 @@ struct SurfaceAudit final {
             else if (!valid_identity(requested) || requested == id || state.captured == 0U)
                 reject("pipeline reconstruction lacks its retained owned image");
             else {
+                if (!admit(requested)) return;
                 auto& pending = surfaces[requested];
                 if (pending.reconstruction || pending.created == 0U || state.captured >= pending.created || pending.captured != 0U ||
                     pending.discarded != 0U || pending.retired != 0U)
@@ -794,55 +798,89 @@ struct SurfaceAudit final {
     [[nodiscard]] std::string joined_failure() const {
         if (!failure.empty()) return failure;
         for (const auto& [id, state] : surfaces) {
-            if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) continue;
-            // A stale candidate remains in the writer's single retiring slot
-            // until its physical release succeeds. A later replacement is
-            // therefore authoritative when the bounded retirement diagnostic
-            // itself was dropped.
-            const bool native_retired =
-                state.native_retired || (state.candidate_withdrawn && newest_replacement_generation > state.generation);
+            if (const auto reason = joined_surface_failure(id, state); !reason.empty()) return reason;
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::string joined_surface_failure(const std::string& id, const SurfaceState& state) const {
+            if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) return {};
             if (state.firefox_import_failed) {
-                const bool native_rejection = state.native_stage == 3U || (state.native_stage == 4U && state.import_failed);
+                const bool native_rejection = state.native_stage == 4U && state.import_failed;
                 if (!native_rejection || state.generation != state.iced_generation || state.width != state.browser_width ||
-                    state.height != state.browser_height || !native_retired)
+                    state.height != state.browser_height || !state.native_retired)
                     return "rejected import " + id + " lacks matching native admission and retirement";
                 if (state.firefox_stage != 2U || state.created == 0U || state.captured != 0U || state.discarded <= state.created ||
                     state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
                     return "rejected import " + id + " lacks exact receiver discard and texture retirement";
-                continue;
+                return {};
             }
             if (state.native_stage != 4U || state.generation != state.iced_generation || state.width != state.browser_width ||
-                state.height != state.browser_height || !native_retired)
+                state.height != state.browser_height || !state.native_retired)
                 return "surface " + id + " lacks matching native/browser import and retirement";
             if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
                 return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
-            if (state.import_failed && state.samples.empty()) continue;
+            if (state.import_failed && state.samples.empty()) return {};
             if (state.import_failed || state.firefox_stage != 5U) return "surface " + id + " sampled or withdrew an incomplete import";
             if ((!state.firefox_retired || state.retired == 0U) && !(native_shutdown && browser_shutdown))
                 return "surface " + id + " lacks receiver retirement";
             for (const auto& [publication, frame] : state.samples) {
                 const auto native = state.publications.find(publication);
-                const auto forwarded = state.forwarded_publications.find(publication);
                 const bool native_match = native != state.publications.end() && native->second == frame;
-                const bool forwarded_match =
-                    native == state.publications.end() && forwarded != state.forwarded_publications.end() && forwarded->second == frame;
-                if (publication == 0U || frame == 0U || (!native_match && !forwarded_match))
+                if (publication == 0U || frame == 0U || !native_match)
                     return "sampled surface " + id + " lacks matching native frame publication";
             }
             if (state.discarded != 0U && (state.retired == 0U || (!state.withdrawn && !state.firefox_withdrawn)))
                 return "discarded pending surface " + id + " lacks withdrawal and texture retirement";
-        }
         return {};
     }
 
+    [[nodiscard]] bool evidence_settled() const {
+        if (!failure.empty()) return false;
+        for (const auto& [id, state] : surfaces) {
+            if (state.native_stage != 4U) return false;
+            if (state.native_retired && !joined_surface_failure(id, state).empty()) return false;
+            for (const auto& [publication, frame] : state.samples) {
+                const auto produced = state.publications.find(publication);
+                if (produced == state.publications.end() || produced->second != frame) return false;
+            }
+            for (const auto& [operation, stage] : state.source_steps)
+                // A successfully borrowed source may be superseded before any
+                // copy is submitted. Actual publications still require stage 3.
+                if (stage == 1U && !state.failed_source_operations.contains(operation)) return false;
+            for (const auto& [publication, stage] : state.publication_steps)
+                if (stage != 3U && !state.failed_publications.contains(publication)) return false;
+        }
+        return true;
+    }
+
+    void SettleScenario() {
+        for (auto iterator = surfaces.begin(); iterator != surfaces.end();) {
+            auto& [id, state] = *iterator;
+            if (state.native_retired && (state.firefox_retired || state.firefox_import_failed) && state.retired != 0U) {
+                if (const auto reason = joined_surface_failure(id, state); !reason.empty()) {
+                    reject(reason);
+                    return;
+                }
+                iterator = surfaces.erase(iterator);
+                continue;
+            }
+            // A scenario boundary is not a release of the receiver-owned image.
+            // Retain bounded physical publication/copy provenance, including
+            // incomplete independent-stream joins, until actual retirement.
+            ++iterator;
+        }
+        draws.clear();
+    }
+
     [[nodiscard]] bool pending_supersession_completed() const {
-        if (!joined_failure().empty()) return false;
+        if (!failure.empty()) return false;
         for (const auto& [b, pending] : surfaces) {
             if (!pending.candidate_withdrawn || pending.created == 0U || pending.captured != 0U || !pending.publications.empty() ||
                 pending.discarded <= pending.created || pending.retired <= pending.discarded || !pending.reconstruction ||
                 pending.reconstruction->requested != b || pending.reconstruction->ordinal <= pending.created ||
                 pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired ||
-                (!pending.native_retired && newest_replacement_generation <= pending.generation))
+                !pending.native_retired)
                 continue;
             const auto& active_identity = pending.reconstruction->completed;
             const auto& active = surfaces.at(active_identity);
@@ -925,11 +963,17 @@ struct PixelBoundaryAudit final {
             // the replacement to reuse a physical surface or mailbox slot.
             if (!allocation && !receipt.empty() && scalar(receipt, "layer") == scalar(failed, "layer") &&
                 scalar(receipt, "content_session") == scalar(failed, "content_session") &&
+                scalar(receipt, "content_sequence") == scalar(failed, "content_sequence") &&
+                scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
+                std::ranges::all_of(publication.counted, [](bool value) { return value; }))
+                recovered = true;
+            if (allocation && key.first != surface && !receipt.empty() &&
                 scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
         }
-        const bool failure_settled = allocation ? forwarded || failed_probe_retirements.contains(surface) : forwarded && recovered;
+        const bool failure_settled =
+            allocation ? (forwarded || failed_probe_retirements.contains(surface)) && recovered : forwarded && recovered;
         return failure_settled && raw_complete() && viewer_nonblack_complete();
     }
     std::array<std::size_t, 3> joined{};
@@ -1056,7 +1100,7 @@ struct PixelBoundaryAudit final {
                 !canvas_sampled || canvas.identity != owned.identity)
                 return false;
             const auto& native = attempt->second;
-            return native.complete() && (native.publication_fact.empty() || native.identity == native.publication_fact) &&
+            return native.complete() && !native.publication_fact.empty() && native.identity == native.publication_fact &&
                    scalar(native.identity, "source_revision") == successful_viewer->second && has_color(native) && has_color(canvas);
         });
     }
@@ -1108,11 +1152,10 @@ struct PixelBoundaryAudit final {
         const auto& source = native->second;
         const auto& fact = source.identity;
         if (fact.empty()) return;
-        // The optional frame-edge log can be dropped after its complete native
-        // probe batch. The receiver's exact physical transfer then corroborates
-        // publication; every source field and all 25 samples still must join.
-        if (source.publication_fact.empty() && !source.complete()) return;
-        if (!source.publication_fact.empty() && fact != source.publication_fact)
+        // Independent streams can arrive in either order. Settlement requires
+        // the native publication, even after a complete receiver probe batch.
+        if (source.publication_fact.empty()) return;
+        if (fact != source.publication_fact)
             reject("native pixels differ from the canonical publication fact");
         const auto width = scalar(fact, "source_width"), height = scalar(fact, "source_height");
         if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") || height > scalar(fact, "capacity_height") ||
@@ -1502,7 +1545,8 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         fill(dropped_edge, owned, missing_sample, false, "presentation.frame.edge");
         dropped_edge.consume(canvas);
         dropped_edge.consume(selected);
-        CHECK(dropped_edge.viewer_nonblack_complete() == !missing_sample);
+        CHECK_FALSE(dropped_edge.viewer_nonblack_complete());
+        CHECK_FALSE(dropped_edge.raw_complete());
         CHECK(dropped_edge.samples.at({surface, 7U}).native.at(4U).publication_fact.empty());
         auto contradictory_edge = native;
         contradictory_edge["event"] = "presentation.frame.edge";
@@ -1527,6 +1571,20 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         ordinary["pixel_probe"] = false;
         audit.consume(ordinary);
         CHECK(audit.probe_failure_complete(target));
+        if (!allocation) {
+            auto unrelated_content = audit;
+            auto& publication = unrelated_content.samples.at({surface, 7U});
+            const auto other_sequence = scalar(publication.receivers[0].identity, "content_sequence") + 1U;
+            for (auto& [_, receipt_boundary] : publication.native) {
+                receipt_boundary.identity["content_sequence"] = other_sequence;
+                receipt_boundary.publication_fact["content_sequence"] = other_sequence;
+            }
+            for (auto& receipt_boundary : publication.receivers)
+                receipt_boundary.identity["content_sequence"] = other_sequence;
+            publication.forwarded["content_sequence"] = other_sequence;
+            CHECK_FALSE(unrelated_content.probe_failure_complete(target));
+            CHECK(audit.probe_failure_complete(target));
+        }
         auto wrong_slot = audit;
         wrong_slot.probe_failures.front()["slot"] = 0U;
         if (!allocation) CHECK_FALSE(wrong_slot.probe_failure_complete(target));
@@ -1882,40 +1940,19 @@ struct NativeAudit final {
         reconcile_incremental_publication(generation);
     }
 
-    void join_gallery_publication(const std::uint64_t generation, const std::map<std::uint64_t, std::uint64_t>& complete_slots,
-                                  const std::uint64_t frame_revision, const std::uint64_t snapshot_revision,
-                                  const std::vector<bool>& ready_slots) {
+    void join_gallery_publication(const std::uint64_t generation, const std::map<std::uint64_t, std::uint64_t>& complete_slots) {
         if (complete_slots.empty() || complete_slots.size() > kAcceptanceSlotLimit ||
             complete_slots.rbegin()->first != complete_slots.size() - 1U || generation == 0U)
             return;
-        const auto presented = presented_explore_frames.find({snapshot_revision, frame_revision});
-        if (!placeholder_cardinalities.contains(generation)) {
-            const auto frames = published_frames.find(generation);
-            const bool native_frame =
-                frames != published_frames.end() && std::ranges::any_of(frames->second, [frame_revision](const auto& publication) {
-                    return publication.second == frame_revision;
-                });
-            if (!placeholder_ordinals.contains(generation) || frame_revision == 0U ||
-                (!native_frame && presented == presented_explore_frames.end()))
-                return;
-            const auto placeholder = placeholder_slots.find(generation);
-            const auto patched = patched_slots.find(generation);
-            const auto published = published_tiles.find(generation);
-            const bool exact_placeholder = placeholder != placeholder_slots.end() && placeholder->second == complete_slots;
-            const bool exact_material = patched != patched_slots.end() && patched->second == complete_slots &&
-                                        published != published_tiles.end() && published->second == complete_slots.size();
-            // The native sink is bounded and nonblocking. A missing summary
-            // needs a complete native inventory (initial or fully patched),
-            // corroborated by the exact frame carrying these browser slots.
-            if (!exact_placeholder && !exact_material) return;
-            placeholder_cardinalities.emplace(generation, complete_slots.size());
-        }
         const auto cardinality = placeholder_cardinalities.find(generation);
-        if (cardinality == placeholder_cardinalities.end() || complete_slots.size() != cardinality->second) {
+        if (cardinality == placeholder_cardinalities.end()) return;
+        if (complete_slots.size() != cardinality->second) {
             reject_causal_evidence("joined placeholder cardinality");
             return;
         }
-        auto& received = placeholder_slots[generation];
+        const auto observed = placeholder_slots.find(generation);
+        if (observed == placeholder_slots.end()) return;
+        const auto& received = observed->second;
         const bool conflict = std::ranges::any_of(received, [&complete_slots](const auto& slot) {
             const auto found = complete_slots.find(slot.first);
             return found == complete_slots.end() || found->second != slot.second;
@@ -1924,34 +1961,17 @@ struct NativeAudit final {
             reject_causal_evidence("joined placeholder identity");
             return;
         }
-        received = complete_slots;
+        // The two writers are independent. Missing native slots must arrive
+        // from the native cursor; a browser inventory never creates them.
+        if (received.size() != complete_slots.size()) return;
         const auto patched = patched_slots.find(generation);
         if (patched != patched_slots.end())
             explore_stale_patch = explore_stale_patch || std::ranges::any_of(patched->second, [&received](const auto& slot) {
                                       const auto found = received.find(slot.first);
                                       return found == received.end() || found->second != slot.second;
                                   });
-        // The physical Presentation receipt corroborates an omitted Explore
-        // frame event only after the exact reflected snapshot and complete
-        // generation inventory join. Every consumer uses this one frame set.
-        if (presented != presented_explore_frames.end()) {
-            record_frame(generation, frame_revision, presented->second);
-            const auto patch_ordinal = last_patch_ordinals.find(generation);
-            if (!first_publication_ordinals.contains(generation) && ready_slots.size() == complete_slots.size() &&
-                patched != patched_slots.end() && patch_ordinal != last_patch_ordinals.end() && patch_ordinal->second < presented->second) {
-                const auto ready_count = static_cast<std::uint64_t>(std::ranges::count(ready_slots, true));
-                if (ready_count != 0U && patched->second.size() == ready_count &&
-                    std::ranges::all_of(patched->second, [&](const auto& patch) {
-                        const auto slot = complete_slots.find(patch.first);
-                        return slot != complete_slots.end() && slot->second == patch.second && ready_slots[patch.first];
-                    })) {
-                    // A dropped batch count cannot strand the acceptance lane gate.
-                    // The exact published snapshot's complete readiness bitmap and
-                    // native patched inventory independently establish that count.
-                    record_tile_publication(generation, ready_count, presented->second);
-                }
-            }
-        }
+        // Frame and tile publication are recorded exclusively by their native
+        // producers. Presentation and frontend snapshots retain separate facts.
         reconcile_incremental_publication(generation);
         reconcile_rendered_probes(generation);
     }
@@ -2087,10 +2107,10 @@ struct NativeAudit final {
             if (cardinality <= kAcceptanceSlotLimit) {
                 placeholder_cardinalities.insert_or_assign(sequence, cardinality);
                 placeholder_digests.insert_or_assign(sequence, digest);
-                // This exact slot inventory is stronger than the preceding
-                // generic placeholder fact, which the nonblocking diagnostic
-                // sink may drop. Keep the latest generation actionable so its
-                // first committed patch can release the remaining test lanes.
+                // Gallery emits its inventory even when retained pixels make
+                // Explore's PlaceholderPublished/DiagnoseFrame conditional.
+                // This is the inventory's own entered boundary, not a
+                // reconstruction of either omitted product event.
                 if (sequence >= explore_generation) {
                     explore_placeholder = sequence != 0U;
                     explore_generation = sequence;
@@ -2275,7 +2295,7 @@ struct NativeAudit final {
             placeholder_cardinalities.at(generation) != placeholder->second.size() || placeholder->second != rendered_slots)
             return std::nullopt;
         const auto native_frame = published_frames.find(generation);
-        if (native_frame != published_frames.end() && std::ranges::none_of(native_frame->second, [frame_revision](const auto& publication) {
+        if (native_frame == published_frames.end() || std::ranges::none_of(native_frame->second, [frame_revision](const auto& publication) {
                 return publication.second == frame_revision;
             }))
             return std::nullopt;
@@ -4248,23 +4268,98 @@ class ArtifactNotifications final {
     }
 }
 
-void run_workspace_wayland_product(const TerminationMode termination, const std::string& viewer_scenario = {}, const bool logging = true,
-                                   const bool pixel_fixture = false, const std::string& probe_failure = {}) {
-    if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
-    const auto permitted_cpus = permitted_cpu_count();
-    if (permitted_cpus < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
-    const bool h2d = GENERATE(true, false);
-    const char* pixel_environment = std::getenv("MMLTK_GUI_PIXEL_TRACE");
-    const bool pixel_probes = !viewer_scenario.empty() || pixel_fixture || !probe_failure.empty() ||
-                              (pixel_environment != nullptr && std::string_view{pixel_environment} == "1");
-    INFO("selected H2D dataset transport: " << h2d);
-    if (!h2d && !gdr_transport_available()) SKIP("GDR hardware unavailable; packaged Wayland GDR behavior remains unverified");
+class PreparedWaylandInputs final {
+   public:
+    PreparedWaylandInputs()
+        : root_("mmltk-wayland-inputs"),
+          square_{.root_dir = (root_.path() / "square").string(), .split = "train", .width = 768, .height = 384,
+                  .num_images = 128, .background_images = 10, .pixel_evidence = true},
+          mixed_{.root_dir = (root_.path() / "mixed").string(), .split = "train", .width = 768, .height = 384,
+                 .num_images = 300, .background_images = 10, .pixel_evidence = true} {
+        using namespace mmltk::backend::data::testsupport;
+        for (const auto* fixture : {&square_, &mixed_}) {
+            create_synthetic_dataset(*fixture);
+            replace_synthetic_image(*fixture, 8, 192, 384);
+            replace_synthetic_image(*fixture, 9, 384, 192);
+            replace_synthetic_image(*fixture, 11, 192, 384);
+            const auto split = std::filesystem::path(dataset_dir(*fixture)) / fixture->split;
+            std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl",
+                                       std::filesystem::copy_options::overwrite_existing);
+            std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
+            if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
+            dropped_instance
+                << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
+                << fixture->width << ',' << fixture->height << "]}\n";
+        }
+        replace_synthetic_image(square_, 1, 384, 384);
+        // This small prerequisite is compiled once. The primary browser owns
+        // the one real 512-pixel compile/control/error workflow.
+        const auto plan = mmltk::backend::data::DatasetCompiler::prepare(
+            {.source_dir = dataset_dir(square_), .output_dir = compiled_dir(square_), .split = "train",
+             .target_width = 384U, .target_height = 384U}, {"train"});
+        mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
+    }
+    [[nodiscard]] const auto& square() const noexcept { return square_; }
+    [[nodiscard]] const auto& mixed() const noexcept { return mixed_; }
 
+   private:
+    ScopedTempDir root_;
+    mmltk::backend::data::testsupport::FixtureSpec square_;
+    mmltk::backend::data::testsupport::FixtureSpec mixed_;
+};
+
+// One owner retains the process, resources, physical evidence and byte cursors.
+// RunScenario contains domain assertions; Advance is acknowledged only after
+// typed UI settlement and those independent evidence streams have joined.
+class WaylandSession final {
+   public:
+    WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile,
+                   bool diagnostics_enabled = true, bool dpi = false, bool host_to_device = true, std::string fault = {},
+                   bool pixels_enabled = true);
+    void RunScenario(const std::string& viewer_scenario, bool last, bool dark = false, bool pending_reconstruction = false);
+
+   private:
+    void AdvanceScenario();
+    std::shared_ptr<PreparedWaylandInputs> inputs_;
+    TerminationMode termination;
+    std::string profile_;
+    bool logging;
+    bool high_dpi;
+    bool h2d;
+    bool pixel_probes;
+    bool pixel_fixture;
+    std::string probe_failure;
     ScopedTempDir quiet_artifacts{"mmltk-wayland-quiet-artifacts"};
-    const auto diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
-    const auto runtime_log = configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
-    const auto firefox_log = !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
-    const auto acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
+    ScopedTempDir working{"mmltk-workspace-wayland-session"};
+    std::filesystem::path diagnostics;
+    std::filesystem::path runtime_log;
+    std::filesystem::path firefox_log;
+    std::filesystem::path acceptance_log;
+    std::unique_ptr<ArtifactNotifications> notifications_;
+    std::unique_ptr<BrowserHostProcess> process_;
+    ScopedFd deadline;
+    NativeAudit native;
+    BrowserAudit browser;
+    SurfaceAudit surface_audit;
+    PixelBoundaryAudit pixel_audit;
+    std::unique_ptr<JsonLineCursor> native_cursor_;
+    std::unique_ptr<JsonLineCursor> browser_cursor_;
+    std::uint64_t scenario_sequence_ = 1U;
+    bool frontend_settled_ = false;
+    bool pressure_entered_ = false;
+    bool browser_failed_ = false;
+};
+
+WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
+                               const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault,
+                               const bool pixels_enabled)
+    : inputs_(std::move(inputs)), termination(terminal), profile_(std::move(profile)), logging(diagnostics_enabled), high_dpi(dpi),
+      h2d(host_to_device), pixel_probes(logging && pixels_enabled), pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
+      probe_failure(std::move(fault)), pixel_audit(pixel_probes) {
+    diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
+    runtime_log = !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
+    firefox_log = !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
+    acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
     const auto rotation_id = std::to_string(::getpid()) + "-" +
                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     if (logging) {
@@ -4279,14 +4374,9 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     prepare_latest_log(runtime_log, "workspace Wayland native runtime log", rotation_id);
     if (logging) prepare_latest_log(firefox_log, "workspace Wayland Firefox log", rotation_id);
 
-    const std::string working_label = "mmltk-workspace-wayland-" + std::string{termination_label(termination)};
-    ScopedTempDir working{working_label.c_str()};
     auto initial_settings = mmltk::controller::contracts::default_gui_settings_state();
-    if (viewer_scenario == "rapid" || viewer_scenario == "copy") {
-        const bool dark = GENERATE(false, true);
-        initial_settings.ui.dark_mode = dark;
-        initial_settings.ui.ui_scale = 1.0F;
-    }
+    initial_settings.ui.dark_mode = false;
+    initial_settings.ui.ui_scale = 1.0F;
     initial_settings.workflows.explore.h2d_dataloader = h2d;
     initial_settings.workflows.train.request.h2d_dataloader = h2d;
     std::filesystem::create_directories(working.path() / ".mmltk-data");
@@ -4294,60 +4384,36 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     REQUIRE(settings_file);
     settings_file << mmltk::controller::contracts::snapshot_gui_settings(initial_settings).dump();
     settings_file.close();
-    const mmltk::backend::data::testsupport::FixtureSpec fixture{
-        .root_dir = (working.path() / "fixture").string(),
-        .split = "train",
-        .width = 768,
-        .height = 384,
-        .num_images = viewer_scenario == "rapid" ? 300 : 128,
-        .background_images = viewer_scenario.empty() ? 7 : 10,
-        .pixel_evidence = pixel_fixture || !probe_failure.empty(),
-    };
-    mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
-    if (viewer_scenario == "square")
-        mmltk::backend::data::testsupport::replace_synthetic_image(fixture, 1, 384, 384);
-    else if (viewer_scenario == "tall")
-        mmltk::backend::data::testsupport::replace_synthetic_image(fixture, 1, 192, 384);
-    if (viewer_scenario.empty()) {
-        // Keep both padding orientations inside the initial square 3x3 atlas.
-        mmltk::backend::data::testsupport::replace_synthetic_image(fixture, 8, 192, 384);
-        mmltk::backend::data::testsupport::replace_synthetic_image(fixture, 9, 384, 192);
-    } else {
-        mmltk::backend::data::testsupport::replace_synthetic_image(fixture, 11, 192, 384);
-    }
-    if (viewer_scenario == "copy" || viewer_scenario == "semantics") {
-        const auto split = std::filesystem::path{mmltk::backend::data::testsupport::dataset_dir(fixture)} / fixture.split;
-        std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
-    }
-    {
-        std::ofstream dropped_instance{
-            std::filesystem::path{mmltk::backend::data::testsupport::dataset_dir(fixture)} / fixture.split / "000013.jsonl", std::ios::app};
-        REQUIRE(dropped_instance);
-        dropped_instance
-            << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
-            << fixture.width << ',' << fixture.height << "]}\n";
-    }
-
-    constexpr std::uintmax_t diagnostics_offset = 0U;
-    constexpr std::uintmax_t firefox_offset = 0U;
-    ArtifactNotifications notifications{diagnostics, firefox_log};
-    const bool high_dpi = viewer_scenario == "copy" ? GENERATE(false, true) : viewer_scenario == "rapid" && initial_settings.ui.dark_mode;
-    BrowserHostProcess process{MMLTK_TEST_MMLTK_GUI_LAUNCHER,
+    notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
+    process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER,
                                diagnostics,
                                runtime_log,
                                firefox_log,
                                working.path(),
                                termination,
-                               fixture,
-                               viewer_scenario,
+                               inputs_->mixed(),
+                               profile_ == "blocked" ? "quiet" : profile_,
                                logging,
                                high_dpi,
                                h2d,
                                pixel_probes,
-                               probe_failure};
-    ScopedFd deadline{::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK)};
+                               probe_failure,
+                               &inputs_->square());
+    deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
     if (deadline.get() < 0)
         throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
+    native_cursor_ = std::make_unique<JsonLineCursor>(diagnostics, 0U);
+    browser_cursor_ = std::make_unique<JsonLineCursor>(firefox_log, 0U, JsonLineCursor::Format::FirefoxText);
+}
+
+void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark,
+                                 const bool pending_reconstruction) {
+    const auto permitted_cpus = permitted_cpu_count();
+    const auto& fixture = viewer_scenario == "square" ? inputs_->square() : inputs_->mixed();
+    auto& process = *process_;
+    auto& notifications = *notifications_;
+    auto& native_cursor = *native_cursor_;
+    auto& browser_cursor = *browser_cursor_;
     auto deadline_duration = kWaylandStartupDeadline;
     std::string deadline_stage{"browser startup"};
     const auto arm_acceptance_deadline = [&](const std::chrono::seconds duration, std::string stage) {
@@ -4364,20 +4430,50 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     if (!logging) {
         // The acceptance socket reports entry into the real I/O gate. This
         // shutdown case needs neither diagnostic records nor a startup delay.
-        std::array<pollfd, 3U> waits{{
-            {.fd = process.control_fd(), .events = POLLIN, .revents = 0},
-            {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
-            {.fd = deadline.get(), .events = POLLIN, .revents = 0},
-        }};
-        int ready;
-        do {
-            ready = ::poll(waits.data(), waits.size(), -1);
-        } while (ready < 0 && errno == EINTR);
-        REQUIRE(ready > 0);
-        REQUIRE((waits[0].revents & POLLIN) != 0);
-        const auto entered = process.receive_explore_event();
-        REQUIRE(entered.has_value());
-        REQUIRE(entered->event == mmltk::controller::ExploreAcceptanceGate::ControlEvent::InitialWait);
+        std::uint64_t progress = 0U;
+        for (;;) {
+            std::array<pollfd, 3U> waits{{
+                {.fd = process.control_fd(), .events = POLLIN, .revents = 0},
+                {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
+                {.fd = deadline.get(), .events = POLLIN, .revents = 0},
+            }};
+            int ready;
+            do {
+                ready = ::poll(waits.data(), waits.size(), -1);
+            } while (ready < 0 && errno == EINTR);
+            REQUIRE(ready > 0);
+            REQUIRE((waits[2].revents & POLLIN) == 0);
+            REQUIRE((waits[1].revents & POLLIN) == 0);
+            REQUIRE((waits[0].revents & POLLIN) != 0);
+            const auto entered = process.receive_explore_event();
+            REQUIRE(entered.has_value());
+            if (entered->event == ExploreAcceptanceGate::ControlEvent::InitialWait) {
+                if (profile_ == "blocked") break;
+                REQUIRE(process.command_explore(2U));
+            } else if (entered->event == ExploreAcceptanceGate::ControlEvent::HeldWait) {
+                REQUIRE(process.command_explore(4U));
+            } else if (entered->event == ExploreAcceptanceGate::ControlEvent::Frontend) {
+                REQUIRE(entered->generation == scenario_sequence_);
+                using Kind = mmltk::controller::contracts::IntegrationControlKind;
+                const auto kind = static_cast<Kind>(entered->slot);
+                REQUIRE(kind != Kind::Failed);
+                if (kind == Kind::PressureEntered) {
+                    REQUIRE_FALSE(pressure_entered_);
+                    pressure_entered_ = true;
+                } else if (kind == Kind::Settled) {
+                    REQUIRE(pressure_entered_);
+                    frontend_settled_ = true;
+                    break;
+                } else if (kind == Kind::Progress) {
+                    REQUIRE(entered->compiled_index > progress);
+                    progress = entered->compiled_index;
+                    arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline,
+                                             "quiet typed workflow progress");
+                } else {
+                    FAIL("invalid quiet integration control direction");
+                }
+            }
+        }
         process.interrupt();
         arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
         const auto terminal = await_shutdown(process, deadline.get());
@@ -4390,12 +4486,6 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         return;
     }
 
-    NativeAudit native;
-    BrowserAudit browser;
-    SurfaceAudit surface_audit;
-    PixelBoundaryAudit pixel_audit{pixel_probes};
-    JsonLineCursor native_cursor{diagnostics, diagnostics_offset};
-    JsonLineCursor browser_cursor{firefox_log, firefox_offset, JsonLineCursor::Format::FirefoxText};
     const auto consume_records = [&](const bool final = false) {
         native_cursor.consume(native, [&](const auto& record) {
             surface_audit.native(record);
@@ -4411,14 +4501,14 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                 report_consumed_record(record, "firefox");
             },
             final);
+        browser_failed_ = browser_failed_ || browser.failed_before_termination();
         for (const auto& [generation, evidence] : browser.gallery_generations) {
             const auto digest = native.placeholder_digests.find(generation);
             const auto cardinality = native.placeholder_cardinalities.find(generation);
             if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) ||
                 (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
                 continue;
-            native.join_gallery_publication(generation, evidence.slots, evidence.source_revision, evidence.snapshot_revision,
-                                            evidence.ready_slots);
+            native.join_gallery_publication(generation, evidence.slots);
         }
     };
     std::size_t observed_phase_progress = 0U;
@@ -4504,6 +4594,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         if (pixel_probes && viewer_scenario == "square" && !pixel_audit.upscale_growth)
             blockers.emplace_back("pixel: four-times allocation growth");
         if (!pixel_audit.probe_failure_complete(probe_failure)) blockers.emplace_back("pixel: injected probe-failure recovery");
+        if (!frontend_settled_) blockers.emplace_back("frontend: typed scenario settlement");
+        if (!surface_audit.evidence_settled()) blockers.emplace_back("surface: independent physical lifecycle joins");
         if (pixel_fixture && !pixel_audit.composition_complete()) blockers.emplace_back("pixel: atlas fixture composition");
         return blockers;
     };
@@ -4535,15 +4627,27 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                                                {"held_compiled_index", native.held_compiled_index},
                                                {"held_staging_bytes", native.held_capacity}});
     };
+    const auto terminal_annotation_ready = [&] {
+        return viewer_scenario != "terminal" ||
+               (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
+                browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer && browser.complete &&
+                browser.surface_draws.contains(browser.presentation_receipt) &&
+                browser.surface_redraws.contains(browser.presentation_receipt));
+    };
     bool readiness_reached = false;
     for (;;) {
         consume_records();
         if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
-        if (!terminal_failure_observed && !browser.failed_before_termination() && !viewer_scenario.empty() &&
+        if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() &&
             browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
             native.presentation_ready && native.explore_rendered && surface_audit.failure.empty() && pixel_audit.failure.empty() &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
             pixel_audit.probe_failure_complete(probe_failure) &&
+            surface_audit.evidence_settled() &&
+            terminal_annotation_ready() &&
+            (!pixel_fixture || pixel_audit.composition_complete()) &&
+            ((viewer_scenario != "copy" && viewer_scenario != "semantics") || pixel_audit.continuity_complete(false)) &&
+            (!pending_reconstruction || surface_audit.pending_supersession_completed()) &&
             (viewer_scenario != "square" || !pixel_probes || (pixel_audit.retained_logical_content && pixel_audit.upscale_growth))) {
             readiness_reached = true;
             break;
@@ -4607,11 +4711,14 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             terminal_failure_observed = true;
             arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "terminal failure settlement");
         }
-        if (!terminal_failure_observed && !browser.failed_before_termination() &&
+        if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ &&
             (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) &&
             browser.product_ready() && rendered_probe_exported &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-            pixel_audit.probe_failure_complete(probe_failure) && (!pixel_fixture || pixel_audit.composition_complete())) {
+            pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() &&
+            (!pixel_fixture || pixel_audit.composition_complete()) &&
+            pixel_audit.continuity_complete(true) &&
+            (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
             readiness_reached = true;
             break;
         }
@@ -4677,6 +4784,21 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                 process.terminate();
                 FAIL("workspace Wayland Explore control event was invalid");
             }
+            if (event->event == ExploreAcceptanceGate::ControlEvent::Frontend) {
+                REQUIRE(event->generation == scenario_sequence_);
+                using Kind = mmltk::controller::contracts::IntegrationControlKind;
+                const auto kind = static_cast<Kind>(event->slot);
+                if (kind == Kind::Settled) {
+                    REQUIRE_FALSE(frontend_settled_);
+                    frontend_settled_ = true;
+                } else if (kind == Kind::Failed) {
+                    terminal_failure_observed = true;
+                    arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "typed frontend failure");
+                } else {
+                    REQUIRE(kind == Kind::Progress);
+                }
+                continue;
+            }
             if (event->event == ExploreAcceptanceGate::ControlEvent::HeldWait) held_read_waiting = true;
             native.RecordHeldControlObservation(*event);
             if (logging) {
@@ -4728,13 +4850,20 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
 
     bool peer_killed = false;
     if (readiness_reached) record_acceptance_state("acceptance.readiness.completed", false);
-    process.close_explore_control();
-    if (termination == TerminationMode::SignalInterrupt)
-        process.interrupt();
-    else if (termination == TerminationMode::AbruptPeerLoss)
-        peer_killed = process.kill_peer(native.firefox_pid);
-    arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
-    const auto terminal_result = process.active() ? await_shutdown(process, deadline.get()) : std::optional<int>{process.status()};
+    REQUIRE(readiness_reached);
+    REQUIRE(frontend_settled_);
+    REQUIRE_FALSE(browser_failed_);
+    if (last) {
+        if (termination == TerminationMode::SignalInterrupt)
+            process.interrupt();
+        else if (termination == TerminationMode::AbruptPeerLoss)
+            peer_killed = process.kill_peer(native.firefox_pid);
+        else
+            REQUIRE(process.command_explore(8U));
+        arm_acceptance_deadline(kWaylandShutdownDeadline, "shutdown");
+    }
+    const auto terminal_result = !last ? std::optional<int>{0}
+                                     : process.active() ? await_shutdown(process, deadline.get()) : std::optional<int>{process.status()};
     if (!terminal_result) {
         consume_records();
         std::cerr << "workspace-wayland shutdown made no progress within " << deadline_duration.count() << " seconds"
@@ -4746,8 +4875,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         FAIL("workspace Wayland acceptance exceeded its configured deadline during shutdown");
     }
     const int terminal = *terminal_result;
-    consume_records(true);
-    native_cursor.finish();
+    consume_records(last);
+    if (last) native_cursor.finish();
     const std::string native_text = read_tail(diagnostics);
     const std::string browser_text = read_tail(firefox_log);
 
@@ -4758,13 +4887,28 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     INFO("native readiness blocker: " << native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
     INFO("browser readiness blocker: " << browser.readiness_blocker());
     INFO("browser failure: " << browser.failure_blocker());
+    CHECK_FALSE(browser_failed_);
     CHECK_FALSE(browser.failed_before_termination());
     REQUIRE(terminal >= 0);
     CHECK(native.peer_open_count > 0U);
-    CHECK(native.peer_close_count == native.peer_open_count);
-    if (termination == TerminationMode::SignalInterrupt) CHECK(native.peer_closed_after_shutdown);
-    INFO("surface identity join: " << surface_audit.joined_failure());
-    CHECK(surface_audit.joined_failure().empty());
+    if (last) {
+        CHECK(native.peer_close_count == native.peer_open_count);
+        if (termination == TerminationMode::SignalInterrupt) CHECK(native.peer_closed_after_shutdown);
+        INFO("surface identity join: " << surface_audit.joined_failure());
+        CHECK(surface_audit.joined_failure().empty());
+        CHECK(native.shutdown_requested);
+        CHECK(native.firefox_terminal);
+        CHECK(native.shutdown_complete);
+        CHECK_FALSE(native.shutdown_incomplete);
+        CHECK_FALSE(native.worker_failed);
+        if (termination == TerminationMode::AbruptPeerLoss) {
+            CHECK(peer_killed);
+            REQUIRE(WIFEXITED(terminal));
+            CHECK(WEXITSTATUS(terminal) != 0);
+        } else {
+            CHECK(terminal == 0);
+        }
+    }
     INFO("pixel boundary evidence: " << pixel_audit.failure);
     CHECK(pixel_audit.failure.empty());
     CHECK(pixel_audit.probe_failure_complete(probe_failure));
@@ -4787,11 +4931,23 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         CHECK(pixel_audit.continuity_complete(viewer_scenario.empty()));
     CHECK_FALSE(browser.owned_atlas_interrupted);
     CHECK(browser.initial_atlas_complete);
+    if (viewer_scenario == "terminal") {
+        CHECK(terminal_annotation_ready());
+        CHECK(browser.bounds_valid);
+        CHECK_FALSE(native.failed_before_termination());
+        CHECK(browser.presentation_receipt != 0U);
+        CHECK(browser.surface_draws.contains(browser.presentation_receipt));
+        CHECK(browser.surface_redraws.contains(browser.presentation_receipt));
+    }
+    if (pending_reconstruction) {
+        CHECK(surface_audit.pending_supersession_completed());
+        for (const auto& [id, surface] : surface_audit.surfaces)
+            if (surface.candidate_withdrawn && surface.reconstruction) CHECK(browser.renderer_reconstructions[id] == 1U);
+    }
     if (!viewer_scenario.empty()) {
-        CHECK(terminal == 0);
+        if (last && termination != TerminationMode::AbruptPeerLoss) CHECK(terminal == 0);
         CHECK(browser.viewer_complete);
         if (viewer_scenario == "rapid") {
-            CHECK(surface_audit.pending_supersession_completed());
             CHECK(browser.gallery_no_input_complete);
             CHECK(browser.owned_atlas_seen);
             CHECK(browser.atlas_draws.valid);
@@ -4800,15 +4956,13 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             CHECK(browser.atlas_draws.drawn_rows.contains(2U));
             CHECK(browser.atlas_draws.drawn_rows.contains(10U));
             CHECK(browser.atlas_draws.grid_round_trip);
-            for (const auto& [id, surface] : surface_audit.surfaces)
-                if (surface.candidate_withdrawn && surface.reconstruction) CHECK(browser.renderer_reconstructions[id] == 1U);
             CHECK(browser.atlas_geometry_valid);
             CHECK_FALSE(browser.atlas_scaled_frames.empty());
             CHECK(browser.atlas_native_capacity);
             CHECK((browser.atlas_notices == std::set<std::string>{"explore.gallery.capacity", "explore.gallery.empty"}));
             CHECK((browser.atlas_window_draws == std::set<std::string>{"fullscreen", "restored"}));
-            CHECK(browser.atlas_themes.contains(initial_settings.ui.dark_mode ? "dark" : "light"));
-            CHECK(browser.atlas_device_scales.contains(initial_settings.ui.dark_mode ? 1.5 : 1.0));
+            CHECK(browser.atlas_themes.contains(dark ? "dark" : "light"));
+            CHECK(browser.atlas_device_scales.contains(high_dpi ? 1.5 : 1.0));
             CHECK((browser.atlas_visibility_modes == std::set<std::uint64_t>{0, 1, 2, 3, 4, 5, 6, 7}));
             CHECK((browser.atlas_scroll_stages == std::set<std::string>{"fractional", "row1", "row2", "row10", "end", "restored"}));
         }
@@ -4816,7 +4970,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         CHECK(browser.surface_draws.contains(browser.viewer_presentation));
         CHECK(native.explore_rendered);
         CHECK(native.presentation_ready);
-        CHECK(native.shutdown_complete);
+        if (last) CHECK(native.shutdown_complete);
         CHECK_FALSE(native.worker_failed);
         if (viewer_scenario == "semantics") {
             CHECK((browser.viewer_overlay_modes == std::set<std::uint64_t>{0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}));
@@ -4880,6 +5034,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                     CHECK(static_cast<float>(run.row) + 1.0F <= object.box.second.y);
                 }
         }
+        if (!last) AdvanceScenario();
         return;
     }
     CHECK_FALSE(exited_early);
@@ -4912,9 +5067,11 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     CHECK(browser.compiled_height == static_cast<std::uint64_t>(kCompiledResolution));
     CHECK(browser.presentation_receipt != 0U);
     CHECK(native.presentation_timeline != 0U);
-    CHECK(native.shutdown_requested);
-    CHECK(native.firefox_terminal);
-    CHECK(native.shutdown_complete);
+    if (last) {
+        CHECK(native.shutdown_requested);
+        CHECK(native.firefox_terminal);
+        CHECK(native.shutdown_complete);
+    }
     CHECK_FALSE(native.shutdown_incomplete);
     CHECK_FALSE(native.worker_failed);
     CHECK_FALSE(native.invalid_message);
@@ -4955,34 +5112,138 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     CHECK(compiled.channels != 0U);
     CHECK_FALSE(compiled.class_names.empty());
 
-    if (termination == TerminationMode::AbruptPeerLoss) {
-        CHECK(peer_killed);
-        REQUIRE(WIFEXITED(terminal));
-        CHECK(WEXITSTATUS(terminal) != 0);
-    } else {
-        CHECK(terminal == 0);
-    }
+    if (!last) AdvanceScenario();
 }
 
-void workspace_wayland_product_sigint() { run_workspace_wayland_product(TerminationMode::SignalInterrupt); }
+void WaylandSession::AdvanceScenario() {
+    REQUIRE(frontend_settled_);
+    REQUIRE_FALSE(browser_failed_);
+    REQUIRE_FALSE(browser.failed_before_termination());
+    REQUIRE_FALSE(native.failed_before_termination());
+    REQUIRE(pixel_audit.failure.empty());
+    REQUIRE(surface_audit.evidence_settled());
+    surface_audit.SettleScenario();
+    REQUIRE(surface_audit.failure.empty());
+    REQUIRE(surface_audit.surfaces.size() <= kAcceptanceGenerationLimit);
 
-void workspace_wayland_product_sigint_without_logging() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, {}, false); }
+    const auto live_publication = [&](const auto& identity, const auto revision) {
+        const auto surface = surface_audit.surfaces.find(identity);
+        return surface != surface_audit.surfaces.end() && surface->second.publications.contains(revision);
+    };
+    PixelBoundaryAudit next_pixels{pixel_probes};
+    next_pixels.samples = std::move(pixel_audit.samples);
+    std::erase_if(next_pixels.samples, [&](const auto& entry) {
+        const auto surface = surface_audit.surfaces.find(entry.first.first);
+        if (surface == surface_audit.surfaces.end()) return true;
+        const bool complete = std::ranges::all_of(entry.second.counted, [](const bool value) { return value; });
+        return complete && !live_publication(entry.first.first, entry.first.second);
+    });
+    for (auto& [_, publication] : next_pixels.samples) {
+        publication.receivers[3] = {};
+        publication.viewer = false;
+        publication.counted.fill(false);
+    }
+    pixel_audit = std::move(next_pixels);
 
-void workspace_wayland_product_window_close() { run_workspace_wayland_product(TerminationMode::WindowClose); }
+    AtlasDrawAudit retained_atlas;
+    retained_atlas.captures = std::move(browser.atlas_draws.captures);
+    std::erase_if(retained_atlas.captures, [&](const auto& entry) {
+        return !surface_audit.surfaces.contains(std::get<0>(entry.first));
+    });
+    std::set<AtlasDrawAudit::SourceKey> retained_sources;
+    for (const auto& [_, capture] : retained_atlas.captures)
+        retained_sources.insert(AtlasDrawAudit::source_key(capture));
+    std::map<std::array<std::uint64_t, 3U>, AtlasDrawAudit::SourceKey> latest_sources;
+    for (const auto& [key, _] : browser.atlas_draws.sources) {
+        const std::array owner{key[0], key[1], key[2]};
+        auto [found, inserted] = latest_sources.try_emplace(owner, key);
+        if (!inserted && key[3] > found->second[3]) found->second = key;
+    }
+    for (const auto& [_, key] : latest_sources) retained_sources.insert(key);
+    retained_atlas.sources = std::move(browser.atlas_draws.sources);
+    retained_atlas.sessions = std::move(browser.atlas_draws.sessions);
+    std::erase_if(retained_atlas.sources, [&](const auto& entry) { return !retained_sources.contains(entry.first); });
+    std::erase_if(retained_atlas.sessions, [&](const auto& entry) { return !retained_sources.contains(entry.second); });
+    const bool current_atlas = browser.owned_atlas_current;
+    browser = {};
+    browser.atlas_draws = std::move(retained_atlas);
+    browser.owned_atlas_current = current_atlas;
 
-void workspace_wayland_product_peer_loss() { run_workspace_wayland_product(TerminationMode::AbruptPeerLoss); }
+    NativeAudit next_native;
+    next_native.server_started = native.server_started;
+    next_native.peer_opened = native.peer_opened;
+    next_native.firefox_pid = native.firefox_pid;
+    next_native.peer_open_count = native.peer_open_count;
+    next_native.peer_close_count = native.peer_close_count;
+    next_native.presentation_ready = native.presentation_ready;
+    next_native.presentation_timeline = native.presentation_timeline;
+    next_native.explore_nproc = native.explore_nproc;
+    native = std::move(next_native);
+    ++scenario_sequence_;
+    frontend_settled_ = false;
+    REQUIRE(process_->command_explore(8U));
+}
 
-void workspace_wayland_viewer_square() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "square"); }
-void workspace_wayland_viewer_wide() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "wide"); }
-void workspace_wayland_viewer_tall() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "tall"); }
-void workspace_wayland_viewer_semantics() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "semantics"); }
-void workspace_wayland_viewer_copy() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "copy"); }
-void workspace_wayland_viewer_rapid() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, "rapid"); }
-void workspace_wayland_atlas_overlay() { run_workspace_wayland_product(TerminationMode::SignalInterrupt, {}, true, true); }
-void workspace_wayland_pixel_probe_failure() {
+[[nodiscard]] std::shared_ptr<PreparedWaylandInputs> wayland_inputs(const bool require_compiled) {
+    if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
+    if (permitted_cpu_count() < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
+    // Dataset/artifact custody only: no GPU runtime or browser is global.
+    // Catch enumeration never enters this function.
+    static const auto inputs = std::make_shared<PreparedWaylandInputs>();
+    const auto& fixture = inputs->mixed();
+    if (require_compiled && !std::filesystem::is_regular_file(mmltk::backend::data::testsupport::compiled_bin_path(fixture))) {
+        const auto plan = mmltk::backend::data::DatasetCompiler::prepare(
+            {.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
+             .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture), .split = "train",
+             .target_width = kCompiledResolution, .target_height = kCompiledResolution}, {"train"});
+        mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
+    }
+    return inputs;
+}
+
+void workspace_wayland_retained() {
+    WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, "retained"};
+    session.RunScenario("square", false, false, true);
+    session.RunScenario("", false);
+    session.RunScenario("wide", false);
+    session.RunScenario("tall", false);
+    session.RunScenario("semantics", false);
+    session.RunScenario("copy", false);
+    session.RunScenario("copy", false, true);
+    session.RunScenario("rapid", true);
+}
+
+void workspace_wayland_dpi() {
+    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "dpi", true, true};
+    session.RunScenario("copy", false, false, true);
+    session.RunScenario("copy", false, true);
+    session.RunScenario("rapid", true, true);
+}
+
+void workspace_wayland_terminal() {
+    const auto terminal = GENERATE(TerminationMode::WindowClose, TerminationMode::AbruptPeerLoss);
+    WaylandSession session{wayland_inputs(true), terminal, "terminal", true, false, true, {},
+                           terminal != TerminationMode::WindowClose};
+    session.RunScenario("terminal", true);
+}
+
+void workspace_wayland_probe_recovery() {
     const std::string boundary = GENERATE("allocation", "reset", "begin", "end");
-    const auto termination = GENERATE(TerminationMode::SignalInterrupt, TerminationMode::AbruptPeerLoss);
-    run_workspace_wayland_product(termination, {}, true, false, boundary);
+    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "semantics", true, false, true, boundary};
+    session.RunScenario("semantics", true);
+}
+
+void workspace_wayland_gdr() {
+    if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
+    if (!gdr_transport_available()) SKIP("GDR hardware unavailable; focused packaged GDR coverage remains unverified");
+    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "wide", true, false, false};
+    session.RunScenario("wide", true);
+}
+
+void workspace_wayland_quiet() {
+    const std::string profile = GENERATE("blocked", "quiet");
+    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, false};
+    session.RunScenario("quiet", true);
 }
 
 void add_rendered_probe_audit_fixture(NativeAudit& audit, const NativeAudit::PaddingOrientation orientation, const std::uint64_t generation,
@@ -5160,21 +5421,18 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
     CHECK_FALSE(audit.bounds_valid);
 }
 
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][sigint]", workspace_wayland_product_sigint);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][window_close]", workspace_wayland_product_window_close);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][peer_loss]", workspace_wayland_product_peer_loss);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_square]", workspace_wayland_viewer_square);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_wide]", workspace_wayland_viewer_wide);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_tall]", workspace_wayland_viewer_tall);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_semantics]", workspace_wayland_viewer_semantics);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_copy]", workspace_wayland_viewer_copy);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][viewer_rapid]", workspace_wayland_viewer_rapid);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][atlas_overlay]", workspace_wayland_atlas_overlay);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][pixel_probe_failure]", workspace_wayland_pixel_probe_failure);
+// Configured inventory: primary + DPI + two destructive terminals + four
+// startup-latched faults + two quiet paths = 10 H2D lifetimes. Optional GDR
+// adds one focused lifetime. The former matrix used 23 per transport (46
+// with GDR), recompiling/relaunching ordinary coverage for each case.
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][retained]", workspace_wayland_retained);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][dpi]", workspace_wayland_dpi);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][terminal]", workspace_wayland_terminal);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][probe_recovery]", workspace_wayland_probe_recovery);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][gdr]", workspace_wayland_gdr);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][quiet]", workspace_wayland_quiet);
 MMLTK_REGISTER_TEST_CASE("[workspace_wayland_integration][rendered_probe_audit]", rendered_probe_audit_rejects_mismatched_identity);
 
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][sigint_without_logging]",
-                         workspace_wayland_product_sigint_without_logging);
 
 }  // namespace
 namespace {
@@ -5244,6 +5502,46 @@ void record_receiver_withdrawal(SurfaceAudit& audit) {
     audit.browser(browser_surface_record("firefox.workspace.retired"));
 }
 
+TEST_CASE("scenario settlement retains physical reuse and waits for independent native delivery", "[workspace][audit]") {
+    SurfaceAudit audit;
+    for (std::size_t stage = 0U; stage < 9U; ++stage)
+        audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < 8U; ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    REQUIRE(audit.failure.empty());
+    CHECK_FALSE(audit.evidence_settled());
+    audit.native(native_surface_record(native_surface_events[9U]));
+    REQUIRE(audit.evidence_settled());
+    const auto id = SurfaceAudit::native_identity(native_surface_record(""));
+    const auto publications = audit.surfaces.at(id).publications;
+    audit.SettleScenario();
+    REQUIRE(audit.surfaces.contains(id));
+    CHECK(audit.surfaces.at(id).publications == publications);
+    CHECK(audit.draws.empty());
+    audit.browser(browser_surface_record("iced.surface.owned_draw_selected"));
+    CHECK(audit.evidence_settled());
+    CHECK(audit.draws.size() == 1U);
+    for (std::size_t stage = 10U; stage < native_surface_events.size(); ++stage)
+        audit.native(native_surface_record(native_surface_events[stage]));
+    CHECK_FALSE(audit.evidence_settled());
+    for (std::size_t stage = 8U; stage < browser_surface_events.size(); ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    REQUIRE(audit.evidence_settled());
+    audit.SettleScenario();
+    CHECK(audit.surfaces.empty());
+    CHECK(audit.failure.empty());
+}
+
+TEST_CASE("physical lifecycle custody rejects capacity overflow instead of dropping provenance", "[workspace][audit]") {
+    SurfaceAudit audit;
+    for (std::size_t identity = 1U; identity <= kAcceptanceGenerationLimit; ++identity)
+        audit.native(native_surface_record("presentation.allocation.created", identity));
+    REQUIRE(audit.failure.empty());
+    audit.native(native_surface_record("presentation.allocation.created", kAcceptanceGenerationLimit + 1U));
+    CHECK_FALSE(audit.failure.empty());
+    CHECK(audit.surfaces.size() == kAcceptanceGenerationLimit);
+}
+
 TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]") {
     for (const char* field :
          {"sequence", "selection_generation", "frame_revision", "capacity_width", "capacity_height", "condition", "outcome"}) {
@@ -5277,19 +5575,15 @@ TEST_CASE("surface join records failed span endings without accepting a complete
 }
 
 TEST_CASE("surface join rejects omitted admission and reordered observed copy stages", "[workspace][audit]") {
-    // Native admission queue/write/import diagnostics are bounded and
-    // nonblocking. The exact native allocation, subsequent physical operation,
-    // and complete receiver admission chain corroborate one dropped success.
-    for (const std::size_t omitted : {0U, 1U, 2U, 3U, 11U}) {
+    for (std::size_t omitted = 0U; omitted < native_surface_events.size(); ++omitted) {
+        if (std::string_view{native_surface_events[omitted]} == "presentation.active.withdrawal")
+            continue;  // Receiver-initiated withdrawal is independently authoritative.
         SurfaceAudit audit;
         for (std::size_t index = 0U; index < native_surface_events.size(); ++index)
             if (index != omitted) audit.native(native_surface_record(native_surface_events[index]));
         for (const char* event : browser_surface_events)
             audit.browser(browser_surface_record(event));
-        if (omitted <= 3U)
-            CHECK(audit.joined_failure().empty());
-        else
-            CHECK_FALSE(audit.joined_failure().empty());
+        CHECK_FALSE(audit.joined_failure().empty());
     }
     for (std::size_t omitted = 0U; omitted < browser_surface_events.size(); ++omitted) {
         if (std::string_view{browser_surface_events[omitted]} == "iced.surface.owned_draw_selected")
@@ -5316,7 +5610,7 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
         if (index != 7U) dropped_ready_start.native(native_surface_record(native_surface_events[index]));
     for (const char* event : browser_surface_events)
         dropped_ready_start.browser(browser_surface_record(event));
-    CHECK(dropped_ready_start.joined_failure().empty());
+    CHECK_FALSE(dropped_ready_start.joined_failure().empty());
     SurfaceAudit reordered_ready;
     for (std::size_t index = 0U; index < 7U; ++index)
         reordered_ready.native(native_surface_record(native_surface_events[index]));
@@ -5342,7 +5636,7 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     replacement["allocation_generation"] = 8U;
     dropped_candidate_retirement.native(replacement);
     record_receiver_withdrawal(dropped_candidate_retirement);
-    CHECK(dropped_candidate_retirement.joined_failure().empty());
+    CHECK_FALSE(dropped_candidate_retirement.joined_failure().empty());
 
     SurfaceAudit used_pending;
     for (const char* event : native_surface_events)
@@ -5372,7 +5666,7 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
         rejected.browser(browser_surface_record("firefox.workspace.import_failed"));
         rejected.browser(browser_surface_record("iced.surface.pending_discarded"));
         rejected.browser(browser_surface_record("iced.surface.retired"));
-        CHECK(rejected.joined_failure().empty());
+        CHECK(rejected.joined_failure().empty() == observed_native_outcome);
     }
 }
 
@@ -5406,28 +5700,39 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     joined_after_publication.consume_explore_evidence("acceptance.slot.patched", 0U, 10U, 4096U);
     joined_after_publication.consume_explore_evidence("tile.batch.published", 1U, 0U, 4096U);
     CHECK_FALSE(joined_after_publication.acceptance_first_patch_exact);
-    joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}}, 0U, 0U, {});
+    joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}});
+    CHECK_FALSE(joined_after_publication.acceptance_first_patch_exact);
+    joined_after_publication.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U, 4096U);
+    joined_after_publication.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U, 4096U);
+    joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}});
     CHECK(joined_after_publication.partial_generation == 2U);
     CHECK(joined_after_publication.acceptance_first_patch_exact);
 
     const std::map<std::uint64_t, std::uint64_t> rendered_slots{{0U, 10U}, {1U, 11U}};
-    for (const auto missing : {"none", "placeholder", "patch", "count", "frame", "identity", "conflict"}) {
+    for (const auto missing : {"none", "summary", "slot", "patch", "count", "frame", "identity", "conflict"}) {
         INFO("missing native inventory evidence: " << missing);
         NativeAudit material;
         const std::string_view omitted{missing};
-        if (omitted != "placeholder") material.consume_explore_evidence("placeholder.published", 2U);
-        if (omitted == "conflict") material.consume_explore_evidence("acceptance.placeholder.slot", 1U, 12U);
+        material.consume_explore_evidence("placeholder.published", 2U);
+        material.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U);
+        if (omitted != "slot")
+            material.consume_explore_evidence("acceptance.placeholder.slot", 1U, omitted == "conflict" ? 12U : 11U);
+        if (omitted != "summary") material.consume_explore_evidence("acceptance.placeholder.complete", 2U);
         material.consume_explore_evidence("acceptance.slot.patched", 0U, 10U);
         if (omitted != "patch") material.consume_explore_evidence("acceptance.slot.patched", 1U, omitted == "identity" ? 12U : 11U);
         material.consume_explore_evidence("tile.batch.published", omitted == "count" ? 1U : 2U);
         if (omitted != "frame") material.consume_explore_evidence("explore.frame.published", 7U);
-        material.join_gallery_publication(3U, rendered_slots, 7U, 10U, {});
-        material.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+        material.join_gallery_publication(3U, rendered_slots);
+        material.join_gallery_publication(2U, rendered_slots);
         CHECK_FALSE(material.final_generations_for(rendered_slots, 3U, 7U).has_value());
         CHECK_FALSE(material.final_generations_for(rendered_slots, 2U, 8U).has_value());
-        material.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+        material.join_gallery_publication(2U, rendered_slots);
         const auto final = material.final_generations_for(rendered_slots, 2U, 7U);
-        CHECK(final.has_value() == (omitted == "none"));
+        CHECK(final.has_value() == (omitted != "summary" && omitted != "slot" && omitted != "frame" && omitted != "conflict"));
+        const bool complete_material = final && material.patched_slots.at(2U) == rendered_slots &&
+                                       material.published_tiles.at(2U) == rendered_slots.size() &&
+                                       !material.explore_stale_patch && !material.causal_inconsistent;
+        CHECK(complete_material == (omitted == "none"));
         if (final) {
             CHECK(final->material == 2U);
             CHECK(final->cursor == 2U);
@@ -5443,13 +5748,15 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     initial.consume_explore_evidence("acceptance.slot.patched", 0U, 10U);
     initial.consume_explore_evidence("explore.frame.published", 7U);
     initial.consume_explore_evidence("tile.batch.published", 1U);
-    initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+    initial.join_gallery_publication(2U, rendered_slots);
     CHECK_FALSE(initial.acceptance_first_patch_exact);
     CHECK_FALSE(initial.placeholder_cardinalities.contains(2U));
     initial.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U);
-    initial.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+    initial.join_gallery_publication(2U, rendered_slots);
     CHECK_FALSE(initial.acceptance_first_patch_exact);
-    initial.join_gallery_publication(2U, rendered_slots, 7U, 10U, {});
+    initial.join_gallery_publication(2U, rendered_slots);
+    CHECK_FALSE(initial.acceptance_first_patch_exact);
+    initial.consume_explore_evidence("acceptance.placeholder.complete", 2U);
     CHECK(initial.acceptance_first_patch_exact);
     CHECK(initial.partial_generation == 2U);
     CHECK(initial.partial_first_tile_count == 1U);
@@ -5463,9 +5770,12 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
                      {"source_observation_revision", 10U},
                      {"source_revision", 8U},
                      {"frame_revision", 8U}});
-    initial.join_gallery_publication(2U, rendered_slots, 8U, 9U, {});
+    initial.join_gallery_publication(2U, rendered_slots);
     CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
-    initial.join_gallery_publication(2U, rendered_slots, 8U, 10U, {});
+    initial.join_gallery_publication(2U, rendered_slots);
+    CHECK_FALSE(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
+    initial.consume_explore_evidence("explore.frame.published", 8U);
+    initial.join_gallery_publication(2U, rendered_slots);
     CHECK(initial.final_generations_for(rendered_slots, 2U, 8U).has_value());
     initial.augmentation_seeds.emplace(2U, 0U);
     CHECK(initial.augmentation_generation_for(0U, 8U) == 2U);
@@ -5503,9 +5813,14 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         browser.consume_gallery_generation(snapshot);
         REQUIRE(browser.bounds_valid);
         const auto& evidence = browser.gallery_generations.at(2U);
-        partial.join_gallery_publication(2U, evidence.slots, evidence.source_revision, evidence.snapshot_revision, evidence.ready_slots);
-        CHECK(partial.acceptance_first_patch_exact == (missing == "none"));
+        partial.join_gallery_publication(2U, evidence.slots);
+        // Even a complete receiver bitmap and Presentation receipt cannot
+        // substitute for the native batch publication.
+        CHECK_FALSE(partial.acceptance_first_patch_exact);
+        CHECK_FALSE(partial.first_publication_ordinals.contains(2U));
         if (missing == "none") {
+            partial.consume_explore_evidence("tile.batch.published", 1U);
+            CHECK(partial.acceptance_first_patch_exact);
             CHECK(partial.partial_generation == 2U);
             CHECK(partial.partial_first_tile_count == 1U);
             CHECK(partial.first_patched_slots.at(2U) == std::map<std::uint64_t, std::uint64_t>{{1U, 11U}});

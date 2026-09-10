@@ -112,6 +112,20 @@ test('quiet draw-conditioned input uses direct readiness, once, independently of
   assertQuiet(f);
 });
 
+test('quiet pressure gesture preserves its ordered terminal edge without diagnostic collection', t => {
+  const f = canvasFixture(t);
+  for (const steps of [0, 257, Infinity, 1.5]) {
+    assert.equal(browser.mmltkIntegrationAnnotationPointer(0, 0, 100, 100, .1, .1, .9, .9, false, steps), 0);
+  }
+  assert.equal(browser.mmltkIntegrationAnnotationPointer(0, 0, 100, 100, .1, .1, .9, .9, false, 160), 1);
+  f.flushMicrotasks();
+  assert.equal(f.events.length, 163);
+  assert.deepEqual(f.events.slice(0, 2), ['pointermove', 'pointerdown']);
+  assert.ok(f.events.slice(2, -1).every(event => event === 'pointermove'));
+  assert.equal(f.events.at(-1), 'pointerup');
+  assertQuiet(f);
+});
+
 test('quiet reset retires both armed and queued input without touching replacement input', t => {
   const f = canvasFixture(t);
   browser.mmltkIntegrationClickAfterSurfaceDraw(10, 20, gallery, 7, false);

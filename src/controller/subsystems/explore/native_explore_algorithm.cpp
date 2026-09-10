@@ -24,6 +24,7 @@
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <unistd.h>
@@ -54,89 +55,48 @@ class ExploreAcceptanceGate::Impl final {
     mutable std::atomic_bool probe_failure{false};
     explicit Impl(const int command_descriptor)
         : command_(command_descriptor),
-          stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)),
-          generation_changed_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
-        if (command_.get() < 0 || stop_.get() < 0 || generation_changed_.get() < 0)
+          stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
+        if (command_.get() < 0 || stop_.get() < 0)
             throw std::invalid_argument("invalid Explore acceptance gate descriptor");
+        reader_ = std::jthread([this] { ReadCommands(); });
+    }
+    ~Impl() {
+        Stop();
+        if (reader_.joinable()) reader_.join();
     }
 
     void AdvanceGeneration(const std::uint64_t generation) noexcept {
-        bool wake_reader = false;
-        {
-            std::scoped_lock lock(mutex_);
-            if (current_generation_ != generation) {
-                current_generation_ = generation;
-                ++generation_epoch_;
-                wake_reader = true;
-            }
-            changed_.notify_all();
-        }
-        if (wake_reader) static_cast<void>(mmltk::common::io::signal_event_fd(generation_changed_.get()));
+        std::scoped_lock lock(mutex_);
+        current_generation_ = generation;
+        changed_.notify_all();
     }
 
     [[nodiscard]] WaitResult AwaitInitialRelease(const std::uint64_t generation) {
-        for (;;) {
-            std::unique_lock lock(mutex_);
-            if (terminal_ || generation != current_generation_) return WaitResult::Stale;
-            if (release_all_) return WaitResult::Proceed;
-            if (release_one_) {
-                release_one_ = false;
-                initial_released_generation_ = generation;
-                return WaitResult::Proceed;
-            }
-            if (reader_) {
-                changed_.wait(lock, [this, generation] {
-                    return terminal_ || generation != current_generation_ || release_all_ || release_one_ || !reader_;
-                });
-                continue;
-            }
-            reader_ = true;
-            const auto generation_epoch = generation_epoch_;
-            const bool announce = !std::exchange(initial_wait_announced_, true);
-            lock.unlock();
-            if (announce) {
-                const std::uint8_t waiting = 0x80U;
-                static_cast<void>(::send(command_.get(), &waiting, sizeof(waiting), MSG_NOSIGNAL | MSG_DONTWAIT));
-            }
-            mmltk::common::io::drain_event_fd(generation_changed_.get());
-            lock.lock();
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) {
-                reader_ = false;
-                changed_.notify_all();
-                return WaitResult::Stale;
-            }
-            lock.unlock();
-            const auto command = ReadCommand();
-            lock.lock();
-            reader_ = false;
-            // Release-all is global acceptance state, not generation-local
-            // state. Preserve it even when the generation wake raced the
-            // command read so the replacement generation cannot consume and
-            // lose the command.
-            if (command.value == 2U) release_all_ = true;
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) {
-                changed_.notify_all();
-                return WaitResult::Stale;
-            }
-            if (command.generation_changed) {
-                changed_.notify_all();
-                continue;
-            }
-            if (command.value == 1U) {
-                // A superseding-generation retry can arrive after the first command already released that generation.
-                if (initial_released_generation_ != current_generation_) release_one_ = true;
-            } else if (command.value == 2U) {
-                // Already latched before the generation-local stale check.
-            } else
+        std::unique_lock lock(mutex_);
+        if (terminal_ || generation != current_generation_) return WaitResult::Stale;
+        if (!release_all_ && !release_one_ && !std::exchange(initial_wait_announced_, true)) {
+            const std::uint8_t waiting = 0x80U;
+            if (::send(command_.get(), &waiting, sizeof(waiting), MSG_NOSIGNAL | MSG_DONTWAIT) != sizeof(waiting))
                 terminal_ = true;
-            changed_.notify_all();
         }
+        ++waiters_;
+        changed_.wait(lock, [this, generation] {
+            return terminal_ || generation != current_generation_ || release_all_ || release_one_;
+        });
+        --waiters_;
+        if (terminal_ || generation != current_generation_) return WaitResult::Stale;
+        if (!release_all_) {
+            release_one_ = false;
+            initial_released_generation_ = generation;
+        }
+        return WaitResult::Proceed;
     }
 
     [[nodiscard]] bool ClaimHeldCompletion() {
         std::scoped_lock lock(mutex_);
         if (terminal_ || held_claimed_) return false;
         held_claimed_ = true;
+        held_pending_ = true;
         return true;
     }
 
@@ -161,32 +121,41 @@ class ExploreAcceptanceGate::Impl final {
             static_cast<void>(SendControlObservation(observation));
             return result;
         };
-        for (;;) {
-            std::unique_lock lock(mutex_);
-            changed_.wait(lock, [this, generation] { return terminal_ || generation != current_generation_ || !reader_; });
-            if (terminal_ || generation != current_generation_) return finish(WaitResult::Stale);
-            reader_ = true;
-            const auto generation_epoch = generation_epoch_;
-            lock.unlock();
-            mmltk::common::io::drain_event_fd(generation_changed_.get());
-            lock.lock();
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) {
-                reader_ = false;
-                changed_.notify_all();
-                return finish(WaitResult::Stale);
-            }
-            lock.unlock();
-            const auto command = ReadCommand();
-            lock.lock();
-            reader_ = false;
-            changed_.notify_all();
-            if (terminal_ || generation != current_generation_ || generation_epoch != generation_epoch_) return finish(WaitResult::Stale);
-            if (command.generation_changed) continue;
-            if (command.value == 4U) return finish(WaitResult::Proceed);
+        std::unique_lock lock(mutex_);
+        ++waiters_;
+        changed_.wait(lock, [this, generation] { return terminal_ || generation != current_generation_ || release_held_; });
+        --waiters_;
+        held_pending_ = false;
+        return finish(terminal_ || generation != current_generation_ ? WaitResult::Stale : WaitResult::Proceed);
+    }
+
+    void SetFrontendCommand(FrontendCommand callback) {
+        auto retained = callback ? std::make_shared<const FrontendCommand>(std::move(callback)) : nullptr;
+        std::scoped_lock lock(mutex_);
+        frontend_command_ = std::move(retained);
+    }
+
+    [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
+        std::scoped_lock lock(mutex_);
+        using Kind = contracts::IntegrationControlKind;
+        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ ||
+            receipt.kind == Kind::Advance)
+            return false;
+        if (receipt.kind == Kind::Progress) {
+            if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;
+            frontend_progress_ = receipt.progress;
+        }
+        if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return false;
+        if (receipt.kind == Kind::Settled) frontend_settled_ = true;
+        const bool sent = SendControlObservation({.event = ControlEvent::Frontend,
+                                                  .generation = receipt.sequence,
+                                                  .slot = static_cast<std::uint64_t>(receipt.kind),
+                                                  .compiled_index = receipt.progress});
+        if (!sent || receipt.kind == Kind::Failed) {
             terminal_ = true;
             changed_.notify_all();
-            return finish(WaitResult::Stale);
         }
+        return sent;
     }
 
     void Stop() noexcept {
@@ -196,65 +165,103 @@ class ExploreAcceptanceGate::Impl final {
     }
 
    private:
-    struct CommandRead final {
-        std::uint8_t value = 0U;
-        bool generation_changed = false;
-    };
-
     [[nodiscard]] bool SendControlObservation(const ControlObservation& observation) const noexcept {
         ssize_t written = -1;
         do {
-            written = ::send(command_.get(), &observation, sizeof(observation), MSG_NOSIGNAL);
+            written = ::send(command_.get(), &observation, sizeof(observation), MSG_NOSIGNAL | MSG_DONTWAIT);
         } while (written < 0 && errno == EINTR);
         return written == static_cast<ssize_t>(sizeof(observation));
     }
 
-    [[nodiscard]] CommandRead ReadCommand() noexcept {
-        std::array<pollfd, 3U> descriptors{{
+    [[nodiscard]] std::uint8_t ReadCommand() noexcept {
+        std::array<pollfd, 2U> descriptors{{
             {.fd = command_.get(), .events = POLLIN | POLLHUP | POLLERR, .revents = 0},
             {.fd = stop_.get(), .events = POLLIN | POLLHUP | POLLERR, .revents = 0},
-            {.fd = generation_changed_.get(), .events = POLLIN | POLLHUP | POLLERR, .revents = 0},
         }};
         int ready = -1;
         do {
             ready = ::poll(descriptors.data(), descriptors.size(), -1);
         } while (ready < 0 && errno == EINTR);
         if (ready <= 0 || descriptors[1].revents != 0) return {};
-        if (descriptors[2].revents != 0) {
-            mmltk::common::io::drain_event_fd(generation_changed_.get());
-            return {.generation_changed = true};
-        }
         if ((descriptors[0].revents & POLLIN) == 0) return {};
         std::uint8_t command = 0U;
         ssize_t consumed = -1;
         do {
-            consumed = ::read(command_.get(), &command, sizeof(command));
+            consumed = ::recv(command_.get(), &command, sizeof(command), MSG_TRUNC);
         } while (consumed < 0 && errno == EINTR);
-        return {.value = consumed == sizeof(command) ? command : static_cast<std::uint8_t>(0U)};
+        return consumed == sizeof(command) ? command : static_cast<std::uint8_t>(0U);
+    }
+
+    void ReadCommands() noexcept {
+        for (;;) {
+            const auto command = ReadCommand();
+            std::shared_ptr<const FrontendCommand> callback;
+            std::uint64_t sequence = 0U;
+            {
+                std::scoped_lock lock(mutex_);
+                if (terminal_) return;
+                if (command == 1U) {
+                    if (current_generation_ == 0U || initial_released_generation_ != current_generation_) release_one_ = true;
+                } else if (command == 2U) {
+                    release_all_ = true;
+                } else if (command == 4U) {
+                    release_held_ = true;
+                } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ &&
+                           frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
+                    release_all_ = false;
+                    release_one_ = false;
+                    release_held_ = false;
+                    held_claimed_ = false;
+                    initial_wait_announced_ = false;
+                    initial_released_generation_ = 0U;
+                    frontend_settled_ = false;
+                    frontend_progress_ = 0U;
+                    frontend_pressure_ = false;
+                    sequence = ++frontend_sequence_;
+                    callback = frontend_command_;
+                } else {
+                    terminal_ = true;
+                }
+                changed_.notify_all();
+                if (terminal_) return;
+            }
+            if (callback) {
+                try {
+                    if ((*callback)({.kind = contracts::IntegrationControlKind::Advance, .sequence = sequence})) continue;
+                } catch (...) {}
+                Terminal();
+                return;
+            }
+        }
     }
 
     void Terminal() noexcept {
         std::scoped_lock lock(mutex_);
         terminal_ = true;
-        reader_ = false;
         changed_.notify_all();
     }
 
     mmltk::common::io::ScopedFd command_;
     mmltk::common::io::ScopedFd stop_;
-    mmltk::common::io::ScopedFd generation_changed_;
     std::mutex mutex_;
     std::condition_variable changed_;
-    bool reader_ = false;
+    std::size_t waiters_ = 0U;
     bool initial_wait_announced_ = false;
     bool terminal_ = false;
     bool release_one_ = false;
     bool release_all_ = false;
+    bool release_held_ = false;
     bool held_claimed_ = false;
+    bool held_pending_ = false;
     bool terminal_reported_ = false;
     std::uint64_t current_generation_ = 0U;
-    std::uint64_t generation_epoch_ = 0U;
     std::uint64_t initial_released_generation_ = 0U;
+    std::shared_ptr<const FrontendCommand> frontend_command_;
+    std::uint64_t frontend_sequence_ = 1U;
+    bool frontend_settled_ = false;
+    bool frontend_pressure_ = false;
+    std::uint64_t frontend_progress_ = 0U;
+    std::jthread reader_;
 };
 
 ExploreAcceptanceGate::ExploreAcceptanceGate(const int command_descriptor) : impl_(std::make_unique<Impl>(command_descriptor)) {}
@@ -270,6 +277,10 @@ auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, 
 bool ExploreAcceptanceGate::ClaimHeldCompletion() { return impl_->ClaimHeldCompletion(); }
 bool ExploreAcceptanceGate::ClaimTerminalReport() { return impl_->ClaimTerminalReport(); }
 void ExploreAcceptanceGate::Stop() noexcept { impl_->Stop(); }
+void ExploreAcceptanceGate::SetFrontendCommand(FrontendCommand callback) { impl_->SetFrontendCommand(std::move(callback)); }
+bool ExploreAcceptanceGate::ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
+    return impl_->ObserveFrontend(receipt);
+}
 void ExploreAcceptanceGate::SetProductObserver(void* context, void (*observer)(void*, ProductObservation) noexcept) noexcept {
     impl_->product_context = context;
     impl_->product_observer = observer;

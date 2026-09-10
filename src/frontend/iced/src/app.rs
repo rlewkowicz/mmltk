@@ -44,14 +44,20 @@ pub fn boot() -> (App, Task<Message>) {
         config.integration_pixel_fixture,
     );
     let integration = config.integration.then(|| {
-        crate::integration_control::Controller::new(
+        let mut controller = crate::integration_control::Controller::new(
             true,
             config.integration_window_close,
             config.integration_dataset_source.clone(),
             config.integration_compiled_directory.clone(),
             config.integration_resolution.clone(),
             config.integration_viewer_scenario.clone(),
-        )
+        );
+        controller.configure_session(
+            &config.integration_viewer_scenario,
+            config.integration_square_source.clone(),
+            config.integration_square_compiled.clone(),
+        );
+        controller
     });
     (
         App {
@@ -148,21 +154,27 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         .presentation
         .redraw(previous_surface)
         .map(Message::Presentation);
-    Task::batch([
-        task,
-        presentation_task,
+    let integration_task =
         if let Some(integration) = app.integration.as_mut() {
-            integration.advance(
+            let task = integration.advance(
                 &app.model,
                 app.settings.state(),
                 app.settings.applied_scale(),
                 &app.workspace,
                 app.workspace.active(),
                 frame,
-            )
+            );
+            if let Some(connection) = app.connection.as_mut() {
+                integration.publish_control(connection);
+            }
+            task
         } else {
             Task::none()
-        },
+        };
+    Task::batch([
+        task,
+        presentation_task,
+        integration_task,
     ])
 }
 #[cfg(test)]

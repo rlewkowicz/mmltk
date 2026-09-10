@@ -4,12 +4,14 @@
 #include <mutex>
 #include <limits>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/contracts/application_systems.h"
+#include "src/controller/subsystems/explore/explore_system.h"
 
 namespace mmltk::controller::browser {
 namespace {
@@ -249,6 +251,8 @@ struct ApplicationBrowserHost::Impl final {
                         return published;
                     } else if constexpr (std::same_as<Type, Interaction>) {
                         return interaction(*installed, InteractionView{value});
+                    } else if constexpr (std::same_as<Type, IntegrationControl>) {
+                        return integration && integration->ObserveFrontend(value.receipt);
                     } else {
                         auto* presentation = installed->presentation;
                         if (presentation == nullptr) {
@@ -390,6 +394,7 @@ struct ApplicationBrowserHost::Impl final {
     std::uint64_t input_epoch = 0U;
     std::uint64_t consumed_sequence = 0U;
     bool input_active = false;
+    std::shared_ptr<ExploreAcceptanceGate> integration;
     transport::BrowserServer* server = nullptr;
     services::RuntimeDiagnosticTarget diagnostics;
     std::atomic<ApplicationSystems*> systems = nullptr;
@@ -400,6 +405,17 @@ ApplicationBrowserHost::ApplicationBrowserHost(transport::BrowserServer& server,
     : impl_(std::make_shared<Impl>(server, diagnostics)) {}
 
 bool ApplicationBrowserHost::install(ApplicationSystems& systems) noexcept { return impl_->install(systems); }
+
+void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate) {
+    if (!gate || impl_->integration) throw std::invalid_argument("integration gate installation is unique");
+    std::weak_ptr<Impl> weak = impl_;
+    gate->SetFrontendCommand([weak](const contracts::IntegrationControlReceipt receipt) {
+        const auto owner = weak.lock();
+        return owner && owner->admission.load(std::memory_order_acquire) &&
+               owner->publish_record(IntegrationControl{.receipt = receipt}, transport::BrowserRecordPriority::Critical);
+    });
+    impl_->integration = std::move(gate);
+}
 
 transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const noexcept {
     return {
@@ -415,7 +431,13 @@ transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const no
 void ApplicationBrowserHost::publish(SystemEvent event) noexcept { impl_->publish(std::move(event)); }
 void ApplicationBrowserHost::continuity_lost() noexcept { impl_->continuity_lost(); }
 
-void ApplicationBrowserHost::close_admission() noexcept { impl_->admission.store(false, std::memory_order_release); }
+void ApplicationBrowserHost::close_admission() noexcept {
+    impl_->admission.store(false, std::memory_order_release);
+    if (impl_->integration) {
+        impl_->integration->SetFrontendCommand({});
+        impl_->integration->Stop();
+    }
+}
 
 bool ApplicationBrowserHost::accepting() const noexcept { return impl_->admission.load(std::memory_order_acquire); }
 

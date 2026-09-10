@@ -20,6 +20,7 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/artifact_catalog.h"
 #include "src/controller/contracts/explore_filter.h"
+#include "src/controller/contracts/integration_control.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
@@ -361,7 +362,13 @@ class ExploreAcceptanceGate final {
         HeldWait = 0x81U,
         HeldProceed = 0x82U,
         HeldStale = 0x83U,
+        Frontend = 0x84U,
     };
+    using FrontendCommand = std::function<bool(contracts::IntegrationControlReceipt)>;
+    // Installed only by the explicit integration host. The descriptor reader
+    // remains the sole receiver of parent commands throughout the session.
+    void SetFrontendCommand(FrontendCommand);
+    [[nodiscard]] bool ObserveFrontend(contracts::IntegrationControlReceipt) noexcept;
     struct ControlObservation final {
         ControlEvent event = ControlEvent::InitialWait;
         std::uint64_t generation = 0U;

@@ -92,7 +92,7 @@ int main(const int argument_count, char* const* const arguments) {
     auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
     if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
     bootstrap.input_epoch = 1U;
-    const std::array<ServerRecord, 7U> records{
+    const std::array<ServerRecord, 8U> records{
         std::move(bootstrap),
         IntentReply{
             .correlation = 17U,
@@ -115,6 +115,7 @@ int main(const int argument_count, char* const* const arguments) {
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
         InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U, .rejection = std::string(kVisualFailureByteCapacity, 'r')},
                       .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
+        IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {

@@ -49,6 +49,8 @@ impl App {
                 TransportEvent::Bootstrap(_)
                     | TransportEvent::IntentReply(_)
                     | TransportEvent::SystemEvent(_)
+                    | TransportEvent::IntegrationControl(_)
+                    | TransportEvent::IntegrationInputSettled
                     | TransportEvent::Rejected(_)
             )
         {
@@ -56,6 +58,9 @@ impl App {
         }
         match event {
             TransportEvent::Connected(mut connection) => {
+                if self.config.integration && self.config.integration_viewer_scenario == "quiet" {
+                    connection.observe_integration_pressure(1);
+                }
                 if self.model.connection == crate::view_model::ConnectionState::Connected {
                     self.presentation
                         .suspend_viewer(&self.model, self.workspace.active());
@@ -82,6 +87,20 @@ impl App {
             TransportEvent::Bootstrap(bootstrap) => self.install_bootstrap(bootstrap),
             TransportEvent::IntentReply(reply) => self.reduce_reply(reply),
             TransportEvent::SystemEvent(event) => self.reduce_event(event),
+            TransportEvent::IntegrationControl(receipt) => {
+                if let Some(integration) = self.integration.as_mut() {
+                    if let Err(detail) = integration.receive_control(receipt) {
+                        self.model.error = Some(UiError::protocol(detail));
+                    }
+                } else {
+                    self.retire_peer(UiError::protocol("integration control without an integration driver"));
+                }
+            }
+            TransportEvent::IntegrationInputSettled => {
+                if self.integration.is_none() {
+                    self.retire_peer(UiError::protocol("integration input settlement without a driver"));
+                }
+            }
             TransportEvent::Disconnected(reason) => {
                 self.retire_peer(UiError::transport(reason));
             }

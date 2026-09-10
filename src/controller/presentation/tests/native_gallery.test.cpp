@@ -1272,5 +1272,112 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
 }
 
+TEST_CASE("acceptance gate retains one reader across settled frontend workflows", "[explore][acceptance][control]") {
+    using Kind = contracts::IntegrationControlKind;
+    const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
+    std::array<int, 2U> sockets{};
+    REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    mmltk::common::io::ScopedFd commands{sockets[0]};
+    ExploreAcceptanceGate gate{sockets[1]};
+    std::promise<contracts::IntegrationControlReceipt> advanced;
+    auto delivered = advanced.get_future();
+    gate.SetFrontendCommand([&advanced](const auto receipt) {
+        advanced.set_value(receipt);
+        return true;
+    });
+    const std::uint8_t release_held = 4U;
+    REQUIRE(::send(commands.get(), &release_held, sizeof(release_held), MSG_NOSIGNAL) == sizeof(release_held));
+    REQUIRE(gate.ClaimHeldCompletion());
+    auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(0U, 4U, 8U, 64U); });
+    const auto held_status = held.wait_for(std::chrono::seconds{2});
+    if (held_status != std::future_status::ready) gate.Stop();
+    REQUIRE(held_status == std::future_status::ready);
+    CHECK(held.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    CHECK_FALSE(gate.ClaimHeldCompletion());
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 2U}));
+    CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Advance, .sequence = 1U}));
+    CHECK(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
+    const std::uint8_t advance = 8U;
+    REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
+    const auto status = delivered.wait_for(std::chrono::seconds{2});
+    if (status != std::future_status::ready) gate.Stop();
+    REQUIRE(status == std::future_status::ready);
+    CHECK((delivered.get() == contracts::IntegrationControlReceipt{.kind = Kind::Advance, .sequence = 2U}));
+    CHECK(gate.ClaimHeldCompletion());
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 1U}));
+    CHECK(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 2U, .progress = 1U}));
+    gate.SetFrontendCommand({});
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Settled, .sequence = 2U}));
+    gate.Stop();
+    CHECK(gate.ClaimTerminalReport());
+    CHECK_FALSE(gate.ClaimTerminalReport());
+}
+
+TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits", "[explore][acceptance][control]") {
+    const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
+    std::array<int, 2U> sockets{};
+    REQUIRE(::socketpair(AF_UNIX, transport | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    mmltk::common::io::ScopedFd commands{sockets[0]};
+    ExploreAcceptanceGate gate{sockets[1]};
+    for (const std::uint8_t command : {1U, 2U, 4U})
+        REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
+    gate.AdvanceGeneration(7U);
+    auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
+    const auto status = initial.wait_for(std::chrono::seconds{2});
+    if (status != std::future_status::ready) gate.Stop();
+    REQUIRE(status == std::future_status::ready);
+    CHECK(initial.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    REQUIRE(gate.ClaimHeldCompletion());
+    auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 4U, 8U, 64U); });
+    const auto held_status = held.wait_for(std::chrono::seconds{2});
+    if (held_status != std::future_status::ready) gate.Stop();
+    REQUIRE(held_status == std::future_status::ready);
+    CHECK(held.get() == ExploreAcceptanceGate::WaitResult::Proceed);
+    CHECK_FALSE(gate.ClaimHeldCompletion());
+    gate.AdvanceGeneration(8U);
+    CHECK(gate.AwaitInitialRelease(7U) == ExploreAcceptanceGate::WaitResult::Stale);
+    gate.Stop();
+    CHECK(gate.AwaitInitialRelease(8U) == ExploreAcceptanceGate::WaitResult::Stale);
+}
+
+TEST_CASE("acceptance gate rejects premature advancement and unavailable callbacks", "[explore][acceptance][control]") {
+    const unsigned terminal_path = GENERATE(0U, 1U, 2U, 3U, 4U);
+    std::array<int, 2U> sockets{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    mmltk::common::io::ScopedFd commands{sockets[0]};
+    ExploreAcceptanceGate gate{sockets[1]};
+    std::promise<void> invoked;
+    auto invocation = invoked.get_future();
+    gate.SetFrontendCommand([terminal_path, &invoked](auto) {
+        invoked.set_value();
+        return terminal_path == 4U;
+    });
+    if (terminal_path == 1U || terminal_path == 4U)
+        REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Settled, .sequence = 1U}));
+    if (terminal_path == 2U)
+        REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U}));
+    gate.AdvanceGeneration(1U);
+    const std::uint8_t advance = 8U;
+    if (terminal_path < 2U || terminal_path == 4U)
+        REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
+    if (terminal_path == 1U || terminal_path == 4U) {
+        const auto callback_status = invocation.wait_for(std::chrono::seconds{2});
+        if (callback_status != std::future_status::ready) gate.Stop();
+        REQUIRE(callback_status == std::future_status::ready);
+    }
+    if (terminal_path == 4U)
+        REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
+    if (terminal_path == 3U) commands.reset();
+    auto waiting = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(1U); });
+    const auto status = waiting.wait_for(std::chrono::seconds{2});
+    if (status != std::future_status::ready) gate.Stop();
+    REQUIRE(status == std::future_status::ready);
+    CHECK(waiting.get() == ExploreAcceptanceGate::WaitResult::Stale);
+    CHECK(gate.ClaimTerminalReport());
+}
+
 }  // namespace
 }  // namespace mmltk::controller

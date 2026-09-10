@@ -784,9 +784,10 @@ export function mmltkIntegrationAnnotationRelease() {
   const end=integrationDriver.integrationAnnotationPointerEnd;
   if(end){end.canvas.dispatchEvent(integrationPointer(end.rect,end.x,end.y,'pointerup',0));integrationDriver.integrationAnnotationPointerEnd=null;}
 }
-export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, startY, endX, endY, hold) {
+export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, startY, endX, endY, hold, steps = 1) {
   const canvas = document.querySelector('canvas');
-  if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return 0;
+  if (!canvas || ![x, y, width, height, startX, startY, endX, endY].every(Number.isFinite)
+      || width <= 0 || height <= 0 || !Number.isInteger(steps) || steps < 1 || steps > 256) return 0;
   const rect = canvas.getBoundingClientRect();
   const x0 = x + width * startX;
   const y0 = y + height * startY;
@@ -795,7 +796,10 @@ export function mmltkIntegrationAnnotationPointer(x, y, width, height, startX, s
   integrationMicrotask(() => {
     canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointermove', 0));
     canvas.dispatchEvent(integrationPointer(rect, x0, y0, 'pointerdown', 1));
-    canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointermove', 1));
+    for (let step = 1; step <= steps; ++step) {
+      const fraction = step / steps;
+      canvas.dispatchEvent(integrationPointer(rect, x0 + (x1 - x0) * fraction, y0 + (y1 - y0) * fraction, 'pointermove', 1));
+    }
     if(hold) integrationDriver.integrationAnnotationPointerEnd={canvas,rect,x:x1,y:y1};
     else canvas.dispatchEvent(integrationPointer(rect, x1, y1, 'pointerup', 0));
   });

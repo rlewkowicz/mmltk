@@ -124,7 +124,7 @@ fn preflight_protocol_record(bytes: &[u8]) -> Result<(), ProtocolError> {
                 ServerRecordKind::Bootstrap => RecordKind::Bootstrap,
                 ServerRecordKind::IntentReply => RecordKind::IntentReply,
                 ServerRecordKind::SystemEvent => RecordKind::SystemEvent,
-                ServerRecordKind::InputProgress | ServerRecordKind::InteractionRejected => {
+                ServerRecordKind::InputProgress | ServerRecordKind::InteractionRejected | ServerRecordKind::IntegrationControl => {
                     RecordKind::Reflected(kind.reflected_preflight().ok_or_else(|| {
                         ProtocolError("missing reflected server preflight".into())
                     })?)
