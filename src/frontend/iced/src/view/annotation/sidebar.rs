@@ -1142,9 +1142,9 @@ mod tests {
             object(AnnotationShape::Spline, false),
         ];
         snapshot.ui.editor.selectedobject = Some(0);
-        crate::view_model::AnnotationModel {
-            snapshot: Some(snapshot),
-        }
+        let mut model = crate::view_model::AnnotationModel::default();
+        model.snapshot = Some(snapshot);
+        model
     }
 
     #[test]

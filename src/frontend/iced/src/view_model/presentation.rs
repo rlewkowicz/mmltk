@@ -907,6 +907,80 @@ mod tests {
                 .is_none()
         );
 
+        for frame_first in [true, false] {
+            let mut full = model.annotation.snapshot.clone().unwrap();
+            full.revision += 1;
+            full.uirevision = full.revision;
+            full.ui.documentrevision += 1;
+            let mut pixels = full.frame.clone();
+            pixels.revision += 1;
+            let small = crate::generated::AnnotationFrameChanged {
+                snapshot: crate::generated::AnnotationFrameState {
+                    revision: full.revision + 1,
+                    uirevision: full.uirevision,
+                    frame: pixels.clone(),
+                },
+            };
+            if frame_first {
+                assert!(model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(small.clone())).is_none());
+            }
+            let observed = model.reduce_event(ApplicationEvent::AnnotationAnnotationChanged(
+                crate::generated::AnnotationChanged { snapshot: full.clone() },
+            ));
+            if frame_first {
+                assert_eq!(observed, Some(pixels.clone()));
+            } else {
+                assert_eq!(model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(small.clone())), Some(pixels.clone()));
+            }
+            model.record_presentation_sent(pixels.clone());
+            assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame, pixels);
+            assert!(model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(small)).is_none());
+            assert!(model.reduce_event(ApplicationEvent::AnnotationAnnotationChanged(
+                crate::generated::AnnotationChanged { snapshot: full },
+            )).is_none());
+        }
+
+        let installed = model.annotation.snapshot.clone().unwrap();
+        let mut malformed = installed.clone();
+        malformed.uirevision = malformed.revision + 1;
+        assert!(model.annotation.install_snapshot(malformed).is_err());
+        assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
+        for ui_revision in [installed.uirevision - 1, installed.uirevision + 1] {
+            model.error = None;
+            model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(
+                crate::generated::AnnotationFrameChanged { snapshot: crate::generated::AnnotationFrameState {
+                    revision: installed.revision, uirevision: ui_revision, frame: installed.frame.clone(),
+                } },
+            ));
+            assert!(model.error.is_some());
+            assert_eq!(model.annotation.snapshot.as_ref(), Some(&installed));
+        }
+        model.error = None;
+        let future = crate::generated::AnnotationFrameState {
+            revision: installed.revision + 3,
+            uirevision: installed.revision + 2,
+            frame: visual_frame(PresentationSourceKind::Annotation, installed.frame.revision + 1),
+        };
+        model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(
+            crate::generated::AnnotationFrameChanged { snapshot: future.clone() },
+        ));
+        let mut intermediate = installed.clone();
+        intermediate.revision += 1;
+        intermediate.uirevision = intermediate.revision;
+        assert!(model.annotation.install_snapshot(intermediate.clone()).is_ok());
+        let mut malformed = intermediate.clone();
+        malformed.uirevision = future.uirevision;
+        assert!(model.annotation.install_snapshot(malformed).is_err());
+        let mut matching = intermediate.clone();
+        matching.revision = future.uirevision;
+        matching.uirevision = future.uirevision;
+        assert!(model.annotation.install_snapshot(matching).is_ok());
+        assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame, future.frame);
+        assert_eq!(model.annotation.snapshot.as_ref().unwrap().revision, future.revision);
+        assert!(model.annotation.install_snapshot(intermediate).is_ok());
+        assert_eq!(model.annotation.snapshot.as_ref().unwrap().revision, future.revision);
+        assert!(model.error.is_none());
+
         model.set_foreground_feature(FeatureId::Live);
         let mut live = model.live_snapshot.clone().unwrap();
         live.running = true;

@@ -156,31 +156,34 @@ ImageProductPool::~ImageProductPool() {
     admission_->Notify();
 }
 ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Product baseline, ImagePlanePreservation preservation) {
-    if (baseline.slot_ && (baseline.slot_->admission != admission_ || !baseline.valid()))
-        throw std::invalid_argument("image product baseline is invalid or foreign");
-    const auto find = [&]() -> std::shared_ptr<Slot> {
-        for (const auto& slot : slots_) {
-            if (slot->buffer.terminal()) throw std::runtime_error("image product storage is quarantined");
-            const bool in_place = slots_.size() == 1U;
-            const auto owned_baseline = static_cast<std::size_t>(in_place && baseline.slot_ == slot);
-            if (slot->reserved || slot->products != owned_baseline || (slot->selected && !in_place)) continue;
-            if (slot->buffer.writable()) return slot;
-        }
-        return {};
-    };
+    ValidateBaseline(baseline);
     while (!stop.stop_requested()) {
         const auto available = ObserveAvailability();
-        {
-            std::scoped_lock lock(admission_->mutex);
-            if (auto slot = find()) {
-                slot->reserved = true;
-                return Candidate{std::move(slot), std::move(baseline), preservation};
-            }
-        }
+        auto candidate = TryAcquire(baseline, preservation);
+        if (candidate.valid()) return candidate;
         if (!available.Wait(stop)) return {};
     }
     return {};
 }
+void ImageProductPool::ValidateBaseline(const Product& baseline) const {
+    if (baseline.slot_ && (baseline.slot_->admission != admission_ || !baseline.valid()))
+        throw std::invalid_argument("image product baseline is invalid or foreign");
+}
+ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, ImagePlanePreservation preservation) {
+    ValidateBaseline(baseline);
+    std::scoped_lock lock(admission_->mutex);
+    for (const auto& slot : slots_) {
+        if (slot->buffer.terminal()) throw std::runtime_error("image product storage is quarantined");
+        const bool in_place = slots_.size() == 1U;
+        const auto owned_baseline = static_cast<std::size_t>(in_place && baseline.slot_ == slot);
+        if (slot->reserved || slot->products != owned_baseline || (slot->selected && !in_place)) continue;
+        if (!slot->buffer.writable()) continue;
+        slot->reserved = true;
+        return Candidate{slot, std::move(baseline), preservation};
+    }
+    return {};
+}
+
 void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height, std::uint64_t revision,
                                ImageProductBuffer::ProductSubmit submit) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)

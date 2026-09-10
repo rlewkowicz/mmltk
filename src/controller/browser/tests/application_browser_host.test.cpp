@@ -260,9 +260,10 @@ class HostAnnotationAlgorithm final : public AnnotationAlgorithm {
         state_.scene.document.revision = 1U;
         return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
     }
-    AnnotationOperationResult Pointer(const AnnotationPointer&) override {
-        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+    AnnotationPointerResult Pointer(const AnnotationPointer&) override {
+        return {.detail = {}, .outcome = AnnotationOperationOutcome::Applied};
     }
+    const contracts::AnnotationUiState& Ui() const noexcept override { return state_; }
     void PeerClosed() noexcept override { closed_->fetch_add(1U, std::memory_order_release); }
     AnnotationOperationResult Edit(const AnnotationEdit&) override {
         ++state_.document_revision;
@@ -276,7 +277,7 @@ class HostAnnotationAlgorithm final : public AnnotationAlgorithm {
     }
     void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
                 const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
-        mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
+        if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
         std::memset(reinterpret_cast<void*>(semantic.data), 0, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
     }
 

@@ -19,9 +19,17 @@ namespace {
     return *algorithm;
 }
 
+void require_annotation_ui(const contracts::AnnotationUiState& ui) {
+    if (!ui.valid()) throw contracts::UnavailableError("Annotation document state is invalid");
+}
+
 }  // namespace
 
 class AnnotationSystem::Impl final {
+    struct InputSlot final {
+        AnnotationInputBatch batch;
+        bool occupied = false;
+    };
    public:
     Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
          SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
@@ -31,6 +39,11 @@ class AnnotationSystem::Impl final {
           diagnostics_(diagnostics),
           worker_(std::move(factory), [this](const std::exception_ptr failure) { Failed(failure); }) {
         if (!settings_.valid() || !borrow_source_) throw contracts::InvalidIntentError("Annotation device settings are invalid");
+        worker_.RegisterOrderedDrain([this](auto& runtime, auto stop) { return DrainInput(runtime, stop); });
+        worker_.RegisterContinuation([this](auto& runtime, auto stop) {
+            RenderPending(runtime, stop, false);
+            return detail::VisualRuntimeOwner::Notification{};
+        }, {}, true);
     }
 
     [[nodiscard]] AnnotationSnapshot Open(const AnnotationOpen request) {
@@ -53,6 +66,7 @@ class AnnotationSystem::Impl final {
                     [this, request, source = std::move(source)](
                         mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                         const std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
+                        RenderPending(runtime, stop, true);
                         if (stop.stop_requested()) return [this] { Cancelled(); };
                         const auto crop = request.original_content ? request.source.content : VisualRegion{};
                         contracts::AnnotationSceneContent scene;
@@ -74,11 +88,13 @@ class AnnotationSystem::Impl final {
                         const auto source_plane = input.plane(0U).plane();
                         auto result = annotation_algorithm(runtime).Open(source_plane, std::move(scene), crop);
                         if (result.outcome == AnnotationOperationOutcome::Rejected) throw contracts::InvalidIntentError(result.detail);
+                        require_annotation_ui(result.ui);
                         runtime.Publish(result.ui.scene.frame_width, result.ui.scene.frame_height,
                                         [&](const auto clean, const auto semantic, const auto stream) {
                                             annotation_algorithm(runtime).Render(source_plane, clean, semantic, stream);
                                         });
                         const VisualExtent extent{result.ui.scene.frame_width, result.ui.scene.frame_height};
+                        clean_revision_ = runtime.OutputFacts().revision;
                         auto frame = Frame(runtime, extent);
                         if (result.outcome == AnnotationOperationOutcome::Rejected)
                             return [this, ui = std::move(result.ui), detail = std::move(result.detail), frame]() mutable {
@@ -140,7 +156,7 @@ class AnnotationSystem::Impl final {
     void Input(AnnotationInputBatch&& batch) {
         std::scoped_lock lock(mutex_);
         if (state_.busy) throw contracts::InvalidIntentError("Annotation command barrier is unsettled");
-        RequireReady();
+        RequireInputReady();
         if (terminal_barrier_) throw contracts::UnavailableError("Annotation input is resetting");
         if (batch.epoch == 0U || batch.epoch != input_epoch_ || batch.document_epoch != state_.input_document_epoch || batch.sequence == 0U || batch.sequence != admitted_sequence_ + 1U || batch.samples.empty())
             throw contracts::InvalidIntentError("Annotation input epoch or sequence is invalid");
@@ -153,74 +169,32 @@ class AnnotationSystem::Impl final {
         auto slot = std::ranges::find(input_slots_, false, &InputSlot::occupied);
         if (slot == input_slots_.end()) throw contracts::InvalidIntentError("Annotation input exceeded its two consumption credits");
         slot->batch = std::move(batch);
-        const auto extent = state_.frame.extent;
-        auto* storage = &*slot;
-        if (!worker_.SubmitOrdered([this, storage, extent](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                         std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-                AnnotationOperationResult result;
-                std::inplace_vector<std::string, kAnnotationInputBatchCapacity> rejections;
-                for (const auto& pointer : storage->batch.samples) {
-                    result = annotation_algorithm(runtime).Pointer(pointer);
-                    if (result.outcome == AnnotationOperationOutcome::Rejected)
-                        rejections.push_back(std::move(result.detail));
-                }
-                SystemEventSink<AnnotationInputProgress> progress;
-                AnnotationInputProgress consumed;
-                {
-                    std::scoped_lock consumed_lock(mutex_);
-                    consumed = {storage->batch.epoch, storage->batch.sequence};
-                    storage->occupied = false;
-                    if (consumed.epoch == input_epoch_) { consumed_sequence_ = consumed.consumed_sequence; progress = input_progress_; }
-                }
-                // CPU consumption releases admission independently of graphics work.
-                if (progress) progress(consumed);
-                const auto input = runtime.BorrowInput();
-                if (!input.valid()) throw contracts::UnavailableError("Annotation source storage is unavailable");
-                runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
-                    annotation_algorithm(runtime).Render(input.plane(0U).plane(), clean, semantic, stream);
-                });
-                const auto frame = Frame(runtime, extent);
-                return [this, ui = std::move(result.ui), frame, rejections = std::move(rejections)]() mutable {
-                    InstallInteraction(std::move(ui), frame);
-                    for (auto& rejection : rejections) Rejected(std::move(rejection), false, std::nullopt, frame);
-                };
-            })) {
-            storage->occupied = false;
+        slot->occupied = true;
+        if (!worker_.NotifyOrderedDrain()) {
+            slot->occupied = false;
             throw contracts::UnavailableError("Annotation input worker is unavailable");
         }
-        storage->occupied = true;
-        admitted_sequence_ = storage->batch.sequence;
+        admitted_sequence_ = slot->batch.sequence;
     }
 
     void PeerClosed() noexcept {
-        VisualExtent extent;
         {
             std::scoped_lock lock(mutex_);
             if (terminal_barrier_ || !state_.ready || !state_.frame.valid() || !state_.ui.valid()) return;
             terminal_barrier_ = true;
-            extent = state_.frame.extent;
         }
-        if (worker_.SubmitTerminalBarrier([this, extent](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                         std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        if (worker_.SubmitTerminalBarrier([this](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                         const std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
+                require_annotation_ui(annotation_algorithm(runtime).Ui());
                 annotation_algorithm(runtime).PeerClosed();
-                const auto input = runtime.BorrowInput();
-                if (!input.valid()) throw contracts::UnavailableError("Annotation source storage is unavailable");
-                const auto source = input.plane(0U).plane();
-                runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
-                    annotation_algorithm(runtime).Render(source, clean, semantic, stream);
-                });
-                const auto frame = Frame(runtime, extent);
-                return [this, frame] {
-                    AnnotationSnapshot changed;
+                render_pending_ = true;
+                RenderPending(runtime, stop, true);
+                return [this] {
                     {
                         std::scoped_lock lock(mutex_);
                         terminal_barrier_ = false;
-                        state_.frame = frame;
-                        AdvanceRevision();
-                        changed = state_;
                     }
                     InputReady();
-                    Publish(AnnotationChanged{std::move(changed)});
                 };
             }))
             return;
@@ -256,6 +230,9 @@ class AnnotationSystem::Impl final {
                     [this, request = std::move(request)](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                          const std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
                         if (stop.stop_requested()) return [this] { Cancelled(); };
+                        require_annotation_ui(annotation_algorithm(runtime).Ui());
+                        RenderPending(runtime, stop, true);
+                        if (stop.stop_requested()) return [this] { Cancelled(); };
                         auto result = annotation_algorithm(runtime).Save(request.destination);
                         return CompleteOperation(std::move(result));
                     },
@@ -279,6 +256,7 @@ class AnnotationSystem::Impl final {
             if (state_.busy && !state_.cancellation_requested) {
                 state_.cancellation_requested = true;
                 AdvanceRevision();
+                state_.ui_revision = state_.revision;
                 accepted = true;
             }
         }
@@ -293,6 +271,10 @@ class AnnotationSystem::Impl final {
         std::scoped_lock lock(mutex_);
         return state_;
     }
+    [[nodiscard]] VisualSourceObservation ObserveSource() const {
+        std::scoped_lock lock(mutex_);
+        return visual_source::Observe(state_);
+    }
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
         VisualFrame committed;
         {
@@ -304,8 +286,95 @@ class AnnotationSystem::Impl final {
     }
 
    private:
+    [[nodiscard]] detail::VisualRuntimeOwner::Notification DrainInput(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                                     const std::stop_token stop) {
+        std::inplace_vector<InputSlot*, kAnnotationInputAdmissionSlots> frontier;
+        {
+            std::scoped_lock lock(mutex_);
+            for (auto& slot : input_slots_) if (slot.occupied) frontier.push_back(&slot);
+            std::ranges::sort(frontier, {}, [](const auto* slot) { return slot->batch.sequence; });
+        }
+        auto& algorithm = annotation_algorithm(runtime);
+        std::inplace_vector<std::string, kAnnotationInputBatchCapacity * kAnnotationInputAdmissionSlots> rejections;
+        bool ui_changed = false;
+        for (auto* storage : frontier) {
+            for (const auto& pointer : storage->batch.samples) {
+                auto result = algorithm.Pointer(pointer);
+                ui_changed = ui_changed || result.ui_changed;
+                if (result.outcome == AnnotationOperationOutcome::Rejected) rejections.push_back(std::move(result.detail));
+            }
+            SystemEventSink<AnnotationInputProgress> progress;
+            AnnotationInputProgress consumed;
+            {
+                std::scoped_lock lock(mutex_);
+                consumed = {storage->batch.epoch, storage->batch.sequence};
+                storage->occupied = false;
+                if (consumed.epoch == input_epoch_) {
+                    consumed_sequence_ = consumed.consumed_sequence;
+                    progress = input_progress_;
+                }
+            }
+            // Return exact CPU credits before any GPU publication or wait.
+            if (progress) progress(consumed);
+        }
+        if (ui_changed) {
+            const auto& ui = algorithm.Ui();
+            require_annotation_ui(ui);
+            pending_ui_ = ui;
+        }
+        render_pending_ = render_pending_ || !frontier.empty();
+        RenderPending(runtime, stop, false);
+        for (auto& rejection : rejections) Rejected(std::move(rejection), false, std::nullopt);
+        return {};
+    }
+    void RenderPending(mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token stop, const bool wait) {
+        if (!render_pending_) {
+            worker_.SetOutputRetry(false);
+            return;
+        }
+        VisualExtent extent;
+        {
+            std::scoped_lock lock(mutex_);
+            extent = state_.frame.extent;
+        }
+        // Retain the baseline across a failed try: releasing it generates an availability
+        // notification, which must not turn capacity pressure into a self-waking loop.
+        if (!pending_baseline_.valid()) pending_baseline_ = runtime.Completed();
+        // Arm before observing writability: a receiver release racing the try
+        // either makes reservation succeed or leaves a coalesced retry pending.
+        worker_.SetOutputRetry(!wait);
+        auto output = wait
+            ? runtime.AcquireOutput(stop, std::move(pending_baseline_), mmltk::frameworks::gpu::ImagePlanePreservation::Clean)
+            : runtime.TryAcquireOutput(pending_baseline_, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
+        if (!output.valid()) {
+            if (wait && stop.stop_requested()) {
+                bool cancelled_command = false;
+                {
+                    std::scoped_lock lock(mutex_);
+                    cancelled_command = state_.busy && state_.cancellation_requested && !terminal_barrier_;
+                }
+                if (cancelled_command) {
+                    // Re-arm first, then request one retry to cover a receiver
+                    // release during the disarmed blocking wait. An unsuccessful
+                    // continuation retains its baseline and waits for availability.
+                    worker_.SetOutputRetry(true);
+                    static_cast<void>(worker_.NotifyContinuation());
+                }
+            }
+            return;
+        }
+        worker_.SetOutputRetry(false);
+        runtime.Publish(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
+            annotation_algorithm(runtime).Render({}, clean, semantic, stream);
+        });
+        runtime.CommitOutput(std::move(output));
+        render_pending_ = false;
+        InstallInteraction(std::move(pending_ui_), Frame(runtime, extent));
+        pending_ui_.reset();
+    }
     [[nodiscard]] detail::VisualRuntimeOwner::Notification CompleteOperation(AnnotationOperationResult result,
                                                                              const VisualFrame frame = {}) {
+        require_annotation_ui(result.ui);
         return [this, result = std::move(result), frame]() mutable {
             if (result.outcome == AnnotationOperationOutcome::Rejected) {
                 Rejected(std::move(result.detail), true, std::move(result.ui));
@@ -331,15 +400,20 @@ class AnnotationSystem::Impl final {
                     [this, operation = std::move(operation), diagnostic, extent](
                         mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                         const std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
+                        require_annotation_ui(annotation_algorithm(runtime).Ui());
+                        RenderPending(runtime, stop, true);
                         const auto input = runtime.BorrowInput();
                         if (!input.valid()) throw contracts::UnavailableError("Annotation source storage is unavailable");
-                        const auto source = input.plane(0U).plane();
                         if (stop.stop_requested()) return [this] { Cancelled(); };
+                        auto output = runtime.AcquireOutput(stop, runtime.Completed(), mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
+                        if (!output.valid()) return [this] { Cancelled(); };
                         auto result = operation(annotation_algorithm(runtime));
+                        require_annotation_ui(result.ui);
                         if (result.outcome == AnnotationOperationOutcome::Rejected) return CompleteOperation(std::move(result));
-                        runtime.Publish(extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
-                            annotation_algorithm(runtime).Render(source, clean, semantic, stream);
+                        runtime.Publish(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
+                            annotation_algorithm(runtime).Render({}, clean, semantic, stream);
                         });
+                        runtime.CommitOutput(std::move(output));
                         diagnostics_.Emit([&] {
                             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
                                                         .operation = diagnostic,
@@ -359,14 +433,20 @@ class AnnotationSystem::Impl final {
     }
 
     [[nodiscard]] VisualFrame Frame(const mmltk::frameworks::gpu::SystemImageRuntime& runtime, const VisualExtent extent) const {
-        return visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
+        auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
+        frame.clean_revision = clean_revision_;
+        return frame;
     }
     void RequireIdle() const {
         if (state_.busy) throw contracts::BusyError("Annotation is busy");
     }
     void RequireReady() const {
+        RequireInputReady();
+        require_annotation_ui(state_.ui);
+    }
+    void RequireInputReady() const {
         RequireIdle();
-        if (!state_.ready || !state_.frame.valid() || !state_.ui.valid())
+        if (!state_.ready || !state_.frame.valid())
             throw contracts::UnavailableError("Annotation document is unavailable");
     }
     void Admit() {
@@ -374,6 +454,7 @@ class AnnotationSystem::Impl final {
         state_.cancellation_requested = false;
         // CLEANUP-IGNORE: Annotation advances its own snapshot revision when admission changes observable facts.
         AdvanceRevision();
+        state_.ui_revision = state_.revision;
     }
     void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
     template <class Install>
@@ -385,21 +466,28 @@ class AnnotationSystem::Impl final {
             state_.busy = false;
             state_.cancellation_requested = false;
             AdvanceRevision();
+            state_.ui_revision = state_.revision;
             settled = state_;
         }
         Publish(AnnotationChanged{std::move(settled)});
     }
-    void InstallInteraction(contracts::AnnotationUiState ui, const VisualFrame frame) noexcept {
-        AnnotationSnapshot changed;
+    void InstallInteraction(std::optional<contracts::AnnotationUiState> ui, const VisualFrame frame) noexcept {
+        std::optional<AnnotationSnapshot> changed;
+        AnnotationFrameState rendered;
         {
             std::scoped_lock lock(mutex_);
-            if (ui.document_revision < state_.ui.document_revision) return;
-            state_.ui = std::move(ui);
+            if (ui && ui->document_revision < state_.ui.document_revision) return;
             state_.frame = frame;
             AdvanceRevision();
-            changed = state_;
+            if (ui) {
+                state_.ui = std::move(*ui);
+                state_.ui_revision = state_.revision;
+                changed = state_;
+            }
+            rendered = {state_.revision, state_.ui_revision, frame};
         }
-        Publish(AnnotationChanged{std::move(changed)});
+        if (changed) Publish(AnnotationChanged{std::move(*changed)});
+        Publish(AnnotationFrameChanged{rendered});
     }
     void Cancelled() noexcept {
         Settled([](auto&) {});
@@ -416,11 +504,15 @@ class AnnotationSystem::Impl final {
             if (ui) state_.ui = std::move(*ui);
             if (frame.valid()) state_.frame = frame;
             AdvanceRevision();
+            state_.ui_revision = state_.revision;
             failed = state_;
         }
         Publish(AnnotationFailed{std::move(failed), std::move(detail)});
     }
     void Failed(const std::exception_ptr failure) noexcept {
+        worker_.SetOutputRetry(false);
+        pending_baseline_ = {};
+        render_pending_ = false;
         auto detail = visual_failure_detail(failure, "Annotation GPU worker failed");
         AnnotationSnapshot failed;
         SystemEventSink<AnnotationInputProgress> progress;
@@ -433,6 +525,8 @@ class AnnotationSystem::Impl final {
                 progress = input_progress_;
                 rejected = {input_epoch_, consumed_sequence_, detail};
             }
+            if (pending_ui_) state_.ui = std::move(*pending_ui_);
+            pending_ui_.reset();
             state_.ready = false;
             state_.frame = {};
             state_.busy = false;
@@ -443,6 +537,7 @@ class AnnotationSystem::Impl final {
             // CLEANUP-IGNORE: Annotation owns this state transition; common noexcept event publication is already
             // shared.
             AdvanceRevision();
+            state_.ui_revision = state_.revision;
             failed = state_;
         }
         report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Annotation, settings_.device, detail);
@@ -460,16 +555,16 @@ class AnnotationSystem::Impl final {
     VisualDiagnosticSink diagnostics_{};
     mutable std::mutex mutex_;
     AnnotationSnapshot state_;
-    struct InputSlot final {
-        AnnotationInputBatch batch;
-        bool occupied = false;
-    };
     std::array<InputSlot, kAnnotationInputAdmissionSlots> input_slots_{};
     std::uint64_t input_epoch_ = 0U;
     std::uint64_t admitted_sequence_ = 0U;
     std::uint64_t consumed_sequence_ = 0U;
     SystemEventSink<AnnotationInputProgress> input_progress_;
     bool terminal_barrier_ = false;
+    std::optional<contracts::AnnotationUiState> pending_ui_;
+    mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput pending_baseline_;
+    bool render_pending_ = false;
+    std::uint64_t clean_revision_ = 0U;
     detail::VisualRuntimeOwner worker_;
 };
 
@@ -489,6 +584,7 @@ void AnnotationSystem::PeerClosed() noexcept { impl_->PeerClosed(); }
 void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
+VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 
 }  // namespace mmltk::controller

@@ -3,28 +3,88 @@ use super::UiError;
 #[derive(Debug, Clone, Default)]
 pub struct AnnotationModel {
     pub snapshot: Option<crate::generated::AnnotationSnapshot>,
+    pending_frame: Option<crate::generated::AnnotationFrameState>,
 }
 
 impl AnnotationModel {
     pub(super) fn install_snapshot(
         &mut self,
-        incoming: crate::generated::AnnotationSnapshot,
+        mut incoming: crate::generated::AnnotationSnapshot,
     ) -> Result<Observation, UiError> {
-        match self.snapshot.as_ref() {
-            Some(installed) if incoming.revision < installed.revision => Ok(Observation::Stale),
-            Some(installed)
-                if incoming.revision == installed.revision && incoming != *installed =>
+        if incoming.uirevision > incoming.revision {
+            return Err(UiError::protocol("invalid Annotation full-state UI revision"));
+        }
+        if self.snapshot.as_ref().is_some_and(|installed| installed.revision == incoming.revision && *installed != incoming) {
+            return Err(UiError::protocol("inconsistent Annotation snapshot revision"));
+        }
+        let mut keep_pending = false;
+        if let Some(frame) = self.pending_frame.as_ref() {
+            if frame.revision == incoming.revision
+                && (frame.uirevision != incoming.uirevision || frame.frame != incoming.frame)
             {
-                Err(UiError::protocol(
-                    "inconsistent Annotation snapshot revision",
-                ))
+                return Err(UiError::protocol("inconsistent Annotation frame and full-state revision"));
             }
-            Some(installed) if incoming == *installed => Ok(Observation::Current),
-            _ => {
-                self.snapshot = Some(incoming);
-                Ok(Observation::Installed)
+            if frame.revision > incoming.revision {
+                if frame.uirevision == incoming.uirevision {
+                    incoming.frame = frame.frame.clone();
+                    incoming.revision = frame.revision;
+                } else {
+                    keep_pending = frame.uirevision > incoming.uirevision;
+                }
             }
         }
+        let observation = match self.snapshot.as_ref() {
+            Some(installed) if incoming.revision < installed.revision => return Ok(Observation::Stale),
+            Some(installed) if incoming.revision == installed.revision && incoming != *installed => {
+                return Err(UiError::protocol("inconsistent Annotation snapshot revision"));
+            }
+            Some(installed) if incoming == *installed => Observation::Current,
+            _ => {
+                self.snapshot = Some(incoming);
+                Observation::Installed
+            }
+        };
+        if !keep_pending { self.pending_frame = None; }
+        Ok(observation)
+    }
+
+    fn install_frame(
+        &mut self,
+        incoming: crate::generated::AnnotationFrameState,
+    ) -> Result<Observation, UiError> {
+        if incoming.uirevision > incoming.revision {
+            return Err(UiError::protocol("invalid Annotation frame UI revision"));
+        }
+        if let Some(pending) = self.pending_frame.as_ref() {
+            if pending.revision == incoming.revision && *pending != incoming {
+                return Err(UiError::protocol("inconsistent pending Annotation frame revision"));
+            }
+        }
+        if let Some(installed) = self.snapshot.as_mut() {
+            if incoming.revision == installed.revision {
+                return if incoming.uirevision == installed.uirevision && incoming.frame == installed.frame {
+                    Ok(Observation::Current)
+                } else {
+                    Err(UiError::protocol("inconsistent Annotation frame revision"))
+                };
+            }
+            if incoming.revision < installed.revision || incoming.uirevision < installed.uirevision {
+                return Ok(Observation::Stale);
+            }
+            if incoming.uirevision == installed.uirevision {
+                if self.pending_frame.as_ref().is_some_and(|pending| pending.revision <= incoming.revision) {
+                    self.pending_frame = None;
+                }
+                installed.revision = incoming.revision;
+                installed.frame = incoming.frame;
+                return Ok(Observation::Installed);
+            }
+        }
+        if self.pending_frame.as_ref().is_some_and(|pending| pending.revision > incoming.revision) {
+            return Ok(Observation::Stale);
+        }
+        self.pending_frame = Some(incoming);
+        Ok(Observation::Current)
     }
 }
 
@@ -39,32 +99,33 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
     }
 
     fn project_annotation_event(&mut self, event: ApplicationEvent) {
-        match event {
+        let observation = match event {
             ApplicationEvent::AnnotationAnnotationChanged(value) => {
-                match self.annotation.install_snapshot(value.snapshot) {
-                    Err(error) => self.error = Some(error),
-                    Ok(Observation::Installed) => {
-                        if self.presentation_model.foreground()
-                            == Some(crate::generated::PresentationSourceKind::Annotation)
-                        {
-                            self.set_foreground_visual(Some(
-                                crate::generated::PresentationSourceKind::Annotation,
-                            ));
-                        }
-                    }
-                    Ok(Observation::Current | Observation::Stale) => {}
-                }
+                self.annotation.install_snapshot(value.snapshot)
+            }
+            ApplicationEvent::AnnotationAnnotationFrameChanged(value) => {
+                self.annotation.install_frame(value.snapshot)
             }
             ApplicationEvent::AnnotationAnnotationFailed(value) => {
                 match self.annotation.install_snapshot(value.snapshot) {
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Stale) => {}
-                    Ok(Observation::Installed | Observation::Current) => {
-                        self.failed(value.detail);
-                    }
+                    Ok(Observation::Installed | Observation::Current) => self.failed(value.detail),
                 }
+                return;
             }
             _ => unreachable!("generated Annotation dispatch supplied another system event"),
+        };
+        match observation {
+            Err(error) => self.error = Some(error),
+            Ok(Observation::Installed) => {
+                if self.presentation_model.foreground()
+                    == Some(crate::generated::PresentationSourceKind::Annotation)
+                {
+                    self.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Annotation));
+                }
+            }
+            Ok(Observation::Current | Observation::Stale) => {}
         }
     }
 

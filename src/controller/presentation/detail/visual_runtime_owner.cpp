@@ -18,6 +18,12 @@ namespace mmltk::controller::detail {
 
 using mmltk::frameworks::gpu::combine_image_failures;
 
+struct VisualRuntimeOwner::OutputWake final {
+    std::mutex mutex;
+    VisualRuntimeOwner* owner = nullptr;
+    bool retry_armed = false;
+};
+
 VisualRuntimeOwner::VisualRuntimeOwner(RuntimeFactory factory, FailureSink failures, ActivityObservation activity)
     : factory_(std::move(factory)),
       failures_(std::move(failures)),
@@ -27,6 +33,11 @@ VisualRuntimeOwner::VisualRuntimeOwner(RuntimeFactory factory, FailureSink failu
     if (!factory_) throw std::invalid_argument("visual runtime factory is unavailable");
 }
 VisualRuntimeOwner::~VisualRuntimeOwner() {
+    if (output_wake_) {
+        std::scoped_lock lock(output_wake_->mutex);
+        output_wake_->retry_armed = false;
+        output_wake_->owner = nullptr;
+    }
     StopAndWait();
     RetainedRuntime retained;
     {
@@ -73,6 +84,25 @@ bool VisualRuntimeOwner::SubmitOrdered(Work work) {
     worker_.Wake();
     return true;
 }
+void VisualRuntimeOwner::RegisterOrderedDrain(Work work) {
+    if (!work) throw std::invalid_argument("visual ordered drain is empty");
+    std::scoped_lock lock(mutex_);
+    if (ordered_drain_ || stopping_) throw std::logic_error("visual ordered drain registration is unavailable");
+    drain_stop_ = std::stop_source{};
+    ordered_drain_ = std::move(work);
+}
+bool VisualRuntimeOwner::NotifyOrderedDrain() {
+    {
+        std::scoped_lock lock(mutex_);
+        if (!ordered_drain_ || stopping_ || runtime_retirement_blocked_ || terminal_barrier_active_) return false;
+        if (drain_queued_) return true;
+        FlushLatest();
+        ordered_.push_back(ScheduledWork{.stop = drain_stop_, .ordered_drain = true});
+        drain_queued_ = true;
+    }
+    worker_.Wake();
+    return true;
+}
 void VisualRuntimeOwner::FlushLatest() {
     if (!latest_) return;
     ordered_.push_back(ScheduledWork{
@@ -112,11 +142,16 @@ bool VisualRuntimeOwner::SubmitLatest(Work work) {
     worker_.Wake();
     return true;
 }
-void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched) {
+void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available) {
     if (!work) throw std::invalid_argument("visual continuation work is empty");
     std::scoped_lock lock(mutex_);
-    if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_)
+    if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ ||
+        (wake_on_output_available && runtime_))
         throw std::logic_error("visual continuation registration is unavailable");
+    if (wake_on_output_available) {
+        output_wake_ = std::make_shared<OutputWake>();
+        output_wake_->owner = this;
+    }
     continuation_ = std::move(work);
     continuation_dispatched_ = std::move(dispatched);
     continuation_state_.store(kContinuationEnabled, std::memory_order_release);
@@ -127,12 +162,19 @@ bool VisualRuntimeOwner::NotifyContinuation() noexcept {
     if ((state & kContinuationPending) == 0U) worker_.Wake();
     return true;
 }
+void VisualRuntimeOwner::SetOutputRetry(const bool armed) noexcept {
+    if (!output_wake_) return;
+    std::scoped_lock lock(output_wake_->mutex);
+    output_wake_->retry_armed = armed && (continuation_state_.load(std::memory_order_acquire) & kContinuationEnabled) != 0U;
+    if (!output_wake_->retry_armed)
+        continuation_state_.fetch_and(static_cast<std::uint8_t>(~kOutputRetryPending), std::memory_order_acq_rel);
+}
 bool VisualRuntimeOwner::RequestActiveStop() noexcept {
     std::stop_source stop{std::nostopstate};
     Notification cancellation;
     {
         std::scoped_lock lock(mutex_);
-        if (active_outcome_ == ActiveOutcome::Running) {
+        if (!active_preserves_input_ && active_outcome_ == ActiveOutcome::Running) {
             active_outcome_ = ActiveOutcome::Cancelled;
             stop = active_stop_;
         }
@@ -163,6 +205,7 @@ void VisualRuntimeOwner::RequestStop() noexcept {
         if (stopping_) return;
         stopping_ = true;
         ordered_.clear();
+        drain_queued_ = false;
         latest_.reset();
         continuation_state_.store(0U, std::memory_order_release);
         runtime_retirement_blocked_ = true;
@@ -173,6 +216,7 @@ void VisualRuntimeOwner::RequestStop() noexcept {
             stop = active_stop_;
         }
     }
+    SetOutputRetry(false);
     static_cast<void>(stop.request_stop());
     Observe(ActivityStage::StopRequested);
     worker_.RequestStop();
@@ -224,6 +268,16 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         if (replacement_active_) RestorePolicy();
         auto created = factory_(product_revision_sequence_);
         if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
+        if (output_wake_) created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
+            if (const auto gate = wake.lock()) {
+                std::scoped_lock lock(gate->mutex);
+                if (gate->owner && gate->retry_armed) {
+                    const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
+                    if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
+                        gate->owner->worker_.Wake();
+                }
+            }
+        });
         {
             std::scoped_lock lock(mutex_);
             if (!stopping_ && !stopped()) destination = std::move(created);
@@ -261,13 +315,15 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         if (!ordered_.empty()) {
             ordered_work.emplace(std::move(ordered_.front()));
             ordered_.pop_front();
+            if (ordered_work->ordered_drain) drain_queued_ = false;
             discrete = ordered_work->discrete;
             terminal_barrier = ordered_work->terminal_barrier;
         } else if (latest_) {
             latest_work = std::move(latest_);
             latest_.reset();
-        } else if ((continuation_state_.fetch_and(static_cast<std::uint8_t>(~kContinuationPending), std::memory_order_acq_rel) &
-                    (kContinuationEnabled | kContinuationPending)) == (kContinuationEnabled | kContinuationPending)) {
+        } else if (const auto pending = continuation_state_.fetch_and(
+                       static_cast<std::uint8_t>(~(kContinuationPending | kOutputRetryPending)), std::memory_order_acq_rel);
+                   (pending & kContinuationEnabled) != 0U && (pending & (kContinuationPending | kOutputRetryPending)) != 0U) {
             continuation_work = true;
         } else {
             return;
@@ -275,6 +331,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_stop_ = ordered_work ? ordered_work->stop : std::stop_source{};
         active_outcome_ = ActiveOutcome::Running;
         active_discrete_ = discrete;
+        active_preserves_input_ = (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
+                                  (continuation_work && output_wake_);
         operation_stop = active_stop_.get_token();
     }
     Observe(ActivityStage::WorkSelected, ordered_work ? 1U : (latest_work ? 2U : (continuation_work ? 3U : 0U)));
@@ -311,7 +369,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         } else {
             if (auto* runtime = RuntimeForWork(worker_stop, operation_stop);
                 runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
-                notification = ordered_work->run(*runtime, operation_stop);
+                notification = ordered_work->ordered_drain ? ordered_drain_(*runtime, operation_stop)
+                                                           : ordered_work->run(*runtime, operation_stop);
             else
                 notification = std::move(ordered_work->cancellation);
         }
@@ -337,8 +396,9 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         }
         active_stop_ = std::stop_source{std::nostopstate};
         active_discrete_ = false;
-        wake_again =
-            !ordered_.empty() || latest_.has_value() || (continuation_state_.load(std::memory_order_acquire) & kContinuationPending) != 0U;
+        active_preserves_input_ = false;
+        wake_again = !ordered_.empty() || latest_.has_value() ||
+                     (continuation_state_.load(std::memory_order_acquire) & (kContinuationPending | kOutputRetryPending)) != 0U;
     }
     NotifyReaders();
     Observe(ActivityStage::CycleFinalized, wake_again ? 1U : 0U);
@@ -355,6 +415,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     Observe(ActivityStage::CycleExited);
 }
 void VisualRuntimeOwner::Failed(const std::exception_ptr failure) noexcept {
+    SetOutputRetry(false);
     auto construction_custody = Runtime::UnsafeConstruction(failure);
     auto reported = construction_custody ? construction_custody->failure() : failure;
     std::unique_ptr<Runtime> retired;
@@ -369,15 +430,18 @@ void VisualRuntimeOwner::Failed(const std::exception_ptr failure) noexcept {
 }
 
 void VisualRuntimeOwner::ReportFailure(std::exception_ptr failure) noexcept {
+    SetOutputRetry(false);
     {
         std::scoped_lock lock(mutex_);
         ordered_.clear();
+        drain_queued_ = false;
         latest_.reset();
         continuation_state_.store(0U, std::memory_order_release);
         discrete_active_ = false;
         terminal_barrier_active_ = false;
         active_stop_ = std::stop_source{std::nostopstate};
         active_discrete_ = false;
+        active_preserves_input_ = false;
         runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
         if (continuation_ && !runtime_retirement_blocked_) continuation_state_.store(kContinuationEnabled, std::memory_order_release);
     }

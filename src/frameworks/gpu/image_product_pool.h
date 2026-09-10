@@ -87,6 +87,9 @@ class ImageProductPool final {
     // one-slot pool. Multi-slot candidates retain their exact baseline.
     // Clean preservation requires the publication callback to replace semantics.
     [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {}, ImagePlanePreservation = ImagePlanePreservation::All);
+    // Transfer the baseline only on success. A failed try retains custody without
+    // emitting a spurious availability notification from a temporary Product.
+    [[nodiscard]] Candidate TryAcquire(Product& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
@@ -101,6 +104,7 @@ class ImageProductPool final {
     [[nodiscard]] std::size_t size() const noexcept;
 
    private:
+    void ValidateBaseline(const Product&) const;
     std::shared_ptr<Admission> admission_;
     std::vector<std::shared_ptr<Slot>> slots_;
 };

@@ -4,6 +4,7 @@
 #include <string_view>
 #include <utility>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <span>
 #include <string>
@@ -53,6 +54,7 @@ TEST_CASE("Annotation private document owns pointer history and peer cancellatio
     editor.PeerClosed();
     pointer.interaction_id = 2U;
     const auto pointer_revision = editor.ui().interaction_revision;
+    const auto pointer_ui = editor.ui();
     REQUIRE(editor.Pointer(pointer).outcome == document::DocumentOutcome::Applied);
     CHECK(editor.ui().interaction_revision == pointer_revision);
     pointer.phase = contracts::AnnotationPointerPhase::Update;
@@ -60,6 +62,7 @@ TEST_CASE("Annotation private document owns pointer history and peer cancellatio
     pointer.point = {12.0F, 14.0F};
     REQUIRE(editor.Pointer(pointer).outcome == document::DocumentOutcome::Applied);
     CHECK(editor.ui().interaction_revision == pointer_revision);
+    CHECK(editor.ui() == pointer_ui);
     pointer.phase = contracts::AnnotationPointerPhase::End;
     pointer.sequence = 3U;
     pointer.point = {20.0F, 24.0F};
@@ -70,6 +73,10 @@ TEST_CASE("Annotation private document owns pointer history and peer cancellatio
     CHECK(editor.ui().scene.objects.empty());
     REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
     CHECK(editor.ui().scene.objects.size() == 1U);
+    auto reopened = editor.ui().scene;
+    REQUIRE(editor.Open(std::move(reopened)).outcome == document::DocumentOutcome::Applied);
+    CHECK_FALSE(editor.ui().tool_capabilities.empty());
+    CHECK(editor.ui().valid());
 }
 
 TEST_CASE("Annotation private document enforces the canonical fixed text policy") {
@@ -223,6 +230,20 @@ TEST_CASE("Annotation import capacity failure leaves the open editable document 
                   .present = true}});
     CHECK(editor.Open(std::move(excessive)).outcome != document::DocumentOutcome::Applied);
     CHECK(editor.ui() == kept);
+    // Inject malformed current facts through the existing read-only observation
+    // solely to verify mutation and persistence boundaries reject them unchanged.
+    auto& malformed = const_cast<contracts::AnnotationUiState&>(editor.ui());
+    malformed.editor.selected_object = 0U;
+    const auto invalid = malformed;
+    CHECK(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("refused")}}).outcome == document::DocumentOutcome::Rejected);
+    mmltk::testsupport::ScopedTempDir directory{"annotation-invalid-current"};
+    const auto destination = directory.path() / "invalid.cbor";
+    CHECK(editor.Save(destination.string()).outcome == document::DocumentOutcome::Rejected);
+    CHECK_FALSE(std::filesystem::exists(destination));
+    CHECK(editor.ui() == invalid);
+    malformed = kept;
+    CHECK(editor.ui() == kept);
+
 }
 
 TEST_CASE("The native maximum object scene fits the bounded editable snapshot and persistence policy") {

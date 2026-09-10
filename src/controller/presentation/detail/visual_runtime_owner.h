@@ -58,10 +58,14 @@ class VisualRuntimeOwner final {
     VisualRuntimeOwner& operator=(const VisualRuntimeOwner&) = delete;
     [[nodiscard]] bool SubmitDiscrete(Work, Notification cancellation = {}, bool reconstruct = false);
     [[nodiscard]] bool SubmitOrdered(Work);
+    void RegisterOrderedDrain(Work);
+    [[nodiscard]] bool NotifyOrderedDrain();
     [[nodiscard]] bool SubmitTerminalBarrier(Work);
     bool SubmitLatest(Work);
-    void RegisterContinuation(Work, DispatchObservation = {});
+    void RegisterContinuation(Work, DispatchObservation = {}, bool wake_on_output_available = false);
     [[nodiscard]] bool NotifyContinuation() noexcept;
+    // Arm before testing output writability; disarm clears only availability retries.
+    void SetOutputRetry(bool armed) noexcept;
     bool RequestActiveStop() noexcept;
     void RequestStop() noexcept;
     void StopAndWait() noexcept;
@@ -75,6 +79,7 @@ class VisualRuntimeOwner final {
         Notification cancellation;
         DispatchObservation dispatched;
         std::stop_source stop;
+        bool ordered_drain = false;
         bool discrete = false;
         bool terminal_barrier = false;
         bool reconstruct = false;
@@ -103,16 +108,22 @@ class VisualRuntimeOwner final {
     void Observe(ActivityStage, std::uint64_t value = 0U) const noexcept;
     [[nodiscard]] Runtime* RuntimeForWork(std::stop_token worker_stop, std::stop_token operation_stop);
 
+    struct OutputWake;
+    std::shared_ptr<OutputWake> output_wake_;
     RuntimeFactory factory_;
     FailureSink failures_;
     ActivityObservation activity_;
     mutable std::mutex mutex_;
     std::deque<ScheduledWork> ordered_;
     std::optional<Work> latest_;
+    Work ordered_drain_;
+    std::stop_source drain_stop_{std::nostopstate};
+    bool drain_queued_ = false;
     Work continuation_;
     DispatchObservation continuation_dispatched_;
     static constexpr std::uint8_t kContinuationEnabled = 1U;
     static constexpr std::uint8_t kContinuationPending = 2U;
+    static constexpr std::uint8_t kOutputRetryPending = 4U;
     std::atomic<std::uint8_t> continuation_state_{0U};
     std::unique_ptr<Runtime> runtime_;
     std::unique_ptr<Runtime> replacement_;
@@ -126,6 +137,7 @@ class VisualRuntimeOwner final {
     ActiveOutcome active_outcome_ = ActiveOutcome::Running;
     bool discrete_active_ = false;
     bool active_discrete_ = false;
+    bool active_preserves_input_ = false;
     bool terminal_barrier_active_ = false;
     bool runtime_retirement_blocked_ = false;
     bool stopping_ = false;

@@ -53,8 +53,8 @@ struct PointerFacts final {
     domain::AnnotationPoint origin{};
     domain::AnnotationPoint latest{};
     std::uint64_t sequence = 0U;
-    std::optional<domain::AnnotationObject> brush{};
-    std::optional<domain::AnnotationObject> preview{};
+    bool brush = false;
+    bool preview = false;
 };
 struct JournalEntry final {
     struct Facts final {};
@@ -89,6 +89,9 @@ struct JournalEntry final {
 struct DocumentState final {
     domain::AnnotationUiState ui{};
     PointerFacts pointer{};
+    domain::AnnotationObject brush;
+    domain::AnnotationObject preview;
+    MaskScratch mask_scratch;
     std::deque<JournalEntry> undo{};
     std::deque<JournalEntry> redo{};
     std::string_view rejection = "The action requires a compatible selected object or handle";
@@ -102,7 +105,10 @@ struct DocumentState final {
 
 [[nodiscard]] DocumentOutcome capacity(const DocumentState&) { return DocumentOutcome::Capacity; }
 
-[[nodiscard]] bool current(const DocumentState& state) { return state.ui.valid() && state.ui.scene.document.valid(); }
+// Open validates the imported scene; journal admission validates each committed mutation.
+// Pointer previews never mutate this established document invariant.
+[[nodiscard]] bool pointer_ready(const DocumentState& state) { return state.ui.scene.document.valid(); }
+[[nodiscard]] bool current(const DocumentState& state) { return pointer_ready(state) && state.ui.valid(); }
 
 [[nodiscard]] bool next_revision_available(const DocumentState& state) {
     return state.ui.document_revision != std::numeric_limits<std::uint64_t>::max() &&
@@ -333,6 +339,7 @@ void mark_edited(DocumentState& state) {
 }
 
 [[nodiscard]] DocumentOutcome commit(DocumentState& state, JournalEntry entry) {
+    if (!current(state)) return refused(state);
     if (!entry_forward_valid(state, entry)) return refused(state);
     if (!entry_changes(entry)) return DocumentOutcome::Applied;
     if (!next_revision_available(state)) return refused(state);
@@ -546,7 +553,7 @@ void set_spline_handle(domain::AnnotationSplineKnot& knot, domain::AnnotationHan
     opposite = {.point = {knot.point.x + dx * scale, knot.point.y + dy * scale}, .enabled = true};
 }
 void drag_object(domain::AnnotationObject& object, const domain::AnnotationPointerTarget& target, const domain::AnnotationPoint origin,
-                 const domain::AnnotationPoint point, const AnnotationSceneContent& scene) {
+                 const domain::AnnotationPoint point, const AnnotationSceneContent& scene, MaskScratch& scratch) {
     const auto original_box = object.box;
     if (target.role == domain::AnnotationHandleRole::BoxCorner) {
         const auto corner = *target.element;
@@ -578,23 +585,26 @@ void drag_object(domain::AnnotationObject& object, const domain::AnnotationPoint
         object.box.first.y += dy;
         object.box.second.y += dy;
     }
-    if (object.shape == domain::AnnotationShape::Mask) transform_mask(object, original_box, object.box);
+    if (object.shape == domain::AnnotationShape::Mask) transform_mask(object, original_box, object.box, scratch);
 }
 void update_drag_preview(DocumentState& state, const domain::AnnotationPoint point) {
     auto& pointer = state.pointer;
     if (pointer.action == AnnotationPointerAction::BoxDrag && !pointer.target.object && !state.ui.scene.categories.empty() &&
         state.ui.scene.objects.size() < domain::kAnnotationObjectCapacity) {
-        domain::AnnotationObject object;
+        auto& object = state.preview;
+        const domain::AnnotationObject empty;
+        object = empty;
         object.name = domain::AnnotationText::From("box");
         object.shape = domain::AnnotationShape::Box;
         object.category = state.ui.editor.selected_category.value_or(0U);
         object.box = box_between(pointer.origin, point);
-        pointer.preview = std::move(object);
+        pointer.preview = true;
     } else if ((pointer.action == AnnotationPointerAction::Select || pointer.action == AnnotationPointerAction::HandleDrag) &&
                pointer.target.object) {
-        auto object = state.ui.scene.objects[*pointer.target.object];
-        drag_object(object, pointer.target, pointer.origin, point, state.ui.scene);
-        pointer.preview = std::move(object);
+        auto& object = state.preview;
+        object = state.ui.scene.objects[*pointer.target.object];
+        drag_object(object, pointer.target, pointer.origin, point, state.ui.scene, state.mask_scratch);
+        pointer.preview = true;
     }
 }
 }  // namespace
@@ -610,7 +620,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         }
         return refused(state, reason);
     };
-    if (!current(state)) return refused(state, "Open an image before editing");
+    if (!pointer_ready(state)) return refused(state, "Open an image before editing");
     if (!request.valid() || !mmltk::frameworks::reflection::enum_contains(request.phase) ||
         !mmltk::frameworks::reflection::enum_contains(tool) || request.interaction_id == 0U || request.sequence == 0U ||
         !point_in_frame(state.ui.scene, request.point) || !target_valid(state.ui.scene, state.ui.editor, request.target) ||
@@ -640,7 +650,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 state.pointer = {};
                 return capacity(state);
             }
-            domain::AnnotationObject brush;
+            auto& brush = state.brush;
             if (request.target.object)
                 brush = state.ui.scene.objects[*request.target.object];
             else {
@@ -648,6 +658,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                     state.pointer = {};
                     return refused(state);
                 }
+                const domain::AnnotationObject empty;
+                brush = empty;
                 brush.name = domain::AnnotationText::From("mask");
                 brush.shape = domain::AnnotationShape::Mask;
                 brush.category = after.selected_category.value_or(0U);
@@ -657,8 +669,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 return refused(state);
             }
             stroke_mask(brush, request.point, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
-                        tool == domain::AnnotationTool::MaskErase);
-            state.pointer.brush = std::move(brush);
+                        tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+            state.pointer.brush = true;
         }
         update_drag_preview(state, request.point);
         return DocumentOutcome::Applied;
@@ -668,8 +680,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             return refuse_pointer("Gesture identity, target or sequence does not match the active gesture");
         }
         if (state.pointer.brush)
-            stroke_mask(*state.pointer.brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
-                        state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase);
+            stroke_mask(state.brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
+                        state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
         update_drag_preview(state, request.point);
         state.pointer.latest = request.point;
         state.pointer.sequence = request.sequence;
@@ -689,10 +701,10 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     after.tool = tool;
     const auto origin = state.pointer.origin;
     const auto target = state.pointer.target;
-    auto brush = std::move(state.pointer.brush);
+    auto* brush = state.pointer.brush ? &state.brush : nullptr;
     if (brush)
         stroke_mask(*brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
-                    tool == domain::AnnotationTool::MaskErase);
+                    tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
     state.pointer = {};
     const auto& scene = state.ui.scene;
     switch (action) {
@@ -700,7 +712,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             if (target.object && request.point != origin) {
                 const auto& existing = scene.objects[*target.object];
                 auto object = existing;
-                drag_object(object, target, origin, request.point, scene);
+                drag_object(object, target, origin, request.point, scene, state.mask_scratch);
                 after.selected_object = target.object;
                 return commit(state, object_entry(before, after, *target.object, true, existing, true, object));
             }
@@ -728,7 +740,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             if (existing.shape != domain::AnnotationShape::Box && existing.shape != domain::AnnotationShape::Mask) return refuse_pointer();
             auto object = existing;
             object.box = box_between(origin, request.point);
-            if (object.shape == domain::AnnotationShape::Mask) transform_mask(object, existing.box, object.box);
+            if (object.shape == domain::AnnotationShape::Mask) transform_mask(object, existing.box, object.box, state.mask_scratch);
             after.selected_object = *target.object;
             return commit(state, object_entry(before, after, *target.object, true, existing, true, object));
         }
@@ -773,7 +785,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 case AnnotationPointerAction::Brush:
                     if (object.shape != domain::AnnotationShape::Mask) return refuse_pointer();
                     if (!brush) return refuse_pointer();
-                    object = std::move(*brush);
+                    object = *brush;
                     break;
                 case AnnotationPointerAction::Fill:
                     if (object.shape != domain::AnnotationShape::Mask) return refuse_pointer();
@@ -1065,7 +1077,9 @@ class AnnotationDocument::Impl final {
         for (auto& object : content.objects)
             if (object.shape == domain::AnnotationShape::Mask) normalize_mask(object);
         if (content.palette.empty()) content.palette = domain::annotation_class_palette(content.categories.size());
-        return Result(reduce_open(state_, std::move(content)), "open");
+        const auto outcome = reduce_open(state_, std::move(content));
+        if (outcome == DocumentOutcome::Applied) capabilities_revision_ = 0U;
+        return Result(outcome, "open");
     }
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer& pointer) {
         if (diagnostics_enabled_) {
@@ -1085,6 +1099,7 @@ class AnnotationDocument::Impl final {
     }
     void PeerClosed() noexcept { state_.pointer = {}; }
     [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit& edit) {
+        if (!current(state_)) return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document state is invalid"};
         state_.pointer = {};
         std::string_view operation;
         const auto result = std::visit(
@@ -1133,6 +1148,7 @@ class AnnotationDocument::Impl final {
         return Result(result, operation);
     }
     [[nodiscard]] DocumentResult Save(const std::string_view destination) {
+        if (!current(state_)) return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document state is invalid"};
         const auto effect = save_annotation_document(state_.ui, destination, next_save_generation_++);
         if (effect == DocumentSaveEffect::NotApplied) {
             state_.ui.save_status = domain::AnnotationSaveStatus::Failed;
@@ -1152,7 +1168,7 @@ class AnnotationDocument::Impl final {
                ((state_.pointer.brush || state_.pointer.preview) && !state_.pointer.target.object ? 1U : 0U);
     }
     [[nodiscard]] const domain::AnnotationObject& RenderObjectAt(std::size_t index) const {
-        const auto& preview = state_.pointer.brush ? state_.pointer.brush : state_.pointer.preview;
+        const auto* preview = state_.pointer.brush ? &state_.brush : state_.pointer.preview ? &state_.preview : nullptr;
         if (preview && index == state_.pointer.target.object.value_or(static_cast<std::uint16_t>(state_.ui.scene.objects.size())))
             return *preview;
         return state_.ui.scene.objects.at(index);
@@ -1160,13 +1176,16 @@ class AnnotationDocument::Impl final {
 
    private:
     [[nodiscard]] DocumentResult Result(const DocumentOutcome result, const std::string_view operation) {
-        state_.ui.tool_capabilities.clear();
-        if (state_.ui.scene.document.valid()) {
-            if (!tool_applicable(state_.ui.scene, state_.ui.editor.tool, state_.ui.editor.selected_object, false))
-                state_.ui.editor.tool = domain::AnnotationTool::Select;
-            for (const auto entry : mmltk::frameworks::reflection::enum_entries<domain::AnnotationTool>())
-                state_.ui.tool_capabilities.push_back(
-                    {entry.value, tool_applicable(state_.ui.scene, entry.value, state_.ui.editor.selected_object, false)});
+        if (capabilities_revision_ != state_.ui.scene_revision) {
+            state_.ui.tool_capabilities.clear();
+            if (state_.ui.scene.document.valid()) {
+                if (!tool_applicable(state_.ui.scene, state_.ui.editor.tool, state_.ui.editor.selected_object, false))
+                    state_.ui.editor.tool = domain::AnnotationTool::Select;
+                for (const auto entry : mmltk::frameworks::reflection::enum_entries<domain::AnnotationTool>())
+                    state_.ui.tool_capabilities.push_back(
+                        {entry.value, tool_applicable(state_.ui.scene, entry.value, state_.ui.editor.selected_object, false)});
+            }
+            capabilities_revision_ = state_.ui.scene_revision;
         }
         state_.ui.can_undo = !state_.undo.empty();
         state_.ui.can_redo = !state_.redo.empty();
@@ -1191,6 +1210,7 @@ class AnnotationDocument::Impl final {
     const bool diagnostics_enabled_ = annotation_diagnostics_enabled();
     DocumentState state_;
     std::uint64_t next_save_generation_ = 1U;
+    std::uint64_t capabilities_revision_ = 0U;
 };
 
 AnnotationDocument::AnnotationDocument() : impl_(std::make_unique<Impl>()) {}

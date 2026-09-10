@@ -22,8 +22,8 @@ void normalize(Runs& runs) {
     runs.resize(count);
     if (count > c::kAnnotationMaskRunCapacity) throw std::length_error("Mask run capacity exceeded");
 }
-void subtract(Runs& runs, const Runs& removed) {
-    Runs result;
+void subtract(Runs& runs, const Runs& removed, Runs& result) {
+    result.clear();
     result.reserve(runs.size());
     std::size_t next = 0;
     for (auto run : runs) {
@@ -39,7 +39,7 @@ void subtract(Runs& runs, const Runs& removed) {
         }
         if (first <= run.last) result.push_back({run.row, static_cast<std::uint16_t>(first), run.last});
     }
-    runs = std::move(result);
+    runs.swap(result);
 }
 Runs complement(const Runs& runs, std::uint16_t width, std::uint16_t height) {
     Runs result;
@@ -121,8 +121,9 @@ void normalize_mask(c::AnnotationObject& object) {
                   {static_cast<float>(last) + 1, static_cast<float>(object.mask.runs.back().row) + 1}};
 }
 void stroke_mask(c::AnnotationObject& object, c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width,
-                 std::uint16_t height, bool erase) {
-    Runs stroke;
+                 std::uint16_t height, bool erase, MaskScratch& scratch) {
+    auto& stroke = scratch.stroke;
+    stroke.clear();
     const float dx = to.x - from.x, dy = to.y - from.y;
     const auto steps = static_cast<unsigned>(std::ceil(std::max(std::abs(dx), std::abs(dy))));
     for (unsigned step = 0; step <= steps; ++step) {
@@ -144,12 +145,12 @@ void stroke_mask(c::AnnotationObject& object, c::AnnotationPoint from, c::Annota
     normalize(stroke);
     normalize(object.mask.runs);
     if (erase)
-        subtract(object.mask.runs, stroke);
+        subtract(object.mask.runs, stroke, scratch.result);
     else
         object.mask.runs.insert(object.mask.runs.end(), stroke.begin(), stroke.end());
     normalize_mask(object);
 }
-void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::AnnotationBox to) {
+void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::AnnotationBox to, MaskScratch& scratch) {
     if (to.first.x >= to.second.x || to.first.y >= to.second.y) {
         object.mask.runs.clear();
         normalize_mask(object);
@@ -165,7 +166,8 @@ void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::Annot
         return std::pair{static_cast<int>(std::floor(target + (first - source) * scale)),
                          static_cast<int>(std::ceil(target + (last + 1 - source) * scale)) - 1};
     };
-    Runs transformed;
+    auto& transformed = scratch.result;
+    transformed.clear();
     for (auto run : object.mask.runs) {
         const auto [first, last] = map_interval(run.first, run.last, from.first.x, to.first.x, sx);
         const auto [top, bottom] = map_interval(run.row, run.row, from.first.y, to.first.y, sy);
@@ -173,7 +175,7 @@ void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::Annot
             transformed.push_back({static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
         if (transformed.size() > c::kAnnotationMaskRunCapacity * 2) normalize(transformed);
     }
-    object.mask.runs = std::move(transformed);
+    object.mask.runs.swap(transformed);
     normalize_mask(object);
 }
 void fill_mask(c::AnnotationObject& object, c::AnnotationPoint point, std::uint16_t width, std::uint16_t height) {

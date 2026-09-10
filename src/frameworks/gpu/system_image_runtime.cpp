@@ -196,6 +196,9 @@ SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std:
                                                                       ImagePlanePreservation preservation) {
     return ActiveState().output->Acquire(stop, std::move(baseline), preservation);
 }
+SystemImageRuntime::OutputCandidate SystemImageRuntime::TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation preservation) {
+    return ActiveState().output->TryAcquire(baseline, preservation);
+}
 void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
                                  ImageProductBuffer::ProductSubmit submit) {
     auto& state = ActiveState();

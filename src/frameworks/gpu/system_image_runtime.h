@@ -75,6 +75,7 @@ class SystemImageRuntime final {
     [[nodiscard]] ImageStorageFootprint OutputStorageFootprint() const;
     [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {},
                                                 ImagePlanePreservation = ImagePlanePreservation::All);
+    [[nodiscard]] OutputCandidate TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
     void SelectOutput(const CompletedOutput&);

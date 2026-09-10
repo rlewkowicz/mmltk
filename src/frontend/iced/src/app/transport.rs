@@ -189,7 +189,7 @@ impl App {
             system,
             crate::generated::ApplicationSystem::Explore
                 | crate::generated::ApplicationSystem::Annotation
-        );
+        ) && !matches!(&event.event, crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(_));
         let reconcile_explore = system == crate::generated::ApplicationSystem::Explore;
         let explore_failed = Self::explore_event_failed(&event.event);
         let _ = self.model.reduce_event(event.event);

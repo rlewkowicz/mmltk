@@ -1092,7 +1092,7 @@ struct ApplicationEventDescriptor final {
     static_assert(
         delivery != contracts::reflection::EventDelivery::LatestState || requires(const Event& event) {
             { event.snapshot.revision } -> std::same_as<const std::uint64_t&>;
-        }, "LatestState requires the canonical complete snapshot revision");
+        }, "LatestState requires the canonical state snapshot revision");
     static constexpr auto system_id = identity::system_id;
     static constexpr auto event_id = identity::event_id;
     [[nodiscard]] static constexpr std::uint64_t StateRevision(const Event& event) noexcept {

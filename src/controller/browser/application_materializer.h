@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstddef>
+#include <concepts>
 #include <expected>
 #include <functional>
 #include <iterator>
@@ -195,7 +196,12 @@ template <class Composition>
         if (system == nullptr) throw std::logic_error("visual source is unavailable during application construction");
         readers[index++] = {
             .source = {Projection::kind, 1U},
-            .observe = [system] { return Projection::Observe(std::invoke(&[:Snapshot:], *system)); },
+            .observe = [system] {
+                if constexpr (requires { { system->ObserveSource() } -> std::same_as<VisualSourceObservation>; })
+                    return system->ObserveSource();
+                else
+                    return Projection::Observe(std::invoke(&[:Snapshot:], *system));
+            },
             .borrow = [system] { return system->BorrowFrame(); },
         };
     });

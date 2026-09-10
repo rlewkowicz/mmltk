@@ -127,20 +127,29 @@ struct AnnotationOperationResult final {
     AnnotationOperationOutcome outcome = AnnotationOperationOutcome::Rejected;
 };
 
+struct AnnotationPointerResult final {
+    std::string detail;
+    AnnotationOperationOutcome outcome = AnnotationOperationOutcome::Rejected;
+    bool ui_changed = false;
+};
+
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     ~AnnotationAlgorithm() override = default;
     [[nodiscard]] virtual AnnotationOperationResult Open(mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
                                                          VisualRegion) = 0;
-    [[nodiscard]] virtual AnnotationOperationResult Pointer(const AnnotationPointer&) = 0;
+    [[nodiscard]] virtual AnnotationPointerResult Pointer(const AnnotationPointer&) = 0;
+    [[nodiscard]] virtual const contracts::AnnotationUiState& Ui() const noexcept = 0;
     virtual void PeerClosed() noexcept = 0;
     [[nodiscard]] virtual AnnotationOperationResult Edit(const AnnotationEdit&) = 0;
     [[nodiscard]] virtual AnnotationOperationResult Save(std::string_view destination) = 0;
+    // A missing source preserves the initialized clean plane; semantics are replaced completely.
     virtual void Render(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
                         mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
 };
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
+    std::uint64_t ui_revision = 0U;
     std::uint64_t input_document_epoch = 0U;
     bool busy = false;
     bool cancellation_requested = false;
@@ -153,6 +162,16 @@ struct AnnotationSnapshot final {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationChanged final {
     AnnotationSnapshot snapshot{};
 };
+// A frame may advance without changing UI. The matching full-state identity also
+// orders command admission/settlement when socket records arrive in either order.
+struct AnnotationFrameState final {
+    std::uint64_t revision = 0U;
+    std::uint64_t ui_revision = 0U;
+    VisualFrame frame{};
+};
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationFrameChanged final {
+    AnnotationFrameState snapshot{};
+};
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] AnnotationFailed final {
     AnnotationSnapshot snapshot{};
     // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
@@ -164,7 +183,7 @@ class AnnotationSystem final {
     using visual_source = VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
                                                  mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
                                                  mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>>;
-    using event_type = std::variant<AnnotationChanged, AnnotationFailed>;
+    using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
     AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                      VisualDiagnosticSink = {});
     ~AnnotationSystem();
@@ -180,6 +199,7 @@ class AnnotationSystem final {
     void Shutdown() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
+    [[nodiscard]] VisualSourceObservation ObserveSource() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
 
    private:
@@ -217,6 +237,8 @@ MMLTK_REFLECT_FIELDS(AnnotationEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEditRequest)
 MMLTK_REFLECT_FIELDS(AnnotationSnapshot)
 MMLTK_REFLECT_FIELDS(AnnotationChanged)
+MMLTK_REFLECT_FIELDS(AnnotationFrameState)
+MMLTK_REFLECT_FIELDS(AnnotationFrameChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFailed)
 
 }  // namespace mmltk::controller

@@ -1186,12 +1186,14 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
                                      std::shared_ptr<MutationCommitProbe> mutation = {},
                                      std::shared_ptr<std::promise<void>> peer_closed = {},
                                      std::shared_ptr<MutationCommitProbe> pointer_gate = {},
-                                     std::shared_ptr<std::atomic_bool> pointer_failure = {})
+                                     std::shared_ptr<std::atomic_bool> pointer_failure = {},
+                                     std::shared_ptr<std::atomic_bool> invalid_ui = {},
+                                     std::function<void()> ui_observed = {})
         : document_revision_(std::move(document_revision)),
           order_(std::move(order)),
           save_applied_(std::move(save_applied)),
           mutation_(std::move(mutation)),
-          peer_closed_(std::move(peer_closed)), pointer_gate_(std::move(pointer_gate)), pointer_failure_(std::move(pointer_failure)) {}
+          peer_closed_(std::move(peer_closed)), pointer_gate_(std::move(pointer_gate)), pointer_failure_(std::move(pointer_failure)), invalid_ui_(std::move(invalid_ui)), ui_observed_(std::move(ui_observed)) {}
     AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
                                    VisualRegion) override {
         state_.scene.document = contracts::WorkspaceResource::From("direct://test-annotation", 1U);
@@ -1205,7 +1207,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         state_.scene.document.revision = 1U;
         return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
     }
-    AnnotationOperationResult Pointer(const AnnotationPointer& pointer) override {
+    AnnotationPointerResult Pointer(const AnnotationPointer& pointer) override {
         if (pointer_failure_ && pointer_failure_->exchange(false, std::memory_order_acq_rel))
             throw std::runtime_error("deterministic pointer reduction failure");
         ++state_.document_revision;
@@ -1215,7 +1217,11 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         document_revision_->store(pointer.sequence, std::memory_order_release);
         if (order_) order_->push_back(pointer.sequence);
         if (pointer_gate_ && pointer.sequence == 1U) { pointer_gate_->committed.set_value(); pointer_gate_->released.wait(); }
-        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
+        return {.detail = {}, .outcome = AnnotationOperationOutcome::Applied, .ui_changed = true};
+    }
+    const contracts::AnnotationUiState& Ui() const noexcept override {
+        if (ui_observed_) ui_observed_();
+        return invalid_ui_ && invalid_ui_->load(std::memory_order_acquire) ? invalid_state_ : state_;
     }
     void PeerClosed() noexcept override {
         if (order_) order_->push_back(200U);
@@ -1240,7 +1246,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
 
     void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
                 const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
-        mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
+        if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
         Fill(semantic, 0xa5U);
     }
 
@@ -1252,6 +1258,9 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
     std::shared_ptr<std::promise<void>> peer_closed_;
     std::shared_ptr<MutationCommitProbe> pointer_gate_;
     std::shared_ptr<std::atomic_bool> pointer_failure_;
+    std::shared_ptr<std::atomic_bool> invalid_ui_;
+    std::function<void()> ui_observed_;
+    const contracts::AnnotationUiState invalid_state_{.document_revision = 1U};
     contracts::AnnotationUiState state_;
 };
 
@@ -1263,7 +1272,8 @@ class CancellableAnnotationAlgorithm final : public AnnotationAlgorithm {
         static_cast<void>(source);
         return {.ui = {}, .detail = "deterministic refusal", .outcome = AnnotationOperationOutcome::Rejected};
     }
-    AnnotationOperationResult Pointer(const AnnotationPointer&) override { return {}; }
+    AnnotationPointerResult Pointer(const AnnotationPointer&) override { return {}; }
+    const contracts::AnnotationUiState& Ui() const noexcept override { return state_; }
     void PeerClosed() noexcept override {}
     AnnotationOperationResult Edit(const AnnotationEdit&) override { return {}; }
     AnnotationOperationResult Save(std::string_view) override { return {}; }
@@ -1274,6 +1284,7 @@ class CancellableAnnotationAlgorithm final : public AnnotationAlgorithm {
     }
 
    private:
+    contracts::AnnotationUiState state_;
     std::shared_ptr<CancellationProbe> probe_;
 };
 
@@ -3153,6 +3164,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(diagnostics.last_system.load(std::memory_order_acquire) == contracts::DiagnosticOwner::Explore);
 
     EventGate annotation_events;
+    std::atomic_uint64_t ui_observations{0U}, credit_records{0U}, frame_records{0U};
     auto document_revision = std::make_shared<std::atomic<std::uint64_t>>(0U);
     auto annotation_order = std::make_shared<std::vector<std::uint64_t>>();
     auto save_applied = std::make_shared<std::atomic_bool>(false);
@@ -3161,13 +3173,17 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     auto pointer_entered = pointer_gate->committed.get_future();
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [document_revision, annotation_order, save_applied, pointer_gate] {
+                                               [document_revision, annotation_order, save_applied, pointer_gate, &ui_observations, &annotation_events] {
                                                    return std::make_unique<TestAnnotationAlgorithm>(document_revision, annotation_order,
-                                                                                                    save_applied, nullptr, nullptr, pointer_gate);
+                                                                                                    save_applied, nullptr, nullptr, pointer_gate, nullptr, nullptr, [&ui_observations, &annotation_events] {
+                                                                                                        ui_observations.fetch_add(1U, std::memory_order_release);
+                                                                                                        annotation_events.Advance();
+                                                                                                    });
                                                }),
-                                borrow_exactly_from(explore), [&annotation_events, save_failures](AnnotationSystem::event_type event) {
+                                borrow_exactly_from(explore), [&annotation_events, &frame_records, save_failures](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event))
                                         save_failures->fetch_add(1U, std::memory_order_acq_rel);
+                                    if (std::holds_alternative<AnnotationFrameChanged>(event)) frame_records.fetch_add(1U, std::memory_order_release);
                                     annotation_events.Advance();
                                 }};
     CHECK_FALSE(annotation.BorrowFrame().valid());
@@ -3181,7 +3197,10 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(annotation.snapshot().revision > annotation_admitted.revision);
     std::atomic_uint64_t consumed{0U};
     annotation.SetInputPeer(7U, [&](AnnotationInputProgress progress) {
-        if (progress.epoch == 7U) consumed.store(progress.consumed_sequence, std::memory_order_release);
+        if (progress.epoch == 7U) {
+            if (progress.consumed_sequence != 0U) credit_records.fetch_add(1U, std::memory_order_release);
+            consumed.store(progress.consumed_sequence, std::memory_order_release);
+        }
         annotation_events.Advance();
     });
     const auto input_document = annotation.snapshot().input_document_epoch;
@@ -3198,6 +3217,9 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                     {.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .target = {.object = 0U}, .point = {7.0F, 8.0F}}}};
     const auto release_pointer = [](MutationCommitProbe* gate) noexcept { try { gate->release.set_value(); } catch (...) {} };
     const std::unique_ptr<MutationCommitProbe, decltype(release_pointer)> release_on_exit{pointer_gate.get(), release_pointer};
+    const auto initial_annotation_frame = annotation.snapshot().frame;
+    auto retained_annotation_frame = annotation.BorrowFrame();
+    REQUIRE(retained_annotation_frame.valid());
     annotation.Input(first);
     REQUIRE(pointer_entered.wait_for(2s) == std::future_status::ready);
     AnnotationInputBatch second{.epoch = 7U, .document_epoch = input_document, .sequence = 2U,
@@ -3209,6 +3231,31 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK_THROWS_AS(annotation.Input(first), contracts::InvalidIntentError);
     pointer_gate->release.set_value();
     REQUIRE(annotation_events.Wait([&] { return consumed.load(std::memory_order_acquire) == 2U; }));
+    // Both batches are consumed while a receiver still owns the output. Releasing
+    // that exact borrow renders the newest accumulated state once.
+    CHECK(annotation.snapshot().frame == initial_annotation_frame);
+    REQUIRE(annotation_events.Wait([&] { return ui_observations.load(std::memory_order_acquire) == 2U; }));
+    static_cast<void>(annotation.Save({.destination = "/test/cancelled-before-save.json"}));
+    // The third algorithm observation is inside the active Save worker, after
+    // its entry stop check and before its unconditional blocking boundary flush.
+    REQUIRE(annotation_events.Wait([&] { return ui_observations.load(std::memory_order_acquire) == 3U; }));
+    static_cast<void>(annotation.Stop());
+    REQUIRE(annotation_events.Wait([&] { return !annotation.snapshot().busy; }));
+    CHECK(save_failures->load(std::memory_order_acquire) == 0U);
+    CHECK(annotation.snapshot().frame == initial_annotation_frame);
+    CHECK(consumed.load(std::memory_order_acquire) == 2U);
+    CHECK(credit_records.load(std::memory_order_acquire) == 2U);
+    retained_annotation_frame = {};
+    REQUIRE(annotation_events.Wait([&] {
+        return annotation.snapshot().frame.revision > initial_annotation_frame.revision && frame_records.load(std::memory_order_acquire) == 1U;
+    }));
+    CHECK(annotation.snapshot().frame.revision == initial_annotation_frame.revision + 1U);
+    CHECK(annotation.snapshot().frame.clean_revision == initial_annotation_frame.clean_revision);
+    CHECK(annotation.ObserveSource().frame == annotation.snapshot().frame);
+    CHECK(annotation.snapshot().ui.document_revision == 4U);
+    CHECK(annotation.snapshot().ui_revision == annotation.snapshot().revision);
+    CHECK(frame_records.load(std::memory_order_acquire) == 1U);
+    CHECK(credit_records.load(std::memory_order_acquire) == 2U);
     static_cast<void>(annotation.Edit({
         .edit = {.value = AnnotationUndoEdit{}},
     }));
@@ -4461,10 +4508,11 @@ TEST_CASE("Annotation open rejection after receiver copy retires the aggregate")
 
     auto revision = std::make_shared<std::atomic_uint64_t>(0U);
     auto pointer_failure = std::make_shared<std::atomic_bool>(true);
+    auto invalid_ui = std::make_shared<std::atomic_bool>(false);
     std::atomic_uint64_t failures{0U};
     AnnotationSystem input_owner{kDevice,
         RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-            [revision, pointer_failure] { return std::make_unique<TestAnnotationAlgorithm>(revision, nullptr, nullptr, nullptr, nullptr, nullptr, pointer_failure); }),
+            [revision, pointer_failure, invalid_ui] { return std::make_unique<TestAnnotationAlgorithm>(revision, nullptr, nullptr, nullptr, nullptr, nullptr, pointer_failure, invalid_ui); }),
         borrow_exactly_from(explore), [&](AnnotationSystem::event_type event) {
             if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U, std::memory_order_release);
             events.Advance();
@@ -4482,6 +4530,20 @@ TEST_CASE("Annotation open rejection after receiver copy retires the aggregate")
     static_cast<void>(input_owner.Open({.source = explore.snapshot().frame}));
     REQUIRE(events.Wait([&] { return input_owner.snapshot().ready; }));
     CHECK(input_owner.BorrowFrame().valid());
+    for (const bool save : {false, true}) {
+        const auto committed_ui = input_owner.snapshot().ui;
+        const auto prior_failures = failures.load(std::memory_order_acquire);
+        invalid_ui->store(true, std::memory_order_release);
+        if (save) static_cast<void>(input_owner.Save({.destination = "/test/invalid.cbor"}));
+        else static_cast<void>(input_owner.Edit({.edit = {.value = AnnotationUndoEdit{}}}));
+        REQUIRE(events.Wait([&] { return failures.load(std::memory_order_acquire) > prior_failures; }));
+        CHECK(input_owner.snapshot().ui == committed_ui);
+        CHECK_FALSE(input_owner.snapshot().ready);
+        invalid_ui->store(false, std::memory_order_release);
+        static_cast<void>(input_owner.Open({.source = explore.snapshot().frame}));
+        REQUIRE(events.Wait([&] { return input_owner.snapshot().ready; }));
+    }
+
 }
 
 TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {
@@ -6856,6 +6918,66 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     REQUIRE(completed.get_future().wait_for(2s) == std::future_status::ready);
     owner.StopAndWait();
     CHECK(values == std::vector<int>{1, 3, 4});
+
+    EventGate retry_events;
+    std::atomic_uint32_t retry_calls{0U}, cycles{0U};
+    std::atomic_uint64_t wake_again{0U};
+    std::atomic_bool reserved{false}, failed_try{false};
+    mmltk::frameworks::gpu::BorrowedImageProductReadView held;
+    mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+    detail::VisualRuntimeOwner retry_owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+        [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t value) noexcept {
+            if (stage == detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) {
+                wake_again.store(value, std::memory_order_release);
+                cycles.fetch_add(1U, std::memory_order_release);
+                retry_events.Advance();
+            }
+        }};
+    retry_owner.RegisterContinuation([&](auto& runtime, std::stop_token) {
+        auto output = runtime.TryAcquireOutput(baseline);
+        if (output.valid()) {
+            retry_owner.SetOutputRetry(false);
+            reserved.store(true, std::memory_order_release);
+        }
+        retry_calls.fetch_add(1U, std::memory_order_release);
+        retry_events.Advance();
+        return detail::VisualRuntimeOwner::Notification{};
+    }, {}, true);
+    REQUIRE(retry_owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(8U, 8U, [](auto, auto, auto) {});
+        held = retry_owner.Borrow();
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 1U; }));
+    CHECK(wake_again.load(std::memory_order_acquire) == 0U);
+    CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
+    REQUIRE(retry_owner.SubmitOrdered([&](auto&, std::stop_token) {
+        held = {};
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    REQUIRE(retry_events.Wait([&] { return cycles.load(std::memory_order_acquire) >= 2U; }));
+    CHECK(wake_again.load(std::memory_order_acquire) == 0U);
+    CHECK(retry_calls.load(std::memory_order_acquire) == 0U);
+    REQUIRE(retry_owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        held = retry_owner.Borrow();
+        baseline = runtime.Completed();
+        retry_owner.SetOutputRetry(true);
+        failed_try.store(!runtime.TryAcquireOutput(baseline).valid(), std::memory_order_release);
+        // Retained-product notifications happen before physical receiver release;
+        // several such signals must leave only one still-unsuccessful retry.
+        for (unsigned index = 0U; index != 2U; ++index) {
+            auto temporary = runtime.Completed();
+        }
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    REQUIRE(retry_events.Wait([&] { return retry_calls.load(std::memory_order_acquire) == 1U; }));
+    CHECK(failed_try.load(std::memory_order_acquire));
+    CHECK_FALSE(reserved.load(std::memory_order_acquire));
+    held = {};
+    REQUIRE(retry_events.Wait([&] { return reserved.load(std::memory_order_acquire); }));
+    retry_owner.StopAndWait();
+    CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
+
 }
 
 // CLEANUP-IGNORE: Borrow locking requires independent promises and runtime ownership from continuation draining.
