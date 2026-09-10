@@ -25,7 +25,7 @@ pub struct Interaction {
 pub trait Compact {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError>;
 }
-fn reserve(bytes: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), super::ProtocolError> {
+pub(crate) fn reserve(bytes: &mut Vec<u8>, additional: usize, limit: usize) -> Result<(), super::ProtocolError> {
     if bytes.len().checked_add(additional).is_none_or(|length| length > limit) {
         return Err(super::ProtocolError("compact encoding exceeds byte capacity".into()));
     }
@@ -77,12 +77,18 @@ impl<T: Compact> Compact for Option<T> {
         } }
     }
 }
-impl<T: Compact> Compact for Vec<T> {
+impl<T: Compact> Compact for [T] {
     fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
         compact_head(4, self.len() as u64, bytes)?;
         for item in self { item.compact(bytes)?; }
         Ok(())
     }
+}
+impl<T: Compact> Compact for Vec<T> {
+    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> { self.as_slice().compact(bytes) }
+}
+impl<T: Compact, const N: usize> Compact for [T; N] {
+    fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), super::ProtocolError> { self.as_slice().compact(bytes) }
 }
 pub fn compact_bytes(value: &impl Compact) -> Result<Vec<u8>, super::ProtocolError> {
     let mut bytes = Vec::new();
@@ -95,23 +101,5 @@ pub fn encode_compact_interaction(endpoint: u64, value: &impl Compact, scratch: 
     encode_interaction_bytes(endpoint, scratch, output)
 }
 pub fn encode_interaction_bytes(endpoint: u64, payload: &[u8], output: &mut Vec<u8>) -> Result<(), super::ProtocolError> {
-    use super::cbor::{head, encode_text_item};
-    if endpoint == 0 || payload.len() > crate::generated::MAX_INTENT_VALUE_BYTES {
-        return Err(super::ProtocolError("invalid compact interaction endpoint or byte capacity".into()));
-    }
-    output.clear();
-    reserve(output, payload.len().checked_add(96).ok_or_else(|| super::ProtocolError("compact envelope size overflow".into()))?, crate::generated::MAX_RECORD_WIRE_BYTES)?;
-    head(5, 2, output);
-    encode_text_item("kind", output);
-    encode_text_item("Interaction", output);
-    encode_text_item("payload", output);
-    head(5, 3, output);
-    encode_text_item("protocol_version", output);
-    head(0, crate::generated::BROWSER_PROTOCOL_VERSION, output);
-    encode_text_item("endpoint_id", output);
-    head(0, endpoint, output);
-    encode_text_item("value", output);
-    head(2, payload.len() as u64, output);
-    output.extend_from_slice(payload);
-    Ok(())
+    crate::generated::encode_interaction_record(crate::generated::BROWSER_PROTOCOL_VERSION, endpoint, payload, output)
 }

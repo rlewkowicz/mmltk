@@ -113,24 +113,14 @@ template <class Record>
 }  // namespace
 
 bool is_interaction_record(const std::span<const std::byte> bytes) noexcept {
-    constexpr std::string_view prefix = "\xa2\x64" "kind" "\x6b" "Interaction";
-    return bytes.size() >= prefix.size() && std::string_view(reinterpret_cast<const char*>(bytes.data()), prefix.size()) == prefix;
+    wire::Reader reader({.first = bytes}, decoding_limits({.first = bytes}));
+    return mmltk::frameworks::serialization::ReflectedVariantEnvelope<ClientRecord, Interaction>::Read(reader);
 }
 std::optional<InteractionView> decode_interaction_view(const std::span<const std::byte> bytes) {
-    wire::Reader reader({.first = bytes}, {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth});
-    auto outer = reader.begin_object_item(0U);
-    if (!outer || *outer != 2U || !reader.expect_text_item(1U, "kind") || !reader.expect_text_item(1U, "Interaction") ||
-        !reader.expect_text_item(1U, "payload")) return std::nullopt;
-    auto fields = reader.begin_object_item(1U);
-    if (!fields || *fields != 3U || !reader.expect_text_item(2U, "protocol_version")) return std::nullopt;
-    std::uint64_t version = 0U;
+    wire::Reader reader({.first = bytes}, decoding_limits({.first = bytes}));
     InteractionView result;
-    namespace compact = mmltk::frameworks::serialization;
-    if (!compact::decode_compact_item(version, reader, 2U) || version != kBrowserProtocolVersion || !reader.expect_text_item(2U, "endpoint_id") ||
-        !compact::decode_compact_item(result.endpoint_id, reader, 2U) || result.endpoint_id == 0U || !reader.expect_text_item(2U, "value")) return std::nullopt;
-    auto payload = reader.borrow_bytes_item(2U);
-    if (!payload || payload->size() > kMaxIntentValueBytes || !reader.finish()) return std::nullopt;
-    result.value = *payload;
+    if (!result.Decode<ClientRecord>(reader) || result.Get<&Interaction::protocol_version>() != kBrowserProtocolVersion ||
+        result.Get<&Interaction::endpoint_id>() == 0U) return std::nullopt;
     return result;
 }
 

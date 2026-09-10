@@ -2,6 +2,7 @@
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_materializer.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -91,7 +92,7 @@ int main(const int argument_count, char* const* const arguments) {
     auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
     if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
     bootstrap.input_epoch = 1U;
-    const std::array<ServerRecord, 6U> records{
+    const std::array<ServerRecord, 7U> records{
         std::move(bootstrap),
         IntentReply{
             .correlation = 17U,
@@ -112,7 +113,17 @@ int main(const int argument_count, char* const* const arguments) {
         InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U}},
         InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
+        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U,
+                                   .rejection = std::string(kVisualFailureByteCapacity, 'r')},
+                      .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
     };
+    bool complete_record_surface = true;
+    application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
+        complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {
+            return std::holds_alternative<Alternative>(record);
+        });
+    });
+    if (!complete_record_surface) return EXIT_FAILURE;
     std::ofstream output(arguments[1], std::ios::binary | std::ios::trunc);
     if (!output) return EXIT_FAILURE;
     for (const ServerRecord& record : records) {

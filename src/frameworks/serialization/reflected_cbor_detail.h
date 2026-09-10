@@ -48,6 +48,12 @@ class FixedCborEncoder;
 
 namespace detail {
 
+struct VariantEnvelope final {
+    static constexpr std::string_view kind_key = "kind";
+    static constexpr std::string_view payload_key = "payload";
+    static constexpr std::size_t field_count = 2U;
+};
+
 using mmltk::frameworks::reflection::materialized_field_policies;
 using mmltk::frameworks::reflection::OptionalValueT;
 using mmltk::frameworks::reflection::RemoveCvRef;
@@ -815,7 +821,7 @@ template <class T>
 template <class Variant>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_variant(const Variant& value) {
     wire::Value::Object object;
-    object.reserve(2U);
+    object.reserve(VariantEnvelope::field_count);
     std::optional<wire::EncodeError> failure;
     std::visit(
         [&object, &failure](const auto& alternative) {
@@ -823,11 +829,11 @@ template <class Variant>
             auto encoded = to_value(alternative);
             if (!encoded) {
                 failure = encoded.error();
-                prepend_path(*failure, "payload");
+                prepend_path(*failure, VariantEnvelope::payload_key);
                 return;
             }
-            object.emplace_back("kind", wire::Value(variant_name<Alternative>()));
-            object.emplace_back("payload", std::move(*encoded));
+            object.emplace_back(VariantEnvelope::kind_key, wire::Value(variant_name<Alternative>()));
+            object.emplace_back(VariantEnvelope::payload_key, std::move(*encoded));
         },
         value);
     if (failure) { return std::unexpected(std::move(*failure)); }
@@ -837,15 +843,15 @@ template <class Variant>
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_variant(const wire::Value& value) {
     const auto* object = std::get_if<wire::Value::Object>(&value.storage);
-    if (object == nullptr || object->size() != 2U || (*object)[0].first != "kind" || (*object)[1].first != "payload") {
+    if (object == nullptr || object->size() != VariantEnvelope::field_count || (*object)[0].first != VariantEnvelope::kind_key || (*object)[1].first != VariantEnvelope::payload_key) {
         auto error = decode_error(wire::ErrorCode::TypeMismatch);
-        prepend_path(error, "kind");
+        prepend_path(error, VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
     }
     const auto* kind = std::get_if<std::string>(&(*object)[0].second.storage);
     if (kind == nullptr) {
         auto error = decode_error(wire::ErrorCode::TypeMismatch);
-        prepend_path(error, "kind");
+        prepend_path(error, VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
     }
 
@@ -865,12 +871,12 @@ template <class Variant>
               : void()), ...);
     }(std::type_identity<Variant>{}, *kind, (*object)[1].second, decoded, failure);
     if (failure) {
-        prepend_path(*failure, "payload");
+        prepend_path(*failure, VariantEnvelope::payload_key);
         return std::unexpected(std::move(*failure));
     }
     if (!decoded) {
         auto error = decode_error(wire::ErrorCode::UnknownKey);
-        prepend_path(error, "kind");
+        prepend_path(error, VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
     }
     return std::move(*decoded);
@@ -1089,9 +1095,9 @@ template <class Variant, DynamicValueBound Mode>
         ((kind = cbor_maximum(kind, cbor_text_size(std::string_view(static_variant_name<Alternatives>()).size())),
           payload = cbor_maximum(payload, maximum_cbor_bytes<Alternatives, Mode>())),
          ...);
-        const std::size_t members = cbor_size_add(cbor_text_size(std::string_view("kind").size()), kind);
-        return cbor_size_add(cbor_size_add(wire::head_size(2U), members),
-                             cbor_size_add(cbor_text_size(std::string_view("payload").size()), payload));
+        const std::size_t members = cbor_size_add(cbor_text_size(std::string_view(VariantEnvelope::kind_key).size()), kind);
+        return cbor_size_add(cbor_size_add(wire::head_size(VariantEnvelope::field_count), members),
+                             cbor_size_add(cbor_text_size(std::string_view(VariantEnvelope::payload_key).size()), payload));
     }(std::type_identity<RemoveCvRef<Variant>>{});
 }
 
@@ -1273,7 +1279,7 @@ void append_decode_allocation_limits(DecodeAllocationLimits& limits, std::vector
 template <class Alternative, class... Active>
 void append_variant_allocation_limits(DecodeAllocationLimits& limits, std::vector<DecodePathSelector>& path) {
     DecodePathSelector selector;
-    selector.name = "payload";
+    selector.name = VariantEnvelope::payload_key;
     selector.object_kind = variant_name<Alternative>();
     path.push_back(std::move(selector));
     DecodeAllocationLimit discriminator_guard;
@@ -1641,13 +1647,13 @@ template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_projected_variant(wire::Reader& reader, const std::size_t depth) {
     auto member_count = reader.begin_object_item(depth);
     if (!member_count) { return std::unexpected(member_count.error()); }
-    if (*member_count != 2U) { return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)); }
+    if (*member_count != VariantEnvelope::field_count) { return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)); }
     auto kind_key = reader.read_object_key(depth + 1U);
     if (!kind_key) { return std::unexpected(kind_key.error()); }
-    if (*kind_key != "kind") {
+    if (*kind_key != VariantEnvelope::kind_key) {
         auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
         if (!error.path.empty()) { error.path.push_back('.'); }
-        error.path.append("kind");
+        error.path.append(VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
     }
 
@@ -1663,10 +1669,10 @@ template <class Variant>
 
     auto payload_key = reader.read_object_key(depth + 1U);
     if (!payload_key) { return std::unexpected(payload_key.error()); }
-    if (*payload_key != "payload") {
+    if (*payload_key != VariantEnvelope::payload_key) {
         auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
         if (!error.path.empty()) { error.path.push_back('.'); }
-        error.path.append("payload");
+        error.path.append(VariantEnvelope::payload_key);
         return std::unexpected(std::move(error));
     }
 
@@ -1690,7 +1696,7 @@ template <class Variant>
         }(std::type_identity<Variant>{}, kind, reader, depth, result, failure);
     }
     if (failure) { return std::unexpected(std::move(*failure)); }
-    if (!result) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::UnknownKey, "kind"));
+    if (!result) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::UnknownKey, VariantEnvelope::kind_key));
     return std::move(*result);
 }
 
@@ -1868,8 +1874,8 @@ template <class T>
         static_assert(kUniqueVariantAlternatives<U>, "Reflected CBOR variant alternatives require unique type identifiers.");
         return std::visit(
             [&writer](const auto& alternative) {
-                return writer.object(2U) && writer.text("kind") && writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
-                       writer.text("payload") && encode_fixed_projection(writer, alternative);
+                return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) && writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
+                       writer.text(VariantEnvelope::payload_key) && encode_fixed_projection(writer, alternative);
             },
             value);
     } else if constexpr (kIsArray<U> || kIsVector<U> || kIsSpan<U> || kIsInplaceVector<U>) {
@@ -1963,6 +1969,73 @@ template <class T>
 // Positional projection for schema-agreed interaction records. Scalars use the
 // canonical Reader/encoder; structure and validation derive from declarations.
 namespace compact_detail {
+enum class Shape { Unsupported, Scalar, Optional, Sequence, Enum, Object };
+
+template <class T>
+inline constexpr Shape shape = [] consteval {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (std::same_as<U, bool> || std::same_as<U, std::uint8_t> || std::same_as<U, std::uint16_t> ||
+                  std::same_as<U, std::uint32_t> || std::same_as<U, std::uint64_t> || std::same_as<U, std::int8_t> ||
+                  std::same_as<U, std::int16_t> || std::same_as<U, std::int32_t> || std::same_as<U, std::int64_t> ||
+                  (std::same_as<U, char> && std::is_signed_v<char>)) {
+        return Shape::Scalar;
+    } else if constexpr (std::same_as<U, float> || std::same_as<U, double>) {
+        return Shape::Scalar;
+    } else if constexpr (detail::kByteSequence<U> || std::same_as<U, std::monostate> ||
+                         mmltk::frameworks::reflection::kOpaqueRelationStorage<U>) {
+        return Shape::Unsupported;
+    } else if constexpr (std::is_enum_v<U>) {
+        return detail::enumerators<U>().empty() || shape<std::underlying_type_t<U>> != Shape::Scalar ? Shape::Unsupported : Shape::Enum;
+    } else if constexpr (detail::kIsOptional<U>) {
+        return shape<typename detail::IsOptional<U>::value_type> == Shape::Unsupported ? Shape::Unsupported : Shape::Optional;
+    } else if constexpr (detail::kIsArray<U> || detail::kIsInplaceVector<U>) {
+        return shape<detail::SequenceElementT<U>> == Shape::Unsupported ? Shape::Unsupported : Shape::Sequence;
+    } else if constexpr (detail::kReflectedObject<U>) {
+        bool supported = true;
+        detail::visit_bases<U>([&]<class Base>() { supported = supported && shape<Base> == Shape::Object; });
+        detail::visit_members<U>([&]<class Declaration>(const auto&) {
+            supported = supported && shape<typename Declaration::member_type> != Shape::Unsupported;
+        });
+        return supported ? Shape::Object : Shape::Unsupported;
+    }
+    return Shape::Unsupported;
+}();
+
+template <class T>
+[[nodiscard]] consteval std::size_t maximum_bytes() {
+    static_assert(shape<T> != Shape::Unsupported, "unsupported compact wire projection");
+    if constexpr (shape<T> == Shape::Optional) {
+        return detail::cbor_maximum(1U, maximum_bytes<typename detail::IsOptional<T>::value_type>());
+    } else if constexpr (shape<T> == Shape::Sequence) {
+        constexpr std::size_t count = [] consteval {
+            if constexpr (detail::kIsArray<T>) return detail::IsArray<T>::size;
+            else return detail::IsInplaceVector<T>::capacity;
+        }();
+        return detail::cbor_size_add(wire::head_size(count), detail::cbor_size_multiply(count, maximum_bytes<detail::SequenceElementT<T>>()));
+    } else if constexpr (shape<T> == Shape::Enum) {
+        std::size_t result = 0U;
+        for (const auto enumerator : detail::enumerators<T>()) {
+            std::uint64_t argument = 0U;
+            if constexpr (std::is_signed_v<std::underlying_type_t<T>>) {
+                const auto value = static_cast<std::int64_t>(enumerator.value);
+                argument = value < 0 ? static_cast<std::uint64_t>(-(value + 1)) : static_cast<std::uint64_t>(value);
+            } else {
+                argument = static_cast<std::uint64_t>(enumerator.value);
+            }
+            result = detail::cbor_maximum(result, wire::head_size(argument));
+        }
+        return result;
+    } else if constexpr (shape<T> == Shape::Object) {
+        detail::audit_object<T>();
+        return detail::cbor_size_add(wire::head_size(detail::flattened_member_count<T>()),
+            detail::reflected_object_member_sum<T>([]<class, class Declaration>(const auto&) {
+                return maximum_bytes<typename Declaration::member_type>();
+            }));
+    } else {
+        return detail::maximum_cbor_bytes<T>();
+    }
+}
+
 template <class T, class Visitor>
 void visit_fields(T& value, Visitor& visitor) {
     using U = std::remove_cvref_t<T>;
@@ -1977,15 +2050,17 @@ void visit_fields(T& value, Visitor& visitor) {
 template <class T>
 [[nodiscard]] bool encode(FixedCborEncoder& writer, const T& value) {
     namespace d = detail;
-    if constexpr (d::kIsOptional<T>) {
+    static_assert(shape<T> != Shape::Unsupported, "unsupported compact wire projection");
+    if constexpr (shape<T> == Shape::Optional) {
         return value ? encode(writer, *value) : writer.null();
-    } else if constexpr (d::kIsArray<T> || d::kIsVector<T> || d::kIsInplaceVector<T>) {
+    } else if constexpr (shape<T> == Shape::Sequence) {
         if (!writer.array(value.size())) return false;
         for (const auto& item : value) if (!encode(writer, item)) return false;
         return true;
-    } else if constexpr (std::is_enum_v<T>) {
+    } else if constexpr (shape<T> == Shape::Enum) {
         return mmltk::frameworks::reflection::enum_contains(value) && encode(writer, static_cast<std::underlying_type_t<T>>(value));
-    } else if constexpr (d::kReflectedObject<T>) {
+    } else if constexpr (shape<T> == Shape::Object) {
+        d::audit_object<T>();
         bool valid = writer.array(d::flattened_member_count<T>());
         auto field = [&]<class Declaration>(const auto& member) {
             valid = valid && d::member_constraints_accept<Declaration>(member) && encode(writer, member);
@@ -1999,13 +2074,14 @@ template <class T>
 template <class T>
 [[nodiscard]] bool decode(wire::Reader& reader, T& value, const std::size_t depth) {
     namespace d = detail;
-    if constexpr (d::kIsOptional<T>) {
+    static_assert(shape<T> != Shape::Unsupported, "unsupported compact wire projection");
+    if constexpr (shape<T> == Shape::Optional) {
         auto absent = reader.next_is_null();
         if (!absent) return false;
         if (*absent) { value.reset(); return reader.read_scalar_item(depth).has_value(); }
         value.emplace();
         return decode(reader, *value, depth);
-    } else if constexpr (d::kIsArray<T> || d::kIsInplaceVector<T>) {
+    } else if constexpr (shape<T> == Shape::Sequence) {
         auto count = reader.begin_array_item(depth);
         if (!count) return false;
         if constexpr (d::kIsArray<T>) {
@@ -2016,12 +2092,13 @@ template <class T>
         }
         for (auto& item : value) if (!decode(reader, item, depth + 1U)) return false;
         return true;
-    } else if constexpr (std::is_enum_v<T>) {
+    } else if constexpr (shape<T> == Shape::Enum) {
         std::underlying_type_t<T> raw{};
         if (!decode(reader, raw, depth)) return false;
         value = static_cast<T>(raw);
         return mmltk::frameworks::reflection::enum_contains(value);
-    } else if constexpr (d::kReflectedObject<T>) {
+    } else if constexpr (shape<T> == Shape::Object) {
+        d::audit_object<T>();
         auto count = reader.begin_array_item(depth);
         if (!count || *count != d::flattened_member_count<T>()) return false;
         bool valid = true;

@@ -486,7 +486,7 @@ class LoopbackWebSocket final {
 }
 
 [[nodiscard]] Interaction explore_viewport_interaction() {
-    wire::ByteBuffer bytes(128U);
+    wire::ByteBuffer bytes(mmltk::frameworks::serialization::compact_maximum_cbor_bytes<ExploreViewportUpdate>());
     mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
     REQUIRE(mmltk::frameworks::serialization::encode_compact(writer, ExploreViewportUpdate{}));
     bytes.resize(writer.size());

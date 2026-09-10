@@ -237,7 +237,7 @@ struct ApplicationBrowserHost::Impl final {
                         }
                         return published;
                     } else if constexpr (std::same_as<Type, Interaction>) {
-                        return interaction(*installed, InteractionView{.endpoint_id = value.endpoint_id, .value = {.first = value.value}});
+                        return interaction(*installed, InteractionView{value});
                     } else {
                         auto* presentation = installed->presentation;
                         if (presentation == nullptr) {

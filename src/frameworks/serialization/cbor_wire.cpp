@@ -603,9 +603,13 @@ std::expected<std::string, DecodeError> Reader::read_object_key(const std::size_
 }
 
 std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::size_t depth) {
+    return borrow_string_item(depth, 2U);
+}
+
+std::expected<ByteSegments, DecodeError> Reader::borrow_string_item(const std::size_t depth, const std::uint8_t major) {
     auto head = item_head(depth);
     if (!head) return std::unexpected(head.error());
-    if (head->major != 2U) return std::unexpected(error(ErrorCode::TypeMismatch));
+    if (head->major != major) return std::unexpected(error(ErrorCode::TypeMismatch));
     auto count = size_argument(head->additional);
     if (!count) return std::unexpected(count.error());
     if (*count > input_.size() - offset_) return std::unexpected(error(ErrorCode::UnexpectedEof));
@@ -620,6 +624,19 @@ std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::si
     }
     offset_ += *count;
     return result;
+}
+
+std::expected<std::size_t, DecodeError> Reader::read_text_choice(const std::size_t depth, const std::span<const std::string_view> choices) {
+    auto bytes = borrow_string_item(depth, 3U);
+    if (!bytes) return std::unexpected(bytes.error());
+    for (std::size_t index = 0U; index < choices.size(); ++index) {
+        if (choices[index].size() != bytes->size()) continue;
+        const auto expected = std::as_bytes(std::span(choices[index].data(), choices[index].size()));
+        if (std::equal(bytes->first.begin(), bytes->first.end(), expected.begin()) &&
+            std::equal(bytes->second.begin(), bytes->second.end(), expected.begin() + static_cast<std::ptrdiff_t>(bytes->first.size())))
+            return index;
+    }
+    return std::unexpected(error(ErrorCode::UnknownKey));
 }
 
 std::expected<void, DecodeError> Reader::expect_text_item(const std::size_t depth, const std::string_view expected) {

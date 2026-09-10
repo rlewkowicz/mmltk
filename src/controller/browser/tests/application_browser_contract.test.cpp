@@ -736,6 +736,98 @@ TEST_CASE("closed application categories discover nested reflected declarations 
 }
 
 TEST_CASE("protocol-14 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    STATIC_REQUIRE(cbor::compact_shape<AnnotationInputBatch> == cbor::CompactShape::Object);
+    STATIC_REQUIRE(cbor::compact_shape<ExploreViewportUpdate> == cbor::CompactShape::Object);
+    STATIC_REQUIRE(cbor::compact_shape<std::array<std::uint16_t, 2U>> == cbor::CompactShape::Sequence);
+    STATIC_REQUIRE(cbor::compact_shape<std::vector<AnnotationPointer>> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(cbor::compact_shape<std::string> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(cbor::compact_shape<wire::Value> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(cbor::compact_shape<std::variant<AnnotationPointer>> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(cbor::compact_shape<long double> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(kAnnotationInputBatchCapacity == 32U);
+    STATIC_REQUIRE(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>() <= kMaxIntentValueBytes);
+    const auto structural = []<class T>() {
+        application_schema_detail::FingerprintSink sink;
+        application_schema_detail::append_type<T>(sink);
+        return sink.words();
+    };
+    CHECK(structural.template operator()<std::string>() == structural.template operator()<std::filesystem::path>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint16_t, 3U>>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint32_t, 2U>>());
+    CHECK(structural.template operator()<std::inplace_vector<std::uint16_t, 0U>>() !=
+          structural.template operator()<std::vector<std::uint16_t>>());
+    application_schema_detail::FingerprintSink default_value;
+    application_schema_detail::append_wire_value(default_value, wire::Value{std::uint64_t{7U}});
+    application_schema_detail::FingerprintSink expected_default;
+    expected_default.append("integer");
+    expected_default.append_number(sizeof(std::uint64_t));
+    expected_default.append_number(false);
+    expected_default.append_number(std::uint64_t{7U});
+    CHECK(default_value.words() == expected_default.words());
+    const auto repeated = []<class First, class Second>() {
+        application_schema_detail::FingerprintSink sink;
+        application_schema_detail::append_type<First>(sink);
+        application_schema_detail::append_type<Second>(sink);
+        return sink.words();
+    };
+    CHECK((repeated.template operator()<std::optional<std::uint16_t>, std::optional<std::uint32_t>>() !=
+           repeated.template operator()<std::optional<std::uint32_t>, std::optional<std::uint16_t>>()));
+    const auto object_order = [](const bool reverse) {
+        using Sink = application_schema_detail::FingerprintSink;
+        std::vector<std::function<void(Sink&)>> fields;
+        auto field = [&]<class, class Declaration>(const auto& fact) {
+            fields.emplace_back([fact](Sink& sink) {
+                sink.append(fact.member_name);
+                application_schema_detail::append_constraint(sink, fact.constraint);
+                sink.append_number(static_cast<std::uint8_t>(fact.presentation));
+                application_schema_detail::append_annotations<Declaration>(sink);
+                application_schema_detail::append_type<typename Declaration::member_type>(sink);
+            });
+        };
+        application_schema_detail::visit_fields<IntentField>(field);
+        if (reverse) std::ranges::reverse(fields);
+        Sink sink;
+        sink.append("type");
+        sink.append("object");
+        sink.append_number(fields.size());
+        for (const auto& append : fields) append(sink);
+        sink.append("end-type");
+        return sink.words();
+    };
+    CHECK(object_order(false) == structural.template operator()<IntentField>());
+    CHECK(object_order(true) != object_order(false));
+    const auto verify_variant = [&]<class Variant>() {
+        application_schema_detail::FingerprintSink expected;
+        expected.append("type");
+        expected.append("variant");
+        expected.append_number(std::variant_size_v<Variant>);
+        application_schema_detail::Variant<Variant>::Visit([&]<class Alternative>() {
+            expected.append(std::meta::identifier_of(^^Alternative));
+            application_schema_detail::append_type<Alternative>(expected);
+        });
+        expected.append("end-type");
+        CHECK(expected.words() == structural.template operator()<Variant>());
+    };
+    verify_variant.template operator()<ClientRecord>();
+    verify_variant.template operator()<ServerRecord>();
+    application_schema_detail::FingerprintSink actual_enum;
+    application_schema_detail::append_type<RendererObservationKind>(actual_enum);
+    for (const bool reassign : {false, true}) {
+        application_schema_detail::FingerprintSink expected_enum;
+        expected_enum.append("type");
+        expected_enum.append("enum");
+        using Underlying = std::underlying_type_t<RendererObservationKind>;
+        expected_enum.append_number(sizeof(Underlying));
+        expected_enum.append_number(std::is_signed_v<Underlying>);
+        expected_enum.append_number(mmltk::frameworks::reflection::enum_entries<RendererObservationKind>().size());
+        for (const auto entry : mmltk::frameworks::reflection::enum_entries<RendererObservationKind>()) {
+            expected_enum.append(entry.name);
+            expected_enum.append_number(static_cast<Underlying>(static_cast<Underlying>(entry.value) + (reassign ? 1U : 0U)));
+        }
+        expected_enum.append("end-type");
+        CHECK((actual_enum.words() == expected_enum.words()) == !reassign);
+    }
     const auto first = application_schema_fingerprint<TestSettingsSystems>();
     const auto second = application_schema_fingerprint<TestSettingsSystems>();
     const auto changed = application_schema_fingerprint<ChangedTestSettingsSystems>();

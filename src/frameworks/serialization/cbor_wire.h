@@ -244,6 +244,7 @@ class Reader {
     // Allocation-free exact text projection for fixed protocol keys and
     // discriminants. The item still passes canonical head, byte, item, and
     // depth admission through this Reader.
+    [[nodiscard]] std::expected<std::size_t, DecodeError> read_text_choice(std::size_t depth, std::span<const std::string_view> choices);
     [[nodiscard]] std::expected<void, DecodeError> expect_text_item(std::size_t depth, std::string_view expected);
     [[nodiscard]] PathScope enter_path(std::string_view name);
     [[nodiscard]] std::expected<void, DecodeError> finish();
@@ -271,6 +272,7 @@ class Reader {
     [[nodiscard]] std::expected<ByteBuffer, DecodeError> bytes(std::size_t count);
     [[nodiscard]] bool allocation_allowed(AllocationKind kind, std::size_t size) const noexcept;
     [[nodiscard]] std::expected<ItemHead, DecodeError> item_head(std::size_t depth);
+    [[nodiscard]] std::expected<ByteSegments, DecodeError> borrow_string_item(std::size_t depth, std::uint8_t major);
     [[nodiscard]] std::expected<TextRange, DecodeError> read_structural_object_key(std::size_t depth);
     [[nodiscard]] std::expected<void, DecodeError> insert_structural_object_key(TextRange key, std::span<std::uint32_t> table);
     [[nodiscard]] std::expected<void, DecodeError> validate_structural();

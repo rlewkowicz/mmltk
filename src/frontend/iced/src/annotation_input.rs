@@ -88,7 +88,7 @@ impl AnnotationInput {
                 if self.epoch != 0 && self.epoch != bootstrap.input_epoch { return Err("input peer epoch changed".into()); }
                 self.epoch = bootstrap.input_epoch;
             }
-            ServerRecord::InputProgress { progress, error } => {
+            ServerRecord::InputProgress(crate::generated::InputProgress { progress, error , .. }) => {
                 if self.epoch == 0 { return Err("input progress preceded Bootstrap".into()); }
                 if progress.epoch != self.epoch { return Ok(()); }
                 if let Some(detail) = &progress.rejection { return Err(format!("annotation input failed: {detail}")); }

@@ -198,8 +198,8 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
         ServerRecord::Bootstrap(record) => Some(TransportEvent::Bootstrap(record)),
         ServerRecord::IntentReply(record) => Some(TransportEvent::IntentReply(record)),
         ServerRecord::SystemEvent(record) => Some(TransportEvent::SystemEvent(record)),
-        ServerRecord::InputProgress { .. } => None,
-        ServerRecord::InteractionRejected(error) => Some(TransportEvent::Rejected(error.detail)),
+        ServerRecord::InputProgress(_) => None,
+        ServerRecord::InteractionRejected(record) => Some(TransportEvent::Rejected(record.error.detail)),
     }
 }
 

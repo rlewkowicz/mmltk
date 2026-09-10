@@ -249,7 +249,8 @@ template <class Declaration>
             ++provider_count;
             using Provider = typename A::provider_type;
             static_assert(Provider::valid(), "reflected catalog provider is invalid");
-            result.catalog_provider = mmltk::frameworks::reflection::type_name<Provider>();
+            static_assert(std::meta::has_identifier(^^Provider), "catalog providers require canonical declaration identifiers");
+            result.catalog_provider = std::meta::identifier_of(^^Provider);
         }
     });
     if (workflow_count > 1U) throw "settings declaration has duplicate feature scopes";
@@ -403,16 +404,19 @@ struct Sequence final : std::false_type {};
 template <class Value, class Allocator>
 struct Sequence<std::vector<Value, Allocator>> final : std::true_type {
     using value_type = Value;
+    static constexpr bool bounded = false;
     static constexpr std::size_t extent = 0U;
 };
 template <class Value, std::size_t Extent>
 struct Sequence<std::array<Value, Extent>> final : std::true_type {
     using value_type = Value;
+    static constexpr bool bounded = true;
     static constexpr std::size_t extent = Extent;
 };
 template <class Value, std::size_t Capacity>
 struct Sequence<std::inplace_vector<Value, Capacity>> final : std::true_type {
     using value_type = Value;
+    static constexpr bool bounded = true;
     static constexpr std::size_t extent = Capacity;
 };
 
@@ -838,22 +842,33 @@ inline void append_wire_value(FingerprintSink& sink, const mmltk::frameworks::se
     std::visit(
         [&](const auto& storage) {
             using Type = std::remove_cvref_t<decltype(storage)>;
-            sink.append(mmltk::frameworks::reflection::type_name<Type>());
             if constexpr (std::same_as<Type, std::monostate>) {
+                sink.append("null");
                 return;
-            } else if constexpr (std::same_as<Type, bool> || std::is_arithmetic_v<Type>) {
+            } else if constexpr (std::same_as<Type, bool>) {
+                sink.append("boolean");
+                sink.append_number(storage);
+            } else if constexpr (std::is_arithmetic_v<Type>) {
+                sink.append(std::is_floating_point_v<Type> ? "floating" : "integer");
+                sink.append_number(sizeof(Type));
+                sink.append_number(std::is_signed_v<Type>);
                 sink.append_number(storage);
             } else if constexpr (std::same_as<Type, std::string>) {
+                sink.append("text");
                 sink.append(storage);
             } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Bytes>) {
+                sink.append("bytes");
                 sink.append_number(storage.size());
                 for (const std::byte byte : storage)
                     sink.append_number(std::to_integer<std::uint8_t>(byte));
             } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Array>) {
+                sink.append("array");
                 sink.append_number(storage.size());
                 for (const auto& item : storage)
                     append_wire_value(sink, item);
             } else {
+                static_assert(std::same_as<Type, mmltk::frameworks::serialization::wire::Value::Object>);
+                sink.append("object");
                 sink.append_number(storage.size());
                 for (const auto& [name, item] : storage) {
                     sink.append(name);
@@ -867,7 +882,8 @@ inline void append_wire_value(FingerprintSink& sink, const mmltk::frameworks::se
 template <class Annotation>
 void append_annotation(FingerprintSink& sink, const Annotation& annotation) {
     using A = std::remove_cvref_t<Annotation>;
-    sink.append(mmltk::frameworks::reflection::type_name<A>());
+    static_assert(std::meta::has_identifier(^^A), "wire annotations require canonical declaration identifiers");
+    sink.append(std::meta::identifier_of(^^A));
     if constexpr (mmltk::frameworks::reflection::MinimumAnnotation<A>::value ||
                   mmltk::frameworks::reflection::MaximumAnnotation<A>::value ||
                   mmltk::frameworks::reflection::MinBytesAnnotation<A>::value ||
@@ -937,56 +953,78 @@ void append_type_annotations(FingerprintSink& sink) {
 }
 
 template <class Value>
-void append_type(FingerprintSink& sink, std::set<std::string>& seen) {
+void append_type(FingerprintSink& sink) {
     using Type = std::remove_cvref_t<Value>;
     static_assert(valid_fixed_text_shape<Type>(),
                   "fixed-text annotation requires matching char bytes, unsigned size, capacity, and policy");
-    const std::string name(mmltk::frameworks::serialization::reflected_schema_type_name<Type>());
-    if (!seen.insert(name).second) return;
     sink.append("type");
-    sink.append(name);
     append_type_annotations<Type>(sink);
     if constexpr (Optional<Type>::value) {
         sink.append("optional");
-        append_type<typename Optional<Type>::value_type>(sink, seen);
+        append_type<typename Optional<Type>::value_type>(sink);
     } else if constexpr (ByteSequence<Type>::value) {
         sink.append("bytes");
+        sink.append_number(StaticArray<Type>::value);
         sink.append_number(ByteSequence<Type>::extent);
     } else if constexpr (Sequence<Type>::value) {
         sink.append("sequence");
+        sink.append_number(StaticArray<Type>::value);
+        sink.append_number(Sequence<Type>::bounded);
         sink.append_number(Sequence<Type>::extent);
-        append_type<typename Sequence<Type>::value_type>(sink, seen);
-    } else if constexpr (std::is_enum_v<Type>) {
+        append_type<typename Sequence<Type>::value_type>(sink);
+    } else if constexpr (std::is_enum_v<Type> && !std::same_as<Type, std::byte>) {
         sink.append("enum");
-        for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>())
+        using Underlying = std::underlying_type_t<Type>;
+        sink.append_number(sizeof(Underlying));
+        sink.append_number(std::is_signed_v<Underlying>);
+        sink.append_number(mmltk::frameworks::reflection::enum_entries<Type>().size());
+        for (const auto entry : mmltk::frameworks::reflection::enum_entries<Type>()) {
             sink.append(entry.name);
+            sink.append_number(static_cast<Underlying>(entry.value));
+        }
     } else if constexpr (Variant<Type>::value) {
         sink.append("variant");
-        Variant<Type>::Visit([&]<class Alternative>() { append_type<Alternative>(sink, seen); });
+        sink.append_number(std::variant_size_v<Type>);
+        Variant<Type>::Visit([&]<class Alternative>() {
+            static_assert(std::meta::has_identifier(^^Alternative), "wire alternatives require canonical declaration identifiers");
+            sink.append(std::meta::identifier_of(^^Alternative));
+            append_type<Alternative>(sink);
+        });
     } else if constexpr (ReflectedObject<Type> && !std::same_as<Type, std::string> && !std::same_as<Type, std::filesystem::path>) {
         sink.append("object");
+        constexpr auto count = [] consteval {
+            std::size_t result = 0U;
+            auto field = [&]<class, class>(const auto&) { ++result; };
+            visit_fields<Type>(field);
+            return result;
+        }();
+        sink.append_number(count);
         auto visitor = [&]<class Owner, class Declaration>(const auto& fact) {
             using Field = typename Declaration::member_type;
             sink.append(fact.member_name);
             append_constraint(sink, fact.constraint);
             sink.append_number(static_cast<std::uint8_t>(fact.presentation));
             append_annotations<Declaration>(sink);
-            append_type<Field>(sink, seen);
+            append_type<Field>(sink);
         };
         visit_fields<Type>(visitor);
     } else if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::Value> ||
                          std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue>) {
-        sink.append("dynamic");
+        sink.append(std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue> ? "flat-dynamic" : "dynamic");
     } else if constexpr (std::same_as<Type, std::string_view>) {
         sink.append("static-string");
-    } else if constexpr (std::same_as<Type, bool> || std::is_arithmetic_v<Type> || std::same_as<Type, std::string> ||
-                         std::same_as<Type, std::filesystem::path> || std::same_as<Type, std::byte>) {
-        sink.append("scalar");
+    } else if constexpr (std::same_as<Type, std::string> || std::same_as<Type, std::filesystem::path>) {
+        sink.append("text");
+    } else if constexpr (std::same_as<Type, bool>) {
+        sink.append("boolean");
+    } else if constexpr (std::is_arithmetic_v<Type> || std::same_as<Type, std::byte>) {
+        sink.append(std::is_floating_point_v<Type> ? "floating" : "integer");
         sink.append_number(sizeof(Type));
         sink.append_number(std::is_signed_v<Type>);
     } else {
         static_assert(!sizeof(Type), "unsupported reachable application boundary type");
     }
+    sink.append("end-type");
 }
 
 }  // namespace application_schema_detail
@@ -1026,7 +1064,8 @@ template <class Composition, auto Member, class Event>
 struct ApplicationEventIdentity final {
     using system_cell = ReflectedSystem<Composition, application_system_member<Composition, Member>()>;
     static constexpr std::uint64_t system_id = system_cell::stable_id;
-    static constexpr std::uint64_t event_id = application_stable_id(system_cell::name, mmltk::frameworks::reflection::type_name<Event>());
+    static_assert(std::meta::has_identifier(^^Event), "application events require canonical declaration identifiers");
+    static constexpr std::uint64_t event_id = application_stable_id(system_cell::name, std::meta::identifier_of(^^Event));
 };
 
 template <class Composition, auto Member, class Event>
@@ -1086,6 +1125,9 @@ struct ReflectedEndpoint final {
                   "annotated endpoint request contains an unsupported or unreflected reachable type");
     static_assert(application_schema_detail::runtime_boundary_projectable<result_type>(),
                   "annotated endpoint result contains an unsupported or unreflected reachable type");
+    static_assert(!interaction || mmltk::frameworks::serialization::compact_shape<request_type> !=
+                                      mmltk::frameworks::serialization::CompactShape::Unsupported,
+                  "interaction request has no compact wire projection");
     static_assert(!interaction || (signature::has_request && std::is_void_v<result_type>),
                   "InteractionEndpoint requires one typed request and no reply");
 };
@@ -1447,9 +1489,11 @@ struct ApplicationSchema final {
         auto visit_provider = [&]<class Provider>() {
             application_schema_detail::validate_catalog_provider<Provider>();
             using Row = typename Provider::row_type;
-            constexpr std::string_view name = mmltk::frameworks::reflection::type_name<Provider>();
+            static_assert(std::meta::has_identifier(^^Provider) && std::meta::has_identifier(^^Row),
+                          "catalog providers and rows require canonical declaration identifiers");
+            constexpr std::string_view name = std::meta::identifier_of(^^Provider);
             constexpr std::string_view identity = Provider::identity;
-            constexpr std::string_view row_type = mmltk::frameworks::reflection::type_name<Row>();
+            constexpr std::string_view row_type = std::meta::identifier_of(^^Row);
             if (identity.empty()) throw std::logic_error("catalog provider identity must not be empty");
             const std::uint64_t stable_id = application_stable_id(identity);
             const auto [prior, inserted] = providers.emplace(stable_id, std::string(name));
@@ -1493,7 +1537,6 @@ template <class Composition>
 [[nodiscard]] ApplicationSchemaFingerprint application_schema_fingerprint() {
     static const ApplicationSchemaFingerprint fingerprint = [] {
         application_schema_detail::FingerprintSink sink;
-        std::set<std::string> seen_types;
         std::map<std::uint64_t, std::string> identities;
         const auto reserve_identity = [&identities](const std::uint64_t identity, const std::string& source) {
             if (identity == 0U) throw std::logic_error("application schema emitted a zero identity for " + source);
@@ -1502,14 +1545,13 @@ template <class Composition>
         };
         sink.append_number(kBrowserProtocolVersion);
         sink.append("compact-positional-interactions");
-        application_schema_detail::append_type<Bootstrap>(sink, seen_types);
-        application_schema_detail::append_type<InputProgress>(sink, seen_types);
-        application_schema_detail::append_type<InteractionRejected>(sink, seen_types);
+        application_schema_detail::append_type<ClientRecord>(sink);
+        application_schema_detail::append_type<ServerRecord>(sink);
         sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
         sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
         sink.append("visual-source-projections");
-        application_schema_detail::append_type<VisualSourceObservation>(sink, seen_types);
-        application_schema_detail::append_type<VisualCleanContentIdentity>(sink, seen_types);
+        application_schema_detail::append_type<VisualSourceObservation>(sink);
+        application_schema_detail::append_type<VisualCleanContentIdentity>(sink);
         sink.append_number(ApplicationSchema<Composition>::VisualSourceCount());
         for (const auto metadata : presentation_source_metadata) {
             sink.append(mmltk::frameworks::reflection::enum_name(metadata.kind));
@@ -1543,7 +1585,6 @@ template <class Composition>
         sink.append("zero-fallback");
         sink.append(fallback_source.view());
         sink.append(fallback_destination.view());
-        application_schema_detail::append_type<SystemEvent>(sink, seen_types);
         ApplicationSchema<Composition>::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
             using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;
             static_assert(!Signature::has_request, "snapshot method must not accept a request");
@@ -1555,7 +1596,7 @@ template <class Composition>
             sink.append(SystemCell::name);
             sink.append_number(SystemCell::stable_id);
             sink.append_number(metadata.byte_budget);
-            application_schema_detail::append_type<typename Signature::result_type>(sink, seen_types);
+            application_schema_detail::append_type<typename Signature::result_type>(sink);
             const typename Signature::result_type default_snapshot{};
             auto encoded = mmltk::frameworks::serialization::reflected_value(default_snapshot);
             if (!encoded) throw std::logic_error("unsupported reflected snapshot default");
@@ -1587,10 +1628,10 @@ template <class Composition>
                         if (!encoded) throw std::logic_error("unsupported reflected request default");
                         application_schema_detail::append_wire_value(sink, *encoded);
                     });
-                application_schema_detail::append_type<typename Endpoint::request_type>(sink, seen_types);
+                application_schema_detail::append_type<typename Endpoint::request_type>(sink);
             }
             if constexpr (!std::is_void_v<typename Endpoint::result_type>)
-                application_schema_detail::append_type<typename Endpoint::result_type>(sink, seen_types);
+                application_schema_detail::append_type<typename Endpoint::result_type>(sink);
         });
         ApplicationSchema<Composition>::VisitEvents(
             [&]<class Identity, class Event>(const mmltk::controller::contracts::reflection::Event metadata) {
@@ -1600,7 +1641,7 @@ template <class Composition>
                 sink.append_number(Identity::system_id);
                 sink.append_number(Identity::event_id);
                 sink.append_number(static_cast<std::uint8_t>(metadata.delivery));
-                application_schema_detail::append_type<Event>(sink, seen_types);
+                application_schema_detail::append_type<Event>(sink);
             });
         ApplicationSchema<Composition>::VisitApplicationSettingsLeaves(
             [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
@@ -1639,7 +1680,7 @@ template <class Composition>
                 sink.append(provider.identity);
                 sink.append(provider.row_type);
                 sink.append_number(provider.stable_id);
-                application_schema_detail::append_type<Row>(sink, seen_types);
+                application_schema_detail::append_type<Row>(sink);
                 ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
                     [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
                         reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));

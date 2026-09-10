@@ -222,9 +222,9 @@ impl Connection {
         connection.observe(&crate::protocol::ServerRecord::Bootstrap(crate::protocol::Bootstrap {
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT, input_epoch: 1, snapshots: Vec::new(),
         })).unwrap();
-        connection.observe(&crate::protocol::ServerRecord::InputProgress {
+        connection.observe(&crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress { protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
             progress: crate::generated::AnnotationInputProgress { epoch: 1, consumedsequence: 0, rejection: None }, error: None,
-        }).unwrap();
+        })).unwrap();
         let capture = Capture { connection: connection.clone(), _wake: receiver, records: Default::default() };
         (connection, capture)
     }
@@ -338,16 +338,16 @@ mod tests {
         }
         let (sender, _receiver) = mpsc::channel(0);
         let mut connection = Connection::new(sender);
-        assert!(connection.observe(&crate::protocol::ServerRecord::InputProgress {
+        assert!(connection.observe(&crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress { protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
             progress: crate::generated::AnnotationInputProgress { epoch: 1, consumedsequence: 0, rejection: None }, error: None,
-        }).is_err(), "Bootstrap must precede all progress");
+        })).is_err(), "Bootstrap must precede all progress");
         connection.observe(&crate::protocol::ServerRecord::Bootstrap(crate::protocol::Bootstrap {
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
             input_epoch: 1, snapshots: Vec::new(),
         })).unwrap();
-        let consumed = |sequence| crate::protocol::ServerRecord::InputProgress {
+        let consumed = |sequence| crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress { protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
             progress: crate::generated::AnnotationInputProgress { epoch: 1, consumedsequence: sequence, rejection: None }, error: None,
-        };
+        });
         connection.observe(&consumed(0)).unwrap();
         let samples: Vec<_> = (0..130).map(|index| {
             let mut sample = pointer(if index == 0 { crate::generated::AnnotationPointerPhase::Begin }
@@ -388,15 +388,15 @@ mod tests {
         assert_eq!(sent.len(), 5);
         assert!(connection.observe(&consumed(6)).is_err());
         connection.observe(&consumed(5)).unwrap(); // Duplicate cumulative progress consumes no second prefix.
-        let stale = crate::protocol::ServerRecord::InputProgress {
+        let stale = crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress { protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
             progress: crate::generated::AnnotationInputProgress { epoch: 99, consumedsequence: u64::MAX, rejection: Some("old peer failure".into()) },
             error: Some(crate::protocol::ApplicationError { category: crate::generated::ApplicationErrorCategory::Busy, detail: "old rejection".into() }),
-        };
+        });
         connection.observe(&stale).unwrap();
-        let rejected = crate::protocol::ServerRecord::InputProgress {
+        let rejected = crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress { protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
             progress: crate::generated::AnnotationInputProgress { epoch: 1, consumedsequence: 5, rejection: None },
             error: Some(crate::protocol::ApplicationError { category: crate::generated::ApplicationErrorCategory::Busy, detail: "invalid admission".into() }),
-        };
+        });
         assert!(connection.observe(&rejected).is_err(), "unidentified rejection is terminal, never a rewind");
         connection.close();
         assert_eq!(connection.send_annotation_pointer(samples[0].clone(), 1), Err(OutboundSendError::Closed));

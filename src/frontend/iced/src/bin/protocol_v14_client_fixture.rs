@@ -240,6 +240,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
 
     let bytes = fs::read(env!("MMLTK_PROTOCOL_V14_SERVER_FIXTURE_PATH"))?;
     let mut records = Vec::new();
+    let mut kinds = BTreeSet::new();
     let mut cursor = 0_usize;
     while cursor < bytes.len() {
         require(cursor + 4 <= bytes.len(), "truncated native fixture header")?;
@@ -249,16 +250,28 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             cursor + size <= bytes.len(),
             "truncated native fixture record",
         )?;
+        let envelope = mmltk_browser_app::protocol::decode_envelope(&bytes[cursor..cursor + size])?;
+        let kind = generated::ServerRecordKind::parse(envelope.kind.as_bytes()).ok_or("native server discriminator missing")?;
+        kinds.insert(kind.wire_name());
         records.push(mmltk_browser_app::protocol::decode_server(
             &bytes[cursor..cursor + size],
         )?);
         cursor += size;
     }
-    require(records.len() == 6, "native fixture record count changed")?;
-    require(matches!(&records[4], ServerRecord::InputProgress { progress, error: None }
+    require(records.len() == 7, "native fixture record count changed")?;
+    require(kinds.len() == generated::ServerRecordKind::ALL.len()
+        && generated::ServerRecordKind::ALL.iter().all(|kind| kinds.contains(kind.wire_name())
+            && generated::ServerRecordKind::parse(kind.wire_name().as_bytes()) == Some(*kind)),
+        "generated discriminator does not cover the complete native fixture")?;
+    require(generated::ServerRecordKind::parse(b"UnknownServerRecord").is_none(), "unknown server discriminator accepted")?;
+    require(matches!(&records[4], ServerRecord::InputProgress(mmltk_browser_app::generated::InputProgress { progress, error: None , .. })
         if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none()), "native cumulative progress fixture changed")?;
-    require(matches!(&records[5], ServerRecord::InteractionRejected(error)
-        if error.category == generated::ApplicationErrorCategory::Unavailable && error.detail == "fixture unavailable"), "native interaction rejection fixture changed")?;
+    require(matches!(&records[5], ServerRecord::InteractionRejected(record)
+        if record.endpointid == generated::ENDPOINT_Explore_UpdateViewport && record.error.category == generated::ApplicationErrorCategory::Unavailable && record.error.detail == "fixture unavailable"), "native interaction rejection fixture changed")?;
+    require(matches!(&records[6], ServerRecord::InputProgress(record)
+        if record.progress.rejection.as_ref().is_some_and(|detail| detail.len() == generated::ReflectedRecordPath::AnnotationInputProgress.map_child(b"rejection").max_leaf_bytes())
+            && record.error.as_ref().is_some_and(|error| error.category == generated::ApplicationErrorCategory::Busy && error.detail == "fixture busy")),
+        "native optional rejection bounds changed")?;
     let Some(ServerRecord::Bootstrap(bootstrap)) = records
         .iter()
         .find(|record| matches!(record, ServerRecord::Bootstrap(_)))
@@ -537,6 +550,30 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
         .ok_or_else(|| io::Error::other("fixture requires a reflected model artifact dialog"))?;
     let settings_update =
         generated::update_currentview(generated::default_currentview().map_err(io::Error::other)?);
+    let batch = generated::AnnotationInputBatch {
+        epoch: 7, documentepoch: 1, sequence: 1,
+        samples: (0..generated::ANNOTATION_INPUT_BATCH_CAPACITY).map(|index| generated::AnnotationPointer {
+                phase: if index == 0 { generated::AnnotationPointerPhase::Begin }
+                    else if index + 1 == generated::ANNOTATION_INPUT_BATCH_CAPACITY { generated::AnnotationPointerPhase::End }
+                    else { generated::AnnotationPointerPhase::Update }, interactionid: 1, sequence: index as u64 + 1,
+                target: generated::AnnotationPointerTarget { object: Some(1), element: Some(2), role: Some(generated::AnnotationHandleRole::BoxCorner) },
+                point: generated::AnnotationPoint { x: index as f32, y: 1.0 },
+                brushradius: generated::default_uiannotationbrushradius().unwrap() as u16,
+            }).collect(),
+    };
+    let ordinary = generated::encode_annotation_Input(batch.clone())?.encode()?;
+    let mut scratch = Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY);
+    let mut batch_encoded = Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY);
+    let retained = (scratch.as_ptr(), scratch.capacity(), batch_encoded.as_ptr(), batch_encoded.capacity());
+    for _ in 0..2 {
+        generated::encode_annotation_Input_into(&batch, &mut scratch, &mut batch_encoded)?;
+        require(batch_encoded == ordinary, "retained and owned compact encoders disagree")?;
+        require(retained == (scratch.as_ptr(), scratch.capacity(), batch_encoded.as_ptr(), batch_encoded.capacity()),
+            "32-sample encoding grew retained storage")?;
+    }
+    let mut oversized = batch;
+    oversized.samples.push(oversized.samples[0].clone());
+    require(generated::encode_annotation_Input(oversized).is_err(), "compact sample bound was not enforced")?;
     Ok(vec![
         (
             "Intent:settings.Update",
@@ -588,16 +625,7 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
         ),
         (
             "Interaction:annotation.Input",
-            generated::encode_annotation_Input(generated::AnnotationInputBatch {
-                epoch: 7, documentepoch: 1, sequence: 1,
-                samples: [generated::AnnotationPointerPhase::Begin, generated::AnnotationPointerPhase::Update, generated::AnnotationPointerPhase::End]
-                    .into_iter().enumerate().map(|(index, phase)| generated::AnnotationPointer {
-                        phase, interactionid: 1, sequence: index as u64 + 1,
-                        target: generated::AnnotationPointerTarget { object: None, element: None, role: None },
-                        point: generated::AnnotationPoint { x: index as f32, y: 1.0 },
-                        brushradius: generated::default_uiannotationbrushradius().unwrap() as u16,
-                    }).collect(),
-            })?.encode()?,
+            batch_encoded,
         ),
     ])
 }

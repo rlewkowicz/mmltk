@@ -59,12 +59,6 @@ struct Interaction final {
     bool operator==(const Interaction&) const = default;
 };
 
-struct InteractionView final {
-    std::uint64_t endpoint_id = 0U;
-    wire::ByteSegments value{};
-};
-[[nodiscard]] bool is_interaction_record(std::span<const std::byte>) noexcept;
-[[nodiscard]] std::optional<InteractionView> decode_interaction_view(std::span<const std::byte>);
 
 enum class RendererObservationKind : std::uint8_t {
     Ready,
@@ -151,6 +145,10 @@ MMLTK_REFLECT_FIELDS(Bootstrap)
 MMLTK_REFLECT_FIELDS(ApplicationErrorRecord)
 MMLTK_REFLECT_FIELDS(IntentReply)
 MMLTK_REFLECT_FIELDS(SystemEvent)
+
+using InteractionView = mmltk::frameworks::serialization::BorrowedByteRecord<Interaction, &Interaction::value>;
+[[nodiscard]] bool is_interaction_record(std::span<const std::byte>) noexcept;
+[[nodiscard]] std::optional<InteractionView> decode_interaction_view(std::span<const std::byte>);
 
 struct RecordCodecError final {
     wire::ErrorCode code = wire::ErrorCode::MalformedItem;
