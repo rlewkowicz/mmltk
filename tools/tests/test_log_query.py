@@ -845,6 +845,86 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(sum(row["_log"]["role"] == "mozilla" for row in rows), 8)
 
+    def test_family_inventory_groups_selectors_without_capturing_unrelated_entries(self):
+        expected = set()
+        histories = set()
+        for family in ("first", "second", "third"):
+            for suffix in (".jsonl", "-application.1.log", "-mozilla-child.13.log.child-4.child-5.moz_log.2"):
+                current = self.write(f"build/validation/{family}{suffix}", "")
+                expected.add(current)
+                extension = ".jsonl" if suffix == ".jsonl" else ".log"
+                archive = self.write(f"{current.relative_to(self.root)}.history/57-1000000000{extension}", "")
+                expected.add(archive)
+                histories.add(archive.parent)
+        for index in range(80):
+            self.write(f"build/validation/unrelated-{index}.bin", "")
+            self.write(f"build/validation/other-mozilla-main.{index}.log.moz_log.0", "")
+        options = logs.argument_parser().parse_args([
+            "--family", "first", "--family", "second", "--family", "third",
+            "--family", "first", "--family", "build/validation/./second.jsonl", "--history", "--triage",
+        ])
+        # Recognized names remain candidates for a later symlink target, but
+        # unrelated content is never captured and nonartifact names are discarded.
+        with patch.object(logs, "MAX_DISTINCT_KEYS", 128), \
+                patch.object(logs.os, "scandir", wraps=logs.os.scandir) as scanned, \
+                patch.object(logs.LogFile, "capture", wraps=logs.LogFile.capture) as captured:
+            catalog = logs.ArtifactCatalog(options, self.root)
+        self.assertEqual({source.path for source in catalog.files}, expected)
+        counts = logs.Counter(Path(call.args[0]).resolve() for call in scanned.call_args_list)
+        self.assertEqual(counts, {self.root / "build/validation": 1, **{path: 1 for path in histories}})
+        self.assertEqual(captured.call_count, len(expected))
+        self.assertEqual(catalog.candidate_count, 86)
+        self.assertEqual(sum(len(names) for candidates in catalog.inventory.values() for names in candidates.values()), 86)
+        with patch.object(logs, "MAX_DISTINCT_KEYS", 85):
+            with self.assertRaisesRegex(logs.QueryError, "candidate inventory exceeds file budget"):
+                logs.ArtifactCatalog(options, self.root)
+
+    def test_family_symlink_reuses_earlier_target_candidates_and_checks_containment(self):
+        expected = set()
+        process = "-mozilla-child.12.log.child-3.moz_log.0"
+        for suffix in (".jsonl", "-application.1.log", process):
+            current = self.write("build/validation/a-target" + suffix, "")
+            extension = ".jsonl" if suffix == ".jsonl" else ".log"
+            archive = self.write(f"{current.relative_to(self.root)}.history/57-1000000000{extension}", "")
+            expected.update((current, archive))
+        parent = self.root / "build/validation"
+        alias = parent / ("z-alias" + process)
+        alias.symlink_to(parent / ("a-target" + process))
+        options = logs.argument_parser().parse_args(["--family", "z-alias", "--history", "--triage"])
+        counts = logs.Counter()
+        closed = []
+        names = {}
+        original = logs.os.scandir
+
+        @contextmanager
+        def ordered(directory):
+            directory = Path(directory).resolve()
+            counts[directory] += 1
+            try:
+                with original(directory) as entries:
+                    ordered_entries = sorted(entries, key=lambda entry: entry.name)
+                    names[directory] = [entry.name for entry in ordered_entries]
+                    yield iter(ordered_entries)
+            finally:
+                closed.append(directory)
+
+        with patch.object(logs.os, "scandir", ordered), \
+                patch.object(logs.LogFile, "capture", wraps=logs.LogFile.capture) as captured:
+            catalog = logs.ArtifactCatalog(options, self.root)
+        self.assertEqual({source.path for source in catalog.files}, expected)
+        self.assertEqual({source.metadata["family"] for source in catalog.files}, {"build/validation/a-target"})
+        self.assertEqual(captured.call_count, len(expected))
+        self.assertEqual(counts, {parent: 1, **{path.parent: 1 for path in expected if path.parent != parent}})
+        self.assertCountEqual(closed, counts.keys())
+        self.assertLess(names[parent].index("a-target" + process), names[parent].index(alias.name))
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside) / ("escaped" + process)
+            external.write_text("outside\n")
+            alias.unlink()
+            alias.symlink_to(external)
+            with self.assertRaisesRegex(logs.QueryError, "escapes repository"):
+                logs.ArtifactCatalog(options, self.root)
+
     def test_child_mozilla_archived_only_family_and_direct_role(self):
         archive = "build/validation/retired-mozilla-child.34.log.child-7.moz_log.2.history/57-1000000000.log"
         self.write(archive, "archived child module\n")
@@ -897,11 +977,36 @@ class FileQueryTests(unittest.TestCase):
         options = logs.argument_parser().parse_args([
             "build/validation/capture.jsonl.history/*.jsonl", "--history", "--triage",
         ])
-        with patch.object(logs, "directory_logs", counted):
+        with patch.object(logs, "directory_logs", counted), \
+                patch.object(logs.os, "scandir", wraps=logs.os.scandir) as scanned, \
+                patch.object(logs.LogFile, "capture", wraps=logs.LogFile.capture) as captured:
             catalog = logs.ArtifactCatalog(options, self.root)
         self.assertEqual(len(catalog.files), 36)
         self.assertEqual(len(counts), 3)
         self.assertEqual(set(counts.values()), {1})
+        physical = logs.Counter(Path(call.args[0]).resolve() for call in scanned.call_args_list)
+        # The explicit wildcard enumerates its directory separately from full
+        # history expansion; the family parent and other histories each scan once.
+        self.assertEqual(physical, {
+            self.root / "build/validation": 1,
+            self.root / "build/validation/capture.jsonl.history": 2,
+            self.root / "build/validation/capture-native.log.history": 1,
+            self.root / "build/validation/capture-firefox.log.history": 1,
+        })
+        self.assertEqual(captured.call_count, 36)
+        for direct in ("build/validation/capture.jsonl.history",
+                       "/host/repo/build/validation/capture.jsonl.history"):
+            options = logs.argument_parser().parse_args([direct, "--history", "--triage"])
+            with patch.dict(logs.os.environ, {"MMLTK_LOG_HOST_ROOT": "/host/repo"}), \
+                    patch.object(logs.os, "scandir", wraps=logs.os.scandir) as scanned, \
+                    patch.object(logs.LogFile, "capture", wraps=logs.LogFile.capture) as captured:
+                direct_catalog = logs.ArtifactCatalog(options, self.root)
+            self.assertEqual({source.path for source in direct_catalog.files},
+                             {source.path for source in catalog.files})
+            physical = logs.Counter(Path(call.args[0]).resolve() for call in scanned.call_args_list)
+            self.assertEqual(set(physical.values()), {1})
+            self.assertEqual(len(physical), 4)
+            self.assertEqual(captured.call_count, 36)
 
     def test_shared_event_anchors_link_transcript_and_propagate_test_tags(self):
         self.family_fixture()

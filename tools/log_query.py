@@ -737,6 +737,7 @@ MOZILLA_ARTIFACT = re.compile(
 
 
 APPLICATION_ARTIFACT = re.compile(r"^(.*)-application(?:\.[1-5])?\.log$")
+FAMILY_SUFFIXES = (".jsonl", ".log", "-native.log", "-firefox.log", "-acceptance.jsonl", "-application.log")
 
 
 def is_log_path(path, suffixes=(".jsonl", ".log", ".out", ".txt")):
@@ -751,17 +752,20 @@ def directory_logs(directory, suffixes=(".jsonl", ".log", ".out", ".txt")):
                 yield Path(entry.path)
 
 
-def discover_files(inputs, root, recursive=False, host_root=None):
+def normalize_input(supplied, root, host_root=None):
+    pattern = str(supplied)
+    if host_root and (pattern == host_root or pattern.startswith(host_root + "/")):
+        pattern = str(root) + pattern[len(host_root):]
+    return pattern if os.path.isabs(pattern) else str(root / pattern)
+
+
+def discover_files(inputs, root, recursive=False, host_root=None, captured=None, complete_histories=None, directories=None):
     selected = {}
     patterns = set()
-    directories = {}
+    directories = {} if directories is None else directories
     candidates_seen = set()
     for supplied in inputs or ["build/validation"]:
-        pattern = supplied
-        if host_root and (pattern == host_root or pattern.startswith(host_root + "/")):
-            pattern = str(root) + pattern[len(host_root):]
-        if not os.path.isabs(pattern):
-            pattern = str(root / pattern)
+        pattern = normalize_input(supplied, root, host_root)
         if pattern in patterns:
             continue
         patterns.add(pattern)
@@ -786,15 +790,22 @@ def discover_files(inputs, root, recursive=False, host_root=None):
                 directory_found = None
                 candidates = (path,)
             for candidate in candidates:
-                if candidate not in candidates_seen:
-                    item = LogFile.capture(candidate, root)
+                resolved_candidate = candidate.resolve()
+                if resolved_candidate not in candidates_seen:
+                    item = captured.get(resolved_candidate) if captured is not None else None
+                    if item is None:
+                        item = LogFile.capture(candidate, root)
+                        if captured is not None:
+                            captured[item.path] = item
                     selected[item.path] = item
-                    candidates_seen.add(candidate)
+                    candidates_seen.add(resolved_candidate)
                 found = True
                 if directory_found is not None:
                     directory_found = True
             if directory_found is not None:
                 directories[resolved] = directory_found
+                if complete_histories is not None and resolved.name.endswith(".history"):
+                    complete_histories.add(resolved)
         if not found:
             raise QueryError(f"input contains no .jsonl, .log, .out, .txt, or Mozilla process logs: {supplied}")
     return sorted(selected.values(), key=lambda item: item.source)
@@ -808,27 +819,15 @@ def artifact_family(path):
     return original.parent / stem, original, archived
 
 
-def family_paths(family, root, existing=True):
-    host_root = os.environ.get("MMLTK_LOG_HOST_ROOT")
-    if host_root and (family == host_root or family.startswith(host_root + "/")):
-        family = str(root) + family[len(host_root):]
+def normalize_family(family, root, host_root):
     supplied = Path(family)
-    if not supplied.is_absolute():
-        supplied = root / ("build/validation" if supplied.parent == Path(".") else "") / supplied
+    if not supplied.is_absolute() and supplied.parent == Path("."):
+        supplied = Path("build/validation") / supplied
+    supplied = Path(normalize_input(supplied, root, host_root))
     if is_log_path(supplied):
         supplied = artifact_family(supplied)[0]
-    paths = {Path(str(supplied) + suffix) for suffix in
-             (".jsonl", ".log", "-native.log", "-firefox.log", "-acceptance.jsonl", "-application.log")}
-    if supplied.parent.is_dir():
-        with os.scandir(supplied.parent) as entries:
-            for entry in entries:
-                original = entry.name.removesuffix(".history")
-                match = MOZILLA_ARTIFACT.fullmatch(original) or APPLICATION_ARTIFACT.fullmatch(original)
-                if match and match[1] == supplied.name and supplied.parent / original not in paths:
-                    if len(paths) >= MAX_DISTINCT_KEYS:
-                        raise QueryError("artifact family exceeds file budget; narrow the input paths")
-                    paths.add(supplied.parent / original)
-    return sorted({path for path in paths if not existing or path.is_file()})
+    # Normalize the parent, preserving the selected artifact name for role matching.
+    return supplied.parent.resolve() / supplied.name
 
 
 def rotation_identity(identity):
@@ -840,18 +839,34 @@ class ArtifactCatalog:
     """Discover capture siblings and qualify inferred archive pairings explicitly."""
 
     def __init__(self, options, root):
-        inputs = list(options.paths)
-        for family in options.family:
-            siblings = family_paths(family, root)
+        host_root = os.environ.get("MMLTK_LOG_HOST_ROOT")
+        captured = {}
+        complete_histories = set()
+        directories = {}
+        self.files = []
+        if options.paths or not options.family:
+            self.files = discover_files(options.paths, root, options.recursive, host_root,
+                                        captured, complete_histories, directories)
+        requested_families = {normalize_family(family, root, host_root) for family in options.family}
+        families = set(requested_families)
+        if options.history or options.run or options.triage:
+            families.update(artifact_family(source.path)[0] for source in self.files)
+        self.root = root
+        self.inventory = {}
+        self.candidate_count = 0
+        self.discover_families(families, root)
+        inputs = []
+        for family in sorted(requested_families):
+            siblings = self.family_paths(family)
             if not siblings and (options.history or options.run):
-                siblings += [Path(str(path) + ".history") for path in family_paths(family, root, existing=False)
+                siblings += [Path(str(path) + ".history") for path in self.family_paths(family, existing=False)
                              if Path(str(path) + ".history").is_dir()]
             if not siblings:
                 raise QueryError(f"no artifact family found: {family}")
             inputs.extend(str(path) for path in siblings)
-        self.files = discover_files(inputs, root, options.recursive, os.environ.get("MMLTK_LOG_HOST_ROOT"))
-        complete_histories = {Path(path).resolve() for path in inputs
-                              if Path(path).is_dir() and Path(path).name.endswith(".history")}
+        if inputs:
+            discover_files(inputs, root, options.recursive, host_root, captured, complete_histories, directories)
+            self.files = sorted(captured.values(), key=lambda item: item.source)
         if options.history or options.run:
             archives = set()
             families = set()
@@ -861,7 +876,7 @@ class ArtifactCatalog:
                     if family in families:
                         continue
                     families.add(family)
-                    siblings = family_paths(str(family), root, existing=False)
+                    siblings = self.family_paths(family, existing=False)
                 else:
                     siblings = [original]
                 for sibling in siblings:
@@ -869,9 +884,9 @@ class ArtifactCatalog:
                     if directory not in archives and directory.resolve() not in complete_histories and directory.is_dir():
                         archives.add(directory)
             if archives:
-                combined = self.files + discover_files([str(path) for path in sorted(archives)], root)
-                self.files = sorted({item.path: item for item in combined}.values(), key=lambda item: item.source)
-                complete_histories.update(path.resolve() for path in archives)
+                discover_files([str(path) for path in sorted(archives)], root,
+                               captured=captured, complete_histories=complete_histories, directories=directories)
+                self.files = sorted(captured.values(), key=lambda item: item.source)
         original_paths = {source.path for source in self.files}
         if options.triage:
             self.discover_siblings(root, complete_histories)
@@ -898,6 +913,40 @@ class ArtifactCatalog:
                 source for source in self.files
                 if source.metadata["run"] in self.selected_runs or source.metadata["family"] not in selected_families
             ]
+
+    def discover_families(self, families, root):
+        """Retain bounded process names so resolved symlinks need no parent rescan."""
+        parents = set()
+        for family in families:
+            if not family.is_relative_to(root):
+                raise QueryError(f"log input escapes repository mount: {family}")
+            parents.add(family.parent)
+        for parent in sorted(parents):
+            if parent in self.inventory:
+                continue
+            candidates = self.inventory[parent] = {}
+            if not parent.is_dir():
+                continue
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    original = entry.name.removesuffix(".history")
+                    match = MOZILLA_ARTIFACT.fullmatch(original) or APPLICATION_ARTIFACT.fullmatch(original)
+                    if not match or original == match[1] + "-application.log":
+                        continue
+                    names = candidates.setdefault(match[1], set())
+                    if original not in names:
+                        if self.candidate_count >= MAX_DISTINCT_KEYS:
+                            raise QueryError("artifact candidate inventory exceeds file budget; narrow the input paths")
+                        names.add(original)
+                        self.candidate_count += 1
+
+    def family_paths(self, family, existing=True):
+        self.discover_families((family,), self.root)
+        names = self.inventory[family.parent].get(family.name, ())
+        if names and len(names) + len(FAMILY_SUFFIXES) > MAX_DISTINCT_KEYS:
+            raise QueryError("artifact family exceeds file budget; narrow the input paths")
+        paths = {family.parent / name for name in names} | {Path(str(family) + suffix) for suffix in FAMILY_SUFFIXES}
+        return sorted(path for path in paths if not existing or path.is_file())
 
     def discover_siblings(self, root, complete_histories):
         """Scan each relevant history directory once; match only requested neighborhoods."""
@@ -927,7 +976,7 @@ class ArtifactCatalog:
                 request["names"].add(source.path.stem)
         for family, request in sorted(requests.items()):
             rotations = {pid: sorted(times) for pid, times in request["rotations"].items()}
-            for original in family_paths(str(family), root, existing=False):
+            for original in self.family_paths(family, existing=False):
                 if request["current"] and original.is_file():
                     add(original, "current artifact sibling")
                 directory = Path(str(original) + ".history")

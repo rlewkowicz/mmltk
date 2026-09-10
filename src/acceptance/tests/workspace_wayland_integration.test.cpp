@@ -3501,7 +3501,7 @@ struct BrowserAudit final {
             complete = record.value("detail", "") == "typed-mvc-wayland" && annotation_revision != 0U && exported_receipt != 0U &&
                        exported_receipt == frame_receipt && frame_receipt == browser_receipt;
             presentation_receipt = exported_receipt;
-        } else if (event == "integration.failed") {
+        } else if (event == "integration.failed" || event == "browser.invalid_webgpu_texture") {
             failed = true;
         } else if (event == "firefox.workspace.admitted") {
             firefox_import = true;
@@ -3821,7 +3821,7 @@ struct BrowserAudit final {
             reopened, "dataset reopen", repeated_same_revision, "same-revision redraw",
             annotation_ready && annotation_tool && annotation_pointer, "annotation lifecycle",
             complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt),
-            "presentation completion", bounds_valid && !failed && !panic && !workspace_protocol_failure, "browser validity",
+            "presentation completion", bounds_valid && !failed_before_termination(), "browser validity",
             firefox_import && firefox_claim && firefox_ready, "Firefox integration",
             std::ranges::all_of(expected, [this](const std::string_view id) { return controls.contains(id); }), "expected controls");
     }
@@ -3961,7 +3961,7 @@ class JsonLineCursor final {
         : path_(std::move(path)), offset_(offset), format_(format) {}
 
     template <class Audit, class Observer>
-    void consume(Audit& audit, Observer&& observer) {
+    void consume(Audit& audit, Observer&& observer, const bool final = false) {
         std::ifstream input{path_, std::ios::binary | std::ios::ate};
         if (!input) throw std::runtime_error("evidence artifact unavailable: " + path_.string());
         const auto end = input.tellg();
@@ -3986,6 +3986,10 @@ class JsonLineCursor final {
                 consume_line(audit, observer);
                 pending_.clear();
             }
+        }
+        if (final && format_ == Format::FirefoxText && !pending_.empty()) {
+            consume_line(audit, observer);
+            pending_.clear();
         }
     }
 
@@ -4117,6 +4121,55 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
     JsonLineCursor browser_cursor{firefox, 0U, JsonLineCursor::Format::FirefoxText};
     browser_cursor.consume(browser, [](const auto&) {});
     CHECK(browser.records == 1U);
+    const std::array failures{
+        "Uncaptured WebGPU error: Texture TextureId(1,1) is invalid",
+        "XPCOMGlueLoad error: dependency unavailable",
+        "Couldn't load XPCOM",
+        "thread 'main' panicked at failure",
+        "{\"event\":\"integration.failed\"}",
+        "{\"event\":\"browser.panic\"}",
+        "{\"event\":\"browser.invalid_webgpu_texture\"}",
+        "{\"event\":\"firefox.workspace.channel_terminal\",\"terminal\":\"protocol_failure\"}",
+    };
+    for (const bool viewer : {false, true}) {
+        const nlohmann::json completion{
+            {"event", viewer ? "integration.viewer_complete" : "integration.complete"},
+            {"detail", viewer ? "square" : "typed-mvc-wayland"}, {"a", 1U}, {"b", 1U}, {"c", 1U}, {"d", 1U},
+        };
+        for (const auto* failure : failures) {
+            for (const std::string_view order : {"failure-first", "completion-first", "final-drain", "older-than-tail"}) {
+                INFO("viewer: " << viewer << ", failure: " << failure << ", order: " << order);
+                {
+                    std::ofstream output{firefox, std::ios::trunc};
+                    if (order == "failure-first" || order == "older-than-tail") output << failure << '\n';
+                    if (order == "older-than-tail")
+                        for (std::size_t index = 0U; index != count; ++index) output << "Firefox ordinary text\n";
+                    output << completion.dump() << '\n';
+                    if (order == "completion-first") output << failure << '\n';
+                }
+                BrowserAudit evidence;
+                JsonLineCursor evidence_cursor{firefox, 0U, JsonLineCursor::Format::FirefoxText};
+                evidence_cursor.consume(evidence, [](const auto&) {});
+                CHECK((viewer ? evidence.viewer_complete : evidence.complete));
+                if (order == "final-drain") {
+                    CHECK_FALSE(evidence.failed_before_termination());
+                    { std::ofstream output{firefox, std::ios::app}; output << failure; }
+                    // Final Firefox text need not have a newline. Ordinary reads
+                    // retain it until terminal settlement supplies the last extent.
+                    evidence_cursor.consume(evidence, [](const auto&) {});
+                    CHECK_FALSE(evidence.failed_before_termination());
+                    evidence_cursor.consume(evidence, [](const auto&) {}, true);
+                }
+                if (order == "older-than-tail") CHECK_FALSE(read_tail(firefox).contains(failure));
+                // Both readiness exits and terminal settlement use this owner,
+                // independently of their ordinary/viewer completion evidence.
+                CHECK(evidence.failed_before_termination());
+                CHECK_FALSE(evidence.failure_blocker().empty());
+                evidence_cursor.consume(evidence, [](const auto&) {}, true);
+                CHECK(evidence.failed_before_termination());
+            }
+        }
+    }
 }
 
 void report_consumed_record(const nlohmann::json& record, const std::string_view source) {
@@ -4343,18 +4396,21 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     PixelBoundaryAudit pixel_audit{pixel_probes};
     JsonLineCursor native_cursor{diagnostics, diagnostics_offset};
     JsonLineCursor browser_cursor{firefox_log, firefox_offset, JsonLineCursor::Format::FirefoxText};
-    const auto consume_records = [&] {
+    const auto consume_records = [&](const bool final = false) {
         native_cursor.consume(native, [&](const auto& record) {
             surface_audit.native(record);
             pixel_audit.consume(record);
             report_consumed_record(record, "native");
         });
         if (native.firefox_pid > 0) process.retain_peer(native.firefox_pid);
-        browser_cursor.consume(browser, [&](const auto& record) {
-            surface_audit.browser(record);
-            pixel_audit.consume(record);
-            report_consumed_record(record, "firefox");
-        });
+        browser_cursor.consume(
+            browser,
+            [&](const auto& record) {
+                surface_audit.browser(record);
+                pixel_audit.consume(record);
+                report_consumed_record(record, "firefox");
+            },
+            final);
         for (const auto& [generation, evidence] : browser.gallery_generations) {
             const auto digest = native.placeholder_digests.find(generation);
             const auto cardinality = native.placeholder_cardinalities.find(generation);
@@ -4483,7 +4539,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     for (;;) {
         consume_records();
         if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
-        if (!viewer_scenario.empty() && browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
+        if (!terminal_failure_observed && !browser.failed_before_termination() && !viewer_scenario.empty() &&
+            browser.viewer_complete && browser.surface_draws.contains(browser.viewer_presentation) &&
             native.presentation_ready && native.explore_rendered && surface_audit.failure.empty() && pixel_audit.failure.empty() &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
             pixel_audit.probe_failure_complete(probe_failure) &&
@@ -4550,7 +4607,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
             terminal_failure_observed = true;
             arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "terminal failure settlement");
         }
-        if (!terminal_failure_observed &&
+        if (!terminal_failure_observed && !browser.failed_before_termination() &&
             (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) &&
             browser.product_ready() && rendered_probe_exported &&
             (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
@@ -4689,7 +4746,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         FAIL("workspace Wayland acceptance exceeded its configured deadline during shutdown");
     }
     const int terminal = *terminal_result;
-    consume_records();
+    consume_records(true);
     native_cursor.finish();
     const std::string native_text = read_tail(diagnostics);
     const std::string browser_text = read_tail(firefox_log);
@@ -4700,6 +4757,8 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     INFO("Firefox diagnostics: " << browser_text);
     INFO("native readiness blocker: " << native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
     INFO("browser readiness blocker: " << browser.readiness_blocker());
+    INFO("browser failure: " << browser.failure_blocker());
+    CHECK_FALSE(browser.failed_before_termination());
     REQUIRE(terminal >= 0);
     CHECK(native.peer_open_count > 0U);
     CHECK(native.peer_close_count == native.peer_open_count);
@@ -4759,7 +4818,6 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         CHECK(native.presentation_ready);
         CHECK(native.shutdown_complete);
         CHECK_FALSE(native.worker_failed);
-        CHECK_FALSE(browser.workspace_protocol_failure);
         if (viewer_scenario == "semantics") {
             CHECK((browser.viewer_overlay_modes == std::set<std::uint64_t>{0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U}));
             CHECK_FALSE(browser.viewer_label_colors.empty());
@@ -4886,10 +4944,6 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     constexpr std::size_t fixture_descriptor_allowance = 64U * 1024U;
     constexpr std::size_t maximum_fixture_lane_bytes = source_and_donor_bytes + donor_mask_bytes + fixture_descriptor_allowance;
     CHECK(native.explore_max_pinned <= native.explore_nproc * maximum_fixture_lane_bytes);
-    CHECK_FALSE(browser.workspace_protocol_failure);
-    CHECK(browser_text.find("XPCOMGlueLoad error") == std::string::npos);
-    CHECK(browser_text.find("Couldn't load XPCOM") == std::string::npos);
-    CHECK(browser_text.find("panicked at") == std::string::npos);
 
     const auto compiled_path = std::filesystem::path{mmltk::backend::data::testsupport::compiled_bin_path(fixture)};
     REQUIRE(std::filesystem::is_regular_file(compiled_path));
