@@ -75,9 +75,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     }
 
     ~NativePresentationWriter() override {
-        // A receiver whose CUDA completion cannot be established must never
-        // release a borrowed producer into concurrent reuse during destruction.
-        if (!SettleSourceRead()) std::terminate();
+        // Unsettled CUDA work must never outlive callback storage or release
+        // a borrowed producer into concurrent reuse during destruction.
+        if (!SettlePhysicalWork()) std::terminate();
         if (pixel_samples_) {
             try {
                 context_.Bind();
@@ -138,7 +138,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (release_span_) release_span_->Finish(contracts::DiagnosticSpanOutcome::Exception);
         if (terminal_retired_)
             return {.all_released = terminal_release_succeeded_,
-                    .safe_to_destroy = !source_read_ && !source_completion_ && !pixel_work_pending_ && !transfer_target_ && !release_wait_pending_};
+                    .safe_to_destroy = !NeedsSettlement()};
         bool context_bound = true;
         try {
             context_.Bind();
@@ -148,7 +148,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         browser_terminal_ = true;
         terminal_release_succeeded_ = RetirePhysical() && context_bound;
         return {.all_released = terminal_release_succeeded_,
-                .safe_to_destroy = !source_read_ && !source_completion_ && !pixel_work_pending_ && !transfer_target_ && !release_wait_pending_};
+                .safe_to_destroy = !NeedsSettlement()};
     }
 
    private:
@@ -166,7 +166,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         cudaError_t status = cudaSuccess;
     };
 
-    [[nodiscard]] static bool EnqueueCompletion(cudaStream_t stream, Completion& signal) noexcept {
+    [[nodiscard]] bool EnqueueCompletion(cudaStream_t stream, Completion& signal) noexcept {
+        // Notification consumption does not prove callback return: the callback
+        // still accesses its record and descriptor after publishing ready.
+        // Only stream settlement discharges this obligation, including when
+        // callback submission reports a failure from earlier asynchronous work.
+        completion_settlement_pending_ = true;
         // Unlike a host function, this callback also wakes on device failure.
         return cudaStreamAddCallback(stream, [](cudaStream_t, const cudaError_t status, void* context) {
                 auto& completion = *static_cast<Completion*>(context);
@@ -201,8 +206,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
     }
 
-    [[nodiscard]] bool SettleSourceRead() noexcept {
-        if (!source_read_ && !source_completion_ && !pixel_work_pending_ && !transfer_target_ && !release_wait_pending_) return true;
+    [[nodiscard]] bool NeedsSettlement() const noexcept {
+        return source_read_ || source_completion_ || pixel_work_pending_ || transfer_target_ || release_wait_pending_ ||
+               completion_settlement_pending_;
+    }
+
+    [[nodiscard]] bool SettlePhysicalWork() noexcept {
+        if (!NeedsSettlement()) return true;
         // A dead browser cannot be asked to advance its semaphore. Retain this
         // writer (including callback storage) if that external wait is unsettled.
         if (browser_terminal_ && release_wait_pending_) {
@@ -221,6 +231,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         pixel_work_pending_ = false;
         transfer_target_ = nullptr;
         release_wait_pending_ = false;
+        completion_settlement_pending_ = false;
         return true;
     }
 
@@ -243,7 +254,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
 
     [[nodiscard]] bool RetirePhysical() noexcept {
         if (!browser_terminal_ || terminal_retired_) return false;
-        if (!SettleSourceRead()) return false;
+        if (!SettlePhysicalWork()) return false;
         // Releasing terminal source storage can destroy its context on this
         // thread. Restore the receiver before retiring exported resources.
         try {
@@ -525,7 +536,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             // Copy or timeline submission may fail after a source read was
             // queued. Keep custody until the receiver reaches completion; an
             // unprovable settlement stays with this writer through retirement.
-            static_cast<void>(SettleSourceRead());
+            static_cast<void>(SettlePhysicalWork());
             throw;
         }
         return {};
@@ -751,6 +762,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     mmltk::common::io::ScopedFd completion_fd_;
     Completion completion_;
     Completion copy_completion_;
+    bool completion_settlement_pending_ = false;
     std::optional<gpu::BorrowedImageProductReadView> source_read_;
     std::optional<gpu::ImageProductReadCompletion> source_completion_;
     NativeAllocation* transfer_target_ = nullptr;
