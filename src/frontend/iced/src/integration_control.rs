@@ -542,7 +542,7 @@ function report(record) {
   }
   const line = JSON.stringify(record);
   if (typeof globalThis.dump === 'function') globalThis.dump(`${line}\n`);
-  console.error(line);
+  else console.error(line);
   releaseIntegrationSurfaceClick(record);
 }
 
@@ -7410,11 +7410,12 @@ impl Controller {
                 else {
                     return Task::none();
                 };
-                if pixel_source != source
-                    || pixel_presentation != drawn
-                    || checksum == 0
-                    || blue < 32
-                {
+                if pixel_source != source || pixel_presentation != drawn {
+                    self.upscale_pixels = None;
+                    sample_upscale_pixels(viewer.image, button, source, drawn);
+                    return Task::none();
+                }
+                if checksum == 0 || blue < 32 {
                     self.fail("Upscale actual canvas image or completed blue method did not match its displayed result");
                     return Task::none();
                 }
@@ -8341,12 +8342,9 @@ impl Controller {
                     return Task::none();
                 };
                 let presentation_revision = sampleable.presentation_revision;
-                if !model.annotation_edit_available() || (self.copy_step!=8 && snapshot.ui.interactionrevision <= revision)
-                    || (self.copy_step==8 && snapshot.frame.revision<=self.copy_product_frame)
-                    // The browser helper emits Begin, Update, End (or holds after
-                    // Update). Each ordered native pointer publishes one frame.
-                    || (self.copy_step==8 && self.copy_product_gesture.is_some() && !self.copy_product_cancelled
-                        && snapshot.frame.revision<self.copy_product_frame+if self.copy_product_cancel{2}else{3})
+                if !model.annotation_edit_available()
+                    || (self.copy_step != 8 && snapshot.ui.interactionrevision <= revision)
+                    || (self.copy_step == 8 && snapshot.frame.revision <= self.copy_product_frame)
                     || sampleable.source_revision != snapshot.frame.revision
                     || presentation.completed.source.kind
                         != crate::generated::PresentationSourceKind::Annotation

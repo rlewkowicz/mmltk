@@ -118,7 +118,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (result.progress != PresentationNativeProgress::Published && capacity_wake && active_ && active_->import_id == *capacity_wake &&
             active_->latest)
             reoffer_pending_ = true;
-        if (reoffer_pending_ && !pending_frame_ && !transfer_target_ && !release_wait_pending_ && active_ && active_->latest) {
+        if (application_peer_connected_.load(std::memory_order_acquire) && reoffer_pending_ && !pending_frame_ && !transfer_target_ &&
+            !release_wait_pending_ && active_ && active_->latest && channel_.claimable(active_->import_id)) {
             reoffer_pending_ = false;
             static_cast<void>(OfferLatest(*active_, reinterpret_cast<cudaStream_t>(stream_.native_handle())));
         }
@@ -130,6 +131,10 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     int completion_fd() const noexcept override { return completion_fd_.get(); }
 
     bool wants_write() const noexcept override { return channel_.wants_write(); }
+
+    void SetApplicationPeerConnected(const bool connected) noexcept override {
+        application_peer_connected_.store(connected, std::memory_order_release);
+    }
 
     void SetExpectedBrowserProcessGroup(const pid_t process_group) override { channel_.set_expected_process_group(process_group); }
 
@@ -230,6 +235,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         ReleaseSourceRead();
         pixel_work_pending_ = false;
         transfer_target_ = nullptr;
+        transfer_copy_completed_ = false;
         release_wait_pending_ = false;
         completion_settlement_pending_ = false;
         return true;
@@ -454,6 +460,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     PresentationNativeOutcome TryIssue(const std::uint64_t current_selection_generation) {
         if (transfer_target_ || release_wait_pending_) return {};
         if (!pending_frame_) return {};
+        if (!application_peer_connected_.load(std::memory_order_acquire) || !channel_.connected()) return {};
         if (pending_frame_->submitted.selection_generation != current_selection_generation) {
             const auto superseded = pending_frame_->submitted;
             pending_frame_.reset();
@@ -470,7 +477,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             target = candidate_.get();
         else if (!candidate_ && active_ && active_->timeline && Contains(active_.get(), frame.extent))
             target = active_.get();
-        if (target == nullptr) return {};
+        if (target == nullptr || !channel_.claimable(target->import_id)) return {};
         auto stream = reinterpret_cast<cudaStream_t>(stream_.native_handle());
         const auto previous_submitted = target->submitted;
         target->submitted = submitted;
@@ -547,30 +554,35 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         auto* target = transfer_target_;
         const auto submitted = target->latest->submitted;
         const auto ready = native::detail::workspace_timeline_ready(target->latest->transfer_sequence);
-        ReleaseSourceRead();
-        // Releasing a terminal producer may restore its own CUDA context.
-        context_.Bind();
-        if (pixel_sample_pending_) {
-            const auto* samples = static_cast<const std::uint32_t*>(pixel_samples_->data());
-            std::array<VisualDiagnosticFact, 25U> facts;
-            for (std::size_t index = 0U; index < pixel_coordinates_.size(); ++index) {
-                facts[index] = pixel_fact_;
-                facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
-                                              .sample_x = pixel_coordinates_[index][0],
-                                              .sample_y = pixel_coordinates_[index][1],
-                                              .sample_rgba = samples[index]};
+        if (!transfer_copy_completed_) {
+            ReleaseSourceRead();
+            // Releasing a terminal producer may restore its own CUDA context.
+            context_.Bind();
+            if (pixel_sample_pending_) {
+                const auto* samples = static_cast<const std::uint32_t*>(pixel_samples_->data());
+                std::array<VisualDiagnosticFact, 25U> facts;
+                for (std::size_t index = 0U; index < pixel_coordinates_.size(); ++index) {
+                    facts[index] = pixel_fact_;
+                    facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
+                                                  .sample_x = pixel_coordinates_[index][0],
+                                                  .sample_y = pixel_coordinates_[index][1],
+                                                  .sample_rgba = samples[index]};
+                }
+                diagnostics_.WriteBatch(facts);
+                pixel_sample_pending_ = false;
             }
-            diagnostics_.WriteBatch(facts);
-            pixel_sample_pending_ = false;
+            pixel_work_pending_ = false;
+            if (ready_span_) {
+                ready_span_->FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
+                ready_span_.reset();
+            }
+            transfer_copy_completed_ = true;
         }
-        pixel_work_pending_ = false;
-        if (ready_span_) {
-            ready_span_->FinishWith([](auto& fact) { fact.detail = fact.context.outcome = 1U; });
-            ready_span_.reset();
-        }
+        if (!application_peer_connected_.load(std::memory_order_acquire) || !channel_.claimable(target->import_id)) return {};
         PublishTransfer(*target, ready);
         transfer_target_ = nullptr;
         transfer_complete_ = false;
+        transfer_copy_completed_ = false;
         const bool publication = std::exchange(transfer_is_publication_, false);
         if (!publication) return {};
         if (target == candidate_.get()) {
@@ -607,22 +619,23 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         const std::uint64_t transfer_sequence = mmltk::common::types::take_monotonic_identity(allocation.next_transfer_sequence);
         const std::uint64_t ready = native::detail::workspace_timeline_ready(transfer_sequence);
         allocation.latest->transfer_sequence = transfer_sequence;
-        if (diagnostics_.pixel_probes_enabled() && !pixel_probe_failed_ && source_completion_ &&
-            !EnqueueCompletion(stream, copy_completion_))
-            pixel_probe_failed_ = true;
-        services::RuntimeDiagnosticSpan probe_span{
-            diagnostics_.pixel_probes_enabled() ? diagnostics_ : VisualDiagnosticSink{},
-            [&] {
-                return visual_diagnostic_boundary(AllocationFact(VisualDiagnosticOperation::PresentationPixelProbeStarted, allocation),
-                                                  VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
-            },
-            allocation.latest->diagnostic_link};
-        if (SamplePixels(allocation, stream)) {
-            pixel_fact_ = AllocationFact(VisualDiagnosticOperation::PresentationPixel, allocation);
-            pixel_fact_.context.link = probe_span.link();
-            pixel_sample_pending_ = true;
+        if (diagnostics_.pixel_probes_enabled()) {
+            if (!pixel_probe_failed_ && source_completion_ && !EnqueueCompletion(stream, copy_completion_)) pixel_probe_failed_ = true;
+            services::RuntimeDiagnosticSpan probe_span{
+                diagnostics_,
+                [&] {
+                    return visual_diagnostic_boundary(
+                        AllocationFact(VisualDiagnosticOperation::PresentationPixelProbeStarted, allocation),
+                        VisualDiagnosticOperation::PresentationPixelProbeSubmitted);
+                },
+                allocation.latest->diagnostic_link};
+            if (SamplePixels(allocation, stream)) {
+                pixel_fact_ = AllocationFact(VisualDiagnosticOperation::PresentationPixel, allocation);
+                pixel_fact_.context.link = probe_span.link();
+                pixel_sample_pending_ = true;
+            }
+            probe_span.FinishWith([&](auto& fact) { fact.context.outcome = pixel_probe_failed_ ? 0U : 1U; });
         }
-        probe_span.FinishWith([&](auto& fact) { fact.context.outcome = pixel_probe_failed_ ? 0U : 1U; });
         // The stream orders all image work before the exported ready value.
         // The worker publishes its exact metadata when completion wakes it.
         allocation.timeline->SignalReady(stream, ready);
@@ -635,6 +648,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 },
                 allocation.latest->diagnostic_link);
         transfer_target_ = std::addressof(allocation);
+        transfer_copy_completed_ = false;
         if (!EnqueueCompletion(stream, completion_)) throw std::runtime_error("presentation completion submission failed");
         return ready;
     }
@@ -773,6 +787,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::optional<gpu::ImageProductReadCompletion> source_completion_;
     NativeAllocation* transfer_target_ = nullptr;
     bool transfer_complete_ = false;
+    bool transfer_copy_completed_ = false;
     bool transfer_is_publication_ = false;
     bool reoffer_pending_ = false;
     std::unique_ptr<NativeAllocation> active_;
@@ -782,6 +797,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::uint64_t next_generation_ = 1U;
     std::uint64_t next_presentation_revision_ = 1U;
     bool release_wait_pending_ = false;
+    std::atomic_bool application_peer_connected_{true};
     bool browser_terminal_ = false;
     bool terminal_retired_ = false;
     bool terminal_release_succeeded_ = true;

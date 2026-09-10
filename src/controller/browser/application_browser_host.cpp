@@ -137,6 +137,7 @@ struct ApplicationBrowserHost::Impl final {
         try {
             auto* installed = systems.load(std::memory_order_acquire);
             if (admission.load(std::memory_order_acquire) && installed != nullptr) {
+                if (installed->presentation != nullptr) installed->presentation->SetApplicationPeerConnected(true);
                 std::uint64_t epoch;
                 {
                     std::scoped_lock lock(input_mutex);
@@ -368,7 +369,10 @@ struct ApplicationBrowserHost::Impl final {
         }
         if (!admission.load(std::memory_order_acquire)) return;
         auto* installed = systems.load(std::memory_order_acquire);
-        if (installed != nullptr && installed->annotation != nullptr) installed->annotation->PeerClosed();
+        if (installed != nullptr) {
+            if (installed->presentation != nullptr) installed->presentation->SetApplicationPeerConnected(false);
+            if (installed->annotation != nullptr) installed->annotation->PeerClosed();
+        }
     }
     static void Closed(void* context) noexcept { static_cast<Impl*>(context)->closed(); }
     static void Diagnostic(void* context, const transport::BrowserServerEvent event, const std::size_t value) noexcept {

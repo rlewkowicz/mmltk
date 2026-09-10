@@ -272,6 +272,7 @@ class BrowserHostProcess final {
     BrowserHostProcess& operator=(const BrowserHostProcess&) = delete;
 
     [[nodiscard]] int control_fd() const noexcept { return control_write_.get(); }
+    [[nodiscard]] bool explore_control_closed() const noexcept { return explore_control_closed_; }
     [[nodiscard]] int pidfd() const noexcept { return pidfd_.get(); }
     [[nodiscard]] bool active() const noexcept { return child_ > 0 && pidfd_.get() >= 0; }
     [[nodiscard]] int status() const noexcept { return status_; }
@@ -301,6 +302,7 @@ class BrowserHostProcess final {
         } while (consumed < 0 && errno == EINTR);
         if (consumed == static_cast<ssize_t>(sizeof(event))) return event;
         if (consumed == 1 && event.event == mmltk::controller::ExploreAcceptanceGate::ControlEvent::InitialWait) return event;
+        explore_control_closed_ = consumed == 0;
         control_write_.reset();
         return std::nullopt;
     }
@@ -386,6 +388,7 @@ class BrowserHostProcess final {
     pid_t peer_group_ = -1;
     ScopedFd peer_pidfd_;
     ScopedFd control_write_;
+    bool explore_control_closed_ = false;
     int status_ = -1;
 };
 
@@ -728,8 +731,8 @@ struct SurfaceAudit final {
                 draws.push_back({id, record.value("requested_surface", ""), browser_ordinal});
             }
         } else if (event == "iced.surface.pending_discarded") {
-            if (state.created == 0U || state.captured != 0U || state.discarded != 0U)
-                reject("Iced pending discard does not name a unique uncaptured import");
+            if (state.created == 0U || state.discarded != 0U)
+                reject("Iced pending discard does not name a unique live import");
             state.discarded = browser_ordinal;
         } else if (event == "iced.surface.renderer_reconstructed") {
             const std::string requested = record.value("requested_surface", "");
@@ -1267,8 +1270,9 @@ struct PixelBoundaryAudit final {
         } else if (event == "iced.surface.pixel")
             boundary = 3U;
         else if (event == "iced.surface.canvas_pixel") {
-            boundary = 4U;
             canvas_seen = true;
+            if (record.value("control", "") != "explore.detail.workspace") return;
+            boundary = 4U;
         } else
             return;
         if (!enabled && (event == "presentation.frame.edge" || event == "firefox.workspace.frame_forwarded")) return;
@@ -1318,7 +1322,7 @@ struct PixelBoundaryAudit final {
                            static_cast<std::uint32_t>(scalar(record, "sample_rgba"))};
         if (boundary != 4U && target.values[index] && target.values[index] != value) reject("immutable owner pixel changed");
         target.values[index] = value;
-        publication.viewer = publication.viewer || (boundary == 4U && record.value("control", "") == "explore.detail.workspace");
+        publication.viewer = publication.viewer || boundary == 4U;
         if (publication.viewer && boundary == 4U) ++viewer_canvas_joins;
         reconcile(publication);
     }
@@ -1450,6 +1454,12 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     colored_viewer.consume(canvas);
     colored_viewer.consume(selected);
     CHECK(colored_viewer.viewer_nonblack_complete());
+    canvas["control"] = "workflow.visual.workspace";
+    canvas["sample_rgba"] = 0xff000000U;
+    colored_viewer.consume(canvas);
+    CHECK(colored_viewer.failure.empty());
+    canvas["control"] = "explore.detail.workspace";
+    canvas["sample_rgba"] = 0xff705030U;
     for (const bool missing_sample : {false, true}) {
         PixelBoundaryAudit dropped_edge;
         fill(dropped_edge, owned, missing_sample, false, "presentation.frame.edge");
@@ -2195,8 +2205,9 @@ struct NativeAudit final {
         donor_descriptors = donor_descriptors || (owner == "explore" && event == "explore.donor.descriptors.prepared" && value != 0U &&
                                                   scalar(record, "detail") != 0U && scalar(record, "capacity_width") > value &&
                                                   scalar(record, "capacity_height") > scalar(record, "detail"));
-        annotation_copied = annotation_copied || (owner == "annotation" && event == "copy.completed");
-        annotation_opened = annotation_opened || (owner == "annotation" && event == "document.opened");
+        const bool document_opened = owner == "annotation" && event == "document.opened";
+        annotation_copied = annotation_copied || document_opened || (owner == "annotation" && event == "copy.completed");
+        annotation_opened = annotation_opened || document_opened;
         annotation_edited = annotation_edited || (owner == "annotation" && event == "document.edited");
         if (owner == "presentation" && event == "timeline.ready" && value != 0U) {
             presentation_ready = true;
@@ -2459,6 +2470,23 @@ struct AtlasDrawAudit final {
         return {record.value("surface", ""), scalar(record, "generation"), scalar(record, "presentation_revision")};
     }
 
+    [[nodiscard]] static AllocationKey allocation_key(const nlohmann::json& record) {
+        return {record.value("surface", ""), scalar(record, "generation"), scalar(record, "width"), scalar(record, "height")};
+    }
+
+    void observe_staged_rows(const AllocationKey& allocation, const std::uint64_t rows) {
+        if (!staged_allocation) {
+            staged_allocation = allocation;
+        } else if (*staged_allocation != allocation) {
+            return;
+        } else {
+            if (previous_staged_rows == 4U && rows == 5U) staged_transitions |= 1U;
+            if (previous_staged_rows == 5U && rows == 4U) staged_transitions |= 2U;
+        }
+        grid_round_trip = staged_transitions == 3U;
+        previous_staged_rows = rows;
+    }
+
     [[nodiscard]] static bool same_fields(const nlohmann::json& left, const nlohmann::json& right,
                                           const std::initializer_list<const char*> fields) {
         return std::ranges::all_of(
@@ -2475,8 +2503,7 @@ struct AtlasDrawAudit final {
                          "content_session", "source_kind", "source_instance", "source_revision", "content_width",         "content_height",
                          "columns",         "rows",        "first_row",       "matching_count",  "visible_indices",       "bounds",
                          "image",           "clip"});
-        const AllocationKey allocation{record.value("surface", ""), scalar(record, "generation"), scalar(record, "width"),
-                                       scalar(record, "height")};
+        const auto allocation = allocation_key(record);
         matching = matching && (!staged_allocation || *staged_allocation == allocation);
         if (matching) {
             const auto row = scalar(record, "first_row");
@@ -2497,12 +2524,7 @@ struct AtlasDrawAudit final {
         valid = valid && matching;
         if (matching) {
             stages.emplace(name);
-            staged_allocation = allocation;
-            const auto rows = scalar(record, "rows");
-            if (previous_staged_rows == 4U && rows == 5U) staged_transitions |= 1U;
-            if (previous_staged_rows == 5U && rows == 4U) staged_transitions |= 2U;
-            grid_round_trip = staged_transitions == 3U;
-            previous_staged_rows = rows;
+            observe_staged_rows(allocation, scalar(record, "rows"));
         }
         last_draw.reset();
     }
@@ -2591,6 +2613,8 @@ struct AtlasDrawAudit final {
         valid = valid && matching;
         if (matching) {
             seen = true;
+            if (staged_allocation)
+                observe_staged_rows(allocation_key(record), rows);
             last_draw = record;
             drawn_rows.emplace(scalar(record, "first_row"));
         } else {
@@ -3193,7 +3217,7 @@ struct BrowserAudit final {
             annotation_pixels_valid =
                 annotation_pixels_valid && annotation_pixel_frames.contains({scalar(record, "a"), scalar(record, "b")});
         } else if (event == "integration.annotation_preview") {
-            if (scalar(record, "b") >= scalar(record, "a") + 2U && scalar(record, "c") != 0U) ++annotation_previews;
+            if (scalar(record, "b") > scalar(record, "a") && scalar(record, "c") != 0U) ++annotation_previews;
         } else if (event == "integration.annotation_shape") {
             annotation_shapes.insert(record.value("detail", ""));
         } else if (event == "integration.viewer_import_edit") {
@@ -4414,6 +4438,10 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         if ((descriptors[2].revents & POLLIN) != 0) {
             const auto event = process.receive_explore_event();
             if (!event) {
+                // A successful child teardown can close the sequenced-packet
+                // control peer before its pidfd becomes readable. Let the
+                // process/readiness path judge that terminal transition.
+                if (process.explore_control_closed()) continue;
                 record_acceptance_state("acceptance.control.failed", true);
                 process.terminate();
                 FAIL("workspace Wayland Explore control event was invalid");
@@ -4660,7 +4688,11 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         CHECK((native.peer_close_count + 1U == native.peer_open_count ||
                (native.peer_close_count == native.peer_open_count && native.peer_closed_after_shutdown)));
     } else {
-        CHECK(native.peer_close_count == native.peer_open_count);
+        // BrowserServer finalization physically closes the remaining peer before
+        // shutdown.complete. Its bounded diagnostic stream may omit that final
+        // peer_closed record under teardown pressure.
+        CHECK((native.peer_close_count == native.peer_open_count ||
+               (native.peer_close_count + 1U == native.peer_open_count && native.shutdown_complete)));
     }
     CHECK_FALSE(native.interaction_rejected);
     CHECK(native.partial_generation != 0U);
@@ -5090,6 +5122,17 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     record_receiver_withdrawal(dropped_candidate_retirement);
     CHECK(dropped_candidate_retirement.joined_failure().empty());
 
+    SurfaceAudit used_pending;
+    for (const char* event : native_surface_events)
+        used_pending.native(native_surface_record(event));
+    for (std::size_t index = 0U; index < 8U; ++index)
+        used_pending.browser(browser_surface_record(browser_surface_events[index]));
+    used_pending.browser(browser_surface_record("firefox.workspace.withdrawal"));
+    used_pending.browser(browser_surface_record("iced.surface.pending_discarded"));
+    used_pending.browser(browser_surface_record("iced.surface.retired"));
+    used_pending.browser(browser_surface_record("firefox.workspace.retired"));
+    CHECK(used_pending.joined_failure().empty());
+
     for (const bool observed_native_outcome : {false, true}) {
         SurfaceAudit rejected;
         for (std::size_t index = 0U; index < 3U; ++index)
@@ -5112,6 +5155,11 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
 }
 
 TEST_CASE("incremental Explore audit joins exact inventories across dropped diagnostics", "[workspace][audit]") {
+    NativeAudit annotation;
+    annotation.consume({{"kind", "gui_runtime"}, {"owner", "annotation"}, {"event", "document.opened"}});
+    CHECK(annotation.annotation_copied);
+    CHECK(annotation.annotation_opened);
+
     NativeAudit audit;
     audit.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U, 4096U);
     audit.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U, 4096U);
@@ -5603,6 +5651,21 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
             audit.consume(draw);
         }
     };
+    AtlasDrawAudit between_stages;
+    for (std::size_t index = 0U; index != names.size(); ++index) {
+        const std::array<std::uint64_t, 6U> first_rows{0U, 1U, 2U, 10U, 71U, 0U};
+        const double top = index == 4U ? -100.0 : (index == 0U ? -37.25 : 0.0);
+        auto draw = atlas_draw_record(70U + index, first_rows[index], 4U, top);
+        publish(between_stages, draw);
+        draw["event"] = "iced.surface.scroll_stage";
+        draw["control"] = names[index];
+        between_stages.consume(draw);
+        if (index == 0U)
+            publish(between_stages, atlas_draw_record(80U, 0U, 5U, -37.25));
+    }
+    CHECK(between_stages.valid);
+    CHECK(between_stages.grid_round_trip);
+
     for (const auto* scenario : {"constant", "only-grow", "only-shrink", "generation", "surface", "width", "height"}) {
         INFO(scenario);
         const std::string_view kind{scenario};

@@ -1701,7 +1701,9 @@ class TestPresentationWriter final : public PresentationNativeWriter {
                 .submitted = submitted_,
             };
         }
-        if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) return {.capability = capability()};
+        if (!pending_ || !application_peer_connected_.load(std::memory_order_acquire) ||
+            !state_->allow_publication.load(std::memory_order_acquire))
+            return {.capability = capability()};
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
         if (candidate_target && retiring_) return {.capability = capability()};
         auto source = reader_->borrow();
@@ -1738,6 +1740,9 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     int poll_fd() const noexcept override { return state_->readiness.get(); }
     int completion_fd() const noexcept override { return -1; }
     bool wants_write() const noexcept override { return false; }
+    void SetApplicationPeerConnected(const bool connected) noexcept override {
+        application_peer_connected_.store(connected, std::memory_order_release);
+    }
     void SetExpectedBrowserProcessGroup(pid_t) override {}
     Retirement BrowserPeerLost() noexcept override {
         try {
@@ -1783,6 +1788,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     std::optional<Allocation> active_;
     std::optional<Allocation> candidate_;
     std::optional<Allocation> retiring_;
+    std::atomic_bool application_peer_connected_{true};
     std::uint64_t next_generation_ = 1U;
 };
 
@@ -2962,7 +2968,9 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     }
     probe->AllowPostRead();
     REQUIRE(probe->Wait([&] { return probe->publications == 1U; }));
-    CHECK(explore.snapshot().frame.revision == placeholder_revision);
+    REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > placeholder_revision; }));
+    const auto submitted_revision = explore.snapshot().frame.revision;
+    CHECK(submitted_revision > placeholder_revision);
     CHECK(explore.snapshot().gallery.slots == std::vector<bool>{false});
     {
         std::scoped_lock lock(probe->mutex);
@@ -2971,7 +2979,7 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     }
     probe->CompleteCallbacks();
     REQUIRE(events.Wait([&] { return explore.snapshot().gallery.slots == std::vector<bool>{true}; }));
-    CHECK(explore.snapshot().frame.revision > placeholder_revision);
+    CHECK(explore.snapshot().frame.revision == submitted_revision);
     REQUIRE(probe->Wait([&] { return probe->assignments.empty(); }));
 
     explore.Shutdown();
@@ -4771,6 +4779,10 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
         CHECK(runs->load() == inferred);
     }
     CHECK(runs->load() == 2U);
+    const auto retained = upscale.snapshot().frame;
+    upscale.Stop();
+    CHECK_FALSE(upscale.snapshot().ready);
+    CHECK(upscale.BorrowDocument(retained).valid());
     const auto previous = source.frame();
     source.Publish(previous.extent, 19U);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
@@ -6394,6 +6406,33 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(presentation.snapshot().completed_source_revision == 4U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
+
+    const auto paused_pump = writer_state->PumpCount();
+    presentation.SetApplicationPeerConnected(false);
+    source.Advance();
+    presentation.SourceChanged(source.identity());
+    writer_state->SignalReadiness();
+    REQUIRE(writer_state->WaitForPumpAfter(paused_pump));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
+    presentation.SetApplicationPeerConnected(true);
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 5U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 5U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 4U);
+
+    writer_state->allow_publication.store(false, std::memory_order_release);
+    source.Advance();
+    presentation.SourceChanged(source.identity());
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
+    presentation.SetApplicationPeerConnected(false);
+    writer_state->allow_publication.store(true, std::memory_order_release);
+    const auto disconnected_pump = writer_state->PumpCount();
+    writer_state->SignalReadiness();
+    REQUIRE(writer_state->WaitForPumpAfter(disconnected_pump));
+    CHECK(presentation.snapshot().completed.revision == 5U);
+    presentation.SetApplicationPeerConnected(true);
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 6U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 6U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
 
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();

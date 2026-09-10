@@ -866,9 +866,10 @@ VisualDocumentRead UpscaleSystem::BorrowDocument(const VisualFrame& frame) const
     mmltk::frameworks::gpu::ImageProductPool::Product product;
     {
         std::scoped_lock lock(impl_->mutex_);
-        if (!impl_->state_.ready || impl_->state_.frame != frame) return {};
-        document = impl_->document_;
-        product = impl_->selected_;
+        const auto found = std::ranges::find(impl_->records_, frame, &Impl::Record::frame);
+        if (found == impl_->records_.end() || !found->product.valid()) return {};
+        document = found->document;
+        product = found->product;
     }
     return {product.Borrow(), std::move(document)};
 }

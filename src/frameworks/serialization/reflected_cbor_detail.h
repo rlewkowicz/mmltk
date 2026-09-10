@@ -696,26 +696,32 @@ template <class T>
 
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
-void decode_reflected_object_fields(T& result, const wire::Value::Object& object, std::size_t& source_index,
-                                    std::optional<wire::DecodeError>& failure) {
+void decode_reflected_object_fields(T& result, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
     visit_bases<T>([&]<class Base>() {
-        if (!failure) { decode_reflected_object_fields(static_cast<Base&>(result), object, source_index, failure); }
+        if (!failure) { decode_reflected_object_fields(static_cast<Base&>(result), object, failure); }
     });
     visit_members<T>([&]<class Declaration>(const auto& fact) {
         if constexpr (requires { Declaration::pointer; }) {
             if (!failure) {
                 constexpr auto member = Declaration::pointer;
                 const std::string_view name = fact.member_name;
-                if (source_index < object.size() && object[source_index].first == name) {
-                    auto decoded = from_member_value_into<Declaration>(result.*member, object[source_index].second);
+                const auto source =
+                    std::ranges::find_if(object, [name](const auto& field) { return field.first == name; });
+                if (source != object.end()) {
+                    const auto duplicate =
+                        std::ranges::find_if(std::next(source), object.end(), [name](const auto& field) { return field.first == name; });
+                    if (duplicate != object.end()) {
+                        failure = decode_error(wire::ErrorCode::DuplicateKey);
+                        prepend_path(*failure, name);
+                        return;
+                    }
+                    auto decoded = from_member_value_into<Declaration>(result.*member, source->second);
                     if (!decoded) {
                         failure = decoded.error();
                         prepend_path(*failure, name);
                     } else if (!member_constraints_accept<Declaration>(result.*member)) {
                         failure = decode_error(wire::ErrorCode::LimitExceeded);
                         prepend_path(*failure, name);
-                    } else {
-                        ++source_index;
                     }
                 } else if constexpr (!kIsOptional<RemoveCvRef<decltype(result.*member)>>) {
                     failure = decode_error(wire::ErrorCode::UnknownKey);
@@ -724,6 +730,18 @@ void decode_reflected_object_fields(T& result, const wire::Value::Object& object
             }
         }
     });
+}
+
+template <class T>
+[[nodiscard]] bool reflected_object_has_member(const std::string_view name) {
+    bool found = false;
+    visit_bases<T>([&]<class Base>() {
+        if (!found) found = reflected_object_has_member<Base>(name);
+    });
+    visit_members<T>([&]<class>(const auto& fact) {
+        if (!found) found = fact.member_name == name;
+    });
+    return found;
 }
 
 template <class T>
@@ -749,10 +767,17 @@ template <class T>
         if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
 
         T result{};
-        std::size_t source_index = 0U;
         std::optional<wire::DecodeError> failure;
-        decode_reflected_object_fields(result, *object, source_index, failure);
-        return finish_decoded_object(std::move(result), *object, source_index, std::move(failure));
+        decode_reflected_object_fields(result, *object, failure);
+        if (failure) return std::unexpected(std::move(*failure));
+        const auto unknown =
+            std::ranges::find_if(*object, [](const auto& field) { return !reflected_object_has_member<T>(field.first); });
+        if (unknown != object->end()) {
+            auto error = decode_error(wire::ErrorCode::UnknownKey);
+            prepend_path(error, unknown->first);
+            return std::unexpected(std::move(error));
+        }
+        return result;
     }
 }
 

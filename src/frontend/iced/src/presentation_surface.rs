@@ -98,7 +98,9 @@ fn emit_surface_trace(line: &str) {
         && let Some(dump) = candidate.dyn_ref::<js_sys::Function>()
     {
         let output = wasm_bindgen::JsValue::from_str(&(line.to_owned() + "\n"));
-        let _ = dump.call1(global.as_ref(), &output);
+        if dump.call1(global.as_ref(), &output).is_ok() {
+            return;
+        }
     }
     web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(line));
 }
@@ -168,7 +170,11 @@ fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle,
 
 #[cfg(target_arch = "wasm32")]
 pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreSnapshot) {
-    if surface_trace_enabled() {
+    if surface_trace_enabled()
+        && snapshot.gallery.generation != 0
+        && snapshot.frame.source.instance != 0
+        && snapshot.frame.revision != 0
+    {
         emit_surface_trace(&format!(
             "{{\"event\":\"iced.gallery.source\",\"content_session\":{},\"content_width\":{},\"content_height\":{}{} }}",
             crate::generated::presentation_source_session(snapshot.frame.source.kind),
@@ -1276,7 +1282,15 @@ pub(crate) fn drawable_detail(requested: Surface) -> Option<(Surface, DetailCont
                     Some((requested, pending.detail.clone()?))
                 })
         })
-        .or_else(retained_detail)
+        .or_else(|| {
+            retained_detail().map(|(retained, detail)| {
+                if retained.frame == requested.frame && same_allocation(retained, requested) {
+                    (requested, detail)
+                } else {
+                    (retained, detail)
+                }
+            })
+        })
 }
 
 pub(crate) struct Pipeline {
@@ -1571,10 +1585,56 @@ impl SurfaceRenderer {
 
 fn retained_draw_admitted(retained: Surface, requested: Surface, placement: Placement) -> bool {
     matches!(placement, Placement::GalleryGrid { .. })
+        || (retained.frame.is_some() && retained.frame == requested.frame)
         || retained.viewer_identity == requested.viewer_identity
 }
 
 impl SurfaceRenderer {
+    fn reconcile_capture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: Surface,
+        placement: Placement,
+    ) {
+        let imported_matches = self
+            .imported
+            .as_ref()
+            .is_some_and(|imported| same_allocation(imported.image.surface, surface));
+        let pending_matches = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| same_allocation(pending.image.surface, surface));
+        if imported_matches || pending_matches {
+            let selected = if imported_matches {
+                self.imported.as_mut()
+            } else {
+                self.pending.as_mut()
+            };
+            selected
+                .expect("matched imported surface")
+                .reconcile_capture(
+                    device,
+                    queue,
+                    &self.capture,
+                    &self.layout,
+                    &self.sampler,
+                    surface,
+                    placement,
+                );
+            return;
+        }
+        self.prepare(
+            device,
+            queue,
+            surface,
+            self.bounds,
+            self.scale_factor,
+            placement,
+            ViewTransform::FIT,
+        );
+    }
+
     fn prepare_draw(
         &mut self,
         device: &wgpu::Device,
@@ -2062,22 +2122,14 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         let Some(renderer) = renderer.as_mut() else {
             return;
         };
-        // Submit before Iced builds labels and layout so the same draw consumes
-        // both this queue-ordered capture and its exact native metadata.
+        // Submit the receiver-owned copy before Iced builds labels and layout.
+        // Widget preparation remains the sole owner of view identity and geometry.
         let device = renderer.device.clone();
         let queue = renderer.queue.clone();
         let placement = gallery::matching(Some(frame))
             .as_ref()
             .map_or(Placement::Contain, |snapshot| gallery::placement(snapshot));
-        renderer.prepare(
-            &device,
-            &queue,
-            surface,
-            renderer.bounds,
-            renderer.scale_factor,
-            placement,
-            ViewTransform::FIT,
-        );
+        renderer.reconcile_capture(&device, &queue, surface, placement);
         for imported in [&mut renderer.imported, &mut renderer.pending]
             .into_iter()
             .flatten()
@@ -2253,6 +2305,28 @@ impl ImagePublication {
 }
 
 impl Imported {
+    fn reconcile_capture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &wgpu::RenderPipeline,
+        layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        surface: Surface,
+        placement: Placement,
+    ) {
+        let retained_surface = self.image.surface;
+        let retained_gallery = self.image.gallery.clone();
+        let retained_placement = self.image.placement;
+        self.image.surface = surface;
+        self.image.gallery = gallery::matching(surface.frame);
+        self.image.placement = placement;
+        self.capture(device, queue, pipeline, layout, sampler);
+        self.image.surface = retained_surface;
+        self.image.gallery = retained_gallery;
+        self.image.placement = retained_placement;
+    }
+
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -3178,6 +3252,15 @@ mod tests {
             pending,
             Placement::Contain
         ));
+        pending.frame = retained.frame;
+        pending.viewer_identity = Some((10, 3));
+        assert!(retained_draw_admitted(
+            retained,
+            pending,
+            Placement::Contain
+        ));
+        pending.frame = None;
+        pending.viewer_identity = retained.viewer_identity;
         pending.high += 1;
         pending.generation += 1;
         assert!(retained_draw_admitted(

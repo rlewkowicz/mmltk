@@ -125,6 +125,7 @@ class PresentationNativeWriter {
     [[nodiscard]] virtual int poll_fd() const noexcept = 0;
     [[nodiscard]] virtual int completion_fd() const noexcept = 0;
     [[nodiscard]] virtual bool wants_write() const noexcept = 0;
+    virtual void SetApplicationPeerConnected(bool) noexcept = 0;
     virtual void SetExpectedBrowserProcessGroup(pid_t) = 0;
     [[nodiscard]] virtual Retirement BrowserPeerLost() noexcept = 0;
 };
@@ -158,6 +159,7 @@ class PresentationSystem final {
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationSnapshot Select(PresentationSourceIdentity);
     void Observe(RendererObservation);
     void SourceChanged(PresentationSourceIdentity) noexcept;
+    void SetApplicationPeerConnected(bool) noexcept;
     void SetExpectedBrowserProcessGroup(pid_t);
     void BrowserPeerLost() noexcept;
     void CloseAdmission() noexcept;

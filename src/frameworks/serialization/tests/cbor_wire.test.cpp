@@ -158,9 +158,9 @@ concept PublicRawCborAppend = requires(const Owner& source, wire::Value::Object&
 };
 
 template <class Owner>
-concept PublicRawCborValueDecode = requires(Owner& destination, const wire::Value::Object& object, std::size_t& source_index,
-                                            std::optional<wire::DecodeError>& failure) {
-    mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, object, source_index, failure);
+concept PublicRawCborValueDecode =
+    requires(Owner& destination, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
+        mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, object, failure);
 };
 
 template <class Owner>

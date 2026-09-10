@@ -1488,7 +1488,7 @@ struct ApplicationSchema final {
                           "catalog providers and rows require canonical declaration identifiers");
             constexpr std::string_view name = std::meta::identifier_of(^^Provider);
             constexpr std::string_view identity = Provider::identity;
-            constexpr std::string_view row_type = std::meta::identifier_of(^^Row);
+            constexpr std::string_view row_type = mmltk::frameworks::reflection::type_name<Row>();
             if (identity.empty()) throw std::logic_error("catalog provider identity must not be empty");
             const std::uint64_t stable_id = application_stable_id(identity);
             const auto [prior, inserted] = providers.emplace(stable_id, std::string(name));

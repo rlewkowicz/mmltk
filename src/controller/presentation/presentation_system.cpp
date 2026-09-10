@@ -77,7 +77,7 @@ class PresentationSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (terminal_failure_) throw contracts::FailedError(*terminal_failure_);
-            if (stopping_) throw contracts::UnavailableError("Presentation admission is closed");
+            if (stopping_ || !application_peer_connected_) throw contracts::UnavailableError("Presentation admission is closed");
             selection_generation_ = mmltk::common::types::advance_monotonic_identity(selection_generation_);
             state_.selected = source;
             AdvanceRevision();
@@ -97,12 +97,30 @@ class PresentationSystem::Impl final {
         bool wake = false;
         {
             std::scoped_lock lock(mutex_);
-            if (!stopping_ && state_.selected == source && !pending_) {
+            if (!stopping_ && application_peer_connected_ && state_.selected == source && !pending_) {
                 wake = true;
                 pending_ = Pending{.source = source, .generation = selection_generation_, .force = false};
             }
         }
         if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation source notification failed")));
+    }
+
+    void SetApplicationPeerConnected(const bool connected) noexcept {
+        bool wake = false;
+        {
+            std::scoped_lock lock(mutex_);
+            if (stopping_ || application_peer_connected_ == connected) return;
+            application_peer_connected_ = connected;
+            writer_->SetApplicationPeerConnected(connected);
+            if (!connected) {
+                pending_.reset();
+            } else {
+                if (state_.selected.valid() && !pending_)
+                    pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = false};
+                wake = true;
+            }
+        }
+        if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation peer notification failed")));
     }
 
     void Observe(const RendererObservation observation) {
@@ -118,7 +136,7 @@ class PresentationSystem::Impl final {
                 completed = state_;
                 publish = true;
             }
-            if (observation.redraw_requested && state_.selected.valid() && !stopping_ && !pending_) {
+            if (observation.redraw_requested && state_.selected.valid() && !stopping_ && application_peer_connected_ && !pending_) {
                 pending_ = Pending{
                     .source = state_.selected,
                     .generation = selection_generation_,
@@ -240,7 +258,8 @@ class PresentationSystem::Impl final {
                 std::scoped_lock lock(mutex_);
                 const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
                                       in_flight_->observation.frame.source == pending->source;
-                if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
+                if (reserved && !stopping_ && application_peer_connected_ && !stop.stop_requested() && observation.valid() &&
+                    frame.source == pending->source &&
                     pending->generation == selection_generation_ && state_.selected == pending->source &&
                     (pending->force || state_.completed != frame)) {
                     in_flight_ = submitted;
@@ -452,6 +471,7 @@ class PresentationSystem::Impl final {
     std::optional<pid_t> expected_process_group_;
     std::uint64_t selection_generation_ = 0U;
     bool stopping_ = false;
+    bool application_peer_connected_ = true;
     bool browser_terminal_ = false;
     bool shutdown_started_ = false;
     bool stopped_ = false;
@@ -474,6 +494,7 @@ PresentationSystem::~PresentationSystem() {
 PresentationSnapshot PresentationSystem::Select(const PresentationSourceIdentity source) { return impl_->Select(source); }
 void PresentationSystem::Observe(const RendererObservation observation) { impl_->Observe(observation); }
 void PresentationSystem::SourceChanged(const PresentationSourceIdentity source) noexcept { impl_->SourceChanged(source); }
+void PresentationSystem::SetApplicationPeerConnected(const bool connected) noexcept { impl_->SetApplicationPeerConnected(connected); }
 void PresentationSystem::SetExpectedBrowserProcessGroup(const pid_t process_group) { impl_->SetExpectedBrowserProcessGroup(process_group); }
 void PresentationSystem::BrowserPeerLost() noexcept { impl_->BrowserPeerLost(); }
 void PresentationSystem::CloseAdmission() noexcept { impl_->CloseAdmission(); }
