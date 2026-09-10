@@ -13,6 +13,7 @@
 #include <span>
 #include <vector>
 
+#include "cuda_test_utils.hpp"
 #include "src/backend/data/compiled_format.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"
@@ -182,10 +183,7 @@ TEST_CASE("Host render demand samples only the current atomic generation", "[bac
 }
 
 TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha", "[backend][imaging][explore][probe]") {
-    int devices = 0;
-    const auto status = cudaGetDeviceCount(&devices);
-    if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver || (status == cudaSuccess && devices == 0)) SKIP("CUDA device unavailable");
-    REQUIRE(status == cudaSuccess);
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     constexpr std::size_t pitch = 32U;
     std::array<std::uint8_t, pitch * 4U> pixels{};
     for (std::size_t y = 0U; y < 4U; ++y)
@@ -372,15 +370,6 @@ class SemanticOracleBuffers final {
     };
 }
 
-[[nodiscard]] bool has_cuda_device() {
-    int count = 0;
-    const auto status = cudaGetDeviceCount(&count);
-    if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver) return false;
-    REQUIRE(status == cudaSuccess);
-    return count > 0;
-}
-
-
 [[nodiscard]] SemanticOracleResult SemanticOracleBuffers::RenderDetail(
     const std::span<const ExploreRenderAnnotationDescriptor> annotations, const std::span<const mmltk::backend::data::RLEPair> runs,
     const std::span<const ExploreRenderClassDescriptor> classes, const bool boxes,
@@ -465,7 +454,7 @@ class SemanticOracleBuffers final {
 }
 
 TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail scaling", "[backend][imaging][explore][cuda][support]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     namespace augment = mmltk::backend::models::rfdetr;
     using mmltk::backend::data::RLEPair;
@@ -579,7 +568,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
 }
 
 TEST_CASE("Explore cropped detail clips exterior edges without painting surviving pixels", "[backend][imaging][explore][cuda][support]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .rle_count = 1}};
     const std::array runs{mmltk::backend::data::RLEPair{10, 4}};
@@ -709,7 +698,7 @@ TEST_CASE("Explore gallery contain geometry preserves complete non-square backin
 }
 
 TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear ramps", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     std::uint32_t source_width = 4U;
     constexpr std::uint32_t kSourceHeight = 2U;
     constexpr std::uint32_t kCardExtent = 4U;
@@ -796,7 +785,7 @@ TEST_CASE("Explore CUDA atlas and detail preserve pixels, padding, and bilinear 
 }
 
 TEST_CASE("Semantic upscaling preserves class color and alpha at exact nearest samples", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     const std::array<std::uint8_t, 8U> source{255U, 0U, 0U, 92U, 0U, 255U, 255U, 0U};
     CudaBuffer input{source.size()};
     CudaBuffer output{8U * 4U * 4U};
@@ -815,7 +804,7 @@ TEST_CASE("Semantic upscaling preserves class color and alpha at exact nearest s
 }
 
 TEST_CASE("Explore atlas semantic planes compose through the Presentation raster path", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     constexpr std::array<std::uint8_t, 4U> kBase{0U, 0U, 255U, 255U};
     constexpr std::array<std::uint8_t, 4U> kPadding{24U, 18U, 35U, 255U};
@@ -873,7 +862,7 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
 }
 
 TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition pixels", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U};
     const std::array runs{mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
@@ -921,7 +910,7 @@ TEST_CASE("Explore renderer rejects semantic descriptors beyond admitted storage
 }
 
 TEST_CASE("Explore CUDA donor occlusion remains independent of semantic class visibility", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     auto annotations = make_occlusion_annotations({0.0F, 0.0F, 1.0F, 1.0F});
     const std::array runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 16U},
@@ -944,7 +933,7 @@ TEST_CASE("Explore CUDA donor occlusion remains independent of semantic class vi
 }
 
 TEST_CASE("Explore CUDA class filtering applies to box composition", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.75F}, .class_id = 0U}};
     std::array classes{ExploreRenderClassDescriptor{}};
@@ -954,7 +943,7 @@ TEST_CASE("Explore CUDA class filtering applies to box composition", "[backend][
 }
 
 TEST_CASE("Explore detail and atlas mask support follows final spatial erasure", "[backend][imaging][explore][cuda]") {
-    if (!has_cuda_device()) { SKIP("CUDA unavailable"); }
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA unavailable"); }
     SemanticOracleBuffers oracle;
     namespace rfdetr = mmltk::backend::models::rfdetr;
     const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U}};

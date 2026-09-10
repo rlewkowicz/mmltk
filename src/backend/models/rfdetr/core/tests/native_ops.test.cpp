@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "catch2_compat.hpp"
+#include "cuda_test_utils.hpp"
 #include "detail/detection_ops.h"
 #include "detail/lsap_scratch.h"
 #include "detail/matcher_workspace.h"
@@ -423,7 +424,7 @@ void test_sparse_mask_loss_matches_dense_reference() {
 }
 
 void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
-    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
 
     auto targets = make_targets();
     targets.packed_masks = pack_dense_masks(torch_api::ones({1, 1, 1}, torch_api::TensorOptions().dtype(torch_api::kFloat32)));
@@ -447,7 +448,7 @@ void test_matcher_mask_cost_handles_zero_point_sampling_on_cuda() {
 }
 
 void test_packed_mask_sampling_matches_grid_sample_nearest_boundaries() {
-    if (!torch_api::cuda::is_available()) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
 
     auto dense_masks = torch_api::tensor({{{0.0f, 1.0f, 0.0f, 1.0f}}}, torch_api::TensorOptions().dtype(torch_api::kFloat32));
     const auto packed = pack_dense_masks(dense_masks);
@@ -549,11 +550,8 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
     using namespace mmltk::backend::models::rfdetr;
     const bool selected_h2d = GENERATE(true, false);
     const int group = GENERATE(1, 2);
-    int devices = 0;
-    const auto device_status = cudaGetDeviceCount(&devices);
-    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver || (device_status == cudaSuccess && devices == 0))
+    if (mmltk::testsupport::checked_cuda_device_count() == 0)
         SKIP("CUDA unavailable; criterion transport parity remains unverified");
-    REQUIRE(device_status == cudaSuccess);
     c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(0));
     if (!selected_h2d) {
         int mmap = 0;

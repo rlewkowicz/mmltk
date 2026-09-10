@@ -90,6 +90,7 @@ mmltk_register_private_headers(
     mmltk_acceptance_support
     tests/async_test_utils.hpp
     tests/catch2_compat.hpp
+    tests/cuda_test_utils.hpp
     tests/cli_option_table.h
     tests/error_expectation_test_utils.hpp
     tests/filesystem_test_utils.hpp

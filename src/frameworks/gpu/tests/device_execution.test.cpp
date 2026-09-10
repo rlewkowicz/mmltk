@@ -1,5 +1,6 @@
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
+#include "cuda_test_utils.hpp"
 #include <cuda.h>
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
@@ -10,6 +11,28 @@
 #include "src/common/system/cpu_affinity.h"
 
 namespace {
+TEST_CASE("CUDA device enumeration distinguishes unavailable capability from runtime failures", "[frameworks][gpu]") {
+    using mmltk::testsupport::classify_cuda_device_count;
+    for (const int count : {0, 1, 2}) {
+        const auto result = classify_cuda_device_count(cudaSuccess, count);
+        REQUIRE(result.has_value());
+        CHECK(*result == count);
+    }
+    for (const auto status : {cudaErrorNoDevice, cudaErrorInsufficientDriver}) {
+        const auto result = classify_cuda_device_count(status, 2);
+        REQUIRE(result.has_value());
+        CHECK(*result == 0);
+    }
+    for (const auto status : {cudaErrorInitializationError, cudaErrorUnknown, cudaErrorMemoryAllocation}) {
+        const auto result = classify_cuda_device_count(status, 2);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error() == status);
+    }
+    const auto invalid_count = classify_cuda_device_count(cudaSuccess, -1);
+    REQUIRE_FALSE(invalid_count.has_value());
+    CHECK(invalid_count.error() == cudaSuccess);
+}
+
 TEST_CASE("Device placement rejects every forbidden explicit CPU before locality filtering", "[frameworks][gpu][placement]") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();

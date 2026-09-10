@@ -49,6 +49,7 @@ function(mmltk_add_backend_ml_layers_tests)
     target_link_libraries(mmltk_backend_ml_layers_tests PRIVATE
         mmltk_acceptance_support
         mmltk::backend::ml::layers
+        CUDA::cudart
     )
     mmltk_enable_torch(mmltk_backend_ml_layers_tests PRIVATE)
     mmltk_enable_native_runtime_rpath(mmltk_backend_ml_layers_tests)

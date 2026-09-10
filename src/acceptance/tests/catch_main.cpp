@@ -23,8 +23,9 @@ class TestProgressListener final : public Catch::EventListenerBase {
     }
 
     void testCaseEnded(const Catch::TestCaseStats& test_stats) override {
-        const bool passed = !test_stats.aborting && test_stats.totals.testCases.failed == 0U;
-        std::fprintf(stderr, passed ? "[       OK ] %s\n" : "[  FAILED  ] %s\n", test_stats.testInfo->name.c_str());
+        const bool failed = test_stats.aborting || test_stats.totals.testCases.failed != 0U;
+        const char* outcome = failed ? "[  FAILED  ]" : test_stats.totals.testCases.skipped != 0U ? "[  SKIPPED ]" : "[       OK ]";
+        std::fprintf(stderr, "%s %s\n", outcome, test_stats.testInfo->name.c_str());
         std::fflush(stderr);
     }
 };
