@@ -35,7 +35,7 @@ void normalize(ApplicationShellConfig::PresentationConfig& config) {
 
 ApplicationShell::ApplicationShell(ApplicationShellConfig config)
     : diagnostics_client_(std::move(config.diagnostics)),
-      runtime_diagnostics_(diagnostics_client_.producer(), config.pixel_probes),
+      runtime_diagnostics_(diagnostics_client_.producer(), config.pixel_probes, config.diagnostic_delivery),
       visual_diagnostic_target_(runtime_diagnostics_.target()),
       browser_host_(browser_server_, runtime_diagnostics_.target()),
       provider_owner_(std::move(config.vast_provider)),

@@ -8,6 +8,7 @@ from pathlib import Path
 import resource
 import select
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -57,6 +58,43 @@ class HardwareContractTests(unittest.TestCase):
         self.assertTrue(os.WIFSIGNALED(status))
         self.assertEqual(os.WTERMSIG(status), signal.SIGABRT)
         self.assertFalse(os.WCOREDUMP(status))
+
+    def test_packaged_enumeration_bypasses_compositor_but_execution_owns_one(self):
+        wrapper = (Path(__file__).parents[2] / "mmltk").read_text()
+        function = wrapper.split("run_workspace_wayland_test_executable() {", 1)[1].split("\nrun_tests() {", 1)[0]
+        setup = """
+repo_root=/workspace
+cache_root=/cache
+container_cache_root=/cache
+image_name=packaged
+wayland_validation_image_name=validation
+test_run_container_name=runner
+test_headless_compositor=1
+gui_runtime_dir_container=/runtime
+gui_wayland_socket_container_path=/runtime/wayland-test
+uid=1000
+gid=1000
+common_group_args=()
+bind_mount_specs=()
+docker() { return 0; }
+prepare_owned_dirs() { :; }
+prepare_workspace_wayland_test_mounts() { :; }
+build_common_group_args() { :; }
+gui_runtime_tmpfs_spec() { echo /runtime; }
+append_execution_policy_args() { :; }
+append_native_environment() { :; }
+append_wrapper_labels() { :; }
+append_native_logging_environment() { :; }
+append_explicit_test_environment() { :; }
+run_owned_docker_command() { printf '%s\\n' "$@"; }
+"""
+        for argument in ("--list-tests", "workspace_wayland_product_sigint"):
+            script = setup + "\nrun_workspace_wayland_test_executable() {" + function
+            script += f"\nrun_workspace_wayland_test_executable /packaged/test {argument}\n"
+            result = subprocess.run(("bash", "-c", script), check=True, capture_output=True, text=True)
+            self.assertEqual("/workspace/tools/headless_compositor.py" in result.stdout, argument != "--list-tests")
+            self.assertIn("/packaged/test", result.stdout)
+            self.assertIn(argument, result.stdout)
 
     def test_requires_nvidia_vendor_and_modifier_support(self):
         self.assertEqual(runner.hardware_renderer(HARDWARE_LOG)["GL vendor"], "NVIDIA Corporation")
@@ -129,9 +167,9 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.root.glob("headless-*")), "runtime directory leaked")
         self.temporary.cleanup()
 
-    async def run_command(self, code, timeout=2):
+    async def run_command(self, code):
         return await runner.run_session(
-            (sys.executable, "-c", code), self.artifacts, timeout,
+            (sys.executable, "-c", code), self.artifacts,
         )
 
     def events(self):
@@ -143,6 +181,11 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("headless.ready", [event["event"] for event in events])
         self.assertEqual(events[-2]["returncode"], 0)
         self.assertEqual(events[-1]["exit_code"], 7)
+
+    async def test_command_death_propagates_without_a_session_deadline(self):
+        code = "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"
+        self.assertEqual(await self.run_command(code), 137)
+        self.assertEqual(self.events()[-1]["exit_code"], 137)
 
     async def test_success_requires_clean_compositor_shutdown(self):
         self.assertEqual(await self.run_command("raise SystemExit(0)"), 0)
@@ -182,13 +225,14 @@ signal.pause()
         self.assertIn("73", next(event["message"] for event in self.events()
                                  if event["event"] == "headless.failed"))
 
-    async def test_command_deadline_terminates_child(self):
-        self.assertEqual(await self.run_command("import signal; signal.pause()", timeout=0.1), 1)
+    async def test_cancellation_terminates_child(self):
+        code = "import os, signal; os.kill(os.getppid(), signal.SIGTERM); signal.pause()"
+        self.assertEqual(await self.run_command(code), 143)
         self.assertEqual(self.children[-1].returncode, -signal.SIGTERM)
 
     async def test_stubborn_child_is_killed_after_grace_period(self):
-        code = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.pause()"
-        self.assertEqual(await self.run_command(code, timeout=0.1), 1)
+        code = "import os, signal; signal.signal(signal.SIGTERM, signal.SIG_IGN); os.kill(os.getppid(), signal.SIGTERM); signal.pause()"
+        self.assertEqual(await self.run_command(code), 143)
         self.assertEqual(self.children[-1].returncode, -signal.SIGKILL)
         self.assertIn("headless.cleanup.escalated", [event["event"] for event in self.events()])
 
@@ -241,7 +285,7 @@ Path({str(pid_file)!r}).write_text(str(pid))
 
     async def test_missing_command_cleans_started_compositor(self):
         self.assertEqual(await runner.run_session(
-            ("/no/such/mmltk-test-command",), self.artifacts, 2,
+            ("/no/such/mmltk-test-command",), self.artifacts,
         ), 1)
 
     async def test_signal_is_propagated_and_all_children_retire(self):

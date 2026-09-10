@@ -40,7 +40,7 @@ pub fn boot() -> (App, Task<Message>) {
     let config = TransportConfig::from_page();
     crate::presentation_surface::initialize_diagnostics(config.surface_trace, config.pixel_trace);
     crate::integration_control::initialize_reporting(
-        config.integration,
+        config.integration && config.surface_trace,
         config.integration_pixel_fixture,
     );
     let integration = config.integration.then(|| {

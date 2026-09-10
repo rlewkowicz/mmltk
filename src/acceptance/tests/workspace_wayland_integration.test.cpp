@@ -134,17 +134,42 @@ enum class TerminationMode : std::uint8_t {
     return repository / "build" / "validation" / filename;
 }
 
-void prepare_latest_log(const std::filesystem::path& path, const std::string_view description) {
+void prepare_latest_log(const std::filesystem::path& path, const std::string_view description, const std::string& identity) {
     std::filesystem::create_directories(path.parent_path());
     if (std::filesystem::is_regular_file(path) && std::filesystem::file_size(path) != 0U) {
         const auto history = path.parent_path() / (path.filename().string() + ".history");
         std::filesystem::create_directories(history);
-        const auto identity =
-            std::to_string(::getpid()) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-        std::filesystem::rename(path, history / (identity + path.extension().string()));
+        std::filesystem::rename(path, history / (identity + (path.extension() == ".jsonl" ? ".jsonl" : ".log")));
     }
     if (!std::ofstream{path, std::ios::binary | std::ios::trunc})
         throw std::runtime_error("failed to prepare " + std::string{description} + " at " + path.string());
+}
+
+[[nodiscard]] std::filesystem::path artifact_sibling(const std::filesystem::path& native, const std::string_view suffix) {
+    return native.parent_path() / (native.stem().string() + std::string{suffix});
+}
+
+void require_independent_artifacts(const std::span<const std::filesystem::path> paths) {
+    for (std::size_t index = 0U; index != paths.size(); ++index) {
+        const auto canonical = std::filesystem::weakly_canonical(paths[index]);
+        for (std::size_t previous = 0U; previous != index; ++previous) {
+            if (canonical == std::filesystem::weakly_canonical(paths[previous]) ||
+                (std::filesystem::exists(paths[index]) && std::filesystem::exists(paths[previous]) &&
+                 std::filesystem::equivalent(paths[index], paths[previous])))
+                throw std::runtime_error("evidence artifacts must have independent writer destinations: " + paths[index].string());
+        }
+    }
+}
+
+void rotate_process_log_family(const std::filesystem::path& native, const std::string& identity) {
+    const std::string prefix = native.stem().string() + "-mozilla-";
+    const std::string application_prefix = native.stem().string() + "-application.";
+    for (const auto& entry : std::filesystem::directory_iterator(native.parent_path())) {
+        const auto name = entry.path().filename().string();
+        if ((!name.starts_with(prefix) && !name.starts_with(application_prefix)) || !entry.is_regular_file()) continue;
+        prepare_latest_log(entry.path(), "process log family", identity);
+        std::filesystem::remove(entry.path());
+    }
 }
 
 void append_acceptance_record(const std::filesystem::path& path, nlohmann::json record) {
@@ -175,8 +200,17 @@ void append_acceptance_record(const std::filesystem::path& path, nlohmann::json 
     return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
 
-[[nodiscard]] std::string bounded_tail(const std::string& value, const std::size_t maximum = 96U * 1024U) {
-    return value.size() <= maximum ? value : value.substr(value.size() - maximum);
+[[nodiscard]] std::string read_tail(const std::filesystem::path& path) {
+    constexpr std::size_t maximum = 96U * 1024U;
+    std::ifstream input{path, std::ios::binary | std::ios::ate};
+    if (!input) return "[artifact unavailable]";
+    const auto end = input.tellg();
+    if (end < 0) return "[artifact size unavailable]";
+    const auto size = std::min(static_cast<std::uintmax_t>(end), static_cast<std::uintmax_t>(maximum));
+    input.seekg(end - static_cast<std::streamoff>(size));
+    std::string result(static_cast<std::size_t>(size), '\0');
+    if (!input.read(result.data(), static_cast<std::streamsize>(size))) return "[artifact tail read failed]";
+    return result;
 }
 
 [[nodiscard]] std::size_t permitted_cpu_count() noexcept {
@@ -203,7 +237,9 @@ class BrowserHostProcess final {
         const std::string executable_text = executable.string();
         const std::string diagnostics_text = diagnostics.string();
         const std::string runtime_log_text = runtime_log.string();
+        const std::string application_log_text = artifact_sibling(diagnostics, "-application.log").string();
         const std::string firefox_text = firefox_log.string();
+        const std::string mozilla_text = artifact_sibling(diagnostics, "-mozilla%PID.log").string();
         const std::string dataset_source = mmltk::backend::data::testsupport::dataset_dir(fixture);
         const std::string compiled_directory = mmltk::backend::data::testsupport::compiled_dir(fixture);
         const std::string resolution = std::to_string(viewer_scenario == "square" ? 384 : kCompiledResolution);
@@ -223,18 +259,19 @@ class BrowserHostProcess final {
                 runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 &&
                 ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
                 ::chdir(working_directory.c_str()) == 0 &&
-                (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", runtime_log_text.c_str(), 1) == 0 &&
+                (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
                             ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 &&
                             ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
                             ::setenv("MOZ_LOG",
                                      "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
-                                     "nsRefreshDriver:5,PresShell:5",
+                                     "nsRefreshDriver:5,PresShell:5,rotate:16",
                                      1) == 0 &&
+                            ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 &&
                             ::setenv("RUST_BACKTRACE", "full", 1) == 0)
-                         : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 &&
+                         : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
                             ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 &&
-                            ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
-                ::unsetenv("MOZ_LOG_FILE") == 0 && ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 &&
+                            ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_GUI_PIXEL_TRACE", logging && pixel_probes ? "1" : "0", 1) == 0 &&
@@ -2206,7 +2243,7 @@ struct NativeAudit final {
                                                   scalar(record, "detail") != 0U && scalar(record, "capacity_width") > value &&
                                                   scalar(record, "capacity_height") > scalar(record, "detail"));
         const bool document_opened = owner == "annotation" && event == "document.opened";
-        annotation_copied = annotation_copied || document_opened || (owner == "annotation" && event == "copy.completed");
+        annotation_copied = annotation_copied || (owner == "annotation" && event == "copy.completed");
         annotation_opened = annotation_opened || document_opened;
         annotation_edited = annotation_edited || (owner == "annotation" && event == "document.edited");
         if (owner == "presentation" && event == "timeline.ready" && value != 0U) {
@@ -3919,45 +3956,168 @@ struct BrowserAudit final {
 
 class JsonLineCursor final {
    public:
-    JsonLineCursor(std::filesystem::path path, const std::uintmax_t offset) : path_(std::move(path)), offset_(offset) {}
+    enum class Format { NativeJson, FirefoxText };
+    JsonLineCursor(std::filesystem::path path, const std::uintmax_t offset, Format format = Format::NativeJson)
+        : path_(std::move(path)), offset_(offset), format_(format) {}
 
     template <class Audit, class Observer>
     void consume(Audit& audit, Observer&& observer) {
-        std::ifstream input{path_, std::ios::binary};
-        if (!input) return;
+        std::ifstream input{path_, std::ios::binary | std::ios::ate};
+        if (!input) throw std::runtime_error("evidence artifact unavailable: " + path_.string());
+        const auto end = input.tellg();
+        if (end < 0 || static_cast<std::uintmax_t>(end) < offset_)
+            throw std::runtime_error("evidence artifact truncated: " + path_.string());
         input.seekg(static_cast<std::streamoff>(offset_));
-        std::string appended{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
-        offset_ += appended.size();
-        pending_.append(appended);
-        std::size_t begin = 0U;
-        for (;;) {
-            const auto end = pending_.find('\n', begin);
-            if (end == std::string::npos) break;
-            const std::string_view line{pending_.data() + begin, end - begin};
-            if (line.find("Uncaptured WebGPU error: Texture") != std::string_view::npos &&
-                line.find("is invalid") != std::string_view::npos) {
-                const nlohmann::json record{{"event", "browser.invalid_webgpu_texture"}};
-                audit.consume(record);
-                observer(record);
-            }
-            const auto object = line.find('{');
-            if (object != std::string_view::npos) {
-                const auto record = nlohmann::json::parse(line.substr(object), nullptr, false);
-                if (record.is_object()) {
-                    audit.consume(record);
-                    observer(record);
+        std::array<char, 16U * 1024U> chunk{};
+        // Bound each allocation and consume one captured extent. Later appends
+        // remain for the next notification; they cannot prolong this pass.
+        const auto captured_end = static_cast<std::uintmax_t>(end);
+        while (offset_ < captured_end) {
+            const auto count = std::min<std::uintmax_t>(chunk.size(), captured_end - offset_);
+            if (!input.read(chunk.data(), static_cast<std::streamsize>(count)))
+                throw std::runtime_error("evidence transport read failed: " + path_.string());
+            offset_ += count;
+            for (const char byte : std::string_view{chunk.data(), static_cast<std::size_t>(count)}) {
+                if (byte != '\n') {
+                    if (pending_.size() == kLineLimit) throw std::runtime_error("evidence line exceeded capacity: " + path_.string());
+                    pending_.push_back(byte);
+                    continue;
                 }
+                consume_line(audit, observer);
+                pending_.clear();
             }
-            begin = end + 1U;
         }
-        pending_.erase(0U, begin);
+    }
+
+    void finish() const {
+        if (format_ == Format::NativeJson && !pending_.empty())
+            throw std::runtime_error("native evidence ended in an incomplete record: " + path_.string());
     }
 
    private:
+    template <class Audit, class Observer>
+    void consume_line(Audit& audit, Observer& observer) {
+        const std::string_view line{pending_};
+        if (format_ == Format::FirefoxText &&
+            ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) ||
+             line.contains("XPCOMGlueLoad error") || line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
+            const nlohmann::json failure{{"event", "integration.failed"}, {"detail", std::string{line}}};
+            audit.consume(failure);
+            observer(failure);
+        }
+        const auto start = format_ == Format::NativeJson ? 0U : line.find('{');
+        if (start == std::string_view::npos) return;
+        const auto record = nlohmann::json::parse(line.substr(start), nullptr, false);
+        if (!record.is_object()) {
+            if (format_ == Format::NativeJson)
+                throw std::runtime_error("malformed native JSONL evidence: " + path_.string());
+            return;
+        }
+        audit.consume(record);
+        observer(record);
+    }
+
+    static constexpr std::size_t kLineLimit = 64U * 1024U;
     std::filesystem::path path_;
     std::uintmax_t offset_;
+    Format format_;
     std::string pending_;
 };
+
+TEST_CASE("acceptance artifacts have independent writers and one process-family archive identity", "[workspace][audit]") {
+    ScopedTempDir temporary{"mmltk-evidence-ownership"};
+    const auto native = temporary.path() / "capture.jsonl";
+    const auto parent = artifact_sibling(native, "-acceptance.jsonl");
+    const auto application = artifact_sibling(native, "-application.log");
+    const auto mozilla = artifact_sibling(native, "-mozilla-child.12.log.child-4.moz_log.0");
+    const auto mozilla_parent = artifact_sibling(native, "-mozilla-main.11.log.moz_log.3");
+    const auto adjacent = temporary.path() / "capture-other-mozilla-child.13.log.child-5.moz_log.0";
+    { std::ofstream output{adjacent}; output << "adjacent capture\n"; }
+    for (const auto& path : {native, parent, application, mozilla, mozilla_parent}) {
+        std::ofstream output{path};
+        output << "{\"event\":\"previous\"}\n";
+    }
+    const std::array independent{native, parent, application, mozilla, mozilla_parent};
+    require_independent_artifacts(independent);
+    const auto alias = temporary.path() / "alias.jsonl";
+    std::filesystem::create_hard_link(native, alias);
+    const std::array competing{native, alias};
+    CHECK_THROWS_AS(require_independent_artifacts(competing), std::runtime_error);
+    std::filesystem::remove(alias);
+    prepare_latest_log(native, "native", "17-123");
+    prepare_latest_log(parent, "acceptance", "17-123");
+    rotate_process_log_family(native, "17-123");
+    for (const auto& path : {native, parent, application, mozilla, mozilla_parent}) {
+        const auto archive = std::filesystem::path{path.string() + ".history"} /
+                             (path.extension() == ".jsonl" ? "17-123.jsonl" : "17-123.log");
+        CHECK(read_tail(archive) == "{\"event\":\"previous\"}\n");
+    }
+    CHECK_FALSE(std::filesystem::exists(application));
+    CHECK_FALSE(std::filesystem::exists(mozilla));
+    CHECK_FALSE(std::filesystem::exists(mozilla_parent));
+    CHECK(read_tail(adjacent) == "adjacent capture\n");
+    append_acceptance_record(parent, {{"event", "acceptance.complete"}});
+    CHECK(std::filesystem::file_size(native) == 0U);
+    CHECK(read_tail(parent).contains("acceptance.complete"));
+}
+
+TEST_CASE("native evidence cursors reject malformed truncated oversized and incomplete records", "[workspace][audit]") {
+    struct Count final {
+        std::size_t records = 0U;
+        void consume(const nlohmann::json&) { ++records; }
+    };
+    ScopedTempDir temporary{"mmltk-evidence-cursor"};
+    const auto path = temporary.path() / "native.jsonl";
+    const auto observer = [](const auto&) {};
+    for (const std::string content : {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"},
+                                      std::string(64U * 1024U + 1U, 'x')}) {
+        { std::ofstream output{path, std::ios::binary | std::ios::trunc}; output << content; }
+        Count audit;
+        JsonLineCursor cursor{path, 0U};
+        CHECK_THROWS_AS(cursor.consume(audit, observer), std::runtime_error);
+        CHECK(audit.records == 0U);
+    }
+    { std::ofstream output{path, std::ios::binary | std::ios::trunc}; output << "{\"event\":\"partial"; }
+    Count audit;
+    JsonLineCursor cursor{path, 0U};
+    cursor.consume(audit, observer);
+    CHECK(audit.records == 0U);
+    CHECK_THROWS_AS(cursor.finish(), std::runtime_error);
+    { std::ofstream output{path, std::ios::binary | std::ios::app}; output << "\"}\n"; }
+    cursor.consume(audit, observer);
+    cursor.finish();
+    CHECK(audit.records == 1U);
+    { std::ofstream output{path, std::ios::binary | std::ios::trunc}; }
+    CHECK_THROWS_AS(cursor.consume(audit, observer), std::runtime_error);
+    std::filesystem::remove(path);
+    CHECK_THROWS_AS(cursor.consume(audit, observer), std::runtime_error);
+}
+
+TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual final bytes", "[workspace][audit]") {
+    struct Count final {
+        std::size_t records = 0U;
+        void consume(const nlohmann::json&) { ++records; }
+    };
+    ScopedTempDir temporary{"mmltk-evidence-chunks"};
+    const auto path = temporary.path() / "native.jsonl";
+    constexpr std::size_t count = 12000U;
+    { std::ofstream output{path}; for (std::size_t index = 0U; index != count; ++index) output << "{\"event\":\"chunk\"}\n"; }
+    Count audit;
+    JsonLineCursor cursor{path, 0U};
+    cursor.consume(audit, [](const auto&) {});
+    cursor.finish();
+    CHECK(audit.records == count);
+    { std::ofstream output{path, std::ios::app}; output << "FINAL TAIL\n"; }
+    const auto tail = read_tail(path);
+    CHECK(tail.size() == 96U * 1024U);
+    CHECK(tail.ends_with("FINAL TAIL\n"));
+    const auto firefox = temporary.path() / "firefox.log";
+    { std::ofstream output{firefox}; output << "intentional Firefox text\nprefix {\"event\":\"browser\"}\n"; }
+    Count browser;
+    JsonLineCursor browser_cursor{firefox, 0U, JsonLineCursor::Format::FirefoxText};
+    browser_cursor.consume(browser, [](const auto&) {});
+    CHECK(browser.records == 1U);
+}
 
 void report_consumed_record(const nlohmann::json& record, const std::string_view source) {
     const std::string event = record.value("event", "");
@@ -4047,12 +4207,24 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     INFO("selected H2D dataset transport: " << h2d);
     if (!h2d && !gdr_transport_available()) SKIP("GDR hardware unavailable; packaged Wayland GDR behavior remains unverified");
 
-    const auto diagnostics = configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
+    ScopedTempDir quiet_artifacts{"mmltk-wayland-quiet-artifacts"};
+    const auto diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
     const auto runtime_log = configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
-    const auto firefox_log = configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
-    prepare_latest_log(diagnostics, "workspace Wayland native trace");
-    prepare_latest_log(runtime_log, "workspace Wayland native runtime log");
-    prepare_latest_log(firefox_log, "workspace Wayland Firefox log");
+    const auto firefox_log = !logging ? quiet_artifacts.path() / "firefox.log" : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
+    const auto acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
+    const auto rotation_id = std::to_string(::getpid()) + "-" +
+                             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    if (logging) {
+        const std::array owned_artifacts{diagnostics, acceptance_log, runtime_log, firefox_log,
+                                         artifact_sibling(diagnostics, "-application.log")};
+        require_independent_artifacts(owned_artifacts);
+        prepare_latest_log(diagnostics, "workspace Wayland native trace", rotation_id);
+        prepare_latest_log(acceptance_log, "workspace Wayland parent evidence", rotation_id);
+        rotate_process_log_family(diagnostics, rotation_id);
+        prepare_latest_log(artifact_sibling(diagnostics, "-application.log"), "workspace Wayland application log", rotation_id);
+    }
+    prepare_latest_log(runtime_log, "workspace Wayland native runtime log", rotation_id);
+    if (logging) prepare_latest_log(firefox_log, "workspace Wayland Firefox log", rotation_id);
 
     const std::string working_label = "mmltk-workspace-wayland-" + std::string{termination_label(termination)};
     ScopedTempDir working{working_label.c_str()};
@@ -4104,7 +4276,6 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     }
 
     constexpr std::uintmax_t diagnostics_offset = 0U;
-    constexpr std::uintmax_t runtime_log_offset = 0U;
     constexpr std::uintmax_t firefox_offset = 0U;
     ArtifactNotifications notifications{diagnostics, firefox_log};
     const bool high_dpi = viewer_scenario == "copy" ? GENERATE(false, true) : viewer_scenario == "rapid" && initial_settings.ui.dark_mode;
@@ -4159,7 +4330,10 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
         const auto terminal = await_shutdown(process, deadline.get());
         REQUIRE(terminal.has_value());
         CHECK(*terminal == 0);
-        CHECK(read_from(diagnostics, 0U).empty());
+        CHECK_FALSE(std::filesystem::exists(diagnostics));
+        CHECK_FALSE(std::filesystem::exists(firefox_log));
+        CHECK_FALSE(std::filesystem::exists(artifact_sibling(diagnostics, "-application.log")));
+        CHECK(std::filesystem::file_size(runtime_log) == 0U);
         return;
     }
 
@@ -4168,7 +4342,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     SurfaceAudit surface_audit;
     PixelBoundaryAudit pixel_audit{pixel_probes};
     JsonLineCursor native_cursor{diagnostics, diagnostics_offset};
-    JsonLineCursor browser_cursor{firefox_log, firefox_offset};
+    JsonLineCursor browser_cursor{firefox_log, firefox_offset, JsonLineCursor::Format::FirefoxText};
     const auto consume_records = [&] {
         native_cursor.consume(native, [&](const auto& record) {
             surface_audit.native(record);
@@ -4210,9 +4384,9 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     };
     const auto report_artifacts = [&] {
         std::cerr << "\nnative diagnostics:\n"
-                  << bounded_tail(read_from(diagnostics, diagnostics_offset)) << "\nnative runtime log:\n"
-                  << bounded_tail(read_from(runtime_log, runtime_log_offset)) << "\nFirefox diagnostics:\n"
-                  << bounded_tail(read_from(firefox_log, firefox_offset)) << '\n';
+                  << read_tail(diagnostics) << "\nnative runtime log:\n"
+                  << read_tail(runtime_log) << "\nFirefox diagnostics:\n"
+                  << read_tail(firefox_log) << '\n';
     };
     bool exited_early = false;
     bool released_one_lane = false;
@@ -4288,7 +4462,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     };
     const auto record_acceptance_state = [&](const std::string_view event, const bool terminal) {
         if (!logging) return;
-        append_acceptance_record(diagnostics, {{"event", event},
+        append_acceptance_record(acceptance_log, {{"event", event},
                                                {"terminal", terminal},
                                                {"termination", termination_label(termination)},
                                                {"deadline_stage", deadline_stage},
@@ -4454,7 +4628,7 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
                     : event->event == ExploreAcceptanceGate::ControlEvent::HeldProceed ? "acceptance.control.held_proceed"
                     : event->event == ExploreAcceptanceGate::ControlEvent::HeldStale   ? "acceptance.control.held_stale"
                                                                                        : "acceptance.control.initial_wait";
-                append_acceptance_record(diagnostics, {{"event", control_event},
+                append_acceptance_record(acceptance_log, {{"event", control_event},
                                                        {"sequence", event->generation},
                                                        {"value", event->slot},
                                                        {"detail", event->compiled_index},
@@ -4516,16 +4690,20 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     }
     const int terminal = *terminal_result;
     consume_records();
-    const std::string native_text = read_from(diagnostics, diagnostics_offset);
-    const std::string browser_text = read_from(firefox_log, firefox_offset);
+    native_cursor.finish();
+    const std::string native_text = read_tail(diagnostics);
+    const std::string browser_text = read_tail(firefox_log);
 
     INFO("termination: " << termination_label(termination));
-    INFO("native diagnostics: " << bounded_tail(native_text));
-    INFO("native runtime log: " << bounded_tail(read_from(runtime_log, runtime_log_offset)));
-    INFO("Firefox diagnostics: " << bounded_tail(browser_text));
+    INFO("native diagnostics: " << native_text);
+    INFO("native runtime log: " << read_tail(runtime_log));
+    INFO("Firefox diagnostics: " << browser_text);
     INFO("native readiness blocker: " << native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
     INFO("browser readiness blocker: " << browser.readiness_blocker());
     REQUIRE(terminal >= 0);
+    CHECK(native.peer_open_count > 0U);
+    CHECK(native.peer_close_count == native.peer_open_count);
+    if (termination == TerminationMode::SignalInterrupt) CHECK(native.peer_closed_after_shutdown);
     INFO("surface identity join: " << surface_audit.joined_failure());
     CHECK(surface_audit.joined_failure().empty());
     INFO("pixel boundary evidence: " << pixel_audit.failure);
@@ -4684,16 +4862,6 @@ void run_workspace_wayland_product(const TerminationMode termination, const std:
     CHECK_FALSE(native.invalid_message);
     CHECK_FALSE(native.peer_replaced);
     CHECK(native.peer_open_count >= 2U);
-    if (termination == TerminationMode::SignalInterrupt) {
-        CHECK((native.peer_close_count + 1U == native.peer_open_count ||
-               (native.peer_close_count == native.peer_open_count && native.peer_closed_after_shutdown)));
-    } else {
-        // BrowserServer finalization physically closes the remaining peer before
-        // shutdown.complete. Its bounded diagnostic stream may omit that final
-        // peer_closed record under teardown pressure.
-        CHECK((native.peer_close_count == native.peer_open_count ||
-               (native.peer_close_count + 1U == native.peer_open_count && native.shutdown_complete)));
-    }
     CHECK_FALSE(native.interaction_rejected);
     CHECK(native.partial_generation != 0U);
     CHECK(native.partial_placeholder_ordinal != 0U);
@@ -5154,11 +5322,20 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     }
 }
 
-TEST_CASE("incremental Explore audit joins exact inventories across dropped diagnostics", "[workspace][audit]") {
+TEST_CASE("incremental Explore audit requires independent lifecycle and exact inventory evidence", "[workspace][audit]") {
     NativeAudit annotation;
     annotation.consume({{"kind", "gui_runtime"}, {"owner", "annotation"}, {"event", "document.opened"}});
-    CHECK(annotation.annotation_copied);
+    CHECK_FALSE(annotation.annotation_copied);
     CHECK(annotation.annotation_opened);
+    annotation.consume({{"kind", "gui_runtime"}, {"owner", "annotation"}, {"event", "copy.completed"}});
+    CHECK(annotation.annotation_copied);
+    NativeAudit closure;
+    closure.consume({{"kind", "gui_runtime"}, {"event", "browser.server.peer_opened"}});
+    closure.consume({{"kind", "gui_runtime"}, {"event", "shutdown.complete"}});
+    CHECK(closure.peer_open_count == 1U);
+    CHECK(closure.peer_close_count == 0U);
+    closure.consume({{"kind", "gui_runtime"}, {"event", "browser.server.peer_closed"}});
+    CHECK(closure.peer_close_count == closure.peer_open_count);
 
     NativeAudit audit;
     audit.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U, 4096U);

@@ -62,7 +62,7 @@ TEST_STATUS = re.compile(r"^\[\s*(RUN|FAILED|OK|SKIPPED)\s*\]\s+(.+)$")
 CATCH_FAILURE = re.compile(r"^(.+?):(\d+): (failed|skipped|warning|fatal error): (.*)$")
 CONTEXT_LABEL = re.compile(
     r"(?:^['\"]?|['\"] and ['\"]|\bwith \d+ messages?:\s*['\"])"
-    r"(native diagnostics|native runtime log|Firefox diagnostics):\s*"
+    r"(native diagnostics|native runtime log|Firefox diagnostics|acceptance diagnostics|Mozilla diagnostics|application log):\s*"
 )
 ANCHOR_EVENTS = (
     "browser.server.started", "child.spawned", "child.signaled", "child.exited",
@@ -731,14 +731,24 @@ class LogFile:
                     raise QueryError(f"log changed during correlation query; retry a completed capture: {self.source}")
 
 
+MOZILLA_ARTIFACT = re.compile(
+    r"^(.*)-mozilla-(?:main\.[0-9]+\.log|child\.[0-9]+\.log(?:\.child-[0-9]+)+)\.moz_log(?:\.[0-3])?$"
+)
+
+
+APPLICATION_ARTIFACT = re.compile(r"^(.*)-application(?:\.[1-5])?\.log$")
+
+
+def is_log_path(path, suffixes=(".jsonl", ".log", ".out", ".txt")):
+    return path.suffix in suffixes or bool(MOZILLA_ARTIFACT.fullmatch(path.name))
+
+
 def directory_logs(directory, suffixes=(".jsonl", ".log", ".out", ".txt")):
     """Stream names and reuse directory-entry stat data even in large histories."""
     with os.scandir(directory) as entries:
         for entry in entries:
-            if entry.name.endswith(suffixes) and entry.is_file():
-                path = Path(entry.path)
-                if path.suffix in suffixes:
-                    yield path
+            if (entry.name.endswith(suffixes) or MOZILLA_ARTIFACT.fullmatch(entry.name)) and entry.is_file():
+                yield Path(entry.path)
 
 
 def discover_files(inputs, root, recursive=False, host_root=None):
@@ -769,7 +779,7 @@ def discover_files(inputs, root, recursive=False, host_root=None):
                     continue
                 directory_found = False
                 candidates = (
-                    (item for item in path.rglob("*") if item.suffix in (".jsonl", ".log", ".out", ".txt") and item.is_file())
+                    (item for item in path.rglob("*") if is_log_path(item) and item.is_file())
                     if recursive else directory_logs(path)
                 )
             else:
@@ -786,14 +796,15 @@ def discover_files(inputs, root, recursive=False, host_root=None):
             if directory_found is not None:
                 directories[resolved] = directory_found
         if not found:
-            raise QueryError(f"input contains no .jsonl, .log, .out, or .txt files: {supplied}")
+            raise QueryError(f"input contains no .jsonl, .log, .out, .txt, or Mozilla process logs: {supplied}")
     return sorted(selected.values(), key=lambda item: item.source)
 
 
 def artifact_family(path):
     archived = path.parent.name.endswith(".history")
     original = path.parent.parent / path.parent.name.removesuffix(".history") if archived else path
-    stem = re.sub(r"-(?:native|firefox)$", "", original.stem)
+    process = MOZILLA_ARTIFACT.fullmatch(original.name) or APPLICATION_ARTIFACT.fullmatch(original.name)
+    stem = process[1] if process else re.sub(r"-(?:native|firefox|acceptance|application)$", "", original.stem)
     return original.parent / stem, original, archived
 
 
@@ -804,10 +815,20 @@ def family_paths(family, root, existing=True):
     supplied = Path(family)
     if not supplied.is_absolute():
         supplied = root / ("build/validation" if supplied.parent == Path(".") else "") / supplied
-    if supplied.suffix in (".jsonl", ".log"):
+    if is_log_path(supplied):
         supplied = artifact_family(supplied)[0]
-    paths = [Path(str(supplied) + suffix) for suffix in (".jsonl", ".log", "-native.log", "-firefox.log")]
-    return [path for path in paths if not existing or path.is_file()]
+    paths = {Path(str(supplied) + suffix) for suffix in
+             (".jsonl", ".log", "-native.log", "-firefox.log", "-acceptance.jsonl", "-application.log")}
+    if supplied.parent.is_dir():
+        with os.scandir(supplied.parent) as entries:
+            for entry in entries:
+                original = entry.name.removesuffix(".history")
+                match = MOZILLA_ARTIFACT.fullmatch(original) or APPLICATION_ARTIFACT.fullmatch(original)
+                if match and match[1] == supplied.name and supplied.parent / original not in paths:
+                    if len(paths) >= MAX_DISTINCT_KEYS:
+                        raise QueryError("artifact family exceeds file budget; narrow the input paths")
+                    paths.add(supplied.parent / original)
+    return sorted({path for path in paths if not existing or path.is_file()})
 
 
 def rotation_identity(identity):
@@ -822,29 +843,35 @@ class ArtifactCatalog:
         inputs = list(options.paths)
         for family in options.family:
             siblings = family_paths(family, root)
+            if not siblings and (options.history or options.run):
+                siblings += [Path(str(path) + ".history") for path in family_paths(family, root, existing=False)
+                             if Path(str(path) + ".history").is_dir()]
             if not siblings:
                 raise QueryError(f"no artifact family found: {family}")
             inputs.extend(str(path) for path in siblings)
         self.files = discover_files(inputs, root, options.recursive, os.environ.get("MMLTK_LOG_HOST_ROOT"))
-        complete_histories = set()
+        complete_histories = {Path(path).resolve() for path in inputs
+                              if Path(path).is_dir() and Path(path).name.endswith(".history")}
         if options.history or options.run:
             archives = set()
             families = set()
             for source in self.files:
                 family, original, archived = artifact_family(source.path)
-                if archived:
+                if archived or options.family:
                     if family in families:
                         continue
                     families.add(family)
-                siblings = family_paths(str(family), root) if archived else [original]
+                    siblings = family_paths(str(family), root, existing=False)
+                else:
+                    siblings = [original]
                 for sibling in siblings:
                     directory = Path(str(sibling) + ".history")
-                    if directory not in archives and directory.is_dir():
+                    if directory not in archives and directory.resolve() not in complete_histories and directory.is_dir():
                         archives.add(directory)
             if archives:
                 combined = self.files + discover_files([str(path) for path in sorted(archives)], root)
                 self.files = sorted({item.path: item for item in combined}.values(), key=lambda item: item.source)
-                complete_histories = {path.resolve() for path in archives}
+                complete_histories.update(path.resolve() for path in archives)
         original_paths = {source.path for source in self.files}
         if options.triage:
             self.discover_siblings(root, complete_histories)
@@ -888,7 +915,7 @@ class ArtifactCatalog:
 
         for source in self.files:
             family, original, archived = artifact_family(source.path)
-            if original.suffix not in (".jsonl", ".log", ".out", ".txt"):
+            if not is_log_path(original):
                 continue
             request = requests.setdefault(family, {"current": False, "rotations": {}, "names": set()})
             if not archived:
@@ -910,7 +937,7 @@ class ArtifactCatalog:
                         raise QueryError(f"log input escapes repository mount: {directory}")
                     if resolved in complete_histories:
                         continue
-                    for path in directory_logs(directory, (original.suffix,)):
+                    for path in directory_logs(directory, (".jsonl" if original.suffix == ".jsonl" else ".log",)):
                         if path.stem in request["names"]:
                             add(path, "matching archive name")
                         elif rotation := rotation_identity(path.stem):
@@ -932,6 +959,9 @@ class ArtifactCatalog:
             metadata = {**source.metadata, "family": name, "run": name + "@" + identity,
                         "artifact": original.name, "run_link": "artifact-stem"}
             metadata["role"] = (
+                "mozilla" if MOZILLA_ARTIFACT.fullmatch(original.name) else
+                "acceptance" if original.stem.endswith("-acceptance") else
+                "application" if APPLICATION_ARTIFACT.fullmatch(original.name) else
                 "trace" if original.suffix == ".jsonl" else
                 "native" if original.stem.endswith("-native") else
                 "firefox" if original.stem.endswith("-firefox") else "transcript"
@@ -2770,7 +2800,7 @@ Fields:
 
 Inputs and ordering:
   Paths/globs are repository-relative or absolute within the repository.
-  Directories select .jsonl/.log/.out/.txt; --recursive includes histories.
+  Directories select .jsonl/.log/.out/.txt and Mozilla process logs; --recursive includes histories.
   Explicit files can have any suffix. Repeated paths are deduplicated.
   The default is build/validation, without recursive archived captures.
   Time ordering groups steady, UTC wall, timezone-free wall, per-file elapsed,
@@ -2783,7 +2813,12 @@ Inputs and ordering:
 
 Artifact families:
   --family STEM selects STEM.jsonl / STEM.log / STEM-native.log / STEM-firefox.log
-  under build/validation (or supply a repository path). --history adds rotated
+  plus STEM-acceptance.jsonl, STEM-application.log, and
+  STEM-mozilla-main.PID.log.moz_log[.0..3] and
+  STEM-mozilla-child.PID.log.child-LOGICAL_ID.moz_log[.0..3]. Descendant
+  launchers append another .child-LOGICAL_ID before .moz_log. Mozilla modules
+  retain four bounded rotating files per process, separately from structured Firefox evidence.
+  Families live under build/validation (or supply a repository path). --history adds rotated
   siblings; --run selects an exact archive ID or 'current'. Adjacent rotations
   with the same PID within 10ms are grouped and explicitly labeled inferred.
   Shared (event, steady_ns) anchors link transcript captures to native runs and
@@ -2935,7 +2970,7 @@ def argument_parser():
     parser.add_argument("--tail", action="store_true", help="retain the last N records, displayed in ascending order")
     parser.add_argument("--recursive", action="store_true", help="descend directories, including archived runs")
     parser.add_argument("--family", action="append", default=[], metavar="STEM",
-                        help="discover runtime/native/Firefox artifact siblings; repeatable")
+                        help="discover native/acceptance/application/Firefox/Mozilla artifact siblings; repeatable")
     parser.add_argument("--history", action="store_true", help="include selected files' rotated .history siblings")
     parser.add_argument("--run", help="select an archive ID, full run identity, or current; implies --history")
     parser.add_argument("--list-runs", action="store_true", help="list discovered run IDs and files without parsing records")

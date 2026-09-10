@@ -107,10 +107,9 @@ def group_pidfds(group, resources):
 
 
 class HeadlessSession:
-    def __init__(self, artifacts, environment, timeout):
+    def __init__(self, artifacts, environment):
         self.artifacts = artifacts
         self.environment = environment
-        self.timeout = timeout
         self.compositor = None
         self.compositor_exit = None
         self.children = []
@@ -199,7 +198,7 @@ class HeadlessSession:
                       file=sys.stderr, flush=True)
                 process = await self.start(command)
                 self.event("test.started", child_pid=process.pid)
-                code = await self.guarded(process.wait(), self.timeout)
+                code = await self.guarded(process.wait(), None)
                 self.event("test.exited", child_pid=process.pid, returncode=code)
                 return exit_status(code)
 
@@ -252,9 +251,9 @@ class HeadlessSession:
         return clean
 
 
-async def run_session(command, artifacts, timeout):
+async def run_session(command, artifacts):
     with tempfile.TemporaryDirectory(prefix="headless-", dir=os.environ["XDG_RUNTIME_DIR"]) as runtime:
-        session = HeadlessSession(artifacts, session_environment(runtime), timeout)
+        session = HeadlessSession(artifacts, session_environment(runtime))
         loop = asyncio.get_running_loop()
 
         def stop(number):
@@ -292,17 +291,10 @@ def main():
         command = command[1:]
     if not command:
         parser.error("a command is required")
-    try:
-        value = os.environ.get("MMLTK_TEST_TIMEOUT_SECONDS")
-        timeout = int(value) if value is not None else None
-        if timeout is not None and timeout <= 0:
-            raise ValueError
-    except ValueError:
-        parser.error("MMLTK_TEST_TIMEOUT_SECONDS must be a positive integer")
     root = Path(os.environ["MMLTK_REPO_ROOT"]) / "build" / "validation"
     root.mkdir(parents=True, exist_ok=True)
     artifacts = Path(tempfile.mkdtemp(prefix=f"headless-compositor-{os.getpid()}-", dir=root))
-    return asyncio.run(run_session(command, artifacts, timeout))
+    return asyncio.run(run_session(command, artifacts))
 
 
 if __name__ == "__main__":

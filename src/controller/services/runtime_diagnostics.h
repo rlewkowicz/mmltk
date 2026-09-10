@@ -26,6 +26,8 @@ struct RuntimeDiagnosticFact final {
 };
 MMLTK_REFLECT_FIELDS(RuntimeDiagnosticFact)
 
+enum class RuntimeDiagnosticDelivery : std::uint8_t { BestEffort, Complete };
+
 class RuntimeDiagnostics;
 
 // An optional, effect-only trace capability. Its shared private state owns the
@@ -40,10 +42,8 @@ class RuntimeDiagnosticTarget final {
     void operator()(RuntimeDiagnosticFact fact) const noexcept { write(fact); }
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
-        if (!valid()) return;
-        try {
-            write(std::forward<Factory>(factory)());
-        } catch (...) {}
+        auto make_fact = [&]() -> RuntimeDiagnosticFact { return std::forward<Factory>(factory)(); };
+        emit(&make_fact, [](void* context) { return (*static_cast<decltype(make_fact)*>(context))(); });
     }
     void write(RuntimeDiagnosticFact fact) const noexcept;
     void write_batch(std::span<const RuntimeDiagnosticFact> facts) const noexcept;
@@ -55,6 +55,8 @@ class RuntimeDiagnosticTarget final {
     void write_benchmark_trace(std::string_view event, std::string_view json_fields) const noexcept;
 
    private:
+    using FactFactory = RuntimeDiagnosticFact (*)(void*);
+    void emit(void* context, FactFactory factory) const noexcept;
     struct State;
     explicit RuntimeDiagnosticTarget(std::shared_ptr<State> state) noexcept : state_(std::move(state)) {}
     std::shared_ptr<State> state_;
@@ -66,7 +68,8 @@ class RuntimeDiagnosticTarget final {
 // transport and process paths perform no trace collection or formatting.
 class RuntimeDiagnostics final {
    public:
-    explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false) noexcept;
+    explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false,
+                                RuntimeDiagnosticDelivery delivery = RuntimeDiagnosticDelivery::BestEffort);
 
     [[nodiscard]] RuntimeDiagnosticTarget target() noexcept;
     void write(RuntimeDiagnosticFact fact) noexcept;

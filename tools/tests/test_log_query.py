@@ -819,6 +819,69 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("session@current", listing)
         self.assertIn("links are inferred", listing)
 
+    def test_family_discovers_separate_acceptance_and_rotating_mozilla_evidence(self):
+        self.family_fixture()
+        self.write("build/validation/session-acceptance.jsonl", [{"event": "acceptance.readiness.completed"}])
+        self.write("build/validation/session-application.log", "application text\n")
+        for role, pid, child in (("main", 12, ""), ("child", 13, ".child-4")):
+            for index in range(4):
+                self.write(f"build/validation/session-mozilla-{role}.{pid}.log{child}.moz_log.{index}",
+                           f"Mozilla module {role} ring {index}\n")
+        self.write("build/validation/session-acceptance.jsonl.history/57-1000070000.jsonl",
+                   [{"event": "acceptance.shutdown.stalled"}])
+        self.write("build/validation/session-application.log.history/57-1000075000.log", "old application\n")
+        # The process owning this archive no longer has any current artifact.
+        self.write("build/validation/session-mozilla-child.9.log.child-3.moz_log.0.history/57-1000080000.log", "old Mozilla\n")
+        status, rows, _ = self.exported("--family", "session")
+        self.assertEqual(status, 0)
+        self.assertEqual(len({row["_log"]["file"] for row in rows}), 13)
+        self.assertEqual({row["_log"]["role"] for row in rows},
+                         {"trace", "native", "firefox", "acceptance", "application", "mozilla"})
+        status, rows, _ = self.exported("--family", "session", "--run", "57-1000080000")
+        self.assertEqual(status, 0)
+        self.assertEqual(len({row["_log"]["file"] for row in rows}), 6)
+        self.assertEqual({row["_log"]["run"] for row in rows}, {"build/validation/session@57-1000000000"})
+        status, rows, _ = self.exported("build/validation")
+        self.assertEqual(status, 0)
+        self.assertEqual(sum(row["_log"]["role"] == "mozilla" for row in rows), 8)
+
+    def test_child_mozilla_archived_only_family_and_direct_role(self):
+        archive = "build/validation/retired-mozilla-child.34.log.child-7.moz_log.2.history/57-1000000000.log"
+        self.write(archive, "archived child module\n")
+        self.write("build/validation/retired.jsonl.history/57-1000000000.jsonl", [{"event": "shutdown.complete"}])
+        for arguments in (("--family", "retired", "--history"),
+                          ("--family", "retired", "--run", "57-1000000000")):
+            status, rows, error = self.exported(*arguments)
+            self.assertEqual(status, 0, error)
+            self.assertEqual({row["_log"]["role"] for row in rows}, {"trace", "mozilla"})
+            self.assertEqual({row["_log"]["family"] for row in rows}, {"build/validation/retired"})
+            self.assertEqual({row["_log"]["run"] for row in rows}, {"build/validation/retired@57-1000000000"})
+        status, rows, _ = self.exported(archive)
+        self.assertEqual(status, 0)
+        self.assertEqual(rows[0]["_log"]["role"], "mozilla")
+        for name in ("retired-mozilla-main.3.log.moz_log", "retired-mozilla-child.4.log.child-8.moz_log.3",
+                     "retired-mozilla-child.5.log.child-8.child-9.moz_log.0"):
+            self.assertEqual(logs.MOZILLA_ARTIFACT.fullmatch(name)[1], "retired")
+        for name in ("retired-mozilla-child.4.log.moz_log.0", "retired-mozilla-main.3.log.child-8.moz_log.0",
+                     "retired-mozilla-child.4.log.child-x.moz_log.0", "retired-mozilla-child.4.log.child-8.moz_log.4",
+                     "unrelated.moz_log.0"):
+            self.assertIsNone(logs.MOZILLA_ARTIFACT.fullmatch(name))
+
+    def test_mozilla_family_retains_containment_and_discovery_budget(self):
+        self.write("build/validation/session.jsonl", [{"event": "native"}])
+        self.write("build/validation/session-mozilla-main.1.log.moz_log.0", "Mozilla\n")
+        with patch.object(logs, "MAX_DISTINCT_KEYS", 6):
+            status, _, error = self.run_query("--family", "session")
+        self.assertEqual(status, 2)
+        self.assertIn("file budget", error)
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "escaped.log"
+            target.write_text("outside\n")
+            (self.root / "build/validation/session-mozilla-child.2.log.child-6.moz_log.0").symlink_to(target)
+            status, _, error = self.run_query("--family", "session")
+            self.assertEqual(status, 2)
+            self.assertIn("escapes repository", error)
+
     def test_history_catalog_enumerates_each_archive_directory_once(self):
         for suffix in (".jsonl", "-native.log", "-firefox.log"):
             current = self.write("build/validation/capture" + suffix, "")

@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -26,6 +28,7 @@
 #include <utility>
 
 #include "filesystem_test_utils.hpp"
+#include "async_test_utils.hpp"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/workspace.h"
@@ -39,6 +42,7 @@
 
 namespace mmltk::controller::services {
 struct DiagnosticsClientTestAccess final {
+    [[nodiscard]] static bool WaitForCapacityWaiter(DiagnosticsClient& client) { return client.wait_for_capacity_waiter_for_test(); }
     [[nodiscard]] static std::unique_lock<std::mutex> LockQueue(DiagnosticsClient& client) {
         return std::unique_lock{client.queue_mutex_for_test()};
     }
@@ -255,6 +259,11 @@ TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][se
             return std::pair{RuntimeDiagnosticFact{}, RuntimeDiagnosticFact{}};
         }};
     span.FinishWith([&](auto&) { ++collections; });
+    target.Emit([&] {
+        ++collections;
+        static_cast<void>(DiagnosticCountingClock::now());
+        return RuntimeDiagnosticFact{.event = "disabled.lazy"};
+    });
     CHECK(collections == 0U);
     CHECK(DiagnosticCountingClock::reads == 0U);
     CHECK(DiagnosticSpanIds::issued() == ids);
@@ -288,31 +297,28 @@ TEST_CASE("diagnostic spans pair overlapping intervals and explicit asynchronous
     CHECK(DiagnosticCountingClock::reads == 4U);
 }
 
-TEST_CASE("effect-only submission drops on queue-lock contention while lossless submission waits", "[gui][services]") {
-    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-contention"};
-    const int descriptor = ::open((temporary.path() / "trace.jsonl").c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR);
-    REQUIRE(descriptor >= 0);
-    DiagnosticsClient diagnostics{ScopedFd{descriptor}, DiagnosticsExecutionPolicy::CallerDriven};
-    const auto operation = diagnostics.producer().acquire();
-    std::promise<void> locked;
-    std::promise<void> release;
-    auto release_ready = release.get_future();
+TEST_CASE("effect-only submission drops on queue-lock contention while complete delivery preserves evidence", "[gui][services]") {
+    using namespace mmltk::testsupport;
+    ScopedTempDir temporary{"mmltk-diagnostics-contention"};
+    DiagnosticsClient diagnostics{temporary.path() / "trace.jsonl"};
+    RuntimeDiagnostics complete{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
+    TestGate held{"diagnostic queue lock held"};
     std::jthread holder{[&] {
         auto lock = DiagnosticsClientTestAccess::LockQueue(diagnostics);
-        locked.set_value();
-        release_ready.wait();
+        held.receipt().ArriveAndWait();
     }};
-    locked.get_future().wait();
-    auto lossy = std::async(std::launch::async, [operation] { return operation.try_submit({"{\"event\":\"lossy\"}"}); });
-    const auto ready = lossy.wait_for(std::chrono::seconds{2});
-    auto lossless = std::async(std::launch::async, [operation] { return operation.submit({"{\"event\":\"lossless\"}"}); });
-    const auto waiting = lossless.wait_for(std::chrono::milliseconds{20});
-    release.set_value();
+    std::future<void> reliable;
+    ScopedTestCleanup release{[&] { held.Release(); diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    REQUIRE(held.WaitEntered(std::chrono::seconds{2}));
+    CHECK(diagnostics.producer().acquire().try_submit({"{\"event\":\"lossy\"}"}) == DiagnosticSubmitResult::Contended);
+    reliable = std::async(std::launch::async, [target = complete.target()] { target.write({.event = "reliable"}); });
+    held.Release();
+    await_test_future(reliable, "contended complete submission");
     holder.join();
-    CHECK(ready == std::future_status::ready);
-    CHECK(lossy.get() == DiagnosticSubmitResult::Contended);
-    CHECK(waiting == std::future_status::timeout);
-    CHECK(lossless.get() == DiagnosticSubmitResult::Accepted);
+    diagnostics.close();
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    CHECK(diagnostics.counters().accepted == 1U);
     CHECK(diagnostics.counters().dropped == 1U);
 }
 
@@ -697,36 +703,178 @@ TEST_CASE("diagnostics flush preserves order and reports write failure", "[gui][
     require_one_terminal_wake(failing);
 }
 
-TEST_CASE("background diagnostics serialize concurrent producers without losing records", "[gui][services]") {
+TEST_CASE("complete background diagnostics preserve unique concurrent single and batch identities", "[gui][services]") {
+    using namespace mmltk::testsupport;
     constexpr std::size_t kProducerCount = 4U;
     constexpr std::size_t kRecordsPerProducer = 512U;
     constexpr std::size_t kExpectedRecords = kProducerCount * kRecordsPerProducer;
-    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-lossless"};
+    ScopedTempDir temporary{"mmltk-diagnostics-lossless"};
     const auto path = temporary.path() / "diagnostics.jsonl";
     DiagnosticsClient diagnostics{path};
-    const auto producer = diagnostics.producer();
-    std::atomic<std::size_t> accepted{0U};
-    std::array<std::thread, kProducerCount> submitters;
-    for (std::thread& submitter : submitters) {
-        submitter = std::thread([operation = producer.acquire(), &accepted] {
-            for (std::size_t index = 0U; index != kRecordsPerProducer; ++index) {
-                if (operation.submit({"{\"event\":\"concurrent\"}"}) == DiagnosticSubmitResult::Accepted)
-                    accepted.fetch_add(1U, std::memory_order_relaxed);
+    RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
+    std::array<std::future<void>, kProducerCount> submitters;
+    ScopedTestCleanup close{[&] { diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    for (std::size_t producer = 0U; producer != kProducerCount; ++producer) {
+        submitters[producer] = std::async(std::launch::async, [target = runtime.target(), producer] {
+            for (std::size_t index = 0U; index != kRecordsPerProducer;) {
+                if (index % 3U == 0U && index + 1U < kRecordsPerProducer) {
+                    const std::array batch{RuntimeDiagnosticFact{.event = "concurrent", .sequence = index, .value = producer},
+                                           RuntimeDiagnosticFact{.event = "concurrent", .sequence = index + 1U, .value = producer}};
+                    target.write_batch(batch);
+                    index += 2U;
+                } else {
+                    target.write({.event = "concurrent", .sequence = index++, .value = producer});
+                }
             }
         });
     }
-    for (std::thread& submitter : submitters)
-        submitter.join();
-
-    diagnostics.close(DiagnosticsCloseMode::Flush);
+    for (auto& submitter : submitters) await_test_future(submitter, "complete diagnostic producer", std::chrono::seconds{5});
+    runtime.target().write_required({.event = "shutdown.complete"});
+    diagnostics.close();
     require_one_terminal_wake(diagnostics);
-    const DiagnosticsCounters counters = diagnostics.counters();
-    CHECK(accepted.load(std::memory_order_relaxed) == kExpectedRecords);
-    CHECK(counters.accepted == kExpectedRecords);
-    CHECK(counters.flushed == kExpectedRecords);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Drained);
+    const auto counters = diagnostics.counters();
+    CHECK(counters.accepted == kExpectedRecords + 1U);
+    CHECK(counters.flushed == kExpectedRecords + 1U);
     CHECK(counters.dropped == 0U);
     CHECK(counters.write_failures == 0U);
-    CHECK(std::ranges::count(read_file(path), '\n') == kExpectedRecords);
+    std::array<std::size_t, kProducerCount> next{};
+    std::ifstream input{path};
+    std::string line;
+    std::size_t terminal = 0U;
+    while (std::getline(input, line)) {
+        const auto record = nlohmann::json::parse(line);
+        if (record.at("event") == "shutdown.complete") {
+            ++terminal;
+            for (const auto count : next) CHECK(count == kRecordsPerProducer);
+        } else {
+            CHECK(terminal == 0U);
+            const auto producer = record.at("value").get<std::size_t>();
+            REQUIRE(producer < next.size());
+            CHECK(record.at("sequence") == next[producer]++);
+        }
+    }
+    CHECK(terminal == 1U);
+    for (const auto count : next) CHECK(count == kRecordsPerProducer);
+}
+
+TEST_CASE("complete diagnostic records and batches wait atomically and settle on drain closure or writer loss", "[gui][services]") {
+    using namespace mmltk::testsupport;
+    const int outcome = GENERATE(0, 1, 2);
+    const bool batch = GENERATE(false, true);
+    const std::size_t record_count = batch ? 2U : 1U;
+    int descriptors[2]{-1, -1};
+    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
+    ScopedFd reader{descriptors[0]};
+    ScopedFd writer{descriptors[1]};
+    REQUIRE(::fcntl(writer.get(), F_SETPIPE_SZ, 4096) > 0);
+    DiagnosticsClient diagnostics{std::move(writer)};
+    RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
+    const auto operation = diagnostics.producer().acquire();
+    const auto large = maximum_diagnostic_record();
+    REQUIRE(operation.submit({large}) == DiagnosticSubmitResult::Accepted);
+    pollfd readable{.fd = reader.get(), .events = POLLIN, .revents = 0};
+    REQUIRE(::poll(&readable, 1U, 2000) == 1);
+    for (std::size_t index = 1U; index < DiagnosticsClient::kQueueCapacity - (record_count - 1U); ++index)
+        REQUIRE(operation.submit({"{\"event\":\"filler\"}"}) == DiagnosticSubmitResult::Accepted);
+    const auto before = diagnostics.counters().accepted;
+    std::future<std::string> output;
+    auto submission = std::async(std::launch::async, [target = runtime.target(), batch] {
+        const std::array facts{RuntimeDiagnosticFact{.event = "batch", .sequence = 1U},
+                               RuntimeDiagnosticFact{.event = "batch", .sequence = 2U}};
+        if (batch) target.write_batch(facts);
+        else target.write(facts.front());
+    });
+    ScopedTestCleanup close{[&] { diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    REQUIRE(DiagnosticsClientTestAccess::WaitForCapacityWaiter(diagnostics));
+    CHECK(diagnostics.counters().accepted == before);
+    if (outcome == 0) {
+        output = std::async(std::launch::async, [&] {
+            std::string bytes;
+            std::array<char, 4096U> buffer{};
+            for (;;) {
+                const auto size = ::read(reader.get(), buffer.data(), buffer.size());
+                if (size < 0 && errno == EINTR) continue;
+                if (size == 0) break;
+                if (size < 0) throw std::runtime_error("diagnostic read failed");
+                bytes.append(buffer.data(), static_cast<std::size_t>(size));
+            }
+            return bytes;
+        });
+    } else if (outcome == 1) diagnostics.close(DiagnosticsCloseMode::Discard);
+    else reader.reset();
+    await_test_future(submission, "complete batch settlement");
+    diagnostics.close();
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.terminal() == (outcome == 0 ? DiagnosticsTerminal::Drained : DiagnosticsTerminal::Failed));
+    CHECK(diagnostics.counters().accepted == before + (outcome == 0 ? record_count : 0U));
+    if (outcome == 0) {
+        const auto bytes = await_test_future(output, "diagnostic reader settlement");
+        std::istringstream lines{bytes};
+        std::string line;
+        std::size_t next = 1U;
+        while (std::getline(lines, line)) {
+            const auto record = nlohmann::json::parse(line);
+            if (record.value("event", "") == "batch") CHECK(record.at("sequence") == next++);
+        }
+        CHECK(next == record_count + 1U);
+    }
+}
+
+TEST_CASE("complete lazy factories reserve delivery before closure or terminal sealing", "[gui][services]") {
+    using namespace mmltk::testsupport;
+    const bool seal = GENERATE(false, true);
+    const bool throwing = GENERATE(false, true);
+    ScopedTempDir temporary{"mmltk-diagnostics-lazy-close"};
+    DiagnosticsClient diagnostics{temporary.path() / "trace.jsonl"};
+    RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
+    TestGate factory{"complete lazy factory entered"};
+    auto emission = std::async(std::launch::async, [target = runtime.target(), receipt = factory.receipt(), throwing] {
+        target.Emit([&]() -> RuntimeDiagnosticFact {
+            receipt.ArriveAndWait();
+            if (throwing) throw std::runtime_error("lazy factory failed after close");
+            return {.event = "lazy.fact"};
+        });
+    });
+    ScopedTestCleanup cleanup{[&] { factory.Release(); diagnostics.close(DiagnosticsCloseMode::Discard); }};
+    REQUIRE(factory.WaitEntered(std::chrono::seconds{2}));
+    if (seal) runtime.target().write_required({.event = "shutdown.complete"});
+    diagnostics.close(DiagnosticsCloseMode::Flush);
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    factory.Release();
+    await_test_future(emission, "lazy factory settlement after close");
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    CHECK(diagnostics.counters().accepted == (seal ? 1U : 0U));
+    CHECK_FALSE(read_file(temporary.path() / "trace.jsonl").contains("lazy.fact"));
+}
+
+TEST_CASE("complete diagnostics reject unavailable sinks and encoding or impossible batch loss", "[gui][services]") {
+    DiagnosticsClient disabled;
+    CHECK_THROWS_AS((RuntimeDiagnostics{disabled.producer(), false, RuntimeDiagnosticDelivery::Complete}), std::runtime_error);
+    const int manual_fd = ::open("/dev/null", O_WRONLY | O_CLOEXEC);
+    REQUIRE(manual_fd >= 0);
+    DiagnosticsClient manual{ScopedFd{manual_fd}, DiagnosticsExecutionPolicy::CallerDriven};
+    CHECK_THROWS_AS((RuntimeDiagnostics{manual.producer(), false, RuntimeDiagnosticDelivery::Complete}), std::runtime_error);
+    const int failure = GENERATE(0, 1, 2, 3, 4);
+    mmltk::testsupport::ScopedTempDir temporary{"mmltk-diagnostics-rejection"};
+    DiagnosticsClient diagnostics{temporary.path() / "trace.jsonl"};
+    RuntimeDiagnostics runtime{diagnostics.producer(), false, RuntimeDiagnosticDelivery::Complete};
+    const auto target = runtime.target();
+    if (failure == 0) target.write({.event = "invalid event"});
+    else if (failure == 1) target.write({.event = "invalid", .message = "\xc0\x80"});
+    else if (failure == 2) {
+        std::array<RuntimeDiagnosticFact, DiagnosticsClient::kQueueCapacity + 1U> facts{};
+        for (auto& fact : facts) fact.event = "too_many";
+        target.write_batch(facts);
+    } else if (failure == 3) {
+        const std::array facts{RuntimeDiagnosticFact{.event = "valid"}, RuntimeDiagnosticFact{.event = "invalid", .message = "\xc0\x80"}};
+        target.write_batch(facts);
+    } else target.Emit([]() -> RuntimeDiagnosticFact { throw std::runtime_error("factory failure"); });
+    require_one_terminal_wake(diagnostics);
+    CHECK(diagnostics.terminal() == DiagnosticsTerminal::Failed);
+    CHECK(diagnostics.counters().accepted == 0U);
+    CHECK_FALSE(target.valid());
 }
 
 TEST_CASE("diagnostics path sessions truncate and producers expire after close", "[gui][services]") {

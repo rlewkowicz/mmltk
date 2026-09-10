@@ -40,6 +40,7 @@ struct ApplicationShellConfig final {
     LiveNativeConfiguration live{};
     ExploreNativeConfiguration explore{};
     services::DiagnosticsClient diagnostics{};
+    services::RuntimeDiagnosticDelivery diagnostic_delivery = services::RuntimeDiagnosticDelivery::BestEffort;
     bool pixel_probes = false;
     std::optional<services::VastBridgeConfig> vast_provider{};
     std::string_view file_dialog_helper{"zenity"};

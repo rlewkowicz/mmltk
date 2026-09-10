@@ -6,8 +6,14 @@
 #include <pthread.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <sys/signalfd.h>
+#include <unistd.h>
+
+#include "src/common/io/scoped_fd.h"
 
 #include <cstdlib>
+#include <cerrno>
 #include <charconv>
 #include <cstdio>
 #include <exception>
@@ -70,22 +76,29 @@ void report_integration_failure(const bool integration, const std::string_view s
 
 class SignalWaiter final {
    public:
-    explicit SignalWaiter(mmltk::controller::shell::ApplicationShell& shell)
-        : thread_([&shell](const std::stop_token stop) {
+    explicit SignalWaiter(mmltk::controller::shell::ApplicationShell& shell, const int diagnostics_terminal)
+        : thread_([&shell, diagnostics_terminal](const std::stop_token stop) {
               sigset_t signals{};
               if (::sigemptyset(&signals) != 0 || ::sigaddset(&signals, SIGINT) != 0 || ::sigaddset(&signals, SIGTERM) != 0) {
                   shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
                   return;
               }
-              int signal = 0;
-              const int wait_result = ::sigwait(&signals, &signal);
+              mmltk::common::io::ScopedFd signal_fd{::signalfd(-1, &signals, SFD_CLOEXEC)};
+              pollfd events[]{{.fd = signal_fd.get(), .events = POLLIN, .revents = 0},
+                              {.fd = diagnostics_terminal, .events = POLLIN, .revents = 0}};
+              int ready = -1;
+              if (signal_fd.get() >= 0) {
+                  do { ready = ::poll(events, 2U, -1); } while (ready < 0 && errno == EINTR);
+              }
               if (stop.stop_requested()) return;
-              if (wait_result != 0) {
+              signalfd_siginfo signal{};
+              if (ready < 0 || events[1].revents != 0 ||
+                  ::read(signal_fd.get(), &signal, sizeof(signal)) != static_cast<ssize_t>(sizeof(signal))) {
                   shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
                   return;
               }
-              shell.request_shutdown(signal == SIGINT ? mmltk::controller::services::ApplicationShutdownReason::SignalInterrupt
-                                                      : mmltk::controller::services::ApplicationShutdownReason::SignalTerminate);
+              shell.request_shutdown(signal.ssi_signo == SIGINT ? mmltk::controller::services::ApplicationShutdownReason::SignalInterrupt
+                                                               : mmltk::controller::services::ApplicationShutdownReason::SignalTerminate);
           }) {}
 
     ~SignalWaiter() {
@@ -166,12 +179,6 @@ int main(int argc, char** argv) {
     try {
         {
             auto logging_config = mmltk::common::logging::config_from_env({});
-            if (integration) {
-                // stderr is already the stable acceptance artifact. Avoid opening the same file through
-                // a second sink because independent file offsets would make the trace nondeterministic.
-                logging_config.log_file.reset();
-                if (!logging_config.level) logging_config.level = spdlog::level::info;
-            }
             if (logging_config.enabled()) { logging_config.app_name = "mmltk-browser-host"; }
             mmltk::common::logging::initialize(logging_config);
             mmltk::common::logging::trace([](auto& logger) { logger.trace("workspace Wayland native runtime logging initialized"); });
@@ -213,8 +220,11 @@ int main(int argc, char** argv) {
         }
         if (lifecycle_trace != nullptr && *lifecycle_trace != '\0') {
             config.diagnostics = mmltk::controller::services::DiagnosticsClient{std::filesystem::path{lifecycle_trace}};
+            if (integration) config.diagnostic_delivery = mmltk::controller::services::RuntimeDiagnosticDelivery::Complete;
         }
         config.settings_location = production_settings_location();
+        const int diagnostics_terminal = config.diagnostic_delivery == mmltk::controller::services::RuntimeDiagnosticDelivery::Complete
+                                             ? config.diagnostics.terminal_fd() : -1;
         mmltk::controller::shell::ApplicationShell shell{std::move(config)};
         try {
             const std::filesystem::path assets = configured_root("MMLTK_BROWSER_APP_ASSET_ROOT_OVERRIDE", MMLTK_BROWSER_APP_ASSET_ROOT);
@@ -262,7 +272,7 @@ int main(int argc, char** argv) {
                  .integration_high_dpi = integration_high_dpi});
             if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal)
                 return fail_closed(shell, integration, "Firefox process start failed");
-            SignalWaiter signal_waiter{shell};
+            SignalWaiter signal_waiter{shell, diagnostics_terminal};
             shell.run();
             return mmltk::controller::services::browser_runtime_exit_status(shell.firefox_lifecycle(), shell.healthy());
         } catch (const std::exception& error) {

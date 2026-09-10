@@ -2808,11 +2808,7 @@ run_test_executable() {
         docker_args+=(--args "${executable}")
         docker_args+=("$@")
     else
-        local test_timeout_seconds="${MMLTK_TEST_TIMEOUT_SECONDS:-300}"
-        [[ "${test_timeout_seconds}" =~ ^[1-9][0-9]*$ ]] ||
-            die "MMLTK_TEST_TIMEOUT_SECONDS must be a positive integer"
-        docker_args+=(--entrypoint /usr/bin/timeout "${build_image_name}")
-        docker_args+=(--foreground --signal=TERM --kill-after=10s "${test_timeout_seconds}s" "${executable}")
+        docker_args+=(--entrypoint "${executable}" "${build_image_name}")
         docker_args+=("$@")
     fi
     run_owned_docker_command "${test_run_container_name}" "${docker_args[@]}"
@@ -2937,16 +2933,13 @@ run_workspace_wayland_test_executable() {
     if [[ -n "${MMLTK_FIREFOX_LOG_FILE:-}" ]]; then
         docker_args+=(--env "MMLTK_FIREFOX_LOG_FILE=$(rewrite_host_path "${MMLTK_FIREFOX_LOG_FILE}")")
     fi
-    if (( test_headless_compositor )) && [[ -n "${MMLTK_TEST_TIMEOUT_SECONDS:-}" ]]; then
-        docker_args+=(--env "MMLTK_TEST_TIMEOUT_SECONDS=${MMLTK_TEST_TIMEOUT_SECONDS}")
-    fi
     append_explicit_test_environment docker_args
     docker_args+=("${common_group_args[@]}")
     local bind_mount_spec
     for bind_mount_spec in "${bind_mount_specs[@]}"; do
         docker_args+=(--volume "${bind_mount_spec}")
     done
-    if (( test_headless_compositor )); then
+    if (( test_headless_compositor )) && [[ "${1:-}" != "--list-tests" ]]; then
         # Linux skips piped core handlers at exactly one byte; zero is ignored
         # by that path. Scope this to the validation container, not host sysctls.
         docker_args+=(

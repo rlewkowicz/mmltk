@@ -70,6 +70,7 @@ class DiagnosticsClient final {
 
    private:
     [[nodiscard]] std::mutex& queue_mutex_for_test() noexcept;
+    [[nodiscard]] bool wait_for_capacity_waiter_for_test() noexcept;
     friend struct DiagnosticsClientTestAccess;
     void initialize(mmltk::common::io::ScopedFd descriptor, DiagnosticsExecutionPolicy policy) noexcept;
 
@@ -83,23 +84,30 @@ class DiagnosticsProducer final {
     class Operation final {
        public:
         Operation() noexcept = default;
+        ~Operation() noexcept;
+        Operation(const Operation& other) noexcept;
+        Operation(Operation&& other) noexcept;
+        Operation& operator=(Operation other) noexcept;
         [[nodiscard]] bool enabled() const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record) const noexcept;
         // Effect-only instrumentation must never wait for diagnostic capacity.
         [[nodiscard]] DiagnosticSubmitResult try_submit(DiagnosticRecord record) const noexcept;
 
        private:
+        void fail_delivery() const noexcept;
+        void settle_complete_locked() const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit_terminal_encoded(DiagnosticRecord record) const noexcept;
         using EncodedBatchWriter = bool (*)(void*, std::size_t, std::span<char>, std::size_t&) noexcept;
-        [[nodiscard]] DiagnosticSubmitResult try_submit_encoded_batch(std::size_t count, void* context,
-                                                                      EncodedBatchWriter writer) const noexcept;
-        [[nodiscard]] DiagnosticSubmitResult try_submit_encoded(DiagnosticRecord record) const noexcept {
-            return submit(record, false, false);
+        [[nodiscard]] DiagnosticSubmitResult submit_encoded_batch(std::size_t count, void* context,
+                                                                      EncodedBatchWriter writer, bool complete) const noexcept;
+        [[nodiscard]] DiagnosticSubmitResult submit_encoded(DiagnosticRecord record, bool complete) const noexcept {
+            return submit(record, complete, false);
         }
         friend class RuntimeDiagnosticTarget;
-        explicit Operation(std::shared_ptr<DiagnosticsClient::State> state) noexcept;
+        explicit Operation(std::shared_ptr<DiagnosticsClient::State> state, bool complete = false) noexcept;
         std::shared_ptr<DiagnosticsClient::State> state_;
+        mutable bool complete_active_ = false;
         friend class DiagnosticsProducer;
     };
 
@@ -108,6 +116,10 @@ class DiagnosticsProducer final {
     [[nodiscard]] bool enabled() const noexcept;
 
    private:
+    [[nodiscard]] Operation acquire_complete() const noexcept;
+    friend class RuntimeDiagnosticTarget;
+    [[nodiscard]] bool supports_complete_delivery() const noexcept;
+    friend class RuntimeDiagnostics;
     explicit DiagnosticsProducer(std::weak_ptr<DiagnosticsClient::State> state) noexcept;
     std::weak_ptr<DiagnosticsClient::State> state_;
     friend class DiagnosticsClient;

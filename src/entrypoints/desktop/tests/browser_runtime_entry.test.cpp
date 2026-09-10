@@ -1,4 +1,6 @@
 #include <poll.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -78,12 +80,30 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
 
 [[nodiscard]] EntryResult run_entry(const std::filesystem::path& executable, const std::filesystem::path& firefox_log,
                                     const std::filesystem::path& working_directory, const std::filesystem::path& firefox_root,
-                                    const int tracing = 0) {
+                                    const int tracing = 0, const bool integration = false) {
     const std::string executable_path = executable.string();
     const std::string diagnostics_path = (working_directory / "trace.jsonl").string();
+    std::array<int, 2U> control{-1, -1};
+    if (integration && ::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, control.data()) != 0)
+        throw std::runtime_error("cannot create entry integration control socket");
+    ScopedFd control_child{control[0]};
+    ScopedFd control_parent{control[1]};
+    const std::string control_text = std::to_string(control_child.get());
+    const auto native_output = working_directory / "native-output.txt";
     const pid_t child = ::fork();
     if (child < 0) { throw std::runtime_error(std::string{"failed to fork browser entry fixture: "} + std::strerror(errno)); }
     if (child == 0) {
+        control_parent.reset();
+        ScopedFd output{::open(native_output.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
+        if (output.get() < 0 || ::dup2(output.get(), STDOUT_FILENO) < 0 || ::dup2(output.get(), STDERR_FILENO) < 0 ||
+            ::unsetenv("MMLTK_LOG_LEVEL") != 0 || ::unsetenv("MMLTK_LOG_FILE") != 0 || ::unsetenv("MMLTK_LOG_DIR") != 0 ||
+            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", integration ? "1" : "0", 1) != 0)
+            std::_Exit(126);
+        if (integration && (::fcntl(control_child.get(), F_SETFD, 0) != 0 ||
+            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_text.c_str(), 1) != 0 ||
+            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", working_directory.c_str(), 1) != 0 ||
+            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", working_directory.c_str(), 1) != 0 ||
+            ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", "512", 1) != 0)) std::_Exit(126);
         if (::chdir(working_directory.c_str()) != 0) std::_Exit(126);
         if ((tracing == 0 ? ::unsetenv("MMLTK_GUI_TRACE_FILE") : ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_path.c_str(), 1)) != 0 ||
             ::setenv("MMLTK_GUI_PIXEL_TRACE", tracing == 2 ? "1" : "0", 1) != 0)
@@ -101,6 +121,7 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
         std::_Exit(127);
     }
 
+    control_child.reset();
     int cleanup_pidfd = -1;
     try {
         ScopedFd pidfd{static_cast<int>(::syscall(SYS_pidfd_open, child, 0U))};
@@ -194,6 +215,25 @@ TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing
                                      " pixels=" + std::to_string(tracing == 2) + " environment=" + std::to_string(tracing == 2);
         CHECK(text.find(expected) != std::string::npos);
     }
+}
+
+TEST_CASE("integration entry selects explicit complete evidence without forcing ordinary logging", "[gui][browser-runtime][entry]") {
+    for (const int tracing : {0, 1}) {
+        TemporaryFirefoxLog output;
+        const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(),
+                                      MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, tracing, true);
+        REQUIRE(result.exited());
+        CHECK(result.exit_code() == 0);
+        CHECK(std::filesystem::file_size(output.directory() / "native-output.txt") == 0U);
+        CHECK(std::filesystem::exists(output.directory() / "trace.jsonl") == (tracing != 0));
+    }
+    TemporaryFirefoxLog refused;
+    std::filesystem::create_directory(refused.directory() / "trace.jsonl");
+    const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, refused.path(), refused.directory(),
+                                  MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 1, true);
+    REQUIRE(result.exited());
+    CHECK(result.exit_code() != 0);
+    CHECK_FALSE(std::filesystem::exists(refused.path()));
 }
 
 }  // namespace
