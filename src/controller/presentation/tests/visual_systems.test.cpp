@@ -1731,6 +1731,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         return outcome;
     }
     int poll_fd() const noexcept override { return state_->readiness.get(); }
+    int completion_fd() const noexcept override { return -1; }
     bool wants_write() const noexcept override { return false; }
     void SetExpectedBrowserProcessGroup(pid_t) override {}
     Retirement BrowserPeerLost() noexcept override {
@@ -6271,7 +6272,7 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
     }
 }
 
-TEST_CASE("Presentation explicitly refreshes a selected private product") {
+TEST_CASE("Presentation directly refreshes a selected private product") {
     PresentationSourceFixture source;
     EventGate events;
     std::atomic<std::uint64_t> completed_events{0U};
@@ -6319,10 +6320,7 @@ TEST_CASE("Presentation explicitly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 1U);
 
     source.Advance();
-    presentation.Observe({
-        .completed_sample = 7U,
-        .redraw_requested = true,
-    });
+    presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 2U; }));
     CHECK(presentation.snapshot().completed_source_revision == 2U);
@@ -6333,10 +6331,11 @@ TEST_CASE("Presentation explicitly refreshes a selected private product") {
 
     writer_state->allow_publication.store(false, std::memory_order_release);
     source.Advance();
-    static_cast<void>(presentation.Select(source.identity()));
+    presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
     source.Advance();
+    presentation.SourceChanged(source.identity());
     writer_state->allow_publication.store(true, std::memory_order_release);
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 4U; }));

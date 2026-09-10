@@ -57,6 +57,7 @@ fn queued_redraw(surface: Surface) -> Task<Message> {
 
 impl Controller {
     pub(super) fn suspend_viewer(&mut self, model: &ApplicationModel, route: FeatureId) {
+        crate::presentation_surface::authorize_draw(None);
         self.stop_requested |= model.has_pending(ApplicationIntentEndpoint::UpscaleStop);
         if self.suspended.is_none() {
             self.suspended = Some(SuspendedViewer {
@@ -169,6 +170,7 @@ impl Controller {
     }
 
     pub(super) fn reset_failure(&mut self) {
+        crate::presentation_surface::authorize_draw(None);
         self.failed = false;
     }
 
@@ -301,10 +303,6 @@ impl App {
         }
     }
     pub(super) fn on_presentation(&mut self, message: Message) -> Task<crate::message::Message> {
-        let capture_completed = matches!(
-            &message,
-            Message::Surface(crate::presentation_surface::Notification::Completed(_))
-        );
         let update = self.presentation.update(message, &self.model);
         if let Some((frame, surface)) = update.native {
             if let Some(integration) = self.integration.as_mut() {
@@ -321,12 +319,7 @@ impl App {
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
         }
-        if capture_completed {
-            self.presentation
-                .surface()
-                .map_or_else(Task::none, queued_redraw)
-                .map(crate::message::Message::Presentation)
-        } else if update.redraw {
+        if update.redraw {
             iced::window::request_redraw()
         } else {
             Task::none()
@@ -440,6 +433,13 @@ impl App {
     pub(super) fn reconcile_presentation(&mut self, recovery: bool) {
         self.reconcile_viewer();
         self.dispatch_viewer_desired();
+        if let Some(snapshot) = self.model.explore.snapshot.as_ref() {
+            crate::presentation_surface::gallery::select(
+                (self.model.foreground_visual() == Some(PresentationSourceKind::Explore))
+                    .then_some(snapshot),
+                &snapshot.frame,
+            );
+        }
         if let Err(error) = self.model.completed_presentation_is_obsolete() {
             self.retire_peer(error);
             return;
@@ -554,6 +554,7 @@ impl Controller {
     }
 
     pub(super) fn retire_frame(&mut self) {
+        crate::presentation_surface::authorize_draw(None);
         self.retire_pending();
         self.retained = None;
         crate::presentation_surface::clear_drawn_detail();
@@ -579,6 +580,7 @@ impl Controller {
         feature: FeatureId,
         recovery: bool,
     ) -> Result<(), UiError> {
+        crate::presentation_surface::authorize_draw(None);
         // Transport loss clears domain facts, not receiver-owned image custody.
         let Some(snapshot) = model.presentation.as_ref() else {
             return Ok(());
@@ -597,7 +599,7 @@ impl Controller {
                 crate::presentation_surface::completed_content(&snapshot.completed, snapshot)
         {
             crate::presentation_surface::reconcile_completed(
-                retained.frame.expect("completed retained surface"),
+                retained,
                 model,
             );
             self.retained = Some(retained);
@@ -629,7 +631,7 @@ impl Controller {
                     &snapshot.completed,
                     model.explore.snapshot.as_ref(),
                 );
-                crate::presentation_surface::reconcile_completed(frame, model);
+                crate::presentation_surface::reconcile_completed(self.pending.expect("matching pending surface"), model);
                 if let Some(retained) = crate::presentation_surface::retained_surface()
                     .filter(|surface| surface.frame == Some(frame))
                 {

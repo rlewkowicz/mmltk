@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Clone, Default)]
 pub(super) struct PresentationModel {
     foreground: Option<PresentationSourceKind>,
-    sent: Option<VisualFrame>,
+    sent: Option<PresentationSourceIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,16 +41,16 @@ impl PresentationModel {
         if self
             .sent
             .as_ref()
-            .is_some_and(|sent| sent.source != frame.source)
+            .is_some_and(|sent| sent != &frame.source)
         {
             self.clear_sent();
         }
-        (decision == Reconciliation::Superseded && self.sent.as_ref() != Some(&frame))
+        (decision == Reconciliation::Superseded && self.sent.as_ref() != Some(&frame.source))
             .then_some(frame)
     }
 
     fn sent(&mut self, frame: VisualFrame) {
-        self.sent = Some(frame);
+        self.sent = Some(frame.source);
     }
 
     fn reconcile(
@@ -839,8 +839,9 @@ mod tests {
                 selection,
                 Ok(ApplicationReply::PresentationSelect(admitted)),
             ),
-            Some(explore.frame)
+            None
         );
+        assert_eq!(model.explore.snapshot.as_ref().unwrap().frame, explore.frame);
     }
 
     #[test]
@@ -864,15 +865,16 @@ mod tests {
                 5 => explore.viewport.firstrow = 3,
                 _ => unreachable!(),
             }
-            let frame = model
-                .reduce_event(ApplicationEvent::ExploreExploreChanged(
+            let refresh = model.reduce_event(ApplicationEvent::ExploreExploreChanged(
                     crate::generated::ExploreChanged {
                         snapshot: explore.clone(),
                     },
-                ))
-                .expect("changed Explore foreground");
-            assert_eq!(frame.revision, revision);
-            model.record_presentation_sent(frame);
+                ));
+            assert_eq!(refresh.is_some(), revision == 1);
+            assert_eq!(model.explore.snapshot.as_ref().unwrap().frame.revision, revision);
+            if let Some(frame) = refresh {
+                model.record_presentation_sent(frame);
+            }
         }
     }
 
@@ -887,15 +889,16 @@ mod tests {
             annotation.revision += 1;
             annotation.ui.documentrevision += 1;
             annotation.frame.revision = revision;
-            let frame = model
-                .reduce_event(ApplicationEvent::AnnotationAnnotationChanged(
+            let refresh = model.reduce_event(ApplicationEvent::AnnotationAnnotationChanged(
                     crate::generated::AnnotationChanged {
                         snapshot: annotation.clone(),
                     },
-                ))
-                .expect("changed Annotation foreground");
-            assert_eq!(frame.revision, revision);
-            model.record_presentation_sent(frame);
+                ));
+            assert_eq!(refresh.is_some(), revision == 1);
+            assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame.revision, revision);
+            if let Some(frame) = refresh {
+                model.record_presentation_sent(frame);
+            }
         }
         assert!(
             model
@@ -927,10 +930,9 @@ mod tests {
             let observed = model.reduce_event(ApplicationEvent::AnnotationAnnotationChanged(
                 crate::generated::AnnotationChanged { snapshot: full.clone() },
             ));
-            if frame_first {
-                assert_eq!(observed, Some(pixels.clone()));
-            } else {
-                assert_eq!(model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(small.clone())), Some(pixels.clone()));
+            assert!(observed.is_none());
+            if !frame_first {
+                assert!(model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(small.clone())).is_none());
             }
             model.record_presentation_sent(pixels.clone());
             assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame, pixels);
@@ -989,15 +991,16 @@ mod tests {
             live.revision += 1;
             live.completedframes += 1;
             live.frame.revision = revision;
-            let frame = model
-                .reduce_event(ApplicationEvent::LiveLiveFrameCompleted(
+            let refresh = model.reduce_event(ApplicationEvent::LiveLiveFrameCompleted(
                     crate::generated::LiveFrameCompleted {
                         snapshot: live.clone(),
                     },
-                ))
-                .expect("changed Live foreground");
-            assert_eq!(frame.revision, revision);
-            model.record_presentation_sent(frame);
+                ));
+            assert_eq!(refresh.is_some(), revision == 1);
+            assert_eq!(model.live_snapshot.as_ref().unwrap().frame.revision, revision);
+            if let Some(frame) = refresh {
+                model.record_presentation_sent(frame);
+            }
         }
     }
 

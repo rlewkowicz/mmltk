@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <functional>
@@ -70,6 +71,7 @@ class ApplicationSystemStorage final {
     // is unrelated to transport-channel queue inventories and cannot use an erased or shared storage base.
     EventSink events_;
     ContinuitySink continuity_;
+    std::atomic<PresentationSystem*> presentation_notifications_{nullptr};
     std::unique_ptr<SettingsSystem> settings_;
     std::unique_ptr<FileDialogSystem> file_dialog_;
     std::unique_ptr<DatasetSystem> dataset_;
@@ -90,6 +92,7 @@ class ApplicationSystemStorage final {
 
 [[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&,
                                                                                          UpscaleSystem&,
-                                                                                         ApplicationSystemStorage::ContinuitySink = {});
+                                                                                         ApplicationSystemStorage::ContinuitySink = {},
+                                                                                         std::function<void(PresentationSourceIdentity)> = {});
 
 }  // namespace mmltk::controller::shell

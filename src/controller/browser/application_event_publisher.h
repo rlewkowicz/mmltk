@@ -1,10 +1,12 @@
 #pragma once
 
 #include <functional>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
 #include "src/controller/browser/application_materializer.h"
+#include "src/controller/presentation/visual_system_types.h"
 
 namespace mmltk::controller::browser {
 
@@ -13,17 +15,23 @@ class ApplicationEventPublisher final {
    public:
     using Sink = std::function<void(SystemEvent)>;
     using ContinuitySink = std::function<void()>;
+    using SourceSink = std::function<void(PresentationSourceIdentity)>;
 
-    ApplicationEventPublisher(Sink& sink, ContinuitySink continuity) : sink_(sink), continuity_(std::move(continuity)) {}
+    ApplicationEventPublisher(Sink& sink, ContinuitySink continuity, SourceSink source = {})
+        : sink_(sink), continuity_(std::move(continuity)), source_(std::move(source)) {}
 
     template <class Variant>
     void operator()(const Variant& event) const noexcept {
-        if (!sink_) return;
         std::visit(
             [this]<class Event>(const Event& value) noexcept {
                 using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
                 try {
-                    sink_(encode_system_event<Member, Event, Composition>(value));
+                    using System = std::remove_pointer_t<std::remove_cvref_t<decltype(std::declval<Composition>().*Member)>>;
+                    if constexpr (requires { typename System::visual_source; }) {
+                        using Projection = typename System::visual_source;
+                        if (source_) source_({Projection::kind, 1U});
+                    }
+                    if (sink_) sink_(encode_system_event<Member, Event, Composition>(value));
                 } catch (...) {
                     if constexpr (Descriptor::delivery != contracts::reflection::EventDelivery::Transient) {
                         try {
@@ -38,6 +46,7 @@ class ApplicationEventPublisher final {
    private:
     Sink& sink_;
     ContinuitySink continuity_;
+    SourceSink source_;
 };
 
 }  // namespace mmltk::controller::browser

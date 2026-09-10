@@ -668,6 +668,12 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     CHECK(published.event_id ==
           ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationCompleted>::event_id);
     CHECK(lost == 2U);
+    std::optional<PresentationSourceIdentity> notified;
+    std::function<void(SystemEvent)> absent;
+    ApplicationEventPublisher<&ApplicationSystems::annotation> annotation(
+        absent, {}, [&](const PresentationSourceIdentity source) { notified = source; });
+    annotation(AnnotationSystem::event_type{AnnotationFrameChanged{}});
+    CHECK((notified == std::optional{PresentationSourceIdentity{PresentationSourceKind::Annotation, 1U}}));
 }
 
 TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products", "[controller][browser][reflection]") {

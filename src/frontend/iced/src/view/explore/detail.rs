@@ -111,7 +111,7 @@ pub(super) fn view<'a>(
                     placement: crate::presentation_surface::Placement::Contain,
                     control_id: super::DETAIL_WORKSPACE_ID,
                 },
-                crate::presentation_surface::retained_detail()
+                crate::presentation_surface::drawable_detail(surface)
                     .filter(|(retained, _)| retained.viewer_identity == surface.viewer_identity)
                     .map_or(
                         crate::presentation_surface::labels::Source::Hidden,

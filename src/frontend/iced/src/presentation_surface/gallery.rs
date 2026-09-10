@@ -61,6 +61,11 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
                 && snapshot
                     .is_some_and(|current| current.dataset.identity == value.dataset.identity)
         }) {
+            if let Some(snapshot) = snapshot
+                && selected.as_ref().is_some_and(|value| snapshot.revision > value.revision)
+            {
+                *selected = Some(Arc::new(snapshot.clone()));
+            }
             return;
         }
         CONFIRMED.with(|value| *value.borrow_mut() = None);
@@ -107,7 +112,17 @@ pub(super) fn matching(frame: Option<FrameReady>) -> Option<Arc<ExploreSnapshot>
 pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreSnapshot>)> {
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
-        let imported = renderer.as_ref()?.imported.as_ref()?;
+        let renderer = renderer.as_ref()?;
+        if let Some(submitted) = [&renderer.pending, &renderer.imported]
+            .into_iter().flatten().find_map(|imported| {
+                let pending = imported.image.pending_capture.as_ref()?;
+                let pending = imported.image.submitted_draw(pending.surface)?;
+                Some((pending.surface, pending.gallery.clone()?))
+            })
+        {
+            return Some(submitted);
+        }
+        let imported = renderer.imported.as_ref()?;
         let frame = imported.image.captured?;
         let snapshot = imported.image.gallery.as_ref()?;
         (imported.image.surface.frame == Some(frame) && matches(snapshot, frame))
@@ -275,6 +290,9 @@ mod tests {
     #[test]
     fn selected_gallery_facts_require_the_exact_revision_and_extent() {
         let mut snapshot = crate::view_model::test_support::explore_snapshot();
+        snapshot.ready = true;
+        snapshot.revision = 1;
+        snapshot.dataset.identity = 11;
         snapshot.mode = ExploreMode::Gallery;
         snapshot.frame.source = crate::generated::PresentationSourceIdentity {
             kind: crate::generated::PresentationSourceKind::Explore,
@@ -290,6 +308,55 @@ mod tests {
         select(Some(&snapshot), &snapshot.frame);
         confirm(frame, &snapshot.frame, Some(&snapshot));
         let retained = matching(Some(frame)).unwrap();
+        let surface = crate::view_model::test_support::physical_surface(frame);
+        let mut image = super::super::ImagePublication {
+            surface,
+            owned_index: 0,
+            captured: None,
+            pending_capture: Some(super::super::PendingImage {
+                surface,
+                gallery: Some(retained.clone()),
+                detail: None,
+                placement: placement(&snapshot),
+                index: 1,
+                complete: false,
+                view_ready: false,
+            }),
+            gallery: None,
+            detail: None,
+            placement: placement(&snapshot),
+        };
+        let mut model = crate::view_model::test_support::bootstrapped();
+        model.set_foreground_feature(crate::generated::FeatureId::Explore);
+        model.explore.snapshot = Some(snapshot.clone());
+        let control = model.presentation.as_mut().unwrap();
+        control.completed = snapshot.frame.clone();
+        control.completedsourcerevision = snapshot.revision;
+        control.presentationrevision = frame.presentation_revision;
+        snapshot.revision += 1;
+        snapshot.overlay.showlabels = !snapshot.overlay.showlabels;
+        model.explore.snapshot = Some(snapshot.clone());
+        select(Some(&snapshot), &snapshot.frame);
+        assert_eq!(matching(Some(frame)).unwrap().revision, snapshot.revision);
+        image.reconcile_pending(frame, &model);
+        let pending = image.pending_capture.as_ref().unwrap();
+        assert_eq!(pending.gallery.as_ref().unwrap().revision, snapshot.revision);
+        assert_eq!(pending.gallery.as_ref().unwrap().overlay.showlabels, snapshot.overlay.showlabels);
+        assert!(!pending.complete);
+        assert!(image.retained().is_none());
+        assert!(!image.promote(frame, &model));
+        let mut other_dataset = snapshot.clone();
+        other_dataset.dataset.identity += 1;
+        select(Some(&other_dataset), &other_dataset.frame);
+        confirm(frame, &other_dataset.frame, Some(&other_dataset));
+        image.reconcile_pending(frame, &model);
+        assert_eq!(image.pending_capture.as_ref().unwrap().gallery.as_ref().unwrap().dataset.identity,
+                   snapshot.dataset.identity);
+        select(Some(&snapshot), &snapshot.frame);
+        confirm(frame, &snapshot.frame, Some(&snapshot));
+        image.complete(frame);
+        assert!(image.promote(frame, &model));
+        assert_eq!(image.retained(), Some(surface));
         snapshot.viewport.rowcount = 5;
         snapshot.viewport.firstrow = 1;
         snapshot.frame.extent.height = 500;

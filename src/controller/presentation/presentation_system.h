@@ -123,6 +123,7 @@ class PresentationNativeWriter {
     virtual void Submit(PresentationSubmittedSource, const VisualSourceReader&) = 0;
     [[nodiscard]] virtual PresentationNativeOutcome Pump(std::uint64_t current_selection_generation) = 0;
     [[nodiscard]] virtual int poll_fd() const noexcept = 0;
+    [[nodiscard]] virtual int completion_fd() const noexcept = 0;
     [[nodiscard]] virtual bool wants_write() const noexcept = 0;
     virtual void SetExpectedBrowserProcessGroup(pid_t) = 0;
     [[nodiscard]] virtual Retirement BrowserPeerLost() noexcept = 0;
@@ -156,6 +157,7 @@ class PresentationSystem final {
     ~PresentationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationSnapshot Select(PresentationSourceIdentity);
     void Observe(RendererObservation);
+    void SourceChanged(PresentationSourceIdentity) noexcept;
     void SetExpectedBrowserProcessGroup(pid_t);
     void BrowserPeerLost() noexcept;
     void CloseAdmission() noexcept;

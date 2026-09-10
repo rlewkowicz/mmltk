@@ -93,6 +93,18 @@ class PresentationSystem::Impl final {
         return snapshot();
     }
 
+    void SourceChanged(const PresentationSourceIdentity source) noexcept {
+        bool wake = false;
+        {
+            std::scoped_lock lock(mutex_);
+            if (!stopping_ && state_.selected == source && !pending_) {
+                wake = true;
+                pending_ = Pending{.source = source, .generation = selection_generation_, .force = false};
+            }
+        }
+        if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation source notification failed")));
+    }
+
     void Observe(const RendererObservation observation) {
         PresentationSnapshot completed;
         bool publish = false;
@@ -177,6 +189,7 @@ class PresentationSystem::Impl final {
     struct Pending final {
         PresentationSourceIdentity source{};
         std::uint64_t generation = 0U;
+        bool force = true;
     };
 
     void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
@@ -228,7 +241,8 @@ class PresentationSystem::Impl final {
                 const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
                                       in_flight_->observation.frame.source == pending->source;
                 if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
-                    pending->generation == selection_generation_ && state_.selected == pending->source) {
+                    pending->generation == selection_generation_ && state_.selected == pending->source &&
+                    (pending->force || state_.completed != frame)) {
                     in_flight_ = submitted;
                     submit = true;
                 } else if (reserved) {
@@ -354,10 +368,11 @@ class PresentationSystem::Impl final {
             short native_events = POLLIN;
             if (writer_->wants_write()) native_events |= POLLOUT;
             // CLEANUP-IGNORE: Presentation waits on its writer and control event; Firefox owns a separate process loop.
-            std::array<pollfd, 2U> descriptors{{
+            std::array<pollfd, 3U> descriptors{{
                 // CLEANUP-IGNORE: The writer descriptor is a Presentation-owned event source.
                 {.fd = native_fd, .events = native_events, .revents = 0},
                 {.fd = control_fd_.get(), .events = POLLIN, .revents = 0},
+                {.fd = writer_->completion_fd(), .events = POLLIN, .revents = 0},
             }};
             const int result = ::poll(descriptors.data(), descriptors.size(), -1);
             if (result < 0) {
@@ -458,6 +473,7 @@ PresentationSystem::~PresentationSystem() {
 }
 PresentationSnapshot PresentationSystem::Select(const PresentationSourceIdentity source) { return impl_->Select(source); }
 void PresentationSystem::Observe(const RendererObservation observation) { impl_->Observe(observation); }
+void PresentationSystem::SourceChanged(const PresentationSourceIdentity source) noexcept { impl_->SourceChanged(source); }
 void PresentationSystem::SetExpectedBrowserProcessGroup(const pid_t process_group) { impl_->SetExpectedBrowserProcessGroup(process_group); }
 void PresentationSystem::BrowserPeerLost() noexcept { impl_->BrowserPeerLost(); }
 void PresentationSystem::CloseAdmission() noexcept { impl_->CloseAdmission(); }

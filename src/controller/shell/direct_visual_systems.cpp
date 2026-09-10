@@ -15,8 +15,10 @@ namespace mmltk::controller::shell {
 
 SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink& sink,
                                                                            UpscaleSystem& upscale,
-                                                                           ApplicationSystemStorage::ContinuitySink continuity) {
-    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity))](
+                                                                           ApplicationSystemStorage::ContinuitySink continuity,
+                                                                           std::function<void(PresentationSourceIdentity)> source) {
+    return [&upscale, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::explore>(sink, std::move(continuity),
+                                                                                               std::move(source))](
                ExploreSystem::event_type event) noexcept {
         if (const auto* changed = std::get_if<ExploreChanged>(&event);
             changed != nullptr && changed->snapshot.ready && !changed->snapshot.busy &&
@@ -48,6 +50,9 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
                                                    const VisualDiagnosticSink diagnostics, ContinuitySink continuity)
     : events_(std::move(events)), continuity_(std::move(continuity)) {
     const auto borrow_exact = [this](const VisualFrame& frame) { return BorrowDocument(frame); };
+    const auto source_changed = [this](const PresentationSourceIdentity source) {
+        if (auto* presentation = presentation_notifications_.load(std::memory_order_acquire)) presentation->SourceChanged(source);
+    };
     settings_ = std::make_unique<SettingsSystem>([this, publisher = browser::ApplicationEventPublisher<&ApplicationSystems::settings>(
                                                             events_, continuity_)](SettingsSystem::event_type event) noexcept {
         publisher(event);
@@ -87,18 +92,18 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
         browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_), compute.execution);
     predict_ = std::make_unique<PredictSystem>(
         *settings_, *dataset_, *model_, configuration.base_visual, [compute] { return std::make_unique<CudaPredictRuntime>(compute); },
-        browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_));
+        browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_, source_changed));
     upscale_ = std::make_unique<UpscaleSystem>(
         configuration.output_visual, make_native_upscale_runtime_factory(configuration.output_visual), borrow_exact,
-        browser::ApplicationEventPublisher<&ApplicationSystems::upscale>(events_, continuity_), diagnostics);
+        browser::ApplicationEventPublisher<&ApplicationSystems::upscale>(events_, continuity_, source_changed), diagnostics);
     explore_ = make_shell_explore_system(*settings_, configuration, *compute.execution,
-                                         make_explore_upscale_event_sink(events_, *upscale_, continuity_), diagnostics);
+                                         make_explore_upscale_event_sink(events_, *upscale_, continuity_, source_changed), diagnostics);
     annotation_ = std::make_unique<AnnotationSystem>(
         configuration.output_visual, make_native_annotation_runtime_factory(configuration.output_visual), borrow_exact,
-        browser::ApplicationEventPublisher<&ApplicationSystems::annotation>(events_, continuity_), diagnostics);
+        browser::ApplicationEventPublisher<&ApplicationSystems::annotation>(events_, continuity_, source_changed), diagnostics);
     live_ = std::make_unique<LiveSystem>(configuration.base_visual,
                                          make_native_live_runtime_factory(configuration.base_visual, std::move(configuration.live)),
-                                         browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_), diagnostics);
+                                         browser::ApplicationEventPublisher<&ApplicationSystems::live>(events_, continuity_, source_changed), diagnostics);
 
     systems_.settings = settings_.get();
     systems_.file_dialog = file_dialog_.get();
@@ -118,6 +123,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
         make_native_presentation_writer_factory(configuration.output_visual, std::move(configuration.presentation), diagnostics),
         source_readers_, browser::ApplicationEventPublisher<&ApplicationSystems::presentation>(events_, continuity_), diagnostics);
     systems_.presentation = presentation_.get();
+    presentation_notifications_.store(presentation_.get(), std::memory_order_release);
 }
 
 mmltk::frameworks::gpu::BorrowedImageProductReadView ApplicationSystemStorage::BorrowExactFrame(const VisualFrame& frame) const {
@@ -127,7 +133,9 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView ApplicationSystemStorage::B
     return borrow_matching_visual_product(frame, found->borrow());
 }
 
-ApplicationSystemStorage::~ApplicationSystemStorage() = default;
+ApplicationSystemStorage::~ApplicationSystemStorage() {
+    presentation_notifications_.store(nullptr, std::memory_order_release);
+}
 VisualDocumentRead ApplicationSystemStorage::BorrowDocument(const VisualFrame& frame) const {
     if (frame.source.kind == PresentationSourceKind::Explore) return explore_->BorrowDocument(frame);
     if (frame.source.kind == PresentationSourceKind::Upscale) return upscale_->BorrowDocument(frame);

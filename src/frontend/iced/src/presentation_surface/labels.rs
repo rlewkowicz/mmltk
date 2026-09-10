@@ -96,7 +96,7 @@ pub(crate) fn view<'a, Message: 'a>(
         Source::Gallery(_) => {
             super::gallery::displayed().map_or(program.surface, |(surface, _)| surface)
         }
-        Source::Detail(_) => super::retained_detail().map_or(program.surface, |(retained, _)| {
+        Source::Detail(_) => super::drawable_detail(program.surface).map_or(program.surface, |(retained, _)| {
             if program.surface.frame == retained.frame
                 && super::same_allocation(program.surface, retained)
             {
