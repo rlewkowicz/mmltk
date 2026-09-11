@@ -1181,15 +1181,14 @@ impl ViewportOwner {
                 self.pan_origin = cursor.position();
                 Some(shader::Action::capture())
             }
-            Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                // Availability belongs to Iced's overlay/hit-test pass; the
-                // coordinates belong to this event, never the batch frontier.
-                let cursor = if cursor.position().is_some() { mouse::Cursor::Available(*position) } else { mouse::Cursor::Unavailable };
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                // Iced supplies this event's cursor in the child's coordinate
+                // space, including scroll/ancestor transforms and overlay gating.
                 if let Some(prior) = self.pan_origin {
-                    cursor.position()?;
+                    let position = cursor.position()?;
                     self.pan_x += position.x - prior.x;
                     self.pan_y += position.y - prior.y;
-                    self.pan_origin = Some(*position);
+                    self.pan_origin = Some(position);
                     Some(shader::Action::request_redraw().and_capture())
                 } else if self.pointer_active {
                     let Some(publish) = publish else {
@@ -3849,43 +3848,85 @@ mod tests {
         use std::{cell::RefCell, rc::Rc};
         type Observed = (core::Event, core::mouse::Cursor);
 
+        struct TestRenderer;
+        impl core::Renderer for TestRenderer {
+            fn start_layer(&mut self, _: Rectangle) {}
+            fn end_layer(&mut self) {}
+            fn start_transformation(&mut self, _: core::Transformation) {}
+            fn end_transformation(&mut self) {}
+            fn fill_quad(&mut self, _: core::renderer::Quad, _: impl Into<core::Background>) {}
+            fn allocate_image(&mut self, _: &core::image::Handle,
+                callback: impl FnOnce(Result<core::image::Allocation, core::image::Error>) + Send + 'static) {
+                callback(Err(core::image::Error::Unsupported));
+            }
+            fn hint(&mut self, _: f32) {}
+            fn scale_factor(&self) -> Option<f32> { None }
+            fn reset(&mut self, _: core::Rectangle) {}
+        }
+        impl core::text::Renderer for TestRenderer {
+            type Font = core::Font;
+            type Paragraph = iced::advanced::graphics::text::Paragraph;
+            type Editor = iced::advanced::graphics::text::Editor;
+            const ICON_FONT: core::Font = core::Font::DEFAULT;
+            const CHECKMARK_ICON: char = ' ';
+            const ARROW_DOWN_ICON: char = ' ';
+            const SCROLL_UP_ICON: char = ' ';
+            const SCROLL_DOWN_ICON: char = ' ';
+            const SCROLL_LEFT_ICON: char = ' ';
+            const SCROLL_RIGHT_ICON: char = ' ';
+            const ICED_LOGO: char = ' ';
+            fn default_font(&self) -> core::Font { core::Font::DEFAULT }
+            fn default_size(&self) -> core::Pixels { core::Pixels(16.0) }
+            fn fill_paragraph(&mut self, _: &Self::Paragraph, _: Point, _: core::Color, _: Rectangle) {}
+            fn fill_editor(&mut self, _: &Self::Editor, _: Point, _: core::Color, _: Rectangle) {}
+            fn fill_text(&mut self, _: core::Text<String>, _: Point, _: core::Color, _: Rectangle) {}
+        }
         struct Probe {
             overlay_events: Option<Rc<RefCell<Vec<Observed>>>>,
+            size: core::Size,
+            viewport: ViewportOwner,
+            gestures: Rc<RefCell<Vec<SurfaceGesture>>>,
         }
         struct ModalProbe(Rc<RefCell<Vec<Observed>>>);
 
-        impl core::Widget<Observed, (), ()> for Probe {
+        impl core::Widget<Observed, iced::Theme, TestRenderer> for Probe {
             fn size(&self) -> core::Size<core::Length> {
-                core::Size::new(core::Length::Fixed(100.0), core::Length::Fixed(100.0))
+                core::Size::new(core::Length::Fixed(self.size.width), core::Length::Fixed(self.size.height))
             }
-            fn layout(&mut self, _tree: &mut core::widget::Tree, _renderer: &(),
+            fn layout(&mut self, _tree: &mut core::widget::Tree, _renderer: &TestRenderer,
                 _limits: &core::layout::Limits) -> core::layout::Node {
-                core::layout::Node::new(core::Size::new(100.0, 100.0))
+                core::layout::Node::new(self.size)
             }
-            fn draw(&self, _tree: &core::widget::Tree, _renderer: &mut (), _theme: &(),
+            fn draw(&self, _tree: &core::widget::Tree, _renderer: &mut TestRenderer, _theme: &iced::Theme,
                 _style: &core::renderer::Style, _layout: core::Layout<'_>,
                 _cursor: core::mouse::Cursor, _viewport: &core::Rectangle) {}
             fn update(&mut self, _tree: &mut core::widget::Tree, event: &core::Event,
-                _layout: core::Layout<'_>, cursor: core::mouse::Cursor, _renderer: &(),
+                layout: core::Layout<'_>, cursor: core::mouse::Cursor, _renderer: &TestRenderer,
                 shell: &mut core::Shell<'_, Observed>, _viewport: &core::Rectangle) {
                 shell.publish((event.clone(), cursor));
+                let publish = |gesture| {
+                    self.gestures.borrow_mut().push(gesture);
+                    shader::Action::<()>::capture()
+                };
+                let _ = self.viewport.update(event, layout.bounds(), cursor,
+                    surface_for_content_session(1), Placement::Contain, Some(&publish));
             }
             fn overlay<'a>(&'a mut self, _tree: &'a mut core::widget::Tree,
-                _layout: core::Layout<'a>, _renderer: &(), _viewport: &core::Rectangle,
-                _translation: core::Vector) -> Option<core::overlay::Element<'a, Observed, (), ()>> {
+                _layout: core::Layout<'a>, _renderer: &TestRenderer, _viewport: &core::Rectangle,
+                _translation: core::Vector) -> Option<core::overlay::Element<'a, Observed, iced::Theme, TestRenderer>> {
                 self.overlay_events.as_ref().map(|events| {
                     core::overlay::Element::new(Box::new(ModalProbe(events.clone())))
                 })
             }
         }
-        impl core::Overlay<Observed, (), ()> for ModalProbe {
-            fn layout(&mut self, _renderer: &(), _bounds: core::Size) -> core::layout::Node {
+        impl core::Overlay<Observed, iced::Theme, TestRenderer> for ModalProbe {
+            fn layout(&mut self, _renderer: &TestRenderer, _bounds: core::Size) -> core::layout::Node {
                 core::layout::Node::new(core::Size::new(50.0, 100.0))
             }
-            fn draw(&self, _renderer: &mut (), _theme: &(), _style: &core::renderer::Style,
+            fn draw(&self, _renderer: &mut TestRenderer, _theme: &iced::Theme, _style: &core::renderer::Style,
                 _layout: core::Layout<'_>, _cursor: core::mouse::Cursor) {}
             fn update(&mut self, event: &core::Event, layout: core::Layout<'_>,
-                cursor: core::mouse::Cursor, _renderer: &(), shell: &mut core::Shell<'_, Observed>) {
+                cursor: core::mouse::Cursor, _renderer: &TestRenderer, shell: &mut core::Shell<'_, Observed>) {
                 self.0.borrow_mut().push((event.clone(), cursor));
                 if matches!(event, core::Event::Mouse(core::mouse::Event::ButtonPressed(_)))
                     && cursor.is_over(layout.bounds()) {
@@ -3893,7 +3934,7 @@ mod tests {
                 }
             }
             fn mouse_interaction(&self, layout: core::Layout<'_>, cursor: core::mouse::Cursor,
-                _renderer: &()) -> core::mouse::Interaction {
+                _renderer: &TestRenderer) -> core::mouse::Interaction {
                 if cursor.is_over(layout.bounds()) { core::mouse::Interaction::Pointer }
                 else { core::mouse::Interaction::None }
             }
@@ -3916,8 +3957,11 @@ mod tests {
             let observed_overlay = Rc::new(RefCell::new(Vec::new()));
             let root = core::Element::new(Probe {
                 overlay_events: modal.then(|| observed_overlay.clone()),
+                size: core::Size::new(100.0, 100.0),
+                viewport: ViewportOwner::default(),
+                gestures: Rc::default(),
             });
-            let mut renderer = ();
+            let mut renderer = TestRenderer;
             let mut ui = iced_runtime::UserInterface::build(root, core::Size::new(100.0, 100.0),
                 iced_runtime::user_interface::Cache::default(), &mut renderer);
             let mut observed_base = Vec::new();
@@ -3935,6 +3979,51 @@ mod tests {
             } else {
                 assert_eq!(observed_base, events);
                 assert_eq!(statuses, vec![core::event::Status::Ignored; events.len()]);
+            }
+        }
+        for (outer_scroll, inner_scroll) in [(220.0, 35.0), (217.25, 37.5)] {
+            for modal in [false, true] {
+                let gestures = Rc::new(RefCell::new(Vec::new()));
+                let probe = core::Element::new(Probe {
+                    overlay_events: modal.then(|| Rc::default()),
+                    size: core::Size::new(640.0, 480.0),
+                    viewport: ViewportOwner::default(),
+                    gestures: gestures.clone(),
+                });
+                let inner = iced::widget::scrollable(probe).id("inner").height(300.0);
+                let content = iced::widget::column![
+                    iced::widget::space::vertical().height(200.0),
+                    inner,
+                ].spacing(0);
+                let root = iced::widget::scrollable(content).id("outer").height(100.0);
+                let mut renderer = TestRenderer;
+                let mut ui = iced_runtime::UserInterface::build(root, core::Size::new(640.0, 100.0),
+                    iced_runtime::user_interface::Cache::default(), &mut renderer);
+                for (id, y) in [("outer", outer_scroll), ("inner", inner_scroll)] {
+                    ui.operate(&renderer, &mut core::widget::operation::scrollable::scroll_to::<()>(
+                        core::widget::Id::new(id),
+                        core::widget::operation::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+                    ));
+                }
+                let mut observed = Vec::new();
+                let _ = ui.update(&core::window::Headless, &core::shell::Waker::noop(),
+                    &events, second_cursor, &mut renderer, &mut observed);
+                // Scrollable rounds each physical translation independently;
+                // the event's remaining fractional coordinates stay untouched.
+                let translation = core::Vector::new(0.0, outer_scroll.round() + inner_scroll.round());
+                let expected_events = if modal {
+                    vec![(events[0].0.clone(), unavailable), events[2].clone(),
+                        events[3].clone(), events[4].clone(), events[5].clone()]
+                } else { events.clone() };
+                assert_eq!(observed, expected_events.into_iter()
+                    .map(|(event, cursor)| (event, cursor + translation)).collect::<Vec<_>>());
+                let gestures = gestures.borrow();
+                let expected = if modal { vec![second] } else { vec![first, first, second, second] };
+                assert_eq!(gestures.len(), expected.len());
+                for (gesture, raw) in gestures.iter().zip(expected) {
+                    assert_eq!(gesture.sample.content_x, raw.x);
+                    assert_eq!(gesture.sample.content_y, raw.y + translation.y - 200.0);
+                }
             }
         }
     }
@@ -3973,6 +4062,25 @@ mod tests {
             mouse::Cursor::Unavailable, surface, Placement::Contain, Some(&publish));
         assert!(captured.borrow().is_empty());
         assert!(!viewport.pointer_active);
+        for cursor in [mouse::Cursor::Unavailable, mouse::Cursor::Levitating(first)] {
+            let _ = viewport.update(&Event::Mouse(mouse::Event::CursorMoved { position: first }),
+                bounds, cursor, surface, Placement::Contain, Some(&publish));
+            assert!(captured.borrow().is_empty());
+        }
+
+        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+            bounds, mouse::Cursor::Available(first), surface, Placement::Contain, Some(&publish));
+        let raw_window_position = Point::new(1.0, 2.0);
+        let motion = Event::Mouse(mouse::Event::CursorMoved { position: raw_window_position });
+        let _ = viewport.update(&motion, bounds, mouse::Cursor::Levitating(second),
+            surface, Placement::Contain, Some(&publish));
+        assert_eq!(viewport.pan_origin, Some(first));
+        let _ = viewport.update(&motion, bounds, mouse::Cursor::Available(second),
+            surface, Placement::Contain, Some(&publish));
+        assert_eq!((viewport.pan_x, viewport.pan_y), (second.x - first.x, second.y - first.y));
+        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            bounds, mouse::Cursor::Unavailable, surface, Placement::Contain, Some(&publish));
+        assert!(viewport.pan_origin.is_none());
     }
 
     #[test]

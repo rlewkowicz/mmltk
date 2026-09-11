@@ -1,4 +1,73 @@
 use crate::generated::{ExploreFilterUpdate, ExploreSnapshot, ExploreViewportUpdate, VisualExtent};
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct GallerySource {
+    dataset: u64,
+    frame: crate::generated::VisualFrame,
+}
+
+impl GallerySource {
+    pub(super) fn current(snapshot: Option<&ExploreSnapshot>) -> Option<Self> {
+        snapshot
+            .filter(|value| value.ready && value.mode == crate::generated::ExploreMode::Gallery)
+            .map(|value| Self {
+                dataset: value.dataset.identity,
+                frame: value.frame.clone(),
+            })
+    }
+
+    fn hit(
+        &self,
+        shown: &ExploreSnapshot,
+        sample: crate::presentation_surface::SurfaceSample,
+    ) -> Option<Option<u32>> {
+        (Self::current(Some(shown)).as_ref() == Some(self))
+            .then(|| selected_at(Some(shown), sample))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct GalleryHover {
+    focused: Mutex<Option<Option<u32>>>,
+}
+
+/// A hit stays attached to the source and component incarnation that sampled it.
+#[derive(Debug, Clone)]
+pub struct GalleryInput {
+    owner: Arc<GalleryHover>,
+    source: Option<GallerySource>,
+    selected: Option<u32>,
+    kind: crate::presentation_surface::SurfaceGestureKind,
+    pressed: bool,
+}
+
+impl GalleryHover {
+    pub(super) fn capture(
+        self: &Arc<Self>,
+        source: Option<&GallerySource>,
+        shown: Option<&ExploreSnapshot>,
+        gesture: crate::presentation_surface::SurfaceGesture,
+        focus_ready: bool,
+    ) -> Option<GalleryInput> {
+        let hit = source.and_then(|source| source.hit(shown?, gesture.sample));
+        if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport {
+            let selected = hit.filter(|_| focus_ready)?;
+            let mut focused = self.focused.lock().expect("gallery local focus");
+            if *focused == Some(selected) {
+                return None;
+            }
+            *focused = Some(selected);
+        }
+        Some(GalleryInput {
+            owner: self.clone(),
+            source: hit.and(source.cloned()),
+            selected: hit.flatten(),
+            kind: gesture.kind,
+            pressed: gesture.sample.pressed,
+        })
+    }
+}
 
 #[cfg(test)]
 use crate::generated::EXPLORE_VISIBLE_ITEM_CAPACITY as VISIBLE_ITEM_CAPACITY;
@@ -168,7 +237,7 @@ pub struct State {
     viewport_writable_wait: bool,
     measured_gallery: Option<MeasuredGallery>,
     pressed_image: Option<u32>,
-    pub(super) gallery_hover: std::sync::Arc<std::sync::Mutex<Option<(u64, Option<u32>)>>>,
+    pub(super) gallery_hover: Arc<GalleryHover>,
 }
 
 impl State {
@@ -209,12 +278,22 @@ impl State {
                 .filter(|result| result.outcome != crate::generated::ExploreViewportOutcome::Ready)
                 .map(|result| result.request.clone())
                 .unwrap_or_else(|| Self::committed_viewport(snapshot));
-            if Some(&committed) == self.sent_viewport.as_ref() {
+            if self.sent_viewport.as_ref().is_some_and(|sent| {
+                *sent == committed
+                    || (sent.viewport == snapshot.viewport
+                        && snapshot.focusedimage.is_none()
+                        && sent.focusedcompiledindex.is_some_and(|index| {
+                            !snapshot.order.visibleindices.contains(&index)
+                        }))
+            }) {
                 self.sent_viewport = None;
             }
             if self.sent_viewport.is_none() && Some(&committed) == self.desired_viewport.as_ref() {
                 self.desired_viewport = None;
             }
+        }
+        if !bootstrap {
+            self.reconcile_gallery_hover(snapshot);
         }
         self.pressed_image = None;
     }
@@ -289,6 +368,7 @@ impl State {
         } else {
             self.desired_viewport = Some(request);
         }
+        self.reconcile_gallery_hover(snapshot);
     }
 
     pub fn dispatchable_viewport(&self) -> Option<ExploreViewportUpdate> {
@@ -301,6 +381,7 @@ impl State {
         }
         self.sent_viewport = Some(request);
         self.viewport_writable_wait = false;
+        self.reconcile_gallery_hover(None);
     }
 
     pub fn arm_viewport_writable_wait(&mut self) -> bool {
@@ -319,6 +400,8 @@ impl State {
         self.sent_viewport = None;
         self.desired_viewport = None;
         self.viewport_writable_wait = false;
+        self.gallery_hover = Arc::default();
+        self.pressed_image = None;
     }
 
     pub fn measure_gallery(
@@ -346,6 +429,7 @@ impl State {
             return false;
         }
         self.measured_gallery = Some(measurement);
+        *self.gallery_hover.focused.lock().expect("gallery local focus") = None;
         true
     }
 
@@ -431,23 +515,35 @@ impl State {
             .unwrap_or(fallback)
     }
 
-    pub(crate) fn gallery_gesture(
+    fn reconcile_gallery_hover(&self, snapshot: Option<&ExploreSnapshot>) {
+        let focused = self
+            .desired_viewport
+            .as_ref()
+            .or(self.sent_viewport.as_ref())
+            .map(|request| request.focusedcompiledindex)
+            .or_else(|| {
+                snapshot
+                    .filter(|value| GallerySource::current(Some(value)).is_some())
+                    .map(|value| value.focusedimage)
+            });
+        *self.gallery_hover.focused.lock().expect("gallery local focus") = focused;
+    }
+
+    pub(crate) fn gallery_input(
         &mut self,
         snapshot: Option<&ExploreSnapshot>,
-        displayed_snapshot: Option<&ExploreSnapshot>,
-        gesture: crate::presentation_surface::SurfaceGesture,
+        input: GalleryInput,
     ) -> Option<GalleryGestureOutcome> {
-        // Events refer to the image actually drawn. A new dataset or mode may
-        // invalidate that image while its completed texture is still retained.
-        let source = displayed_snapshot.filter(|shown| {
-            snapshot.is_some_and(|current| {
-                current.frame == shown.frame && current.dataset.identity == shown.dataset.identity
-            })
+        if !Arc::ptr_eq(&input.owner, &self.gallery_hover) {
+            return None;
+        }
+        let source = input.source.filter(|source| {
+            GallerySource::current(snapshot).as_ref() == Some(source)
         });
-        let selected = selected_at(source, gesture.sample);
-        match gesture.kind {
+        let selected = source.as_ref().and(input.selected);
+        match input.kind {
             crate::presentation_surface::SurfaceGestureKind::Pointer => {
-                if !gesture.sample.pressed {
+                if !input.pressed {
                     self.pressed_image = None;
                     return None;
                 }
@@ -463,9 +559,32 @@ impl State {
                 None
             }
             crate::presentation_surface::SurfaceGestureKind::Viewport => {
+                // The callback marker only spans the current Iced batch. From
+                // reduction onward, retained admission/native focus owns it.
+                self.reconcile_gallery_hover(snapshot);
                 source.map(|_| GalleryGestureOutcome::Focused(selected))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gallery_gesture(
+        &mut self,
+        snapshot: Option<&ExploreSnapshot>,
+        displayed_snapshot: Option<&ExploreSnapshot>,
+        gesture: crate::presentation_surface::SurfaceGesture,
+    ) -> Option<GalleryGestureOutcome> {
+        let source = GallerySource::current(snapshot);
+        let hit = source
+            .as_ref()
+            .and_then(|source| source.hit(displayed_snapshot?, gesture.sample));
+        self.gallery_input(snapshot, GalleryInput {
+            owner: self.gallery_hover.clone(),
+            source: hit.and(source),
+            selected: hit.flatten(),
+            kind: gesture.kind,
+            pressed: gesture.sample.pressed,
+        })
     }
 }
 
@@ -589,6 +708,147 @@ mod tests {
             content_y: y as f32,
             pressed: true,
         }
+    }
+
+    fn local_focus(state: &State, snapshot: &ExploreSnapshot) -> Option<GalleryInput> {
+        state.gallery_hover.capture(
+            GallerySource::current(Some(snapshot)).as_ref(),
+            Some(snapshot),
+            crate::presentation_surface::SurfaceGesture {
+                kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
+                sample: gallery_sample(150, 150),
+            },
+            state.measured_layout_request(Some(snapshot), 4, snapshot.order.matchingcount).is_some(),
+        )
+    }
+
+    fn accept_local_focus(state: &mut State, snapshot: &ExploreSnapshot, input: GalleryInput) -> ExploreViewportUpdate {
+        let outcome = super::super::gallery::update(
+            state, Some(snapshot), &mut crate::view::settings::SettingsModel::default(),
+            super::super::gallery::Message::Surface(input),
+        ).unwrap();
+        let Some(super::super::gallery::Outcome::ViewportChanged(request)) = outcome else {
+            panic!("local focus must become a retained viewport request");
+        };
+        state.request_viewport(Some(snapshot), request.clone());
+        request
+    }
+
+    #[test]
+    fn local_focus_follows_measurement_retained_admission_and_native_focus() {
+        let mut snapshot = displayed_gallery_snapshot();
+        snapshot.order.matchingcount = 100;
+        snapshot.focusedimage = None;
+        let mut state = State::default();
+        state.rebase(Some(&snapshot), false);
+        assert!(local_focus(&state, &snapshot).is_none());
+        state.measure_gallery(400.0, 200.0, capacity(0, 0), 4);
+        assert!(local_focus(&state, &snapshot).is_none());
+        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+
+        for ready in [false, true] {
+            snapshot.gallery.slots.fill(ready);
+            state.clear_viewport_admission();
+            let input = local_focus(&state, &snapshot).unwrap();
+            assert!(local_focus(&state, &snapshot).is_none(), "one focus per cell in an Iced batch");
+            let request = accept_local_focus(&mut state, &snapshot, input);
+            assert_eq!(request.focusedcompiledindex, Some(21));
+            assert!(local_focus(&state, &snapshot).is_none());
+            assert!(state.arm_viewport_writable_wait());
+            state.viewport_writable();
+            assert!(local_focus(&state, &snapshot).is_none(), "writable wake retains pending focus");
+            state.viewport_queued(request.clone());
+            snapshot.revision += 1;
+            state.rebase(Some(&snapshot), false);
+            assert!(local_focus(&state, &snapshot).is_none(), "unrelated state keeps admitted focus");
+            snapshot.viewport = request.viewport;
+            snapshot.focusedimage = Some(21);
+            state.rebase(Some(&snapshot), false);
+            assert!(state.sent_viewport.is_none());
+            assert!(local_focus(&state, &snapshot).is_none(), "committed focus suppresses motion");
+            snapshot.focusedimage = None;
+            state.rebase(Some(&snapshot), false);
+            assert!(local_focus(&state, &snapshot).is_some(), "native focus clearing permits renewed focus");
+        }
+    }
+
+    #[test]
+    fn row_return_and_failed_admission_recover_local_same_cell_focus() {
+        let mut snapshot = displayed_gallery_snapshot();
+        snapshot.order.matchingcount = 100;
+        snapshot.focusedimage = None;
+        let mut state = State::default();
+        state.rebase(Some(&snapshot), false);
+        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+        let input = local_focus(&state, &snapshot).unwrap();
+        let focused = accept_local_focus(&mut state, &snapshot, input);
+        state.viewport_queued(focused.clone());
+        snapshot.viewportresult = Some(crate::generated::ExploreViewportResult {
+            request: focused,
+            outcome: crate::generated::ExploreViewportOutcome::AtlasExtentExceeded,
+        });
+        state.rebase(Some(&snapshot), false);
+        assert!(state.sent_viewport.is_none());
+        let discarded = local_focus(&state, &snapshot).unwrap();
+        state.clear_viewport_admission();
+        assert_eq!(state.gallery_input(Some(&snapshot), discarded), None);
+        assert!(local_focus(&state, &snapshot).is_some());
+
+        snapshot.viewportresult = None;
+        snapshot.focusedimage = Some(21);
+        state.rebase(Some(&snapshot), false);
+        let mut away = State::committed_viewport(&snapshot);
+        away.viewport.firstrow = 10;
+        state.record_gallery_scroll(10);
+        state.request_viewport(Some(&snapshot), away.clone());
+        state.viewport_queued(away.clone());
+        snapshot.viewport = away.viewport;
+        snapshot.focusedimage = None;
+        snapshot.order.visibleindices = (40..48).collect();
+        state.rebase(Some(&snapshot), false);
+        assert!(state.sent_viewport.is_none(), "native clearing settles the normalized request");
+        state.record_gallery_scroll(0);
+        snapshot.viewport.firstrow = 0;
+        snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
+        state.rebase(Some(&snapshot), false);
+        let input = local_focus(&state, &snapshot).unwrap();
+        assert_eq!(accept_local_focus(&mut state, &snapshot, input).focusedcompiledindex, Some(21));
+    }
+
+    #[test]
+    fn captured_hits_keep_source_identity_and_bootstrap_invalidates_old_callbacks() {
+        let mut snapshot = displayed_gallery_snapshot();
+        snapshot.order.matchingcount = 100;
+        snapshot.focusedimage = None;
+        let mut state = State::default();
+        state.rebase(Some(&snapshot), false);
+        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+        let input = local_focus(&state, &snapshot).unwrap();
+        let old_callback = state.gallery_hover.clone();
+        state.rebase(Some(&snapshot), true);
+        assert_eq!(state.gallery_input(Some(&snapshot), input), None);
+        assert!(!Arc::ptr_eq(&old_callback, &state.gallery_hover));
+        let input = local_focus(&state, &snapshot).unwrap();
+        let mut changed = snapshot.clone();
+        changed.order.visibleindices.reverse();
+        // A delayed message carries its hit, not coordinates to reinterpret
+        // against whichever displayed directory happens to exist at reduction.
+        assert_eq!(state.gallery_input(Some(&changed), input),
+            Some(GalleryGestureOutcome::Focused(Some(21))));
+        state.clear_viewport_admission();
+        let input = local_focus(&state, &snapshot).unwrap();
+        changed.frame.revision += 1;
+        assert_eq!(state.gallery_input(Some(&changed), input), None);
+        let source = GallerySource::current(Some(&snapshot));
+        let gesture = crate::presentation_surface::SurfaceGesture {
+            kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
+            sample: gallery_sample(150, 150),
+        };
+        assert!(state.gallery_hover.capture(source.as_ref(), Some(&changed), gesture, true).is_none());
+        changed = snapshot.clone();
+        changed.dataset.identity += 1;
+        assert!(state.gallery_hover.capture(source.as_ref(), Some(&changed), gesture, true).is_none());
+        assert!(state.gallery_hover.capture(source.as_ref(), None, gesture, true).is_none());
     }
 
     fn submit_toggled_labels(state: &mut State, snapshot: &ExploreSnapshot) -> ExploreFilterUpdate {

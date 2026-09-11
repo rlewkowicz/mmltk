@@ -31,7 +31,7 @@ pub enum Message {
         maximum_extent: crate::generated::VisualExtent,
         columns: u32,
     },
-    Surface(crate::presentation_surface::SurfaceGesture),
+    Surface(super::state::GalleryInput),
 }
 
 #[derive(Debug, Clone)]
@@ -112,19 +112,14 @@ pub(super) fn update(
             };
             Outcome::ViewportChanged(request)
         }
-        Message::Surface(gesture) => {
+        Message::Surface(input) => {
             let snapshot = snapshot.filter(|value| {
                 value.ready && value.mode == crate::generated::ExploreMode::Gallery
             });
             if snapshot.is_none() {
                 return Ok(None);
             }
-            let displayed = crate::presentation_surface::gallery::displayed();
-            match state.gallery_gesture(
-                snapshot,
-                displayed.as_ref().map(|(_, value)| value.as_ref()),
-                gesture,
-            ) {
+            match state.gallery_input(snapshot, input) {
                 Some(super::state::GalleryGestureOutcome::Selected(index)) => {
                     Outcome::ImageSelected(index)
                 }
@@ -154,21 +149,21 @@ pub(super) fn update(
 fn local_gestures(
     state: &super::state::State,
     snapshot: Option<&crate::generated::ExploreSnapshot>,
+    columns: u32,
 ) -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync> {
     let hover = state.gallery_hover.clone();
-    let current = snapshot.map(|snapshot| (snapshot.dataset.identity, snapshot.frame.clone()));
+    let current = super::state::GallerySource::current(snapshot);
+    let focus_ready = snapshot.is_some_and(|snapshot| {
+        state.measured_layout_request(Some(snapshot), columns, snapshot.order.matchingcount).is_some()
+    });
     std::sync::Arc::new(move |gesture| {
-        if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport {
-            let (_, shown) = crate::presentation_surface::gallery::displayed()?;
-            let (identity, frame) = current.as_ref()?;
-            if *identity != shown.dataset.identity || *frame != shown.frame { return None; }
-            let selected = super::state::selected_at(Some(&shown), gesture.sample);
-            let next = Some((*identity, selected));
-            let mut prior = hover.lock().expect("gallery local focus");
-            if *prior == next { return None; }
-            *prior = next;
-        }
-        Some(Message::Surface(gesture))
+        let shown = crate::presentation_surface::gallery::displayed();
+        hover.capture(
+            current.as_ref(),
+            shown.as_ref().map(|(_, snapshot)| snapshot.as_ref()),
+            gesture,
+            focus_ready,
+        ).map(Message::Surface)
     })
 }
 
@@ -390,7 +385,7 @@ fn gallery_viewport<'a>(
         |surface| {
             crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
-                    local: Some(local_gestures(state, snapshot)),
+                    local: Some(local_gestures(state, snapshot, columns)),
                     surface,
                     publish: None,
                     placement: crate::presentation_surface::Placement::GalleryGrid {
@@ -751,17 +746,7 @@ mod tests {
             },
         };
 
-        let mut settings = SettingsModel::default();
-        assert!(
-            update(
-                &mut state,
-                Some(&snapshot),
-                &mut settings,
-                Message::Surface(gesture),
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(local_gestures(&state, Some(&snapshot), 4)(gesture).is_none());
 
         assert!(state.measure_gallery(
             400.0,
@@ -772,15 +757,8 @@ mod tests {
             },
             4,
         ));
-        let focused = update(
-            &mut state,
-            Some(&snapshot),
-            &mut settings,
-            Message::Surface(gesture),
-        )
-        .unwrap();
         assert!(
-            focused.is_none(),
+            local_gestures(&state, Some(&snapshot), 4)(gesture).is_none(),
             "viewport gestures without displayed pixels must preserve focus"
         );
     }
