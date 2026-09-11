@@ -284,6 +284,8 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept = 0;
     virtual void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery) = 0;
     virtual void CommitOutputPublication() noexcept = 0;
+    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) { return {}; }
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
                                                                  mmltk::frameworks::gpu::ImagePlaneView,
@@ -336,6 +338,9 @@ class ExploreSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] ExploreSnapshot snapshot() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+    void RequestWorkspace(VisualWorkspaceRequest);
     [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
 
    private:

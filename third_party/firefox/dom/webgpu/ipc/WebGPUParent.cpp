@@ -40,10 +40,14 @@ extern void wgpu_parent_external_texture_frame_ready(
     uint32_t aSlot,
     uint64_t aContentSession, uint64_t aContentSequence,
     uint64_t aPresentationRevision, uint32_t aContentWidth,
-    uint32_t aContentHeight) {
+    uint32_t aContentHeight, bool aCopyComplete) {
   static_cast<WebGPUParent*>(aParent)->NotifyExternalTextureFrame(
       aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
-      aContentSequence, aPresentationRevision, aContentWidth, aContentHeight);
+      aContentSequence, aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete);
+}
+
+extern void wgpu_parent_workspace_source_requested(WGPUWebGPUParentPtr aParent, uint64_t aHigh, uint64_t aLow) {
+  static_cast<WebGPUParent*>(aParent)->NotifyWorkspaceSourceRequested(aHigh, aLow);
 }
 
 extern void wgpu_parent_external_texture_import_ready(
@@ -480,23 +484,32 @@ void WebGPUParent::NotifyExternalTextureFrame(
     const uint32_t aSlot,
     const uint64_t aContentSession, const uint64_t aContentSequence,
     const uint64_t aPresentationRevision, const uint32_t aContentWidth,
-    const uint32_t aContentHeight) {
+    const uint32_t aContentHeight, const bool aCopyComplete) {
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
       "WebGPUParent::NotifyExternalTextureFrame",
       [self = std::move(self), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
        aLayer, aSlot, aContentSession, aContentSequence,
-       aPresentationRevision, aContentWidth, aContentHeight]() {
+       aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete]() {
         if (self->CanSend() && !self->SendExternalTextureFrame(
                                    aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
                                    aLayer, aSlot, aContentSession, aContentSequence,
                                    aPresentationRevision, aContentWidth,
-                                   aContentHeight)) {
+                                   aContentHeight, aCopyComplete)) {
           NS_WARNING("SendExternalTextureFrame failed");
         }
       });
   MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(
       runnable.forget(), nsIThread::DISPATCH_NORMAL));
+}
+
+void WebGPUParent::NotifyWorkspaceSourceRequested(const uint64_t aSourceHigh, const uint64_t aSourceLow) {
+  RefPtr<WebGPUParent> self = this;
+  nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction("WebGPUParent::NotifyWorkspaceSourceRequested",
+      [self = std::move(self), aSourceHigh, aSourceLow]() {
+        if (self->CanSend()) ffi::wgpu_server_attach_workspace_source(self->mContext.get(), aSourceHigh, aSourceLow);
+      });
+  MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
 }
 
 void WebGPUParent::NotifyExternalTextureImportReady(

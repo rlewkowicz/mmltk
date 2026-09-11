@@ -16,8 +16,6 @@ struct WorkspaceContentIdentity final {
 
 enum class WorkspacePresentationLayer : std::uint64_t {
     Primary = 0U,
-    Gallery = 1U,
-    Detail = 2U,
     Invalid = std::numeric_limits<std::uint64_t>::max(),
 };
 

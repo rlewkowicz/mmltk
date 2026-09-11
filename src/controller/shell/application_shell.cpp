@@ -66,7 +66,6 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
                                        .explore = std::move(explore_configuration),
                                        .live = live_configuration_,
                                        .presentation = {.import_socket = presentation_config_.import_socket,
-                                                        .pitch_alignment = 256U,
                                                         .minimum_allocation_bytes = presentation_config_.minimum_allocation_bytes,
                                                         .pending_supersession_acceptance = config.pending_supersession_acceptance},
                                        .settings_location = std::move(config.settings_location),

@@ -12,14 +12,28 @@ SystemImageWorker::SystemImageWorker(Cycle cycle, FailureSink failures, Cleanup 
 SystemImageWorker::~SystemImageWorker() { RequestStop(); }
 
 void SystemImageWorker::Wake() noexcept {
-    signals_.fetch_or(kPending, std::memory_order_release);
-    signals_.notify_one();
+    {
+        std::scoped_lock lock(wait_mutex_);
+        signals_.fetch_or(kPending, std::memory_order_release);
+    }
+    wait_ready_.notify_one();
+}
+
+void SystemImageWorker::WakeAt(const std::chrono::steady_clock::time_point deadline) noexcept {
+    {
+        std::scoped_lock lock(wait_mutex_);
+        if (!deadline_ || deadline < *deadline_) deadline_ = deadline;
+    }
+    wait_ready_.notify_one();
 }
 
 void SystemImageWorker::RequestStop() noexcept {
-    if ((signals_.fetch_or(kStopping, std::memory_order_acq_rel) & kStopping) != 0U) return;
+    {
+        std::scoped_lock lock(wait_mutex_);
+        if ((signals_.fetch_or(kStopping, std::memory_order_acq_rel) & kStopping) != 0U) return;
+    }
     worker_.request_stop();
-    signals_.notify_all();
+    wait_ready_.notify_all();
 }
 
 void SystemImageWorker::WaitStopped() noexcept { stopped_.wait(false, std::memory_order_acquire); }
@@ -28,7 +42,21 @@ bool SystemImageWorker::stopped() const noexcept { return stopped_.load(std::mem
 
 void SystemImageWorker::Run(const std::stop_token stop) {
     while (!stop.stop_requested()) {
-        signals_.wait(0U, std::memory_order_acquire);
+        {
+            std::unique_lock lock(wait_mutex_);
+            while (signals_.load(std::memory_order_acquire) == 0U) {
+                if (deadline_) {
+                    if (std::chrono::steady_clock::now() >= *deadline_) {
+                        deadline_.reset();
+                        signals_.fetch_or(kPending, std::memory_order_release);
+                        break;
+                    }
+                    wait_ready_.wait_until(lock, *deadline_);
+                } else {
+                    wait_ready_.wait(lock);
+                }
+            }
+        }
         const auto signals = signals_.fetch_and(static_cast<std::uint8_t>(~kPending), std::memory_order_acq_rel);
         if ((signals & kStopping) != 0U || stop.stop_requested()) break;
         try {

@@ -26,6 +26,7 @@ void require_annotation_ui(const contracts::AnnotationUiState& ui) {
 }  // namespace
 
 class AnnotationSystem::Impl final {
+    friend class AnnotationSystem;
     struct InputSlot final {
         AnnotationInputBatch batch;
         bool occupied = false;
@@ -593,5 +594,8 @@ bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
+mmltk::frameworks::gpu::BorrowedImageWorkspace AnnotationSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
+mmltk::frameworks::gpu::ImageWorkspaceObservation AnnotationSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
+void AnnotationSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 
 }  // namespace mmltk::controller

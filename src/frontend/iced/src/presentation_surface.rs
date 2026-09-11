@@ -30,7 +30,7 @@ pub(crate) fn trace_surface(event: &str, surface: Surface) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn trace_frame(event: &str, frame: FrameReady) {
+pub(crate) fn trace_frame(event: &str, frame: FrameReady) {
     if surface_trace_enabled() {
         emit_surface_trace(&format!(
             "{{\"event\":\"iced.frame.{event}\",\"surface\":\"{:016x}{:016x}\",\"source_revision\":{}{}}}",
@@ -76,7 +76,7 @@ pub(crate) fn surface_trace_fields(surface: Surface, requested: Surface) -> Stri
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn trace_frame(_event: &str, _frame: FrameReady) {}
+pub(crate) fn trace_frame(_event: &str, _frame: FrameReady) {}
 
 #[cfg(target_arch = "wasm32")]
 fn trace_surface_request(event: &str, surface: Surface, requested: Surface, control: &str) {
@@ -209,8 +209,8 @@ const MAILBOX_SLOTS: u32 = 2;
 const INTEGRATION_REDRAW_PASSES: u8 = 4;
 thread_local! {
     static DRAWN_DETAIL: std::cell::Cell<Option<(Surface, [u32; 4])>> = const { std::cell::Cell::new(None) };
-    static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; 6]> = const { std::cell::Cell::new([None; 6]) };
-    static BORROWS: std::cell::Cell<[Option<FrameReady>; 6]> = const { std::cell::Cell::new([None; 6]) };
+    static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; 2]> = const { std::cell::Cell::new([None; 2]) };
+    static BORROWS: std::cell::Cell<[Option<FrameReady>; 2]> = const { std::cell::Cell::new([None; 2]) };
 }
 
 // Publication metadata is copyable; permission to read an external layer is not.
@@ -354,6 +354,8 @@ pub(crate) fn invalidate_drawn_slot(frame: FrameReady) {
 #[cfg(target_arch = "wasm32")]
 const FRAME_EVENT: &str = "gpuexternaltextureframe";
 #[cfg(target_arch = "wasm32")]
+const COPY_EVENT: &str = "gpuexternaltexturecopycomplete";
+#[cfg(target_arch = "wasm32")]
 const RELEASE_EVENT: &str = "gpuexternaltextureslotrelease";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -416,7 +418,7 @@ impl FrameReady {
             content_height: fields.next()?.parse().ok()?,
         };
         (fields.next().is_none()
-            && ready.layer < 3
+            && ready.layer == 0
             && ready.slot < MAILBOX_SLOTS
             && (ready.content_session != 0 || ready.content_sequence != 0)
             && ready.presentation_revision != 0
@@ -434,6 +436,7 @@ pub fn subscription() -> iced::Subscription<Notification> {
 #[derive(Debug, Clone, Copy)]
 pub enum Notification {
     Native(FrameReady),
+    Copied(FrameReady),
     Completed(FrameReady),
     CaptureRejected(FrameReady),
     Drawn,
@@ -461,7 +464,7 @@ fn notify_surface(notification: Notification) {
                     trace_frame("capture_rejection_enqueued", frame);
                 }
                 Notification::Drawn => mailbox.drawn = true,
-                Notification::Native(_) => {
+                Notification::Native(_) | Notification::Copied(_) => {
                     unreachable!("native frames arrive through their mailbox")
                 }
             }
@@ -478,7 +481,8 @@ struct FrameMailbox {
     completed: Option<FrameReady>,
     rejected: Option<FrameReady>,
     drawn: bool,
-    frames: [Option<FrameReady>; 3],
+    frames: [Option<FrameReady>; 1],
+    copied: [Option<FrameReady>; 2],
     next_layer: usize,
 }
 
@@ -496,6 +500,7 @@ impl FrameMailbox {
         self.completed
             .take()
             .map(Notification::Completed)
+            .or_else(|| self.copied.iter_mut().find_map(Option::take).map(Notification::Copied))
             .or_else(|| self.rejected.take().map(Notification::CaptureRejected))
             .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
             .or_else(|| self.pop().map(Notification::Native))
@@ -555,6 +560,11 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
             else {
                 return;
             };
+            if event.type_() == COPY_EVENT {
+                pending.borrow_mut().copied[ready.slot as usize] = Some(ready);
+                notify.wake();
+                return;
+            }
             invalidate_drawn_slot(ready);
             let displaced = pending.borrow_mut().push(ready);
             if let Some(displaced) = displaced {
@@ -565,6 +575,10 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
         window
             .add_event_listener_with_callback(FRAME_EVENT, callback.as_ref().unchecked_ref())
             .ok()?;
+        if window.add_event_listener_with_callback(COPY_EVENT, callback.as_ref().unchecked_ref()).is_err() {
+            let _ = window.remove_event_listener_with_callback(FRAME_EVENT, callback.as_ref().unchecked_ref());
+            return None;
+        }
         Some(FrameListener { window, callback })
     });
     unfold(
@@ -593,6 +607,7 @@ struct FrameListener {
 impl Drop for FrameListener {
     fn drop(&mut self) {
         COMPLETION_WAKE.with(|notify| *notify.borrow_mut() = None);
+        let _ = self.window.remove_event_listener_with_callback(COPY_EVENT, self.callback.as_ref().unchecked_ref());
         let _ = self.window.remove_event_listener_with_callback(
             FRAME_EVENT,
             self.callback.as_ref().unchecked_ref(),
@@ -1430,8 +1445,8 @@ struct PreparedDraw {
 }
 
 struct MailboxBindings {
-    _views: [wgpu::TextureView; 6],
-    bind_groups: [wgpu::BindGroup; 6],
+    _views: [wgpu::TextureView; 2],
+    bind_groups: [wgpu::BindGroup; 2],
 }
 
 impl Drop for Imported {
@@ -1814,7 +1829,7 @@ impl SurfaceRenderer {
             size: wgpu::Extent3d {
                 width: surface.width,
                 height: surface.height,
-                depth_or_array_layers: 6,
+                depth_or_array_layers: 2,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -2541,7 +2556,7 @@ fn mailbox_binding(frame: FrameReady) -> Option<usize> {
         .layer
         .checked_mul(MAILBOX_SLOTS)?
         .checked_add(frame.slot)?;
-    (binding < 6).then_some(binding as usize)
+    (binding < 2).then_some(binding as usize)
 }
 
 fn bind_group(
@@ -2712,8 +2727,8 @@ fn dispatch_release(frame: FrameReady) {
 #[cfg(test)]
 pub(crate) fn reset_test_releases() {
     authorize_draw(None);
-    BORROWS.with(|borrows| borrows.set([None; 6]));
-    RELEASED_FRAMES.with(|released| released.set([None; 6]));
+    BORROWS.with(|borrows| borrows.set([None; 2]));
+    RELEASED_FRAMES.with(|released| released.set([None; 2]));
     TEST_RELEASES.with(|released| released.borrow_mut().clear());
     clear_drawn_detail();
 }
@@ -3262,12 +3277,12 @@ mod tests {
     }
 
     #[test]
-    fn mailbox_pressure_retains_the_latest_frame_for_each_layer() {
+    fn mailbox_pressure_retains_the_latest_arena_frame() {
         reset_test_releases();
         let mut mailbox = FrameMailbox::default();
         for revision in 1..=20 {
             let mut frame = frame_ready(1, revision, revision, 640, 480);
-            frame.layer = (revision % 3) as u32;
+            frame.layer = 0;
             if let Some(displaced) = mailbox.push(frame) {
                 release(displaced);
             }
@@ -3277,8 +3292,8 @@ mod tests {
             revisions.push(frame.presentation_revision);
         }
         revisions.sort_unstable();
-        assert_eq!(revisions, vec![18, 19, 20]);
-        assert_eq!(test_releases().len(), 17);
+        assert_eq!(revisions, vec![20]);
+        assert_eq!(test_releases().len(), 19);
     }
 
     #[test]
@@ -3960,9 +3975,9 @@ mod tests {
     }
 
     #[test]
-    fn native_mailbox_binding_is_bounded_to_six_retained_slots() {
+    fn native_mailbox_binding_is_bounded_to_two_retained_slots() {
         let mut frame = frame_ready(1, 2, 3, 640, 360);
-        for layer in 0..3 {
+        for layer in 0..1 {
             for slot in 0..MAILBOX_SLOTS {
                 frame.layer = layer;
                 frame.slot = slot;

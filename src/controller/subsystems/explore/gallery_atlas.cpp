@@ -61,6 +61,19 @@ void GalleryAtlas::Stage(const std::size_t physical, std::shared_ptr<const Galle
                          const std::uint64_t semantics, const bool placeholder) {
     writes_.push_back({physical, {std::move(meaning), semantics, true, placeholder}});
 }
+mmltk::frameworks::gpu::ImageWorkspaceCoverage GalleryAtlas::WorkspaceCoverage(
+    const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) {
+    if (!active_ || !output.workspace || active_->clean.owner != output.product_owner) return {};
+    coverage_.clear();
+    coverage_.reserve(active_->cells.size());
+    for (const auto& write : writes_) {
+        const auto x = static_cast<std::int32_t>((write.physical % layout_.columns) * layout_.card_extent);
+        const auto y = static_cast<std::int32_t>((write.physical / layout_.columns) * layout_.card_extent);
+        const auto extent = static_cast<std::int32_t>(layout_.card_extent);
+        coverage_.push_back({x, y, x + extent, y + extent});
+    }
+    return {output.workspace->identity(), coverage_, false};
+}
 void GalleryAtlas::Commit() noexcept {
     if (active_)
         for (auto& write : writes_) active_->cells[write.physical] = std::move(write.cell);
@@ -68,6 +81,7 @@ void GalleryAtlas::Commit() noexcept {
 }
 void GalleryAtlas::Rollback() noexcept {
     writes_.clear();
+    coverage_.clear();
     active_ = nullptr;
 }
 void GalleryAtlas::Invalidate(const mmltk::frameworks::gpu::ImageAllocation facts) noexcept {
@@ -82,7 +96,8 @@ void GalleryAtlas::Clear() noexcept {
     layout_ = {};
 }
 std::size_t GalleryAtlas::MetadataBytes() const noexcept {
-    std::size_t bytes = writes_.capacity() * sizeof(Write);
+    std::size_t bytes = writes_.capacity() * sizeof(Write) +
+                        coverage_.capacity() * sizeof(mmltk::frameworks::gpu::ImageWorkspaceRegion);
     for (const auto& allocation : allocations_) bytes += allocation.cells.capacity() * sizeof(Cell);
     return bytes;
 }

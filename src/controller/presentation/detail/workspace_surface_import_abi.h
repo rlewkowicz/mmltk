@@ -11,7 +11,7 @@
 // kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
 
-inline constexpr std::uint32_t kAbiVersion = 9U;
+inline constexpr std::uint32_t kAbiVersion = 10U;
 
 // The underlying type is the wire type: the Rust half of this record declares
 // `u32` fields, and the static assertions below are what keep the two frozen
@@ -24,9 +24,9 @@ enum class Opcode : std::uint32_t {
     // `kImportFrameSignalDescriptor` below.
     Import = 1U,
     // Host to shell: `id` is withdrawn. A live capability completes through the
-    // exact Retired terminal after page sampling and mirror cleanup.
+    // exact Retired terminal after its source read or arena page sampling ends.
     Drop = 2U,
-    // Shell to host: `id` is imported and the page's texture exists. Carries
+    // Shell to host: source `id` is imported and initialized. Carries
     // one exported Vulkan timeline semaphore descriptor.
     Ready = 3U,
     // Shell to host: `id` produced no texture, with a reason in `code`.
@@ -45,6 +45,13 @@ enum class Opcode : std::uint32_t {
     // Shell to host: the live peer has released every page sample and destroyed
     // the private mirror/resource state for this withdrawn capability.
     Retired = 8U,
+    // A page-visible, reusable two-slot destination; carries no source memory.
+    Arena = 9U,
+    // Arena creation and its exact device/layout negotiation have completed.
+    ArenaReady = 10U,
+    // Host observed the source's matching even timeline value. Independent of
+    // queue-ordered frame delivery and of the page's final sample release.
+    CopyCompleted = 11U,
 };
 
 // Why the shell produced no texture. These describe what happened in the shell,
@@ -105,12 +112,22 @@ struct Record {
     // Exact generation-scoped arena publication copied into a private mailbox
     // slot. Meaningful only for Available, Presented, and Completed.
     std::uint64_t presentation_revision = 0U;
+    std::uint64_t arena_high = 0U;
+    std::uint64_t arena_low = 0U;
+    std::uint64_t allocation_identity = 0U;
+    std::uint64_t device_incarnation = 0U;
+    // Import/ArenaReady: image byte offset. CopyCompleted: exact source transfer sequence.
+    std::uint64_t offset = 0U;
+    std::uint64_t alignment = 0U;
+    std::uint8_t device_uuid[16]{};
+    std::uint32_t dedicated = 0U;
+    std::uint32_t memory_type_bits = 0U;
 };
 
 static_assert(std::is_standard_layout_v<Record>);
 static_assert(std::is_trivially_copyable_v<Record>);
 static_assert(alignof(Record) == 8U);
-static_assert(sizeof(Record) == 72U);
+static_assert(sizeof(Record) == 144U);
 static_assert(offsetof(Record, abi_version) == 0U);
 static_assert(offsetof(Record, opcode) == 4U);
 static_assert(offsetof(Record, id_high) == 8U);
@@ -168,20 +185,42 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
 [[nodiscard]] inline bool valid(const Record& record) noexcept {
     const bool known = record.opcode == Opcode::Import || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready ||
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
-                       record.opcode == Opcode::Completed || record.opcode == Opcode::Retired;
-    if (!known || record.abi_version != kAbiVersion || record.descriptors != descriptor_count(record.opcode) ||
+                       record.opcode == Opcode::Completed || record.opcode == Opcode::Retired ||
+                       record.opcode == Opcode::Arena || record.opcode == Opcode::ArenaReady || record.opcode == Opcode::CopyCompleted;
+    if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
+        record.descriptors != descriptor_count(record.opcode) ||
         (record.id_high == 0U && record.id_low == 0U)) {
         return false;
     }
     const bool empty_extent = record.width == 0U && record.height == 0U && record.stride == 0U && record.size == 0U;
+    bool uuid_valid = false;
+    for (const auto byte : record.device_uuid) uuid_valid = uuid_valid || byte != 0U;
+    const bool empty_layout = record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
+                              record.device_incarnation == 0U && (record.offset == 0U || record.opcode == Opcode::CopyCompleted) && record.alignment == 0U &&
+                              !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U;
+    if (record.opcode != Opcode::Import && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
+    const bool layout_valid = record.width != 0U && record.height != 0U &&
+                        record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
+                        record.offset <= record.size && record.stride != 0U &&
+                        record.height <= (record.size - record.offset) / record.stride &&
+                        record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
+                        record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) &&
+                        record.device_incarnation != 0U && uuid_valid &&
+                        record.dedicated <= 1U && record.memory_type_bits != 0U;
     switch (record.opcode) {
         case Opcode::Import: {
-            const std::uint64_t row_bytes = static_cast<std::uint64_t>(record.width) * 4U;
-            return record.width != 0U && record.height != 0U && record.stride >= row_bytes && record.code == 0U &&
-                   record.modifier == kModifierLinear && record.presentation_revision == 0U &&
-                   record.stride <= std::numeric_limits<std::uint64_t>::max() / record.height &&
-                   record.size >= record.stride * record.height;
+            return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) &&
+                   record.code == 0U && record.modifier == kModifierLinear && record.presentation_revision == 0U;
         }
+        case Opcode::Arena:
+            return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U &&
+                   record.code == 0U && record.presentation_revision == 0U;
+        case Opcode::ArenaReady:
+            return layout_valid && record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
+                   record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
+        case Opcode::CopyCompleted:
+            return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U &&
+                   (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Drop:
         case Opcode::Ready:
         case Opcode::Retired:
@@ -190,7 +229,7 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
         case Opcode::Presented:
         case Opcode::Completed:
             return record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.code >= 1U &&
-                   record.code <= 6U && (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
+                   record.code <= 2U && (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Failed: {
             const auto failure = static_cast<FailureCode>(record.code);
             const bool known_failure = failure == FailureCode::NotAdmitted || failure == FailureCode::UnsupportedDescriptor ||

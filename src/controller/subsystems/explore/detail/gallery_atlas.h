@@ -37,6 +37,8 @@ class GalleryAtlas final {
     [[nodiscard]] const ExploreAtlasLayout& layout() const noexcept { return layout_; }
     [[nodiscard]] std::size_t MetadataBytes() const noexcept;
     [[nodiscard]] std::size_t AppendMeanings(std::span<std::shared_ptr<const GalleryTileMeaning>>) const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&);
 
    private:
     struct Cell final {
@@ -58,6 +60,7 @@ class GalleryAtlas final {
     Allocation* active_ = nullptr;
     ExploreAtlasLayout layout_{};
     std::vector<Write> writes_;
+    std::vector<mmltk::frameworks::gpu::ImageWorkspaceRegion> coverage_;
 };
 
 }  // namespace mmltk::controller::explore_detail

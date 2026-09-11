@@ -227,9 +227,10 @@ class ImageProductBuffer final {
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {},
                                                          bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
-    void ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     void FinalizeWorkspace(ImageWorkspaceCoverage = {});
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
     [[nodiscard]] ImageStreamSettlement SettleWorkspace() noexcept;
     [[nodiscard]] ImageProductLayout layout() const noexcept;
     [[nodiscard]] std::uint32_t capacity_width() const noexcept;

@@ -48,6 +48,7 @@ class ImageProductPool final {
         [[nodiscard]] std::uint64_t revision() const noexcept;
         [[nodiscard]] BorrowedImageProductReadView Borrow() const;
         [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
+        [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
 
        private:
         Product(std::shared_ptr<Slot>, std::uint64_t) noexcept;
@@ -70,6 +71,7 @@ class ImageProductPool final {
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] std::uint64_t revision() const noexcept;
         [[nodiscard]] std::array<ImageAllocation, 2U> allocations() const;
+        [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
 
        private:
         Candidate(std::shared_ptr<Slot>, Product, ImagePlanePreservation) noexcept;
@@ -98,10 +100,12 @@ class ImageProductPool final {
     void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
-    void ConfigureWorkspace(Candidate&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool ConfigureWorkspace(Candidate&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     // Late admission fills an unpublished display allocation from retained raw
     // pixels; the completed product revision and raw plane addresses stay intact.
-    void PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     void FinalizeWorkspace(Candidate&, ImageWorkspaceCoverage);
     [[nodiscard]] ImageStreamSettlement SettleWorkspaces() noexcept;
     // Existing shared product/plane leases own delayed release. Counted
@@ -113,6 +117,7 @@ class ImageProductPool final {
     [[nodiscard]] Facts SelectedFacts() const;
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
+    [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
     // Wake-only; receiver completion may notify from a GPU host callback.
     void SetAvailabilitySink(std::function<void()>);
     [[nodiscard]] std::size_t size() const noexcept;

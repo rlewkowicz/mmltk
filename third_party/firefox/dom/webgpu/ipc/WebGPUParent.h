@@ -176,7 +176,8 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
                                   uint64_t aContentSequence,
                                   uint64_t aPresentationRevision,
                                   uint32_t aContentWidth,
-                                  uint32_t aContentHeight);
+                                  uint32_t aContentHeight, bool aCopyComplete);
+  void NotifyWorkspaceSourceRequested(uint64_t aSourceHigh, uint64_t aSourceLow);
   void NotifyExternalTextureImportReady(RawId aDeviceId,
                                         uint64_t aSurfaceIdHigh,
                                         uint64_t aSurfaceIdLow);

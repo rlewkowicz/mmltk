@@ -24,6 +24,9 @@ struct VisualSourceReader final {
     PresentationSourceIdentity source{};
     std::function<VisualSourceObservation()> observe;
     std::function<mmltk::frameworks::gpu::BorrowedImageProductReadView()> borrow;
+    std::function<mmltk::frameworks::gpu::ImageWorkspaceObservation()> observe_workspace;
+    std::function<mmltk::frameworks::gpu::BorrowedImageWorkspace()> borrow_workspace;
+    std::function<void(VisualWorkspaceRequest)> request_workspace;
 };
 struct RendererObservation final {
     std::uint64_t completed_sample = 0U;
@@ -67,18 +70,6 @@ struct PresentationPublication final {
     [[nodiscard]] bool valid() const noexcept {
         return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U &&
                presentation_revision != 0U;
-    }
-};
-struct PresentationTargetCapacity final {
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
-    std::size_t pitch = 0U;
-    std::size_t bytes = 0U;
-
-    [[nodiscard]] constexpr bool contains(const VisualExtent extent) const noexcept {
-        const auto row_bytes = static_cast<std::size_t>(extent.width) * 4U;
-        return extent.valid() && width >= extent.width && height >= extent.height && pitch >= row_bytes && pitch != 0U &&
-               height <= bytes / pitch;
     }
 };
 struct PresentationSubmittedSource final {
@@ -132,7 +123,6 @@ class PresentationNativeWriter {
 using PresentationNativeWriterFactory = std::function<std::unique_ptr<PresentationNativeWriter>()>;
 struct PresentationNativeConfiguration final {
     std::filesystem::path import_socket;
-    std::size_t pitch_alignment = 256U;
     std::size_t minimum_allocation_bytes = 0U;
     bool pending_supersession_acceptance = false;
 };

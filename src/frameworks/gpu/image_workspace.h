@@ -75,6 +75,8 @@ class ImageWorkspace final {
     // Called only after the importing device completed initial ownership setup.
     void Admit(std::uint64_t allocation_identity, std::uint64_t device_incarnation);
     [[nodiscard]] bool admitted() const noexcept;
+    [[nodiscard]] bool retired() const noexcept;
+    void Withdraw() noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] ImageStreamSettlement Settle() noexcept;
 
@@ -143,6 +145,12 @@ class BorrowedImageWorkspace final {
     BorrowedImageWorkspace(BorrowedImageProductReadView, std::shared_ptr<ImageWorkspace>);
     friend class ImageProductBuffer;
     friend class ImageStream;
+};
+
+struct ImageWorkspaceObservation final {
+    std::uint64_t product_owner = 0U;
+    std::uint64_t product_revision = 0U;
+    std::shared_ptr<ImageWorkspace> workspace{};
 };
 
 }  // namespace mmltk::frameworks::gpu

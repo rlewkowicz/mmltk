@@ -1493,7 +1493,7 @@ TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the 
     auto candidate = runtime.AcquireOutput();
     auto first = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     first->Admit(first->identity(), first->layout().device_incarnation);
-    runtime.ConfigureWorkspace(candidate, std::move(first));
+    REQUIRE(runtime.ConfigureWorkspace(candidate, std::move(first)));
     auto replacement = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     replacement->Admit(replacement->identity(), replacement->layout().device_incarnation);
     auto not_admitted = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
@@ -1538,6 +1538,56 @@ TEST_CASE("Delayed workspace release reports physical failure through retained r
     retirement.custody.SetRetirementSink({});
 }
 
+TEST_CASE("Late workspace preparation stays pending through raw and counted access", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    ImageWorkspaceTestAccess::Install(runtime);
+    runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+        *reinterpret_cast<std::byte*>(clean.data) = std::byte{73};
+    });
+    auto observed = runtime.ObserveWorkspace();
+    REQUIRE(observed.product_revision != 0U);
+    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto raw = runtime.Borrow();
+    const auto address = raw.plane(0U).plane().data;
+    CHECK_FALSE(runtime.PrepareWorkspace(observed, workspace));
+    CHECK_FALSE(runtime.BorrowWorkspace().valid());
+    CHECK(raw.plane(0U).plane().data == address);
+    raw = {};
+    REQUIRE(runtime.PrepareWorkspace(observed, workspace));
+    auto borrowed = runtime.BorrowWorkspace();
+    REQUIRE(borrowed.valid());
+    CHECK(borrowed.revision() == observed.product_revision);
+    auto completion = std::move(borrowed).TakeCompletion();
+    CHECK_FALSE(runtime.PrepareWorkspace(observed, workspace));
+    completion->Complete();
+    completion.reset();
+    REQUIRE(runtime.PrepareWorkspace(observed, workspace));
+    CHECK(runtime.ObserveWorkspace().product_revision == observed.product_revision);
+}
+
+TEST_CASE("Workspace observation does not manufacture product availability edges", "[gpu][workspace]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend});
+    runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+    std::size_t notifications = 0U;
+    runtime.SetOutputAvailableSink([&] { ++notifications; });
+    const auto before = notifications;
+    const auto observed = runtime.ObserveWorkspace();
+    REQUIRE(observed.product_owner != 0U);
+    for (unsigned index = 0U; index != 8U; ++index) {
+        CHECK(runtime.ObserveWorkspace().product_owner == observed.product_owner);
+        CHECK(runtime.ObserveWorkspace().product_revision == observed.product_revision);
+        CHECK_FALSE(runtime.BorrowWorkspace().valid());
+    }
+    CHECK(notifications == before);
+    runtime.SetOutputAvailableSink({});
+}
+
 TEST_CASE("Healthy external workspace products retain exact raw aliases through deferred retirement", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
@@ -1548,7 +1598,7 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
     auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto candidate = runtime->AcquireOutput();
-    runtime->ConfigureWorkspace(candidate, workspace);
+    REQUIRE(runtime->ConfigureWorkspace(candidate, workspace));
     runtime->Publish(candidate, 4U, 3U, [](auto clean, auto, auto) {
         *reinterpret_cast<std::byte*>(clean.data) = std::byte{73};
     });
@@ -1583,7 +1633,7 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto candidate = runtime.AcquireOutput();
-    runtime.ConfigureWorkspace(candidate, workspace);
+    REQUIRE(runtime.ConfigureWorkspace(candidate, workspace));
     runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
     auto product = runtime.CommitOutput(std::move(candidate));
     auto completion = product.BorrowWorkspace().TakeCompletion();
@@ -1624,7 +1674,7 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     std::exception_ptr failure;
-    try { runtime.PrepareWorkspace(completed, workspace); }
+    try { static_cast<void>(runtime.PrepareWorkspace(completed, workspace)); }
     catch (...) { failure = std::current_exception(); }
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(test_support::ContainsImageFailure(failure, cleanup));
@@ -1665,7 +1715,7 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
         const auto raw = completed.Borrow().plane(0U).plane().data;
         auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
         workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        runtime.PrepareWorkspace(completed, workspace);
+        REQUIRE(runtime.PrepareWorkspace(completed, workspace));
         CHECK(completed.revision() == revision);
         CHECK(completed.Borrow().plane(0U).plane().data == raw);
         CHECK(completed.BorrowWorkspace().revision() == revision);
@@ -1791,7 +1841,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     REQUIRE(descriptor.get() >= 0);
     mmltk::common::io::ScopedFd transferred(descriptor.release());
     CHECK(descriptor.get() == -1);
-    runtime.PrepareWorkspace(completed, workspace);
+    REQUIRE(runtime.PrepareWorkspace(completed, workspace));
     CHECK(runtime.Borrow().plane(0U).plane().data == raw);
     CHECK(runtime.BorrowWorkspace().plane().data != raw);
     CHECK(finalizations == 1U);
@@ -1826,7 +1876,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK(runtime.OutputFacts().revision == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     fail_finalization = false;
-    runtime.PrepareWorkspace(runtime.Completed(), replacement);
+    REQUIRE(runtime.PrepareWorkspace(runtime.Completed(), replacement));
     CHECK(runtime.BorrowWorkspace().revision() == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     CHECK(finalizations == 3U);
@@ -1838,7 +1888,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         std::memcpy(remote_layout.device_uuid.data(), uuid.bytes, remote_layout.device_uuid.size());
         auto remote = runtime.CreateWorkspace(remote_layout);
         remote->Admit(remote->identity(), remote_layout.device_incarnation);
-        runtime.PrepareWorkspace(runtime.Completed(), remote);
+        REQUIRE(runtime.PrepareWorkspace(runtime.Completed(), remote));
         CHECK(runtime.BorrowWorkspace().layout().device == 1);
         CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
         CHECK(finalizations == 3U);

@@ -1255,7 +1255,12 @@ struct ApplicationSchema final {
                 static_assert(
                     requires(const System& system) {
                         { system.BorrowFrame() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageProductReadView>;
+                        { system.BorrowWorkspace() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageWorkspace>;
+                        { system.ObserveWorkspace() } -> std::same_as<mmltk::frameworks::gpu::ImageWorkspaceObservation>;
                     }, "visual producer must expose borrowed-product access");
+                static_assert(requires(System& system, VisualWorkspaceRequest request) {
+                    { system.RequestWorkspace(std::move(request)) } -> std::same_as<void>;
+                }, "visual producer must service workspace requests on its owner");
                 visitor.template operator()<SystemCell, Snapshot, Projection>();
             }
         });

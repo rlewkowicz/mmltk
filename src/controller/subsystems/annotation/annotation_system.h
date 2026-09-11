@@ -205,6 +205,9 @@ class AnnotationSystem final {
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
     [[nodiscard]] VisualSourceObservation ObserveSource() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+    void RequestWorkspace(VisualWorkspaceRequest);
 
    private:
     class Impl;

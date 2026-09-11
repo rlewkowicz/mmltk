@@ -170,6 +170,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
         std::uint64_t frame_revision = 0U;
         std::uint32_t width = 0U;
         std::uint32_t height = 0U;
+        bool arena = false;
+        std::uint64_t workspace_allocation = 0U;
     };
 
     struct PendingRecord {
@@ -266,6 +268,27 @@ struct WorkspaceSurfaceImportChannel::Impl {
     // Sends one record together with exactly the descriptors its opcode
     // declares, in one SCM_RIGHTS array. The record's own count is what the
     // shell checks the ancillary data against.
+    [[nodiscard]] bool admit(Record record, const std::uint64_t generation, const std::span<const int> descriptors,
+                             const std::uint64_t selection_generation = 0U, const std::uint64_t frame_revision = 0U) {
+        const WorkspaceSurfaceImportId id{record.id_high, record.id_low};
+        record.descriptors = static_cast<std::uint32_t>(descriptors.size());
+        if (!id || generation == 0U || !workspace_surface_import::valid(record)) return false;
+        if (contains(seen, id) || seen.size() >= kLedgerCapacity || admitted.size() >= kLedgerCapacity) {
+            fail("workspace capability admission is duplicate or exceeds capacity");
+            return false;
+        }
+        seen.push_back(id);
+        admitted.emplace_back(id, Admission{.generation = generation, .selection_generation = selection_generation,
+                                            .frame_revision = frame_revision, .width = record.width, .height = record.height,
+                                            .arena = record.opcode == Opcode::Arena,
+                                            .workspace_allocation = record.allocation_identity});
+        EmitAdmission(id, VisualDiagnosticOperation::PresentationAdmissionEnqueued);
+        if (send(record, descriptors)) return true;
+        erase_id(seen, id);
+        erase_admission(id);
+        return false;
+    }
+
     [[nodiscard]] bool send(const Record& record, const std::span<const int> descriptors) {
         if (peer.get() < 0 || descriptors.size() != workspace_surface_import::descriptor_count(record.opcode)) { return false; }
         if (pending.size() >= kPendingRecordCapacity) { return false; }
@@ -285,6 +308,31 @@ struct WorkspaceSurfaceImportChannel::Impl {
         pending.push_back(std::move(outbound));
         flush();
         return !terminal.has_value();
+    }
+
+    void EmitAdmission(const WorkspaceSurfaceImportId id, const VisualDiagnosticOperation operation) {
+        diagnostics.Emit([&] {
+            const auto found = find_admission(id);
+            const auto& admission = found->second;
+            return VisualDiagnosticFact{
+                .system = contracts::DiagnosticOwner::Presentation,
+                .operation = admission.arena ? operation :
+                    (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued ?
+                         VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
+                .generation = admission.generation,
+                .context = {.capacity_width = admission.width,
+                            .capacity_height = admission.height,
+                            .surface_high = id.high,
+                            .surface_low = id.low,
+                            .selection_generation = admission.selection_generation,
+                            .frame_revision = admission.frame_revision,
+                            .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
+                            .outcome = 1U,
+                            .allocation = {.allocation_generation = admission.generation},
+                            .workspace = {.workspace_source_high = admission.arena ? 0U : id.high,
+                                          .workspace_source_low = admission.arena ? 0U : id.low,
+                                          .workspace_allocation = admission.workspace_allocation}}};
+        });
     }
 
     void flush() {
@@ -324,31 +372,13 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 fail("workspace import channel write failed");
                 return;
             }
-            if (outbound.record.opcode == Opcode::Import) {
+            if (outbound.record.opcode == Opcode::Import || outbound.record.opcode == Opcode::Arena) {
                 const WorkspaceSurfaceImportId id{
                     .high = outbound.record.id_high,
                     .low = outbound.record.id_low,
                 };
                 if (!contains(committed, id)) committed.push_back(id);
-                if (diagnostics.valid()) {
-                    const auto admission = find_admission(id);
-                    diagnostics.Emit([&] {
-                        return VisualDiagnosticFact{
-                            .system = contracts::DiagnosticOwner::Presentation,
-                            .operation = VisualDiagnosticOperation::PresentationAdmissionWritten,
-                            .generation = admission == admitted.end() ? 0U : admission->second.generation,
-                            .context = {
-                                .capacity_width = admission == admitted.end() ? 0U : admission->second.width,
-                                .capacity_height = admission == admitted.end() ? 0U : admission->second.height,
-                                .surface_high = id.high,
-                                .surface_low = id.low,
-                                .selection_generation = admission == admitted.end() ? 0U : admission->second.selection_generation,
-                                .frame_revision = admission == admitted.end() ? 0U : admission->second.frame_revision,
-                                .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
-                                .outcome = 1U,
-                                .allocation = {.allocation_generation = admission == admitted.end() ? 0U : admission->second.generation}}};
-                    });
-                }
+                EmitAdmission(id, VisualDiagnosticOperation::PresentationAdmissionWritten);
             }
             pending.erase(pending.begin());
         }
@@ -431,12 +461,14 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 const bool presentation_outstanding =
                     std::ranges::any_of(renderer_presentations, [id](const auto& presentation) { return presentation.resource == id; });
                 if (admission == admitted.end() || retirement == retired.end() || !contains(withdrawn, id) || !contains(replied, id) ||
-                    presentation_outstanding || retirements.size() >= kLedgerCapacity) {
+                    (admission != admitted.end() && admission->second.arena && presentation_outstanding) ||
+                    retirements.size() >= kLedgerCapacity) {
                     fail("workspace import channel received an invalid retirement terminal");
                     return;
                 }
                 retirements.push_back(WorkspaceSurfaceRetired{.id = id, .generation = retirement->second});
                 erase_admission(id);
+                erase_id(committed, id);
                 erase_id(replied, id);
                 erase_id(withdrawn, id);
                 std::erase_if(retired, [id](const RetirementRecord& value) { return value.first == id; });
@@ -447,7 +479,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 // already queued ahead of Drop still reconciles against the
                 // exact sample ledger during that interval.
                 if (admission == admitted.end() && !contains(replied, id) && contains(withdrawn, id)) { continue; }
-                if (admission == admitted.end() || !contains(replied, id)) {
+                if (admission == admitted.end() || !admission->second.arena || !contains(replied, id)) {
                     fail("workspace import channel received renderer progress for an inactive capability");
                     return;
                 }
@@ -486,6 +518,11 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 fail("workspace import channel received an unknown or duplicate outcome");
                 return;
             }
+            if ((record.opcode == Opcode::Ready && admission->second.arena) ||
+                (record.opcode == Opcode::ArenaReady && !admission->second.arena)) {
+                fail("workspace import channel received an outcome for the wrong capability role");
+                return;
+            }
             if (record.opcode == Opcode::Failed && static_cast<FailureCode>(record.code) == FailureCode::Layout) {
                 const std::uint64_t row_bytes = static_cast<std::uint64_t>(admission->second.width) * 4U;
                 constexpr std::uint64_t kMaximumObjectBytes = static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max());
@@ -512,6 +549,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     }
                     retirements.push_back(WorkspaceSurfaceRetired{.id = id, .generation = admission->second.generation});
                     erase_admission(id);
+                    erase_id(committed, id);
                     erase_id(replied, id);
                     erase_id(withdrawn, id);
                     std::erase_if(retired, [id](const RetirementRecord& value) { return value.first == id; });
@@ -519,6 +557,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 continue;
             }
             switch (record.opcode) {
+                case Opcode::ArenaReady:
                 case Opcode::Ready:
                     if (outcomes.size() >= kLedgerCapacity) {
                         fail("workspace import outcomes exceeded their bounded ledger");
@@ -527,6 +566,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.emplace_back();
                     outcomes.back().id = id;
                     outcomes.back().imported = true;
+                    outcomes.back().layout = record;
                     outcomes.back().timeline_descriptor = std::move(descriptors[workspace_surface_import::kReadyTimelineDescriptor]);
                     break;
                 case Opcode::Failed:
@@ -540,6 +580,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().required_stride = record.stride;
                     outcomes.back().required_size = record.size;
                     break;
+                case Opcode::Arena:
+                case Opcode::CopyCompleted:
                 case Opcode::Import:
                 case Opcode::Drop:
                 case Opcode::Available:
@@ -614,57 +656,28 @@ void WorkspaceSurfaceImportChannel::reset_peer() noexcept {
     impl_->replied.clear();
 }
 
-bool WorkspaceSurfaceImportChannel::admit(const WorkspaceSurfaceImportId id, const std::uint64_t generation, const std::uint32_t width,
-                                          const std::uint32_t height, const std::uint64_t stride, const std::uint64_t size,
-                                          ScopedFd descriptor, const int frame_edge, const int frame_signal,
-                                          const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
-    if (!connected() || !id || generation == 0U || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0) { return false; }
-    if (Impl::contains(impl_->seen, id)) {
-        impl_->fail("workspace import capability was reused in one browser session");
-        return false;
-    }
-    if (impl_->seen.size() >= Impl::kLedgerCapacity || impl_->admitted.size() >= Impl::kLedgerCapacity) {
-        impl_->fail("workspace import admission exceeded its bounded ledger");
-        return false;
-    }
-    std::array<int, workspace_surface_import::kImportDescriptorCount> descriptors{};
-    descriptors[workspace_surface_import::kImportMemoryDescriptor] = descriptor.get();
-    descriptors[workspace_surface_import::kImportFrameEdgeDescriptor] = frame_edge;
-    descriptors[workspace_surface_import::kImportFrameSignalDescriptor] = frame_signal;
-    const Record record{
-        .opcode = Opcode::Import,
-        .id_high = id.high,
-        .id_low = id.low,
-        .width = width,
-        .height = height,
-        .stride = stride,
-        .size = size,
-    };
-    impl_->seen.push_back(id);
-    impl_->admitted.emplace_back(id, Impl::Admission{.generation = generation,
-                                                     .selection_generation = selection_generation,
-                                                     .frame_revision = frame_revision,
-                                                     .width = width,
-                                                     .height = height});
-    impl_->diagnostics.Emit([&] {
-        return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
-                                    .operation = VisualDiagnosticOperation::PresentationAdmissionEnqueued,
-                                    .generation = generation,
-                                    .context = {.capacity_width = width,
-                                                .capacity_height = height,
-                                                .surface_high = id.high,
-                                                .surface_low = id.low,
-                                                .selection_generation = selection_generation,
-                                                .frame_revision = frame_revision,
-                                                .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
-                                                .allocation = {.allocation_generation = generation}}};
-    });
-    if (!impl_->send(record, descriptors)) {
-        std::erase(impl_->seen, id);
-        std::erase_if(impl_->admitted, [id](const auto& item) { return item.first == id; });
-        return false;
-    }
-    return true;
+bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId id, const std::uint64_t generation,
+                                                const std::uint32_t width, const std::uint32_t height,
+                                                const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
+    return connected() && impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low,
+                                             .width = width, .height = height}, generation, {}, selection_generation, frame_revision);
+}
+bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, ScopedFd descriptor,
+                                                 const int frame_edge, const int frame_signal, const std::uint64_t selection_generation,
+                                                 const std::uint64_t frame_revision) {
+    if (!connected() || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0) return false;
+    record.opcode = Opcode::Import;
+    const std::array descriptors{descriptor.get(), frame_edge, frame_signal};
+    return impl_->admit(record, generation, descriptors, selection_generation, frame_revision);
+}
+bool WorkspaceSurfaceImportChannel::copy_completed(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,
+                                                   const std::uint64_t revision, const std::uint64_t transfer_sequence) {
+    if (!connected() || !claimable(id) || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
+    const auto admission = impl_->find_admission(id);
+    if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) ||
+        Impl::contains(impl_->withdrawn, id)) return false;
+    return impl_->send(Record{.opcode = Opcode::CopyCompleted, .id_high = id.high, .id_low = id.low,
+                             .stride = content.session, .size = content.sequence, .presentation_revision = revision, .offset = transfer_sequence}, {});
 }
 
 WorkspaceSurfaceWithdrawal WorkspaceSurfaceImportChannel::withdraw(const WorkspaceSurfaceImportId id) {
@@ -743,6 +756,7 @@ std::optional<WorkspaceSurfaceRetired> WorkspaceSurfaceImportChannel::take_retir
     if (impl_->retirements.empty()) return std::nullopt;
     WorkspaceSurfaceRetired retired = impl_->retirements.front();
     impl_->retirements.erase(impl_->retirements.begin());
+    impl_->erase_id(impl_->seen, retired.id);
     return retired;
 }
 

@@ -348,7 +348,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
 VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSettings settings) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Annotation native configuration is invalid");
     return [settings, execution = resolve_visual_device_execution(settings)](auto revisions) {
-        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+        mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
             .device = settings.device,
             .model = std::make_unique<NativeAnnotationAlgorithm>(),
             .input_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean,
@@ -356,7 +356,9 @@ VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSe
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),
-        });
+        };
+        configure_visual_workspace_finalization(config);
+        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
 

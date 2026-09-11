@@ -252,7 +252,7 @@ class PresentationSystem::Impl final {
             const PresentationSubmittedSource submitted{observation, pending->generation};
             const auto& frame = observation.frame;
             if (observation.valid() && (frame.extent.width > settings_.maximum_width || frame.extent.height > settings_.maximum_height))
-                throw contracts::InvalidIntentError("presentation source exceeds backbuffer bounds");
+                throw contracts::InvalidIntentError("presentation source exceeds display bounds");
             bool submit = false;
             {
                 std::scoped_lock lock(mutex_);

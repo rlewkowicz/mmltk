@@ -70,7 +70,7 @@ child:
                              uint32_t aSlot,
                              uint64_t aContentSession, uint64_t aContentSequence,
                              uint64_t aPresentationRevision,
-                             uint32_t aContentWidth, uint32_t aContentHeight);
+                             uint32_t aContentWidth, uint32_t aContentHeight, bool aCopyComplete);
   async __delete__();
 };
 

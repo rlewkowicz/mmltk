@@ -178,6 +178,14 @@ bool VisualRuntimeOwner::NotifyContinuation() noexcept {
     if ((state & kContinuationPending) == 0U) worker_.Wake();
     return true;
 }
+void VisualRuntimeOwner::NotifyContinuationAt(const std::chrono::steady_clock::time_point deadline) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopping_ || (continuation_state_.load(std::memory_order_acquire) & kContinuationEnabled) == 0U) return;
+        continuation_deadline_ = deadline;
+    }
+    worker_.WakeAt(deadline);
+}
 void VisualRuntimeOwner::SetOutputRetry(const bool armed) noexcept {
     if (!output_notifications_) return;
     std::scoped_lock lock(output_wake_->mutex);
@@ -268,6 +276,85 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView VisualRuntimeOwner::Borrow(
         if (!available.Wait(stop)) return {};
     }
 }
+mmltk::frameworks::gpu::BorrowedImageWorkspace VisualRuntimeOwner::BorrowWorkspace() const {
+    std::unique_lock lock(mutex_, std::try_to_lock);
+    return lock.owns_lock() && runtime_ ? runtime_->BorrowWorkspace() : mmltk::frameworks::gpu::BorrowedImageWorkspace{};
+}
+mmltk::frameworks::gpu::ImageWorkspaceObservation VisualRuntimeOwner::ObserveWorkspace() const {
+    std::scoped_lock lock(mutex_);
+    if (!runtime_) return {};
+    auto observed = runtime_->ObserveWorkspace();
+    if (observed.product_owner == workspace_candidate_.product_owner && workspace_candidate_.workspace)
+        observed.workspace = workspace_candidate_.workspace;
+    return observed;
+}
+void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
+    if (!request.layout.valid() || request.product_owner == 0U || request.product_revision == 0U || !request.ready)
+        throw std::invalid_argument("visual workspace request is incomplete");
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopping_ || runtime_retirement_blocked_) return;
+        workspace_request_ = std::move(request);
+        workspace_pending_.store(true, std::memory_order_release);
+    }
+    worker_.Wake();
+}
+void VisualRuntimeOwner::ServiceWorkspace() {
+    if (!workspace_pending_.exchange(false, std::memory_order_acq_rel)) return;
+    std::optional<VisualWorkspaceRequest> request;
+    mmltk::frameworks::gpu::ImageWorkspaceObservation candidate;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopping_ || runtime_retirement_blocked_ || !runtime_ || !workspace_request_) return;
+        request = workspace_request_;
+        candidate = workspace_candidate_;
+    }
+    const auto observed = runtime_->ObserveWorkspace();
+    if (observed.product_owner == 0U) {
+        workspace_retry_.store(true, std::memory_order_release);
+        return;
+    }
+    if (observed.product_owner != request->product_owner) {
+        if (candidate.workspace && candidate.product_owner == request->product_owner) {
+            candidate.workspace->Withdraw();
+            std::scoped_lock lock(mutex_);
+            workspace_candidate_ = {};
+        }
+        request->ready();
+        return;
+    }
+    if (observed.product_revision != request->product_revision) {
+        request->ready();
+        return;
+    }
+    runtime_->BeginWork();
+    if (!candidate.workspace && observed.workspace && observed.workspace->layout() == request->layout &&
+        observed.workspace->identity() == request->admitted_allocation)
+        candidate = observed;
+    if (!candidate.workspace || candidate.product_owner != observed.product_owner ||
+        candidate.workspace->layout() != request->layout) {
+        if (request->admitted_allocation != 0U) return;
+        if (candidate.workspace) candidate.workspace->Withdraw();
+        candidate = observed;
+        candidate.workspace = runtime_->CreateWorkspace(request->layout, request->display_execution);
+        {
+            std::scoped_lock lock(mutex_);
+            workspace_candidate_ = candidate;
+        }
+    }
+    if (request->admitted_allocation == candidate.workspace->identity()) {
+        if (!candidate.workspace->admitted())
+            candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
+        workspace_retry_.store(true, std::memory_order_release);
+        if (!runtime_->PrepareWorkspace(observed, candidate.workspace)) return;
+        workspace_retry_.store(false, std::memory_order_release);
+        {
+            std::scoped_lock lock(mutex_);
+            workspace_candidate_ = {};
+        }
+    }
+    request->ready();
+}
 void VisualRuntimeOwner::NotifyReaders() const {
     mmltk::frameworks::gpu::ImageProductPool::Availability available;
     {
@@ -284,10 +371,13 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         if (replacement_active_) RestorePolicy();
         auto created = factory_(product_revision_sequence_);
         if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
-        if (output_notifications_)
-            created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
+        created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
                 if (const auto gate = wake.lock()) {
                     std::scoped_lock lock(gate->mutex);
+                    if (gate->owner && gate->owner->workspace_retry_.load(std::memory_order_acquire)) {
+                        gate->owner->workspace_pending_.store(true, std::memory_order_release);
+                        gate->owner->worker_.Wake();
+                    }
                     if (gate->owner && gate->retry_armed) {
                         const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
                         if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
@@ -320,6 +410,7 @@ void VisualRuntimeOwner::Observe(const ActivityStage stage, const std::uint64_t 
 void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     Observe(ActivityStage::CycleEntered);
     FinishDeferredRetirement();
+    ServiceWorkspace();
     std::optional<ScheduledWork> ordered_work;
     std::optional<Work> latest_work;
     bool continuation_work = false;
@@ -330,6 +421,12 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     {
         std::scoped_lock lock(mutex_);
         if (stopping_ || runtime_retirement_blocked_) return;
+        if (continuation_deadline_ && std::chrono::steady_clock::now() >= *continuation_deadline_) {
+            continuation_deadline_.reset();
+            continuation_state_.fetch_or(kContinuationPending, std::memory_order_release);
+        } else if (continuation_deadline_) {
+            worker_.WakeAt(*continuation_deadline_);
+        }
         if (!ordered_.empty()) {
             ordered_work.emplace(std::move(ordered_.front()));
             ordered_.pop_front();
@@ -480,6 +577,17 @@ void VisualRuntimeOwner::RestorePolicy() {
 
 std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> retired) noexcept {
     Observe(ActivityStage::RetirementStarted);
+    mmltk::frameworks::gpu::ImageWorkspaceObservation workspace;
+    std::function<void()> workspace_ready;
+    {
+        std::scoped_lock lock(mutex_);
+        workspace = std::move(workspace_candidate_);
+        if (workspace_request_) workspace_ready = std::move(workspace_request_->ready);
+        workspace_request_.reset();
+        workspace_pending_.store(false, std::memory_order_release);
+        workspace_retry_.store(false, std::memory_order_release);
+    }
+    workspace = {};
     std::exception_ptr failure;
     bool safe = true;
     if (retired) {
@@ -501,6 +609,9 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
         runtime_retirement_blocked_ = stopping_ || retained_.index() != 0U || execution_policy_.has_value();
     }
     Observe(ActivityStage::RetirementCompleted, safe ? 1U : 0U);
+    if (workspace_ready) {
+        try { workspace_ready(); } catch (...) {}
+    }
     return failure;
 }
 

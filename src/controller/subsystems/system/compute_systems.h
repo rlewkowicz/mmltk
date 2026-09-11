@@ -175,6 +175,9 @@ class PredictSystem final {
     void Shutdown() noexcept;
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] PredictSnapshot snapshot() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+    void RequestWorkspace(VisualWorkspaceRequest);
 
    private:
     class Impl;

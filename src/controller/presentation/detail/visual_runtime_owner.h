@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <cstdint>
 #include <deque>
@@ -66,6 +67,7 @@ class VisualRuntimeOwner final {
     void RegisterContinuation(Work, DispatchObservation = {}, bool wake_on_output_available = false,
                               ContinuationCancellation = ContinuationCancellation::Cancel);
     [[nodiscard]] bool NotifyContinuation() noexcept;
+    void NotifyContinuationAt(std::chrono::steady_clock::time_point) noexcept;
     // Arm before testing output writability; disarm clears only availability retries.
     void SetOutputRetry(bool armed) noexcept;
     bool RequestActiveStop() noexcept;
@@ -74,6 +76,9 @@ class VisualRuntimeOwner final {
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] bool busy() const noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView Borrow() const;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+    void RequestWorkspace(VisualWorkspaceRequest);
 
    private:
     struct ScheduledWork final {
@@ -104,6 +109,7 @@ class VisualRuntimeOwner final {
     [[nodiscard]] std::exception_ptr FinishRuntimeReplacement(bool) noexcept;
     [[nodiscard]] std::exception_ptr RetireOwned(std::unique_ptr<Runtime>) noexcept;
     void FinishDeferredRetirement() noexcept;
+    void ServiceWorkspace();
     void RestorePolicy();
     void NotifyReaders() const;
     void RetireRuntime();
@@ -132,6 +138,11 @@ class VisualRuntimeOwner final {
     static constexpr std::uint8_t kContinuationPending = 2U;
     static constexpr std::uint8_t kOutputRetryPending = 4U;
     std::atomic<std::uint8_t> continuation_state_{0U};
+    std::optional<std::chrono::steady_clock::time_point> continuation_deadline_;
+    std::optional<VisualWorkspaceRequest> workspace_request_;
+    mmltk::frameworks::gpu::ImageWorkspaceObservation workspace_candidate_;
+    std::atomic_bool workspace_pending_{false};
+    std::atomic_bool workspace_retry_{false};
     std::unique_ptr<Runtime> runtime_;
     std::unique_ptr<Runtime> replacement_;
     bool replacement_active_ = false;

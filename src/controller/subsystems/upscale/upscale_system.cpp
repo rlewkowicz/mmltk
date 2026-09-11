@@ -861,6 +861,9 @@ void UpscaleSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool UpscaleSystem::stopped() const noexcept { return impl_->stopped(); }
 UpscaleSnapshot UpscaleSystem::snapshot() const { return impl_->snapshot(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView UpscaleSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
+mmltk::frameworks::gpu::BorrowedImageWorkspace UpscaleSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
+mmltk::frameworks::gpu::ImageWorkspaceObservation UpscaleSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
+void UpscaleSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 VisualDocumentRead UpscaleSystem::BorrowDocument(const VisualFrame& frame) const {
     std::shared_ptr<const VisualDocument> document;
     mmltk::frameworks::gpu::ImageProductPool::Product product;
@@ -878,7 +881,7 @@ VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSetti
                                                          native_upscale::ImageUpscalerExecutionCheckpoint checkpoint) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Upscale device settings are invalid");
     return [settings, execution = resolve_visual_device_execution(settings), checkpoint = std::move(checkpoint)](auto revisions) {
-        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+        mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
             .device = settings.device,
             .model = std::make_unique<NativeUpscaleModel>(settings.device, checkpoint),
             .context_mode = mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop,
@@ -888,7 +891,9 @@ VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSetti
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),
-        });
+        };
+        configure_visual_workspace_finalization(config);
+        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
 

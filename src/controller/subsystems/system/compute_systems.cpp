@@ -440,6 +440,7 @@ void publish_prediction_product(mmltk::frameworks::gpu::SystemImageRuntime& runt
 }  // namespace
 
 class PredictSystem::Impl final {
+    friend class PredictSystem;
    public:
     Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual,
          PredictRuntimeFactory factory, SystemEventSink<event_type> events)
@@ -452,14 +453,16 @@ class PredictSystem::Impl final {
               [visual, topology = mmltk::common::system::NumaTopology::Capture(),
                execution = std::optional<mmltk::frameworks::gpu::DeviceExecution>{}, factory = std::move(factory)](auto revisions) mutable {
                   if (!execution) execution = mmltk::frameworks::gpu::resolve_device_execution(visual.device, topology, visual.numa_node);
-                  return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                  mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
                       .device = visual.device,
                       .model = std::make_unique<PredictVisualModel>(factory),
                       .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                       .numa_node = visual.numa_node,
                       .execution = *execution,
                       .product_revisions = std::move(revisions),
-                  });
+                  };
+                  configure_visual_workspace_finalization(config);
+                  return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
               },
               [this](const std::exception_ptr failure) { Failed(failure); }) {
         if (!visual_.valid()) throw contracts::UnavailableError("prediction visual device is unavailable");
@@ -630,5 +633,8 @@ PredictSnapshot PredictSystem::Stop(contracts::PredictWorkflowIntent) noexcept {
 void PredictSystem::Shutdown() noexcept { impl_->Shutdown(); }
 PredictSnapshot PredictSystem::snapshot() const { return impl_->snapshot(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView PredictSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
+mmltk::frameworks::gpu::BorrowedImageWorkspace PredictSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
+mmltk::frameworks::gpu::ImageWorkspaceObservation PredictSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
+void PredictSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 
 }  // namespace mmltk::controller

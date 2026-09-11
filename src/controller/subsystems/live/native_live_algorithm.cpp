@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <optional>
+#include <atomic>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -49,7 +50,8 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         config.analysis_slots = configuration_.analysis_slots;
         config.composite_slots = configuration_.composite_slots;
         plane_ = std::make_unique<media::LiveMediaDataPlane>(config);
-        revisions_.Reset();
+        failed_.store(false, std::memory_order_release);
+        last_revision_ = 0U;
         plane_->set_revision_listener({
             .context = this,
             .notify = &NativeLiveAlgorithm::RevisionReady,
@@ -66,31 +68,44 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         }
     }
 
-    bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value,
-                 const std::stop_token stop) override {
-        const auto observed = revisions_.Wait(stop, plane_.get(), &NativeLiveAlgorithm::NewestRevision);
-        if (stop.stop_requested()) return false;
-        if (!observed || !plane_) throw std::runtime_error("Live media data plane failed");
-        media::LiveCompositeOutputLease lease;
-        if (!media::try_acquire_live_output(plane_.get(), *observed, &NativeLiveAlgorithm::AcquireOutput, &lease)) {
-            if (revisions_.failed()) throw std::runtime_error("Live media data plane failed");
+    void SetOutputAvailableSink(std::function<void()> sink) override { ready_ = std::move(sink); }
+
+    bool AcquireOutput() override {
+        if (failed_.load(std::memory_order_acquire) || !plane_) throw std::runtime_error("Live media data plane failed");
+        if (lease_) return true;
+        const auto observed = plane_->newest_revision();
+        if (!observed || observed->revision <= last_revision_) return false;
+        if (!media::try_acquire_live_output(plane_.get(), *observed, &NativeLiveAlgorithm::AcquireMediaOutput, &lease_)) {
+            if (failed_.load(std::memory_order_acquire)) throw std::runtime_error("Live media data plane failed");
             return false;
         }
-        const auto source = lease.view();
+        last_revision_ = observed->revision;
+        return true;
+    }
+
+    bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value,
+                 const std::stop_token stop) override {
+        if (stop.stop_requested()) {
+            lease_ = {};
+            return false;
+        }
+        if (!lease_) throw std::logic_error("Live capture has no acquired output");
+        const auto source = lease_.view();
         if (source.width != target.descriptor.width || source.height != target.descriptor.height)
             throw std::runtime_error("Live composite extent changed unexpectedly");
         const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event,
                                                                     stream_value, detail::native_live_receiver_copy_operations());
         if (status != cudaSuccess) throw std::runtime_error("Live composite receiver copy failed");
-        std::move(lease).Complete();
+        std::move(lease_).Complete();
         return true;
     }
 
     void Stop() noexcept override {
         if (!plane_) return;
+        lease_ = {};
         static_cast<void>(plane_->stop());
         plane_.reset();
-        revisions_.Fail();
+        failed_.store(true, std::memory_order_release);
     }
 
    private:
@@ -99,17 +114,23 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
     }
     static bool FailCurrent(const void* context, std::uintptr_t) noexcept {
         auto& owner = *const_cast<NativeLiveAlgorithm*>(static_cast<const NativeLiveAlgorithm*>(context));
-        owner.revisions_.Fail();
+        owner.Fail();
         return true;
     }
-    static void RevisionReady(void* context) noexcept { static_cast<NativeLiveAlgorithm*>(context)->revisions_.RevisionReady(); }
+    void Notify() noexcept {
+        if (ready_) {
+            try { ready_(); } catch (...) {}
+        }
+    }
+    void Fail() noexcept {
+        failed_.store(true, std::memory_order_release);
+        Notify();
+    }
+    static void RevisionReady(void* context) noexcept { static_cast<NativeLiveAlgorithm*>(context)->Notify(); }
     static void TerminalReady(void* context, const media::LivePhysicalTerminal&) noexcept {
-        static_cast<NativeLiveAlgorithm*>(context)->revisions_.Fail();
+        static_cast<NativeLiveAlgorithm*>(context)->Fail();
     }
-    static std::optional<media::PhysicalFrameRevision> NewestRevision(void* context) noexcept {
-        return context == nullptr ? std::nullopt : static_cast<media::LiveMediaDataPlane*>(context)->newest_revision();
-    }
-    static bool AcquireOutput(void* context, const media::PhysicalFrameRevision revision, media::LiveCompositeOutputLease* output) {
+    static bool AcquireMediaOutput(void* context, const media::PhysicalFrameRevision revision, media::LiveCompositeOutputLease* output) {
         return context != nullptr && static_cast<media::LiveMediaDataPlane*>(context)->try_acquire_output(revision, output);
     }
     VisualDeviceSettings settings_;
@@ -117,7 +138,10 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
     LiveNativeConfiguration configuration_;
     std::thread::id owner_thread_;
     std::unique_ptr<media::LiveMediaDataPlane> plane_;
-    media::LiveRevisionWait revisions_;
+    media::LiveCompositeOutputLease lease_;
+    std::uint64_t last_revision_ = 0U;
+    std::atomic_bool failed_{false};
+    std::function<void()> ready_;
 };
 
 }  // namespace
@@ -125,13 +149,15 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
 VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings settings, LiveNativeConfiguration configuration) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Live device settings are invalid");
     return [settings, execution = resolve_visual_device_execution(settings), configuration = std::move(configuration)](auto revisions) {
-        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+        mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
             .device = settings.device,
             .model = std::make_unique<NativeLiveAlgorithm>(settings, configuration, execution),
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),
-        });
+        };
+        configure_visual_workspace_finalization(config);
+        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
 

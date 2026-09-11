@@ -210,6 +210,9 @@ template <class Composition>
                         return Projection::Observe(std::invoke(&[:Snapshot:], *system));
                 },
             .borrow = [system] { return system->BorrowFrame(); },
+            .observe_workspace = [system] { return system->ObserveWorkspace(); },
+            .borrow_workspace = [system] { return system->BorrowWorkspace(); },
+            .request_workspace = [system](VisualWorkspaceRequest request) { system->RequestWorkspace(std::move(request)); },
         };
     });
     return readers;

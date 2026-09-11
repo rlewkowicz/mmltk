@@ -77,9 +77,9 @@ pub(super) fn write_diagnostic(format: impl FnOnce(&mut String) -> fmt::Result) 
     }
 }
 
-pub fn trace_state(event: &str, id: SurfaceId, detail: &str) {
+pub fn trace_state(event: &str, id: SurfaceId, detail: &str, source: bool) {
     write_diagnostic(|line| write!(line,
-        "{{\"event\":\"firefox.workspace.{event}\",\"surface\":\"{id}\",\"detail\":\"{detail}\"}}"
+        "{{\"event\":\"firefox.workspace.{}{event}\",\"surface\":\"{id}\",\"detail\":\"{detail}\"}}", if source { "source." } else { "" }
     ));
 }
 
@@ -148,7 +148,15 @@ fn valid_import_shape(record: &Record) -> bool {
         && record.modifier == MODIFIER_LINEAR
         && record.presentation_revision == 0
         && row_bytes.is_some_and(|bytes| record.stride >= bytes)
-        && described.is_some_and(|bytes| record.size >= bytes)
+        && described.is_some_and(|bytes| record.offset.checked_add(bytes).is_some_and(|end| record.size >= end))
+        && (record.arena_high != 0 || record.arena_low != 0)
+        && record.allocation_identity != 0
+        && record.device_incarnation != 0
+        && record.alignment.is_power_of_two()
+        && record.size % record.alignment == 0
+        && record.device_uuid.iter().any(|byte| *byte != 0)
+        && record.dedicated <= 1
+        && record.memory_type_bits != 0
 }
 
 struct PendingRecord {
@@ -178,6 +186,7 @@ pub struct Admission {
     pub stride: u64,
     pub size: u64,
     pub modifier: u64,
+    pub layout: Record,
     memory: Option<OwnedFd>,
     frame_edge: Option<OwnedFd>,
     frame_signal: Option<OwnedFd>,
@@ -212,6 +221,9 @@ impl Admission {
 
 struct Channel {
     fd: RawFd,
+    sources: HashSet<SurfaceId>,
+    source_requests: VecDeque<SurfaceId>,
+    copy_completions: VecDeque<(SurfaceId, u64, u64, u64, u64)>,
     admitted: HashMap<SurfaceId, Admission>,
     seen: HashSet<SurfaceId>,
     claimed: HashSet<SurfaceId>,
@@ -223,10 +235,6 @@ struct Channel {
     /// Host Drops that completed a released capability. The shell dispatcher
     /// drains these identities and destroys their release-only GPU mirrors.
     settled_releases: VecDeque<SurfaceId>,
-    /// An unclaimed capability whose host Drop already produced the one native
-    /// Failed terminal. One late page texture creation consumes this marker
-    /// locally because its Prepare travelled on the independent page stream.
-    settled_unclaimed: HashSet<SurfaceId>,
     replied: HashSet<SurfaceId>,
     withdrawn: HashSet<SurfaceId>,
     pending: VecDeque<PendingRecord>,
@@ -293,13 +301,15 @@ impl Channel {
         }
         Some(Self {
             fd,
+            sources: HashSet::new(),
+            source_requests: VecDeque::new(),
+            copy_completions: VecDeque::new(),
             admitted: HashMap::new(),
             seen: HashSet::new(),
             claimed: HashSet::new(),
             live: HashSet::new(),
             released: HashSet::new(),
             settled_releases: VecDeque::new(),
-            settled_unclaimed: HashSet::new(),
             replied: HashSet::new(),
             withdrawn: HashSet::new(),
             pending: VecDeque::new(),
@@ -329,6 +339,9 @@ impl Channel {
                 self.withdrawn.len()
             )
         });
+        self.sources.clear();
+        self.source_requests.clear();
+        self.copy_completions.clear();
         self.pending.clear();
         self.admitted.clear();
         self.seen.clear();
@@ -336,7 +349,6 @@ impl Channel {
         self.live.clear();
         self.released.clear();
         self.settled_releases.clear();
-        self.settled_unclaimed.clear();
         self.replied.clear();
         self.withdrawn.clear();
         unsafe { libc::shutdown(self.fd, libc::SHUT_RDWR) };
@@ -351,7 +363,6 @@ impl Channel {
             || !self.withdrawn.is_empty()
             || !self.replied.is_empty()
             || !self.settled_releases.is_empty()
-            || !self.settled_unclaimed.is_empty()
     }
 
     fn observe_close(&mut self, observation: ChannelCloseObservation) {
@@ -398,7 +409,7 @@ impl Channel {
     }
 
     fn accept_new_capability(&mut self, id: SurfaceId) -> bool {
-        if self.seen.insert(id) {
+        if self.seen.len() < PENDING_RECORD_CAPACITY && self.seen.insert(id) {
             return true;
         }
         self.fail();
@@ -413,40 +424,46 @@ impl Channel {
         self.drain();
         let Some(admission) = self.admitted.get(&id) else {
             write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"missing\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
-                self.admitted.len(), self.claimed.len(), self.live.len()
+                "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"missing\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
+                if self.sources.contains(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
             ));
             return None;
         };
         if admission.width != width || admission.height != height {
             write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"mismatch\",\"width\":{width},\"height\":{height},\"admitted_width\":{},\"admitted_height\":{}}}",
-                admission.width, admission.height
+                "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"mismatch\",\"width\":{width},\"height\":{height},\"admitted_width\":{},\"admitted_height\":{}}}",
+                if self.sources.contains(&id) { "source." } else { "" }, admission.width, admission.height
             ));
             return None;
         }
         let admission = self.admitted.remove(&id)?;
         self.claimed.insert(id);
         write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.workspace.claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
-            self.admitted.len(), self.claimed.len(), self.live.len()
+            "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
+            if self.sources.contains(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
         ));
         Some(admission)
     }
 
     fn apply_drop(&mut self, id: SurfaceId) {
-        if self.admitted.remove(&id).is_some() {
-            trace_state("withdrawal", id, "before_claim");
+        if self.sources.contains(&id) && self.live.remove(&id) {
+            trace_state("withdrawal", id, "source_read_released", true);
+            self.replied.remove(&id);
+            self.withdrawn.insert(id);
+            self.settled_releases.push_back(id);
+            self.wake_dispatcher();
+        } else if self.admitted.remove(&id).is_some() {
+            trace_state("withdrawal", id, "before_claim", self.sources.contains(&id));
             // An unclaimed import will never otherwise produce its one
             // outcome. Settle the host's withdrawal tombstone and release
             // both descriptors immediately.
-            self.settled_unclaimed.insert(id);
+            self.withdrawn.insert(id);
             self.send(OPCODE_FAILED, id, FAILED_NOT_ADMITTED, 0, 0, 0, None);
         } else if self.claimed.contains(&id) || self.live.contains(&id) {
-            trace_state("withdrawal", id, "claimed_or_live");
+            trace_state("withdrawal", id, "claimed_or_live", self.sources.contains(&id));
             self.withdrawn.insert(id);
         } else if self.released.remove(&id) {
-            trace_state("withdrawal", id, "page_released");
+            trace_state("withdrawal", id, "page_released", self.sources.contains(&id));
             self.replied.remove(&id);
             self.withdrawn.insert(id);
             self.settled_releases.push_back(id);
@@ -506,12 +523,20 @@ impl Channel {
             if read as usize != RECORD_BYTES
                 || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
                 || record.abi_version != ABI_VERSION
+                || record.modifier != MODIFIER_LINEAR
                 || record.descriptors as usize != descriptor_count(record.opcode)
                 || descriptors.len() != record.descriptors as usize
                 || !id.valid()
             {
                 self.fail();
                 return;
+            }
+            if record.opcode != OPCODE_IMPORT && (record.arena_high != 0 || record.arena_low != 0
+                || record.allocation_identity != 0 || record.device_incarnation != 0
+                || (record.offset != 0 && record.opcode != OPCODE_COPY_COMPLETED)
+                || record.alignment != 0 || record.device_uuid.iter().any(|byte| *byte != 0)
+                || record.dedicated != 0 || record.memory_type_bits != 0) {
+                self.fail(); return;
             }
             match record.opcode {
                 OPCODE_IMPORT => {
@@ -542,6 +567,7 @@ impl Channel {
                     self.admitted.insert(
                         id,
                         Admission {
+                            layout: record,
                             width: record.width,
                             height: record.height,
                             stride: record.stride,
@@ -552,13 +578,40 @@ impl Channel {
                             frame_signal: Some(frame_signal),
                         },
                     );
+                    self.sources.insert(id);
+                    self.source_requests.push_back(id);
+                    self.wake_dispatcher();
                     write_diagnostic(|line| write!(line,
-                        "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
+                        "{{\"event\":\"firefox.workspace.source.admitted\",\"surface\":\"{id}\",\"arena\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"width\":{},\"height\":{},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
+                        record.arena_high, record.arena_low, record.allocation_identity,
                         record.width, record.height, self.admitted.len(), self.claimed.len(), self.live.len()
                     ));
                 }
+                OPCODE_ARENA => {
+                    if record.width == 0 || record.height == 0 || record.stride != 0 || record.size != 0
+                        || record.code != 0 || record.presentation_revision != 0 || !self.accept_new_capability(id) {
+                        self.fail(); return;
+                    }
+                    self.admitted.insert(id, Admission { width: record.width, height: record.height,
+                        stride: 0, size: 0, modifier: MODIFIER_LINEAR, layout: record,
+                        memory: None, frame_edge: None, frame_signal: None });
+                    write_diagnostic(|line| write!(line,
+                        "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{}}}",
+                        record.width, record.height));
+                }
+                OPCODE_COPY_COMPLETED => {
+                    if !self.sources.contains(&id) || !self.live.contains(&id)
+                        || record.width != 0 || record.height != 0 || record.code != 0
+                        || record.presentation_revision == 0 || record.offset == 0 || (record.stride == 0 && record.size == 0)
+                        || self.copy_completions.iter().any(|pending| pending.0 == id && pending.4 == record.offset)
+                        || self.copy_completions.len() >= PENDING_RECORD_CAPACITY {
+                        self.fail(); return;
+                    }
+                    self.copy_completions.push_back((id, record.stride, record.size, record.presentation_revision, record.offset));
+                    self.wake_dispatcher();
+                }
                 OPCODE_DROP => {
-                    trace_state("drop_received", id, "native_withdrawal");
+                    trace_state("drop_received", id, "native_withdrawal", self.sources.contains(&id));
                     if record.width != 0
                         || record.height != 0
                         || record.stride != 0
@@ -637,7 +690,9 @@ impl Channel {
         if !was_claimed && !was_admitted {
             if opcode == OPCODE_FAILED
                 && code == FAILED_NOT_ADMITTED
-                && self.settled_unclaimed.remove(&id)
+                && self.pending.iter().any(|pending| pending.record.id_high == id.high
+                    && pending.record.id_low == id.low && pending.record.opcode == OPCODE_FAILED
+                    && self.withdrawn.contains(&id))
             {
                 return;
             }
@@ -658,16 +713,10 @@ impl Channel {
             self.fail();
             return;
         }
-        self.send(opcode, id, code, stride, size, 0, descriptor);
-        if opcode == OPCODE_READY {
-            if !self.withdrawn.contains(&id) {
-                self.replied.insert(id);
-            }
-        } else {
-            if !self.withdrawn.remove(&id) {
-                self.replied.insert(id);
-            }
+        if !self.withdrawn.contains(&id) {
+            self.replied.insert(id);
         }
+        self.send(opcode, id, code, stride, size, 0, descriptor);
     }
 
     fn release_live(&mut self, id: SurfaceId) -> LiveRelease {
@@ -705,15 +754,17 @@ impl Channel {
 
     fn complete_retirement(&mut self, id: SurfaceId) {
         if self.terminal != ChannelTerminal::Open
-            || !self.withdrawn.remove(&id)
+            || !self.withdrawn.contains(&id)
             || self.live.contains(&id)
             || self.released.contains(&id)
+            || self.pending.iter().any(|pending| pending.record.opcode == OPCODE_RETIRED
+                && pending.record.id_high == id.high && pending.record.id_low == id.low)
         {
             self.fail();
             return;
         }
         self.replied.remove(&id);
-        trace_state("retired", id, "resources_released");
+        trace_state("retired", id, "resources_released", self.sources.contains(&id));
         self.send(OPCODE_RETIRED, id, 0, 0, 0, 0, None);
     }
 
@@ -780,7 +831,19 @@ impl Channel {
                 self.fail();
                 return;
             }
-            self.pending.pop_front();
+            let record = self.pending.pop_front().unwrap().record;
+            let id = SurfaceId { high: record.id_high, low: record.id_low };
+            if record.opcode == OPCODE_RETIRED
+                || (record.opcode == OPCODE_FAILED && self.withdrawn.contains(&id)) {
+                // The terminal has left the socket queue and no physical owner
+                // can refer to this capability. A late independent page claim
+                // is simply unknown and its local failure sends no new terminal.
+                self.withdrawn.remove(&id);
+                self.replied.remove(&id);
+                self.sources.remove(&id);
+                self.source_requests.retain(|source| *source != id);
+                self.seen.remove(&id);
+            }
         }
     }
 }
@@ -910,8 +973,12 @@ pub fn take_admission(id: SurfaceId, width: u32, height: u32) -> Option<Admissio
 pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
-            trace_state("ready", id, "vulkan_import_complete");
+            trace_state("ready", id, "vulkan_import_complete", true);
             channel.send_outcome(OPCODE_READY, id, 0, 0, 0, Some(timeline));
+            if channel.sources.contains(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
+                channel.settled_releases.push_back(id);
+                channel.wake_dispatcher();
+            }
         }
     }
 }
@@ -923,7 +990,7 @@ pub fn send_failed(id: SurfaceId, code: u32, stride: u64, size: u64) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
             write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}"
+                "{{\"event\":\"firefox.workspace.{}import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}", if channel.sources.contains(&id) { "source." } else { "" }
             ));
             channel.send_outcome(OPCODE_FAILED, id, code, stride, size, None);
         }
@@ -938,7 +1005,7 @@ pub fn send_mailbox_available(
     content_sequence: u64,
     presentation_revision: u64,
 ) {
-    if layer >= 3
+    if layer != 0
         || slot >= 2
         || (content_session == 0 && content_sequence == 0)
         || presentation_revision == 0
@@ -971,7 +1038,7 @@ fn send_mailbox_lifecycle(
     content_sequence: u64,
     presentation_revision: u64,
 ) {
-    if layer >= 3
+    if layer != 0
         || slot >= 2
         || (content_session == 0 && content_sequence == 0)
         || presentation_revision == 0
@@ -1065,6 +1132,37 @@ pub fn complete_retirement(id: SurfaceId) {
     }
 }
 
+
+pub fn take_source_requests() -> Vec<SurfaceId> {
+    channel().and_then(|channel| channel.lock().ok().map(|mut channel|
+        channel.source_requests.drain(..).collect())).unwrap_or_default()
+}
+pub fn take_copy_completions() -> Vec<(SurfaceId, u64, u64, u64, u64)> {
+    channel().and_then(|channel| channel.lock().ok().map(|mut channel|
+        channel.copy_completions.drain(..).collect())).unwrap_or_default()
+}
+pub fn take_source_admission(id: SurfaceId) -> Option<Admission> {
+    let mut channel = channel()?.lock().ok()?;
+    let admission = channel.admitted.get(&id)?;
+    if admission.layout.opcode != OPCODE_IMPORT { return None; }
+    let (width, height) = (admission.width, admission.height);
+    channel.claim(id, width, height)
+}
+pub fn send_arena_ready(id: SurfaceId, mut record: Record) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    if !channel.claimed.remove(&id) || !channel.live.insert(id)
+        || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
+    channel.replied.insert(id);
+    trace_state("ready", id, "arena_initialized", false);
+    record.abi_version = ABI_VERSION;
+    record.opcode = OPCODE_ARENA_READY;
+    record.id_high = id.high;
+    record.id_low = id.low;
+    channel.pending.push_back(PendingRecord { record, descriptor: None });
+    channel.flush();
+    channel.wake_dispatcher();
+}
 #[cfg(test)]
 mod tests {
     use super::*;

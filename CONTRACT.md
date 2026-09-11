@@ -53,16 +53,16 @@ bindings project native facts; mutation remains with the owning system.
 | Editable annotation documents and editing history | `AnnotationSystem` |
 | Upscale work and derived image products | `UpscaleSystem` |
 | Live capture, processing, and image products | `LiveSystem` |
-| Foreground source selection, final native composition, exported backbuffer, and native graphics timeline | `PresentationSystem` |
+| Foreground source selection, workspace admission, exact publication, and native graphics timelines | `PresentationSystem` |
 | Navigation, drafts, modal visibility, scroll, selection, and typed event reduction | Rust presentation model and the component owning each UI fact |
 | Widgets, view transforms, styling, rendering, and retained redraw images | Owning Rust/Iced components |
 | Firefox process lifetime and Linux process registrations | `FirefoxProcessOwner` |
 | Native texture import, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
 
-Each domain system also owns its private workers, GPU resources, models, and
-reusable staging as its workload requires. `PresentationSystem` is the single
-native compositor and writer of the exported backbuffer. Producer execution
-stays with the producer.
+Each domain system also owns its private workers, GPU resources, models,
+reusable staging, and final shareable display workspaces. Producers finalize
+display pixels in their own execution boundary. Presentation coordinates their
+admission and publication; it does not allocate, clear, copy, or compose images.
 
 ## Model, presentation model, and views
 
@@ -115,7 +115,7 @@ work. Completion and failure come from typed native results and events.
 
 Images and their annotation meaning share exact source identity, revision, and
 geometry through preview, augmentation, upscale, and editing. Clean pixels and
-native semantic image planes remain separate until final native composition.
+native semantic image planes remain separate until producer-owned final display composition.
 Iced draws text labels from matching typed annotation facts. Class colors
 remain deterministic and stable across filtering and transformations.
 Visibility controls preserve the underlying objects. Annotation imports are
@@ -132,50 +132,60 @@ updates.
 ## GPU buffer flow
 
 ```text
-Independent producers: private GPU products and resources
-                      │ selected complete product; borrowed read
+Independent producers: raw products + final shared display workspaces
+                      │ exact selected workspace read
                       ▼
-PresentationSystem: receiver-owned GPU copy + final composition
-                      │ copy completes; borrowed read releases
+PresentationSystem: layout/import coordination + ready/release timeline
+                      │ no native image copy
                       ▼
-One published native application backbuffer
-                      │ synchronized import and browser-owned GPU copies
+Firefox: imported source → retained two-slot sample arena
+                      │ queue-ordered sample + matching model
                       ▼
-Queue-ordered browser image + matching model → Iced rendering
-                      │
-          Firefox swapchain/compositor → Wayland
+Iced rendering → Firefox swapchain/compositor → Wayland
 ```
 
-Source selection changes which product Presentation copies. Producers retain
-independent, long-lived private resources and continue producing while
-backgrounded. The native graphics timeline protects final backbuffer writes
-and browser reads. Firefox's downstream graphics queues, swapchain, compositor,
-and Wayland cadence remain independent.
+Producers retain independent, reusable resources while backgrounded. A clean
+single-plane product uses its admitted final storage directly. Products with
+native semantic planes retain those raw planes and perform one fused final
+composition. Algorithm systems continue to borrow raw products for explicit
+receiver-owned copies; their clean pixels, documents, and semantic meaning
+remain independent of display preparation.
 
-Cross-system images use typed borrowed read views for one explicit
-receiver-owned copy. Source storage stays valid until GPU completion, and the
-receiver publishes only its own storage. Copies use the shortest supported
-route: device-local or peer access where available, with reusable pinned
-staging for transfers that require it. Browser display remains entirely on
-the GPU through native import and WebGPU/Vulkan.
+Layout negotiation belongs to the exact browser device incarnation and physical
+capacity. Firefox validates external-image support, UUID, memory requirements,
+pitch, offset, and ownership. The producer creates its exportable allocation
+from those immutable facts. Firefox completes initial source ownership before
+the producer fills the final workspace. Late admission uses retained raw data
+without rerunning inference, reapplying edits, or requiring another camera frame.
+Logical completion and ordered input consumption never wait for the browser.
 
-Pending presentation work coalesces to the newest complete selected product
-with bounded outstanding work. The last valid completed browser image remains
-available during subsequent native work, capacity pressure, or presentation
-failure. Obsolete results retain their physical release identity and cannot
-replace a different current product.
+Presentation borrows the selected completed workspace, awaits producer readiness,
+and publishes its exact identity on that source's native graphics timeline. Its
+counted source read lasts through Firefox's matching GPU release, including
+release-only consumption when no sample slot is available. Source observation,
+product revision, physical allocation, source admission, and sample-arena
+identity have separate meanings. Selecting a retained gallery may publish an
+older real product revision under a newer domain observation.
 
-Matching model state authorizes browser image draws in graphics-queue order.
-Physical copy completion independently governs borrowed-image release and
-promotion of the retained completed image. Source changes reach native
-Presentation directly; selecting a source and advancing that source's content
-remain separate responsibilities.
+Firefox retains one reusable two-slot sample arena across producer and pool-slot
+rotation. One slot can hold a completed fallback while another receives a new
+sample. Source retirement waits for that source's GPU reads; it does not wait
+for future draws of copied browser pixels. Arena retirement independently waits
+for page references and GPU readers. Capacity growth prepares an unpublished
+replacement, retains the old completed arena until replacement is usable, then
+drains its readers. Active, candidate, and retiring storage remain bounded.
 
-Capacity growth prepares an unpublished replacement, completes initialization
-and the required import, then atomically promotes the completed replacement.
-The previous allocation remains valid until its consumers release it. There
-is one published native application backbuffer; private producer buffers and
-browser-owned samples have their own lifetimes.
+Matching native model state authorizes a queue-ordered browser sample immediately
+after submission. Physical native-to-sample completion and page sample release
+are separate receipts. The application currently captures that sample into its
+retained Iced image, with its own exact GPU completion hold; direct Iced sampling
+is a subsequent cutover. The last completed browser image remains drawable
+through newer work, capacity pressure, source changes, or presentation failure.
+
+Display-device mismatch uses producer-owned finalization through the existing
+same-device, peer, or reusable pinned transfer route. Browser display remains
+entirely on the GPU. Firefox owns downstream graphics queues, swapchain,
+compositor cadence, and Wayland presentation independently of Live capture rate.
 
 ## Execution, failure, and shutdown
 

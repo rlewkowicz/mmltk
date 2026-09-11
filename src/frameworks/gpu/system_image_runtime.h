@@ -88,10 +88,12 @@ class SystemImageRuntime final {
     void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
     [[nodiscard]] std::shared_ptr<ImageWorkspace> CreateWorkspace(ImageWorkspaceLayout, std::optional<DeviceExecution> display_execution = {});
-    void ConfigureWorkspace(OutputCandidate&, std::shared_ptr<ImageWorkspace>);
-    void PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
+    [[nodiscard]] bool ConfigureWorkspace(OutputCandidate&, std::shared_ptr<ImageWorkspace>);
+    [[nodiscard]] bool PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
+    [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>);
     void FinalizeWorkspace(OutputCandidate&, ImageWorkspaceCoverage = {});
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
     void SelectOutput(const CompletedOutput&);
     // Wake-only; never execute CUDA/product work from this notification.
     void SetOutputAvailableSink(std::function<void()>);

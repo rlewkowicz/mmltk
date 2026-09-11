@@ -57,6 +57,7 @@ struct WorkspaceSurfaceImportOutcome {
     // Present exactly for a successful Ready response. CUDA consumes ownership
     // when the timeline semaphore import succeeds.
     mmltk::common::io::ScopedFd timeline_descriptor;
+    workspace_surface_import::Record layout{};
 };
 
 struct WorkspaceRendererSampleIdentity {
@@ -89,7 +90,7 @@ struct WorkspaceSurfaceWithdrawal {
 
 // One exact page-visible sample owned by the renderer until its final GPU use
 // completes. The native import identity maps the browser sample back to the
-// application backbuffer generation; presentation revision and content form
+// sample arena generation; presentation revision and content form
 // the exact renderer sample identity.
 struct WorkspaceRendererPresentation {
     WorkspaceSurfaceImportId resource{};
@@ -108,9 +109,9 @@ struct WorkspaceRendererPresentation {
 
 // Host-owned mapping for the generic identity paired with the native eventfd.
 // The shell uses atomic loads from its transferred mapping; the presentation owner
-// writes the fixed storage before raising an edge, so backbuffer replacement
+// writes the fixed storage before raising an edge, so source allocation replacement
 // and completed-copy redraws use the native boundary without per-frame
-// WebSocket traffic.
+// application-protocol traffic.
 class WorkspaceSurfaceFrameSignal {
    public:
     WorkspaceSurfaceFrameSignal() noexcept = default;
@@ -130,7 +131,7 @@ class WorkspaceSurfaceFrameSignal {
     detail::WorkspaceFrameSignal* mapping_ = nullptr;
 };
 
-// The host end of the import channel: an AF_UNIX socket that carries the dmabuf
+// The host end of the import channel: an AF_UNIX socket that carries the opaque-FD source allocation
 // descriptor, frame edge, and shared frame identity over SCM_RIGHTS.
 //
 // The host drives. It admits an allocation under an identifier and hands over
@@ -168,16 +169,20 @@ class WorkspaceSurfaceImportChannel final {
     // independently.
     //
     // `frame_edge` is the eventfd the shell watches for the one signal the host
-    // raises per completed backbuffer copy. It is borrowed rather than moved,
+    // raises per producer workspace publication. It is borrowed rather than moved,
     // because the host keeps the signalling end. The channel takes a private
     // duplicate while a nonblocking record is queued; SCM_RIGHTS then installs
     // the shell's descriptor for the same open file. The eventfd is the only
     // per-frame wakeup that crosses the boundary, and the host never reads or
     // waits on it. `frame_signal` is the shared snapshot, read only by the shell, identifying
     // the exact timeline copy authorized by that edge.
-    [[nodiscard]] bool admit(WorkspaceSurfaceImportId id, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
-                             std::uint64_t stride, std::uint64_t size, mmltk::common::io::ScopedFd descriptor, int frame_edge,
-                             int frame_signal, std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool admit_arena(WorkspaceSurfaceImportId, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
+                                   std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation,
+                                   mmltk::common::io::ScopedFd, int frame_edge, int frame_signal,
+                                   std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool copy_completed(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
+                                      std::uint64_t transfer_sequence);
     // Transfers one exact withdrawal ticket. Capacity retains the ticket in the
     // channel, and a claimed capability remains admitted through Retired.
     [[nodiscard]] WorkspaceSurfaceWithdrawal withdraw(WorkspaceSurfaceImportId id);

@@ -153,6 +153,7 @@ std::size_t normalize_explore_parallelism(const std::size_t requested, const mml
 }
 
 class ExploreSystem::Impl final {
+    friend class ExploreSystem;
    public:
     Impl(SettingsSystem& settings_system, const VisualDeviceSettings settings, const std::size_t nproc, VisualRuntimeFactory factory,
          SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
@@ -921,9 +922,10 @@ class ExploreSystem::Impl final {
         const bool continue_gallery = product.gallery.generation != 0U;
         {
             std::scoped_lock lock(mutex_);
-            if (product.output.valid())
+            if (product.output.valid()) {
+                runtime.FinalizeWorkspace(product.output, algorithm.WorkspaceCoverage(product.output.ObserveWorkspace()));
                 product.retained = runtime.CommitOutput(std::move(product.output));
-            else
+            } else
                 runtime.SelectOutput(product.retained);
             algorithm.CommitOutputPublication();
             if (retained_runtime_ != &runtime) {
@@ -1711,6 +1713,9 @@ void ExploreSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool ExploreSystem::stopped() const noexcept { return impl_->stopped(); }
 ExploreSnapshot ExploreSystem::snapshot() const { return impl_->snapshot(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView ExploreSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
+mmltk::frameworks::gpu::BorrowedImageWorkspace ExploreSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
+mmltk::frameworks::gpu::ImageWorkspaceObservation ExploreSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
+void ExploreSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 VisualDocumentRead ExploreSystem::BorrowDocument(const VisualFrame& frame) const { return impl_->BorrowDocument(frame); }
 
 }  // namespace mmltk::controller

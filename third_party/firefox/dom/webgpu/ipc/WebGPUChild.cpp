@@ -173,7 +173,7 @@ NS_IMETHODIMP WorkspaceSlotReleaseListener::HandleEvent(dom::Event* aEvent) {
              &surfaceHigh, &surfaceLow, &layer, &slot, &contentSession,
              &contentSequence, &presentationRevision, &consumed) != 7 ||
       consumed != static_cast<int>(encoded.Length()) ||
-      (surfaceHigh == 0 && surfaceLow == 0) || layer > 2 || slot >= 2 ||
+      (surfaceHigh == 0 && surfaceLow == 0) || layer != 0 || slot >= 2 ||
       (contentSession == 0 && contentSequence == 0) || presentationRevision == 0) {
     return NS_OK;
   }
@@ -572,7 +572,7 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
     const uint32_t aSlot,
     const uint64_t aContentSession, const uint64_t aContentSequence,
     const uint64_t aPresentationRevision, const uint32_t aContentWidth,
-    const uint32_t aContentHeight) {
+    const uint32_t aContentHeight, const bool aCopyComplete) {
   const auto entry = mDeviceMap.find(aDeviceId);
   if (entry == mDeviceMap.end()) {
     return IPC_OK();
@@ -584,7 +584,7 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
   nsIGlobalObject* const global = device->GetParentObject();
   nsPIDOMWindowInner* const window = global ? global->GetAsInnerWindow() : nullptr;
   dom::Document* const document = window ? window->GetExtantDoc() : nullptr;
-  if (document && aLayer <= 2 && aSlot < 2 &&
+  if (document && aLayer == 0 && aSlot < 2 &&
       (aContentSession != 0 || aContentSequence != 0) &&
       aPresentationRevision != 0 && aContentWidth != 0 && aContentHeight != 0) {
     dom::AutoJSAPI api;
@@ -604,20 +604,21 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
     JS::Rooted<JS::Value> detail(api.cx(), JS::StringValue(identityString));
     RefPtr<dom::CustomEvent> event =
         NS_NewDOMCustomEvent(nsGlobalWindowInner::Cast(window), nullptr, nullptr);
-    event->InitCustomEvent(api.cx(), u"gpuexternaltextureframe"_ns, false,
+    event->InitCustomEvent(api.cx(), aCopyComplete ? u"gpuexternaltexturecopycomplete"_ns : u"gpuexternaltextureframe"_ns, false,
                            false, detail);
     event->SetTrusted(true);
     nsGlobalWindowInner::Cast(window)->DispatchEvent(*event);
     if (WorkspaceAcceptanceTraceEnabled()) {
       std::fprintf(
           stderr,
-          "{\"event\":\"firefox.workspace.frame_dispatched\",\"surface\":\"%016" PRIx64
+          "{\"event\":\"firefox.workspace.%s\",\"surface\":\"%016" PRIx64
           "%016" PRIx64 "\",\"layer\":%" PRIu64
           ",\"slot\":%" PRIu32 ",\"content_session\":%" PRIu64
           ",\"content_sequence\":%" PRIu64
           ",\"presentation_revision\":%" PRIu64
           ",\"content_width\":%" PRIu32 ",\"content_height\":%" PRIu32
           "}\n",
+          aCopyComplete ? "copy_completed" : "frame_dispatched",
           aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
           aContentSequence, aPresentationRevision, aContentWidth,
           aContentHeight);

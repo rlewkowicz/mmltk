@@ -14,6 +14,9 @@
 #include <stdexcept>
 #include <string>
 
+#include "src/common/io/scoped_fd.h"
+#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
+
 namespace mmltk::testsupport {
 
 // Upper bound on the descriptors a single workspace surface protocol message carries, which also
@@ -97,6 +100,19 @@ struct WorkspaceSurfaceDescriptors final {
     if (sent == static_cast<ssize_t>(message.size())) { return true; }
     if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return false; }
     throw std::runtime_error(failure_message);
+}
+
+[[nodiscard]] inline bool send_workspace_record(
+    const int socket, const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
+    const std::span<const int> descriptors = {}) {
+    return send_message_with_descriptors(socket, std::as_bytes(std::span{&record, 1U}), descriptors,
+                                         "workspace protocol test send failed");
+}
+
+[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(
+    const int socket, mmltk::controller::presentation::detail::workspace_surface_import::Record& record) {
+    return receive_message_with_descriptors(socket, std::as_writable_bytes(std::span{&record, 1U}),
+                                            "workspace protocol test receive failed");
 }
 
 }  // namespace mmltk::testsupport

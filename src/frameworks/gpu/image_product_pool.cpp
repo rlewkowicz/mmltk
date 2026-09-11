@@ -91,7 +91,24 @@ BorrowedImageProductReadView ImageProductPool::Product::Borrow() const {
     return slot_->buffer.Borrow();
 }
 BorrowedImageWorkspace ImageProductPool::Product::BorrowWorkspace() const {
-    return valid() ? slot_->buffer.BorrowWorkspace() : BorrowedImageWorkspace{};
+    if (!slot_ || revision_ == 0U) return {};
+    std::unique_lock lock(slot_->admission->mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !slot_->Readable() || slot_->reserved || slot_->facts.revision != revision_) return {};
+    lock.unlock();
+    auto result = slot_->buffer.BorrowWorkspace();
+    return result.revision() == revision_ ? std::move(result) : BorrowedImageWorkspace{};
+}
+ImageWorkspaceObservation ImageProductPool::Product::ObserveWorkspace() const {
+    if (!slot_ || revision_ == 0U) return {};
+    std::unique_lock lock(slot_->admission->mutex, std::try_to_lock);
+    if (!lock.owns_lock() || !slot_->Readable() || slot_->reserved || slot_->facts.revision != revision_) return {};
+    return slot_->buffer.ObserveWorkspace();
+}
+ImageWorkspaceObservation ImageProductPool::ObserveWorkspace() const {
+    std::scoped_lock lock(admission_->mutex);
+    for (const auto& slot : slots_)
+        if (slot->SelectedReadable()) return slot->buffer.ObserveWorkspace();
+    return {};
 }
 void ImageProductPool::Product::Retain() {
     if (!slot_) return;
@@ -132,6 +149,9 @@ bool ImageProductPool::Candidate::valid() const noexcept { return slot_ != nullp
 std::uint64_t ImageProductPool::Candidate::revision() const noexcept { return revision_; }
 std::array<ImageAllocation, 2U> ImageProductPool::Candidate::allocations() const {
     return slot_ ? slot_->buffer.Allocations() : std::array<ImageAllocation, 2U>{};
+}
+ImageWorkspaceObservation ImageProductPool::Candidate::ObserveWorkspace() const {
+    return slot_ ? slot_->buffer.ObserveWorkspace() : ImageWorkspaceObservation{};
 }
 void ImageProductPool::Candidate::Release() noexcept {
     if (!slot_) return;
@@ -259,18 +279,37 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
     static_cast<void>(Commit(std::move(candidate)));
     return paths;
 }
-void ImageProductPool::ConfigureWorkspace(Candidate& candidate, std::shared_ptr<ImageWorkspace> workspace,
+bool ImageProductPool::ConfigureWorkspace(Candidate& candidate, std::shared_ptr<ImageWorkspace> workspace,
                                           ImageWorkspaceFinalize finalize) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
         throw std::invalid_argument("workspace candidate is invalid");
-    candidate.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
+    return candidate.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
 }
-void ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace,
+bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace,
                                         ImageWorkspaceFinalize finalize) {
     ValidateBaseline(product);
     if (!product.valid()) throw std::invalid_argument("workspace product is unavailable");
-    product.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
+    if (!product.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize))) return false;
     product.slot_->buffer.FinalizeWorkspace();
+    return true;
+}
+bool ImageProductPool::PrepareWorkspace(const ImageWorkspaceObservation& observation, std::shared_ptr<ImageWorkspace> workspace,
+                                        ImageWorkspaceFinalize finalize) {
+    for (const auto& slot : slots_) {
+        const auto current = slot->buffer.ObserveWorkspace();
+        if (current.product_owner != observation.product_owner || current.product_revision != observation.product_revision) continue;
+        if (!slot->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize))) return false;
+        slot->buffer.FinalizeWorkspace();
+        return true;
+    }
+    return false;
+}
+BorrowedImageWorkspace ImageProductPool::BorrowWorkspace() const {
+    std::unique_lock lock(admission_->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) return {};
+    for (const auto& slot : slots_)
+        if (slot->SelectedReadable()) return slot->buffer.BorrowWorkspace();
+    return {};
 }
 void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCoverage coverage) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)

@@ -264,6 +264,8 @@ class GalleryStream::Impl final {
     void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept { atlas_.Invalidate(allocation); }
     void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery);
     void CommitOutputPublication() noexcept;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) { return atlas_.WorkspaceCoverage(output); }
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
                                                          std::uintptr_t);
@@ -3271,6 +3273,8 @@ bool GalleryStream::HasReadyTiles() const { return impl_->HasReadyTiles(); }
 void GalleryStream::PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept { impl_->PrepareDetailOutput(allocation); }
 void GalleryStream::PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) { impl_->PrepareOutputPublication(change, mode); }
 void GalleryStream::CommitOutputPublication() noexcept { impl_->CommitOutputPublication(); }
+mmltk::frameworks::gpu::ImageWorkspaceCoverage GalleryStream::WorkspaceCoverage(
+    const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) { return impl_->WorkspaceCoverage(output); }
 bool GalleryStream::RollbackOutputPublication() noexcept { return impl_->RollbackOutputPublication(); }
 ExploreGalleryPublication GalleryStream::PublishTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
                                                       const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {

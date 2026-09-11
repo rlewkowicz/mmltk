@@ -663,7 +663,8 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
 TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
     namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
     abi::Record record{.id_high = 1U, .width = 4U, .height = 3U, .stride = 32U, .size = 96U,
-                       .descriptors = abi::kImportDescriptorCount};
+                       .descriptors = abi::kImportDescriptorCount, .arena_high = 2U, .allocation_identity = 3U,
+                       .device_incarnation = 4U, .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
     REQUIRE(abi::valid(record));
     record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
     CHECK_FALSE(abi::valid(record));
@@ -677,4 +678,33 @@ TEST_CASE("Native graphics records reject unknown raw opcodes and malformed desc
     REQUIRE(abi::valid(packet));
     ++packet.presentation_revision_offset;
     CHECK_FALSE(abi::valid(packet));
+}
+
+TEST_CASE("Graphics arena negotiation and source completion use independent record shapes", "[browser][workspace][protocol]") {
+    namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
+    abi::Record arena{.opcode = abi::Opcode::Arena, .id_high = 1U, .width = 4U, .height = 3U};
+    REQUIRE(abi::valid(arena));
+    arena.allocation_identity = 1U;
+    CHECK_FALSE(abi::valid(arena));
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = 1U, .width = 4U, .height = 3U,
+                       .stride = 32U, .size = 128U, .device_incarnation = 2U, .offset = 32U,
+                       .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    REQUIRE(abi::valid(layout));
+    SECTION("subresource offset is included in allocation bounds") {
+        ++layout.offset;
+        CHECK_FALSE(abi::valid(layout));
+    }
+    SECTION("unknown physical UUID is rejected") {
+        layout.device_uuid[0] = 0U;
+        CHECK_FALSE(abi::valid(layout));
+    }
+    SECTION("alignment is a power of two") {
+        layout.alignment = 3U;
+        CHECK_FALSE(abi::valid(layout));
+    }
+    abi::Record completed{.opcode = abi::Opcode::CopyCompleted, .id_high = 3U,
+                          .stride = 7U, .size = 8U, .presentation_revision = 9U};
+    REQUIRE(abi::valid(completed));
+    completed.code = 1U;
+    CHECK_FALSE(abi::valid(completed));
 }

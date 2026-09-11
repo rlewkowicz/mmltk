@@ -48,6 +48,11 @@ struct DiagnosticPublication final {
 struct DiagnosticAllocation final {
     std::uint64_t allocation_generation = 0U;
 };
+struct DiagnosticWorkspace final {
+    std::uint64_t workspace_source_high = 0U;
+    std::uint64_t workspace_source_low = 0U;
+    std::uint64_t workspace_allocation = 0U;
+};
 struct DiagnosticTransfer final {
     std::uint64_t transfer_sequence = 0U;
     std::uint64_t timeline_ready = 0U;
@@ -97,6 +102,7 @@ struct DiagnosticContext final {
     DiagnosticPublication publication{};
     DiagnosticAllocation allocation{};
     DiagnosticTransfer transfer{};
+    DiagnosticWorkspace workspace{};
     DiagnosticLink link{};
     DiagnosticSpanTiming span{};
     DiagnosticPixel pixel{};
@@ -108,6 +114,7 @@ MMLTK_REFLECT_FIELDS(DiagnosticSource)
 MMLTK_REFLECT_FIELDS(DiagnosticDemand)
 MMLTK_REFLECT_FIELDS(DiagnosticPublication)
 MMLTK_REFLECT_FIELDS(DiagnosticAllocation)
+MMLTK_REFLECT_FIELDS(DiagnosticWorkspace)
 MMLTK_REFLECT_FIELDS(DiagnosticTransfer)
 MMLTK_REFLECT_FIELDS(DiagnosticLink)
 MMLTK_REFLECT_FIELDS(DiagnosticSpanTiming)

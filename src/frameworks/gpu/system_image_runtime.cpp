@@ -289,22 +289,29 @@ std::shared_ptr<ImageWorkspace> SystemImageRuntime::CreateWorkspace(ImageWorkspa
         std::rethrow_exception(combine_image_failures(std::current_exception(), retention_->workspaces->failure()));
     }
 }
-void SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
+bool SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
     auto& state = ActiveState();
     retention_->workspaces->Check();
     if (workspace) workspace->CheckOwner(retention_->workspaces);
-    state.output->ConfigureWorkspace(candidate, std::move(workspace), state.workspace_finalize);
+    return state.output->ConfigureWorkspace(candidate, std::move(workspace), state.workspace_finalize);
 }
-void SystemImageRuntime::PrepareWorkspace(const CompletedOutput& product, std::shared_ptr<ImageWorkspace> workspace) {
+bool SystemImageRuntime::PrepareWorkspace(const CompletedOutput& product, std::shared_ptr<ImageWorkspace> workspace) {
     auto& state = ActiveState();
     retention_->workspaces->Check();
     if (workspace) workspace->CheckOwner(retention_->workspaces);
-    state.output->PrepareWorkspace(product, std::move(workspace), state.workspace_finalize);
+    return state.output->PrepareWorkspace(product, std::move(workspace), state.workspace_finalize);
 }
 void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
     ActiveState().output->FinalizeWorkspace(candidate, coverage);
 }
-BorrowedImageWorkspace SystemImageRuntime::BorrowWorkspace() const { return Completed().BorrowWorkspace(); }
+bool SystemImageRuntime::PrepareWorkspace(const ImageWorkspaceObservation& observation, std::shared_ptr<ImageWorkspace> workspace) {
+    auto& state = ActiveState();
+    retention_->workspaces->Check();
+    if (workspace) workspace->CheckOwner(retention_->workspaces);
+    return state.output->PrepareWorkspace(observation, std::move(workspace), state.workspace_finalize);
+}
+BorrowedImageWorkspace SystemImageRuntime::BorrowWorkspace() const { return ActiveState().output->BorrowWorkspace(); }
+ImageWorkspaceObservation SystemImageRuntime::ObserveWorkspace() const { return ActiveState().output->ObserveWorkspace(); }
 void SystemImageRuntime::SelectOutput(const CompletedOutput& product) { ActiveState().output->Select(product); }
 void SystemImageRuntime::SetOutputAvailableSink(std::function<void()> sink) { ActiveState().output->SetAvailabilitySink(std::move(sink)); }
 BorrowedImageProductReadView SystemImageRuntime::BorrowInput() const { return ActiveState().input->Borrow(); }

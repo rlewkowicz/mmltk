@@ -193,6 +193,12 @@ impl Controller {
                     });
                 }
             }
+            Message::Surface(crate::presentation_surface::Notification::Copied(frame)) => {
+                // The temporary capture owns its own stronger completion. Keep
+                // native copy completion distinct from that captured image.
+                crate::presentation_surface::trace_frame("native_copy_completed", frame);
+                update.redraw = true;
+            }
             Message::Surface(crate::presentation_surface::Notification::Completed(frame)) => {
                 crate::presentation_surface::complete_capture(frame);
                 if self.pending.and_then(|surface| surface.frame) == Some(frame) {

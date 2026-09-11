@@ -125,6 +125,7 @@ struct ImageWorkspace::State final {
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     std::atomic_bool admitted{false};
+    std::atomic_bool withdrawn{false};
     TerminalCudaRetirementOwner terminal{1U};
     TerminalCudaRetirementLease retention = ReserveTerminalCudaLease(terminal);
 };
@@ -204,6 +205,11 @@ void ImageWorkspace::Attach(std::uint64_t product_owner) {
     state_->product_owner = product_owner;
 }
 bool ImageWorkspace::admitted() const noexcept { return state_->admitted.load(std::memory_order_acquire); }
+bool ImageWorkspace::retired() const noexcept {
+    std::scoped_lock lock(state_->owner->mutex_);
+    return state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire);
+}
+void ImageWorkspace::Withdraw() noexcept { state_->withdrawn.store(true, std::memory_order_release); }
 std::uint64_t ImageWorkspace::revision() const noexcept { return state_->revision.load(std::memory_order_acquire); }
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
     if (width == 0U || height == 0U || width > layout().width || height > layout().height)
@@ -221,7 +227,8 @@ void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t devi
     std::scoped_lock lock(state_->access);
     std::scoped_lock owner_lock(state_->owner->mutex_);
     if (state_->owner->failure_) std::rethrow_exception(state_->owner->failure_);
-    if (state_->owner->closed_) throw std::runtime_error("workspace owner is retired");
+    if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire))
+        throw std::runtime_error("workspace owner is retired");
     if (allocation_identity != identity() || device_incarnation != layout().device_incarnation || state_->admitted)
         throw std::invalid_argument("workspace admission identity mismatch or duplicate");
     state_->admitted = true;

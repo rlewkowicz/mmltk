@@ -329,6 +329,9 @@ class SyntheticVisualSystem final {
         return result;
     }
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const { return {}; }
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const { return {}; }
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const { return {}; }
+    void RequestWorkspace(VisualWorkspaceRequest) {}
     mutable std::size_t samples = 0U;
 };
 struct SyntheticVisualComposition final {

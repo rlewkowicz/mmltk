@@ -450,14 +450,17 @@ struct BorrowedImageReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageBuffer::State> owner, const std::uintptr_t product_completion = 0U,
                    std::shared_ptr<void> shared_product_lease = {}, const std::uint64_t product_generation = 0U,
                    std::shared_lock<std::shared_mutex>* shared_product_lock = nullptr,
-                   std::shared_ptr<const std::function<void()>> availability_callback = {})
+                   std::shared_ptr<const std::function<void()>> availability_callback = {}, bool nonblocking = false)
         : state(std::move(owner)),
           completion(product_completion == 0U ? state->completion : product_completion),
           product_lease(std::move(shared_product_lease)),
           product_lock(shared_product_lock),
-          lock(state->access),
+          lock(state->access, std::defer_lock),
           revision(product_lease ? product_generation : state->revision),
-          availability(std::move(availability_callback)) {}
+          availability(std::move(availability_callback)) {
+        if (nonblocking) static_cast<void>(lock.try_lock());
+        else lock.lock();
+    }
     ~Lease() {
         if (lock.owns_lock()) {
             lock.unlock();
@@ -666,8 +669,10 @@ struct ImageProductBuffer::State final {
 struct BorrowedImageProductReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageProductBuffer::State> owner)
         : product(std::move(owner)), lock(product->transaction_), generation(product->generation_) {}
+    Lease(std::shared_ptr<ImageProductBuffer::State> owner, std::shared_lock<std::shared_mutex> acquired)
+        : product(std::move(owner)), lock(std::move(acquired)), generation(product->generation_) {}
     ~Lease() {
-        if (completion_access) return;
+        if (completion_access || !lock.owns_lock()) return;
         const auto availability = product->availability_sink_;
         if (lock.owns_lock()) lock.unlock();
         product.reset();
@@ -955,17 +960,19 @@ void ImageProductBuffer::AdoptExternalPlane(std::shared_ptr<void> custody, std::
     raw.capacity_width = plane.allocation.width;
     raw.capacity_height = plane.allocation.height;
 }
-void ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> workspace, ImageWorkspaceFinalize finalize) {
+bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> workspace, ImageWorkspaceFinalize finalize) {
     if (!workspace || !workspace->admitted() || !finalize) throw std::invalid_argument("workspace configuration is incomplete");
-    std::unique_lock transaction(state_->transaction_);
-    state_->AwaitReceiverReads();
+    std::unique_lock transaction(state_->transaction_, std::try_to_lock);
+    if (!transaction.owns_lock() || state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
     workspace->Attach(state_->planes_[0U]->state_->allocation_owner);
     // Retained raw plane custody is unchanged until the next exclusive write.
+    if (state_->workspace_ && state_->workspace_ != workspace) state_->workspace_->Withdraw();
     state_->workspace_ = std::move(workspace);
     state_->finalize_ = std::move(finalize);
     // Dropping the replaced owner can reveal failed physical cleanup even
     // though the new workspace and source execution are healthy.
     state_->workspace_->CheckOwner();
+    return true;
 }
 void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     {
@@ -979,9 +986,26 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
 }
 BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
-    auto source = Borrow();
+    std::shared_lock transaction(state_->transaction_, std::try_to_lock);
+    if (!transaction.owns_lock() || state_->generation_ == 0U || !state_->workspace_ ||
+        state_->workspace_->revision() != state_->generation_) return {};
+    BorrowedImageProductReadView source{
+        std::make_shared<BorrowedImageProductReadView::Lease>(state_, std::move(transaction))};
+    source.count_ = state_->plane_count_;
+    for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
+        source.planes_[index] = BorrowedImageReadView{
+            std::make_unique<BorrowedImageReadView::Lease>(state_->planes_[index]->state_, state_->completion_, source.lease_,
+                                                          source.lease_->generation, &source.lease_->lock,
+                                                          state_->availability_sink_, true)};
+        if (!source.planes_[index].lease_->lock.owns_lock()) return {};
+    }
     if (!source.valid()) return {};
     return BorrowedImageWorkspace(std::move(source), state_->workspace_);
+}
+ImageWorkspaceObservation ImageProductBuffer::ObserveWorkspace() const {
+    std::shared_lock lock(state_->transaction_, std::try_to_lock);
+    if (!lock.owns_lock() || state_->generation_ == 0U) return {};
+    return {state_->planes_[0U]->state_->allocation_owner, state_->generation_, state_->workspace_};
 }
 ImageStreamSettlement ImageProductBuffer::SettleWorkspace() noexcept {
     return state_->workspace_ ? state_->workspace_->Settle() : ImageStreamSettlement{.completion_reached = true};

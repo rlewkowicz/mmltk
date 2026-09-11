@@ -38,6 +38,8 @@ class LiveAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     ~LiveAlgorithm() override = default;
     virtual void Start(const LiveStart&) = 0;
+    virtual void SetOutputAvailableSink(std::function<void()>) = 0;
+    [[nodiscard]] virtual bool AcquireOutput() = 0;
     [[nodiscard]] virtual bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, std::stop_token) = 0;
     virtual void Stop() noexcept = 0;
 };
@@ -80,6 +82,9 @@ class LiveSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] LiveSnapshot snapshot() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
+    void RequestWorkspace(VisualWorkspaceRequest);
 
    private:
     class Impl;

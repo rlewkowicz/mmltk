@@ -62,6 +62,7 @@
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
+#include "src/acceptance/tests/workspace_surface_socket_test_utils.hpp"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/runtime_diagnostics.h"
@@ -1560,6 +1561,8 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
     explicit TestLiveAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> captures, std::shared_ptr<std::atomic_bool> token_changed = {})
         : captures_(std::move(captures)), token_changed_(std::move(token_changed)) {}
     void Start(const LiveStart&) override {}
+    void SetOutputAvailableSink(std::function<void()>) override {}
+    bool AcquireOutput() override { return true; }
     bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t, const std::stop_token stop) override {
         if (!first_stop_)
             first_stop_ = stop;
@@ -1706,6 +1709,8 @@ void submit_counting_continuation(detail::VisualRuntimeOwner& owner, std::atomic
 class FailingLiveAlgorithm final : public LiveAlgorithm {
    public:
     void Start(const LiveStart&) override {}
+    void SetOutputAvailableSink(std::function<void()>) override {}
+    bool AcquireOutput() override { return true; }
     bool Capture(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::stop_token) override {
         throw std::runtime_error("deterministic Live capture failure");
     }
@@ -1830,7 +1835,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     TestPresentationWriter(const int device, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<TestPresentationWriterState> state)
         : context_(device, std::move(backend)),
           stream_(context_),
-          backbuffer_(context_, mmltk::frameworks::gpu::ImageProductLayout::Clean),
+          sample_arena_(context_, mmltk::frameworks::gpu::ImageProductLayout::Clean),
           state_(std::move(state)) {
         state_->constructions.fetch_add(1U, std::memory_order_acq_rel);
     }
@@ -1916,7 +1921,8 @@ class TestPresentationWriter final : public PresentationNativeWriter {
                 .capability = capability(),
             };
         }
-        static_cast<void>(backbuffer_.CopyFrom(stream_, std::move(source)));
+        // This injected writer includes the simulated browser receiver and its sample storage.
+        static_cast<void>(sample_arena_.CopyFrom(stream_, std::move(source)));
         stream_.Synchronize();
         if (candidate_target) {
             if (active_) {
@@ -1980,7 +1986,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     }
     mmltk::frameworks::gpu::DeviceContext context_;
     mmltk::frameworks::gpu::ImageStream stream_;
-    mmltk::frameworks::gpu::ImageProductBuffer backbuffer_;
+    mmltk::frameworks::gpu::ImageProductBuffer sample_arena_;
     std::shared_ptr<TestPresentationWriterState> state_;
     PresentationSubmittedSource submitted_{};
     const VisualSourceReader* reader_ = nullptr;
@@ -1992,29 +1998,20 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     std::uint64_t next_generation_ = 1U;
 };
 
-TEST_CASE("Presentation target capacity rejects a delayed undersized import") {
-    const PresentationTargetCapacity delayed{
-        .width = 100U,
-        .height = 100U,
-        .pitch = 400U,
-        .bytes = 40'000U,
-    };
-    CHECK(delayed.contains({100U, 100U}));
-    CHECK_FALSE(delayed.contains({200U, 200U}));
-    const PresentationTargetCapacity successor{
-        .width = 200U,
-        .height = 200U,
-        .pitch = 1024U,
-        .bytes = 204'800U,
-    };
-    CHECK(successor.contains({200U, 200U}));
-    CHECK_FALSE(PresentationTargetCapacity{
-        .width = 200U,
-        .height = 200U,
-        .pitch = 799U,
-        .bytes = 204'800U,
-    }
-                    .contains({200U, 200U}));
+TEST_CASE("Workspace layout rejects delayed undersized capacity") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = 1U, .width = 100U, .height = 100U,
+                       .stride = 400U, .size = 40'000U, .device_incarnation = 2U, .alignment = 16U,
+                       .device_uuid = {1U}, .memory_type_bits = 1U};
+    CHECK(abi::valid(layout));
+    layout.width = 200U;
+    layout.height = 200U;
+    CHECK_FALSE(abi::valid(layout));
+    layout.stride = 1024U;
+    layout.size = 204'800U;
+    CHECK(abi::valid(layout));
+    layout.stride = 799U;
+    CHECK_FALSE(abi::valid(layout));
 }
 
 class EventGate final {
@@ -6989,7 +6986,7 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
 }
 
-TEST_CASE("Presentation copies every private visual product into its exported backbuffer") {
+TEST_CASE("Presentation forwards every private visual product to the simulated browser arena") {
     ProductPresentationSources products;
     const auto sources = products.sources();
     EventGate events;
@@ -7030,25 +7027,22 @@ TEST_CASE("Synchronous admission writes retain allocation and frame provenance")
                    auto& value = *static_cast<Capture*>(context);
                    if (value.count < value.facts.size()) value.facts[value.count++] = fact;
                }}};
-    mmltk::common::io::ScopedFd peer{::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)};
-    REQUIRE(peer.get() >= 0);
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    const auto text = path.string();
-    REQUIRE(text.size() < sizeof(address.sun_path));
-    std::memcpy(address.sun_path, text.c_str(), text.size() + 1U);
-    REQUIRE(::connect(peer.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
+    auto peer = mmltk::testsupport::connect_workspace_surface_shell(path);
     channel.pump();
     REQUIRE(channel.connected());
     mmltk::common::io::ScopedFd memory{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
     mmltk::common::io::ScopedFd edge{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     const presentation::WorkspaceSurfaceImportId id{11U, 12U};
-    REQUIRE(channel.admit(id, 7U, 64U, 32U, 256U, 8192U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
+    presentation::detail::workspace_surface_import::Record record{
+        .id_high = id.high, .id_low = id.low, .width = 64U, .height = 32U, .stride = 256U, .size = 8192U,
+        .arena_high = 1U, .arena_low = 2U, .allocation_identity = 3U, .device_incarnation = 4U,
+        .alignment = 256U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
     CHECK(channel.claimable(id));
     REQUIRE(capture.count == 2U);
-    CHECK(capture.facts[0].operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued);
-    CHECK(capture.facts[1].operation == VisualDiagnosticOperation::PresentationAdmissionWritten);
+    CHECK(capture.facts[0].operation == VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued);
+    CHECK(capture.facts[1].operation == VisualDiagnosticOperation::PresentationSourceAdmissionWritten);
     for (const auto& fact : capture.facts) {
         CHECK(fact.context.surface_high == id.high);
         CHECK(fact.context.surface_low == id.low);
@@ -7057,6 +7051,154 @@ TEST_CASE("Synchronous admission writes retain allocation and frame provenance")
         CHECK(fact.context.frame_revision == 23U);
         CHECK(fact.context.condition == static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted));
     }
+}
+
+TEST_CASE("Retired source admission does not retire its occupied sample arena", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
+    mmltk::testsupport::ScopedTempDir root{"independent-workspace-retirement"};
+    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
+    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
+    channel.pump();
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    const presentation::WorkspaceSurfaceImportId source{3U, 4U};
+    REQUIRE(channel.admit_arena(arena, 1U, 4U, 3U));
+    abi::Record received{};
+    CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
+    CHECK(received.opcode == abi::Opcode::Arena);
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = arena.high, .id_low = arena.low,
+                       .width = 4U, .height = 3U, .stride = 32U, .size = 96U, .device_incarnation = 5U,
+                       .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    REQUIRE(send_workspace_record(peer.get(), layout));
+    channel.pump();
+    const auto arena_outcome = channel.take_outcome();
+    REQUIRE(arena_outcome.has_value());
+    REQUIRE(arena_outcome->imported);
+    auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
+    auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
+    auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
+    auto imported = layout;
+    imported.id_high = source.high;
+    imported.id_low = source.low;
+    imported.arena_high = arena.high;
+    imported.arena_low = arena.low;
+    imported.allocation_identity = 6U;
+    REQUIRE(channel.admit_source(imported, 2U, std::move(memory), edge.get(), signal.descriptor()));
+    CHECK(receive_workspace_record(peer.get(), received).descriptor_count == abi::kImportDescriptorCount);
+    auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
+    const std::array descriptors{timeline.get()};
+    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Ready, .id_high = source.high, .id_low = source.low,
+                                                .descriptors = abi::kReadyDescriptorCount}, descriptors));
+    channel.pump();
+    const auto source_outcome = channel.take_outcome();
+    REQUIRE(source_outcome.has_value());
+    REQUIRE(source_outcome->imported);
+    // A capacity retry may repeat content and presentation while representing
+    // a new physical source transfer. The wire must preserve that distinction.
+    for (const auto transfer : {1U, 2U}) {
+        REQUIRE(channel.copy_completed(source, {7U, 8U}, 9U, transfer));
+        static_cast<void>(receive_workspace_record(peer.get(), received));
+        CHECK(received.opcode == abi::Opcode::CopyCompleted);
+        CHECK(received.offset == transfer);
+        CHECK(received.stride == 7U);
+        CHECK(received.size == 8U);
+        CHECK(received.presentation_revision == 9U);
+        CHECK(abi::valid(received));
+        auto malformed = received;
+        malformed.offset = 0U;
+        CHECK_FALSE(abi::valid(malformed));
+        malformed = received;
+        malformed.opcode = abi::Opcode::Presented;
+        malformed.code = 1U;
+        CHECK_FALSE(abi::valid(malformed));
+    }
+    CHECK_FALSE(channel.copy_completed(source, {7U, 8U}, 9U, 0U));
+    abi::Record sample{.opcode = abi::Opcode::Presented, .id_high = arena.high, .id_low = arena.low,
+                       .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
+    REQUIRE(send_workspace_record(peer.get(), sample));
+    channel.pump();
+    CHECK(channel.withdraw(source).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+    static_cast<void>(receive_workspace_record(peer.get(), received));
+    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = source.high, .id_low = source.low}));
+    channel.pump();
+    const auto retired_source = channel.take_retirement();
+    REQUIRE(retired_source.has_value());
+    CHECK(retired_source->id == source);
+    CHECK(channel.claimable(arena));
+    CHECK_FALSE(channel.terminal_error());
+    CHECK(channel.withdraw(arena).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+    static_cast<void>(receive_workspace_record(peer.get(), received));
+    sample.opcode = abi::Opcode::Completed;
+    REQUIRE(send_workspace_record(peer.get(), sample));
+    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = arena.high, .id_low = arena.low}));
+    channel.pump();
+    const auto retired_arena = channel.take_retirement();
+    REQUIRE(retired_arena.has_value());
+    CHECK(retired_arena->id == arena);
+    CHECK_FALSE(channel.terminal_error());
+}
+
+TEST_CASE("Workspace capability ledgers survive sequential retirement beyond concurrent capacity", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
+    mmltk::testsupport::ScopedTempDir root{"workspace-capability-churn"};
+    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
+    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
+    channel.pump();
+    auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
+    auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
+    auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
+    const std::array descriptors{timeline.get()};
+    for (std::uint64_t iteration = 1U; iteration <= 300U; ++iteration) {
+        for (const bool source : {false, true}) {
+            for (const bool ready : {false, true}) {
+                const presentation::WorkspaceSurfaceImportId id{iteration, 1U + 2U * source + ready};
+                abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = id.high, .id_low = id.low,
+                                   .width = 4U, .height = 3U, .stride = 32U, .size = 96U, .device_incarnation = 5U,
+                                   .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+                if (source) {
+                    layout.arena_high = iteration;
+                    layout.arena_low = 9U;
+                    layout.allocation_identity = iteration;
+                    REQUIRE(channel.admit_source(layout, iteration,
+                        mmltk::testsupport::workspace_surface_event_descriptor(), edge.get(), signal.descriptor()));
+                } else {
+                    REQUIRE(channel.admit_arena(id, iteration, 4U, 3U));
+                }
+                abi::Record received{};
+                static_cast<void>(receive_workspace_record(peer.get(), received));
+                if (ready) {
+                    if (source) {
+                        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Ready,
+                            .id_high = id.high, .id_low = id.low, .descriptors = abi::kReadyDescriptorCount}, descriptors));
+                    } else {
+                        REQUIRE(send_workspace_record(peer.get(), layout));
+                    }
+                    channel.pump();
+                    REQUIRE(channel.take_outcome().has_value());
+                }
+                REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+                static_cast<void>(receive_workspace_record(peer.get(), received));
+                REQUIRE(send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
+                    .id_high = id.high, .id_low = id.low,
+                    .code = ready ? 0U : static_cast<std::uint32_t>(abi::FailureCode::NotAdmitted)}));
+                channel.pump();
+                REQUIRE(channel.take_retirement().has_value());
+                CHECK_FALSE(channel.claimable(id));
+                CHECK(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Invalid);
+                CHECK_FALSE(channel.take_outcome().has_value());
+                CHECK_FALSE(channel.terminal_error());
+                CHECK(channel.connected());
+            }
+        }
+    }
+    // A still-live admission remains unique even after all the preceding churn.
+    const presentation::WorkspaceSurfaceImportId active{301U, 1U};
+    REQUIRE(channel.admit_arena(active, 301U, 4U, 3U));
+    CHECK_FALSE(channel.admit_arena(active, 301U, 4U, 3U));
+    CHECK(channel.terminal_error().has_value());
 }
 
 void publish_first_presentation(PresentationSystem& presentation, const PresentationSourceFixture& source,

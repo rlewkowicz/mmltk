@@ -71,6 +71,8 @@ class GalleryStream final {
     void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept;
     void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery);
     void CommitOutputPublication() noexcept;
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&);
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
                                                          std::uintptr_t);

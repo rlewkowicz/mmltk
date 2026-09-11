@@ -595,6 +595,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override { gallery_.PrepareDetailOutput(allocation); }
     void PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) override { gallery_.PrepareOutputPublication(change, mode); }
     void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
+    mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) override { return gallery_.WorkspaceCoverage(output); }
     [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
 
     [[nodiscard]] ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate,
@@ -728,7 +730,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             configuration = std::move(configuration)](auto revisions) {
         mmltk::common::system::ScopedExecutionPolicy construction(
             {execution.placement.cpus, {}, 0, execution.placement.numa_node, -10, false});
-        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+        mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
             .device = settings.device,
             .model = std::make_unique<explore_detail::NativeExploreAlgorithm>(configuration, nproc, execution, settings.maximum_height),
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
@@ -736,7 +738,9 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),
-        });
+        };
+        configure_visual_workspace_finalization(config);
+        return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
 
