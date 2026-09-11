@@ -318,6 +318,7 @@ class ExploreSystem::Impl final {
                             [&] noexcept {
                                 algorithm.Commit(std::move(candidate));
                                 committed_source_ = std::move(request.compiled_source);
+                                scroll_direction_ = ExploreScrollDirection::Forward;
                                 runtime_settings_ = std::move(runtime_settings);
                                 settings_.device = settings_candidate.device_id;
                                 settings_.numa_node = settings_candidate.loading.numa_node;
@@ -634,6 +635,9 @@ class ExploreSystem::Impl final {
         const auto previous_viewport = desired_->viewport;
         const auto previous_selection = desired_->selected_image;
         install(*desired_);
+        if (viewport_update && desired_->viewport.first_row != previous_viewport.first_row)
+            scroll_direction_ = desired_->viewport.first_row > previous_viewport.first_row
+                ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
         if (persist || check_settings) {
             desired_settings_ = settings_system_.explore_settings_candidate();
             if (check_settings) desired_augmentation_config_ = desired_settings_->augmentation;
@@ -649,6 +653,7 @@ class ExploreSystem::Impl final {
                                     : NextGeneration();
         auto requested = *desired_;
         auto plan = make_render_plan(requested, desired_augmentation_config_, state_.dataset.identity, generation);
+        plan.scroll_direction = scroll_direction_;
         if (!worker_.SubmitLatest([this, plan, requested = std::move(requested), generation, offset, settings = desired_settings_,
                                    persist = desired_persist_](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                                std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
@@ -1270,7 +1275,9 @@ class ExploreSystem::Impl final {
         };
     }
     [[nodiscard]] ExploreRenderPlan Plan(const std::uint64_t generation) const {
-        return make_render_plan(state_, augmentation_config_, state_.dataset.identity, generation);
+        auto plan = make_render_plan(state_, augmentation_config_, state_.dataset.identity, generation);
+        plan.scroll_direction = scroll_direction_;
+        return plan;
     }
     [[nodiscard]] static VisualExtent ProductExtent(ExploreAlgorithm& algorithm, const ExploreRenderPlan& plan) {
         return plan.mode == ExploreMode::Gallery ? plan.viewport.extent : algorithm.DetailExtent(plan);
@@ -1483,6 +1490,7 @@ class ExploreSystem::Impl final {
     std::mutex open_finalization_mutex_;
     mutable std::mutex mutex_;
     ExploreSnapshot state_;
+    ExploreScrollDirection scroll_direction_ = ExploreScrollDirection::Forward;
     std::optional<ExploreSnapshot> desired_;
     std::optional<ExploreSettingsCandidate> desired_settings_;
     bool desired_persist_ = false;

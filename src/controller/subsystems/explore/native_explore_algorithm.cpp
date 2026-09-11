@@ -388,8 +388,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
 
    public:
     NativeExploreAlgorithm(ExploreNativeConfiguration configuration, const std::size_t nproc,
-                           const mmltk::frameworks::gpu::DeviceExecution& execution)
-        : configuration_(configuration), nproc_(nproc), gallery_(nproc, execution, configuration) {}
+                           const mmltk::frameworks::gpu::DeviceExecution& execution, const std::uint32_t maximum_height)
+        : configuration_(configuration), nproc_(nproc), gallery_(nproc, execution, configuration, maximum_height) {}
     [[nodiscard]] bool UsesLoadingOptions(const data::DataLoadingOptions& options) const override {
         return configuration_.loading == options;
     }
@@ -471,7 +471,9 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
 
     [[nodiscard]] ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t shuffle_seed,
                                                       const std::size_t nproc, const std::stop_token stop) override {
-        gallery_.Suspend();
+        // Filtering builds a separate order over immutable summaries. Existing
+        // physical inputs keep their dataset leases until the new demand can
+        // adopt them by compiled identity or their callbacks settle.
         auto& dataset = CandidateDataset();
         if (nproc != nproc_) throw std::logic_error("Explore nproc changed after runtime construction");
         const auto generation = ++candidate_generation_;
@@ -584,7 +586,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto* dataset = candidate != nullptr && open_candidate_ ? open_candidate_.get() : committed_.get();
         const auto& order = CandidateOrder(candidate);
         const auto first = GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
-        const auto count = GalleryThumbnailCache::CardCount(order.size(), plan.viewport.row_count, plan.viewport.columns);
+        const auto count = GalleryThumbnailCache::WindowCount(order.size(), plan.viewport);
         return gallery_.OutputChange(
             plan, plan.mode == ExploreMode::Gallery ? VisibleRange(plan.viewport, candidate) : std::span<const std::uint32_t>{},
             &dataset->store, std::span{order}.subspan(first, count));
@@ -604,7 +606,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto visible = VisibleRange(plan.viewport, candidate);
         const auto& order = CandidateOrder(candidate);
         const auto window_first = explore_detail::GalleryThumbnailCache::WindowFirst(order.size(), plan.viewport);
-        const auto count = explore_detail::GalleryThumbnailCache::CardCount(order.size(), plan.viewport.row_count, plan.viewport.columns);
+        const auto count = explore_detail::GalleryThumbnailCache::WindowCount(order.size(), plan.viewport);
         const auto window = std::span{order}.subspan(window_first, count);
         if (gallery_.OutputChange(plan, visible, &dataset.store, window) != ExploreOutputChange::Unchanged)
             ConfigureClasses(dataset.classes, plan.overlay, render_classes_);
@@ -727,7 +729,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             {execution.placement.cpus, {}, 0, execution.placement.numa_node, -10, false});
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
             .device = settings.device,
-            .model = std::make_unique<explore_detail::NativeExploreAlgorithm>(configuration, nproc, execution),
+            .model = std::make_unique<explore_detail::NativeExploreAlgorithm>(configuration, nproc, execution, settings.maximum_height),
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
             .output_buffer_count = 2U,
             .numa_node = settings.numa_node,

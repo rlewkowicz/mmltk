@@ -43,6 +43,7 @@ inline constexpr std::size_t kExploreMaximumParallelism = 64U;
 enum class ExploreFailureKind : std::uint8_t { None, Operation, RuntimeInitialization, SelectedTransportUnavailable };
 enum class ExploreViewportOutcome : std::uint8_t { Ready, VisibleCapacityExceeded, AtlasExtentExceeded };
 enum class ExploreMode : std::uint8_t { Gallery, Detail };
+enum class ExploreScrollDirection : std::uint8_t { Forward, Backward };
 enum class ExploreNavigation : std::uint8_t { Previous, Next };
 struct ExploreViewport final {
     bool operator==(const ExploreViewport&) const = default;
@@ -162,6 +163,7 @@ struct ExploreSnapshot final {
 
 struct ExploreRenderPlan final {
     ExploreViewport viewport{};
+    ExploreScrollDirection scroll_direction = ExploreScrollDirection::Forward;
     ExploreOverlay overlay{};
     ExploreMode mode = ExploreMode::Gallery;
     std::optional<std::uint32_t> selected_image{};

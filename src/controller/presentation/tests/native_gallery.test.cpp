@@ -190,6 +190,44 @@ struct GalleryEvidence final {
     }
 };
 
+class GalleryReadPause final {
+   public:
+    explicit GalleryReadPause(const std::uint32_t image, const bool fail = false) : image_(image), fail_(fail) {}
+    struct ReleaseGuard final {
+        GalleryReadPause& pause;
+        ~ReleaseGuard() { pause.Release(); }
+    };
+    void Bind(ExploreAcceptanceGate& gate) {
+        gate.SetReadObserver(this, [](void* context, std::uint64_t, const std::uint32_t index) {
+            auto& pause = *static_cast<GalleryReadPause*>(context);
+            if (index != pause.image_) return;
+            std::unique_lock lock(pause.mutex_);
+            pause.entered_ = true;
+            pause.changed_.notify_all();
+            pause.changed_.wait(lock, [&] { return pause.released_; });
+            if (std::exchange(pause.fail_, false)) throw std::runtime_error("deterministic native source read failure");
+        });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        REQUIRE(changed_.wait_for(lock, std::chrono::seconds{10}, [&] { return entered_; }));
+    }
+    void Release() {
+        std::scoped_lock lock(mutex_);
+        released_ = true;
+        changed_.notify_all();
+    }
+    ~GalleryReadPause() { Release(); }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::uint32_t image_;
+    bool fail_;
+    bool entered_ = false;
+    bool released_ = false;
+};
+
 struct GalleryGpuPause final {
     std::mutex mutex;
     std::condition_variable changed;
@@ -402,10 +440,10 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
             CHECK(fact.detail == columns * 2U);
             background_tiles += fact.value;
         }
-        CHECK(background_tiles == explore_detail::GalleryThumbnailCache::CardCount(203U, 2U, columns) - columns * 2U);
+        CHECK(background_tiles == explore_detail::GalleryThumbnailCache::WindowCount(203U, gallery.plan.viewport) - columns * 2U);
     }
     const auto storage = gallery.algorithm->StorageFootprint();
-    const auto capacity = explore_detail::GalleryThumbnailCache::CardCount(203U, 2U, columns);
+    const auto capacity = std::min<std::size_t>(203U, kExploreVisibleItemCapacity + 8U * columns);
     CHECK(storage.cache_cards == capacity);
     CHECK(storage.cache_device_bytes == 4U * capacity * 8U * 8U * 4U);
     CHECK(storage.host_bytes >= 2U * capacity * sizeof(explore_detail::GalleryThumbnailCache::Entry));
@@ -425,7 +463,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     const auto published = gallery.publications;
     const auto transfers = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
     const auto allocations = gallery.evidence.Count(VisualDiagnosticOperation::ExploreStorageGrown);
-    REQUIRE(reads == explore_detail::GalleryThumbnailCache::CardCount(203U, 2U, columns));
+    REQUIRE(reads == explore_detail::GalleryThumbnailCache::WindowCount(203U, gallery.plan.viewport));
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 0U);
@@ -566,6 +604,137 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     const auto stopped_reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == stopped_reads);
+}
+
+TEST_CASE("Native five six five row demand immediately retains pixel identity through reorder", "[explore][native][cache]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-row-count"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U, 30U);
+    NativeGallery gallery{5U};
+    gallery.plan.viewport = {.extent = {40U, 40U}, .row_count = 5U, .columns = 5U};
+    gallery.Open(path);
+    gallery.Drain();
+    const auto initial_pixels = gallery.Pixels(0U);
+    const auto initial_semantics = gallery.Pixels(1U);
+    const auto storage = gallery.algorithm->StorageFootprint();
+    const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled);
+    const auto renders = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
+    std::vector<std::uint8_t> all_pixels;
+    for (const auto rows : {6U, 5U, 6U, 5U}) {
+        gallery.plan.viewport.row_count = rows;
+        gallery.plan.viewport.extent.height = rows * 8U;
+        ++gallery.plan.generation;
+        gallery.demand->store(gallery.plan.generation);
+        const auto publication = gallery.Begin();
+        CHECK(publication.remaining_tiles == 0U);
+        CHECK(std::ranges::all_of(publication.ready_slots, [](const bool ready) { return ready; }));
+        const auto clean = gallery.Pixels(0U);
+        const auto semantic = gallery.Pixels(1U);
+        if (rows == 6U) all_pixels = clean;
+        REQUIRE(clean.size() >= initial_pixels.size());
+        CHECK(std::ranges::equal(std::span{clean}.first(initial_pixels.size()), initial_pixels));
+        CHECK(std::ranges::equal(std::span{semantic}.first(initial_semantics.size()), initial_semantics));
+        CHECK(gallery.algorithm->StorageFootprint().cache_cards == storage.cache_cards);
+        CHECK(gallery.algorithm->StorageFootprint().cache_device_bytes == storage.cache_device_bytes);
+        CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled) == reads);
+        CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders);
+    }
+    auto reordered = gallery.algorithm->PrepareFilter({}, 83U, 2U, {});
+    const auto order = gallery.algorithm->Visible(gallery.plan.viewport, &reordered).visible_indices;
+    ++gallery.plan.generation;
+    gallery.demand->store(gallery.plan.generation);
+    CHECK(gallery.Begin(&reordered).remaining_tiles == 0U);
+    gallery.algorithm->Commit(std::move(reordered));
+    const auto shuffled = gallery.Pixels(0U);
+    for (std::size_t slot = 0U; slot < order.size(); ++slot)
+        for (std::size_t row = 0U; row < 8U; ++row) {
+            const auto destination = ((slot / 5U * 8U + row) * 40U + slot % 5U * 8U) * 4U;
+            const auto source = ((order[slot] / 5U * 8U + row) * 40U + order[slot] % 5U * 8U) * 4U;
+            CHECK(std::ranges::equal(std::span{shuffled}.subspan(destination, 32U), std::span{all_pixels}.subspan(source, 32U)));
+        }
+    CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled) == reads);
+}
+
+TEST_CASE("Native disk admission follows immediate forward four then backward four", "[explore][native][priority]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    const auto reverse = GENERATE(false, true);
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-admission"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGallery gallery{2U};
+    gallery.plan.viewport.first_row = 10U;
+    gallery.plan.focused_image = 22U;
+    gallery.plan.scroll_direction = reverse ? ExploreScrollDirection::Backward : ExploreScrollDirection::Forward;
+    gallery.Open(path);
+    gallery.Drain();
+    std::vector<std::uint32_t> admitted;
+    {
+        std::scoped_lock lock(gallery.evidence.mutex);
+        for (const auto& fact : gallery.evidence.facts)
+            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled)
+                admitted.push_back(static_cast<std::uint32_t>(fact.detail));
+    }
+    std::vector<std::uint32_t> expected{22U, 20U, 21U, 23U};
+    const auto ahead = [&] { for (std::uint32_t image = 24U; image < 32U; ++image) expected.push_back(image); };
+    const auto behind = [&] {
+        for (std::uint32_t row = 10U; row != 6U;) {
+            --row;
+            expected.push_back(row * 2U);
+            expected.push_back(row * 2U + 1U);
+        }
+    };
+    if (reverse) { behind(); ahead(); } else { ahead(); behind(); }
+    CHECK(admitted == expected);
+}
+
+TEST_CASE("Native cold visible admission proceeds while obsolete speculation holds its physical lane", "[explore][native][priority]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-visible-admission"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    GalleryReadPause held{4U};
+    NativeGallery gallery{2U, false, true};
+    GalleryReadPause::ReleaseGuard release{held};
+    held.Bind(*gallery.gate);
+    gallery.Open(path);
+    for (;;) {
+        const auto observed = gallery.evidence.Epoch();
+        static_cast<void>(gallery.Step());
+        bool scheduled = false;
+        {
+            std::scoped_lock lock(gallery.evidence.mutex);
+            scheduled = std::ranges::any_of(gallery.evidence.facts, [](const auto& fact) {
+                return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.detail == 4U;
+            });
+        }
+        if (scheduled) break;
+        gallery.evidence.Wait(observed);
+    }
+    held.Wait();
+    gallery.plan.viewport.first_row = 20U;
+    ++gallery.plan.generation;
+    gallery.demand->store(gallery.plan.generation);
+    CHECK(gallery.Begin().remaining_tiles == 4U);
+    static_cast<void>(gallery.algorithm->AdvanceGallery());
+    {
+        std::scoped_lock lock(gallery.evidence.mutex);
+        const auto admitted = std::ranges::find_if(gallery.evidence.facts, [&](const auto& fact) {
+            return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation;
+        });
+        REQUIRE(admitted != gallery.evidence.facts.end());
+        CHECK(admitted->detail == 40U);
+        CHECK(std::ranges::none_of(gallery.evidence.facts, [&](const auto& fact) {
+            return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation &&
+                (fact.detail < 40U || fact.detail >= 44U);
+        }));
+    }
+    held.Release();
+    gallery.Drain();
+    CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices == std::vector<std::uint32_t>{40U, 41U, 42U, 43U});
 }
 
 TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed replacement resumes retained work",
@@ -817,53 +986,42 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
 TEST_CASE("Native initialization commit reserves useful reads and isolates obsolete failures", "[explore][native][transaction]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
-    // Useful read, obsolete failure, current failure, adopted current failure.
-    const auto scenario = GENERATE(0U, 1U, 2U, 3U);
-    struct HeldRead final {
-        std::mutex mutex;
-        std::condition_variable changed;
-        bool entered = false;
-        bool released = false;
-        bool fail = false;
-        void Release() {
-            std::scoped_lock lock(mutex);
-            released = true;
-            changed.notify_all();
-        }
-    } held;
-    held.fail = scenario != 0U;
+    // Useful read, obsolete failure, current failure, adopted failure, and shuffled identity.
+    const auto scenario = GENERATE(0U, 1U, 2U, 3U, 4U);
     mmltk::testsupport::ScopedTempDir directory{"native-gallery-commit"};
     const auto path = directory.path() / "compiled.bin";
     write_gallery_artifact(path, 0.25F, 9U);
+    GalleryReadPause held{68U, scenario != 0U && scenario != 4U};
     NativeGallery gallery{4U, false, true};
-    struct ReleaseOnExit final {
-        HeldRead& held;
-        ~ReleaseOnExit() { held.Release(); }
-    } release_on_exit{held};
-    gallery.gate->SetReadObserver(&held, [](void* context, std::uint64_t, const std::uint32_t index) {
-        if (index != 68U) return;
-        auto& held_read = *static_cast<HeldRead*>(context);
-        std::unique_lock lock(held_read.mutex);
-        held_read.entered = true;
-        held_read.changed.notify_all();
-        held_read.changed.wait(lock, [&] { return held_read.released; });
-        if (std::exchange(held_read.fail, false)) throw std::runtime_error("deterministic native source read failure");
-    });
+    GalleryReadPause::ReleaseGuard release{held};
+    held.Bind(*gallery.gate);
     gallery.plan.viewport = {.extent = {32U, 32U}, .first_row = 17U, .row_count = 4U, .columns = 4U};
     gallery.Open(path);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
-    {
-        std::unique_lock lock(held.mutex);
-        REQUIRE(held.changed.wait_for(lock, std::chrono::seconds{10}, [&] { return held.entered; }));
-    }
+    held.Wait();
     if (scenario != 2U) {
         gallery.plan.viewport.row_count = 1U;
         gallery.plan.viewport.extent.height = 8U;
         if (scenario == 1U) gallery.plan.viewport.first_row = 30U;
+        std::optional<ExploreOrderCandidate> reordered;
+        if (scenario == 4U) {
+            auto prepared = std::async(std::launch::async, [&] {
+                gallery.runtime->BindContext();
+                return gallery.algorithm->PrepareFilter({}, 83U, 2U, {});
+            });
+            const auto ready = prepared.wait_for(std::chrono::seconds{10});
+            if (ready != std::future_status::ready) held.Release();
+            REQUIRE(ready == std::future_status::ready);
+            reordered = prepared.get();
+            const auto found = std::ranges::find(reordered->order.visible_indices, 68U);
+            REQUIRE(found != reordered->order.visible_indices.end());
+            gallery.plan.viewport.first_row = static_cast<std::uint32_t>(found - reordered->order.visible_indices.begin()) / 4U;
+        }
         ++gallery.plan.generation;
         gallery.demand->store(gallery.plan.generation);
-        gallery.Begin();
-        CHECK(gallery.algorithm->StorageFootprint().cache_cards == 60U);
+        gallery.Begin(reordered ? &*reordered : nullptr);
+        if (reordered) gallery.algorithm->Commit(std::move(*reordered));
+        CHECK(gallery.algorithm->StorageFootprint().cache_cards == 203U);
         // Exercise scheduling while the old read is still physically held.
         // A useful reservation must prevent another lane from reading slot 68.
         static_cast<void>(gallery.algorithm->AdvanceGallery());
@@ -881,7 +1039,7 @@ TEST_CASE("Native initialization commit reserves useful reads and isolates obsol
               }) == 1);
     } else {
         REQUIRE_NOTHROW(gallery.Drain());
-        if (scenario == 0U) {
+        if (scenario == 0U || scenario == 4U) {
             // CLEANUP-IGNORE: Successful GPU completion evidence differs from the read-failure branch even though
             // both inspect the same diagnostic collection under its lock.
             std::scoped_lock lock(gallery.evidence.mutex);
@@ -1182,7 +1340,7 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     CHECK(gallery.Pixels(1U) == semantic);
 }
 
-TEST_CASE("Native superseded background collision preserves incumbent planes and meaning", "[explore][native][cache][shutdown]") {
+TEST_CASE("Native superseded background work preserves incumbent planes and meaning", "[explore][native][cache][shutdown]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     mmltk::testsupport::ScopedTempDir directory{"native-gallery-background"};
@@ -1197,9 +1355,9 @@ TEST_CASE("Native superseded background collision preserves incumbent planes and
     gallery.Begin();
     const auto clean = gallery.Pixels(0U);
     const auto semantic = gallery.Pixels(1U);
-    // First window retains 0..63. Row eight shifts it to 4..67, so
-    // speculative 64..67 collide with incumbent 0..3 after a hot Begin.
-    gallery.plan.viewport.first_row = 8U;
+    // Initial demand retains 0..23. Row four is hot; new speculative rows
+    // follow it without discarding the ready retained origin.
+    gallery.plan.viewport.first_row = 4U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 0U);

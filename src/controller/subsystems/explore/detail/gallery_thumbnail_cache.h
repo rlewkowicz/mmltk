@@ -60,12 +60,13 @@ struct GalleryTileMeaning final {
     std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderRlePairAbi> runs;
 };
 
-// Physical slots are addressed by filtered position. The product owns the
-// artifact behind incarnation; its address cannot be recycled while retained.
-// The stable dataset identity continues to govern augmentation seeds.
+// Pixel identities occupy retained physical slots. Demand positions only map to
+// those slots; reorder and viewport size are not pixel identity. The product
+// retains the artifact behind incarnation throughout every physical use.
 class GalleryThumbnailCache final {
    public:
-    static constexpr std::size_t kMaximumCards = 15U * kExploreVisibleItemCapacity;
+    static constexpr std::uint32_t kNeighborRows = 4U;
+    static constexpr std::size_t kMaximumCards = (1U + 2U * kNeighborRows) * kExploreVisibleItemCapacity;
     struct Identity final {
         const mmltk::backend::data::CompiledDataset* incarnation = nullptr;
         std::uint64_t dataset = 0U;
@@ -84,18 +85,26 @@ class GalleryThumbnailCache final {
         std::uint64_t semantic_identity = 0U;
     };
 
-    [[nodiscard]] static std::size_t CardCount(std::size_t matching, std::uint32_t rows, std::uint32_t columns) noexcept;
+    [[nodiscard]] static std::size_t WindowCount(std::size_t matching, const ExploreViewport&) noexcept;
     [[nodiscard]] static std::size_t WindowFirst(std::size_t matching, const ExploreViewport&) noexcept;
     void Configure(std::size_t count, Identity);
     void Reserve(std::size_t count);
+    void BeginUpdate();
+    void CommitUpdate() noexcept;
+    void RollbackUpdate() noexcept;
+    [[nodiscard]] const Entry& Protected(std::size_t slot) const noexcept;
+    void Admit(std::span<const std::uint32_t>, std::size_t first);
+    [[nodiscard]] std::size_t Position(std::uint32_t compiled_index) const noexcept;
+    [[nodiscard]] std::size_t MetadataBytes() const noexcept;
     void Clear() noexcept;
+    // Physical slots and their retained metadata capacity; neither is demand size.
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] std::size_t capacity() const noexcept { return entries_.capacity(); }
     [[nodiscard]] const Identity& identity() const noexcept { return identity_; }
-    [[nodiscard]] std::size_t Slot(std::size_t position) const noexcept { return entries_.empty() ? 0U : position % entries_.size(); }
-    [[nodiscard]] const Entry* Find(std::size_t position, std::uint32_t compiled_index) const noexcept;
+    [[nodiscard]] std::size_t Slot(std::size_t position) const noexcept { return demand_slots_[position - demand_first_]; }
+    [[nodiscard]] const Entry* Find(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] const Entry& Physical(std::size_t slot) const { return entries_.at(slot); }
-    void Restore(std::size_t slot, Entry entry) noexcept { entries_[slot] = std::move(entry); }
+    void Restore(std::size_t slot, Entry entry) noexcept;
     void Complete(std::size_t position, std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning>,
                   std::uint64_t semantic_identity, std::uint8_t bank = 0U, std::uint8_t semantic_bank = 0U);
     [[nodiscard]] std::size_t MeaningBytes(const GalleryThumbnailCache* other = nullptr,
@@ -103,7 +112,22 @@ class GalleryThumbnailCache final {
 
    private:
     Identity identity_{};
+    static constexpr std::size_t absent = std::numeric_limits<std::size_t>::max();
+    [[nodiscard]] std::size_t Lookup(std::uint32_t) const noexcept;
+    [[nodiscard]] std::size_t Assign(std::uint32_t);
+    void Reindex();
+    void Save(std::size_t);
+    void Erase(std::size_t) noexcept;
     std::vector<Entry> entries_;
+    std::vector<std::size_t> buckets_, next_, demand_slots_;
+    std::vector<bool> pinned_;
+    std::size_t demand_first_ = 0U;
+    std::size_t eviction_ = 0U;
+    struct Undo final { std::size_t slot; Entry entry; };
+    std::vector<Undo> undo_;
+    std::vector<std::size_t> undo_indices_, prior_demand_;
+    std::size_t prior_first_ = 0U;
+    bool updating_ = false;
 };
 
 }  // namespace mmltk::controller::explore_detail

@@ -60,6 +60,9 @@ class NativeExploreAudit final {
    public:
     void Observe(controller::ExploreSystem::event_type event) noexcept {
         if (const auto* changed = std::get_if<controller::ExploreChanged>(&event); changed && changed->snapshot.ready) {
+            if (require_retained_ready_.load(std::memory_order_acquire) && changed->snapshot.mode == controller::ExploreMode::Gallery &&
+                std::ranges::any_of(changed->snapshot.gallery.slots, [](const bool ready) { return !ready; }))
+                lost_retained_ready_.store(true, std::memory_order_release);
             const auto frame_revision = changed->snapshot.frame.revision;
             std::uint64_t unset = 0U;
             static_cast<void>(first_ready_frame_.compare_exchange_strong(unset, frame_revision));
@@ -91,7 +94,9 @@ class NativeExploreAudit final {
                 [](void* context, const controller::VisualDiagnosticFact fact) noexcept {
                     auto& audit = *static_cast<NativeExploreAudit*>(context);
                     const auto sequence = audit.sequence_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
-                    if (fact.operation == controller::VisualDiagnosticOperation::PlaceholderPublished) {
+                    if (fact.operation == controller::VisualDiagnosticOperation::GalleryReadScheduled) {
+                        audit.read_admissions_.fetch_add(1U, std::memory_order_acq_rel);
+                    } else if (fact.operation == controller::VisualDiagnosticOperation::PlaceholderPublished) {
                         audit.placeholder_.Observe(sequence, fact);
                     } else if (fact.operation == controller::VisualDiagnosticOperation::ExplorePrefetchReady) {
                         if (fact.value < 64U)
@@ -159,6 +164,9 @@ class NativeExploreAudit final {
         }
     }  // CLEANUP-IGNORE: The wait terminator and independent scalar observation getters are not a repeated operation.
 
+    void RequireRetainedReady(const bool enabled) noexcept { require_retained_ready_.store(enabled, std::memory_order_release); }
+    [[nodiscard]] bool LostRetainedReady() const noexcept { return lost_retained_ready_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint64_t ReadAdmissions() const noexcept { return read_admissions_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t first_ready_frame() const noexcept { return first_ready_frame_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_ready_frame() const noexcept { return last_ready_frame_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t placeholder_count() const noexcept { return placeholder_.count.load(std::memory_order_acquire); }
@@ -257,6 +265,9 @@ class NativeExploreAudit final {
     std::optional<controller::ExploreSnapshot> pending_snapshot_;
     std::uint64_t wake_revision_ = 0U;
     std::atomic_uint64_t sequence_{0U};
+    std::atomic_uint64_t read_admissions_{0U};
+    std::atomic_bool require_retained_ready_{false};
+    std::atomic_bool lost_retained_ready_{false};
     std::atomic_uint64_t reused_tiles_{0U};
     std::atomic_uint64_t prefetched_indices_{0U};
     std::atomic_uint64_t first_ready_frame_{0U};
@@ -478,7 +489,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{0U, 1U});
     CHECK(system.snapshot().gallery.generation != 0U);
     CHECK(system.snapshot().gallery.slots == std::vector<bool>{true, true});
-    REQUIRE(audit.Wait([&] { return audit.prefetched_indices() == ((1U << 2U) | (1U << 3U)); }));
+    REQUIRE(audit.Wait([&] { return (audit.prefetched_indices() & ((1U << 2U) | (1U << 3U))) == ((1U << 2U) | (1U << 3U)); }));
     { check_published_frame(system); }
 
     const auto enlarged_placeholders = audit.placeholder_count();
@@ -497,6 +508,25 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const auto restore_tiles = audit.tile_count();
     system.UpdateViewport({.viewport = first_view});
     wait_for_native_gallery(audit, system, restore_placeholders, restore_tiles);
+
+    // Materialize all twelve fixture images, then challenge every published
+    // readiness set during five/six/five row oscillation at unchanged extent.
+    const auto warm_placeholders = audit.placeholder_count();
+    const auto warm_tiles = audit.tile_count();
+    system.UpdateViewport({.viewport = {.extent = {64U, 192U}, .row_count = 6U, .columns = 2U}});
+    wait_for_native_gallery(audit, system, warm_placeholders, warm_tiles, 12U);
+    const auto warm_reads = audit.ReadAdmissions();
+    audit.RequireRetainedReady(true);
+    for (const auto rows : {5U, 6U, 5U}) {
+        const auto previous_placeholders = audit.placeholder_count();
+        const auto previous_tiles = audit.tile_count();
+        system.UpdateViewport({.viewport = {.extent = {64U, rows * 32U}, .row_count = rows, .columns = 2U}});
+        wait_for_native_gallery(audit, system, previous_placeholders, previous_tiles, rows * 2U);
+        CHECK_FALSE(audit.LostRetainedReady());
+        CHECK(audit.ReadAdmissions() == warm_reads);
+        check_published_frame(system);
+    }
+    audit.RequireRetainedReady(false);
 
     auto placeholder_count = audit.placeholder_count();
     auto tile_count = audit.tile_count();

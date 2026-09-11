@@ -37,6 +37,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -75,42 +76,75 @@ using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
 
-TEST_CASE("Gallery row rings retain exact filtered positions through forward reverse and boundary windows", "[explore][cache]") {
+TEST_CASE("Gallery demand clips four neighboring rows independently", "[explore][cache]") {
     using explore_detail::GalleryThumbnailCache;
     const auto columns = GENERATE(4U, 10U);
     ExploreViewport viewport{.extent = {columns * 32U, 96U}, .first_row = 17U, .row_count = 3U, .columns = columns};
-    const auto count = GalleryThumbnailCache::CardCount(1000U, viewport.row_count, columns);
-    CHECK(count == 17U * columns);
-    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == 10U * columns);
-    GalleryThumbnailCache cache;
-    const GalleryThumbnailCache::Identity identity{.dataset = 19U, .seed = 23U, .extent = 32U};
-    cache.Configure(count, identity);
-    auto meaning = std::make_shared<const explore_detail::GalleryTileMeaning>();
-    const std::uint64_t overlay = 1U;
-    const auto initial = GalleryThumbnailCache::WindowFirst(1000U, viewport);
-    for (auto position = initial; position < initial + count; ++position)
-        cache.Complete(position, static_cast<std::uint32_t>(position + 100U), meaning, overlay);
-    for (const auto row : {18U, 19U, 18U, 17U, 16U}) {
-        viewport.first_row = row;
-        const auto first = GalleryThumbnailCache::WindowFirst(1000U, viewport);
-        cache.Configure(count, identity);
-        for (auto position = std::max(initial, first); position < std::min(initial + count, first + count); ++position) {
-            REQUIRE(cache.Find(position, static_cast<std::uint32_t>(position + 100U)));
-            CHECK(cache.Find(position, static_cast<std::uint32_t>(position + 100U))->meaning == meaning);
-        }
-    }
-    CHECK_FALSE(cache.Find(initial + count, static_cast<std::uint32_t>(initial + 100U)));
-    CHECK_FALSE(cache.Find(initial, static_cast<std::uint32_t>(initial + 101U)));
-    cache.Complete(initial + count, 77U, meaning, overlay);
-    CHECK_FALSE(cache.Find(initial, static_cast<std::uint32_t>(initial + 100U)));
-    REQUIRE(cache.Find(initial + count, 77U));
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == 13U * columns);
+    CHECK(GalleryThumbnailCache::WindowCount(1000U, viewport) == 11U * columns);
     viewport.first_row = 0U;
     CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == 0U);
-    viewport.first_row = 999U;
-    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) + count == 1000U);
-    CHECK(GalleryThumbnailCache::CardCount(0U, 3U, columns) == 0U);
-    CHECK(GalleryThumbnailCache::WindowFirst(0U, viewport) == 0U);
-    CHECK(GalleryThumbnailCache::CardCount(columns + 1U, 3U, columns) == columns + 1U);
+    CHECK(GalleryThumbnailCache::WindowCount(1000U, viewport) == 7U * columns);
+    viewport.first_row = 999U / columns;
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) == (viewport.first_row - 4U) * columns);
+    CHECK(GalleryThumbnailCache::WindowFirst(1000U, viewport) + GalleryThumbnailCache::WindowCount(1000U, viewport) == 1000U);
+    CHECK(GalleryThumbnailCache::WindowCount(0U, viewport) == 0U);
+    viewport.first_row = 0U;
+    CHECK(GalleryThumbnailCache::WindowCount(columns + 1U, viewport) == columns + 1U);
+}
+
+TEST_CASE("Gallery cache identity survives five six five demand and reorder with bounded collision rollback", "[explore][cache]") {
+    using explore_detail::GalleryThumbnailCache;
+    GalleryThumbnailCache cache;
+    const GalleryThumbnailCache::Identity identity{.dataset = 19U, .seed = 23U, .extent = 32U};
+    cache.Configure(14U, identity);
+    const auto capacity = cache.capacity();
+    auto meaning = std::make_shared<const explore_detail::GalleryTileMeaning>();
+    std::array<std::uint32_t, 14U> images{};
+    std::iota(images.begin(), images.end(), 0U);
+    cache.Admit(std::span{images}.first(13U), 0U);
+    for (auto image : std::span{images}.first(13U)) cache.Complete(image, image, meaning, 1U, 1U, 0U);
+    const auto original_slot = cache.Slot(4U);
+    for (const auto rows : {6U, 5U, 6U, 5U}) {
+        cache.Configure(rows + 8U, identity);
+        cache.BeginUpdate();
+        cache.Admit(std::span{images}.first(rows + 8U), 0U);
+        REQUIRE(cache.Find(4U));
+        CHECK(cache.Find(4U)->bank == 1U);
+        CHECK(cache.Find(4U)->meaning == meaning);
+        CHECK(cache.Slot(4U) == original_slot);
+        cache.CommitUpdate();
+        CHECK(cache.capacity() == capacity);
+        CHECK(cache.size() == 14U);
+    }
+    std::ranges::reverse(images);
+    cache.BeginUpdate();
+    cache.Admit(images, 100U);
+    REQUIRE(cache.Find(4U));
+    CHECK(cache.Slot(109U) == original_slot);
+    CHECK(cache.Position(4U) == 109U);
+    cache.RollbackUpdate();
+    CHECK(cache.Position(4U) == 4U);
+    CHECK(cache.Slot(4U) == original_slot);
+
+    // Every hash bucket collides. All incumbent slots are needed on rollback,
+    // while the candidate pins a disjoint replacement demand.
+    for (std::size_t index = 0U; index < images.size(); ++index) images[index] = static_cast<std::uint32_t>((index + 1U) * 29U);
+    cache.BeginUpdate();
+    cache.Admit(images, 50U);
+    for (std::size_t index = 0U; index < images.size(); ++index) {
+        const auto slot = cache.Slot(50U + index);
+        const auto old = cache.Protected(slot);
+        cache.Complete(50U + index, images[index], meaning, 2U, static_cast<std::uint8_t>(1U - old.bank));
+        CHECK(cache.Protected(slot).compiled_index == old.compiled_index);
+        REQUIRE(cache.Find(images[index]));
+    }
+    cache.RollbackUpdate();
+    for (std::uint32_t image = 0U; image < 13U; ++image) {
+        REQUIRE(cache.Find(image));
+        CHECK(cache.Find(image)->semantic_identity == 1U);
+        CHECK(cache.Find(image)->bank == 1U);
+    }
 }
 
 TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and content identity", "[explore][cache]") {
@@ -126,12 +160,12 @@ TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and c
     const auto bytes = incumbent.cache.MeaningBytes();
     auto candidate = incumbent;
     candidate.cache.Complete(4U, 7U, meaning, 2U, 1U);
-    REQUIRE(candidate.cache.Find(4U, 7U));
-    CHECK(candidate.cache.Find(4U, 7U)->meaning == incumbent.cache.Find(4U, 7U)->meaning);
-    CHECK(candidate.cache.Find(4U, 7U)->bank == 1U);
-    CHECK(incumbent.cache.Find(4U, 7U)->bank == 0U);
-    CHECK(candidate.cache.Find(4U, 7U)->semantic_identity != incumbent.cache.Find(4U, 7U)->semantic_identity);
-    CHECK(candidate.cache.MeaningBytes() == bytes);
+    REQUIRE(candidate.cache.Find(7U));
+    CHECK(candidate.cache.Find(7U)->meaning == incumbent.cache.Find(7U)->meaning);
+    CHECK(candidate.cache.Find(7U)->bank == 1U);
+    CHECK(incumbent.cache.Find(7U)->bank == 0U);
+    CHECK(candidate.cache.Find(7U)->semantic_identity != incumbent.cache.Find(7U)->semantic_identity);
+    CHECK(candidate.cache.MeaningBytes() - candidate.cache.MetadataBytes() == bytes - incumbent.cache.MetadataBytes());
 
     SECTION("Changing the loaded artifact invalidates even when stable seed identity is unchanged") {
         // Only identity comparison is exercised; the cache never dereferences
@@ -140,16 +174,18 @@ TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and c
     }
     SECTION("Changing augmentation seed invalidates clean pixels") { ++identity.seed; }
     SECTION("Changing augmentation policy invalidates clean pixels") { identity.augmented = true; }
+    SECTION("Changing augmentation configuration invalidates clean pixels") { identity.augmentation.enabled = true; }
+    SECTION("Changing dataset identity invalidates clean pixels") { ++identity.dataset; }
     SECTION("Changing thumbnail extent invalidates clean pixels") { ++identity.extent; }
     candidate.cache.Configure(20U, identity);
-    CHECK_FALSE(candidate.cache.Find(4U, 7U));
-    REQUIRE(incumbent.cache.Find(4U, 7U));
-    CHECK(incumbent.cache.Find(4U, 7U)->meaning->runs.front().start == 5U);
+    CHECK_FALSE(candidate.cache.Find(7U));
+    REQUIRE(incumbent.cache.Find(7U));
+    CHECK(incumbent.cache.Find(7U)->meaning->runs.front().start == 5U);
     const auto capacity = candidate.Capacity();
     candidate.Clear();
     CHECK(candidate.Size() == 0U);
     CHECK(candidate.Capacity() == capacity);
-    REQUIRE(incumbent.cache.Find(4U, 7U));
+    REQUIRE(incumbent.cache.Find(7U));
 }
 
 TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions", "[explore][cache]") {
@@ -161,7 +197,7 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
     const std::uint64_t key = 1U;
     cache.Complete(0U, 0U, meaning, key);
     cache.Complete(1U, 1U, meaning, key);
-    const auto expected = cache.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry) +
+    const auto expected = cache.MetadataBytes() +
                           explore_detail::GallerySharedBytes(meaning) +
                           meaning->annotations.capacity() * sizeof(decltype(meaning->annotations)::value_type) +
                           meaning->runs.capacity() * sizeof(decltype(meaning->runs)::value_type);
@@ -171,11 +207,11 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
     CHECK(cache.MeaningBytes() == expected);
     auto candidate = cache;
     const auto incumbent_bytes = cache.MeaningBytes();
-    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry));
+    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes());
     auto replacement = explore_detail::MakeGalleryShared<explore_detail::GalleryTileMeaning>();
     replacement->runs.reserve(11U);
     candidate.Complete(20U, 20U, replacement, other, 1U, 1U);
-    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.capacity() * sizeof(explore_detail::GalleryThumbnailCache::Entry) +
+    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes() +
                                                 explore_detail::GallerySharedBytes(replacement) +
                                                 replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
 }
@@ -540,6 +576,7 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
     std::size_t callback_completions = 0U;
     std::size_t quiescences = 0U;
     std::size_t aborted_assignments = 0U;
+    ExploreScrollDirection scroll_direction = ExploreScrollDirection::Forward;
     bool fail_next_render = false;
     bool fail_next_labels = false;
     bool fail_rollback = false;
@@ -784,6 +821,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     using PublicationCheckpoint = StreamingExplorePublicationState;
 
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
+        probe_->scroll_direction = plan.scroll_direction;
         probe_->priority_slots.clear();
         if (plan.focused_image) {
             const auto focused = std::ranges::find(probe_->visible, *plan.focused_image);
@@ -2754,6 +2792,25 @@ TEST_CASE("Explore publishes placeholders before loaders and patches released la
     CHECK(explore.snapshot().gallery.slots == before_focus.gallery.slots);
     std::scoped_lock lock(probe->mutex);
     CHECK(probe->lane_preparations == 2U);
+}
+
+TEST_CASE("Explore owns direction across accepted logical rows and zero-movement updates", "[explore][priority]") {
+    StreamingExploreFixture scenario{2U};
+    auto& explore = scenario.system();
+    scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    const auto check = [&](const std::uint32_t row, const ExploreScrollDirection direction) {
+        const auto before = explore.snapshot().revision;
+        explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = row, .row_count = 1U, .columns = 2U}});
+        REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before; }));
+        std::scoped_lock lock(scenario.probe().mutex);
+        CHECK(scenario.probe().scroll_direction == direction);
+    };
+    check(1U, ExploreScrollDirection::Forward);
+    check(2U, ExploreScrollDirection::Forward);
+    check(1U, ExploreScrollDirection::Backward);
+    check(1U, ExploreScrollDirection::Backward);
+    check(0U, ExploreScrollDirection::Backward);
+    check(2U, ExploreScrollDirection::Forward);
 }
 
 TEST_CASE("Explore batches ready lanes and stale viewport completions cannot publish") {
