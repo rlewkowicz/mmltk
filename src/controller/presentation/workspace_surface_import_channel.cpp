@@ -289,8 +289,11 @@ struct WorkspaceSurfaceImportChannel::Impl {
             return false;
         }
         seen.push_back(id);
-        admitted.emplace_back(id, Admission{.generation = generation, .selection_generation = selection_generation,
-                                            .frame_revision = frame_revision, .width = record.width, .height = record.height,
+        admitted.emplace_back(id, Admission{.generation = generation,
+                                            .selection_generation = selection_generation,
+                                            .frame_revision = frame_revision,
+                                            .width = record.width,
+                                            .height = record.height,
                                             .arena = record.opcode == Opcode::Arena});
         EmitAdmission(record, VisualDiagnosticOperation::PresentationAdmissionEnqueued);
         if (send(record, descriptors)) return true;
@@ -327,9 +330,10 @@ struct WorkspaceSurfaceImportChannel::Impl {
             const auto& admission = found->second;
             return VisualDiagnosticFact{
                 .system = contracts::DiagnosticOwner::Presentation,
-                .operation = admission.arena ? operation :
-                    (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued ?
-                         VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
+                .operation = admission.arena ? operation
+                                             : (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued
+                                                    ? VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued
+                                                    : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
                 .generation = admission.generation,
                 .context = {.capacity_width = admission.width,
                             .capacity_height = admission.height,
@@ -668,11 +672,12 @@ void WorkspaceSurfaceImportChannel::reset_peer() noexcept {
 bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId id, const std::uint64_t generation,
                                                 const std::uint32_t width, const std::uint32_t height,
                                                 const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
-    return connected() && impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low,
-                                             .width = width, .height = height}, generation, {}, selection_generation, frame_revision);
+    return connected() &&
+           impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low, .width = width, .height = height}, generation,
+                        {}, selection_generation, frame_revision);
 }
-bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, ScopedFd descriptor,
-                                                 const int frame_edge, const int frame_signal, const std::uint64_t selection_generation,
+bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, ScopedFd descriptor, const int frame_edge,
+                                                 const int frame_signal, const std::uint64_t selection_generation,
                                                  const std::uint64_t frame_revision) {
     if (!connected() || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0) return false;
     record.opcode = Opcode::Import;
@@ -684,9 +689,16 @@ bool WorkspaceSurfaceImportChannel::copy_completed(const WorkspaceSurfaceImportI
     if (!connected() || !claimable(id) || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
     const auto admission = impl_->find_admission(id);
     if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) ||
-        Impl::contains(impl_->withdrawn, id)) return false;
-    return impl_->send(Record{.opcode = Opcode::CopyCompleted, .id_high = id.high, .id_low = id.low,
-                             .stride = content.session, .size = content.sequence, .presentation_revision = revision, .offset = transfer_sequence}, {});
+        Impl::contains(impl_->withdrawn, id))
+        return false;
+    return impl_->send(Record{.opcode = Opcode::CopyCompleted,
+                              .id_high = id.high,
+                              .id_low = id.low,
+                              .stride = content.session,
+                              .size = content.sequence,
+                              .presentation_revision = revision,
+                              .offset = transfer_sequence},
+                       {});
 }
 
 WorkspaceSurfaceWithdrawal WorkspaceSurfaceImportChannel::withdraw(const WorkspaceSurfaceImportId id) {

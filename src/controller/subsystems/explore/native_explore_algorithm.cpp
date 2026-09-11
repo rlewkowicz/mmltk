@@ -128,7 +128,10 @@ class ExploreAcceptanceGate::Impl final {
         frontend_command_ = std::move(retained);
     }
 
-    std::uint64_t FrontendSequence() noexcept { std::scoped_lock lock(mutex_); return frontend_sequence_; }
+    std::uint64_t FrontendSequence() noexcept {
+        std::scoped_lock lock(mutex_);
+        return frontend_sequence_;
+    }
     void SetCompletionCommand(std::function<bool(ControlCommand)> callback) {
         auto retained = callback ? std::make_shared<const std::function<bool(ControlCommand)>>(std::move(callback)) : nullptr;
         std::scoped_lock lock(mutex_);
@@ -152,18 +155,20 @@ class ExploreAcceptanceGate::Impl final {
                 // Another demand can request this same image while the original
                 // read is held. It must not bypass the exact image gate.
                 frontend = {};
-            } else if (!visible_armed_) return;
-            else frontend = frontend_command_;
+            } else if (!visible_armed_)
+                return;
+            else
+                frontend = frontend_command_;
             visible_armed_ = false;
             visible_held_ = true;
             if (frontend) visible_generation_ = generation;
             sequence = frontend_sequence_;
         }
-        const ControlObservation observation{.event = ControlEvent::VisibleReadHeld,
-            .generation = generation, .compiled_index = index};
-        if (frontend && (!SendControlObservation(observation) || !(*frontend)({
-            .kind = contracts::IntegrationControlKind::VisibleReadHeld, .sequence = sequence,
-            .read_generation = generation, .compiled_index = index}))) {
+        const ControlObservation observation{.event = ControlEvent::VisibleReadHeld, .generation = generation, .compiled_index = index};
+        if (frontend && (!SendControlObservation(observation) || !(*frontend)({.kind = contracts::IntegrationControlKind::VisibleReadHeld,
+                                                                               .sequence = sequence,
+                                                                               .read_generation = generation,
+                                                                               .compiled_index = index}))) {
             Terminal();
             return;
         }
@@ -178,7 +183,8 @@ class ExploreAcceptanceGate::Impl final {
     [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
         std::scoped_lock lock(mutex_);
         using Kind = contracts::IntegrationControlKind;
-        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ || contracts::integration_server_command(receipt.kind))
+        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ ||
+            contracts::integration_server_command(receipt.kind))
             return false;
         if (!contracts::integration_receipt_valid(receipt)) return false;
         if (receipt.kind == Kind::CapacityArmRequested && std::exchange(capacity_requested_, true)) return false;
@@ -187,8 +193,10 @@ class ExploreAcceptanceGate::Impl final {
             visible_requested_ = true;
             visible_index_ = receipt.compiled_index;
         }
-        if (receipt.kind == Kind::VisibleReadReleaseRequested && (!visible_held_ || visible_released_ ||
-            receipt.read_generation != visible_generation_ || receipt.compiled_index != visible_index_ || std::exchange(visible_release_requested_, true))) return false;
+        if (receipt.kind == Kind::VisibleReadReleaseRequested &&
+            (!visible_held_ || visible_released_ || receipt.read_generation != visible_generation_ ||
+             receipt.compiled_index != visible_index_ || std::exchange(visible_release_requested_, true)))
+            return false;
         if (receipt.kind == Kind::Progress) {
             if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;
             frontend_progress_ = receipt.progress;
@@ -262,23 +270,25 @@ class ExploreAcceptanceGate::Impl final {
                     if (current_generation_ == 0U || initial_released_generation_ != current_generation_) release_one_ = true;
                 } else if (command == 2U) {
                     release_all_ = true;
-                } else if (command == static_cast<std::uint8_t>(ControlCommand::ArmVisibleRead) &&
-                           visible_requested_ && !visible_armed_ && !visible_held_ && frontend_command_) {
+                } else if (command == static_cast<std::uint8_t>(ControlCommand::ArmVisibleRead) && visible_requested_ && !visible_armed_ &&
+                           !visible_held_ && frontend_command_) {
                     visible_armed_ = true;
                     visible_released_ = false;
                     callback = frontend_command_;
                     sequence = frontend_sequence_;
                     frontend_kind = contracts::IntegrationControlKind::VisibleReadArmed;
-                } else if (command == static_cast<std::uint8_t>(ControlCommand::ReleaseVisibleRead) && visible_held_ && !visible_released_ && visible_release_requested_) {
+                } else if (command == static_cast<std::uint8_t>(ControlCommand::ReleaseVisibleRead) && visible_held_ &&
+                           !visible_released_ && visible_release_requested_) {
                     visible_released_ = true;
                 } else if (command == 4U) {
                     release_held_ = true;
                 } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) ||
                             command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
-                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseSample)) && completion_command_) {
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseSample)) &&
+                           completion_command_) {
                     completion = completion_command_;
-                } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ &&
-                           initial_released_generation_ == 0U && redraw_command_) {
+                } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U &&
+                           redraw_command_) {
                     redraw_claimed_ = true;
                     redraw = redraw_command_;
                 } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ &&
@@ -305,8 +315,9 @@ class ExploreAcceptanceGate::Impl final {
             }
             if (redraw || callback || completion) {
                 try {
-                    const bool accepted =
-                        completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence});
+                    const bool accepted = completion ? (*completion)(static_cast<ControlCommand>(command))
+                                          : redraw   ? (*redraw)()
+                                                     : (*callback)({.kind = frontend_kind, .sequence = sequence});
                     if (accepted) continue;
                 } catch (...) {}
                 Terminal();
@@ -676,11 +687,17 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             &dataset->store, std::span{order}.subspan(first, count));
     }
 
-    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override { gallery_.PrepareDetailOutput(allocation); }
-    void PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) override { gallery_.PrepareOutputPublication(change, mode); }
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override {
+        gallery_.PrepareDetailOutput(allocation);
+    }
+    void PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) override {
+        gallery_.PrepareOutputPublication(change, mode);
+    }
     void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
     mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-        const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) override { return gallery_.WorkspaceCoverage(output); }
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) override {
+        return gallery_.WorkspaceCoverage(output);
+    }
     [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
 
     [[nodiscard]] ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate,

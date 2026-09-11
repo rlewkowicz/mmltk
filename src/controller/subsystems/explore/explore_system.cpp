@@ -154,6 +154,7 @@ std::size_t normalize_explore_parallelism(const std::size_t requested, const mml
 
 class ExploreSystem::Impl final {
     friend class ExploreSystem;
+
    public:
     Impl(SettingsSystem& settings_system, const VisualDeviceSettings settings, const std::size_t nproc, VisualRuntimeFactory factory,
          SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
@@ -511,12 +512,14 @@ class ExploreSystem::Impl final {
     }
 
     [[nodiscard]] ExploreSnapshot Select(const ExploreSelect request) {
-        return QueueDesired([&](ExploreSnapshot& desired) {
-            if (std::ranges::find(desired.order.visible_indices, request.compiled_index) == desired.order.visible_indices.end())
-                throw contracts::InvalidIntentError("Explore selection is outside the visible filtered order");
-            desired.selected_image = request.compiled_index;
-            desired.mode = ExploreMode::Detail;
-        }, 0, false, false, false, true);
+        return QueueDesired(
+            [&](ExploreSnapshot& desired) {
+                if (std::ranges::find(desired.order.visible_indices, request.compiled_index) == desired.order.visible_indices.end())
+                    throw contracts::InvalidIntentError("Explore selection is outside the visible filtered order");
+                desired.selected_image = request.compiled_index;
+                desired.mode = ExploreMode::Detail;
+            },
+            0, false, false, false, true);
     }
 
     [[nodiscard]] ExploreSnapshot Navigate(const ExploreNavigate request) {
@@ -642,8 +645,7 @@ class ExploreSystem::Impl final {
     // Called with mutex_ held: demand generations may stay unchanged for
     // focus-only input, so the accepted request ticket remains authoritative.
     [[nodiscard]] bool CurrentDesired(const DesiredRequest& request) const noexcept {
-        return desired_ && desired_->ticket == request.ticket &&
-               request.generation == latest_generation_->load(std::memory_order_acquire);
+        return desired_ && desired_->ticket == request.ticket && request.generation == latest_generation_->load(std::memory_order_acquire);
     }
 
     template <class Install>
@@ -665,8 +667,8 @@ class ExploreSystem::Impl final {
         const auto previous_selection = request->snapshot.selected_image;
         install(request->snapshot);
         if (viewport_update && request->snapshot.viewport.first_row != previous_viewport.first_row)
-            scroll_direction_ = request->snapshot.viewport.first_row > previous_viewport.first_row
-                                    ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
+            scroll_direction_ = request->snapshot.viewport.first_row > previous_viewport.first_row ? ExploreScrollDirection::Forward
+                                                                                                   : ExploreScrollDirection::Backward;
         if (persist || check_settings) {
             request->settings = settings_system_.explore_settings_candidate();
             if (check_settings) request->augmentation_config = request->settings->augmentation;
@@ -677,7 +679,8 @@ class ExploreSystem::Impl final {
         request->navigation = (request->navigation + navigation) % count;
         request->generation = viewport_update && previous_viewport == request->snapshot.viewport && active_gallery_generation_ != 0U &&
                                       latest_generation_->load(std::memory_order_acquire) != 0U
-                                  ? latest_generation_->load(std::memory_order_acquire) : NextGeneration();
+                                  ? latest_generation_->load(std::memory_order_acquire)
+                                  : NextGeneration();
         request->ticket = desired_work_sequence_ = mmltk::common::types::advance_monotonic_identity(desired_work_sequence_);
         request->direction = scroll_direction_;
         worker_.SetOutputRetry(false);
@@ -758,7 +761,7 @@ class ExploreSystem::Impl final {
     }
 
     [[nodiscard]] detail::VisualRuntimeOwner::Notification RunDesired(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                                       std::stop_token stop) {
+                                                                      std::stop_token stop) {
         std::shared_ptr<DesiredRequest> request;
         ExploreSnapshot requested;
         ExploreRenderPlan plan;
@@ -784,13 +787,11 @@ class ExploreSystem::Impl final {
         auto& algorithm = explore_algorithm(runtime);
         try {
             auto order = algorithm.Visible(plan.viewport);
-            if (plan.focused_image &&
-                std::ranges::find(order.visible_indices, *plan.focused_image) == order.visible_indices.end()) {
+            if (plan.focused_image && std::ranges::find(order.visible_indices, *plan.focused_image) == order.visible_indices.end()) {
                 plan.focused_image.reset();
                 requested.focused_image.reset();
                 std::scoped_lock lock(mutex_);
-                if (CurrentDesired(*request))
-                    request->snapshot.focused_image.reset();
+                if (CurrentDesired(*request)) request->snapshot.focused_image.reset();
             }
             if (offset != 0 && requested.selected_image) {
                 const auto selected = algorithm.Adjacent(*requested.selected_image, offset);
@@ -946,11 +947,10 @@ class ExploreSystem::Impl final {
         return notification;
     }
 
-    [[nodiscard]] std::optional<PreparedProduct> Render(mmltk::frameworks::gpu::SystemImageRuntime& runtime, ExploreAlgorithm& algorithm,
-                                                        ExploreRenderPlan& plan, const std::uint64_t generation,
-                                                        const ExploreOrderCandidate* candidate = nullptr, const std::stop_token stop = {},
-                                                        const bool new_artifact = false,
-                                                        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput* pending_baseline = nullptr) {
+    [[nodiscard]] std::optional<PreparedProduct> Render(
+        mmltk::frameworks::gpu::SystemImageRuntime& runtime, ExploreAlgorithm& algorithm, ExploreRenderPlan& plan,
+        const std::uint64_t generation, const ExploreOrderCandidate* candidate = nullptr, const std::stop_token stop = {},
+        const bool new_artifact = false, mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput* pending_baseline = nullptr) {
         if (stop.stop_possible() && stop.stop_requested()) return std::nullopt;
         // This worker is the sole issuer. Demand and presentation changes do
         // not invalidate native semantics, and failed candidates cannot recycle
@@ -1002,8 +1002,7 @@ class ExploreSystem::Impl final {
                 publication = algorithm.BeginGallery(plan, candidate, nproc, {}, {}, 0U);
             else
                 algorithm.RenderDetail(plan, nproc, {}, {}, 0U);
-            if (plan.mode == ExploreMode::Gallery && prior.output.valid())
-                publication.ready_slots = prior.gallery.slots;
+            if (plan.mode == ExploreMode::Gallery && prior.output.valid()) publication.ready_slots = prior.gallery.slots;
         } else {
             mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput empty_baseline;
             auto& baseline = pending_baseline ? *pending_baseline : empty_baseline;
@@ -1013,17 +1012,15 @@ class ExploreSystem::Impl final {
             }
             worker_.SetOutputRetry(true);
             output = reserved_output_.valid() ? std::move(reserved_output_) : runtime.TryAcquireOutput(baseline);
-            if (!output.valid()) {
-                return std::nullopt;
-            }
+            if (!output.valid()) { return std::nullopt; }
             worker_.SetOutputRetry(false);
             algorithm.PrepareOutputPublication(change, plan.mode);
             const auto submit = [&](const auto clean, const auto semantic, const auto stream) {
-                                if (plan.mode == ExploreMode::Gallery)
-                                    publication = algorithm.BeginGallery(plan, candidate, nproc, clean, semantic, stream);
-                                else
-                                    algorithm.RenderDetail(plan, nproc, clean, semantic, stream);
-                            };
+                if (plan.mode == ExploreMode::Gallery)
+                    publication = algorithm.BeginGallery(plan, candidate, nproc, clean, semantic, stream);
+                else
+                    algorithm.RenderDetail(plan, nproc, clean, semantic, stream);
+            };
             if (plan.mode == ExploreMode::Gallery)
                 runtime.PublishRetained(output, product_extent.width, product_extent.height, submit);
             else {
@@ -1039,7 +1036,8 @@ class ExploreSystem::Impl final {
         const auto revision = retained.valid() ? retained.revision() : output.revision();
         const auto& prior = plan.mode == ExploreMode::Gallery ? retained_gallery_ : retained_detail_;
         const auto clean_revision = retained.valid() && prior.output.valid() ? prior.frame.clean_revision
-                                    : clean_changed ? revision : previous_clean_revision;
+                                    : clean_changed                          ? revision
+                                                                             : previous_clean_revision;
         auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, product_extent, revision);
         frame.content = plan.mode == ExploreMode::Detail ? algorithm.DetailContent(plan) : VisualRegion{};
         frame.clean_revision = clean_revision;
@@ -1047,9 +1045,10 @@ class ExploreSystem::Impl final {
             .output = std::move(output),
             .retained = std::move(retained),
             .frame = frame,
-            .gallery = plan.mode == ExploreMode::Gallery
-                           ? ExploreGalleryReadiness{.generation = publication.generation, .layout = publication.layout, .slots = publication.ready_slots}
-                           : ExploreGalleryReadiness{},
+            .gallery = plan.mode == ExploreMode::Gallery ? ExploreGalleryReadiness{.generation = publication.generation,
+                                                                                   .layout = publication.layout,
+                                                                                   .slots = publication.ready_slots}
+                                                         : ExploreGalleryReadiness{},
             .document = std::move(document),
             .labels = algorithm.Labels(),
         };
@@ -1225,26 +1224,27 @@ class ExploreSystem::Impl final {
                 worker_.SetOutputRetry(false);
                 algorithm.PrepareOutputPublication(ExploreOutputChange::Semantic);
                 try {
-                    runtime.PublishRetained(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
-                        services::RuntimeDiagnosticSpan compose_span{
-                            diagnostics_, [&] {
-                                return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
-                                                                   .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
-                                                                   .device = settings_.device,
-                                                                   .generation = generation,
-                                                                   .value = advanced.cumulative_tiles,
-                                                                   .context = {.capacity_width = extent.width,
-                                                                               .capacity_height = extent.height,
-                                                                               .staging_bytes = advanced.active_pinned_bytes,
-                                                                               .demand = {.demand_generation = generation}}},
-                                                                  VisualDiagnosticOperation::TileBatchComposeCompleted);
-                            }};
-                        published = algorithm.PublishGalleryTiles(clean, semantic, stream);
-                        compose_span.FinishWith([&](auto& fact) {
-                            fact.value = published.cumulative_tiles;
-                            fact.context.staging_bytes = published.active_pinned_bytes;
+                    runtime.PublishRetained(
+                        output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
+                            services::RuntimeDiagnosticSpan compose_span{
+                                diagnostics_, [&] {
+                                    return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
+                                                                       .operation = VisualDiagnosticOperation::TileBatchComposeStarted,
+                                                                       .device = settings_.device,
+                                                                       .generation = generation,
+                                                                       .value = advanced.cumulative_tiles,
+                                                                       .context = {.capacity_width = extent.width,
+                                                                                   .capacity_height = extent.height,
+                                                                                   .staging_bytes = advanced.active_pinned_bytes,
+                                                                                   .demand = {.demand_generation = generation}}},
+                                                                      VisualDiagnosticOperation::TileBatchComposeCompleted);
+                                }};
+                            published = algorithm.PublishGalleryTiles(clean, semantic, stream);
+                            compose_span.FinishWith([&](auto& fact) {
+                                fact.value = published.cumulative_tiles;
+                                fact.context.staging_bytes = published.active_pinned_bytes;
+                            });
                         });
-                    });
                     DiagnoseStorage(runtime, algorithm, generation);
                     auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, extent, output.revision());
                     PreparedProduct product{
@@ -1307,7 +1307,8 @@ class ExploreSystem::Impl final {
                                                 .device = settings_.device,
                                                 .detail = 22U};
                 });
-            }, true, detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
+            },
+            true, detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
     }
     void DiagnoseStorage(const mmltk::frameworks::gpu::SystemImageRuntime& runtime, const ExploreAlgorithm& algorithm,
                          const std::uint64_t generation) const noexcept {
@@ -1362,18 +1363,18 @@ class ExploreSystem::Impl final {
     [[nodiscard]] bool SubmitDiscrete(PendingDiscrete pending) {
         auto cancellation = pending.cancellation;
         const auto reconstruct = pending.reconstruct;
-        return worker_.SubmitDiscrete(
-            [this, pending = std::move(pending)](auto& runtime, auto stop) mutable {
-                return RunDiscrete(runtime, stop, std::move(pending));
-            }, std::move(cancellation), reconstruct);
+        return worker_.SubmitDiscrete([this, pending = std::move(pending)](
+                                          auto& runtime, auto stop) mutable { return RunDiscrete(runtime, stop, std::move(pending)); },
+                                      std::move(cancellation), reconstruct);
     }
     [[nodiscard]] ExploreSnapshot QueueAdmitted(detail::VisualRuntimeOwner::Work work, ExploreSnapshot prior, bool reconstruct = false) {
         PendingDiscrete pending{
             .work = std::move(work),
-            .cancellation = [this] {
-                auto publication = FinalizeQueuedCancellation();
-                if (publication) publication();
-            },
+            .cancellation =
+                [this] {
+                    auto publication = FinalizeQueuedCancellation();
+                    if (publication) publication();
+                },
             .reconstruct = reconstruct,
         };
         if (desired_) {
@@ -1385,8 +1386,7 @@ class ExploreSystem::Impl final {
         return state_;
     }
     [[nodiscard]] detail::VisualRuntimeOwner::Notification RunDiscrete(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                                        const std::stop_token stop,
-                                                                        PendingDiscrete pending) {
+                                                                       const std::stop_token stop, PendingDiscrete pending) {
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
         worker_.SetOutputRetry(true);
         reserved_output_ = runtime.TryAcquireOutput(baseline);
@@ -1439,9 +1439,12 @@ class ExploreSystem::Impl final {
         if (plan.mode != ExploreMode::Gallery) return algorithm.DetailExtent(plan);
         const auto side = explore_atlas_card_extent(plan.viewport);
         std::uint32_t maximum_height;
-        { std::scoped_lock lock(mutex_); maximum_height = state_.maximum_atlas_extent.height; }
-        const auto maximum = std::min(maximum_height / side,
-                                       static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns));
+        {
+            std::scoped_lock lock(mutex_);
+            maximum_height = state_.maximum_atlas_extent.height;
+        }
+        const auto maximum =
+            std::min(maximum_height / side, static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns));
         const auto rows = std::min(std::bit_ceil(plan.viewport.row_count), maximum);
         if (atlas_columns_ != plan.viewport.columns || atlas_side_ != side) atlas_rows_ = 0U;
         atlas_columns_ = plan.viewport.columns;

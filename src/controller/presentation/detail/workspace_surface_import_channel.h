@@ -25,8 +25,7 @@ struct WorkspaceFrameSignal;
 namespace workspace_surface_import = detail::workspace_surface_import;
 
 // Project immutable source-import provenance only inside an enabled diagnostic sink.
-[[nodiscard]] contracts::DiagnosticWorkspace workspace_source_diagnostic(
-    const workspace_surface_import::Record&) noexcept;
+[[nodiscard]] contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surface_import::Record&) noexcept;
 
 // The one identity an admitted allocation carries across the import boundary.
 // This random capability is deliberately unrelated to application generation,
@@ -183,9 +182,8 @@ class WorkspaceSurfaceImportChannel final {
     // the exact timeline copy authorized by that edge.
     [[nodiscard]] bool admit_arena(WorkspaceSurfaceImportId, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
                                    std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
-    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation,
-                                   mmltk::common::io::ScopedFd, int frame_edge, int frame_signal,
-                                   std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, mmltk::common::io::ScopedFd, int frame_edge,
+                                    int frame_signal, std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
     [[nodiscard]] bool copy_completed(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
                                       std::uint64_t transfer_sequence);
     // Transfers one exact withdrawal ticket. Capacity retains the ticket in the

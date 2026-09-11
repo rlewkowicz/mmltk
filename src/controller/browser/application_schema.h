@@ -837,15 +837,13 @@ void append_value(FingerprintSink& sink, const Value& value) {
 template <class Kind>
     requires std::is_enum_v<Kind>
 void append_integration_command_policy(FingerprintSink& sink) {
-    constexpr auto enumerators = std::define_static_array(std::meta::enumerators_of(^^Kind));
     sink.append("integration-command-policy");
-    sink.append_number(enumerators.size());
-    template for (constexpr auto enumerator : enumerators) {
-        constexpr auto kind = std::meta::extract<Kind>(enumerator);
-        sink.append(std::meta::identifier_of(enumerator));
-        append_value(sink, kind);
-        append_value(sink, mmltk::controller::contracts::integration_command_direction<kind>());
-    }
+    sink.append_number(mmltk::frameworks::reflection::kReflectedEnumEntries<Kind>.size());
+    mmltk::controller::contracts::visit_integration_commands<Kind>([&]<auto Value, auto Policy>(const auto name) {
+        sink.append(name);
+        append_value(sink, Value);
+        append_value(sink, Policy);
+    });
 }
 
 inline void append_wire_value(FingerprintSink& sink, const mmltk::frameworks::serialization::wire::Value& value) {
@@ -1273,9 +1271,10 @@ struct ApplicationSchema final {
                         { system.BorrowWorkspace() } -> std::same_as<mmltk::frameworks::gpu::BorrowedImageWorkspace>;
                         { system.ObserveWorkspace() } -> std::same_as<mmltk::frameworks::gpu::ImageWorkspaceObservation>;
                     }, "visual producer must expose borrowed-product access");
-                static_assert(requires(System& system, VisualWorkspaceRequest request) {
-                    { system.RequestWorkspace(std::move(request)) } -> std::same_as<void>;
-                }, "visual producer must service workspace requests on its owner");
+                static_assert(
+                    requires(System& system, VisualWorkspaceRequest request) {
+                        { system.RequestWorkspace(std::move(request)) } -> std::same_as<void>;
+                    }, "visual producer must service workspace requests on its owner");
                 visitor.template operator()<SystemCell, Snapshot, Projection>();
             }
         });
@@ -1588,8 +1587,7 @@ template <class Composition>
     sink.append("visual-clean-content-relation");
     VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
         constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, Entry::source>();
-        constexpr auto destination =
-            mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
+        constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
         sink.append(source.view());
         sink.append(destination.view());
     });
@@ -1688,26 +1686,25 @@ template <class Composition>
             sink.append(fact.path);
             application_schema_detail::append_value(sink, value);
         });
-    ApplicationSchema<Composition>::VisitCatalogProviders(
-        [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
-            reserve_identity(provider.stable_id, "catalog provider " + std::string(provider.name));
-            sink.append("catalog-provider");
-            sink.append(provider.name);
-            sink.append(provider.identity);
-            sink.append(provider.row_type);
-            sink.append_number(provider.stable_id);
-            application_schema_detail::append_type<Row>(sink);
-            ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
-                [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
-                    reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
-                    sink.append("catalog-row");
-                    sink.append_number(fact.provider_id);
-                    sink.append_number(fact.stable_id);
-                    sink.append(fact.key);
-                    sink.append_number(fact.index);
-                    application_schema_detail::append_value(sink, row);
-                });
-        });
+    ApplicationSchema<Composition>::VisitCatalogProviders([&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
+        reserve_identity(provider.stable_id, "catalog provider " + std::string(provider.name));
+        sink.append("catalog-provider");
+        sink.append(provider.name);
+        sink.append(provider.identity);
+        sink.append(provider.row_type);
+        sink.append_number(provider.stable_id);
+        application_schema_detail::append_type<Row>(sink);
+        ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
+            [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
+                reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
+                sink.append("catalog-row");
+                sink.append_number(fact.provider_id);
+                sink.append_number(fact.stable_id);
+                sink.append(fact.key);
+                sink.append_number(fact.index);
+                application_schema_detail::append_value(sink, row);
+            });
+    });
     return sink;
 }
 

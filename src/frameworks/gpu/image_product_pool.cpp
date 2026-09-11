@@ -239,16 +239,14 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
     } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
     candidate.revision_ = revision;
 }
-void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate, const std::uint32_t width,
-                                       const std::uint32_t height, const std::uint64_t revision,
-                                       ImageProductBuffer::ProductSubmit submit) {
+void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate, const std::uint32_t width, const std::uint32_t height,
+                                       const std::uint64_t revision, ImageProductBuffer::ProductSubmit submit) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U ||
         candidate.baseline_.slot_)
         throw std::invalid_argument("retained image candidate is invalid or has a copy baseline");
     if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
     auto& slot = *candidate.slot_;
-    if (slot.buffer.terminal() || !slot.buffer.writable())
-        throw std::runtime_error("retained image candidate is unavailable");
+    if (slot.buffer.terminal() || !slot.buffer.writable()) throw std::runtime_error("retained image candidate is unavailable");
     {
         std::scoped_lock lock(admission_->mutex);
         slot.selected = false;
@@ -326,7 +324,8 @@ ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
     return result;
 }
 void ImageProductPool::ReleaseForRetirement() noexcept {
-    for (const auto& slot : slots_) slot->buffer.DeferReleaseToReaders();
+    for (const auto& slot : slots_)
+        slot->buffer.DeferReleaseToReaders();
     slots_.clear();
 }
 ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {

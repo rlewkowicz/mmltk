@@ -118,14 +118,12 @@ int main(const int argument_count, char* const* const arguments) {
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
     using ControlKind = contracts::IntegrationControlKind;
-    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^ControlKind))) {
-        constexpr auto kind = std::meta::extract<ControlKind>(enumerator);
-        constexpr auto policy = contracts::integration_command_direction<kind>();
-        if constexpr (policy.server && kind != ControlKind::Advance) {
-            records.emplace_back(IntegrationControl{.receipt = {.kind = kind, .sequence = 2U,
-                .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
+    contracts::visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
+        if constexpr (Policy.server && Kind != ControlKind::Advance) {
+            records.emplace_back(IntegrationControl{
+                .receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
         }
-    }
+    });
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

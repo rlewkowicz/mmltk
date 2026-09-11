@@ -15,7 +15,8 @@ std::size_t GalleryThumbnailCache::WindowFirst(const std::size_t matching, const
 }
 
 std::size_t GalleryThumbnailCache::WindowCount(const std::size_t matching, const ExploreViewport& viewport) noexcept {
-    const auto end = std::min(matching, (static_cast<std::size_t>(viewport.first_row) + viewport.row_count + kNeighborRows) * viewport.columns);
+    const auto end =
+        std::min(matching, (static_cast<std::size_t>(viewport.first_row) + viewport.row_count + kNeighborRows) * viewport.columns);
     return end - WindowFirst(matching, viewport);
 }
 
@@ -67,7 +68,8 @@ std::size_t GalleryThumbnailCache::Lookup(const std::uint32_t image) const noexc
 void GalleryThumbnailCache::Erase(const std::size_t slot) noexcept {
     if (entries_[slot].position == absent) return;
     auto* link = &buckets_[entries_[slot].compiled_index % buckets_.size()];
-    while (*link != slot) link = &next_[*link];
+    while (*link != slot)
+        link = &next_[*link];
     *link = next_[slot];
 }
 
@@ -141,14 +143,19 @@ void GalleryThumbnailCache::Complete(const std::size_t position, const std::uint
     if (bank > 1U || semantic_bank > 1U) throw std::invalid_argument("Explore cache plane version is invalid");
     const auto slot = Assign(compiled_index);
     Save(slot);
-    entries_.at(slot) = {.position = position, .compiled_index = compiled_index, .bank = bank,
-        .semantic_bank = semantic_bank, .meaning = std::move(meaning), .semantic_identity = semantic_identity};
+    entries_.at(slot) = {.position = position,
+                         .compiled_index = compiled_index,
+                         .bank = bank,
+                         .semantic_bank = semantic_bank,
+                         .meaning = std::move(meaning),
+                         .semantic_identity = semantic_identity};
 }
 
 std::size_t GalleryThumbnailCache::MetadataBytes() const noexcept {
     return entries_.capacity() * sizeof(Entry) + undo_.capacity() * sizeof(Undo) +
-        (buckets_.capacity() + next_.capacity() + demand_slots_.capacity() + prior_demand_.capacity() + undo_indices_.capacity()) * sizeof(std::size_t) +
-        (pinned_.capacity() + 7U) / 8U;
+           (buckets_.capacity() + next_.capacity() + demand_slots_.capacity() + prior_demand_.capacity() + undo_indices_.capacity()) *
+               sizeof(std::size_t) +
+           (pinned_.capacity() + 7U) / 8U;
 }
 
 void GalleryThumbnailCache::BeginUpdate() {
@@ -170,7 +177,8 @@ const GalleryThumbnailCache::Entry& GalleryThumbnailCache::Protected(const std::
 }
 
 void GalleryThumbnailCache::CommitUpdate() noexcept {
-    for (const auto& undo : undo_) undo_indices_[undo.slot] = absent;
+    for (const auto& undo : undo_)
+        undo_indices_[undo.slot] = absent;
     undo_.clear();
     prior_demand_.clear();
     updating_ = false;
@@ -178,11 +186,13 @@ void GalleryThumbnailCache::CommitUpdate() noexcept {
 
 void GalleryThumbnailCache::RollbackUpdate() noexcept {
     if (!updating_) return;
-    for (auto& undo : undo_) Restore(undo.slot, std::move(undo.entry));
+    for (auto& undo : undo_)
+        Restore(undo.slot, std::move(undo.entry));
     demand_slots_.swap(prior_demand_);
     demand_first_ = prior_first_;
     std::ranges::fill(pinned_, false);
-    for (const auto slot : demand_slots_) pinned_[slot] = true;
+    for (const auto slot : demand_slots_)
+        pinned_[slot] = true;
     CommitUpdate();
 }
 
@@ -210,11 +220,13 @@ std::size_t GalleryThumbnailCache::MeaningBytes(
         }
     };
     visit(entries_);
-    for (const auto& undo : undo_) meaning(undo.entry.meaning);
+    for (const auto& undo : undo_)
+        meaning(undo.entry.meaning);
     if (other && other != this) {
         bytes += other->MetadataBytes();
         visit(other->entries_);
-        for (const auto& undo : other->undo_) meaning(undo.entry.meaning);
+        for (const auto& undo : other->undo_)
+            meaning(undo.entry.meaning);
     }
     for (const auto& value : additional_meanings)
         meaning(value);

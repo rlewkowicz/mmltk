@@ -565,9 +565,7 @@ TEST_CASE("ordinary browser host rejects explicit integration control", "[contro
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
     wire::ByteBuffer encoded;
-    REQUIRE(encode_client_record(ClientRecord{IntegrationControl{
-                                     .receipt = {.kind = kind, .sequence = 1U}}},
-                                 encoded));
+    REQUIRE(encode_client_record(ClientRecord{IntegrationControl{.receipt = {.kind = kind, .sequence = 1U}}}, encoded));
     peer.send_binary(encoded);
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));

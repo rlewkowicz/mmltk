@@ -22,8 +22,7 @@ namespace mmltk::frameworks::gpu {
     static std::atomic<std::uint64_t> next{1U};
     auto value = next.load(std::memory_order_relaxed);
     do {
-        if (value == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("image allocation identity exhausted");
+        if (value == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("image allocation identity exhausted");
     } while (!next.compare_exchange_weak(value, value + 1U, std::memory_order_relaxed));
     return value;
 }
@@ -332,12 +331,8 @@ DeviceContext DeviceContext::OnDevice(int device, std::optional<DeviceExecution>
 void DeviceContext::DestroyEvent(std::uintptr_t event) const noexcept {
     if (event != 0U) state_->backend->DestroyEvent(state_->context, event);
 }
-void ImageStream::Record(std::uintptr_t event) {
-    context_.state_->backend->RecordEvent(context_.state_->context, stream_, event);
-}
-void ImageStream::AwaitEvent(std::uintptr_t event) {
-    context_.state_->backend->WaitEvent(context_.state_->context, stream_, event);
-}
+void ImageStream::Record(std::uintptr_t event) { context_.state_->backend->RecordEvent(context_.state_->context, stream_, event); }
+void ImageStream::AwaitEvent(std::uintptr_t event) { context_.state_->backend->WaitEvent(context_.state_->context, stream_, event); }
 
 ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
     stream_ = context_.state_->backend->CreateStream(context_.state_->context);
@@ -458,8 +453,10 @@ struct BorrowedImageReadView::Lease final {
           lock(state->access, std::defer_lock),
           revision(product_lease ? product_generation : state->revision),
           availability(std::move(availability_callback)) {
-        if (nonblocking) static_cast<void>(lock.try_lock());
-        else lock.lock();
+        if (nonblocking)
+            static_cast<void>(lock.try_lock());
+        else
+            lock.lock();
     }
     ~Lease() {
         if (lock.owns_lock()) {
@@ -800,16 +797,16 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
     static_cast<void>(state_->BeginWrite());
     const auto plane_locks = state_->LockPlanes();
     if (state_->workspace_ && state_->workspace_->admitted() && state_->plane_count_ == 1U &&
-        state_->workspace_->layout().device == state_->context_.device() &&
-        width <= state_->workspace_->layout().width && height <= state_->workspace_->layout().height) {
+        state_->workspace_->layout().device == state_->context_.device() && width <= state_->workspace_->layout().width &&
+        height <= state_->workspace_->layout().height) {
         auto& raw = *state_->planes_[0U]->state_;
         if (raw.external_storage != state_->workspace_) {
             auto destination = state_->workspace_->plane(width, height);
             // A late alias cutover preserves the old authoritative plane before
             // releasing it. Already borrowed raw pointers cannot reach this lock.
             if (raw.plane.valid() && !initialize && raw.plane.descriptor.width == width && raw.plane.descriptor.height == height) {
-                state_->context_.state_->backend->CopySameDevice(state_->context_.state_->context, stream.native_handle(),
-                    destination, state_->context_.state_->context, raw.plane);
+                state_->context_.state_->backend->CopySameDevice(state_->context_.state_->context, stream.native_handle(), destination,
+                                                                 state_->context_.state_->context, raw.plane);
                 stream.Synchronize();
             }
             if (raw.plane.data != 0U && !raw.external_storage)
@@ -988,15 +985,14 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
 BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
     std::shared_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock() || state_->generation_ == 0U || !state_->workspace_ ||
-        state_->workspace_->revision() != state_->generation_) return {};
-    BorrowedImageProductReadView source{
-        std::make_shared<BorrowedImageProductReadView::Lease>(state_, std::move(transaction))};
+        state_->workspace_->revision() != state_->generation_)
+        return {};
+    BorrowedImageProductReadView source{std::make_shared<BorrowedImageProductReadView::Lease>(state_, std::move(transaction))};
     source.count_ = state_->plane_count_;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
-        source.planes_[index] = BorrowedImageReadView{
-            std::make_unique<BorrowedImageReadView::Lease>(state_->planes_[index]->state_, state_->completion_, source.lease_,
-                                                          source.lease_->generation, &source.lease_->lock,
-                                                          state_->availability_sink_, true)};
+        source.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(
+            state_->planes_[index]->state_, state_->completion_, source.lease_, source.lease_->generation, &source.lease_->lock,
+            state_->availability_sink_, true)};
         if (!source.planes_[index].lease_->lock.owns_lock()) return {};
     }
     if (!source.valid()) return {};
@@ -1026,7 +1022,8 @@ ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
         std::shared_lock lock(plane.access);
         if (plane.external_storage) {
             if (plane.external_storage != state_->workspace_) result.device_bytes += plane.external_bytes;
-        } else if (plane.plane.data != 0U) result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
+        } else if (plane.plane.data != 0U)
+            result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
         result.pinned_bytes += plane.staging_bytes;
     }
     if (state_->workspace_) {

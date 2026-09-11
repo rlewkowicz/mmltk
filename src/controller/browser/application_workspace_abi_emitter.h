@@ -59,14 +59,20 @@ class ApplicationWorkspaceAbiEmitter final {
     }
     template <class T>
     static std::string WireType() {
-        if constexpr (std::is_enum_v<T>) return WireType<std::underlying_type_t<T>>();
-        else if constexpr (std::is_same_v<T, std::uint64_t>) return "u64";
-        else if constexpr (std::is_same_v<T, std::uint32_t>) return "u32";
-        else if constexpr (std::is_same_v<T, std::uint16_t>) return "u16";
-        else if constexpr (std::is_same_v<T, std::uint8_t>) return "u8";
+        if constexpr (std::is_enum_v<T>)
+            return WireType<std::underlying_type_t<T>>();
+        else if constexpr (std::is_same_v<T, std::uint64_t>)
+            return "u64";
+        else if constexpr (std::is_same_v<T, std::uint32_t>)
+            return "u32";
+        else if constexpr (std::is_same_v<T, std::uint16_t>)
+            return "u16";
+        else if constexpr (std::is_same_v<T, std::uint8_t>)
+            return "u8";
         else if constexpr (std::is_array_v<T>)
             return "[" + WireType<std::remove_extent_t<T>>() + "; " + std::to_string(std::extent_v<T>) + "]";
-        else static_assert(sizeof(T) == 0, "graphics ABI field requires a fixed-width data projection");
+        else
+            static_assert(sizeof(T) == 0, "graphics ABI field requires a fixed-width data projection");
     }
     template <class T>
     void Enum(std::string_view prefix) {
@@ -86,7 +92,8 @@ class ApplicationWorkspaceAbiEmitter final {
     void Record() {
         static_assert(std::is_standard_layout_v<T> && std::is_trivially_copyable_v<T>);
         constexpr auto name = std::meta::identifier_of(^^T);
-        static constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()));
+        static constexpr auto members =
+            std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()));
         Reserve(name);
         output_ << "#[repr(C, align(" << alignof(T) << "))]\n#[derive(Clone, Copy, Default)]\npub struct " << name << " {\n";
         template for (constexpr auto member : members) {

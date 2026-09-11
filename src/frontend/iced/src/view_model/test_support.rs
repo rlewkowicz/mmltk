@@ -110,14 +110,22 @@ pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_s
 /// independent of when either notification is consumed by the presentation model.
 pub(crate) fn presentation_arrival_orders() -> impl Iterator<Item = [usize; 4]> {
     (0..4).flat_map(|domain| {
-        (0..4).filter(move |control| *control != domain).flat_map(move |control| {
-            (0..4).filter(move |publication| *publication != domain && *publication != control)
-                .map(move |publication| {
-                    let copied = (0..4).find(|position| *position != domain && *position != control && *position != publication)
-                        .expect("remaining copy notification position");
-                    [domain, control, publication, copied]
-                })
-        })
+        (0..4)
+            .filter(move |control| *control != domain)
+            .flat_map(move |control| {
+                (0..4)
+                    .filter(move |publication| *publication != domain && *publication != control)
+                    .map(move |publication| {
+                        let copied = (0..4)
+                            .find(|position| {
+                                *position != domain
+                                    && *position != control
+                                    && *position != publication
+                            })
+                            .expect("remaining copy notification position");
+                        [domain, control, publication, copied]
+                    })
+            })
     })
 }
 

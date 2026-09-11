@@ -102,11 +102,10 @@ struct WorkspaceSurfaceDescriptors final {
     throw std::runtime_error(failure_message);
 }
 
-[[nodiscard]] inline bool send_workspace_record(
-    const int socket, const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
-    const std::span<const int> descriptors = {}) {
-    return send_message_with_descriptors(socket, std::as_bytes(std::span{&record, 1U}), descriptors,
-                                         "workspace protocol test send failed");
+[[nodiscard]] inline bool send_workspace_record(const int socket,
+                                                const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
+                                                const std::span<const int> descriptors = {}) {
+    return send_message_with_descriptors(socket, std::as_bytes(std::span{&record, 1U}), descriptors, "workspace protocol test send failed");
 }
 
 [[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(

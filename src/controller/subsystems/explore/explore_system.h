@@ -285,7 +285,9 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery) = 0;
     virtual void CommitOutputPublication() noexcept = 0;
     [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) { return {}; }
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) {
+        return {};
+    }
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
                                                                  mmltk::frameworks::gpu::ImagePlaneView,
@@ -391,8 +393,16 @@ class ExploreAcceptanceGate final {
         VisibleReadHeld = 0x87U,
     };
     enum class ControlCommand : std::uint8_t {
-        InitialRelease = 1U, ReleaseAll = 2U, ArmVisibleRead = 3U, HeldRelease = 4U, ReleaseVisibleRead = 5U, Advance = 8U,
-        Redraw = 16U, ArmNativeCompletion = 32U, ReleaseNativeCompletion = 64U, ReleaseSample = 128U,
+        InitialRelease = 1U,
+        ReleaseAll = 2U,
+        ArmVisibleRead = 3U,
+        HeldRelease = 4U,
+        ReleaseVisibleRead = 5U,
+        Advance = 8U,
+        Redraw = 16U,
+        ArmNativeCompletion = 32U,
+        ReleaseNativeCompletion = 64U,
+        ReleaseSample = 128U,
     };
     [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
     void SetCompletionCommand(std::function<bool(ControlCommand)>);

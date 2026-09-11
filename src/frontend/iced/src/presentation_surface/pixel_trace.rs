@@ -85,8 +85,14 @@ struct Probe {
 }
 
 impl PixelTrace {
-    pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Option<Self> {
-        if !enabled() { return None; }
+    pub(super) fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Option<Self> {
+        if !enabled() {
+            return None;
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mmltk sample pixel evidence"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(PROBE)),
@@ -99,13 +105,24 @@ impl PixelTrace {
             compilation_options: Default::default(),
             cache: None,
         });
-        let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label), size, usage, mapped_at_creation: false,
-        });
-        let parameters = buffer("mmltk probe extent and slot", 16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
-        let pixels = buffer("mmltk probe pixels", 25 * 256,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let buffer = |label, size, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let parameters = buffer(
+            "mmltk probe extent and slot",
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        );
+        let pixels = buffer(
+            "mmltk probe pixels",
+            25 * 256,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
         let view = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -114,17 +131,36 @@ impl PixelTrace {
             label: Some("mmltk probe sample"),
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: parameters.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: pixels.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: parameters.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: pixels.as_entire_binding(),
+                },
             ],
         });
-        Some(Self { state: Arc::new(Probe {
-            device: device.clone(), queue: queue.clone(), pipeline, bindings, parameters, pixels,
-            buffer: buffer("mmltk bounded pixel evidence", 25 * 256,
-                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
-            requests: Mutex::new(Requests::default()),
-        }) })
+        Some(Self {
+            state: Arc::new(Probe {
+                device: device.clone(),
+                queue: queue.clone(),
+                pipeline,
+                bindings,
+                parameters,
+                pixels,
+                buffer: buffer(
+                    "mmltk bounded pixel evidence",
+                    25 * 256,
+                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                ),
+                requests: Mutex::new(Requests::default()),
+            }),
+        })
     }
 
     pub(super) fn sample(&self, surface: Surface, read: Arc<SampleRead>) {
@@ -134,10 +170,7 @@ impl PixelTrace {
         if frame.content_width == 0 || frame.content_height == 0 {
             return;
         }
-        let request = Request {
-            surface,
-            read,
-        };
+        let request = Request { surface, read };
         let request = self
             .state
             .requests
@@ -185,13 +218,17 @@ impl Probe {
                 label: Some("mmltk receiver pixel evidence"),
             });
         let mut parameters = [0u8; 16];
-        for (index, value) in [frame.content_width, frame.content_height, frame.slot, 0].into_iter().enumerate() {
+        for (index, value) in [frame.content_width, frame.content_height, frame.slot, 0]
+            .into_iter()
+            .enumerate()
+        {
             parameters[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         self.queue.write_buffer(&self.parameters, 0, &parameters);
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("mmltk sample read evidence"), timestamp_writes: None,
+                label: Some("mmltk sample read evidence"),
+                timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bindings, &[]);

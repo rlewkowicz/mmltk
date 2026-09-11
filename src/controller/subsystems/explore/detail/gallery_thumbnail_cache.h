@@ -81,7 +81,7 @@ class GalleryThumbnailCache final {
         std::uint32_t compiled_index = 0U;
         std::uint8_t bank = 0U;
         std::uint8_t semantic_bank = 0U;
-        std::shared_ptr<const GalleryTileMeaning> meaning;
+        std::shared_ptr<const GalleryTileMeaning> meaning{};
         std::uint64_t semantic_identity = 0U;
     };
 
@@ -123,7 +123,10 @@ class GalleryThumbnailCache final {
     std::vector<bool> pinned_;
     std::size_t demand_first_ = 0U;
     std::size_t eviction_ = 0U;
-    struct Undo final { std::size_t slot; Entry entry; };
+    struct Undo final {
+        std::size_t slot;
+        Entry entry;
+    };
     std::vector<Undo> undo_;
     std::vector<std::size_t> undo_indices_, prior_demand_;
     std::size_t prior_first_ = 0U;

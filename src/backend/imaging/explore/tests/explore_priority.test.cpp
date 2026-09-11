@@ -203,13 +203,18 @@ TEST_CASE("Fused workspace raster preserves pitched guards and clipped coverage"
     auto* result = static_cast<std::uint8_t*>(result_device.data()) + offset;
     const raster::ConstBytes source{static_cast<const std::uint8_t*>(clean_device.data()) + offset, clean_pitch, width, height};
     const raster::ConstBytes overlay{static_cast<const std::uint8_t*>(semantic_device.data()) + offset, semantic_pitch, width, height};
-    REQUIRE(cudaMemcpy2DAsync(oracle, target_pitch, source.pixels, clean_pitch, width * 4U, height,
-                              cudaMemcpyDeviceToDevice, stream.get()) == cudaSuccess);
+    REQUIRE(cudaMemcpy2DAsync(oracle, target_pitch, source.pixels, clean_pitch, width * 4U, height, cudaMemcpyDeviceToDevice,
+                              stream.get()) == cudaSuccess);
     REQUIRE(raster::composite_rgba({.base_rgba = raster::pitched_rgba_target(oracle, target_pitch, width, height),
-                                   .overlay_rgba = overlay, .stream = stream.get()}) == cudaSuccess);
+                                    .overlay_rgba = overlay,
+                                    .stream = stream.get()}) == cudaSuccess);
     const std::array regions{raster::IntRect{-5, 0, 3, 2}, raster::IntRect{3, 2, 20, 20}, raster::IntRect{2, 1, 2, 3}};
-    raster::FinalizeRgbaWork work{.clean = source, .semantic = overlay,
-        .destination = {result, target_pitch, width, height}, .regions = regions, .full_image = false, .stream = stream.get()};
+    raster::FinalizeRgbaWork work{.clean = source,
+                                  .semantic = overlay,
+                                  .destination = {result, target_pitch, width, height},
+                                  .regions = regions,
+                                  .full_image = false,
+                                  .stream = stream.get()};
     REQUIRE(raster::finalize_rgba(work) == cudaSuccess);
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
     std::vector<std::uint8_t> expected(guard.size()), actual(guard.size());
@@ -269,7 +274,7 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
         std::array<std::uint64_t, 5U> result{};
         REQUIRE(cudaMemsetAsync(counts.data(), 0, sizeof(result), stream.get()) == cudaSuccess);
         REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()),
-                                           stream.address()) == kExploreStorageSuccess);
+                                            stream.address()) == kExploreStorageSuccess);
         REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
         REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
         return result;

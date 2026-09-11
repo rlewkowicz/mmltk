@@ -220,18 +220,38 @@ thread_local! {
 
 // Publication metadata is copyable; permission to read an external layer is not.
 pub(crate) fn accept_publication(frame: FrameReady) -> bool {
-    if mailbox_binding(frame).is_none() || LIVE_READS.with(|reads| reads.borrow().iter().flatten()
-        .filter_map(std::sync::Weak::upgrade).any(|read| same_mailbox_slot(read.0, frame))) {
+    if mailbox_binding(frame).is_none()
+        || LIVE_READS.with(|reads| {
+            reads
+                .borrow()
+                .iter()
+                .flatten()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|read| same_mailbox_slot(read.0, frame))
+        })
+    {
         return false;
     }
-    if RELEASED_FRAMES.with(|released| released.get().iter().flatten().any(|prior|
-        same_mailbox_slot(*prior, frame) && prior.presentation_revision >= frame.presentation_revision)) {
+    if RELEASED_FRAMES.with(|released| {
+        released.get().iter().flatten().any(|prior| {
+            same_mailbox_slot(*prior, frame)
+                && prior.presentation_revision >= frame.presentation_revision
+        })
+    }) {
         return false;
     }
     BORROWS.with(|borrows| {
         let mut slots = borrows.get();
-        if slots.iter().flatten().any(|prior| same_mailbox_slot(*prior, frame)) { return false; }
-        let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) else { return false; };
+        if slots
+            .iter()
+            .flatten()
+            .any(|prior| same_mailbox_slot(*prior, frame))
+        {
+            return false;
+        }
+        let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
         *slot = Some(frame);
         borrows.set(slots);
         true
@@ -241,7 +261,9 @@ pub(crate) fn accept_publication(frame: FrameReady) -> bool {
 fn take_publication(frame: FrameReady) -> bool {
     BORROWS.with(|borrows| {
         let mut slots = borrows.get();
-        let Some(slot) = slots.iter_mut().find(|slot| **slot == Some(frame)) else { return false; };
+        let Some(slot) = slots.iter_mut().find(|slot| **slot == Some(frame)) else {
+            return false;
+        };
         *slot = None;
         borrows.set(slots);
         true
@@ -250,7 +272,9 @@ fn take_publication(frame: FrameReady) -> bool {
 
 pub(crate) fn retire_publication(frame: FrameReady) {
     // Acquired publications belong to their shared display/read owner.
-    if take_publication(frame) { release(frame); }
+    if take_publication(frame) {
+        release(frame);
+    }
 }
 
 // Only exact copyable facts cross the unconditional Send callback boundary.
@@ -271,18 +295,32 @@ thread_local! {
 fn retain_capacity_sample(read: &std::sync::Arc<SampleRead>) {
     CAPACITY_ACCEPTANCE.with(|owner| {
         let mut owner = owner.borrow_mut();
-        let Some(slots) = owner.as_mut() else { return; };
-        if slots.iter().flatten().any(|prior| prior.0 == read.0) { return; }
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) { *slot = Some(read.clone()); }
+        let Some(slots) = owner.as_mut() else {
+            return;
+        };
+        if slots.iter().flatten().any(|prior| prior.0 == read.0) {
+            return;
+        }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(read.clone());
+        }
     });
 }
 
 pub(crate) fn begin_capacity_acceptance() -> bool {
-    if CAPACITY_ACCEPTANCE.with(|owner| owner.borrow().is_some()) { return false; }
-    let read = RENDERER.with(|renderer| renderer.borrow().as_ref()
-        .and_then(|renderer| renderer.imported.as_ref())
-        .and_then(|imported| imported.image.retained_read.clone()));
-    let Some(read) = read else { return false; };
+    if CAPACITY_ACCEPTANCE.with(|owner| owner.borrow().is_some()) {
+        return false;
+    }
+    let read = RENDERER.with(|renderer| {
+        renderer
+            .borrow()
+            .as_ref()
+            .and_then(|renderer| renderer.imported.as_ref())
+            .and_then(|imported| imported.image.retained_read.clone())
+    });
+    let Some(read) = read else {
+        return false;
+    };
     CAPACITY_ACCEPTANCE.with(|owner| *owner.borrow_mut() = Some([Some(read), None]));
     true
 }
@@ -290,10 +328,17 @@ pub(crate) fn begin_capacity_acceptance() -> bool {
 pub(crate) fn capacity_acceptance_slots() -> usize {
     CAPACITY_ACCEPTANCE.with(|owner| {
         let owner = owner.borrow();
-        let Some(slots) = owner.as_ref() else { return 0; };
+        let Some(slots) = owner.as_ref() else {
+            return 0;
+        };
         match (&slots[0], &slots[1]) {
-            (Some(first), Some(second)) if first.0.high == second.0.high && first.0.low == second.0.low
-                && first.0.slot != second.0.slot => 2,
+            (Some(first), Some(second))
+                if first.0.high == second.0.high
+                    && first.0.low == second.0.low
+                    && first.0.slot != second.0.slot =>
+            {
+                2
+            }
             (Some(_), None) => 1,
             _ => 0,
         }
@@ -302,7 +347,12 @@ pub(crate) fn capacity_acceptance_slots() -> usize {
 
 pub(crate) fn release_capacity_sample() -> bool {
     // Take before dropping: release dispatch may re-enter page-local owners.
-    let read = CAPACITY_ACCEPTANCE.with(|owner| owner.borrow_mut().as_mut().and_then(|slots| slots[0].take()));
+    let read = CAPACITY_ACCEPTANCE.with(|owner| {
+        owner
+            .borrow_mut()
+            .as_mut()
+            .and_then(|slots| slots[0].take())
+    });
     read.is_some()
 }
 
@@ -317,11 +367,15 @@ fn copy_completed(frame: FrameReady) -> bool {
 
 impl SampleRead {
     fn acquire(frame: FrameReady) -> Option<std::sync::Arc<Self>> {
-        if !take_publication(frame) || !reserve_release(frame) { return None; }
+        if !take_publication(frame) || !reserve_release(frame) {
+            return None;
+        }
         let read = std::sync::Arc::new(Self(frame));
         LIVE_READS.with(|reads| {
             let mut reads = reads.borrow_mut();
-            let slot = reads.iter_mut().find(|slot| slot.as_ref().is_none_or(|read| read.strong_count() == 0))
+            let slot = reads
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_none_or(|read| read.strong_count() == 0))
                 .expect("bounded active, candidate and retiring arena slots");
             *slot = Some(std::sync::Arc::downgrade(&read));
         });
@@ -339,7 +393,9 @@ fn settle_sample(frame: FrameReady) {
     COPY_RECEIPTS.with(|receipts| {
         let mut slots = receipts.get();
         for slot in &mut slots {
-            if *slot == Some(frame) { *slot = None; }
+            if *slot == Some(frame) {
+                *slot = None;
+            }
         }
         receipts.set(slots);
     });
@@ -348,7 +404,9 @@ fn settle_sample(frame: FrameReady) {
 }
 
 impl Drop for SampleRead {
-    fn drop(&mut self) { settle_sample(self.0); }
+    fn drop(&mut self) {
+        settle_sample(self.0);
+    }
 }
 
 // Texture wrappers and their destruction stay on the owning page thread. The
@@ -365,7 +423,11 @@ struct RetiredTexture {
 
 fn arena_has_readers(surface: Surface) -> bool {
     LIVE_READS.with(|reads| {
-        reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade)
+        reads
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::sync::Weak::upgrade)
             .any(|read| read.0.high == surface.high && read.0.low == surface.low)
     })
 }
@@ -376,7 +438,10 @@ fn drain_retired_textures() {
     let ready = RETIRED_TEXTURES.with(|retired| {
         let mut retired = retired.borrow_mut();
         std::array::from_fn::<_, ARENA_CAPACITY, _>(|index| {
-            if retired[index].as_ref().is_some_and(|entry| !arena_has_readers(entry.surface)) {
+            if retired[index]
+                .as_ref()
+                .is_some_and(|entry| !arena_has_readers(entry.surface))
+            {
                 retired[index].take()
             } else {
                 None
@@ -399,7 +464,9 @@ struct ArenaTexture {
 
 impl Drop for ArenaTexture {
     fn drop(&mut self) {
-        let Some(texture) = self.texture.take() else { return; };
+        let Some(texture) = self.texture.take() else {
+            return;
+        };
         if !arena_has_readers(self.surface) {
             texture.destroy();
             trace_surface("texture_destroyed", self.surface);
@@ -407,9 +474,14 @@ impl Drop for ArenaTexture {
         }
         RETIRED_TEXTURES.with(|retired| {
             let mut retired = retired.borrow_mut();
-            let slot = retired.iter_mut().find(|slot| slot.is_none())
+            let slot = retired
+                .iter_mut()
+                .find(|slot| slot.is_none())
                 .expect("Firefox admits at most three live sample arenas");
-            *slot = Some(RetiredTexture { surface: self.surface, texture });
+            *slot = Some(RetiredTexture {
+                surface: self.surface,
+                texture,
+            });
         });
     }
 }
@@ -611,18 +683,22 @@ struct FrameMailbox {
 }
 
 fn remember_frame(slots: &mut [Option<FrameReady>; SAMPLE_CAPACITY], frame: FrameReady) {
-    if let Some(slot) = slots.iter_mut().find(|slot| {
-        slot.is_some_and(|prior| same_mailbox_slot(prior, frame))
-    }) {
+    if let Some(slot) = slots
+        .iter_mut()
+        .find(|slot| slot.is_some_and(|prior| same_mailbox_slot(prior, frame)))
+    {
         if slot.is_none_or(|prior| prior.presentation_revision <= frame.presentation_revision) {
             *slot = Some(frame);
         }
         return;
     }
     let index = slots.iter().position(Option::is_none).unwrap_or_else(|| {
-        slots.iter().enumerate()
+        slots
+            .iter()
+            .enumerate()
             .min_by_key(|(_, slot)| slot.map(|frame| frame.presentation_revision))
-            .expect("bounded receipt storage").0
+            .expect("bounded receipt storage")
+            .0
     });
     // Independent arena notifications can arrive out of presentation order.
     slots[index] = Some(frame);
@@ -633,7 +709,10 @@ impl FrameMailbox {
         remember_frame(&mut self.copied, frame);
     }
     fn next_notification(&mut self) -> Option<Notification> {
-        self.copied.iter_mut().find_map(Option::take).map(Notification::Copied)
+        self.copied
+            .iter_mut()
+            .find_map(Option::take)
+            .map(Notification::Copied)
             .or_else(|| self.rejected.take().map(Notification::SampleRejected))
             .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
             .or_else(|| self.pop().map(Notification::Native))
@@ -708,8 +787,14 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
         window
             .add_event_listener_with_callback(FRAME_EVENT, callback.as_ref().unchecked_ref())
             .ok()?;
-        if window.add_event_listener_with_callback(COPY_EVENT, callback.as_ref().unchecked_ref()).is_err() {
-            let _ = window.remove_event_listener_with_callback(FRAME_EVENT, callback.as_ref().unchecked_ref());
+        if window
+            .add_event_listener_with_callback(COPY_EVENT, callback.as_ref().unchecked_ref())
+            .is_err()
+        {
+            let _ = window.remove_event_listener_with_callback(
+                FRAME_EVENT,
+                callback.as_ref().unchecked_ref(),
+            );
             return None;
         }
         Some(FrameListener { window, callback })
@@ -740,7 +825,10 @@ struct FrameListener {
 impl Drop for FrameListener {
     fn drop(&mut self) {
         COMPLETION_WAKE.with(|notify| *notify.borrow_mut() = None);
-        let _ = self.window.remove_event_listener_with_callback(COPY_EVENT, self.callback.as_ref().unchecked_ref());
+        let _ = self.window.remove_event_listener_with_callback(
+            COPY_EVENT,
+            self.callback.as_ref().unchecked_ref(),
+        );
         let _ = self.window.remove_event_listener_with_callback(
             FRAME_EVENT,
             self.callback.as_ref().unchecked_ref(),
@@ -822,8 +910,9 @@ pub(crate) enum Placement {
 impl Placement {
     fn logical_extent(self, physical: (u32, u32)) -> (u32, u32) {
         match self {
-            Self::GalleryGrid { columns, rows, .. } if columns != 0 =>
-                (physical.0, physical.0 / columns * rows),
+            Self::GalleryGrid { columns, rows, .. } if columns != 0 => {
+                (physical.0, physical.0 / columns * rows)
+            }
             _ => physical,
         }
     }
@@ -1172,8 +1261,11 @@ impl ViewportOwner {
             placement,
             self.transform(),
         )?;
-        let (content_x, content_y) =
-            inverse_content_point(geometry, point, placement.logical_extent(surface.content_extent()))?;
+        let (content_x, content_y) = inverse_content_point(
+            geometry,
+            point,
+            placement.logical_extent(surface.content_extent()),
+        )?;
         let [crop_x, crop_y, _, _] = surface.content_region();
         Some(SurfaceSample {
             width: bounds.width.max(1.0) as u32,
@@ -1243,14 +1335,19 @@ fn placement_geometry(
                 (bounds.width, bounds.width / aspect)
             }
         }
-        Placement::GalleryGrid { columns, rows, row_capacity, row_origin, .. }
-            if columns != 0
-                && rows != 0
-                && rows <= row_capacity
-                && row_origin < row_capacity
-                && content.0 % columns == 0
-                && content.1 % row_capacity == 0
-                && content.0 / columns == content.1 / row_capacity =>
+        Placement::GalleryGrid {
+            columns,
+            rows,
+            row_capacity,
+            row_origin,
+            ..
+        } if columns != 0
+            && rows != 0
+            && rows <= row_capacity
+            && row_origin < row_capacity
+            && content.0 % columns == 0
+            && content.1 % row_capacity == 0
+            && content.0 / columns == content.1 / row_capacity =>
         {
             (bounds.width, bounds.width / columns as f32 * rows as f32)
         }
@@ -1703,7 +1800,8 @@ impl SurfaceRenderer {
         let Some(imported) = self.imported.as_ref() else {
             return;
         };
-        if imported.image.completed.is_none() || same_allocation(imported.image.surface, requested) {
+        if imported.image.completed.is_none() || same_allocation(imported.image.surface, requested)
+        {
             return;
         }
         if !self.pending.as_ref().is_some_and(|pending| {
@@ -1795,10 +1893,7 @@ impl SurfaceRenderer {
             return;
         };
         let (surface, gallery) = submitted.map_or(
-            (
-                imported.image.surface,
-                imported.image.gallery.as_ref(),
-            ),
+            (imported.image.surface, imported.image.gallery.as_ref()),
             |(_, pending)| (pending.surface, pending.gallery.as_ref()),
         );
         if !retained_draw_admitted(surface, requested, placement) {
@@ -1930,7 +2025,10 @@ impl SurfaceRenderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let arena = ArenaTexture { surface, texture: Some(texture) };
+        let arena = ArenaTexture {
+            surface,
+            texture: Some(texture),
+        };
         let texture = arena.texture.as_ref().expect("new page texture");
         let views = std::array::from_fn(|slot| {
             texture.create_view(&wgpu::TextureViewDescriptor {
@@ -1963,8 +2061,12 @@ impl SurfaceRenderer {
     }
 
     fn prune_draws(&mut self) {
-        self.draws.retain(|_, draw| [&self.imported, &self.pending].into_iter().flatten()
-            .any(|imported| same_allocation(imported.image.surface, draw.surface)));
+        self.draws.retain(|_, draw| {
+            [&self.imported, &self.pending]
+                .into_iter()
+                .flatten()
+                .any(|imported| same_allocation(imported.image.surface, draw.surface))
+        });
     }
 
     fn discard_pending(&mut self) {
@@ -2028,9 +2130,7 @@ impl SurfaceRenderer {
                         || imported
                             .image
                             .submitted_draw(draw.requested)
-                            .is_some_and(|pending| {
-                                pending.surface.frame == Some(frame)
-                            })
+                            .is_some_and(|pending| pending.surface.frame == Some(frame))
                 })
         else {
             trace_draw("sample_draw_rejected", control_id, draw, image, clip);
@@ -2039,9 +2139,15 @@ impl SurfaceRenderer {
         let read = if imported.image.completed == Some(frame) {
             imported.image.retained_read.as_ref()
         } else {
-            imported.image.pending_sample.as_ref().map(|pending| &pending.read)
+            imported
+                .image
+                .pending_sample
+                .as_ref()
+                .map(|pending| &pending.read)
         };
-        let Some(read) = read.filter(|read| read.0 == frame) else { return; };
+        let Some(read) = read.filter(|read| read.0 == frame) else {
+            return;
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("mmltk presentation pass"),
             color_attachments: &[Some(preserving_color_attachment(target))],
@@ -2073,12 +2179,15 @@ impl SurfaceRenderer {
         if surface_trace_enabled() {
             // The closure carries exact immutable publication facts only. The
             // generic batch owns submission/abandonment, not application state.
-            resources.observe_settlement(move |outcome| trace_frame(
-                match outcome {
-                    shader::Settlement::Submitted => "draw_settled",
-                    shader::Settlement::Abandoned => "draw_abandoned",
-                }, frame,
-            ));
+            resources.observe_settlement(move |outcome| {
+                trace_frame(
+                    match outcome {
+                        shader::Settlement::Submitted => "draw_settled",
+                        shader::Settlement::Abandoned => "draw_abandoned",
+                    },
+                    frame,
+                )
+            });
         }
         trace_surface_request(
             "sample_draw_selected",
@@ -2196,9 +2305,23 @@ fn preserving_color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColo
 
 pub(crate) fn complete_sample(frame: FrameReady) {
     // A disposed publication's late copy receipt cannot resurrect its lease.
-    let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
-    let released = RELEASED_FRAMES.with(|receipts| receipts.get().iter().flatten().any(|prior| same_mailbox_slot(*prior, frame) && prior.presentation_revision >= frame.presentation_revision));
-    if released && !live { return; }
+    let live = LIVE_READS.with(|reads| {
+        reads
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|read| read.0 == frame)
+    });
+    let released = RELEASED_FRAMES.with(|receipts| {
+        receipts.get().iter().flatten().any(|prior| {
+            same_mailbox_slot(*prior, frame)
+                && prior.presentation_revision >= frame.presentation_revision
+        })
+    });
+    if released && !live {
+        return;
+    }
     COPY_RECEIPTS.with(|receipts| {
         let mut slots = receipts.get();
         remember_frame(&mut slots, frame);
@@ -2435,11 +2558,7 @@ impl ImagePublication {
 }
 
 impl Imported {
-    fn reconcile_sample(
-        &mut self,
-        surface: Surface,
-        placement: Placement,
-    ) {
+    fn reconcile_sample(&mut self, surface: Surface, placement: Placement) {
         let retained_surface = self.image.surface;
         let retained_gallery = self.image.gallery.clone();
         let retained_placement = self.image.placement;
@@ -2637,7 +2756,11 @@ fn geometry_key(
         image_origin: placement_geometry(bounds, content, placement, transform)
             .map_or([0.0, 0.0], |g| [g.x, g.y]),
         atlas: match placement {
-            Placement::GalleryGrid { row_capacity, row_origin, .. } => [row_capacity, row_origin],
+            Placement::GalleryGrid {
+                row_capacity,
+                row_origin,
+                ..
+            } => [row_capacity, row_origin],
             Placement::Contain => [0, 0],
         },
     }
@@ -2662,7 +2785,14 @@ fn write_content_geometry(queue: &wgpu::Queue, geometry: &wgpu::Buffer, key: Geo
 }
 
 pub(crate) fn release(frame: FrameReady) {
-    if LIVE_READS.with(|reads| reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame)) {
+    if LIVE_READS.with(|reads| {
+        reads
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|read| read.0 == frame)
+    }) {
         return;
     }
     take_publication(frame);
@@ -2676,8 +2806,12 @@ pub(crate) fn release(frame: FrameReady) {
 fn reserve_release(frame: FrameReady) -> bool {
     RELEASED_FRAMES.with(|released| {
         let mut slots = released.get();
-        if slots.iter().flatten().any(|prior| same_mailbox_slot(*prior, frame)
-            && prior.presentation_revision >= frame.presentation_revision) { return false; }
+        if slots.iter().flatten().any(|prior| {
+            same_mailbox_slot(*prior, frame)
+                && prior.presentation_revision >= frame.presentation_revision
+        }) {
+            return false;
+        }
         remember_frame(&mut slots, frame);
         released.set(slots);
         true
@@ -2945,7 +3079,7 @@ mod tests {
                 let old_read = SampleRead::acquire(old).unwrap();
                 let mut image = ImagePublication {
                     surface: previous,
-                        pending_sample: None,
+                    pending_sample: None,
                     completed: Some(old),
                     retained_read: Some(old_read),
                     gallery: None,
@@ -2998,7 +3132,7 @@ mod tests {
                         if replacement {
                             replacement_image = Some(ImagePublication {
                                 surface: target,
-                                                pending_sample: pending,
+                                pending_sample: pending,
                                 completed: None,
                                 retained_read: None,
                                 gallery: None,
@@ -3027,7 +3161,10 @@ mod tests {
                     } else {
                         let _ = image.promote(next, &model);
                     }
-                    let promoted = domain_arrived && control_arrived && copy_notified && position >= physical_position;
+                    let promoted = domain_arrived
+                        && control_arrived
+                        && copy_notified
+                        && position >= physical_position;
                     assert_eq!(image.surface, if promoted { target } else { previous });
                     assert_eq!(image.completed, Some(if promoted { next } else { old }));
                     assert_eq!(image.surface.frame.unwrap().slot, u32::from(promoted));
@@ -3053,10 +3190,7 @@ mod tests {
                         authorized,
                         promoted || (!domain_arrived && !control_arrived)
                     );
-                    assert_eq!(
-                        test_releases(),
-                        if promoted { vec![old] } else { vec![] }
-                    );
+                    assert_eq!(test_releases(), if promoted { vec![old] } else { vec![] });
                 }
                 image.complete(next); // A duplicate completion cannot promote or release twice.
                 assert!(!image.promote(next, &model));
@@ -3152,7 +3286,7 @@ mod tests {
                 let mut borrow = Some(SampleRead::acquire(frame).unwrap());
                 let mut image = ImagePublication {
                     surface,
-                        completed: None,
+                    completed: None,
                     retained_read: None,
                     pending_sample: Some(PendingImage {
                         read: borrow.as_ref().unwrap().clone(),
@@ -3180,8 +3314,7 @@ mod tests {
                     drop(borrow.take());
                     image.complete(frame);
                 }
-                model
-                    .peer_disconnected(crate::view_model::UiError::transport("sample continuity"));
+                model.peer_disconnected(crate::view_model::UiError::transport("sample continuity"));
                 assert!(!image.promote(frame, &model));
                 model.peer_connected();
                 if !completed_before_disconnect {
@@ -3213,7 +3346,9 @@ mod tests {
                     assert!(image.pending_sample.is_none());
                 }
                 retire_publication(frame);
-                if matching { assert!(test_releases().is_empty()); }
+                if matching {
+                    assert!(test_releases().is_empty());
+                }
                 drop(image);
                 assert_eq!(test_releases(), vec![frame]);
             }
@@ -3420,7 +3555,9 @@ mod tests {
         let observed = settlements.clone();
         first_encoder.observe_settlement(move |outcome| observed.lock().unwrap().push(outcome));
         // Multiple widgets share one publication and one batch callback.
-        for _ in 0..32 { first_encoder.retain(display.clone()); }
+        for _ in 0..32 {
+            first_encoder.retain(display.clone());
+        }
         second_encoder.retain(display.clone());
         complete_sample(frame);
         drop(display);
@@ -3430,7 +3567,10 @@ mod tests {
         // An abandoned encoder drops only its own encoded reads. The same RAII
         // batch settles when wgpu invokes its containing submission callback.
         drop(first_encoder);
-        assert_eq!(*settlements.lock().unwrap(), [shader::Settlement::Abandoned]);
+        assert_eq!(
+            *settlements.lock().unwrap(),
+            [shader::Settlement::Abandoned]
+        );
         assert!(test_releases().is_empty());
         drop(probe);
         assert!(test_releases().is_empty());
@@ -3444,7 +3584,12 @@ mod tests {
     fn both_slots_wait_for_their_own_readers_across_arena_retirement() {
         reset_test_releases();
         let first = frame_ready(1, 1, 1, 640, 480);
-        let second = FrameReady { slot: 1, content_sequence: 2, presentation_revision: 2, ..first };
+        let second = FrameReady {
+            slot: 1,
+            content_sequence: 2,
+            presentation_revision: 2,
+            ..first
+        };
         assert!(accept_publication(first));
         let fallback = SampleRead::acquire(first).unwrap();
         assert!(accept_publication(second));
@@ -3452,12 +3597,20 @@ mod tests {
         let mut encoded = shader::Resources::default();
         encoded.retain(fallback.clone());
         encoded.retain(incoming.clone());
-        let newer = FrameReady { content_sequence: 3, presentation_revision: 3, ..first };
+        let newer = FrameReady {
+            content_sequence: 3,
+            presentation_revision: 3,
+            ..first
+        };
         assert!(!accept_publication(newer));
         drop(fallback);
         drop(incoming);
         // A predecessor's actual encoder remains live after its display owner.
-        let replacement = FrameReady { high: 7, presentation_revision: 4, ..first };
+        let replacement = FrameReady {
+            high: 7,
+            presentation_revision: 4,
+            ..first
+        };
         assert!(accept_publication(replacement));
         let display = SampleRead::acquire(replacement).unwrap();
         complete_sample(replacement);
@@ -3483,7 +3636,11 @@ mod tests {
     fn replaced_undrawn_pending_and_prepublication_copy_receipts_are_exact() {
         reset_test_releases();
         let first = frame_ready(1, 1, 1, 640, 480);
-        let other_arena = FrameReady { high: 7, presentation_revision: 2, ..first };
+        let other_arena = FrameReady {
+            high: 7,
+            presentation_revision: 2,
+            ..first
+        };
         complete_sample(other_arena);
         complete_sample(first);
         assert!(copy_completed(first) && copy_completed(other_arena));
@@ -3501,7 +3658,11 @@ mod tests {
     fn arena_retirement_waits_for_both_slots_draw_batches_and_probe() {
         reset_test_releases();
         let first = frame_ready(1, 1, 1, 640, 480);
-        let second = FrameReady { slot: 1, presentation_revision: 2, ..first };
+        let second = FrameReady {
+            slot: 1,
+            presentation_revision: 2,
+            ..first
+        };
         let arena = crate::view_model::test_support::physical_surface(first);
         assert!(!arena_has_readers(arena)); // An undrawn import can retire now.
         assert!(accept_publication(first));
@@ -3511,7 +3672,9 @@ mod tests {
         let probe = pending.clone();
         let mut submitted = shader::Resources::default();
         let mut abandoned = shader::Resources::default();
-        for _ in 0..16 { submitted.retain(fallback.clone()); }
+        for _ in 0..16 {
+            submitted.retain(fallback.clone());
+        }
         submitted.retain(pending.clone());
         abandoned.retain(pending.clone());
         assert!(arena_has_readers(arena));
@@ -4069,19 +4232,43 @@ mod tests {
         surface.height = 800;
         surface.frame = Some(frame_ready(1, 41, 51, 400, 800));
         let placement = Placement::GalleryGrid {
-            columns: 4, rows: 5, row_capacity: 8, row_origin: 7, first_row: 7,
+            columns: 4,
+            rows: 5,
+            row_capacity: 8,
+            row_origin: 7,
+            first_row: 7,
         };
-        let bounds = Rectangle { x: 0.0, y: -37.5, width: 600.0, height: 700.0 };
-        let geometry = placement_geometry(bounds, surface.content_extent(), placement, ViewTransform::FIT).unwrap();
+        let bounds = Rectangle {
+            x: 0.0,
+            y: -37.5,
+            width: 600.0,
+            height: 700.0,
+        };
+        let geometry = placement_geometry(
+            bounds,
+            surface.content_extent(),
+            placement,
+            ViewTransform::FIT,
+        )
+        .unwrap();
         assert_eq!(geometry.height, 750.0);
-        assert_eq!(placement.logical_extent(surface.content_extent()), (400, 500));
+        assert_eq!(
+            placement.logical_extent(surface.content_extent()),
+            (400, 500)
+        );
         let key = geometry_key(surface, bounds, placement, ViewTransform::FIT);
         assert_eq!(key.atlas, [8, 7]);
         // One row before wrap, followed by four rows at the allocation start.
-        let source_rows: Vec<_> = (0..5).map(|row| (key.atlas[1] + row) % key.atlas[0]).collect();
+        let source_rows: Vec<_> = (0..5)
+            .map(|row| (key.atlas[1] + row) % key.atlas[0])
+            .collect();
         assert_eq!(source_rows, [7, 0, 1, 2, 3]);
         assert_eq!(
-            inverse_content_point(geometry, Point::new(150.0, 262.5), placement.logical_extent(surface.content_extent())),
+            inverse_content_point(
+                geometry,
+                Point::new(150.0, 262.5),
+                placement.logical_extent(surface.content_extent())
+            ),
             Some((100, 200))
         );
     }

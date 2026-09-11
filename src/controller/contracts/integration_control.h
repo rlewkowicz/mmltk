@@ -7,6 +7,7 @@
 #include <meta>
 
 #include "src/frameworks/reflection/reflected_field_policy.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 
 namespace mmltk::controller::contracts {
 
@@ -18,19 +19,19 @@ struct IntegrationCommandDirection final {
     bool compiled_index = false;
 };
 enum class IntegrationControlKind : std::uint8_t {
-    Advance [[= IntegrationCommandDirection{true}]],
-    Settled [[= IntegrationCommandDirection{false}]],
-    Failed [[= IntegrationCommandDirection{false}]],
-    Progress [[= IntegrationCommandDirection{false}]],
-    PressureEntered [[= IntegrationCommandDirection{false}]],
-    CapacityArmRequested [[= IntegrationCommandDirection{false}]],
-    CapacityArmed [[= IntegrationCommandDirection{true}]],
-    CapacityReleaseSample [[= IntegrationCommandDirection{true}]],
-    CapacityCompletionReleased [[= IntegrationCommandDirection{true}]],
-    VisibleReadArmRequested [[= IntegrationCommandDirection{false, false, true}]],
-    VisibleReadArmed [[= IntegrationCommandDirection{true}]],
-    VisibleReadHeld [[= IntegrationCommandDirection{true, true, true}]],
-    VisibleReadReleaseRequested [[= IntegrationCommandDirection{false, true, true}]],
+    Advance[[= IntegrationCommandDirection{true}]],
+    Settled[[= IntegrationCommandDirection{false}]],
+    Failed[[= IntegrationCommandDirection{false}]],
+    Progress[[= IntegrationCommandDirection{false}]],
+    PressureEntered[[= IntegrationCommandDirection{false}]],
+    CapacityArmRequested[[= IntegrationCommandDirection{false}]],
+    CapacityArmed[[= IntegrationCommandDirection{true}]],
+    CapacityReleaseSample[[= IntegrationCommandDirection{true}]],
+    CapacityCompletionReleased[[= IntegrationCommandDirection{true}]],
+    VisibleReadArmRequested[[= IntegrationCommandDirection{false, false, true}]],
+    VisibleReadArmed[[= IntegrationCommandDirection{true}]],
+    VisibleReadHeld[[= IntegrationCommandDirection{true, true, true}]],
+    VisibleReadReleaseRequested[[= IntegrationCommandDirection{false, true, true}]],
 };
 
 template <auto Kind>
@@ -53,12 +54,20 @@ template <auto Kind>
     return result;
 }
 
-[[nodiscard]] constexpr bool integration_server_command(const IntegrationControlKind kind) noexcept {
-    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^IntegrationControlKind))) {
-        constexpr auto value = std::meta::extract<IntegrationControlKind>(enumerator);
-        if (kind == value) return integration_command_direction<value>().server;
+template <class Kind = IntegrationControlKind, class Visitor>
+    requires std::is_enum_v<Kind>
+constexpr void visit_integration_commands(Visitor&& visitor) {
+    template for (constexpr auto entry : mmltk::frameworks::reflection::kReflectedEnumEntries<Kind>) {
+        visitor.template operator()<entry.value, integration_command_direction<entry.value>()>(entry.name);
     }
-    return false;
+}
+
+[[nodiscard]] constexpr bool integration_server_command(const IntegrationControlKind kind) noexcept {
+    bool server = false;
+    visit_integration_commands([&]<auto Value, auto Policy>(auto) {
+        if (kind == Value) server = Policy.server;
+    });
+    return server;
 }
 
 struct IntegrationControlReceipt final {
@@ -74,13 +83,13 @@ struct IntegrationControlReceipt final {
 
 [[nodiscard]] constexpr bool integration_receipt_valid(const IntegrationControlReceipt& receipt) noexcept {
     if (receipt.sequence == 0U || (receipt.kind == IntegrationControlKind::Failed) != (receipt.failureline != 0U)) return false;
-    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^IntegrationControlKind))) {
-        constexpr auto kind = std::meta::extract<IntegrationControlKind>(enumerator);
-        constexpr auto policy = integration_command_direction<kind>();
-        if (receipt.kind == kind) return (receipt.read_generation != 0U) == policy.read_generation &&
-            (policy.compiled_index || receipt.compiled_index == 0U) && (!policy.server || receipt.progress == 0U);
-    }
-    return false;
+    bool valid = false;
+    visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
+        if (receipt.kind == Kind)
+            valid = (receipt.read_generation != 0U) == Policy.read_generation && (Policy.compiled_index || receipt.compiled_index == 0U) &&
+                    (!Policy.server || receipt.progress == 0U);
+    });
+    return valid;
 }
 
 MMLTK_REFLECT_FIELDS(IntegrationCommandDirection)

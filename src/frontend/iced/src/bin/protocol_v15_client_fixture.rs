@@ -856,17 +856,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .encode()?,
     ));
     for (name, kind, generation, index) in [
-        ("IntegrationControl:capacity", generated::IntegrationControlKind::CapacityArmRequested, 0, 0),
-        ("IntegrationControl:visible-arm", generated::IntegrationControlKind::VisibleReadArmRequested, 0, 0),
-        ("IntegrationControl:visible-release", generated::IntegrationControlKind::VisibleReadReleaseRequested, 7, 0),
+        (
+            "IntegrationControl:capacity",
+            generated::IntegrationControlKind::CapacityArmRequested,
+            0,
+            0,
+        ),
+        (
+            "IntegrationControl:visible-arm",
+            generated::IntegrationControlKind::VisibleReadArmRequested,
+            0,
+            0,
+        ),
+        (
+            "IntegrationControl:visible-release",
+            generated::IntegrationControlKind::VisibleReadReleaseRequested,
+            7,
+            0,
+        ),
     ] {
-        records.push((name, generated::IntegrationControl {
-            protocolversion: generated::BROWSER_PROTOCOL_VERSION,
-            receipt: generated::IntegrationControlReceipt {
-                kind, sequence: 1, progress: 0, failureline: 0,
-                readgeneration: generation, compiledindex: index,
-            },
-        }.encode()?));
+        records.push((
+            name,
+            generated::IntegrationControl {
+                protocolversion: generated::BROWSER_PROTOCOL_VERSION,
+                receipt: generated::IntegrationControlReceipt {
+                    kind,
+                    sequence: 1,
+                    progress: 0,
+                    failureline: 0,
+                    readgeneration: generation,
+                    compiledindex: index,
+                },
+            }
+            .encode()?,
+        ));
     }
     for (kind, record) in records {
         write!(&mut output, "{kind} ")?;

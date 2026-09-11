@@ -87,7 +87,8 @@ class SystemImageRuntime final {
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
-    [[nodiscard]] std::shared_ptr<ImageWorkspace> CreateWorkspace(ImageWorkspaceLayout, std::optional<DeviceExecution> display_execution = {});
+    [[nodiscard]] std::shared_ptr<ImageWorkspace> CreateWorkspace(ImageWorkspaceLayout,
+                                                                  std::optional<DeviceExecution> display_execution = {});
     [[nodiscard]] bool ConfigureWorkspace(OutputCandidate&, std::shared_ptr<ImageWorkspace>);
     [[nodiscard]] bool PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
     [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>);

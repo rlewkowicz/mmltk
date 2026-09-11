@@ -119,7 +119,9 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
     }
     void Notify() noexcept {
         if (ready_) {
-            try { ready_(); } catch (...) {}
+            try {
+                ready_();
+            } catch (...) {}
         }
     }
     void Fail() noexcept {

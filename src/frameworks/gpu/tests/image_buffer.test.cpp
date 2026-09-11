@@ -1140,7 +1140,7 @@ TEST_CASE("external image readers await a delayed producer while retaining its e
     event_gate->Release();
     backend->CompleteEvents();
     CHECK(mmltk::testsupport::await_test_future(reading, "external reader completion") == 1U);
-    CHECK_THROWS_AS(stream.Await({}), std::invalid_argument);
+    CHECK_THROWS_AS(stream.Await(BorrowedImageProductReadView{}), std::invalid_argument);
     auto other = make_clean_semantic_runtime(std::make_shared<FakeImageBackend>());
     other.Publish(8U, 8U, [](auto, auto, auto) {});
     CHECK_THROWS_AS(stream.Await(other.Borrow()), std::invalid_argument);
@@ -1282,8 +1282,8 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
 
 TEST_CASE("retained candidates expose allocation-local storage without clear or baseline copy", "[gpu][product][retained]") {
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend,
-                                .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U});
+    SystemImageRuntime runtime(
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U});
     const auto fill = [](const std::uint8_t value) {
         return [value](auto clean, auto semantic, auto) {
             for (auto plane : {clean, semantic})
@@ -1396,8 +1396,8 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
 }
 
 TEST_CASE("Failed workspace construction closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
-    using test_support::ImageWorkspaceTestAccess;
     using test_support::ExportedImageBufferTestAccess;
+    using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
     auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
@@ -1406,8 +1406,9 @@ TEST_CASE("Failed workspace construction closes its runtime family only when cle
     ImageWorkspaceTestAccess::initialize_failure = initiating;
     ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
     std::exception_ptr failure;
-    try { static_cast<void>(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout())); }
-    catch (...) { failure = std::current_exception(); }
+    try {
+        static_cast<void>(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    } catch (...) { failure = std::current_exception(); }
     REQUIRE(failure);
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(is_image_execution_failure(failure));
@@ -1443,8 +1444,9 @@ TEST_CASE("Partial workspace stream construction retains display context and bot
     backend->FailAfter(FakeImageBackend::FailurePoint::CreateStream, 0U, initiating);
     backend->FailDeviceBinding(1, cleanup);
     std::exception_ptr failure;
-    try { static_cast<void>(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout())); }
-    catch (...) { failure = std::current_exception(); }
+    try {
+        static_cast<void>(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    } catch (...) { failure = std::current_exception(); }
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(test_support::ContainsImageFailure(failure, cleanup));
     CHECK(backend->contexts_created == 2U);
@@ -1487,8 +1489,7 @@ TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the 
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend,
-                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
     ImageWorkspaceTestAccess::Install(runtime);
     auto candidate = runtime.AcquireOutput();
     auto first = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
@@ -1542,12 +1543,9 @@ TEST_CASE("Late workspace preparation stays pending through raw and counted acce
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend,
-                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
     ImageWorkspaceTestAccess::Install(runtime);
-    runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
-        *reinterpret_cast<std::byte*>(clean.data) = std::byte{73};
-    });
+    runtime.Publish(4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
     auto observed = runtime.ObserveWorkspace();
     REQUIRE(observed.product_revision != 0U);
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
@@ -1592,16 +1590,14 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
-        .device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    auto runtime = std::make_unique<SystemImageRuntime>(
+        SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
     ImageWorkspaceTestAccess::Install(*runtime);
     auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto candidate = runtime->AcquireOutput();
     REQUIRE(runtime->ConfigureWorkspace(candidate, workspace));
-    runtime->Publish(candidate, 4U, 3U, [](auto clean, auto, auto) {
-        *reinterpret_cast<std::byte*>(clean.data) = std::byte{73};
-    });
+    runtime->Publish(candidate, 4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
     auto product = runtime->CommitOutput(std::move(candidate));
     const auto revision = product.revision();
     const auto address = product.BorrowWorkspace().plane().data;
@@ -1627,8 +1623,7 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend,
-                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
     ImageWorkspaceTestAccess::Install(runtime);
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
@@ -1662,11 +1657,13 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
     auto backend = std::make_shared<FakeImageBackend>();
     const auto initiating = std::make_exception_ptr(std::runtime_error("display finalizer failed after transfer"));
     const auto cleanup = std::make_exception_ptr(std::runtime_error("display completion unavailable"));
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
-        .workspace_finalize = [&](auto, auto, auto, auto, auto) {
-            backend->FailDeviceBinding(1, cleanup);
-            std::rethrow_exception(initiating);
-        }});
+    SystemImageRuntime runtime({.device = 0,
+                                .backend = backend,
+                                .output_layout = ImageProductLayout::CleanAndSemantic,
+                                .workspace_finalize = [&](auto, auto, auto, auto, auto) {
+                                    backend->FailDeviceBinding(1, cleanup);
+                                    std::rethrow_exception(initiating);
+                                }});
     ImageWorkspaceTestAccess::Install(runtime);
     runtime.Publish(4U, 3U, [](auto, auto, auto) {});
     auto completed = runtime.Completed();
@@ -1674,8 +1671,9 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     std::exception_ptr failure;
-    try { static_cast<void>(runtime.PrepareWorkspace(completed, workspace)); }
-    catch (...) { failure = std::current_exception(); }
+    try {
+        static_cast<void>(runtime.PrepareWorkspace(completed, workspace));
+    } catch (...) { failure = std::current_exception(); }
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(test_support::ContainsImageFailure(failure, cleanup));
     CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
@@ -1699,11 +1697,13 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
         ImageWorkspaceTestAccess::Reset();
         auto backend = std::make_shared<FakeImageBackend>();
         backend->peer_access = peer;
-        SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
-            .workspace_finalize = [](auto clean, auto semantic, auto destination, auto, auto) {
-                CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
-                test_support::CopyImagePlane(destination, clean);
-            }});
+        SystemImageRuntime runtime({.device = 0,
+                                    .backend = backend,
+                                    .output_layout = ImageProductLayout::CleanAndSemantic,
+                                    .workspace_finalize = [](auto clean, auto semantic, auto destination, auto, auto) {
+                                        CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
+                                        test_support::CopyImagePlane(destination, clean);
+                                    }});
         ImageWorkspaceTestAccess::Install(runtime);
         runtime.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
             for (const auto plane : {clean, semantic})
@@ -1771,9 +1771,15 @@ TEST_CASE("Workspace transfer routes preserve independent source and receiver pi
 }
 
 TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds", "[gpu][workspace]") {
-    ImageWorkspaceLayout layout{.device_incarnation = 7U, .device_uuid = {1U}, .device = 0,
-        .width = 4U, .height = 3U, .pitch_bytes = 32U, .offset_bytes = 128U, .required_allocation_bytes = 256U,
-        .alignment_bytes = 64U};
+    ImageWorkspaceLayout layout{.device_incarnation = 7U,
+                                .device_uuid = {1U},
+                                .device = 0,
+                                .width = 4U,
+                                .height = 3U,
+                                .pitch_bytes = 32U,
+                                .offset_bytes = 128U,
+                                .required_allocation_bytes = 256U,
+                                .alignment_bytes = 64U};
     REQUIRE(layout.valid());
     auto invalid = layout;
     invalid.offset_bytes = std::numeric_limits<std::size_t>::max() - 1U;
@@ -1804,14 +1810,20 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     if (!supported) SKIP("CUDA opaque-FD allocation is unavailable");
     CUuuid uuid{};
     REQUIRE(cuDeviceGetUuid(&uuid, 0) == CUDA_SUCCESS);
-    ImageWorkspaceLayout layout{.device_incarnation = 7U, .device = 0, .width = 4U, .height = 3U,
-        .pitch_bytes = 64U, .offset_bytes = 128U, .required_allocation_bytes = 4096U, .alignment_bytes = 256U};
+    ImageWorkspaceLayout layout{.device_incarnation = 7U,
+                                .device = 0,
+                                .width = 4U,
+                                .height = 3U,
+                                .pitch_bytes = 64U,
+                                .offset_bytes = 128U,
+                                .required_allocation_bytes = 4096U,
+                                .alignment_bytes = 256U};
     std::memcpy(layout.device_uuid.data(), uuid.bytes, layout.device_uuid.size());
     std::size_t finalizations = 0U;
     bool fail_finalization = false;
     SystemImageRuntimeConfig config{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop};
-    config.workspace_finalize = [&](ImagePlaneView clean, ImagePlaneView, ImagePlaneView destination,
-                                    ImageWorkspaceCoverage coverage, std::uintptr_t stream) {
+    config.workspace_finalize = [&](ImagePlaneView clean, ImagePlaneView, ImagePlaneView destination, ImageWorkspaceCoverage coverage,
+                                    std::uintptr_t stream) {
         CHECK(coverage.full_image);
         ++finalizations;
         CUDA_MEMCPY2D copy{};
@@ -1828,8 +1840,8 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     };
     SystemImageRuntime runtime(std::move(config));
     const auto fill = [](ImagePlaneView clean, ImagePlaneView, std::uintptr_t stream) {
-        REQUIRE(cuMemsetD2D8Async(clean.data, clean.descriptor.pitch_bytes, 37U, clean.descriptor.row_bytes(),
-                                 clean.descriptor.height, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+        REQUIRE(cuMemsetD2D8Async(clean.data, clean.descriptor.pitch_bytes, 37U, clean.descriptor.row_bytes(), clean.descriptor.height,
+                                  reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
     };
     runtime.Publish(4U, 3U, fill);
     auto completed = runtime.Completed();

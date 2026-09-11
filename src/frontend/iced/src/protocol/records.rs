@@ -673,15 +673,26 @@ mod tests {
     #[test]
     fn bootstrap_reply_and_event_decode_without_session_state() {
         let native = native_server_fixtures();
-        let controls: Vec<_> = native.iter().filter_map(|bytes| match decode_server(bytes).unwrap() {
-            ServerRecord::IntegrationControl(record) => Some(record),
-            _ => None,
-        }).collect();
-        assert!(controls.iter().all(|record| crate::generated::integration_receipt_valid(&record.receipt)
-            && crate::generated::integration_server_command(record.receipt.kind)
-            && record.encode().is_err()));
-        assert!(controls.iter().any(|record| record.receipt.kind == crate::generated::IntegrationControlKind::VisibleReadHeld
-            && record.receipt.readgeneration == 7 && record.receipt.compiledindex == 0));
+        let controls: Vec<_> = native
+            .iter()
+            .filter_map(|bytes| match decode_server(bytes).unwrap() {
+                ServerRecord::IntegrationControl(record) => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            controls
+                .iter()
+                .all(
+                    |record| crate::generated::integration_receipt_valid(&record.receipt)
+                        && crate::generated::integration_server_command(record.receipt.kind)
+                        && record.encode().is_err()
+                )
+        );
+        assert!(controls.iter().any(|record| record.receipt.kind
+            == crate::generated::IntegrationControlKind::VisibleReadHeld
+            && record.receipt.readgeneration == 7
+            && record.receipt.compiledindex == 0));
         assert!(
             matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
             if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2)

@@ -1937,8 +1937,7 @@ struct MmltkWorkspaceMailboxReceipt {
 struct MmltkWorkspacePhysicalReceipt {
     transfer_sequence: u64,
     snapshot: Option<MmltkWorkspaceFrameSnapshot>,
-    identity: Option<MmltkWorkspaceFrameIdentity>,
-    pixels: Option<MmltkWorkspacePixelReceipt>,
+    frame: Option<MmltkWorkspaceMailboxReceipt>,
 }
 
 #[derive(Default)]
@@ -2384,8 +2383,9 @@ fn submit_mmltk_workspace_transfer(
     }
     let pending = entry.physical_receipts.iter_mut().find(|pending| pending.is_none())
         .ok_or(vk::Result::ERROR_UNKNOWN)?;
+    let receipt = MmltkWorkspaceMailboxReceipt { identity, pixels };
     *pending = Some((reserved.map(|(_, slot)| slot), MmltkWorkspacePhysicalReceipt {
-        transfer_sequence: snapshot.transfer_sequence, snapshot: Some(snapshot), identity: Some(identity), pixels }));
+        transfer_sequence: snapshot.transfer_sequence, snapshot: Some(snapshot), frame: Some(receipt) }));
     let Some((identity, slot)) = reserved else {
         if let Some(identity) = visible_identity {
             let retry_required = mailboxes.note_capacity_exhausted(identity);
@@ -2403,7 +2403,6 @@ fn submit_mmltk_workspace_transfer(
         }
         return Ok(());
     };
-    let receipt = MmltkWorkspaceMailboxReceipt { identity, pixels };
     if !mailboxes.occupy(receipt, slot) {
         return Err(vk::Result::ERROR_UNKNOWN);
     }
@@ -2654,8 +2653,8 @@ fn service_mmltk_workspace_admissions(
             || receipt.snapshot.is_some_and(|snapshot|
             snapshot.content_session != session || snapshot.content_sequence != sequence || snapshot.presentation_revision != revision)
             || slot.is_some_and(|slot| slot >= MMLTK_WORKSPACE_MAILBOX_SLOTS as u32
-                || receipt.snapshot.and_then(|snapshot| snapshot.identity()) != receipt.identity
-                || receipt.identity.is_none()) {
+                || receipt.snapshot.and_then(|snapshot| snapshot.identity()) != receipt.frame.map(|frame| frame.identity)
+                || receipt.frame.is_none()) {
             mmltk_workspace_channel::fail(); return;
         }
         let (slot, receipt) = entry.physical_receipts[index].take().unwrap();
@@ -2669,8 +2668,9 @@ fn service_mmltk_workspace_admissions(
         };
         let arena = &entry.arena;
         let snapshot = receipt.snapshot.unwrap();
-        if let (Some(pixels), Some(probe)) = (receipt.pixels, &entry.blit.pixels) {
-            probe.report(arena.surface_id, receipt.identity.unwrap(), slot, pixels);
+        let frame = receipt.frame.unwrap();
+        if let (Some(pixels), Some(probe)) = (frame.pixels, &entry.blit.pixels) {
+            probe.report(arena.surface_id, frame.identity, slot, pixels);
         }
         unsafe { wgpu_parent_external_texture_frame_ready(shared.owner, arena.device_id,
             arena.surface_id.high, arena.surface_id.low, 0, slot, session, sequence, revision,
@@ -2825,7 +2825,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                         // sufficient to retain the exact release obligation.
                                         *pending = Some((None, MmltkWorkspacePhysicalReceipt {
                                             transfer_sequence: entry.next_transfer_sequence,
-                                            snapshot, identity: None, pixels: None }));
+                                            snapshot, frame: None }));
                                         entry.next_transfer_sequence += 1;
                                     }
                                     Ok(None) => {}
@@ -4256,6 +4256,11 @@ impl Global {
         image: vk::Image,
         admission: &mut mmltk_workspace_channel::Admission,
     ) -> Result<vk::DeviceMemory, MmltkWorkspaceImportError> {
+        if admission.modifier != mmltk_workspace_channel::MODIFIER_LINEAR {
+            return Err(MmltkWorkspaceImportError::code(
+                mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR,
+            ));
+        }
         let unimportable =
             || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT);
         let device = hal_device.raw_device();

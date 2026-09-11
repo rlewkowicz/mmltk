@@ -233,8 +233,7 @@ SystemImageRuntime::Retirement SystemImageRuntime::Retire() noexcept {
     }
     const auto workspaces = retention_->workspaces->Retire();
     failure = combine_image_failures(failure, workspaces.failure);
-    if (!workspaces.completion_reached)
-        return {.failure = failure, .custody = Retain(failure, !workspaces.failure)};
+    if (!workspaces.completion_reached) return {.failure = failure, .custody = Retain(failure, !workspaces.failure)};
     state_->retired = true;
     return {.safe_to_destroy = true, .failure = failure};
 }
@@ -283,11 +282,9 @@ std::shared_ptr<ImageWorkspace> SystemImageRuntime::CreateWorkspace(ImageWorkspa
     auto& state = ActiveState();
     retention_->workspaces->Check();
     try {
-        return std::shared_ptr<ImageWorkspace>(new ImageWorkspace(retention_->workspaces, *state.context, std::move(layout),
-                                                                 std::move(execution), workspace_operations_));
-    } catch (...) {
-        std::rethrow_exception(combine_image_failures(std::current_exception(), retention_->workspaces->failure()));
-    }
+        return std::shared_ptr<ImageWorkspace>(
+            new ImageWorkspace(retention_->workspaces, *state.context, std::move(layout), std::move(execution), workspace_operations_));
+    } catch (...) { std::rethrow_exception(combine_image_failures(std::current_exception(), retention_->workspaces->failure())); }
 }
 bool SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
     auto& state = ActiveState();

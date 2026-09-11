@@ -64,10 +64,10 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
                     .is_some_and(|current| current.dataset.identity == value.dataset.identity)
         }) {
             if let Some(snapshot) = snapshot
-                && selected
-                    .as_ref()
-                    .is_some_and(|value| snapshot.revision > value.revision
-                        && snapshot.gallery.layout == value.gallery.layout)
+                && selected.as_ref().is_some_and(|value| {
+                    snapshot.revision > value.revision
+                        && snapshot.gallery.layout == value.gallery.layout
+                })
             {
                 *selected = Some(Arc::new(snapshot.clone()));
             }
@@ -222,7 +222,8 @@ pub(super) fn row_offset(layout: Placement, snapshot: &ExploreSnapshot, width: f
             columns, first_row, ..
         } => {
             width
-                * (snapshot.gallery.layout.firstrow as f32 / snapshot.gallery.layout.columns.max(1) as f32
+                * (snapshot.gallery.layout.firstrow as f32
+                    / snapshot.gallery.layout.columns.max(1) as f32
                     - first_row as f32 / columns.max(1) as f32)
         }
         Placement::Contain => 0.0,
@@ -517,7 +518,10 @@ mod tests {
         snapshot.frame.extent.height = 800;
         crate::view_model::test_support::gallery_layout(&mut snapshot);
         snapshot.gallery.layout.roworigin = 7;
-        let physical = FrameReady { content_height: 800, ..frame_ready() };
+        let physical = FrameReady {
+            content_height: 800,
+            ..frame_ready()
+        };
         assert!(matches(&snapshot, physical));
         select(Some(&snapshot), &snapshot.frame);
         confirm(physical, &snapshot.frame, Some(&snapshot));
@@ -529,12 +533,18 @@ mod tests {
         observe(Some(&replacement), false);
         select(Some(&replacement), &replacement.frame);
         confirm(physical, &replacement.frame, Some(&replacement));
-        assert_eq!(matching(Some(physical)).unwrap().gallery.layout.roworigin, 7);
+        assert_eq!(
+            matching(Some(physical)).unwrap().gallery.layout.roworigin,
+            7
+        );
         replacement.frame.revision += 1;
         replacement.viewport.rowcount = 6;
         replacement.viewport.extent.height = 600;
         replacement.gallery.layout.rowcount = 6;
-        let newer = FrameReady { content_sequence: replacement.frame.revision, ..physical };
+        let newer = FrameReady {
+            content_sequence: replacement.frame.revision,
+            ..physical
+        };
         select(Some(&replacement), &replacement.frame);
         confirm(newer, &replacement.frame, Some(&replacement));
         assert_eq!(matching(Some(newer)).unwrap().gallery.layout.rowcount, 6);

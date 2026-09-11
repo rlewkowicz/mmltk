@@ -185,36 +185,34 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
 [[nodiscard]] inline bool valid(const Record& record) noexcept {
     const bool known = record.opcode == Opcode::Import || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready ||
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
-                       record.opcode == Opcode::Completed || record.opcode == Opcode::Retired ||
-                       record.opcode == Opcode::Arena || record.opcode == Opcode::ArenaReady || record.opcode == Opcode::CopyCompleted;
+                       record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
+                       record.opcode == Opcode::ArenaReady || record.opcode == Opcode::CopyCompleted;
     if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
-        record.descriptors != descriptor_count(record.opcode) ||
-        (record.id_high == 0U && record.id_low == 0U)) {
+        record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
         return false;
     }
     const bool empty_extent = record.width == 0U && record.height == 0U && record.stride == 0U && record.size == 0U;
     bool uuid_valid = false;
-    for (const auto byte : record.device_uuid) uuid_valid = uuid_valid || byte != 0U;
+    for (const auto byte : record.device_uuid)
+        uuid_valid = uuid_valid || byte != 0U;
     const bool empty_layout = record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
-                              record.device_incarnation == 0U && (record.offset == 0U || record.opcode == Opcode::CopyCompleted) && record.alignment == 0U &&
-                              !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U;
+                              record.device_incarnation == 0U && (record.offset == 0U || record.opcode == Opcode::CopyCompleted) &&
+                              record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U;
     if (record.opcode != Opcode::Import && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
-    const bool layout_valid = record.width != 0U && record.height != 0U &&
-                        record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
-                        record.offset <= record.size && record.stride != 0U &&
-                        record.height <= (record.size - record.offset) / record.stride &&
-                        record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
-                        record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) &&
-                        record.device_incarnation != 0U && uuid_valid &&
-                        record.dedicated <= 1U && record.memory_type_bits != 0U;
+    const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
+                              record.offset <= record.size && record.stride != 0U &&
+                              record.height <= (record.size - record.offset) / record.stride && record.alignment != 0U &&
+                              (record.alignment & (record.alignment - 1U)) == 0U &&
+                              record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) &&
+                              record.device_incarnation != 0U && uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U;
     switch (record.opcode) {
         case Opcode::Import: {
             return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) &&
                    record.code == 0U && record.modifier == kModifierLinear && record.presentation_revision == 0U;
         }
         case Opcode::Arena:
-            return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U &&
-                   record.code == 0U && record.presentation_revision == 0U;
+            return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U && record.code == 0U &&
+                   record.presentation_revision == 0U;
         case Opcode::ArenaReady:
             return layout_valid && record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
                    record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;

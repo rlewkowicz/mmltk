@@ -125,25 +125,25 @@ namespace mmltk::controller::browser {
 namespace {
 
 enum class IntegrationPolicyBaseline : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+    Command[[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
 };
 enum class IntegrationPolicyUnchanged : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+    Command[[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
 };
 enum class IntegrationPolicyServer : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{true, false, false}]] = 7U,
+    Command[[= contracts::IntegrationCommandDirection{true, false, false}]] = 7U,
 };
 enum class IntegrationPolicyReadGeneration : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{false, true, false}]] = 7U,
+    Command[[= contracts::IntegrationCommandDirection{false, true, false}]] = 7U,
 };
 enum class IntegrationPolicyCompiledIndex : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{false, false, true}]] = 7U,
+    Command[[= contracts::IntegrationCommandDirection{false, false, true}]] = 7U,
 };
 enum class IntegrationPolicyRenamed : std::uint8_t {
-    Renamed [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+    Renamed[[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
 };
 enum class IntegrationPolicyReassigned : std::uint8_t {
-    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 8U,
+    Command[[= contracts::IntegrationCommandDirection{false, false, false}]] = 8U,
 };
 
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::OrphanSettings>());
@@ -1336,12 +1336,14 @@ TEST_CASE("protocol-15 Bootstrap contains fingerprint and current snapshots only
 }  // namespace
 }  // namespace mmltk::controller::browser
 
-TEST_CASE("Workspace graphics projection derives every native field offset without application codecs", "[browser][workspace][generation]") {
+TEST_CASE("Workspace graphics projection derives every native field offset without application codecs",
+          "[browser][workspace][generation]") {
     std::ostringstream output;
     mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
     const auto generated = output.str();
     CHECK(generated.find("pub const ABI_VERSION: u32 = " +
-        std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") != std::string::npos);
+                         std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") !=
+          std::string::npos);
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
     CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);

@@ -107,18 +107,23 @@ struct ImageWorkspaceTestAccess final {
         ExportedImageBufferTestAccess::Reset();
     }
     [[nodiscard]] static ImageWorkspaceLayout Layout(const int device = 1) noexcept {
-        return {.device_incarnation = 7U, .device_uuid = {1U}, .device = device,
-                .width = 4U, .height = 3U, .pitch_bytes = 64U,
-                .required_allocation_bytes = 4096U, .alignment_bytes = 64U};
+        return {.device_incarnation = 7U,
+                .device_uuid = {1U},
+                .device = device,
+                .width = 4U,
+                .height = 3U,
+                .pitch_bytes = 64U,
+                .required_allocation_bytes = 4096U,
+                .alignment_bytes = 64U};
     }
+
    private:
     static void Initialize(ExportedImageBuffer& buffer, const ImageWorkspaceLayout& layout) {
         ++initialized;
         ExportedImageBufferTestAccess::AdoptWorkspace(buffer, layout);
         if (initialize_failure) std::rethrow_exception(initialize_failure);
     }
-    static inline const ImageWorkspace::Operations operations{
-        &Initialize, &ExportedImageBufferTestAccess::ReleaseWorkspace};
+    static inline const ImageWorkspace::Operations operations{&Initialize, &ExportedImageBufferTestAccess::ReleaseWorkspace};
 };
 
 inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {

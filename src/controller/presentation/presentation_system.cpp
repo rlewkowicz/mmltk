@@ -293,8 +293,7 @@ class PresentationSystem::Impl final {
         const PresentationNativeOutcome outcome = writer_->Pump(pump_generation);
         pump_span.FinishWith([&](auto& fact) { fact.detail = static_cast<std::uint64_t>(outcome.progress); });
         bool superseded_source_advanced = false;
-        if (outcome.progress == PresentationNativeProgress::Superseded &&
-            outcome.submitted.selection_generation == pump_generation) {
+        if (outcome.progress == PresentationNativeProgress::Superseded && outcome.submitted.selection_generation == pump_generation) {
             const auto source = Find(outcome.submitted.observation.frame.source);
             if (source != sources_.end()) {
                 const auto latest = source->observe();

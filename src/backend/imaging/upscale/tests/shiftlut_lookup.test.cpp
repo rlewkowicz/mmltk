@@ -88,9 +88,7 @@ class CaptureIdentityKernel final {
             status = cudaMemcpyAsync(output.GetTensorMutableData<float>(), input.GetTensorData<float>(), sizeof(float),
                                      cudaMemcpyDeviceToDevice, stream);
             return status == cudaSuccess ? nullptr : Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, cudaGetErrorString(status));
-        } catch (const std::exception& error) {
-            return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what());
-        } catch (...) {
+        } catch (const std::exception& error) { return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what()); } catch (...) {
             return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, "capture fixture failed");
         }
     }
@@ -111,9 +109,7 @@ struct CaptureIdentityOperator final : Ort::CustomOpBase<CaptureIdentityOperator
         try {
             *result = new CaptureIdentityKernel(observation_);
             return nullptr;
-        } catch (const std::exception& error) {
-            return api.CreateStatus(ORT_RUNTIME_EXCEPTION, error.what());
-        }
+        } catch (const std::exception& error) { return api.CreateStatus(ORT_RUNTIME_EXCEPTION, error.what()); }
     }
 
    private:
@@ -197,9 +193,11 @@ TEST_CASE("ONNX graph capture permits independent worker allocation and retains 
         const auto selected = cudaSetDevice(0);
         if (selected != cudaSuccess) throw std::runtime_error(cudaGetErrorString(selected));
         Ort::RunOptions run;
-        for (int iteration = 0; iteration < 3; ++iteration) session.Run(run, binding);
+        for (int iteration = 0; iteration < 3; ++iteration)
+            session.Run(run, binding);
         const auto captured_calls = observation.calls;
-        for (int iteration = 0; iteration < 3; ++iteration) session.Run(run, binding);
+        for (int iteration = 0; iteration < 3; ++iteration)
+            session.Run(run, binding);
         return std::pair{captured_calls, observation.calls};
     });
     const mmltk::testsupport::ScopedTestCleanup settle_capture{[&] { capture.Release(); }};

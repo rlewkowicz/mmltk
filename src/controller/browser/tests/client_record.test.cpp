@@ -177,12 +177,13 @@ TEST_CASE("browser client records are one complete canonical CBOR item", "[contr
 TEST_CASE("integration control retains typed direction and sequence validation", "[controller][browser][protocol]") {
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     wire::ByteBuffer encoded;
-    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^Kind))) {
-        constexpr auto kind = std::meta::extract<Kind>(enumerator);
-        constexpr auto policy = mmltk::controller::contracts::integration_command_direction<kind>();
-        const IntegrationControl source{.receipt = {.kind = kind, .sequence = 3U,
-            .progress = policy.server ? 0U : 5U, .failureline = kind == Kind::Failed ? 123U : 0U,
-            .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}};
+    mmltk::controller::contracts::visit_integration_commands([&]<auto kind, auto policy>(auto) {
+        const IntegrationControl source{.receipt = {.kind = kind,
+                                                    .sequence = 3U,
+                                                    .progress = policy.server ? 0U : 5U,
+                                                    .failureline = kind == Kind::Failed ? 123U : 0U,
+                                                    .read_generation = policy.read_generation ? 7U : 0U,
+                                                    .compiled_index = 0U}};
         if constexpr (policy.server) {
             REQUIRE(encode_server_record(ServerRecord{source}, encoded));
             const auto decoded = decode_server_record({.first = encoded, .second = {}});
@@ -204,7 +205,7 @@ TEST_CASE("integration control retains typed direction and sequence validation",
         invalid = source.receipt;
         invalid.compiled_index = 9U;
         CHECK(mmltk::controller::contracts::integration_receipt_valid(invalid) == policy.compiled_index);
-    }
+    });
     CHECK_FALSE(encode_client_record(ClientRecord{IntegrationControl{.receipt = {.kind = Kind::Settled}}}, encoded));
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
@@ -214,7 +215,7 @@ TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[con
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
     REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) ==
-        7U + annotation_alternatives);
+            7U + annotation_alternatives);
     for (const auto* name : {"IntegrationControl:capacity", "IntegrationControl:visible-arm", "IntegrationControl:visible-release"}) {
         const auto decoded = decode_client_record({.first = fixture_named(fixtures, name).bytes, .second = {}});
         REQUIRE(decoded);
@@ -683,9 +684,18 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
 
 TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
     namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
-    abi::Record record{.id_high = 1U, .width = 4U, .height = 3U, .stride = 32U, .size = 96U,
-                       .descriptors = abi::kImportDescriptorCount, .arena_high = 2U, .allocation_identity = 3U,
-                       .device_incarnation = 4U, .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    abi::Record record{.id_high = 1U,
+                       .width = 4U,
+                       .height = 3U,
+                       .stride = 32U,
+                       .size = 96U,
+                       .descriptors = abi::kImportDescriptorCount,
+                       .arena_high = 2U,
+                       .allocation_identity = 3U,
+                       .device_incarnation = 4U,
+                       .alignment = 32U,
+                       .device_uuid = {1U},
+                       .memory_type_bits = 1U};
     REQUIRE(abi::valid(record));
     record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
     CHECK_FALSE(abi::valid(record));
@@ -707,9 +717,17 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
     REQUIRE(abi::valid(arena));
     arena.allocation_identity = 1U;
     CHECK_FALSE(abi::valid(arena));
-    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = 1U, .width = 4U, .height = 3U,
-                       .stride = 32U, .size = 128U, .device_incarnation = 2U, .offset = 32U,
-                       .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+                       .id_high = 1U,
+                       .width = 4U,
+                       .height = 3U,
+                       .stride = 32U,
+                       .size = 128U,
+                       .device_incarnation = 2U,
+                       .offset = 32U,
+                       .alignment = 32U,
+                       .device_uuid = {1U},
+                       .memory_type_bits = 1U};
     REQUIRE(abi::valid(layout));
     SECTION("subresource offset is included in allocation bounds") {
         ++layout.offset;
@@ -723,8 +741,8 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         layout.alignment = 3U;
         CHECK_FALSE(abi::valid(layout));
     }
-    abi::Record completed{.opcode = abi::Opcode::CopyCompleted, .id_high = 3U,
-                          .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
+    abi::Record completed{
+        .opcode = abi::Opcode::CopyCompleted, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
     REQUIRE(abi::valid(completed));
     SECTION("source completion requires a physical transfer") {
         completed.offset = 0U;

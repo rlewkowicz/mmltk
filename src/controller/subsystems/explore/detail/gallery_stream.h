@@ -50,7 +50,8 @@ struct GalleryProductState final {
 // owner must also retain the immutable annotated-index span's backing storage.
 class GalleryStream final {
    public:
-    GalleryStream(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution&, const ExploreNativeConfiguration&, std::uint32_t maximum_height);
+    GalleryStream(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution&, const ExploreNativeConfiguration&,
+                  std::uint32_t maximum_height);
     ~GalleryStream();
     [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);

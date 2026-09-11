@@ -145,6 +145,10 @@ impl GalleryGeometry {
             card_extent,
         })
     }
+
+    pub(crate) fn viewport(&self) -> &crate::generated::ExploreViewport {
+        &self.viewport
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1182,8 +1186,14 @@ mod tests {
         let mut snapshot = displayed_gallery_snapshot();
         snapshot.viewport.rowcount = 5;
         snapshot.viewport.firstrow = 7;
-        snapshot.viewport.extent = VisualExtent { width: 400, height: 500 };
-        snapshot.frame.extent = VisualExtent { width: 400, height: 800 };
+        snapshot.viewport.extent = VisualExtent {
+            width: 400,
+            height: 500,
+        };
+        snapshot.frame.extent = VisualExtent {
+            width: 400,
+            height: 800,
+        };
         snapshot.order.visibleindices = (28..47).collect();
         snapshot.gallery.slots = vec![true; 19];
         crate::view_model::test_support::gallery_layout(&mut snapshot);

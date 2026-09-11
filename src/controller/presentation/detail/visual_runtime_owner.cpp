@@ -331,8 +331,7 @@ void VisualRuntimeOwner::ServiceWorkspace() {
     if (!candidate.workspace && observed.workspace && observed.workspace->layout() == request->layout &&
         observed.workspace->identity() == request->admitted_allocation)
         candidate = observed;
-    if (!candidate.workspace || candidate.product_owner != observed.product_owner ||
-        candidate.workspace->layout() != request->layout) {
+    if (!candidate.workspace || candidate.product_owner != observed.product_owner || candidate.workspace->layout() != request->layout) {
         if (request->admitted_allocation != 0U) return;
         if (candidate.workspace) candidate.workspace->Withdraw();
         candidate = observed;
@@ -343,8 +342,7 @@ void VisualRuntimeOwner::ServiceWorkspace() {
         }
     }
     if (request->admitted_allocation == candidate.workspace->identity()) {
-        if (!candidate.workspace->admitted())
-            candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
+        if (!candidate.workspace->admitted()) candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
         workspace_retry_.store(true, std::memory_order_release);
         if (!runtime_->PrepareWorkspace(observed, candidate.workspace)) return;
         workspace_retry_.store(false, std::memory_order_release);
@@ -372,19 +370,19 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         auto created = factory_(product_revision_sequence_);
         if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
         created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
-                if (const auto gate = wake.lock()) {
-                    std::scoped_lock lock(gate->mutex);
-                    if (gate->owner && gate->owner->workspace_retry_.load(std::memory_order_acquire)) {
-                        gate->owner->workspace_pending_.store(true, std::memory_order_release);
-                        gate->owner->worker_.Wake();
-                    }
-                    if (gate->owner && gate->retry_armed) {
-                        const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
-                        if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
-                            gate->owner->worker_.Wake();
-                    }
+            if (const auto gate = wake.lock()) {
+                std::scoped_lock lock(gate->mutex);
+                if (gate->owner && gate->owner->workspace_retry_.load(std::memory_order_acquire)) {
+                    gate->owner->workspace_pending_.store(true, std::memory_order_release);
+                    gate->owner->worker_.Wake();
                 }
-            });
+                if (gate->owner && gate->retry_armed) {
+                    const auto prior = gate->owner->continuation_state_.fetch_or(kOutputRetryPending, std::memory_order_acq_rel);
+                    if ((prior & kContinuationEnabled) != 0U && (prior & (kContinuationPending | kOutputRetryPending)) == 0U)
+                        gate->owner->worker_.Wake();
+                }
+            }
+        });
         {
             std::scoped_lock lock(mutex_);
             if (!stopping_ && !stopped()) destination = std::move(created);
@@ -446,9 +444,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_stop_ = ordered_work ? ordered_work->stop : std::stop_source{};
         active_outcome_ = ActiveOutcome::Running;
         active_discrete_ = discrete;
-        active_preserves_input_ =
-            (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
-            (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
+        active_preserves_input_ = (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
+                                  (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
         operation_stop = active_stop_.get_token();
     }
     Observe(ActivityStage::WorkSelected, ordered_work ? 1U : (latest_work ? 2U : (continuation_work ? 3U : 0U)));
@@ -610,7 +607,9 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
     }
     Observe(ActivityStage::RetirementCompleted, safe ? 1U : 0U);
     if (workspace_ready) {
-        try { workspace_ready(); } catch (...) {}
+        try {
+            workspace_ready();
+        } catch (...) {}
     }
     return failure;
 }

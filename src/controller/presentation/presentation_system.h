@@ -23,11 +23,11 @@ namespace mmltk::controller {
 
 struct VisualSourceReader final {
     PresentationSourceIdentity source{};
-    std::function<VisualSourceObservation()> observe;
-    std::function<mmltk::frameworks::gpu::BorrowedImageProductReadView()> borrow;
-    std::function<mmltk::frameworks::gpu::ImageWorkspaceObservation()> observe_workspace;
-    std::function<mmltk::frameworks::gpu::BorrowedImageWorkspace()> borrow_workspace;
-    std::function<void(VisualWorkspaceRequest)> request_workspace;
+    std::function<VisualSourceObservation()> observe{};
+    std::function<mmltk::frameworks::gpu::BorrowedImageProductReadView()> borrow{};
+    std::function<mmltk::frameworks::gpu::ImageWorkspaceObservation()> observe_workspace{};
+    std::function<mmltk::frameworks::gpu::BorrowedImageWorkspace()> borrow_workspace{};
+    std::function<void(VisualWorkspaceRequest)> request_workspace{};
 };
 struct RendererObservation final {
     std::uint64_t completed_sample = 0U;
@@ -140,6 +140,7 @@ class PresentationAcceptanceGate final {
     [[nodiscard]] bool Hold(Receipt);
     void ObserveCapacity();
     void Stop() noexcept;
+
    private:
     std::mutex mutex_;
     std::function<void()> wake_;

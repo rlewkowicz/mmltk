@@ -1328,11 +1328,10 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
                snapshot.gallery.slots.size() == 4U && snapshot.gallery.slots[0] && snapshot.gallery.slots[1] &&
                audit.last_tile_generation() == audit.last_placeholder_generation();
     });
-    INFO("discarded=" << reads.discarded.load() << " baseline=" << discarded << " reused=" << audit.reused_tiles()
-                       << " baseline=" << reused << " slots=" << system.snapshot().gallery.slots.size()
-                       << " ready slots=" << std::ranges::count(system.snapshot().gallery.slots, true)
-                       << " tile generation=" << audit.last_tile_generation()
-                       << " placeholder generation=" << audit.last_placeholder_generation());
+    INFO("discarded=" << reads.discarded.load() << " baseline=" << discarded << " reused=" << audit.reused_tiles() << " baseline=" << reused
+                      << " slots=" << system.snapshot().gallery.slots.size() << " ready slots="
+                      << std::ranges::count(system.snapshot().gallery.slots, true) << " tile generation=" << audit.last_tile_generation()
+                      << " placeholder generation=" << audit.last_placeholder_generation());
     REQUIRE(replacement_ready);
     INFO(audit.failure_detail());
     REQUIRE_FALSE(audit.failed());

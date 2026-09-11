@@ -21,17 +21,16 @@ bool ImageWorkspaceLayout::valid() const noexcept {
     return format == ImageFormat::Rgba8 && device >= 0 && device_incarnation != 0U && width != 0U && height != 0U &&
            width <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
            height <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
-           std::ranges::any_of(device_uuid, [](auto byte) { return byte != 0U; }) &&
-           pitch_bytes >= static_cast<std::size_t>(width) * 4U && alignment_bytes != 0U &&
-           (alignment_bytes & (alignment_bytes - 1U)) == 0U &&
-           height <= (maximum - offset_bytes) / pitch_bytes &&
+           std::ranges::any_of(device_uuid, [](auto byte) { return byte != 0U; }) && pitch_bytes >= static_cast<std::size_t>(width) * 4U &&
+           alignment_bytes != 0U && (alignment_bytes & (alignment_bytes - 1U)) == 0U && height <= (maximum - offset_bytes) / pitch_bytes &&
            required_allocation_bytes >= offset_bytes + pitch_bytes * height;
 }
 
 namespace {
 [[nodiscard]] std::exception_ptr workspace_release_failure(const char* message) noexcept {
-    try { throw ImageStreamExecutionFailure(std::make_exception_ptr(std::runtime_error(message))); }
-    catch (...) { return std::current_exception(); }
+    try {
+        throw ImageStreamExecutionFailure(std::make_exception_ptr(std::runtime_error(message)));
+    } catch (...) { return std::current_exception(); }
 }
 
 void initialize_workspace_allocation(ExportedImageBuffer& allocation, const ImageWorkspaceLayout& layout) {
@@ -40,8 +39,9 @@ void initialize_workspace_allocation(ExportedImageBuffer& allocation, const Imag
         std::memcmp(uuid.bytes, layout.device_uuid.data(), layout.device_uuid.size()) != 0)
         throw std::invalid_argument("workspace physical device UUID mismatch");
     std::string error;
-    if (!allocation.allocate(layout.device, layout.width, layout.height, layout.pitch_bytes,
-                             layout.required_allocation_bytes, &error, layout.offset_bytes)) throw std::runtime_error(error);
+    if (!allocation.allocate(layout.device, layout.width, layout.height, layout.pitch_bytes, layout.required_allocation_bytes, &error,
+                             layout.offset_bytes))
+        throw std::runtime_error(error);
 }
 }  // namespace
 
@@ -86,15 +86,19 @@ void ImageWorkspace::Owner::Notify() const noexcept {
         sink = retirement_sink_;
     }
     if (sink) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 
 struct ImageWorkspace::State final {
     State(std::shared_ptr<Owner> family, ImageWorkspaceLayout requested, const Operations* injected)
-        : owner(std::move(family)), layout(std::move(requested)),
-          operations(injected ? *injected : Operations{&initialize_workspace_allocation,
-                     [](ExportedImageBuffer& buffer) noexcept { return buffer.Release(); }}) {}
+        : owner(std::move(family)),
+          layout(std::move(requested)),
+          operations(injected ? *injected : Operations{&initialize_workspace_allocation, [](ExportedImageBuffer& buffer) noexcept {
+                                                           return buffer.Release();
+                                                       }}) {}
     void Initialize(DeviceContext source, std::optional<DeviceExecution> execution) {
         identity = next_image_allocation_identity();
         if (!layout.valid()) throw std::invalid_argument("workspace layout is invalid");
@@ -144,9 +148,7 @@ ImageWorkspace::ImageWorkspace(std::shared_ptr<Owner> owner, DeviceContext sourc
     }
     try {
         state_->Initialize(std::move(source), std::move(execution));
-    } catch (...) {
-        std::rethrow_exception(Release(std::current_exception()));
-    }
+    } catch (...) { std::rethrow_exception(Release(std::current_exception())); }
 }
 ImageWorkspace::~ImageWorkspace() noexcept { static_cast<void>(Release()); }
 std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexcept {
@@ -214,7 +216,8 @@ std::uint64_t ImageWorkspace::revision() const noexcept { return state_->revisio
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
     if (width == 0U || height == 0U || width > layout().width || height > layout().height)
         throw std::invalid_argument("workspace logical extent exceeds capacity");
-    return {state_->allocation->data(), {ImagePlaneKind::Clean, ImageFormat::Rgba8, width, height, layout().pitch_bytes},
+    return {state_->allocation->data(),
+            {ImagePlaneKind::Clean, ImageFormat::Rgba8, width, height, layout().pitch_bytes},
             {identity(), layout().width, layout().height, identity()}};
 }
 mmltk::common::io::ScopedFd ImageWorkspace::ExportDescriptor() const {
@@ -227,8 +230,7 @@ void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t devi
     std::scoped_lock lock(state_->access);
     std::scoped_lock owner_lock(state_->owner->mutex_);
     if (state_->owner->failure_) std::rethrow_exception(state_->owner->failure_);
-    if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire))
-        throw std::runtime_error("workspace owner is retired");
+    if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire)) throw std::runtime_error("workspace owner is retired");
     if (allocation_identity != identity() || device_incarnation != layout().device_incarnation || state_->admitted)
         throw std::invalid_argument("workspace admission identity mismatch or duplicate");
     state_->admitted = true;
@@ -245,7 +247,7 @@ ImageStreamSettlement ImageWorkspace::Settle() noexcept {
     return settled;
 }
 void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspaceCoverage coverage,
-                               const ImageWorkspaceFinalize& finalize) {
+                              const ImageWorkspaceFinalize& finalize) {
     CheckOwner();
     std::scoped_lock lock(state_->access);
     if (!admitted() || !source.valid() || state_->unsettled_source) throw std::invalid_argument("workspace source is unavailable");
@@ -323,9 +325,7 @@ const ImageWorkspaceLayout& BorrowedImageWorkspace::layout() const {
 }
 std::uint64_t BorrowedImageWorkspace::identity() const noexcept { return valid() ? lease_->workspace->identity() : 0U; }
 std::uint64_t BorrowedImageWorkspace::revision() const noexcept { return valid() ? lease_->revision : 0U; }
-std::size_t BorrowedImageWorkspace::allocation_bytes() const noexcept {
-    return valid() ? lease_->workspace->allocation_bytes() : 0U;
-}
+std::size_t BorrowedImageWorkspace::allocation_bytes() const noexcept { return valid() ? lease_->workspace->allocation_bytes() : 0U; }
 mmltk::common::io::ScopedFd BorrowedImageWorkspace::ExportDescriptor() const {
     if (!valid()) throw std::invalid_argument("workspace borrow is unavailable");
     return lease_->workspace->ExportDescriptor();

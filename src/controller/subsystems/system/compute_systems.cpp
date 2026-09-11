@@ -441,6 +441,7 @@ void publish_prediction_product(mmltk::frameworks::gpu::SystemImageRuntime& runt
 
 class PredictSystem::Impl final {
     friend class PredictSystem;
+
    public:
     Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual,
          PredictRuntimeFactory factory, SystemEventSink<event_type> events)

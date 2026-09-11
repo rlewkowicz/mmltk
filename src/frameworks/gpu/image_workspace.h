@@ -57,7 +57,7 @@ struct ImageWorkspaceCoverage final {
     bool full_image = true;
 };
 using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
-                                                 ImageWorkspaceCoverage, std::uintptr_t stream)>;
+                                                  ImageWorkspaceCoverage, std::uintptr_t stream)>;
 
 // One physical CUDA opaque-FD allocation and its display-device execution.
 // Admission precedes writes; raw products and browser imports have their own
@@ -91,6 +91,7 @@ class ImageWorkspace final {
         [[nodiscard]] ImageStreamSettlement Retire() noexcept;
         [[nodiscard]] bool has_live_workspaces() const noexcept;
         void SetRetirementSink(std::shared_ptr<const std::function<void()>>) noexcept;
+
        private:
         mutable std::mutex mutex_;
         std::exception_ptr failure_;

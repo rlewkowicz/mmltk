@@ -105,7 +105,8 @@ TEST_CASE("Gallery cache identity survives five six five demand and reorder with
     std::array<std::uint32_t, 14U> images{};
     std::iota(images.begin(), images.end(), 0U);
     cache.Admit(std::span{images}.first(13U), 0U);
-    for (auto image : std::span{images}.first(13U)) cache.Complete(image, image, meaning, 1U, 1U, 0U);
+    for (auto image : std::span{images}.first(13U))
+        cache.Complete(image, image, meaning, 1U, 1U, 0U);
     const auto original_slot = cache.Slot(4U);
     for (const auto rows : {6U, 5U, 6U, 5U}) {
         cache.Configure(rows + 8U, identity);
@@ -131,7 +132,8 @@ TEST_CASE("Gallery cache identity survives five six five demand and reorder with
 
     // Every hash bucket collides. All incumbent slots are needed on rollback,
     // while the candidate pins a disjoint replacement demand.
-    for (std::size_t index = 0U; index < images.size(); ++index) images[index] = static_cast<std::uint32_t>((index + 1U) * 29U);
+    for (std::size_t index = 0U; index < images.size(); ++index)
+        images[index] = static_cast<std::uint32_t>((index + 1U) * 29U);
     cache.BeginUpdate();
     cache.Admit(images, 50U);
     for (std::size_t index = 0U; index < images.size(); ++index) {
@@ -199,8 +201,7 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
     const std::uint64_t key = 1U;
     cache.Complete(0U, 0U, meaning, key);
     cache.Complete(1U, 1U, meaning, key);
-    const auto expected = cache.MetadataBytes() +
-                          explore_detail::GallerySharedBytes(meaning) +
+    const auto expected = cache.MetadataBytes() + explore_detail::GallerySharedBytes(meaning) +
                           meaning->annotations.capacity() * sizeof(decltype(meaning->annotations)::value_type) +
                           meaning->runs.capacity() * sizeof(decltype(meaning->runs)::value_type);
     CHECK(cache.MeaningBytes() == expected);
@@ -213,8 +214,7 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
     auto replacement = explore_detail::MakeGalleryShared<explore_detail::GalleryTileMeaning>();
     replacement->runs.reserve(11U);
     candidate.Complete(20U, 20U, replacement, other, 1U, 1U);
-    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes() +
-                                                explore_detail::GallerySharedBytes(replacement) +
+    CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes() + explore_detail::GallerySharedBytes(replacement) +
                                                 replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
 }
 
@@ -418,11 +418,9 @@ struct ExploreDetailExtentProbe final {
     VisualExtent original{48U, 32U};
 };
 
-[[nodiscard]] ExploreAtlasLayout test_atlas_layout(const ExploreRenderPlan& plan,
-                                                   const mmltk::frameworks::gpu::ImagePlaneView plane) {
+[[nodiscard]] ExploreAtlasLayout test_atlas_layout(const ExploreRenderPlan& plan, const mmltk::frameworks::gpu::ImagePlaneView plane) {
     const auto side = explore_atlas_card_extent(plan.viewport);
-    return {plan.viewport.first_row, plan.viewport.row_count, plane.descriptor.height / side,
-             0U, plan.viewport.columns, side};
+    return {plan.viewport.first_row, plan.viewport.row_count, plane.descriptor.height / side, 0U, plan.viewport.columns, side};
 }
 
 class SynchronousExploreAlgorithm : public ExploreAlgorithm {
@@ -837,8 +835,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
    private:
     using PublicationCheckpoint = StreamingExplorePublicationState;
 
-    void RestorePixels(const mmltk::frameworks::gpu::ImagePlaneView clean,
-                        const mmltk::frameworks::gpu::ImagePlaneView semantic) const {
+    void RestorePixels(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic) const {
         Fill(clean, 0x11U);
         Fill(semantic, 0U);
         const auto place = [&](const std::size_t slot, const std::uint32_t image) {
@@ -848,8 +845,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         for (std::size_t slot = 0U; slot < probe_->completed_slots.size(); ++slot)
             if (probe_->completed_slots[slot]) place(slot, probe_->visible[slot]);
         for (const auto& assignment : probe_->assignments)
-            if (assignment.gpu_pending && assignment.generation == probe_->generation)
-                place(assignment.slot, assignment.compiled_index);
+            if (assignment.gpu_pending && assignment.generation == probe_->generation) place(assignment.slot, assignment.compiled_index);
     }
 
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
@@ -2000,9 +1996,16 @@ class TestPresentationWriter final : public PresentationNativeWriter {
 
 TEST_CASE("Workspace layout rejects delayed undersized capacity") {
     namespace abi = presentation::detail::workspace_surface_import;
-    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = 1U, .width = 100U, .height = 100U,
-                       .stride = 400U, .size = 40'000U, .device_incarnation = 2U, .alignment = 16U,
-                       .device_uuid = {1U}, .memory_type_bits = 1U};
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+                       .id_high = 1U,
+                       .width = 100U,
+                       .height = 100U,
+                       .stride = 400U,
+                       .size = 40'000U,
+                       .device_incarnation = 2U,
+                       .alignment = 16U,
+                       .device_uuid = {1U},
+                       .memory_type_bits = 1U};
     CHECK(abi::valid(layout));
     layout.width = 200U;
     layout.height = 200U;
@@ -2037,7 +2040,7 @@ class EventGate final {
 };
 
 struct ExplorePressureProbe final {
-    EventGate events;
+    EventGate events{};
     std::atomic_size_t attempts{0U};
     std::atomic_size_t idle_attempts{0U};
     std::atomic_bool fail_render{false};
@@ -2047,14 +2050,14 @@ struct ExplorePressureProbe final {
 
     [[nodiscard]] VisualDiagnosticSink sink() noexcept {
         return {.context = this, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-            auto& probe = *static_cast<ExplorePressureProbe*>(context);
-            if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted &&
-                fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) &&
-                fact.value == 0U) {
-                probe.idle_attempts.store(probe.attempts.load(std::memory_order_acquire), std::memory_order_release);
-                probe.events.Advance();
-            }
-        }};
+                    auto& probe = *static_cast<ExplorePressureProbe*>(context);
+                    if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted &&
+                        fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) &&
+                        fact.value == 0U) {
+                        probe.idle_attempts.store(probe.attempts.load(std::memory_order_acquire), std::memory_order_release);
+                        probe.events.Advance();
+                    }
+                }};
     }
     void WaitIdle(const std::size_t expected) {
         REQUIRE(events.Wait([&] { return idle_attempts.load(std::memory_order_acquire) >= expected; }));
@@ -2065,7 +2068,8 @@ struct ExplorePressureProbe final {
 class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
    public:
     explicit CapacityExploreAlgorithm(ExplorePressureProbe& probe)
-        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, nullptr, probe.render_gate), probe_(probe) {}
+        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, nullptr, probe.render_gate),
+          probe_(probe) {}
     ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate*) const override {
         probe_.attempts.fetch_add(1U, std::memory_order_release);
         probe_.events.Advance();
@@ -2074,8 +2078,7 @@ class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
     void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
                        mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
                        const std::uintptr_t stream) override {
-        if (probe_.fail_render.exchange(false, std::memory_order_acq_rel))
-            throw std::runtime_error("Explore pending predecessor failed");
+        if (probe_.fail_render.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("Explore pending predecessor failed");
         TestExploreAlgorithm::RenderProduct(plan, candidate, nproc, clean, semantic, stream);
     }
 
@@ -2207,10 +2210,13 @@ class ExploreScenario final {
     ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {},
                     VisualDiagnosticSink diagnostics = {})
         : observer_(std::move(observer)),
-          explore_(settings.system(), kDevice, nproc, std::move(runtime), [this](ExploreSystem::event_type event) {
-              if (observer_) observer_(std::move(event));
-              events_.Advance();
-          }, diagnostics) {}
+          explore_(
+              settings.system(), kDevice, nproc, std::move(runtime),
+              [this](ExploreSystem::event_type event) {
+                  if (observer_) observer_(std::move(event));
+                  events_.Advance();
+              },
+              diagnostics) {}
 
     [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
 
@@ -2259,11 +2265,11 @@ TEST_CASE("Explore announces the acquired detail allocation before framework pre
     class DetailWriteAlgorithm final : public TestExploreAlgorithm {
        public:
         DetailWriteAlgorithm(std::shared_ptr<ExploreWorkProbe> work, std::atomic_uint64_t& owner)
-            : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, std::move(work)),
-              owner_(owner) {}
+            : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, std::move(work)), owner_(owner) {}
         void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override {
             owner_.store(allocation.owner, std::memory_order_release);
         }
+
        private:
         std::atomic_uint64_t& owner_;
     };
@@ -2300,15 +2306,18 @@ class ExplorePressureFixture final {
     };
     explicit ExplorePressureFixture(const bool gated_resume = false)
         : probe{.render_gate = gated_resume ? std::make_shared<ExplorePostRenderGate>(3U) : nullptr},
-          scenario{settings, backend, [&] {
+          scenario{settings, backend,
+                   [&] {
                        probe.runtimes.fetch_add(1U, std::memory_order_release);
                        return std::make_unique<CapacityExploreAlgorithm>(probe);
-                   }, [this](ExploreSystem::event_type event) {
+                   },
+                   [this](ExploreSystem::event_type event) {
                        std::scoped_lock lock(observation_mutex);
                        const bool failed = std::holds_alternative<ExploreFailed>(event);
                        observations.push_back({std::visit([](auto& value) { return std::move(value.snapshot); }, event),
                                                probe.runtimes.load(std::memory_order_acquire), failed});
-                   }, probe.sink()} {}
+                   },
+                   probe.sink()} {}
     ~ExplorePressureFixture() {
         if (probe.render_gate) mmltk::testsupport::release_test_promise(probe.render_gate->release);
         static_cast<void>(scenario.system().Stop());
@@ -2516,17 +2525,16 @@ TEST_CASE("Explore settles a pending predecessor on the incumbent before reconst
     fixture.RequestViewport(0U, 0U);
     const bool initial_h2d = fixture.settings.system().explore_settings_candidate().loading.h2d_dataloader;
     contracts::SettingsUpdateRequest update;
-    update.updates.push_back({.path = "workflows.explore.h2d_dataloader",
-                              .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    update.updates.push_back(
+        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
     static_cast<void>(fixture.settings.system().Update(std::move(update)));
     CHECK(explore.Open({.viewport = fixture.viewport, .compiled_source = "/replacement"}).busy);
     CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 1U);
     fixture.held = {};
     REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
     const auto observations = fixture.Recorded();
-    const auto predecessor = std::ranges::find_if(observations, [](const auto& event) {
-        return event.snapshot.busy && event.snapshot.viewport.first_row == 0U;
-    });
+    const auto predecessor = std::ranges::find_if(
+        observations, [](const auto& event) { return event.snapshot.busy && event.snapshot.viewport.first_row == 0U; });
     REQUIRE(predecessor != observations.end());
     CHECK(predecessor->runtimes == 1U);
     CHECK(predecessor->snapshot.order.visible_indices == std::vector<std::uint32_t>{0U});
@@ -2858,7 +2866,9 @@ class PresentationSourceFixture final {
     [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
     [[nodiscard]] PresentationSourceIdentity identity() const noexcept { return identity_; }
     void AdvanceObservation() { snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel); }
-    void PublishUnobserved() { source_->Publish(16U, 16U, [](auto, auto, auto) {}); }
+    void PublishUnobserved() {
+        source_->Publish(16U, 16U, [](auto, auto, auto) {});
+    }
     void Advance() {
         PublishUnobserved();
         UpdateObservation();
@@ -5069,35 +5079,35 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
     auto failure_result = failed.get_future();
     std::atomic<std::size_t> failures{0U};
     mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
-    detail::VisualRuntimeOwner owner{
-        [&](auto revisions) {
-            ++constructions;
-            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-            ImageWorkspaceTestAccess::Install(*runtime);
-            return runtime;
-        },
-        [&](std::exception_ptr failure) {
-            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-        }};
+    detail::VisualRuntimeOwner owner{[&](auto revisions) {
+                                         ++constructions;
+                                         auto runtime =
+                                             std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                                                 .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+                                         ImageWorkspaceTestAccess::Install(*runtime);
+                                         return runtime;
+                                     },
+                                     [&](std::exception_ptr failure) {
+                                         if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+                                     }};
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
-        return detail::VisualRuntimeOwner::Notification{[&, workspace = std::move(workspace)]() mutable {
-            created_workspace.set_value(std::move(workspace));
-        }};
+        return detail::VisualRuntimeOwner::Notification{
+            [&, workspace = std::move(workspace)]() mutable { created_workspace.set_value(std::move(workspace)); }};
     }));
     auto workspace = mmltk::testsupport::await_test_future(workspace_result, "external workspace creation");
-    REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
-        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
-        staged_gate.receipt().ArriveAndWait();
-        return detail::VisualRuntimeOwner::Notification{[&] { staged_completed.set_value(); }};
-    }, {}, true));
+    REQUIRE(owner.SubmitDiscrete(
+        [&](auto& runtime, std::stop_token) {
+            runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+            staged_gate.receipt().ArriveAndWait();
+            return detail::VisualRuntimeOwner::Notification{[&] { staged_completed.set_value(); }};
+        },
+        {}, true));
     mmltk::testsupport::ScopedTestCleanup release_stage{[&] { staged_gate.Release(); }};
     REQUIRE(staged_gate.WaitEntered(2s));
-    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
-        return detail::VisualRuntimeOwner::Notification{[&] { queued_completed.set_value(); }};
-    }));
+    REQUIRE(owner.SubmitOrdered(
+        [&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { queued_completed.set_value(); }}; }));
     staged_gate.Release();
     mmltk::testsupport::await_test_future(staged_result, "staged workspace retirement handoff");
     CHECK(failures.load() == 0U);
@@ -5136,12 +5146,12 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
                 .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
             ImageWorkspaceTestAccess::Install(*runtime);
             return runtime;
-        }, [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
+        },
+        [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
     REQUIRE(owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-        return detail::VisualRuntimeOwner::Notification{[&, workspace = std::move(workspace)]() mutable {
-            created.set_value(std::move(workspace));
-        }};
+        return detail::VisualRuntimeOwner::Notification{
+            [&, workspace = std::move(workspace)]() mutable { created.set_value(std::move(workspace)); }};
     }));
     auto workspace = mmltk::testsupport::await_test_future(ready, "workspace before visual owner destruction");
     owner.reset();
@@ -7031,15 +7041,15 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
         bool enabled = false;
     } capture;
     capture.enabled = diagnostics == Diagnostics::Enabled;
-    const VisualDiagnosticSink sink{
-        .context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-                   auto& value = *static_cast<Capture*>(context);
-                   if (value.count < value.facts.size()) value.facts[value.count] = fact;
-                   ++value.count;
-               },
-        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; }};
-    presentation::WorkspaceSurfaceImportChannel channel{
-        path, diagnostics == Diagnostics::Absent ? VisualDiagnosticSink{} : sink};
+    const VisualDiagnosticSink sink{.context = &capture,
+                                    .write =
+                                        [](void* context, const VisualDiagnosticFact fact) noexcept {
+                                            auto& value = *static_cast<Capture*>(context);
+                                            if (value.count < value.facts.size()) value.facts[value.count] = fact;
+                                            ++value.count;
+                                        },
+                                    .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; }};
+    presentation::WorkspaceSurfaceImportChannel channel{path, diagnostics == Diagnostics::Absent ? VisualDiagnosticSink{} : sink};
     auto peer = mmltk::testsupport::connect_workspace_surface_shell(path);
     channel.pump();
     REQUIRE(channel.connected());
@@ -7050,7 +7060,8 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
         REQUIRE(::setsockopt(channel.poll_fd(), SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0);
         // Fill the real outbound socket before admitting the source. The bounded
         // loop stops on EAGAIN; no sleeps or assumed kernel queue length.
-        while (queued_fillers < 256U && send_workspace_record(channel.poll_fd(), filler)) ++queued_fillers;
+        while (queued_fillers < 256U && send_workspace_record(channel.poll_fd(), filler))
+            ++queued_fillers;
         REQUIRE(queued_fillers > 0U);
         REQUIRE(queued_fillers < 256U);
     }
@@ -7058,11 +7069,21 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
     auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     const presentation::WorkspaceSurfaceImportId id{11U, 12U};
-    abi::Record record{
-        .id_high = id.high, .id_low = id.low, .width = 64U, .height = 32U, .stride = 512U, .size = 32768U,
-        .descriptors = abi::kImportDescriptorCount,
-        .arena_high = 1U, .arena_low = 2U, .allocation_identity = 3U, .device_incarnation = 4U,
-        .offset = 256U, .alignment = 256U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    abi::Record record{.id_high = id.high,
+                       .id_low = id.low,
+                       .width = 64U,
+                       .height = 32U,
+                       .stride = 512U,
+                       .size = 32768U,
+                       .descriptors = abi::kImportDescriptorCount,
+                       .arena_high = 1U,
+                       .arena_low = 2U,
+                       .allocation_identity = 3U,
+                       .device_incarnation = 4U,
+                       .offset = 256U,
+                       .alignment = 256U,
+                       .device_uuid = {1U},
+                       .memory_type_bits = 1U};
     const auto admitted = record;
     REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
     CHECK(channel.claimable(id) == !deferred);
@@ -7132,9 +7153,17 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     abi::Record received{};
     CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
     CHECK(received.opcode == abi::Opcode::Arena);
-    abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = arena.high, .id_low = arena.low,
-                       .width = 4U, .height = 3U, .stride = 32U, .size = 96U, .device_incarnation = 5U,
-                       .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+                       .id_high = arena.high,
+                       .id_low = arena.low,
+                       .width = 4U,
+                       .height = 3U,
+                       .stride = 32U,
+                       .size = 96U,
+                       .device_incarnation = 5U,
+                       .alignment = 32U,
+                       .device_uuid = {1U},
+                       .memory_type_bits = 1U};
     REQUIRE(send_workspace_record(peer.get(), layout));
     channel.pump();
     const auto arena_outcome = channel.take_outcome();
@@ -7153,8 +7182,9 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     CHECK(receive_workspace_record(peer.get(), received).descriptor_count == abi::kImportDescriptorCount);
     auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
     const std::array descriptors{timeline.get()};
-    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Ready, .id_high = source.high, .id_low = source.low,
-                                                .descriptors = abi::kReadyDescriptorCount}, descriptors));
+    REQUIRE(send_workspace_record(
+        peer.get(), {.opcode = abi::Opcode::Ready, .id_high = source.high, .id_low = source.low, .descriptors = abi::kReadyDescriptorCount},
+        descriptors));
     channel.pump();
     const auto source_outcome = channel.take_outcome();
     REQUIRE(source_outcome.has_value());
@@ -7179,8 +7209,13 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
         CHECK_FALSE(abi::valid(malformed));
     }
     CHECK_FALSE(channel.copy_completed(source, {7U, 8U}, 9U, 0U));
-    abi::Record sample{.opcode = abi::Opcode::Presented, .id_high = arena.high, .id_low = arena.low,
-                       .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
+    abi::Record sample{.opcode = abi::Opcode::Presented,
+                       .id_high = arena.high,
+                       .id_low = arena.low,
+                       .stride = 7U,
+                       .size = 8U,
+                       .code = 1U,
+                       .presentation_revision = 9U};
     REQUIRE(send_workspace_record(peer.get(), sample));
     channel.pump();
     CHECK(channel.withdraw(source).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
@@ -7218,8 +7253,16 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
         CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
         CHECK(received.opcode == abi::Opcode::Arena);
         REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::ArenaReady,
-            .id_high = id.high, .id_low = id.low, .width = 4U, .height = 3U, .stride = 32U,
-            .size = 96U, .device_incarnation = 5U, .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U}));
+                                                   .id_high = id.high,
+                                                   .id_low = id.low,
+                                                   .width = 4U,
+                                                   .height = 3U,
+                                                   .stride = 32U,
+                                                   .size = 96U,
+                                                   .device_incarnation = 5U,
+                                                   .alignment = 32U,
+                                                   .device_uuid = {1U},
+                                                   .memory_type_bits = 1U}));
         channel.pump();
         const auto outcome = channel.take_outcome();
         REQUIRE(outcome.has_value());
@@ -7243,8 +7286,13 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
     };
     const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
     admit(arena);
-    abi::Record sample{.opcode = abi::Opcode::Presented, .id_high = arena.high, .id_low = arena.low,
-                       .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
+    abi::Record sample{.opcode = abi::Opcode::Presented,
+                       .id_high = arena.high,
+                       .id_low = arena.low,
+                       .stride = 7U,
+                       .size = 8U,
+                       .code = 1U,
+                       .presentation_revision = 9U};
     REQUIRE(send_workspace_record(peer.get(), sample));
     sample.opcode = abi::Opcode::Completed;
     REQUIRE(send_workspace_record(peer.get(), sample));
@@ -7329,15 +7377,23 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
         for (const bool source : {false, true}) {
             for (const bool ready : {false, true}) {
                 const presentation::WorkspaceSurfaceImportId id{iteration, 1U + 2U * source + ready};
-                abi::Record layout{.opcode = abi::Opcode::ArenaReady, .id_high = id.high, .id_low = id.low,
-                                   .width = 4U, .height = 3U, .stride = 32U, .size = 96U, .device_incarnation = 5U,
-                                   .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U};
+                abi::Record layout{.opcode = abi::Opcode::ArenaReady,
+                                   .id_high = id.high,
+                                   .id_low = id.low,
+                                   .width = 4U,
+                                   .height = 3U,
+                                   .stride = 32U,
+                                   .size = 96U,
+                                   .device_incarnation = 5U,
+                                   .alignment = 32U,
+                                   .device_uuid = {1U},
+                                   .memory_type_bits = 1U};
                 if (source) {
                     layout.arena_high = iteration;
                     layout.arena_low = 9U;
                     layout.allocation_identity = iteration;
-                    REQUIRE(channel.admit_source(layout, iteration,
-                        mmltk::testsupport::workspace_surface_event_descriptor(), edge.get(), signal.descriptor()));
+                    REQUIRE(channel.admit_source(layout, iteration, mmltk::testsupport::workspace_surface_event_descriptor(), edge.get(),
+                                                 signal.descriptor()));
                 } else {
                     REQUIRE(channel.admit_arena(id, iteration, 4U, 3U));
                 }
@@ -7345,8 +7401,10 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                 static_cast<void>(receive_workspace_record(peer.get(), received));
                 if (ready) {
                     if (source) {
-                        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Ready,
-                            .id_high = id.high, .id_low = id.low, .descriptors = abi::kReadyDescriptorCount}, descriptors));
+                        REQUIRE(send_workspace_record(
+                            peer.get(),
+                            {.opcode = abi::Opcode::Ready, .id_high = id.high, .id_low = id.low, .descriptors = abi::kReadyDescriptorCount},
+                            descriptors));
                     } else {
                         REQUIRE(send_workspace_record(peer.get(), layout));
                     }
@@ -7355,9 +7413,11 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                 }
                 REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
                 static_cast<void>(receive_workspace_record(peer.get(), received));
-                REQUIRE(send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
-                    .id_high = id.high, .id_low = id.low,
-                    .code = ready ? 0U : static_cast<std::uint32_t>(abi::FailureCode::NotAdmitted)}));
+                REQUIRE(
+                    send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
+                                                       .id_high = id.high,
+                                                       .id_low = id.low,
+                                                       .code = ready ? 0U : static_cast<std::uint32_t>(abi::FailureCode::NotAdmitted)}));
                 channel.pump();
                 REQUIRE(channel.take_retirement().has_value());
                 CHECK_FALSE(channel.claimable(id));
@@ -8216,16 +8276,18 @@ TEST_CASE("visual continuation cancellation policy is independent of output avai
     std::promise<bool> cancelled;
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
     auto settle_owner = settle_visual_on_exit(owner, release_work);
-    owner.RegisterContinuation([&](auto&, const std::stop_token stop) {
-        entered.set_value();
-        released.wait();
-        const bool observed_stop = stop.stop_requested();
-        const bool completed = owner.TryCompleteActiveWork();
-        return detail::VisualRuntimeOwner::Notification{[&, observed_stop, completed] {
-            cancelled.set_value(observed_stop && !completed);
-        }};
-    }, {}, output_wake, preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput
-                                       : detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
+    owner.RegisterContinuation(
+        [&](auto&, const std::stop_token stop) {
+            entered.set_value();
+            released.wait();
+            const bool observed_stop = stop.stop_requested();
+            const bool completed = owner.TryCompleteActiveWork();
+            return detail::VisualRuntimeOwner::Notification{
+                [&, observed_stop, completed] { cancelled.set_value(observed_stop && !completed); }};
+        },
+        {}, output_wake,
+        preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput
+                       : detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
     REQUIRE(owner.NotifyContinuation());
     mmltk::testsupport::await_test_promise(entered, "continuation entered");
     static_cast<void>(owner.RequestActiveStop());

@@ -293,7 +293,7 @@ class NativeGallery final {
         atlas_side = side;
         atlas_columns = plan.viewport.columns;
         atlas_rows = std::max(atlas_rows, std::min(std::bit_ceil(plan.viewport.row_count),
-            static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns)));
+                                                   static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns)));
         return {plan.viewport.extent.width, atlas_rows * side};
     }
     std::size_t publications = 0U;
@@ -377,7 +377,8 @@ class NativeGallery final {
         } else {
             ++acquisitions;
             auto baseline = plan.mode == ExploreMode::Detail && change == ExploreOutputChange::Semantic
-                                ? detail_product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{};
+                                ? detail_product
+                                : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{};
             auto output = runtime->TryAcquireOutput(baseline);
             REQUIRE(output.valid());
             const auto extent = plan.mode == ExploreMode::Gallery ? GalleryExtent() : algorithm->DetailExtent(plan);
@@ -455,8 +456,8 @@ class NativeGallery final {
         const auto row_size = row_bytes * displayed_layout.card_extent;
         std::vector<std::uint8_t> logical(row_size * displayed_layout.row_count);
         for (std::size_t row = 0U; row < displayed_layout.row_count; ++row)
-            std::copy_n(physical.data() + (displayed_layout.row_origin + row) % displayed_layout.row_capacity * row_size,
-                        row_size, logical.data() + row * row_size);
+            std::copy_n(physical.data() + (displayed_layout.row_origin + row) % displayed_layout.row_capacity * row_size, row_size,
+                        logical.data() + row * row_size);
         return logical;
     }
 };
@@ -466,7 +467,8 @@ TEST_CASE("Atlas directories reconcile exact allocations and invalidate only tou
     using namespace mmltk::frameworks::gpu;
     GalleryAtlas directory;
     const auto plane = [](const std::uint64_t owner, const std::uint64_t identity, const ImagePlaneKind kind) {
-        return ImagePlaneView{.data = 1U, .descriptor = {.kind = kind, .width = 16U, .height = 64U, .pitch_bytes = 64U},
+        return ImagePlaneView{.data = 1U,
+                              .descriptor = {.kind = kind, .width = 16U, .height = 64U, .pitch_bytes = 64U},
                               .allocation = {identity, 16U, 64U, owner}};
     };
     auto clean = plane(1U, 11U, ImagePlaneKind::Clean);
@@ -532,8 +534,8 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
     using namespace explore_detail;
     using namespace mmltk::frameworks::gpu;
     auto backend = std::make_shared<test_support::FakeImageBackend>();
-    SystemImageRuntime runtime{{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
-                                .output_buffer_count = 3U}};
+    SystemImageRuntime runtime{
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U}};
     GalleryAtlas directory;
     const ExploreViewport viewport{.extent = {24U, 8U}, .columns = 3U};
     const GalleryThumbnailCache::Identity pixels{.dataset = 1U, .extent = 8U};
@@ -641,7 +643,7 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
     const auto before = gallery.Pixels(0U);
     const auto layout = gallery.displayed_layout;
     const auto readiness = gallery.algorithm->AdvanceGallery().ready_slots;
-    REQUIRE(complete || std::ranges::any_of(readiness, [](bool value) { return !value; }));
+    REQUIRE((complete || std::ranges::any_of(readiness, [](bool value) { return !value; })));
     gallery.plan.mode = ExploreMode::Detail;
     gallery.plan.selected_image = 12U;
     gallery.demand->store(++gallery.plan.generation);
@@ -948,7 +950,10 @@ TEST_CASE("Native disk admission follows immediate forward four then backward fo
                 admitted.push_back(static_cast<std::uint32_t>(fact.detail));
     }
     std::vector<std::uint32_t> expected{22U, 20U, 21U, 23U};
-    const auto ahead = [&] { for (std::uint32_t image = 24U; image < 32U; ++image) expected.push_back(image); };
+    const auto ahead = [&] {
+        for (std::uint32_t image = 24U; image < 32U; ++image)
+            expected.push_back(image);
+    };
     const auto behind = [&] {
         for (std::uint32_t row = 10U; row != 6U;) {
             --row;
@@ -956,7 +961,13 @@ TEST_CASE("Native disk admission follows immediate forward four then backward fo
             expected.push_back(row * 2U + 1U);
         }
     };
-    if (reverse) { behind(); ahead(); } else { ahead(); behind(); }
+    if (reverse) {
+        behind();
+        ahead();
+    } else {
+        ahead();
+        behind();
+    }
     CHECK(admitted == expected);
 }
 
@@ -999,7 +1010,7 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
         CHECK(admitted->detail == 40U);
         CHECK(std::ranges::none_of(gallery.evidence.facts, [&](const auto& fact) {
             return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation &&
-                (fact.detail < 40U || fact.detail >= 44U);
+                   (fact.detail < 40U || fact.detail >= 44U);
         }));
     }
     held.Release();
@@ -1980,7 +1991,8 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
 namespace mmltk::controller {
 namespace {
 
-TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts", "[explore][acceptance][control]") {
+TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts",
+          "[explore][acceptance][control]") {
     using Kind = contracts::IntegrationControlKind;
     AcceptanceGateFixture fixture{SOCK_SEQPACKET};
     auto& gate = fixture.gate();
@@ -2025,8 +2037,14 @@ TEST_CASE("native completion gate preserves the capacity-before-consumption wake
     PresentationAcceptanceGate gate;
     std::vector<PresentationAcceptanceGate::Receipt> receipts;
     unsigned wakes = 0U;
-    gate.SetWake([&] { ++wakes; gate.SetWake({}); });
-    gate.SetObserver([&](const auto receipt) { receipts.push_back(receipt); gate.SetObserver({}); });
+    gate.SetWake([&] {
+        ++wakes;
+        gate.SetWake({});
+    });
+    gate.SetObserver([&](const auto receipt) {
+        receipts.push_back(receipt);
+        gate.SetObserver({});
+    });
     CHECK_FALSE(gate.Release());
     REQUIRE(gate.Arm());
     CHECK_FALSE(gate.Arm());

@@ -36,8 +36,7 @@ class LiveSystem::Impl final {
               Publish(event_type{LiveFailed{std::move(settled), std::move(detail)}});
           }) {
         if (!settings_.valid()) throw contracts::InvalidIntentError("Live device settings are invalid");
-        worker_.RegisterContinuation(
-            [this](auto& runtime, const std::stop_token stop) { return Capture(runtime, stop); }, {}, true);
+        worker_.RegisterContinuation([this](auto& runtime, const std::stop_token stop) { return Capture(runtime, stop); }, {}, true);
     }
     LiveSnapshot Start(const LiveStart request) {
         if (!request.extent.valid() || request.extent.width > settings_.maximum_width || request.extent.height > settings_.maximum_height ||
@@ -130,7 +129,7 @@ class LiveSystem::Impl final {
     friend class LiveSystem;
 
     detail::VisualRuntimeOwner::Notification Capture(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                       const std::stop_token worker_stop) {
+                                                     const std::stop_token worker_stop) {
         auto* const algorithm = dynamic_cast<LiveAlgorithm*>(runtime.model());
         if (!algorithm) throw std::runtime_error("Live capture data plane is unavailable");
         std::stop_token run_stop;
@@ -160,9 +159,7 @@ class LiveSystem::Impl final {
         if (!algorithm->AcquireOutput()) return {};
         bool captured = false;
         runtime.Publish(candidate, request_.extent.width, request_.extent.height,
-                        [&](const auto target, const auto, const auto stream) {
-                            captured = algorithm->Capture(target, stream, run_stop);
-                        });
+                        [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
         if (!captured || run_stop.stop_requested()) {
             static_cast<void>(worker_.NotifyContinuation());
             return {};
@@ -174,9 +171,8 @@ class LiveSystem::Impl final {
                 throw std::overflow_error("Live completed-frame counter exhausted");
             ++state_.completed_frames;
             AdvanceRevision();
-            state_.frame = {.source = {PresentationSourceKind::Live, 1U},
-                            .extent = request_.extent,
-                            .revision = runtime.OutputFacts().revision};
+            state_.frame = {
+                .source = {PresentationSourceKind::Live, 1U}, .extent = request_.extent, .revision = runtime.OutputFacts().revision};
         }
         next_capture_ = std::chrono::steady_clock::now() + cadence_;
         worker_.NotifyContinuationAt(next_capture_);
