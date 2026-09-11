@@ -1993,7 +1993,7 @@ template <class T>
 // Positional projection for schema-agreed interaction records. Scalars use the
 // canonical Reader/encoder; structure and validation derive from declarations.
 namespace compact_detail {
-enum class Shape { Unsupported, Scalar, Optional, Sequence, Enum, Object };
+enum class Shape { Unsupported, Scalar, Optional, Sequence, Enum, Variant, Object };
 
 template <class T>
 inline constexpr Shape shape = [] consteval {
@@ -2011,6 +2011,10 @@ inline constexpr Shape shape = [] consteval {
         return shape<typename detail::IsOptional<U>::value_type> == Shape::Unsupported ? Shape::Unsupported : Shape::Optional;
     } else if constexpr (detail::kIsArray<U> || detail::kIsInplaceVector<U>) {
         return shape<detail::SequenceElementT<U>> == Shape::Unsupported ? Shape::Unsupported : Shape::Sequence;
+    } else if constexpr (detail::kIsVariant<U>) {
+        return []<class... A>(std::type_identity<std::variant<A...>>) {
+            return ((shape<A> != Shape::Unsupported) && ...) ? Shape::Variant : Shape::Unsupported;
+        }(std::type_identity<U>{});
     } else if constexpr (detail::kReflectedObject<U>) {
         bool supported = true;
         detail::visit_bases<U>([&]<class Base>() { supported = supported && shape<Base> == Shape::Object; });
@@ -2049,6 +2053,12 @@ template <class T>
             result = detail::cbor_maximum(result, wire::head_size(argument));
         }
         return result;
+    } else if constexpr (shape<T> == Shape::Variant) {
+        return []<class... A>(std::type_identity<std::variant<A...>>) consteval {
+            std::size_t largest = 0U;
+            ((largest = detail::cbor_maximum(largest, maximum_bytes<A>())), ...);
+            return detail::cbor_size_add(1U + wire::head_size(sizeof...(A) - 1U), largest);
+        }(std::type_identity<T>{});
     } else if constexpr (shape<T> == Shape::Object) {
         detail::audit_object<T>();
         return detail::cbor_size_add(wire::head_size(detail::flattened_member_count<T>()),
@@ -2083,6 +2093,9 @@ template <class T>
         return true;
     } else if constexpr (shape<T> == Shape::Enum) {
         return mmltk::frameworks::reflection::enum_contains(value) && encode(writer, static_cast<std::underlying_type_t<T>>(value));
+    } else if constexpr (shape<T> == Shape::Variant) {
+        return !value.valueless_by_exception() && writer.array(2U) && writer.unsigned_integer(value.index()) &&
+               std::visit([&](const auto& alternative) { return encode(writer, alternative); }, value);
     } else if constexpr (shape<T> == Shape::Object) {
         d::audit_object<T>();
         bool valid = writer.array(d::flattened_member_count<T>());
@@ -2125,6 +2138,15 @@ template <class T>
         if (!decode(reader, raw, depth)) return false;
         value = static_cast<T>(raw);
         return mmltk::frameworks::reflection::enum_contains(value);
+    } else if constexpr (shape<T> == Shape::Variant) {
+        auto count = reader.begin_array_item(depth);
+        std::uint64_t index = 0U;
+        if (!count || *count != 2U || !decode(reader, index, depth + 1U) || index >= std::variant_size_v<T>) return false;
+        return [&]<std::size_t... I>(std::index_sequence<I...>) {
+            bool valid = false;
+            ((index == I ? (value.template emplace<I>(), valid = decode(reader, std::get<I>(value), depth + 1U), void()) : void()), ...);
+            return valid;
+        }(std::make_index_sequence<std::variant_size_v<T>>{});
     } else if constexpr (shape<T> == Shape::Object) {
         d::audit_object<T>();
         auto count = reader.begin_array_item(depth);

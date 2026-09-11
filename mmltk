@@ -2192,7 +2192,7 @@ run_protocol_generation() {
     prepare_cache_layout
     ensure_build_image
     prepare_firefox_build_input
-    if (( ! gui_diagnostics_quiet )); then log "generating Protocol-15 cross-language bindings and fixtures"; fi
+    if (( ! gui_diagnostics_quiet )); then log "generating Protocol-16 cross-language bindings and fixtures"; fi
     run_owned_toolchain_command "${release_build_container_name}-protocol-generation" \
         'set -euo pipefail
          cargo fetch --locked \
@@ -2206,7 +2206,7 @@ run_protocol_generation() {
              -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
              --parallel "${MMLTK_JOBS}" \
-             --target mmltk_protocol_v15_generation
+             --target mmltk_protocol_v16_generation
          python3 /workspace/tools/check_toolchain_invariants.py \
              --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release"'
     release_mutation_locks

@@ -80,6 +80,24 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<Envelope, ProtocolError> {
             "CBOR envelope exceeds protocol byte limit".into(),
         ));
     }
+    // Client test captures normalize numeric interactions for inspection.
+    // Production server ingress still requires the named server envelope.
+    #[cfg(test)]
+    if bytes.first() == Some(&0x82) {
+        let mut cursor = 0;
+        let Value::Array(mut fields) = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0)? else { unreachable!() };
+        if cursor != bytes.len() || fields.len() != 2 { return Err(ProtocolError("invalid compact interaction".into())); }
+        let value = fields.pop().unwrap();
+        let opcode = fields.pop().unwrap().integer_u64().ok_or_else(|| ProtocolError("invalid interaction opcode".into()))?;
+        let endpoint = crate::generated::interaction_endpoint(opcode).ok_or_else(|| ProtocolError("unknown interaction opcode".into()))?;
+        if !matches!(&value, Value::Bytes(bytes) if bytes.len() <= MAX_INTENT_VALUE_BYTES) {
+            return Err(ProtocolError("invalid compact interaction bytes".into()));
+        }
+        return Ok(Envelope { kind: "Interaction".into(), payload: object([
+            ("protocol_version", Value::Unsigned(crate::generated::BROWSER_PROTOCOL_VERSION)),
+            ("endpoint_id", Value::Unsigned(endpoint)), ("value", value),
+        ]) });
+    }
     preflight_protocol_record(bytes)?;
     let mut cursor = 0;
     let value = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0)?;
@@ -568,7 +586,7 @@ fn checked_size(left: usize, right: usize) -> Result<usize, ProtocolError> {
         .ok_or_else(|| ProtocolError("CBOR size overflow".into()))
 }
 
-fn head_len(value: u64) -> usize {
+pub(crate) fn head_len(value: u64) -> usize {
     match value {
         0..=23 => 1,
         24..=0xff => 2,

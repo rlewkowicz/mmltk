@@ -1,4 +1,5 @@
 #include "src/controller/browser/client_record.h"
+#include "src/controller/browser/application_schema.h"
 
 #include <algorithm>
 #include <cmath>
@@ -119,27 +120,60 @@ template <class Record>
 }  // namespace
 
 bool is_interaction_record(const std::span<const std::byte> bytes) noexcept {
-    wire::Reader reader({.first = bytes}, decoding_limits({.first = bytes}));
-    return mmltk::frameworks::serialization::ReflectedVariantEnvelope<ClientRecord, Interaction>::Read(reader);
+    return !bytes.empty() && (std::to_integer<unsigned>(bytes.front()) >> 5U) == 4U;
 }
+namespace {
+std::optional<InteractionView> decode_interaction_segments(const wire::ByteSegments bytes) {
+    wire::Reader reader(bytes, decoding_limits(bytes));
+    mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value> compact;
+    if (!compact.DecodeCompact(reader)) return std::nullopt;
+    std::uint64_t endpoint = 0U;
+    visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto opcode) {
+        if (opcode == compact.Get<&CompactInteraction::opcode>()) endpoint = Endpoint::stable_id;
+    });
+    if (!endpoint) return std::nullopt;
+    return InteractionView{Interaction{.endpoint_id = endpoint}, compact.Get<&CompactInteraction::value>()};
+}
+}  // namespace
 std::optional<InteractionView> decode_interaction_view(const std::span<const std::byte> bytes) {
-    wire::Reader reader({.first = bytes}, decoding_limits({.first = bytes}));
-    InteractionView result;
-    if (!result.Decode<ClientRecord>(reader) || result.Get<&Interaction::protocol_version>() != kBrowserProtocolVersion ||
-        result.Get<&Interaction::endpoint_id>() == 0U)
-        return std::nullopt;
-    return result;
+    return decode_interaction_segments({.first = bytes});
 }
 
 std::expected<void, RecordCodecError> encode_client_record(const ClientRecord& record, wire::ByteBuffer& destination) {
     if (!valid_client_record(record)) return failure(wire::ErrorCode::TypeMismatch);
+    if (const auto* interaction = std::get_if<Interaction>(&record)) {
+        std::optional<std::uint64_t> opcode;
+        visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto value) {
+            if (interaction->endpoint_id == Endpoint::stable_id) opcode = value;
+        });
+        if (!opcode || interaction->value.size() > kMaxIntentValueBytes) return failure(wire::ErrorCode::TypeMismatch);
+        using CompactWire = mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>;
+        destination.resize(CompactWire::EncodedCapacity(interaction->value.size()));
+        mmltk::frameworks::serialization::FixedCborEncoder writer(destination);
+        const CompactWire compact{
+            CompactInteraction{.opcode = *opcode}, {.first = interaction->value}};
+        if (!compact.EncodeCompact(writer))
+            return failure(wire::ErrorCode::LimitExceeded);
+        destination.resize(writer.size());
+        return {};
+    }
     return encode_record(record, destination, encoding_limits());
 }
 
 std::expected<ClientRecord, RecordCodecError> decode_client_record(const wire::ByteSegments bytes) {
+    // Owned diagnostics/fixtures use the same borrowed decoder as ingress.
+    if (is_interaction_record(bytes.first.empty() ? bytes.second : bytes.first)) {
+        auto view = decode_interaction_segments(bytes);
+        if (!view) return failure(wire::ErrorCode::TypeMismatch);
+        const auto payload = view->Get<&Interaction::value>();
+        Interaction value{.endpoint_id = view->Get<&Interaction::endpoint_id>()};
+        value.value.insert(value.value.end(), payload.first.begin(), payload.first.end());
+        value.value.insert(value.value.end(), payload.second.begin(), payload.second.end());
+        return ClientRecord{std::move(value)};
+    }
     auto record = decode_record<ClientRecord>(bytes, decoding_limits(bytes));
     if (!record) return std::unexpected(record.error());
-    if (!valid_client_record(*record)) return failure(wire::ErrorCode::TypeMismatch);
+    if (std::holds_alternative<Interaction>(*record) || !valid_client_record(*record)) return failure(wire::ErrorCode::TypeMismatch);
     return std::move(*record);
 }
 

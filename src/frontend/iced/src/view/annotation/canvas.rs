@@ -218,8 +218,8 @@ impl GestureState {
         ui: &AnnotationUiState,
         gesture: crate::presentation_surface::SurfaceGesture,
     ) -> Option<crate::generated::AnnotationPointer> {
-        let x = gesture.sample.content_x as f32;
-        let y = gesture.sample.content_y as f32;
+        let x = gesture.sample.content_x;
+        let y = gesture.sample.content_y;
         let target = if self.pointer_active {
             self.gesture_target.clone()?
         } else {
@@ -335,6 +335,7 @@ impl Component {
         }
         let owner = self.retained.clone();
         std::sync::Arc::new(move |gesture| {
+            if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport { return None; }
             let mut retained = owner.lock().expect("annotation canvas");
             if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
                 keyboard.store(true, std::sync::atomic::Ordering::Relaxed);

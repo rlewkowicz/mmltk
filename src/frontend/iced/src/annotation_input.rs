@@ -42,6 +42,8 @@ pub(crate) struct AnnotationInput {
     batch: AnnotationInputBatch,
     scratch: Vec<u8>,
     encoded: Vec<u8>,
+    encoded_pointer: Option<AnnotationPointer>,
+    encoded_document_epoch: u64,
 }
 
 impl Default for AnnotationInput {
@@ -61,13 +63,14 @@ impl Default for AnnotationInput {
             settled_revision: 0,
             closed: false,
             batch: AnnotationInputBatch {
-                epoch: 0,
                 documentepoch: 0,
                 sequence: 0,
                 samples: Vec::with_capacity(generated::ANNOTATION_INPUT_BATCH_CAPACITY),
             },
             scratch: Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY),
             encoded: Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY),
+            encoded_pointer: None,
+            encoded_document_epoch: 0,
         }
     }
 }
@@ -293,6 +296,7 @@ impl AnnotationInput {
             }
             self.batch.documentepoch = self.samples[self.sent_samples].document_epoch;
             self.batch.samples.clear();
+            let mut prior = if self.encoded_document_epoch == self.batch.documentepoch { self.encoded_pointer.clone() } else { None };
             let count = available.min(generated::ANNOTATION_INPUT_BATCH_CAPACITY as u64) as usize;
             for sample in self
                 .samples
@@ -301,9 +305,13 @@ impl AnnotationInput {
                 if sample.document_epoch != self.batch.documentepoch {
                     break;
                 }
-                self.batch.samples.push(sample.pointer.clone());
+                self.batch.samples.push(compact_sample(&sample.pointer, prior.as_ref()));
+                prior = if matches!(sample.pointer.phase, generated::AnnotationPointerPhase::End | generated::AnnotationPointerPhase::Cancel) {
+                    None
+                } else {
+                    Some(sample.pointer.clone())
+                };
             }
-            self.batch.epoch = self.epoch;
             self.batch.sequence = self
                 .sequence
                 .checked_add(1)
@@ -315,10 +323,107 @@ impl AnnotationInput {
             )
             .map_err(|error| error.to_string())?;
             send(&self.encoded)?;
+            self.encoded_pointer = prior;
+            self.encoded_document_epoch = self.batch.documentepoch;
             self.sequence = self.batch.sequence;
             self.sent_samples += self.batch.samples.len();
             self.flights
                 .push_back((self.sequence, self.batch.samples.len()));
         }
+    }
+}
+
+// A delta is used only when reconstruction is bit-exact and all retained
+// metadata is unchanged. Absolute samples are also ordered parameter changes.
+pub(crate) fn compact_sample(pointer: &AnnotationPointer, prior: Option<&AnnotationPointer>) -> generated::AnnotationPointerOrAnnotationPointVariant {
+    use generated::AnnotationPointerOrAnnotationPointVariant as Sample;
+    if let Some(prior) = prior.filter(|pointer| pointer.sequence != u64::MAX) {
+        let delta = generated::AnnotationPoint { x: pointer.point.x - prior.point.x, y: pointer.point.y - prior.point.y };
+        let mut reconstructed = prior.clone();
+        reconstructed.phase = generated::AnnotationPointerPhase::Update;
+        reconstructed.sequence = prior.sequence + 1;
+        reconstructed.point.x += delta.x;
+        reconstructed.point.y += delta.y;
+        if delta.x.is_finite() && delta.y.is_finite() && reconstructed == *pointer
+            && reconstructed.point.x.to_bits() == pointer.point.x.to_bits()
+            && reconstructed.point.y.to_bits() == pointer.point.y.to_bits() {
+            return Sample::AnnotationPoint(delta);
+        }
+    }
+    Sample::AnnotationPointer(pointer.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use generated::{AnnotationPoint, AnnotationPointerPhase as Phase, AnnotationPointerOrAnnotationPointVariant as Wire};
+
+    fn pointer() -> AnnotationPointer {
+        AnnotationPointer {
+            phase: Phase::Begin, interactionid: 1, sequence: 1,
+            target: generated::AnnotationPointerTarget { object: None, element: None, role: None },
+            point: AnnotationPoint { x: 1.25, y: 2.5 }, brushradius: 9,
+        }
+    }
+
+    #[test]
+    fn fractional_deltas_and_ordered_metadata_changes_have_exact_escapes() {
+        let prior = pointer();
+        let mut next = prior.clone();
+        next.phase = Phase::Update;
+        next.sequence = 2;
+        next.point = AnnotationPoint { x: 1.375, y: 2.25 };
+        assert_eq!(compact_sample(&next, Some(&prior)), Wire::AnnotationPoint(AnnotationPoint { x: 0.125, y: -0.25 }));
+        assert!(matches!(compact_sample(&next, None), Wire::AnnotationPointer(_)));
+        for changed in [
+            AnnotationPointer { brushradius: 10, ..next.clone() },
+            AnnotationPointer { interactionid: 2, ..next.clone() },
+            AnnotationPointer { sequence: 3, ..next.clone() },
+            AnnotationPointer { phase: Phase::End, ..next.clone() },
+            AnnotationPointer { phase: Phase::Cancel, ..next.clone() },
+            AnnotationPointer { target: generated::AnnotationPointerTarget { object: Some(1), element: None, role: None }, ..next.clone() },
+        ] {
+            assert!(matches!(compact_sample(&changed, Some(&prior)), Wire::AnnotationPointer(value) if value == changed));
+        }
+        let large = AnnotationPointer { point: AnnotationPoint { x: 1.0e20, y: 2.5 }, ..prior.clone() };
+        next.point.x = 1.0;
+        assert!(matches!(compact_sample(&next, Some(&large)), Wire::AnnotationPointer(_)));
+        let zero = AnnotationPointer { point: AnnotationPoint { x: 0.0, y: 2.5 }, ..prior };
+        next.point.x = -0.0;
+        assert!(matches!(compact_sample(&next, Some(&zero)), Wire::AnnotationPointer(_)));
+    }
+
+    #[test]
+    fn dense_curved_input_reconstructs_every_point_and_parameter_boundary() {
+        let mut prior = None;
+        let mut decoded: Option<AnnotationPointer> = None;
+        let mut deltas = 0;
+        for index in 0..257 {
+            let mut next = pointer();
+            next.sequence = index + 1;
+            next.phase = if index == 0 { Phase::Begin } else if index == 256 { Phase::End } else { Phase::Update };
+            let angle = index as f32 / 32.0;
+            next.point = AnnotationPoint { x: 100.0 + angle.cos() * 40.0, y: 100.0 + angle.sin() * 40.0 };
+            next.brushradius = if index < 129 { 9 } else { 11 };
+            let wire = compact_sample(&next, prior.as_ref());
+            let restored = match wire {
+                Wire::AnnotationPointer(pointer) => pointer,
+                Wire::AnnotationPoint(delta) => {
+                    deltas += 1;
+                    let mut pointer = decoded.take().expect("delta predecessor");
+                    pointer.phase = Phase::Update;
+                    pointer.sequence += 1;
+                    pointer.point.x += delta.x;
+                    pointer.point.y += delta.y;
+                    pointer
+                }
+            };
+            assert_eq!(restored, next);
+            assert_eq!(restored.point.x.to_bits(), next.point.x.to_bits());
+            assert_eq!(restored.point.y.to_bits(), next.point.y.to_bits());
+            decoded = Some(restored);
+            prior = Some(next);
+        }
+        assert!(deltas > 200);
     }
 }

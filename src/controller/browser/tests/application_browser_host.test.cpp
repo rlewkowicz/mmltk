@@ -514,7 +514,7 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     CHECK(std::get<InputProgress>(decode(*replacement_progress)).progress.epoch == std::get<Bootstrap>(bootstrap).input_epoch);
 }
 
-TEST_CASE("direct host closes a real peer on malformed Protocol-15 input") {
+TEST_CASE("direct host closes a real peer on malformed Protocol-16 input") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
@@ -626,8 +626,8 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     const auto epoch = annotation.snapshot().input_document_epoch;
     annotation.SetInputPeer(1U, {});
     const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t batch, std::uint64_t sequence) {
-        annotation.Input({.epoch = peer, .document_epoch = epoch, .sequence = batch,
-            .samples = {{.phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
+        annotation.Input({.document_epoch = epoch, .sequence = batch,
+            .samples = {AnnotationPointer{.phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
     };
     auto rendered = annotation.snapshot().rendered.generation;
     gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);

@@ -597,7 +597,7 @@ mod tests {
     }
 
     fn client_fixtures() -> Vec<(&'static str, Vec<u8>)> {
-        include_str!(env!("MMLTK_PROTOCOL_V15_CLIENT_FIXTURE_PATH"))
+        include_str!(env!("MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH"))
             .lines()
             .map(|line| {
                 let (kind, hex) = line.split_once(' ').expect("client fixture");
@@ -607,7 +607,7 @@ mod tests {
     }
 
     fn native_server_fixtures() -> Vec<&'static [u8]> {
-        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V15_SERVER_FIXTURE_PATH"));
+        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V16_SERVER_FIXTURE_PATH"));
         let mut records = Vec::new();
         let mut cursor = 0;
         while cursor < bytes.len() {
@@ -627,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn client_records_match_native_protocol_fourteen_fixtures() {
+    fn client_records_match_native_protocol_sixteen_fixtures() {
         let fixtures = client_fixtures();
         // Native interop checks exhaustive coverage against the reflected variant.
         for (kind, bytes) in &fixtures {
@@ -809,7 +809,7 @@ mod tests {
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogSelected(value) => {
                         assert!(selected);
-                        assert_eq!(value.path, "/tmp/protocol-v15-fixture");
+                        assert_eq!(value.path, "/tmp/protocol-v16-fixture");
                     }
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogCancelled(_) => assert!(!selected),
@@ -904,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_session_records_are_not_part_of_protocol_fourteen() {
+    fn legacy_session_records_are_not_part_of_protocol_sixteen() {
         let legacy = encode_envelope(
             "HostReset",
             &protocol_payload([("legacy_payload", Value::Object(Vec::new()))]),

@@ -25,7 +25,7 @@ namespace mmltk::controller::browser {
 
 namespace field_policy = mmltk::frameworks::reflection;
 namespace wire = mmltk::frameworks::serialization::wire;
-inline constexpr std::uint64_t kBrowserProtocolVersion = 15U;
+inline constexpr std::uint64_t kBrowserProtocolVersion = 16U;
 // Aggregate output admission ceilings. Dynamic values remain actual-sized;
 // individual input fields retain the independent intent limits below.
 inline constexpr std::size_t kMaxOutputValueBytes = 8U * 1024U * 1024U;
@@ -60,6 +60,14 @@ struct Interaction final {
     [[= field_policy::MaxBytes{kMaxIntentValueBytes}]] wire::ByteBuffer value{};
     bool operator==(const Interaction&) const = default;
 };
+
+// Connection bootstrap establishes protocol/schema identity. Interaction opcodes
+// are projected from the canonical endpoint order, never a parallel registry.
+struct CompactInteraction final {
+    std::uint64_t opcode = 0U;
+    [[= field_policy::MaxBytes{kMaxIntentValueBytes}]] wire::ByteBuffer value{};
+};
+MMLTK_REFLECT_FIELDS(CompactInteraction)
 
 enum class RendererObservationKind : std::uint8_t {
     Ready,

@@ -57,7 +57,7 @@ where
         &mut self,
         window: &dyn Window,
         waker: &shell::Waker,
-        events: &[Event],
+        events: &[(Event, mouse::Cursor)],
         cursor: mouse::Cursor,
         renderer: &mut Renderer,
         messages: &mut Vec<Message>,
@@ -86,14 +86,19 @@ where
 
             let mut overlay = maybe_overlay.as_mut().unwrap();
             let mut layout = overlay.layout(renderer, bounds);
-            let mut event_statuses = Vec::new();
+            let mut event_statuses = Vec::with_capacity(events.len());
 
-            for event in events {
+            for (event, event_cursor) in events {
                 let mut shell = Shell::new(window, waker.clone(), messages);
 
-                overlay.update(event, Layout::new(&layout), cursor, renderer, &mut shell);
+                let base_cursor = if overlay.mouse_interaction(Layout::new(&layout), *event_cursor, renderer) == mouse::Interaction::None {
+                    *event_cursor
+                } else {
+                    mouse::Cursor::Unavailable
+                };
+                overlay.update(event, Layout::new(&layout), *event_cursor, renderer, &mut shell);
 
-                event_statuses.push(shell.event_status());
+                event_statuses.push((shell.event_status(), base_cursor));
                 redraw_request = redraw_request.min(shell.redraw_request());
                 input_method.merge(shell.input_method());
                 clipboard.merge(shell.clipboard_mut());
@@ -143,6 +148,8 @@ where
                 }
             }
 
+            event_statuses.extend(events[event_statuses.len()..].iter().map(|(_, cursor)| (event::Status::Ignored, *cursor)));
+
             let (base_cursor, interaction) = if let Some(overlay) = maybe_overlay.as_mut() {
                 let interaction = cursor
                     .position()
@@ -173,7 +180,7 @@ where
         } else {
             (
                 cursor,
-                vec![event::Status::Ignored; events.len()],
+                events.iter().map(|(_, cursor)| (event::Status::Ignored, *cursor)).collect(),
                 mouse::Interaction::None,
             )
         };
@@ -183,7 +190,7 @@ where
         let event_statuses = events
             .iter()
             .zip(overlay_statuses)
-            .map(|(event, overlay_status)| {
+            .map(|((event, _), (overlay_status, event_cursor))| {
                 if matches!(overlay_status, event::Status::Captured) {
                     return overlay_status;
                 }
@@ -194,7 +201,7 @@ where
                     &mut self.state,
                     event,
                     Layout::new(&self.base),
-                    base_cursor,
+                    event_cursor,
                     renderer,
                     &mut shell,
                     &viewport,

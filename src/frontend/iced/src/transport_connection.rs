@@ -225,10 +225,10 @@ impl Connection {
         let mut retained = self.retained.lock().expect("connection output");
         let before = retained.record_count();
         let result = (|| {
+            retained.input.flush(&mut send)?;
             while let Some(record) = retained.records.pop_front() {
                 send(&record.encode().map_err(|error| error.to_string())?)?;
             }
-            retained.input.flush(&mut send)?;
             if let Some((sequence, false)) = retained.pressure_observation
                 && retained.input.pressure_entered()
             {
@@ -469,16 +469,20 @@ mod tests {
                     .len()
                     .div_ceil(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
             );
+            let mut prior = None;
             for (index, batch) in samples
                 .chunks(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
                 .enumerate()
             {
                 let expected = crate::generated::encode_annotation_Input(
                     crate::generated::AnnotationInputBatch {
-                        epoch: 1,
                         documentepoch: 1,
                         sequence: first_sequence + index as u64,
-                        samples: batch.to_vec(),
+                        samples: batch.iter().map(|pointer| {
+                            let sample = crate::annotation_input::compact_sample(pointer, prior.as_ref());
+                            prior = if matches!(pointer.phase, crate::generated::AnnotationPointerPhase::End | crate::generated::AnnotationPointerPhase::Cancel) { None } else { Some(pointer.clone()) };
+                            sample
+                        }).collect(),
                     },
                 )
                 .unwrap()
@@ -516,7 +520,7 @@ mod tests {
             }),
             OutboundRecord::Interaction(Interaction {
                 replaceable: false,
-                endpoint_id: 3,
+                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                 value: Vec::new(),
             }),
             OutboundRecord::RendererObservation(RendererObservation::Ready),
@@ -540,7 +544,7 @@ mod tests {
             connection
                 .send_interaction(Interaction {
                     replaceable: false,
-                    endpoint_id: 1,
+                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                     value: Vec::new(),
                 })
                 .expect("transient pressure"),
@@ -573,7 +577,7 @@ mod tests {
             assert_eq!(
                 viewport.send_interaction(Interaction {
                     replaceable: true,
-                    endpoint_id: 1,
+                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                     value: vec![value]
                 }),
                 Ok(SendDisposition::Queued)
@@ -724,7 +728,7 @@ mod tests {
                 .connection
                 .send_interaction(Interaction {
                     replaceable: false,
-                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter,
+                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                     value: vec![7],
                 })
                 .unwrap();
@@ -921,7 +925,7 @@ mod tests {
                             .connection
                             .send_interaction(Interaction {
                                 replaceable: false,
-                                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateFilter,
+                                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                                 value: vec![8],
                             })
                             .unwrap();
@@ -1051,7 +1055,7 @@ mod tests {
         owner
             .send_interaction(Interaction {
                 replaceable: true,
-                endpoint_id: 1,
+                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                 value: vec![1],
             })
             .unwrap();
@@ -1061,7 +1065,7 @@ mod tests {
         owner
             .send_interaction(Interaction {
                 replaceable: true,
-                endpoint_id: 1,
+                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                 value: vec![2],
             })
             .unwrap();
@@ -1078,11 +1082,11 @@ mod tests {
             "separately stored samples still break replacement adjacency"
         );
         assert_eq!(
-            wire[0].payload.field("value"),
+            wire[1].payload.field("value"),
             Some(&crate::application_codec::Value::Bytes(vec![1]))
         );
         assert_eq!(
-            wire[1].payload.field("value"),
+            wire[2].payload.field("value"),
             Some(&crate::application_codec::Value::Bytes(vec![2]))
         );
         for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {

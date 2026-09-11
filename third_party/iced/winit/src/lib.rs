@@ -661,6 +661,7 @@ async fn run_instance<P>(
                         size: window.state.logical_size(),
                         scale_factor: window.raw.scale_factor() as f32,
                     }),
+                    window.state.cursor(),
                 ));
 
                 let _ = on_open.send(id);
@@ -746,7 +747,7 @@ async fn run_instance<P>(
                                 window.state.scale_factor(),
                                 window.state.modifiers(),
                             ) {
-                                events.push((id, event));
+                                events.push((id, event, window.state.cursor()));
                             }
                         }
 
@@ -793,7 +794,7 @@ async fn run_instance<P>(
                             let (state, _) = interface.update(
                                 &window.raw,
                                 &window.waker,
-                                slice::from_ref(&redraw_event),
+                                slice::from_ref(&(redraw_event.clone(), cursor)),
                                 cursor,
                                 &mut window.renderer,
                                 &mut messages,
@@ -1058,7 +1059,7 @@ async fn run_instance<P>(
                                 window.state.scale_factor(),
                                 window.state.modifiers(),
                             ) {
-                                events.push((id, event));
+                                events.push((id, event, window.state.cursor()));
                             }
                         }
                     }
@@ -1078,9 +1079,9 @@ async fn run_instance<P>(
                             let interact_span = debug::interact(id);
                             let mut window_events = vec![];
 
-                            events.retain(|(window_id, event)| {
+                            events.retain(|(window_id, event, cursor)| {
                                 if *window_id == id {
-                                    window_events.push(event.clone());
+                                    window_events.push((event.clone(), *cursor));
                                     false
                                 } else {
                                     true
@@ -1130,7 +1131,7 @@ async fn run_instance<P>(
                                 }
                             }
 
-                            for (event, status) in window_events.into_iter().zip(statuses) {
+                            for ((event, _), status) in window_events.into_iter().zip(statuses) {
                                 runtime.broadcast(subscription::Event::Interaction {
                                     window: id,
                                     event,
@@ -1141,7 +1142,7 @@ async fn run_instance<P>(
                             interact_span.finish();
                         }
 
-                        for (id, event) in events.drain(..) {
+                        for (id, event, _) in events.drain(..) {
                             runtime.broadcast(subscription::Event::Interaction {
                                 window: id,
                                 event,
@@ -1287,7 +1288,7 @@ fn run_action<'a, P, C>(
     _proxy: &Proxy<P::Message>,
     runtime: &mut Runtime<P::Executor, Proxy<P::Message>, Action<P::Message>>,
     compositor: &mut Option<C>,
-    events: &mut Vec<(window::Id, core::Event)>,
+    events: &mut Vec<(window::Id, core::Event, core::mouse::Cursor)>,
     messages: &mut Vec<P::Message>,
     clipboard: &mut Clipboard,
     control_sender: &mut mpsc::UnboundedSender<Control>,
@@ -1345,7 +1346,7 @@ fn run_action<'a, P, C>(
                 let _ = interfaces.remove(&id);
 
                 if window_manager.remove(id).is_some() {
-                    events.push((id, core::Event::Window(core::window::Event::Closed)));
+                    events.push((id, core::Event::Window(core::window::Event::Closed), core::mouse::Cursor::Unavailable));
                 }
 
                 if window_manager.is_empty() {
@@ -1763,7 +1764,8 @@ fn run_action<'a, P, C>(
             backend::Action::Configure(_, _) => {}
         },
         Action::Event { window, event } => {
-            events.push((window, event));
+            let cursor = window_manager.get_mut(window).map_or(core::mouse::Cursor::Unavailable, |window| window.state.cursor());
+            events.push((window, event, cursor));
         }
         Action::Tick => {
             for (_id, window) in window_manager.iter_mut() {

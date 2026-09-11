@@ -361,7 +361,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     use mmltk_browser_app::generated::{ApplicationEvent, ApplicationReply, ApplicationSnapshot};
     use mmltk_browser_app::protocol::ServerRecord;
 
-    let bytes = fs::read(env!("MMLTK_PROTOCOL_V15_SERVER_FIXTURE_PATH"))?;
+    let bytes = fs::read(env!("MMLTK_PROTOCOL_V16_SERVER_FIXTURE_PATH"))?;
     let mut records = Vec::new();
     let mut kinds = BTreeSet::new();
     let mut cursor = 0_usize;
@@ -538,7 +538,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
                 FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(value) => {
                     require(selected, "native dialog selected/cancelled fixture changed")?;
                     require(
-                        value.path == "/tmp/protocol-v15-fixture",
+                        value.path == "/tmp/protocol-v16-fixture",
                         "native dialog selected path changed",
                     )?;
                 }
@@ -697,7 +697,6 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
     let settings_update =
         generated::update_currentview(generated::default_currentview().map_err(io::Error::other)?);
     let batch = generated::AnnotationInputBatch {
-        epoch: 7,
         documentepoch: 1,
         sequence: 1,
         samples: (0..generated::ANNOTATION_INPUT_BATCH_CAPACITY)
@@ -721,6 +720,18 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
                     y: 1.0,
                 },
                 brushradius: generated::default_uiannotationbrushradius().unwrap() as u16,
+            })
+            .enumerate()
+            .map(|(index, mut pointer)| {
+                use generated::AnnotationPointerOrAnnotationPointVariant as Sample;
+                if index == generated::ANNOTATION_INPUT_BATCH_CAPACITY / 2 {
+                    pointer.brushradius += 1;
+                    Sample::AnnotationPointer(pointer)
+                } else if index != 0 && index + 1 != generated::ANNOTATION_INPUT_BATCH_CAPACITY {
+                    Sample::AnnotationPoint(generated::AnnotationPoint { x: 1.0, y: 0.0 })
+                } else {
+                    Sample::AnnotationPointer(pointer)
+                }
             })
             .collect(),
     };

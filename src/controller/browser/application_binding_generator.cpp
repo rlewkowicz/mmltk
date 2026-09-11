@@ -351,10 +351,9 @@ class BindingEmitter final {
                 << ";\npub const ANNOTATION_INPUT_ADMISSION_SLOTS: usize = " << mmltk::controller::kAnnotationInputAdmissionSlots << ";\n";
         symbols_.Reserve("module", "ANNOTATION_INPUT_ENCODED_CAPACITY", "native annotation input wire bound");
         constexpr auto input_wire_bound = cbor::compact_maximum_cbor_bytes<mmltk::controller::AnnotationInputBatch>();
-        constexpr auto interaction_overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() -
-                                              mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
+        constexpr auto encoded_capacity = cbor::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(input_wire_bound);
         static_assert(input_wire_bound <= kMaxIntentValueBytes);
-        output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << input_wire_bound + interaction_overhead << ";\n";
+        output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << encoded_capacity << ";\n";
         EmitInteractionEnvelope();
         EmitEndpoints();
         EmitRequestDefaults();
@@ -824,59 +823,28 @@ class BindingEmitter final {
 
     void EmitInteractionEnvelope() {
         using namespace mmltk::controller::browser;
-        namespace cbor = mmltk::frameworks::serialization;
-        using Envelope = cbor::ReflectedVariantEnvelope<ClientRecord, Interaction>;
-        symbols_.Reserve("module", "encode_interaction_record", "canonical retained interaction envelope");
-        constexpr auto overhead = cbor::reflected_maximum_cbor_bytes<std::variant<Interaction>>() -
-                                  mmltk::frameworks::reflection::policy_of_member<&Interaction::value>().maximum_bytes;
-        output_ << "pub fn encode_interaction_record(";
-        VisitRustFields<Interaction>([&]<class Field, class>(const auto&, const std::string& member) {
-            output_ << member << ": ";
-            if constexpr (cbor::reflected_byte_sequence<Field>)
-                output_ << "&[u8]";
-            else
-                output_ << rust_type<Field>();
-            output_ << ", ";
+        symbols_.Reserve("module", "encode_interaction_record", "canonical numeric interaction envelope");
+        symbols_.Reserve("module", "interaction_endpoint", "canonical numeric interaction dispatch");
+        output_ << "pub fn interaction_endpoint(opcode: u64) -> Option<u64> { match opcode {\n";
+        visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto opcode) {
+            output_ << opcode << " => Some(" << Endpoint::stable_id << "),\n";
         });
-        output_ << "output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> {\n";
-        VisitRustFields<Interaction>([&]<class Field, class>(const auto& fact, const std::string& member) {
-            if constexpr (cbor::reflected_byte_sequence<Field>)
-                output_ << "if " << member << ".len() > " << fact.constraint.maximum_bytes
-                        << " { return Err(crate::protocol::ProtocolError(\"interaction byte capacity exceeded\".into())) }\n";
-            else if (fact.constraint != mmltk::frameworks::reflection::FieldConstraint{}) {
-                output_ << "(|| -> Result<(), String> {\n";
-                EmitConstraint<Field>(member, fact.constraint);
-                output_ << "Ok(()) })().map_err(crate::protocol::ProtocolError)?;\n";
-            }
+        output_ << "_ => None } }\n";
+        output_ << "pub fn encode_interaction_record(endpoint: u64, value: &[u8], output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> {\n"
+                   "let opcode: u64 = match endpoint {\n";
+        visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto opcode) {
+            output_ << Endpoint::stable_id << " => " << opcode << ",\n";
         });
-        output_ << "output.clear(); let mut capacity = " << overhead << "_usize;\n";
-        VisitRustFields<Interaction>([&]<class Field, class>(const auto&, const std::string& member) {
-            if constexpr (cbor::reflected_byte_sequence<Field>)
-                output_ << "capacity = capacity.checked_add(" << member
-                        << ".len()).ok_or_else(|| crate::protocol::ProtocolError(\"interaction size overflow\".into()))?;\n";
-        });
-        output_ << "crate::protocol::client_records::reserve(output, capacity, MAX_RECORD_WIRE_BYTES)?;\n"
-                   "use crate::protocol::cbor::{head, encode_text_item};\n"
-                   "head(5, "
-                << Envelope::field_count
-                << ", output);\n"
-                   "encode_text_item("
-                << std::quoted(Envelope::kind_key)
-                << ", output);\n"
-                   "encode_text_item("
-                << std::quoted(Envelope::kind)
-                << ", output);\n"
-                   "encode_text_item("
-                << std::quoted(Envelope::payload_key)
-                << ", output);\n"
-                   "head(5, "
-                << cbor::reflected_cbor_member_count<Interaction>() << ", output);\n";
-        VisitRustFields<Interaction>([&]<class Field, class>(const auto& fact, const std::string& member) {
-            output_ << "encode_text_item(" << std::quoted(fact.member_name) << ", output);\n";
-            if constexpr (cbor::reflected_byte_sequence<Field>) {
+        output_ << "_ => return Err(crate::protocol::ProtocolError(\"unknown interaction endpoint\".into())) };\n"
+                   "if value.len() > MAX_INTENT_VALUE_BYTES { return Err(crate::protocol::ProtocolError(\"interaction byte capacity exceeded\".into())) }\n"
+                   "output.clear(); crate::protocol::client_records::reserve(output, value.len() + crate::protocol::cbor::head_len(value.len() as u64) + "
+                << mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(0U) - 1U
+                << ", MAX_RECORD_WIRE_BYTES)?;\nuse crate::protocol::cbor::head;\n";
+        output_ << "head(4, " << mmltk::frameworks::serialization::reflected_cbor_member_count<CompactInteraction>() << ", output);\n";
+        VisitRustFields<CompactInteraction>([&]<class Field, class>(const auto&, const std::string& member) {
+            if constexpr (mmltk::frameworks::serialization::reflected_byte_sequence<Field>) {
                 output_ << "head(2, " << member << ".len() as u64, output); output.extend_from_slice(" << member << ");\n";
             } else {
-                static_assert(cbor::compact_shape<Field> == cbor::CompactShape::Scalar);
                 output_ << "crate::protocol::client_records::Compact::compact(&" << member << ", output)?;\n";
             }
         });
@@ -1063,6 +1031,19 @@ class BindingEmitter final {
             EmitCompactType<typename schema::Optional<Type>::value_type>();
         } else if constexpr (shape == cbor::CompactShape::Sequence) {
             EmitCompactType<typename schema::Sequence<Type>::value_type>();
+        } else if constexpr (shape == cbor::CompactShape::Variant) {
+            if (!compact_types_.insert(NativeSource<Type>()).second) return;
+            schema::Variant<Type>::Visit([&]<class Alternative>() { EmitCompactType<Alternative>(); });
+            output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()
+                    << " { fn compact(&self, bytes: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "
+                       "crate::protocol::client_records::compact_head(4, 2, bytes)?; match self {\n";
+            std::size_t opcode = 0U;
+            schema::Variant<Type>::Visit([&]<class Alternative>() {
+                const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
+                output_ << "Self::" << rust_identifier(source, true) << "(value) => { crate::protocol::client_records::compact_head(0, "
+                        << opcode++ << ", bytes)?; crate::protocol::client_records::Compact::compact(value, bytes) },\n";
+            });
+            output_ << "} } }\n";
         } else if constexpr (shape == cbor::CompactShape::Enum) {
             if (!compact_types_.insert(NativeSource<Type>()).second) return;
             output_ << "impl crate::protocol::client_records::Compact for " << rust_type<Type>()

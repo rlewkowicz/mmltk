@@ -168,6 +168,7 @@ pub struct State {
     viewport_writable_wait: bool,
     measured_gallery: Option<MeasuredGallery>,
     pressed_image: Option<u32>,
+    pub(super) gallery_hover: std::sync::Arc<std::sync::Mutex<Option<(u64, Option<u32>)>>>,
 }
 
 impl State {
@@ -525,7 +526,7 @@ fn measured_dimension(value: f32) -> f32 {
     }
 }
 
-fn selected_at(
+pub(super) fn selected_at(
     snapshot: Option<&ExploreSnapshot>,
     sample: crate::presentation_surface::SurfaceSample,
 ) -> Option<u32> {
@@ -538,8 +539,8 @@ fn selected_at(
         return None;
     }
     let layout = &snapshot.gallery.layout;
-    let column = sample.content_x / layout.cardextent;
-    let row = sample.content_y / layout.cardextent;
+    let column = sample.content_x as u32 / layout.cardextent;
+    let row = sample.content_y as u32 / layout.cardextent;
     if column >= layout.columns || row >= layout.rowcount {
         return None;
     }
@@ -584,8 +585,8 @@ mod tests {
             height: 200,
             x,
             y,
-            content_x: x,
-            content_y: y,
+            content_x: x as f32,
+            content_y: y as f32,
             pressed: true,
         }
     }
@@ -1203,7 +1204,7 @@ mod tests {
         );
         assert_eq!(state.gallery_gesture(Some(&snapshot), None, gesture), None);
         assert_eq!(state.gallery_gesture(None, Some(&snapshot), gesture), None);
-        gesture.sample.content_x = 400;
+        gesture.sample.content_x = 400.0;
         assert_eq!(
             state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
             Some(GalleryGestureOutcome::Focused(None))

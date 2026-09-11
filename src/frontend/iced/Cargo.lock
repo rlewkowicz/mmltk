@@ -1184,6 +1184,7 @@ dependencies = [
  "iced",
  "iced-fluent-theme",
  "iced_aw",
+ "iced_runtime",
  "js-sys",
  "wasm-bindgen",
  "web-sys",

@@ -933,8 +933,8 @@ pub(crate) struct SurfaceSample {
     pub height: u32,
     pub x: u32,
     pub y: u32,
-    pub content_x: u32,
-    pub content_y: u32,
+    pub content_x: f32,
+    pub content_y: f32,
     pub pressed: bool,
 }
 
@@ -1182,7 +1182,11 @@ impl ViewportOwner {
                 Some(shader::Action::capture())
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                // Availability belongs to Iced's overlay/hit-test pass; the
+                // coordinates belong to this event, never the batch frontier.
+                let cursor = if cursor.position().is_some() { mouse::Cursor::Available(*position) } else { mouse::Cursor::Unavailable };
                 if let Some(prior) = self.pan_origin {
+                    cursor.position()?;
                     self.pan_x += position.x - prior.x;
                     self.pan_y += position.y - prior.y;
                     self.pan_origin = Some(*position);
@@ -1272,8 +1276,8 @@ impl ViewportOwner {
             height: bounds.height.max(1.0) as u32,
             x: point.x.max(0.0) as u32,
             y: point.y.max(0.0) as u32,
-            content_x: content_x + crop_x,
-            content_y: content_y + crop_y,
+            content_x: content_x + crop_x as f32,
+            content_y: content_y + crop_y as f32,
             pressed,
         })
     }
@@ -1376,8 +1380,9 @@ fn inverse_content_point(
     geometry: PlacementGeometry,
     point: Point,
     content: (u32, u32),
-) -> Option<(u32, u32)> {
-    if point.x < geometry.x
+) -> Option<(f32, f32)> {
+    if !point.x.is_finite() || !point.y.is_finite()
+        || point.x < geometry.x
         || point.y < geometry.y
         || point.x >= geometry.x + geometry.width
         || point.y >= geometry.y + geometry.height
@@ -1388,9 +1393,9 @@ fn inverse_content_point(
     }
     Some((
         (((point.x - geometry.x) / geometry.width) * content.0 as f32)
-            .clamp(0.0, content.0.saturating_sub(1) as f32) as u32,
+            .clamp(0.0, content.0 as f32),
         (((point.y - geometry.y) / geometry.height) * content.1 as f32)
-            .clamp(0.0, content.1.saturating_sub(1) as f32) as u32,
+            .clamp(0.0, content.1 as f32),
     ))
 }
 
@@ -3807,14 +3812,178 @@ mod tests {
     }
 
     #[test]
+    fn final_content_cells_keep_continuous_fractions_through_crop_pan_and_zoom() {
+        let bounds = Rectangle { x: 40.0, y: 30.0, width: 640.0, height: 480.0 };
+        let viewport = ViewportOwner { zoom: 0.5, pan_x: 10.0, pan_y: -5.0, ..ViewportOwner::default() };
+        for crop in [None, Some([100, 60, 20, 10]), Some([7, 9, 1, 1])] {
+            let surface = Surface { crop, ..surface_for_content_session(1) };
+            let extent = surface.content_extent();
+            let [crop_x, crop_y, _, _] = surface.content_region();
+            let geometry = placement_geometry(Rectangle::with_size(bounds.size()), extent,
+                Placement::Contain, viewport.transform()).unwrap();
+            let mut previous = None;
+            for fraction in [0.25, 0.75] {
+                let content = Point::new(extent.0 as f32 - 1.0 + fraction, extent.1 as f32 - 1.0 + fraction);
+                let cursor = mouse::Cursor::Available(Point::new(
+                    bounds.x + geometry.x + content.x / extent.0 as f32 * geometry.width,
+                    bounds.y + geometry.y + content.y / extent.1 as f32 * geometry.height,
+                ));
+                let sample = viewport.sample(bounds, cursor, surface, Placement::Contain, true).unwrap();
+                assert!((sample.content_x - (crop_x as f32 + content.x)).abs() < 0.0001);
+                assert!((sample.content_y - (crop_y as f32 + content.y)).abs() < 0.0001);
+                if let Some((x, y)) = previous {
+                    assert!(sample.content_x > x && sample.content_y > y);
+                }
+                previous = Some((sample.content_x, sample.content_y));
+            }
+            assert!(inverse_content_point(geometry,
+                Point::new(geometry.x + geometry.width, geometry.y), extent).is_none());
+            assert!(inverse_content_point(geometry,
+                Point::new(geometry.x, geometry.y + geometry.height), extent).is_none());
+        }
+    }
+
+    #[test]
+    fn iced_batched_events_preserve_cursor_order_and_overlay_capture() {
+        use iced_runtime::core as core;
+        use std::{cell::RefCell, rc::Rc};
+        type Observed = (core::Event, core::mouse::Cursor);
+
+        struct Probe {
+            overlay_events: Option<Rc<RefCell<Vec<Observed>>>>,
+        }
+        struct ModalProbe(Rc<RefCell<Vec<Observed>>>);
+
+        impl core::Widget<Observed, (), ()> for Probe {
+            fn size(&self) -> core::Size<core::Length> {
+                core::Size::new(core::Length::Fixed(100.0), core::Length::Fixed(100.0))
+            }
+            fn layout(&mut self, _tree: &mut core::widget::Tree, _renderer: &(),
+                _limits: &core::layout::Limits) -> core::layout::Node {
+                core::layout::Node::new(core::Size::new(100.0, 100.0))
+            }
+            fn draw(&self, _tree: &core::widget::Tree, _renderer: &mut (), _theme: &(),
+                _style: &core::renderer::Style, _layout: core::Layout<'_>,
+                _cursor: core::mouse::Cursor, _viewport: &core::Rectangle) {}
+            fn update(&mut self, _tree: &mut core::widget::Tree, event: &core::Event,
+                _layout: core::Layout<'_>, cursor: core::mouse::Cursor, _renderer: &(),
+                shell: &mut core::Shell<'_, Observed>, _viewport: &core::Rectangle) {
+                shell.publish((event.clone(), cursor));
+            }
+            fn overlay<'a>(&'a mut self, _tree: &'a mut core::widget::Tree,
+                _layout: core::Layout<'a>, _renderer: &(), _viewport: &core::Rectangle,
+                _translation: core::Vector) -> Option<core::overlay::Element<'a, Observed, (), ()>> {
+                self.overlay_events.as_ref().map(|events| {
+                    core::overlay::Element::new(Box::new(ModalProbe(events.clone())))
+                })
+            }
+        }
+        impl core::Overlay<Observed, (), ()> for ModalProbe {
+            fn layout(&mut self, _renderer: &(), _bounds: core::Size) -> core::layout::Node {
+                core::layout::Node::new(core::Size::new(50.0, 100.0))
+            }
+            fn draw(&self, _renderer: &mut (), _theme: &(), _style: &core::renderer::Style,
+                _layout: core::Layout<'_>, _cursor: core::mouse::Cursor) {}
+            fn update(&mut self, event: &core::Event, layout: core::Layout<'_>,
+                cursor: core::mouse::Cursor, _renderer: &(), shell: &mut core::Shell<'_, Observed>) {
+                self.0.borrow_mut().push((event.clone(), cursor));
+                if matches!(event, core::Event::Mouse(core::mouse::Event::ButtonPressed(_)))
+                    && cursor.is_over(layout.bounds()) {
+                    shell.capture_event();
+                }
+            }
+            fn mouse_interaction(&self, layout: core::Layout<'_>, cursor: core::mouse::Cursor,
+                _renderer: &()) -> core::mouse::Interaction {
+                if cursor.is_over(layout.bounds()) { core::mouse::Interaction::Pointer }
+                else { core::mouse::Interaction::None }
+            }
+        }
+
+        let first = Point::new(10.25, 20.5);
+        let second = Point::new(80.75, 40.125);
+        let first_cursor = mouse::Cursor::Available(first);
+        let second_cursor = mouse::Cursor::Available(second);
+        let unavailable = mouse::Cursor::Unavailable;
+        let events = vec![
+            (Event::Mouse(mouse::Event::CursorMoved { position: first }), first_cursor),
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), first_cursor),
+            (Event::Mouse(mouse::Event::CursorMoved { position: second }), second_cursor),
+            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), second_cursor),
+            (Event::Mouse(mouse::Event::CursorMoved { position: first }), unavailable),
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), unavailable),
+        ];
+        for modal in [false, true] {
+            let observed_overlay = Rc::new(RefCell::new(Vec::new()));
+            let root = core::Element::new(Probe {
+                overlay_events: modal.then(|| observed_overlay.clone()),
+            });
+            let mut renderer = ();
+            let mut ui = iced_runtime::UserInterface::build(root, core::Size::new(100.0, 100.0),
+                iced_runtime::user_interface::Cache::default(), &mut renderer);
+            let mut observed_base = Vec::new();
+            let (_, statuses) = ui.update(&core::window::Headless, &core::shell::Waker::noop(),
+                &events, second_cursor, &mut renderer, &mut observed_base);
+            if modal {
+                assert_eq!(*observed_overlay.borrow(), events);
+                assert_eq!(observed_base, vec![
+                    (events[0].0.clone(), unavailable),
+                    events[2].clone(), events[3].clone(), events[4].clone(), events[5].clone(),
+                ]);
+                assert_eq!(statuses, vec![core::event::Status::Ignored, core::event::Status::Captured,
+                    core::event::Status::Ignored, core::event::Status::Ignored,
+                    core::event::Status::Ignored, core::event::Status::Ignored]);
+            } else {
+                assert_eq!(observed_base, events);
+                assert_eq!(statuses, vec![core::event::Status::Ignored; events.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn event_time_cursor_keeps_fractional_motion_and_button_order() {
+        let mut viewport = ViewportOwner::default();
+        let surface = surface_for_content_session(1);
+        let bounds = Rectangle::with_size(iced::Size::new(640.0, 480.0));
+        let captured = std::cell::RefCell::new(Vec::new());
+        let publish = |gesture| {
+            captured.borrow_mut().push(gesture);
+            shader::Action::<()>::capture()
+        };
+        let first = Point::new(10.25, 20.5);
+        let second = Point::new(30.75, 40.125);
+        for (event, position) in [
+            (Event::Mouse(mouse::Event::CursorMoved { position: first }), first),
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), first),
+            (Event::Mouse(mouse::Event::CursorMoved { position: second }), second),
+            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), second),
+        ] {
+            let _ = viewport.update(&event, bounds, mouse::Cursor::Available(position), surface, Placement::Contain, Some(&publish));
+        }
+        let gestures = captured.borrow();
+        assert_eq!(gestures.len(), 4);
+        assert_eq!(gestures[1].sample.content_x, first.x);
+        assert_eq!(gestures[1].sample.content_y, first.y);
+        assert_eq!(gestures[2].sample.content_x, second.x);
+        assert_eq!(gestures[2].sample.content_y, second.y);
+        assert!(gestures[1].sample.pressed && gestures[2].sample.pressed);
+        assert!(!gestures[3].sample.pressed);
+        drop(gestures);
+        captured.borrow_mut().clear();
+        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds,
+            mouse::Cursor::Unavailable, surface, Placement::Contain, Some(&publish));
+        assert!(captured.borrow().is_empty());
+        assert!(!viewport.pointer_active);
+    }
+
+    #[test]
     fn captured_release_outside_surface_uses_last_valid_sample_once() {
         let sample = SurfaceSample {
             width: 640,
             height: 480,
             x: 120,
             y: 80,
-            content_x: 60,
-            content_y: 40,
+            content_x: 60.0,
+            content_y: 40.0,
             pressed: true,
         };
         let mut viewport = ViewportOwner {
@@ -3837,8 +4006,8 @@ mod tests {
             height: 480,
             x: 120,
             y: 80,
-            content_x: 60,
-            content_y: 40,
+            content_x: 60.0,
+            content_y: 40.0,
             pressed: true,
         };
         let mut viewport = ViewportOwner::default();
@@ -4008,7 +4177,7 @@ mod tests {
         );
         assert_eq!(
             inverse_content_point(contain, Point::new(50.0, 50.0), (200, 100)),
-            Some((100, 50))
+            Some((100.0, 50.0))
         );
         assert!(inverse_content_point(contain, Point::new(50.0, 10.0), (200, 100)).is_none());
 
@@ -4040,7 +4209,7 @@ mod tests {
         );
         assert_eq!(
             inverse_content_point(gallery, Point::new(75.0, 50.0), (80, 60)),
-            Some((60, 40))
+            Some((60.0, 40.0))
         );
     }
 
@@ -4069,19 +4238,18 @@ mod tests {
                 );
                 assert_eq!(
                     inverse_content_point(geometry, Point::new(geometry.x, geometry.y), content,),
-                    Some((0, 0))
+                    Some((0.0, 0.0))
                 );
-                assert_eq!(
-                    inverse_content_point(
-                        geometry,
-                        Point::new(
-                            geometry.x + geometry.width - 0.001,
-                            geometry.y + geometry.height - 0.001,
-                        ),
-                        content,
+                let edge = inverse_content_point(
+                    geometry,
+                    Point::new(
+                        geometry.x + geometry.width - 0.001,
+                        geometry.y + geometry.height - 0.001,
                     ),
-                    Some((content.0 - 1, content.1 - 1))
-                );
+                    content,
+                ).unwrap();
+                assert!(edge.0 > (content.0 - 1) as f32 && edge.0 <= content.0 as f32);
+                assert!(edge.1 > (content.1 - 1) as f32 && edge.1 <= content.1 as f32);
             }
         }
     }
@@ -4113,7 +4281,7 @@ mod tests {
             let cell_edge = Point::new(geometry.x + 100.0 * scale, geometry.y + 100.0 * scale);
             assert_eq!(
                 inverse_content_point(geometry, cell_edge, (400, 400)),
-                Some((100, 100))
+                Some((100.0, 100.0))
             );
             assert_eq!(
                 inverse_content_point(
@@ -4121,7 +4289,7 @@ mod tests {
                     Point::new(cell_edge.x - scale * 0.5, cell_edge.y - scale * 0.5),
                     (400, 400)
                 ),
-                Some((99, 99))
+                Some((99.5, 99.5))
             );
             assert!(
                 inverse_content_point(
@@ -4214,10 +4382,9 @@ mod tests {
             assert!(key.image_origin[1] < 0.0);
             let uv_y = (visible.y - key.image_origin[1]) / key.draw_extent[1];
             assert!((uv_y - 37.25 / 750.0).abs() < 0.00001);
-            assert_eq!(
-                inverse_content_point(geometry, Point::new(visible.x, visible.y), (400, 500)),
-                Some((0, 24)),
-            );
+            let point = inverse_content_point(geometry, Point::new(visible.x, visible.y), (400, 500)).unwrap();
+            assert_eq!(point.0, 0.0);
+            assert!((point.1 - 37.25 / 1.5).abs() < 0.0001);
             assert!(
                 placement_geometry(translated, (400, 400), placement, ViewTransform::FIT,)
                     .is_none()
@@ -4269,7 +4436,7 @@ mod tests {
                 Point::new(150.0, 262.5),
                 placement.logical_extent(surface.content_extent())
             ),
-            Some((100, 200))
+            Some((100.0, 200.0))
         );
     }
 

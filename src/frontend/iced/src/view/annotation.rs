@@ -429,8 +429,8 @@ mod tests {
                 height: 480,
                 x: 20,
                 y: 30,
-                content_x: 20,
-                content_y: 30,
+                content_x: 20.0,
+                content_y: 30.0,
                 pressed: true,
             },
         }
@@ -572,16 +572,20 @@ mod tests {
         use crate::presentation_surface::SurfaceGestureKind as Kind;
         use crate::transport_connection::{Capture, CapturedRecord, Connection};
         let assert_batch =
-            |connection: &Connection, capture: &mut Capture, sequence, documentepoch, samples| {
+            |connection: &Connection, capture: &mut Capture, sequence, documentepoch, samples: Vec<crate::generated::AnnotationPointer>| {
+                let mut prior = None;
                 let CapturedRecord::Other(actual) = capture.try_recv().unwrap() else {
                     panic!("direct annotation interaction")
                 };
                 let expected = crate::generated::encode_annotation_Input(
                     crate::generated::AnnotationInputBatch {
-                        epoch: 1,
                         documentepoch,
                         sequence,
-                        samples,
+                        samples: samples.iter().map(|pointer| {
+                            let sample = crate::annotation_input::compact_sample(pointer, prior.as_ref());
+                            prior = if matches!(pointer.phase, Phase::End | Phase::Cancel) { None } else { Some(pointer.clone()) };
+                            sample
+                        }).collect(),
                     },
                 )
                 .unwrap()

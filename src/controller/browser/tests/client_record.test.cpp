@@ -117,7 +117,7 @@ struct FixtureApplicationSystems final {
 };
 
 [[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
-    std::ifstream input(MMLTK_PROTOCOL_V15_CLIENT_FIXTURE_PATH);
+    std::ifstream input(MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH);
     REQUIRE(input.good());
     const auto nibble = [](const char value) -> unsigned char {
         if (value >= '0' && value <= '9') return static_cast<unsigned char>(value - '0');
@@ -210,8 +210,8 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
 
-TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
-    STATIC_REQUIRE(kBrowserProtocolVersion == 15U);
+TEST_CASE("Rust Protocol-16 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
+    STATIC_REQUIRE(kBrowserProtocolVersion == 16U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
     REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) ==
@@ -301,11 +301,14 @@ TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[con
     REQUIRE(batch_view);
     CHECK(dispatch_interaction(systems, *batch_view).disposition == InteractionDispatchDisposition::Accepted);
     REQUIRE(annotation.input.samples.size() == kAnnotationInputBatchCapacity);
-    CHECK(annotation.input.samples.front().target.role == contracts::AnnotationHandleRole::BoxCorner);
-    CHECK(annotation.input.epoch == 7U);
+    CHECK(std::get<AnnotationPointer>(annotation.input.samples.front()).target.role == contracts::AnnotationHandleRole::BoxCorner);
+    CHECK(annotation.input.document_epoch == 1U);
     CHECK(annotation.input.sequence == 1U);
-    CHECK(annotation.input.samples.front().phase == contracts::AnnotationPointerPhase::Begin);
-    CHECK(annotation.input.samples.back().phase == contracts::AnnotationPointerPhase::End);
+    CHECK(std::get<AnnotationPointer>(annotation.input.samples.front()).phase == contracts::AnnotationPointerPhase::Begin);
+    CHECK(std::get<AnnotationPointer>(annotation.input.samples.back()).phase == contracts::AnnotationPointerPhase::End);
+    CHECK(std::get<contracts::AnnotationPoint>(annotation.input.samples[1]) == contracts::AnnotationPoint{1.0F, 0.0F});
+    CHECK(std::get<AnnotationPointer>(annotation.input.samples[kAnnotationInputBatchCapacity / 2U]).brush_radius ==
+          contracts::kDefaultAnnotationBrushRadius + 1U);
     const auto batch_owned = decode_client_record({.first = batch_fixture.bytes});
     REQUIRE(batch_owned);
     auto batch_interaction = std::get<Interaction>(*batch_owned);
@@ -314,6 +317,7 @@ TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[con
     auto compact_value = wire::decode({.first = batch_interaction.value}, compact_limits);
     REQUIRE(compact_value);
     auto& compact_fields = std::get<wire::Value::Array>(compact_value->storage);
+    REQUIRE(compact_fields.size() == 3U);
     auto& compact_samples = std::get<wire::Value::Array>(compact_fields.back().storage);
     REQUIRE(compact_samples.size() == kAnnotationInputBatchCapacity);
     compact_samples.push_back(compact_samples.front());
@@ -328,56 +332,26 @@ TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[con
     batch_interaction.value.push_back(std::byte{0xf6});
     CHECK(dispatch_interaction(systems, batch_interaction).disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK(annotation.input.samples.size() == kAnnotationInputBatchCapacity);
-    // Both projections accept reordered payload keys and reject the same
-    // incomplete, unknown, duplicate, truncated, or trailing record shape.
-    auto named =
-        mmltk::frameworks::serialization::reflected_value(Interaction{.endpoint_id = interaction.endpoint_id, .value = interaction.value});
-    REQUIRE(named);
-    auto& fields = std::get<wire::Value::Object>(named->storage);
+    // The numeric envelope accepts every segmented boundary, rejects obsolete
+    // named records, and never tolerates truncation, unknown opcodes or trailing bytes.
     wire::ByteBuffer projected;
-    for (std::size_t rotation = 0U; rotation < fields.size(); ++rotation) {
-        std::ranges::rotate(fields, fields.begin() + 1);
-        REQUIRE(wire::encode(wire::Value(wire::Value::Object{{"kind", wire::Value(std::string("Interaction"))}, {"payload", *named}}),
-                             projected,
-                             {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
-        REQUIRE(decode_client_record({.first = projected}));
-        auto borrowed = decode_interaction_view(projected);
-        REQUIRE(borrowed);
-        CHECK(borrowed->Get<&Interaction::endpoint_id>() == interaction.endpoint_id);
-        CHECK(dispatch_interaction(systems, *borrowed).disposition == InteractionDispatchDisposition::Accepted);
-        for (std::size_t size = 0U; size < projected.size(); ++size)
-            CHECK_FALSE(decode_interaction_view(std::span<const std::byte>(projected).first(size)));
-        projected.push_back(std::byte{0xf6});
-        CHECK_FALSE(decode_interaction_view(projected));
-        CHECK_FALSE(decode_client_record({.first = projected}));
+    REQUIRE(encode_client_record(interaction, projected));
+    for (std::size_t split = 0U; split <= projected.size(); ++split) {
+        const auto bytes = std::span<const std::byte>(projected);
+        REQUIRE(decode_client_record({.first = bytes.first(split), .second = bytes.subspan(split)}));
     }
-    const auto original_fields = fields;
-    for (const unsigned mutation : {0U, 1U}) {
-        fields = original_fields;
-        if (mutation == 0U)
-            fields.pop_back();
-        else
-            fields.front().first = "unknown";
-        const wire::Value envelope(wire::Value::Object{{"kind", wire::Value(std::string("Interaction"))}, {"payload", *named}});
-        REQUIRE(wire::encode(envelope, projected,
-                             {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
-        CHECK_FALSE(decode_interaction_view(projected));
-        CHECK_FALSE(decode_client_record({.first = projected}));
-    }
-    projected.resize(256U);
-    mmltk::frameworks::serialization::FixedCborEncoder duplicate_writer(projected);
-    REQUIRE(duplicate_writer.object(2U));
-    REQUIRE(duplicate_writer.text("kind"));
-    REQUIRE(duplicate_writer.text("Interaction"));
-    REQUIRE(duplicate_writer.text("payload"));
-    REQUIRE(duplicate_writer.object(3U));
-    REQUIRE(duplicate_writer.text("endpoint_id"));
-    REQUIRE(duplicate_writer.unsigned_integer(interaction.endpoint_id));
-    REQUIRE(duplicate_writer.text("endpoint_id"));
-    REQUIRE(duplicate_writer.unsigned_integer(interaction.endpoint_id));
-    REQUIRE(duplicate_writer.text("value"));
-    REQUIRE(duplicate_writer.bytes(interaction.value));
-    projected.resize(duplicate_writer.size());
+    for (std::size_t size = 0U; size < projected.size(); ++size)
+        CHECK_FALSE(decode_interaction_view(std::span<const std::byte>(projected).first(size)));
+    auto trailing = projected;
+    trailing.push_back(std::byte{0xf6});
+    CHECK_FALSE(decode_interaction_view(trailing));
+    CHECK_FALSE(decode_client_record({.first = trailing}));
+    auto unknown = projected;
+    unknown[1] = std::byte{0x17};
+    CHECK_FALSE(decode_interaction_view(unknown));
+    CHECK_FALSE(decode_client_record({.first = unknown}));
+    REQUIRE(mmltk::frameworks::serialization::encode(ClientRecord{interaction}, projected,
+        {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
     CHECK_FALSE(decode_interaction_view(projected));
     CHECK_FALSE(decode_client_record({.first = projected}));
     const auto accepted_interaction = dispatch_interaction(systems, interaction);
@@ -540,7 +514,7 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
     REQUIRE(accepted.result);
 }
 
-TEST_CASE("Bootstrap uses the compact protocol-15 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
+TEST_CASE("Bootstrap uses the compact protocol-16 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
     STATIC_REQUIRE(kMaxRecordWireBytes >=
                    mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);
@@ -752,4 +726,39 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         completed.code = 1U;
         CHECK_FALSE(abi::valid(completed));
     }
+}
+
+TEST_CASE("compact sample alternatives retain exact fractional values and reject invalid opcodes", "[controller][browser][protocol]") {
+    using namespace mmltk::controller;
+    using namespace mmltk::controller::browser;
+    namespace cbor = mmltk::frameworks::serialization;
+    constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
+    const AnnotationPointer absolute{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 9U, .sequence = 1U,
+                                     .point = {1.25F, 2.5F}};
+    const AnnotationInputBatch source{.document_epoch = 3U, .sequence = 1U,
+        .samples = {absolute, contracts::AnnotationPoint{0.125F, -0.25F},
+                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 9U, .sequence = 3U,
+                                      .point = {1.375F, 2.25F}, .brush_radius = contracts::kMaxAnnotationBrushRadius}}};
+    wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>());
+    cbor::FixedCborEncoder encoder(bytes);
+    REQUIRE(cbor::encode_compact(encoder, source));
+    bytes.resize(encoder.size());
+    for (std::size_t split = 0U; split <= bytes.size(); ++split) {
+        AnnotationInputBatch decoded;
+        const auto span = std::span<const std::byte>(bytes);
+        REQUIRE(cbor::decode_compact_into(decoded, {.first = span.first(split), .second = span.subspan(split)}, limits));
+        REQUIRE(decoded.samples.size() == 3U);
+        CHECK(std::get<AnnotationPointer>(decoded.samples[0]).point == absolute.point);
+        CHECK(std::get<contracts::AnnotationPoint>(decoded.samples[1]) == contracts::AnnotationPoint{0.125F, -0.25F});
+        CHECK(std::get<AnnotationPointer>(decoded.samples[2]).brush_radius == contracts::kMaxAnnotationBrushRadius);
+    }
+    auto malformed = wire::decode({.first = bytes}, limits);
+    REQUIRE(malformed);
+    auto& fields = std::get<wire::Value::Array>(malformed->storage);
+    auto& samples = std::get<wire::Value::Array>(fields.back().storage);
+    auto& delta = std::get<wire::Value::Array>(samples[1].storage);
+    delta.front() = wire::Value(std::uint64_t{2U});
+    REQUIRE(wire::encode(*malformed, bytes, limits));
+    AnnotationInputBatch decoded;
+    CHECK_FALSE(cbor::decode_compact_into(decoded, {.first = bytes}, limits));
 }

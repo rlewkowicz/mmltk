@@ -767,7 +767,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
     STATIC_REQUIRE(application_schema_detail::annotation_count<^^CounterChanged, contracts::reflection::Event>() == 1U);
 }
 
-TEST_CASE("protocol-15 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
+TEST_CASE("protocol-16 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
     namespace cbor = mmltk::frameworks::serialization;
     STATIC_REQUIRE(cbor::compact_shape<AnnotationInputBatch> == cbor::CompactShape::Object);
     STATIC_REQUIRE(cbor::compact_shape<ExploreViewportUpdate> == cbor::CompactShape::Object);
@@ -775,7 +775,7 @@ TEST_CASE("protocol-15 fingerprint is deterministic and covers stable compositio
     STATIC_REQUIRE(cbor::compact_shape<std::vector<AnnotationPointer>> == cbor::CompactShape::Unsupported);
     STATIC_REQUIRE(cbor::compact_shape<std::string> == cbor::CompactShape::Unsupported);
     STATIC_REQUIRE(cbor::compact_shape<wire::Value> == cbor::CompactShape::Unsupported);
-    STATIC_REQUIRE(cbor::compact_shape<std::variant<AnnotationPointer>> == cbor::CompactShape::Unsupported);
+    STATIC_REQUIRE(cbor::compact_shape<std::variant<AnnotationPointer>> == cbor::CompactShape::Variant);
     STATIC_REQUIRE(cbor::compact_shape<long double> == cbor::CompactShape::Unsupported);
     STATIC_REQUIRE(kAnnotationInputBatchCapacity == 32U);
     STATIC_REQUIRE(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>() <= kMaxIntentValueBytes);
@@ -1322,11 +1322,11 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
     }
 }
 
-TEST_CASE("protocol-15 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
+TEST_CASE("protocol-16 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
     CounterSystem counter;
     TestSettingsSystem settings;
     const auto bootstrap = materialize_bootstrap(TestSettingsSystems{.settings = &settings, .counter = &counter});
-    CHECK(bootstrap.protocol_version == 15U);
+    CHECK(bootstrap.protocol_version == 16U);
     CHECK(bootstrap.input_epoch == 0U);  // The physical host installs the peer identity before encoding.
     CHECK(bootstrap.schema_fingerprint == application_schema_fingerprint<TestSettingsSystems>().words);
     REQUIRE(bootstrap.snapshots.size() == 2U);

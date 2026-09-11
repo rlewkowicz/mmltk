@@ -1547,6 +1547,14 @@ struct ApplicationSchemaFingerprint final {
     constexpr bool operator==(const ApplicationSchemaFingerprint&) const noexcept = default;
 };
 
+template <class Composition, class Visitor>
+void visit_interaction_opcodes(Visitor&& visitor) {
+    std::uint64_t opcode = 0U;
+    ApplicationSchema<Composition>::VisitEndpoints([&]<class Endpoint>() {
+        if constexpr (Endpoint::interaction) visitor.template operator()<Endpoint>(opcode++);
+    });
+}
+
 namespace application_schema_detail {
 
 template <class Composition>
@@ -1559,7 +1567,12 @@ template <class Composition>
         if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
     };
     sink.append_number(kBrowserProtocolVersion);
-    sink.append("compact-positional-interactions");
+    sink.append("compact-numeric-interactions");
+    application_schema_detail::append_type<CompactInteraction>(sink);
+    visit_interaction_opcodes<Composition>([&]<class Endpoint>(const auto opcode) {
+        sink.append_number(opcode);
+        sink.append_number(Endpoint::stable_id);
+    });
     application_schema_detail::append_type<ClientRecord>(sink);
     application_schema_detail::append_type<ServerRecord>(sink);
     sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);

@@ -3748,15 +3748,24 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     REQUIRE(retained.valid());
     const auto initial = annotation.snapshot();
     const auto input = [&](std::uint64_t batch, contracts::AnnotationPointerPhase phase, std::uint64_t sequence, float x) {
-        return AnnotationInputBatch{.epoch = 7U, .document_epoch = initial.input_document_epoch, .sequence = batch,
-            .samples = {{.phase = phase, .interaction_id = 1U, .sequence = sequence, .point = {x, 3.0F + x}}}};
+        return AnnotationInputBatch{.document_epoch = initial.input_document_epoch, .sequence = batch,
+            .samples = {AnnotationPointer{.phase = phase, .interaction_id = 1U, .sequence = sequence, .point = {x, 3.0F + x}}}};
     };
     auto invalid = input(1U, contracts::AnnotationPointerPhase::Begin, 1U, 2.0F);
-    invalid.samples.front().target = {.object = 0U, .element = 0U};
+    std::get<AnnotationPointer>(invalid.samples.front()).target = {.object = 0U, .element = 0U};
+    CHECK_THROWS_AS(annotation.Input(invalid), contracts::InvalidIntentError);
+    invalid.samples = {contracts::AnnotationPoint{1.0F, 1.0F}};
     CHECK_THROWS_AS(annotation.Input(invalid), contracts::InvalidIntentError);
     annotation.Input(input(1U, contracts::AnnotationPointerPhase::Begin, 1U, 2.0F));
     REQUIRE(annotation_events.Wait([&] { return consumed.load() == 1U; }));
-    annotation.Input(input(2U, contracts::AnnotationPointerPhase::Update, 2U, 7.0F));
+    auto movement = input(2U, contracts::AnnotationPointerPhase::Update, 2U, 7.0F);
+    // A malformed suffix must roll back the entire admission's retained codec
+    // state; the retry still reconstructs from the accepted Begin.
+    movement.samples = {contracts::AnnotationPoint{1.25F, 0.5F},
+                        contracts::AnnotationPoint{std::numeric_limits<float>::infinity(), 0.0F}};
+    CHECK_THROWS_AS(annotation.Input(movement), contracts::InvalidIntentError);
+    movement.samples = {contracts::AnnotationPoint{5.0F, 5.0F}};
+    annotation.Input(movement);
     REQUIRE(annotation_events.Wait([&] { return consumed.load() == 2U; }));
     CHECK(annotation.snapshot().ui.document_revision == initial.ui.document_revision);
     annotation.Input(input(3U, contracts::AnnotationPointerPhase::End, 3U, 9.0F));
@@ -3764,6 +3773,9 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(annotation.snapshot().frame == initial.frame);
     CHECK(annotation.snapshot().rendered == initial.rendered);
     CHECK_THROWS_AS(annotation.Input(input(3U, contracts::AnnotationPointerPhase::End, 3U, 9.0F)), contracts::InvalidIntentError);
+    movement.sequence = 4U;
+    CHECK_THROWS_AS(annotation.Input(movement), contracts::InvalidIntentError); // End retired the delta predecessor.
+
     // Save and undo settle without waiting for the held output, and preserve the
     // ordered box commit in the real reducer/history rather than a mock journal.
     mmltk::testsupport::ScopedTempDir saved_document{"mmltk-annotation-independent-save"};
@@ -4465,16 +4477,16 @@ TEST_CASE("Annotation peer closure orders accepted input before replacement gest
     annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) { consumed = progress.consumed_sequence; events.Advance(); });
     const auto epoch = annotation.snapshot().input_document_epoch;
     const auto before = annotation.snapshot().ui.scene.objects.size();
-    annotation.Input({.epoch = 1U, .document_epoch = epoch, .sequence = 1U,
-        .samples = {{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2,3}},
-                    {.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4,5}}}});
+    annotation.Input({.document_epoch = epoch, .sequence = 1U,
+        .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2,3}},
+                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4,5}}}});
     annotation.PeerClosed();
     annotation.SetInputPeer(2U, [&](AnnotationInputProgress progress) { ready = progress.epoch; consumed = progress.consumed_sequence; events.Advance(); });
     REQUIRE(events.Wait([&] { return ready.load() == 2U; }));
     CHECK(annotation.snapshot().ui.scene.objects.size() == before);
-    annotation.Input({.epoch = 2U, .document_epoch = epoch, .sequence = 1U,
-        .samples = {{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 2U, .sequence = 1U, .point = {6,7}},
-                    {.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 2U, .sequence = 2U, .point = {8,9}}}});
+    annotation.Input({.document_epoch = epoch, .sequence = 1U,
+        .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 2U, .sequence = 1U, .point = {6,7}},
+                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 2U, .sequence = 2U, .point = {8,9}}}});
     REQUIRE(events.Wait([&] { return consumed.load() == 1U && annotation.snapshot().ui.scene.objects.size() == before + 1U; }));
     CHECK(annotation.snapshot().ready);
 }
@@ -5187,10 +5199,10 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     held_scene = annotation.snapshot().ui.scene_revision;
     std::atomic_uint64_t consumed{0U};
     annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) { consumed = progress.consumed_sequence; events.Advance(); });
-    annotation.Input({.epoch = 1U, .document_epoch = initial.input_document_epoch, .sequence = 1U,
-        .samples = {{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2,3}},
-                    {.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4,5}},
-                    {.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 3U, .point = {6,7}}}});
+    annotation.Input({.document_epoch = initial.input_document_epoch, .sequence = 1U,
+        .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2,3}},
+                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4,5}},
+                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 3U, .point = {6,7}}}});
     REQUIRE(events.Wait([&] { return consumed.load() == 1U && annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
     CHECK(annotation.snapshot().frame == initial.frame);
     const auto committed = annotation.snapshot().ui.document_revision;
@@ -5241,8 +5253,8 @@ TEST_CASE("Annotation admission reuses both credits without consuming rejected b
         events.Advance();
     });
     const auto batch = [epoch](std::uint64_t sequence, contracts::AnnotationPointerPhase phase) {
-        return AnnotationInputBatch{.epoch = 1U, .document_epoch = epoch, .sequence = sequence,
-            .samples = {{.phase = phase, .interaction_id = 1U, .sequence = sequence,
+        return AnnotationInputBatch{.document_epoch = epoch, .sequence = sequence,
+            .samples = {AnnotationPointer{.phase = phase, .interaction_id = 1U, .sequence = sequence,
                          .point = {static_cast<float>(sequence * 2U), static_cast<float>(sequence * 3U)}}}};
     };
     annotation.Input(batch(1U, contracts::AnnotationPointerPhase::Begin));
@@ -5294,10 +5306,10 @@ TEST_CASE("Annotation color sampling completes before following document command
     REQUIRE(held.valid());
     { std::scoped_lock lock(probe->mutex); probe->sample_hold = sample; }
     annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) { consumed = progress.consumed_sequence; events.Advance(); });
-    annotation.Input({.epoch = 1U, .document_epoch = annotation.snapshot().input_document_epoch, .sequence = 1U,
-        .samples = {{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U,
+    annotation.Input({.document_epoch = annotation.snapshot().input_document_epoch, .sequence = 1U,
+        .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U,
                     .target = {.object = 0U}, .point = {4,5}},
-                   {.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 2U,
+                   AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 2U,
                     .target = {.object = 0U}, .point = {4,5}}}});
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     CHECK(consumed.load() == 1U);

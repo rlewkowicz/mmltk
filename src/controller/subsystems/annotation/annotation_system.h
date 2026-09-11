@@ -40,14 +40,16 @@ struct AnnotationPointer final {
                brush_radius <= contracts::kMaxAnnotationBrushRadius;
     }
 };
+// Alternative ordinal is the generated compact opcode: a complete pointer
+// establishes/updates gesture metadata; a point advances it by an exact delta.
+using AnnotationInputSample = std::variant<AnnotationPointer, contracts::AnnotationPoint>;
 inline constexpr std::size_t kAnnotationInputBatchCapacity = 32U;
 inline constexpr std::size_t kAnnotationInputAdmissionSlots = 2U;
 struct AnnotationInputBatch final {
-    std::uint64_t epoch = 0U;
     std::uint64_t document_epoch = 0U;
     std::uint64_t sequence = 0U;
     [[= mmltk::frameworks::reflection::MaxItems{
-        kAnnotationInputBatchCapacity}]] std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity>
+        kAnnotationInputBatchCapacity}]] std::inplace_vector<AnnotationInputSample, kAnnotationInputBatchCapacity>
         samples{};
 };
 struct AnnotationInputProgress final {

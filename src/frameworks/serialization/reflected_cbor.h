@@ -117,6 +117,54 @@ class BorrowedByteRecord final {
                 record_.*Declaration::pointer = record.*Declaration::pointer;
         });
     }
+    BorrowedByteRecord(const Record& record, const wire::ByteSegments bytes) : BorrowedByteRecord(record) { bytes_ = bytes; }
+    [[nodiscard]] static constexpr std::size_t EncodedCapacity(const std::size_t payload_capacity) {
+        namespace d = implementation::detail;
+        std::size_t capacity = wire::head_size(d::flattened_member_count<Record>());
+        d::visit_members<Record>([&]<class Declaration>(const auto&) {
+            if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember)) {
+                capacity = d::cbor_size_add(capacity, d::cbor_size_add(wire::head_size(payload_capacity), payload_capacity));
+            } else {
+                capacity = d::cbor_size_add(capacity, compact_maximum_cbor_bytes<typename Declaration::member_type>());
+            }
+        });
+        return capacity;
+    }
+    [[nodiscard]] bool EncodeCompact(FixedCborEncoder& writer) const {
+        namespace d = implementation::detail;
+        bool valid = writer.array(d::flattened_member_count<Record>());
+        d::visit_members<Record>([&]<class Declaration>(const auto&) {
+            if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember)) {
+                // Encoding receives one contiguous retained payload.
+                constexpr auto policy = d::serialized_member_policy<Declaration>();
+                valid = valid && bytes_.second.empty() && bytes_.size() <= policy.maximum_bytes &&
+                        bytes_.size() >= policy.minimum_bytes && writer.bytes(bytes_.first);
+            } else {
+                valid = valid && d::member_constraints_accept<Declaration>(record_.*Declaration::pointer) &&
+                        encode_compact(writer, record_.*Declaration::pointer);
+            }
+        });
+        return valid;
+    }
+    [[nodiscard]] bool DecodeCompact(wire::Reader& reader) {
+        namespace d = implementation::detail;
+        auto count = reader.begin_array_item(0U);
+        if (!count || *count != d::flattened_member_count<Record>()) return false;
+        bool valid = true;
+        d::visit_members<Record>([&]<class Declaration>(const auto&) {
+            if (!valid) return;
+            if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember)) {
+                auto bytes = reader.borrow_bytes_item(1U);
+                constexpr auto policy = d::serialized_member_policy<Declaration>();
+                valid = bytes && bytes->size() <= policy.maximum_bytes && bytes->size() >= policy.minimum_bytes;
+                if (valid) bytes_ = *bytes;
+            } else {
+                valid = decode_compact_item(record_.*Declaration::pointer, reader, 1U) &&
+                        d::member_constraints_accept<Declaration>(record_.*Declaration::pointer);
+            }
+        });
+        return valid && reader.finish().has_value();
+    }
     template <class Variant>
     [[nodiscard]] bool Decode(wire::Reader& reader) {
         namespace d = implementation::detail;

@@ -149,6 +149,29 @@ pub(super) fn update(
     }))
 }
 
+// Retained component focus suppresses same-cell motion before it becomes an
+// application message. Selection and native viewport admission keep their owners.
+fn local_gestures(
+    state: &super::state::State,
+    snapshot: Option<&crate::generated::ExploreSnapshot>,
+) -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync> {
+    let hover = state.gallery_hover.clone();
+    let current = snapshot.map(|snapshot| (snapshot.dataset.identity, snapshot.frame.clone()));
+    std::sync::Arc::new(move |gesture| {
+        if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport {
+            let (_, shown) = crate::presentation_surface::gallery::displayed()?;
+            let (identity, frame) = current.as_ref()?;
+            if *identity != shown.dataset.identity || *frame != shown.frame { return None; }
+            let selected = super::state::selected_at(Some(&shown), gesture.sample);
+            let next = Some((*identity, selected));
+            let mut prior = hover.lock().expect("gallery local focus");
+            if *prior == next { return None; }
+            *prior = next;
+        }
+        Some(Message::Surface(gesture))
+    })
+}
+
 pub(super) fn view<'a>(
     state: &'a super::state::State,
     model: &'a ApplicationModel,
@@ -367,9 +390,9 @@ fn gallery_viewport<'a>(
         |surface| {
             crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
-                    local: None,
+                    local: Some(local_gestures(state, snapshot)),
                     surface,
-                    publish: Some(Message::Surface),
+                    publish: None,
                     placement: crate::presentation_surface::Placement::GalleryGrid {
                         first_row,
                         columns: presented_grid.0,
@@ -722,8 +745,8 @@ mod tests {
                 height: 200,
                 x: 50,
                 y: 50,
-                content_x: 50,
-                content_y: 50,
+                content_x: 50.0,
+                content_y: 50.0,
                 pressed: false,
             },
         };

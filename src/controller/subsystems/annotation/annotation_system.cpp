@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
@@ -27,7 +28,9 @@ using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
 class AnnotationSystem::Impl final {
     friend class AnnotationSystem;
     struct InputSlot final {
-        AnnotationInputBatch batch;
+        std::uint64_t epoch = 0U;
+        std::uint64_t sequence = 0U;
+        std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity> samples;
         std::size_t next = 0U;
         bool occupied = false;
     };
@@ -65,6 +68,8 @@ class AnnotationSystem::Impl final {
                 terminal_barrier_ = true;
                 command_before_terminal_ = command_.has_value();
             }
+            admitted_pointer_.reset();
+            admitted_document_epoch_ = 0U;
             input_epoch_ = epoch;
             admitted_sequence_ = consumed_sequence_ = 0U;
             input_progress_ = std::move(progress);
@@ -78,18 +83,39 @@ class AnnotationSystem::Impl final {
             RequireReady();
             if (state_.busy) throw contracts::InvalidIntentError("Annotation command barrier is unsettled");
             if (terminal_barrier_) throw contracts::UnavailableError("Annotation input is resetting");
-            if (!batch.epoch || batch.epoch != input_epoch_ || batch.document_epoch != state_.input_document_epoch ||
+            if (!input_epoch_ || batch.document_epoch != state_.input_document_epoch ||
                 !batch.sequence || batch.sequence != admitted_sequence_ + 1U || batch.samples.empty())
                 throw contracts::InvalidIntentError("Annotation input epoch or sequence is invalid");
-            for (const auto& pointer : batch.samples) {
+            auto slot = std::ranges::find(input_slots_, false, &InputSlot::occupied);
+            if (slot == input_slots_.end()) throw contracts::InvalidIntentError("Annotation input exceeded its two consumption credits");
+            auto prior = admitted_document_epoch_ == batch.document_epoch ? admitted_pointer_ : std::nullopt;
+            slot->samples.clear();
+            for (const auto& sample : batch.samples) {
+                AnnotationPointer pointer;
+                if (const auto* absolute = std::get_if<AnnotationPointer>(&sample)) {
+                    pointer = *absolute;
+                } else {
+                    const auto delta = std::get<contracts::AnnotationPoint>(sample);
+                    if (!prior || !delta.finite() || prior->sequence == std::numeric_limits<std::uint64_t>::max())
+                        throw contracts::InvalidIntentError("Annotation delta has no valid gesture predecessor");
+                    pointer = *prior;
+                    pointer.phase = contracts::AnnotationPointerPhase::Update;
+                    ++pointer.sequence;
+                    pointer.point.x += delta.x;
+                    pointer.point.y += delta.y;
+                }
                 if (!pointer.valid() || pointer.point.x < 0 || pointer.point.y < 0 ||
                     pointer.point.x > state_.ui.scene.frame_width || pointer.point.y > state_.ui.scene.frame_height)
                     throw contracts::InvalidIntentError("Annotation batch contains invalid pointer input");
+                slot->samples.push_back(pointer);
+                prior = pointer.phase == contracts::AnnotationPointerPhase::End || pointer.phase == contracts::AnnotationPointerPhase::Cancel
+                            ? std::nullopt : std::optional{pointer};
             }
-            auto slot = std::ranges::find(input_slots_, false, &InputSlot::occupied);
-            if (slot == input_slots_.end()) throw contracts::InvalidIntentError("Annotation input exceeded its two consumption credits");
+            admitted_pointer_ = prior;
+            admitted_document_epoch_ = batch.document_epoch;
             admitted_sequence_ = batch.sequence;
-            slot->batch = std::move(batch);
+            slot->epoch = input_epoch_;
+            slot->sequence = batch.sequence;
             slot->next = 0U;
             slot->occupied = true;
         }
@@ -184,7 +210,7 @@ class AnnotationSystem::Impl final {
                     // The oldest occupied slot may belong to the peer being
                     // retired. Finish its accepted samples before gesture cleanup.
                     for (auto& candidate : input_slots_)
-                        if (candidate.occupied && (!slot || candidate.batch.sequence < slot->batch.sequence)) slot = &candidate;
+                        if (candidate.occupied && (!slot || candidate.sequence < slot->sequence)) slot = &candidate;
                     if (!slot && terminal_barrier_ && !command_before_terminal_) close = true;
                     else if (!slot && command_) {
                         command = std::move(command_); command_.reset(); command_before_terminal_ = false;
@@ -207,8 +233,8 @@ class AnnotationSystem::Impl final {
     void ReduceBatch(InputSlot& slot) {
         bool dirty = false;
         bool ui_changed = false;
-        while (slot.next < slot.batch.samples.size()) {
-            const auto pointer = slot.batch.samples[slot.next++];
+        while (slot.next < slot.samples.size()) {
+            const auto pointer = slot.samples[slot.next++];
             const auto prior = document_.ui().scene_revision;
             auto result = document_.Pointer(pointer);
             dirty = dirty || result.render_changed;
@@ -220,7 +246,7 @@ class AnnotationSystem::Impl final {
             if (sample) {
                 if (ui_changed) InstallUi(false);
                 if (dirty) QueueRender();
-                if (slot.next == slot.batch.samples.size()) Consumed(slot);
+                if (slot.next == slot.samples.size()) Consumed(slot);
                 Sample(pointer);
                 return;
             }
@@ -236,7 +262,7 @@ class AnnotationSystem::Impl final {
         SystemEventSink<AnnotationInputProgress> progress;
         {
             std::scoped_lock lock(mutex_);
-            value = {slot.batch.epoch, slot.batch.sequence};
+            value = {slot.epoch, slot.sequence};
             slot.occupied = false;
             if (value.epoch == input_epoch_) { consumed_sequence_ = value.consumed_sequence; progress = input_progress_; }
         }
@@ -451,7 +477,7 @@ class AnnotationSystem::Impl final {
         document_.PeerClosed();
         {
             std::scoped_lock lock(mutex_);
-            if (std::ranges::any_of(input_slots_, [this](const auto& slot) { return slot.occupied && slot.batch.epoch == input_epoch_; }))
+            if (std::ranges::any_of(input_slots_, [this](const auto& slot) { return slot.occupied && slot.epoch == input_epoch_; }))
                 progress = input_progress_;
             rejected = {input_epoch_, consumed_sequence_, detail};
             for (auto& slot : input_slots_) slot.occupied = false;
@@ -477,6 +503,8 @@ class AnnotationSystem::Impl final {
     std::optional<Command> command_;
     Completion completion_;
     std::uint64_t input_epoch_ = 0U, admitted_sequence_ = 0U, consumed_sequence_ = 0U;
+    std::optional<AnnotationPointer> admitted_pointer_;
+    std::uint64_t admitted_document_epoch_ = 0U;
     SystemEventSink<AnnotationInputProgress> input_progress_;
     bool terminal_barrier_ = false, gpu_continuation_ = false, stopping_ = false, peer_ready_pending_ = false;
     bool command_before_terminal_ = false;
