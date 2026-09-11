@@ -20,6 +20,7 @@
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 
 namespace mmltk::controller {
 
@@ -121,32 +122,20 @@ struct AnnotationEdit final {
 struct AnnotationEditRequest final {
     AnnotationEdit edit{};
 };
-enum class AnnotationOperationOutcome : std::uint8_t { Applied, Rejected };
-struct AnnotationOperationResult final {
-    contracts::AnnotationUiState ui{};
-    std::string detail;
-    AnnotationOperationOutcome outcome = AnnotationOperationOutcome::Rejected;
-};
-
-struct AnnotationPointerResult final {
-    std::string detail;
-    AnnotationOperationOutcome outcome = AnnotationOperationOutcome::Rejected;
-    bool ui_changed = false;
-};
-
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     ~AnnotationAlgorithm() override = default;
-    [[nodiscard]] virtual AnnotationOperationResult Open(mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
-                                                         VisualRegion) = 0;
-    [[nodiscard]] virtual AnnotationPointerResult Pointer(const AnnotationPointer&) = 0;
-    [[nodiscard]] virtual const contracts::AnnotationUiState& Ui() const noexcept = 0;
-    virtual void PeerClosed() noexcept = 0;
-    [[nodiscard]] virtual AnnotationOperationResult Edit(const AnnotationEdit&) = 0;
-    [[nodiscard]] virtual AnnotationOperationResult Save(std::string_view destination) = 0;
+    virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion) = 0;
+    [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
     // A missing source preserves the initialized clean plane; semantics are replaced completely.
-    virtual void Render(mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
+    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
                         mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
+};
+struct AnnotationRenderedFacts final {
+    bool operator==(const AnnotationRenderedFacts&) const = default;
+    std::uint64_t generation = 0U;
+    std::uint64_t document_epoch = 0U;
+    std::uint64_t scene_revision = 0U;
 };
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
@@ -157,6 +146,7 @@ struct AnnotationSnapshot final {
     // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
     bool ready = false;
     contracts::AnnotationUiState ui{};
+    AnnotationRenderedFacts rendered{};
     VisualFrame frame{};
     // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
 };
@@ -170,6 +160,7 @@ struct AnnotationFrameState final {
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
     VisualFrame frame{};
+    AnnotationRenderedFacts rendered{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationFrameChanged final {
     AnnotationFrameState snapshot{};
@@ -242,6 +233,7 @@ MMLTK_REFLECT_FIELDS(AnnotationUndoEdit)
 MMLTK_REFLECT_FIELDS(AnnotationRedoEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEditRequest)
+MMLTK_REFLECT_FIELDS(AnnotationRenderedFacts)
 MMLTK_REFLECT_FIELDS(AnnotationSnapshot)
 MMLTK_REFLECT_FIELDS(AnnotationChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFrameState)

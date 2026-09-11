@@ -55,6 +55,7 @@ struct PointerFacts final {
     std::uint64_t sequence = 0U;
     bool brush = false;
     bool preview = false;
+    std::uint16_t brush_radius = 0U;
 };
 struct JournalEntry final {
     struct Facts final {};
@@ -640,7 +641,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                          .target = request.target,
                          .origin = request.point,
                          .latest = request.point,
-                         .sequence = request.sequence};
+                         .sequence = request.sequence,
+                         .brush_radius = brush_radius};
         if (action == AnnotationPointerAction::Brush) {
             if (!state.ui.scene.frame_ready || state.ui.scene.categories.empty()) {
                 state.pointer = {};
@@ -679,12 +681,14 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         if (!continues_pointer(state.pointer, request, action)) {
             return refuse_pointer("Gesture identity, target or sequence does not match the active gesture");
         }
-        if (state.pointer.brush)
+        const bool changed = state.pointer.latest != request.point || state.pointer.brush_radius != brush_radius;
+        if (state.pointer.brush && changed)
             stroke_mask(state.brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
                         state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
-        update_drag_preview(state, request.point);
+        if (changed) update_drag_preview(state, request.point);
         state.pointer.latest = request.point;
         state.pointer.sequence = request.sequence;
+        state.pointer.brush_radius = brush_radius;
         return DocumentOutcome::Applied;
     }
     if (request.phase == domain::AnnotationPointerPhase::Cancel) {
@@ -1082,6 +1086,16 @@ class AnnotationDocument::Impl final {
         return Result(outcome, "open");
     }
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer& pointer) {
+        const auto scene_revision = state_.ui.scene_revision;
+        const auto before = state_.pointer;
+        const auto changed = [&] {
+            const auto& after = state_.pointer;
+            const bool was_preview = before.brush || before.preview;
+            const bool is_preview = after.brush || after.preview;
+            return scene_revision != state_.ui.scene_revision || was_preview != is_preview ||
+                   (is_preview && (before.latest != after.latest || before.brush_radius != after.brush_radius ||
+                                   before.interaction_id != after.interaction_id));
+        };
         if (diagnostics_enabled_) {
             std::fprintf(stderr,
                          "{\"event\":\"annotation.pointer\",\"interaction_id\":%llu,\"sequence\":%llu,\"phase\":%u,\"target\":%d,\"x\":%."
@@ -1091,15 +1105,24 @@ class AnnotationDocument::Impl final {
                          pointer.point.x, pointer.point.y, static_cast<unsigned>(pointer.brush_radius));
         }
         try {
-            return Result(reduce_pointer(state_, pointer, pointer.brush_radius), "pointer");
+            auto result = Result(reduce_pointer(state_, pointer, pointer.brush_radius), "pointer");
+            result.render_changed = changed();
+            return result;
         } catch (const std::length_error& error) {
             state_.pointer = {};
-            return {.outcome = DocumentOutcome::Capacity, .detail = error.what()};
+            return {.outcome = DocumentOutcome::Capacity, .detail = error.what(), .render_changed = changed()};
         }
     }
-    void PeerClosed() noexcept { state_.pointer = {}; }
+    [[nodiscard]] bool HasPreview() const noexcept { return state_.pointer.brush || state_.pointer.preview; }
+    bool PeerClosed() noexcept {
+        const bool changed = HasPreview();
+        state_.pointer = {};
+        return changed;
+    }
     [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit& edit) {
         if (!current(state_)) return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document state is invalid"};
+        const auto scene_revision = state_.ui.scene_revision;
+        const bool preview = state_.pointer.brush || state_.pointer.preview;
         state_.pointer = {};
         std::string_view operation;
         const auto result = std::visit(
@@ -1145,7 +1168,9 @@ class AnnotationDocument::Impl final {
                     static_assert(std::same_as<Edit, void>, "Unhandled AnnotationEdit alternative");
             },
             edit.value);
-        return Result(result, operation);
+        auto reduced = Result(result, operation);
+        reduced.render_changed = preview || scene_revision != state_.ui.scene_revision;
+        return reduced;
     }
     [[nodiscard]] DocumentResult Save(const std::string_view destination) {
         if (!current(state_)) return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document state is invalid"};
@@ -1163,15 +1188,13 @@ class AnnotationDocument::Impl final {
     [[nodiscard]] bool ToolAvailable(domain::AnnotationTool tool, std::optional<std::uint16_t> target) const noexcept {
         return tool_applicable(state_.ui.scene, tool, target, true);
     }
-    [[nodiscard]] std::size_t RenderObjectCount() const noexcept {
-        return state_.ui.scene.objects.size() +
-               ((state_.pointer.brush || state_.pointer.preview) && !state_.pointer.target.object ? 1U : 0U);
-    }
-    [[nodiscard]] const domain::AnnotationObject& RenderObjectAt(std::size_t index) const {
-        const auto* preview = state_.pointer.brush ? &state_.brush : state_.pointer.preview ? &state_.preview : nullptr;
-        if (preview && index == state_.pointer.target.object.value_or(static_cast<std::uint16_t>(state_.ui.scene.objects.size())))
-            return *preview;
-        return state_.ui.scene.objects.at(index);
+    void CaptureRender(AnnotationRenderState& target) const {
+        target.ui = state_.ui;
+        target.preview_object.reset();
+        if (state_.pointer.brush || state_.pointer.preview) {
+            target.preview_object = state_.pointer.target.object.value_or(static_cast<std::uint16_t>(state_.ui.scene.objects.size()));
+            target.preview = state_.pointer.brush ? state_.brush : state_.preview;
+        }
     }
 
    private:
@@ -1217,11 +1240,16 @@ AnnotationDocument::AnnotationDocument() : impl_(std::make_unique<Impl>()) {}
 AnnotationDocument::~AnnotationDocument() = default;
 DocumentResult AnnotationDocument::Open(domain::AnnotationSceneContent content) { return impl_->Open(std::move(content)); }
 DocumentResult AnnotationDocument::Pointer(const mmltk::controller::AnnotationPointer& pointer) { return impl_->Pointer(pointer); }
-void AnnotationDocument::PeerClosed() noexcept { impl_->PeerClosed(); }
+bool AnnotationDocument::PeerClosed() noexcept { return impl_->PeerClosed(); }
 DocumentResult AnnotationDocument::Edit(const mmltk::controller::AnnotationEdit& edit) {
+    const bool preview = impl_->HasPreview();
+    const auto revision = impl_->ui().scene_revision;
     try {
         return impl_->Edit(edit);
-    } catch (const std::length_error& error) { return {.outcome = DocumentOutcome::Capacity, .detail = error.what()}; }
+    } catch (const std::length_error& error) {
+        return {.outcome = DocumentOutcome::Capacity, .detail = error.what(),
+                .render_changed = preview || revision != impl_->ui().scene_revision};
+    }
 }
 DocumentResult AnnotationDocument::Save(const std::string_view destination) { return impl_->Save(destination); }
 const domain::AnnotationUiState& AnnotationDocument::ui() const noexcept { return impl_->ui(); }
@@ -1229,7 +1257,6 @@ const domain::AnnotationUiState& AnnotationDocument::ui() const noexcept { retur
 bool AnnotationDocument::ToolAvailable(domain::AnnotationTool tool, std::optional<std::uint16_t> target) const noexcept {
     return impl_->ToolAvailable(tool, target);
 }
-std::size_t AnnotationDocument::RenderObjectCount() const noexcept { return impl_->RenderObjectCount(); }
-const domain::AnnotationObject& AnnotationDocument::RenderObjectAt(std::size_t index) const { return impl_->RenderObjectAt(index); }
+void AnnotationDocument::CaptureRender(AnnotationRenderState& target) const { impl_->CaptureRender(target); }
 
 }  // namespace mmltk::controller::subsystems::annotation

@@ -10,6 +10,7 @@
 namespace mmltk::controller {
 struct AnnotationEdit;
 struct AnnotationPointer;
+struct AnnotationRenderState;
 }  // namespace mmltk::controller
 
 namespace mmltk::controller::subsystems::annotation {
@@ -21,6 +22,7 @@ enum class DocumentOutcome : std::uint8_t { Applied, Rejected, Capacity };
 struct DocumentResult final {
     DocumentOutcome outcome = DocumentOutcome::Rejected;
     std::string detail;
+    bool render_changed = false;
 };
 
 enum class DocumentSaveEffect : std::uint8_t { NotApplied, Committed, Uncertain };
@@ -35,13 +37,12 @@ class AnnotationDocument final {
 
     [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
-    void PeerClosed() noexcept;
+    bool PeerClosed() noexcept;
     [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);
     [[nodiscard]] DocumentResult Save(std::string_view);
     [[nodiscard]] const contracts::AnnotationUiState& ui() const noexcept;
     [[nodiscard]] bool ToolAvailable(contracts::AnnotationTool, std::optional<std::uint16_t>) const noexcept;
-    [[nodiscard]] std::size_t RenderObjectCount() const noexcept;
-    [[nodiscard]] const contracts::AnnotationObject& RenderObjectAt(std::size_t) const;
+    void CaptureRender(AnnotationRenderState&) const;
 
    private:
     class Impl;

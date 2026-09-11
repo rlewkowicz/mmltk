@@ -638,6 +638,7 @@ mod tests {
             crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(
                 crate::generated::AnnotationFrameChanged {
                     snapshot: crate::generated::AnnotationFrameState {
+                        rendered: model.annotation.snapshot.as_ref().unwrap().rendered.clone(),
                         revision: 2,
                         uirevision: 1,
                         frame: frame.clone(),

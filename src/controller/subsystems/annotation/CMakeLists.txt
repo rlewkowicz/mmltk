@@ -20,6 +20,7 @@ mmltk_register_private_headers(
     mmltk_controller_annotation_system
     detail/annotation_mask.h
     detail/annotation_document.h
+    detail/annotation_render_state.h
     detail/annotation_atomic_save.h)
 mmltk_register_retained_module_importers(
     mmltk_controller_annotation_system

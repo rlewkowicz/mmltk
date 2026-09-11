@@ -250,46 +250,14 @@ class RunningHost final {
 
 class HostAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
-    explicit HostAnnotationAlgorithm(std::shared_ptr<std::atomic_size_t> closed) : closed_(std::move(closed)) {}
-    // CLEANUP-IGNORE: This browser-host test double owns an independent annotation fixture and observable behavior.
-    AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, contracts::AnnotationSceneContent,
-                                   VisualRegion) override {
-        // CLEANUP-IGNORE: The fixture values deliberately satisfy the production AnnotationUiState validity contract.
-        state_.scene.document = contracts::WorkspaceResource::From("direct://browser-host", 1U);
-        state_.scene.categories = {{.value = "object"}};
-        state_.scene.frame_width = static_cast<std::uint16_t>(source.descriptor.width);
-        state_.scene.frame_height = static_cast<std::uint16_t>(source.descriptor.height);
-        state_.scene.frame_ready = true;
-        state_.document_revision = 1U;
-        state_.scene_revision = 1U;
-        state_.interaction_revision = 1U;
-        state_.scene.document.revision = 1U;
-        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
-    }
-    AnnotationPointerResult Pointer(const AnnotationPointer&) override {
-        return {.detail = {}, .outcome = AnnotationOperationOutcome::Applied};
-    }
-    const contracts::AnnotationUiState& Ui() const noexcept override { return state_; }
-    void PeerClosed() noexcept override { closed_->fetch_add(1U, std::memory_order_release); }
-    AnnotationOperationResult Edit(const AnnotationEdit&) override {
-        ++state_.document_revision;
-        ++state_.scene_revision;
-        state_.scene.document.revision = state_.document_revision;
-        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
-    }
-    AnnotationOperationResult Save(std::string_view) override {
-        // CLEANUP-IGNORE: This browser-host double returns its own deterministic applied Save result.
-        return {.ui = state_, .detail = {}, .outcome = AnnotationOperationOutcome::Applied};
-    }
-    void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
+    void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {}
+    contracts::AnnotationColor Sample(contracts::AnnotationPoint) override { return {}; }
+    void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source,
+                const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                std::uintptr_t) const override {
         if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
         std::memset(reinterpret_cast<void*>(semantic.data), 0, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
     }
-
-   private:
-    std::shared_ptr<std::atomic_size_t> closed_;
-    contracts::AnnotationUiState state_;
 };
 
 class ReadyHostAnnotation final {
@@ -300,11 +268,11 @@ class ReadyHostAnnotation final {
               mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
           annotation_(
               {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-              [backend = backend_, closed = closed_](auto revisions) {
+              [backend = backend_](auto revisions) {
                   return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
                       .device = 0,
                       .backend = backend,
-                      .model = std::make_unique<HostAnnotationAlgorithm>(closed),
+                      .model = std::make_unique<HostAnnotationAlgorithm>(),
                       .input_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean,
                       .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                       .product_revisions = std::move(revisions),
@@ -327,14 +295,13 @@ class ReadyHostAnnotation final {
               }) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
-        const bool ready = Wait([this] { return annotation_.snapshot().ready || !failure_.empty(); });
+        const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
         INFO("Annotation startup failure: " << failure_);
         REQUIRE(ready);
         REQUIRE(failure_.empty());
     }
 
     [[nodiscard]] AnnotationSystem& system() noexcept { return annotation_; }
-    [[nodiscard]] std::size_t closed() const noexcept { return closed_->load(std::memory_order_acquire); }
     void Flush() {
         const auto before = annotation_.snapshot();
         INFO("Annotation ready: " << before.ready << ", frame valid: " << before.frame.valid() << ", UI valid: " << before.ui.valid());
@@ -348,16 +315,15 @@ class ReadyHostAnnotation final {
         }));
     }
 
-   private:
     template <class Predicate>
     [[nodiscard]] bool Wait(Predicate predicate) {
         std::unique_lock lock(mutex_);
         return changed_.wait_for(lock, std::chrono::seconds{2}, std::move(predicate));
     }
 
+   private:
     std::shared_ptr<mmltk::frameworks::gpu::test_support::FakeImageBackend> backend_;
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> source_;
-    std::shared_ptr<std::atomic_size_t> closed_ = std::make_shared<std::atomic_size_t>(0U);
     PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
     std::mutex mutex_;
     std::condition_variable changed_;
@@ -653,14 +619,33 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     REQUIRE(host.install(systems));
     const auto callbacks = host.callbacks();
 
+    auto& annotation = ready.system();
+    const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
+    REQUIRE(ready.Wait([&] { return !annotation.snapshot().busy && annotation.snapshot().revision > edit.revision; }));
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.scene_revision == annotation.snapshot().ui.scene_revision; }));
+    const auto epoch = annotation.snapshot().input_document_epoch;
+    annotation.SetInputPeer(1U, {});
+    const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t batch, std::uint64_t sequence) {
+        annotation.Input({.epoch = peer, .document_epoch = epoch, .sequence = batch,
+            .samples = {{.phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
+    };
+    auto rendered = annotation.snapshot().rendered.generation;
+    gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
+    rendered = annotation.snapshot().rendered.generation;
     callbacks.closed(callbacks.context.get());
-    ready.Flush();
-    CHECK(ready.closed() == 1U);
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
+    CHECK(annotation.snapshot().ui.scene.objects.empty());
 
+    annotation.SetInputPeer(1U, {});
+    rendered = annotation.snapshot().rendered.generation;
+    gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
     host.close_admission();
     callbacks.closed(callbacks.context.get());
-    ready.Flush();
-    CHECK(ready.closed() == 1U);
+    gesture(1U, contracts::AnnotationPointerPhase::End, 2U, 2U);
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().ui.scene.objects.size() == 1U; }));
+
 }
 
 TEST_CASE("browser admission settles acceptance redraw callbacks before releasing systems") {

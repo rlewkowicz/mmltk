@@ -65,6 +65,13 @@ display pixels in their own execution boundary. Presentation coordinates their
 admission and publishes those workspaces directly; image storage and
 finalization remain with each producer.
 
+Annotation owns an independent input executor and its sole mutable document,
+editing history, and gesture reduction. Its renderer receives bounded immutable
+descriptions, retaining the newest unsubmitted work. GPU source preparation and
+color sampling return ordered continuations to the document owner. Accepted
+ordinary input and document commands progress independently of rendering and
+external image readers.
+
 ## Model, presentation model, and views
 
 ```text
@@ -241,6 +248,12 @@ independently while retaining their required order. Long-lived buffers retain
 useful high-water capacity and reuse tightly sized storage. Steady-state
 graphics work avoids allocation and unnecessary CPU/GPU transfers, blocking,
 and memory churn.
+
+Logical annotation UI facts describe the latest committed document. Published
+frame facts retain the exact rendered scene and preview generation, including
+completed frames overtaken by newer input. Preview-only publications use compact
+progress without repeating document storage. Input credits acknowledge reduction;
+GPU-dependent command continuations retain their separate settlement ordering.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and
 failure context. Disabled diagnostics create no active diagnostic or probe

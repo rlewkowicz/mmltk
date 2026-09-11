@@ -316,6 +316,50 @@ TEST_CASE("Annotation brush follows every segment as one cancelable transaction"
     CHECK(editor.ui().scene.objects.front() == painted);
 }
 
+TEST_CASE("Annotation render descriptions retain exact previews independently of document reduction") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    for (const auto tool : {c::contracts::AnnotationTool::Box, c::contracts::AnnotationTool::MaskPaint}) {
+        d::AnnotationDocument editor;
+        c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://immutable-render", 1U),
+                                                   .categories = {{.value = "object"}},
+                                                   .frame_width = 64U, .frame_height = 64U, .frame_ready = true};
+        REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+        REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
+        CHECK_FALSE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
+        const auto committed = editor.ui().document_revision;
+        c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {4,5}, .brush_radius = 2U};
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        c::AnnotationRenderState held;
+        editor.CaptureRender(held);
+        REQUIRE(held.preview_object == 0U);
+        const auto captured = held.ObjectAt(0U);
+        pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+        ++pointer.sequence;
+        CHECK_FALSE(editor.Pointer(pointer).render_changed);
+        pointer.point = {20,25};
+        ++pointer.sequence;
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        CHECK(editor.ui().document_revision == committed);
+        CHECK(held.ObjectAt(0U) == captured);
+        c::AnnotationRenderState latest;
+        editor.CaptureRender(latest);
+        CHECK(latest.ObjectAt(0U) != captured);
+        pointer.phase = c::contracts::AnnotationPointerPhase::Cancel;
+        ++pointer.sequence;
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        CHECK(editor.ui().scene.objects.empty());
+        editor.CaptureRender(latest);
+        CHECK_FALSE(latest.preview_object);
+        CHECK(latest.ObjectCount() == 0U);
+        CHECK(held.ObjectAt(0U) == captured);
+        ++pointer.sequence;
+        const auto rejected = editor.Pointer(pointer);
+        CHECK(rejected.outcome == d::DocumentOutcome::Rejected);
+        CHECK_FALSE(rejected.render_changed);
+    }
+}
+
 TEST_CASE("Annotation creates each supported shape in the selected native class") {
     namespace c = mmltk::controller;
     namespace d = c::subsystems::annotation;

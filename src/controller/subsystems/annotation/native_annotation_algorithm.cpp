@@ -11,7 +11,6 @@
 #include <stdexcept>
 #include <utility>
 
-#include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/detail/raster_color.h"
@@ -22,7 +21,6 @@ namespace mmltk::controller {
 namespace {
 
 namespace raster = mmltk::backend::imaging::raster;
-namespace document = mmltk::controller::subsystems::annotation;
 namespace domain = mmltk::controller::contracts;
 
 }  // namespace
@@ -31,16 +29,10 @@ namespace {
 
 class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
-    [[nodiscard]] AnnotationOperationResult Open(const mmltk::frameworks::gpu::ImagePlaneView source, domain::AnnotationSceneContent scene,
-                                                 const VisualRegion crop) override {
-        auto result = Result(document_.Open(std::move(scene)));
-        if (result.outcome == AnnotationOperationOutcome::Applied) {
-            crop_ = crop;
-            source_ = source;
-            for (auto& geometry : geometry_)
-                geometry.scene_revision = 0U;
-        }
-        return result;
+    void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop) override {
+        crop_ = crop;
+        source_ = source;
+        for (auto& geometry : geometry_) geometry.scene_revision = 0U;
     }
     Release ReleaseResources() noexcept override {
         if (mask_upload_ != nullptr) {
@@ -55,27 +47,13 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         return {};
     }
 
-    [[nodiscard]] AnnotationPointerResult Pointer(const AnnotationPointer& pointer) override {
-        const auto before = document_.ui().scene_revision;
-        const auto pointer_result = [&](document::DocumentResult result) {
-            return AnnotationPointerResult{
-                .detail = std::move(result.detail),
-                .outcome = result.outcome == document::DocumentOutcome::Applied ? AnnotationOperationOutcome::Applied
-                                                                                : AnnotationOperationOutcome::Rejected,
-                .ui_changed = document_.ui().scene_revision != before,
-            };
-        };
-        auto result = document_.Pointer(pointer);
-        if (result.outcome != document::DocumentOutcome::Applied || pointer.phase != domain::AnnotationPointerPhase::End ||
-            document_.ui().editor.tool != domain::AnnotationTool::ColorSample ||
-            !document_.ToolAvailable(domain::AnnotationTool::ColorSample, pointer.target.object))
-            return pointer_result(std::move(result));
+    [[nodiscard]] domain::AnnotationColor Sample(const domain::AnnotationPoint point) override {
         if (!sample_host_) sample_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         sample_host_->ensure_bytes(4);
         const auto x =
-            std::min(static_cast<unsigned>(pointer.point.x), static_cast<unsigned>(document_.ui().scene.frame_width) - 1) + crop_.x;
+            std::min(static_cast<unsigned>(point.x), (crop_.valid() ? crop_.width : source_.descriptor.width) - 1) + crop_.x;
         const auto y =
-            std::min(static_cast<unsigned>(pointer.point.y), static_cast<unsigned>(document_.ui().scene.frame_height) - 1) + crop_.y;
+            std::min(static_cast<unsigned>(point.y), (crop_.valid() ? crop_.height : source_.descriptor.height) - 1) + crop_.y;
         if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4,
                        cudaMemcpyDeviceToHost) != cudaSuccess)
             throw std::runtime_error("Annotation color sample failed");
@@ -92,34 +70,11 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 hue = 60 * ((r - g) / delta + 4);
             if (hue < 0) hue += 360;
         }
-        const auto& object = document_.ui().scene.objects[*pointer.target.object];
-        auto supported = object.sup;
-        supported.center = {hue, high == 0 ? 0 : delta / high, high};
-        supported.sampling = true;
-        auto selected = document_.Edit({.value = AnnotationObjectEdit{*pointer.target.object}});
-        if (selected.outcome != document::DocumentOutcome::Applied) return pointer_result(std::move(selected));
-        return pointer_result(document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}}));
-    }
-    [[nodiscard]] const domain::AnnotationUiState& Ui() const noexcept override { return document_.ui(); }
-    void PeerClosed() noexcept override { document_.PeerClosed(); }
-
-    [[nodiscard]] AnnotationOperationResult Edit(const AnnotationEdit& edit) override { return Result(document_.Edit(edit)); }
-
-    [[nodiscard]] AnnotationOperationResult Save(const std::string_view destination) override {
-        return Result(document_.Save(destination));
+        return {hue, high == 0 ? 0 : delta / high, high};
     }
 
    private:
-    [[nodiscard]] AnnotationOperationResult Result(document::DocumentResult result) const {
-        return {
-            .ui = document_.ui(),
-            .detail = std::move(result.detail),
-            .outcome = result.outcome == document::DocumentOutcome::Applied ? AnnotationOperationOutcome::Applied
-                                                                            : AnnotationOperationOutcome::Rejected,
-        };
-    }
-
-    void Render(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
+    void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
                 const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
         auto stream = reinterpret_cast<cudaStream_t>(stream_value);
         cudaError_t status =
@@ -134,24 +89,24 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             status = cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data), semantic.descriptor.pitch_bytes, 0,
                                        semantic.descriptor.row_bytes(), semantic.descriptor.height, stream);
         if (status != cudaSuccess) throw std::runtime_error("Annotation image plane preparation failed");
-        const auto& scene = document_.ui().scene;
+        const auto& scene = description.ui.scene;
         // Reuse pinned staging only after its prior transfer has consumed it;
         // the rendering kernels themselves remain ordered on the runtime stream.
         if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess)
             throw std::runtime_error("Annotation mask upload settlement failed");
         std::size_t run_count = 0U;
-        for (std::size_t index = 0; index < document_.RenderObjectCount(); ++index) {
-            const auto& object = document_.RenderObjectAt(index);
+        for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+            const auto& object = description.ObjectAt(index);
             if (object.enabled) run_count += object.mask.runs.size();
         }
-        if (geometry_.size() < document_.RenderObjectCount()) geometry_.resize(document_.RenderObjectCount());
+        if (geometry_.size() < description.ObjectCount()) geometry_.resize(description.ObjectCount());
         geometry_words_.clear();
-        for (std::size_t index = 0; index < document_.RenderObjectCount(); ++index) {
-            const auto& object = document_.RenderObjectAt(index);
+        for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+            const auto& object = description.ObjectAt(index);
             if (!object.enabled) continue;
             auto& geometry = geometry_[index];
-            const bool preview = index >= scene.objects.size() || &object != &scene.objects[index];
-            if (geometry.scene_revision != document_.ui().scene_revision || geometry.preview || preview) {
+            const bool preview = description.preview_object == index;
+            if (geometry.scene_revision != description.ui.scene_revision || geometry.preview || preview) {
                 geometry.words.clear();
                 geometry.count = geometry.edges = geometry.handles = 0;
                 geometry.edge_offset = geometry.handle_offset = 0U;
@@ -198,13 +153,13 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 if (object.shape == domain::AnnotationShape::Skeleton)
                     for (const auto& node : object.skeleton_nodes)
                         if (node.visible) handle(node.point);
-                if (document_.ui().editor.selected_object == index && object.shape == domain::AnnotationShape::Spline)
+                if (description.ui.editor.selected_object == index && object.shape == domain::AnnotationShape::Spline)
                     for (const auto& knot : object.spline_knots) {
                         handle(knot.point);
                         if (knot.in.enabled) handle(knot.in.point);
                         if (knot.out.enabled) handle(knot.out.point);
                     }
-                geometry.scene_revision = document_.ui().scene_revision;
+                geometry.scene_revision = description.ui.scene_revision;
                 geometry.preview = preview;
             }
             geometry.offset = geometry_words_.size();
@@ -215,8 +170,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             EnsureMasks(total_words * sizeof(std::uint32_t));
             auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
             std::size_t offset = 0U;
-            for (std::size_t index = 0; index < document_.RenderObjectCount(); ++index) {
-                const auto& object = document_.RenderObjectAt(index);
+            for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+                const auto& object = description.ObjectAt(index);
                 if (!object.enabled) continue;
                 for (const auto run : object.mask.runs) {
                     pairs[offset++] = static_cast<std::uint32_t>(run.row) * clean.descriptor.width + run.first;
@@ -239,8 +194,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 raster::detail::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value,
                                                   palette_[index].r, palette_[index].g, palette_[index].b);
         }
-        for (std::size_t index = 0; index < document_.RenderObjectCount(); ++index) {
-            const auto& object = document_.RenderObjectAt(index);
+        for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+            const auto& object = description.ObjectAt(index);
             if (!object.enabled) continue;
             const auto color = palette_[object.category];
             if (!object.mask.runs.empty()) {
@@ -278,7 +233,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                          native_stream}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
-            if (document_.ui().editor.selected_object == index &&
+            if (description.ui.editor.selected_object == index &&
                 raster::raster_selection_handles_rgba(
                     {overlay,
                      {static_cast<int>(object.box.first.x) - 5, static_cast<int>(object.box.first.y) - 5,
@@ -311,7 +266,6 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
     }
 
-    document::AnnotationDocument document_;
     const std::exception_ptr release_failure_ = std::make_exception_ptr(std::runtime_error("Annotation mask release failed"));
     VisualRegion crop_{};
     // The runtime owns this input until the next Open or resource teardown.

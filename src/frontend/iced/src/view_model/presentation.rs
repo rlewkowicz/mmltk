@@ -924,6 +924,7 @@ mod tests {
             pixels.revision += 1;
             let small = crate::generated::AnnotationFrameChanged {
                 snapshot: crate::generated::AnnotationFrameState {
+                    rendered: full.rendered.clone(),
                     revision: full.revision + 1,
                     uirevision: full.uirevision,
                     frame: pixels.clone(),
@@ -979,6 +980,7 @@ mod tests {
             model.reduce_event(ApplicationEvent::AnnotationAnnotationFrameChanged(
                 crate::generated::AnnotationFrameChanged {
                     snapshot: crate::generated::AnnotationFrameState {
+                        rendered: installed.rendered.clone(),
                         revision: installed.revision,
                         uirevision: ui_revision,
                         frame: installed.frame.clone(),
@@ -990,6 +992,7 @@ mod tests {
         }
         model.error = None;
         let future = crate::generated::AnnotationFrameState {
+            rendered: installed.rendered.clone(),
             revision: installed.revision + 3,
             uirevision: installed.revision + 2,
             frame: visual_frame(
