@@ -131,7 +131,7 @@ pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreSnapshot>)> {
             .into_iter()
             .flatten()
             .find_map(|imported| {
-                let pending = imported.image.pending_capture.as_ref()?;
+                let pending = imported.image.pending_sample.as_ref()?;
                 let pending = imported.image.submitted_draw(pending.surface)?;
                 Some((pending.surface, pending.gallery.clone()?))
             })
@@ -139,10 +139,10 @@ pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreSnapshot>)> {
             return Some(submitted);
         }
         let imported = renderer.imported.as_ref()?;
-        let frame = imported.image.captured?;
+        let surface = imported.image.retained()?;
+        let frame = surface.frame?;
         let snapshot = imported.image.gallery.as_ref()?;
-        (imported.image.surface.frame == Some(frame) && matches(snapshot, frame))
-            .then(|| (imported.image.surface, snapshot.clone()))
+        matches(snapshot, frame).then(|| (surface, snapshot.clone()))
     })
 }
 
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_capture_from_another_dataset_cannot_be_promoted() {
+    fn completed_sample_from_another_dataset_cannot_be_promoted() {
         let mut snapshot = gallery_snapshot();
         snapshot.dataset.identity = 11;
         let native = frame_ready();
@@ -314,6 +314,7 @@ mod tests {
 
     #[test]
     fn selected_gallery_facts_require_the_exact_revision_and_extent() {
+        super::super::reset_test_releases();
         let mut snapshot = crate::view_model::test_support::explore_snapshot();
         snapshot.ready = true;
         snapshot.revision = 1;
@@ -335,16 +336,18 @@ mod tests {
         confirm(frame, &snapshot.frame, Some(&snapshot));
         let retained = matching(Some(frame)).unwrap();
         let surface = crate::view_model::test_support::physical_surface(frame);
+        assert!(super::super::accept_publication(frame));
+        let read = super::super::SampleRead::acquire(frame).unwrap();
         let mut image = super::super::ImagePublication {
             surface,
-            owned_index: 0,
-            captured: None,
-            pending_capture: Some(super::super::PendingImage {
+            completed: None,
+            retained_read: None,
+            pending_sample: Some(super::super::PendingImage {
+                read,
                 surface,
                 gallery: Some(retained.clone()),
                 detail: None,
                 placement: placement(&snapshot),
-                index: 1,
                 complete: false,
                 view_ready: false,
             }),
@@ -365,7 +368,10 @@ mod tests {
         select(Some(&snapshot), &snapshot.frame);
         assert_eq!(matching(Some(frame)).unwrap().revision, snapshot.revision);
         image.reconcile_pending(frame, &model);
-        let pending = image.pending_capture.as_ref().unwrap();
+        assert!(image.submitted_draw(surface).is_none());
+        super::super::authorize_draw(Some(frame));
+        assert!(image.submitted_draw(surface).is_some());
+        let pending = image.pending_sample.as_ref().unwrap();
         assert_eq!(
             pending.gallery.as_ref().unwrap().revision,
             snapshot.revision
@@ -384,7 +390,7 @@ mod tests {
         image.reconcile_pending(frame, &model);
         assert_eq!(
             image
-                .pending_capture
+                .pending_sample
                 .as_ref()
                 .unwrap()
                 .gallery
@@ -394,8 +400,10 @@ mod tests {
                 .identity,
             snapshot.dataset.identity
         );
+        assert!(image.submitted_draw(surface).is_none());
         select(Some(&snapshot), &snapshot.frame);
         confirm(frame, &snapshot.frame, Some(&snapshot));
+        super::super::complete_sample(frame);
         image.complete(frame);
         assert!(image.promote(frame, &model));
         assert_eq!(image.retained(), Some(surface));
@@ -429,6 +437,11 @@ mod tests {
         .unwrap();
         assert_eq!(next.viewport.rowcount, 5);
         assert_eq!(next.viewport.firstrow, 1);
+        assert!(super::super::test_releases().is_empty());
+        super::super::retire_publication(frame);
+        assert!(super::super::test_releases().is_empty());
+        drop(image);
+        assert_eq!(super::super::test_releases(), vec![frame]);
         clear();
     }
 

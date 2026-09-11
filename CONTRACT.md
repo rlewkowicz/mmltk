@@ -177,10 +177,13 @@ drains its readers. Active, candidate, and retiring storage remain bounded.
 
 Matching native model state authorizes a queue-ordered browser sample immediately
 after submission. Physical native-to-sample completion and page sample release
-are separate receipts. The application currently captures that sample into its
-retained Iced image, with its own exact GPU completion hold; direct Iced sampling
-is a subsequent cutover. The last completed browser image remains drawable
-through newer work, capacity pressure, source changes, or presentation failure.
+are separate receipts. Iced directly samples that exact arena slot. Display
+custody and each encoded draw retain independent references; actual submission
+settlement or unsubmitted abandonment releases draw custody. Only physical copy
+completion with matching model authorization promotes a completed fallback.
+Page and device teardown settle terminal resource ownership independently from
+rendering success. The last completed browser image remains drawable through
+newer work, capacity pressure, source changes, or presentation failure.
 
 Display-device mismatch uses producer-owned finalization through the existing
 same-device, peer, or reusable pinned transfer route. Browser display remains

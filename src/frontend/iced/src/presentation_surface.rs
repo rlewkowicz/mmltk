@@ -42,7 +42,7 @@ pub(crate) fn trace_frame(event: &str, frame: FrameReady) {
     }
 }
 
-// One projection of the physical native receipt. Capture notifications carry
+// One projection of the physical native receipt. Sample notifications carry
 // the receipt by value, including when the requested surface has since changed.
 #[cfg(target_arch = "wasm32")]
 fn frame_trace_fields(frame: Option<FrameReady>) -> String {
@@ -206,81 +206,158 @@ pub(crate) fn trace_surface(_event: &str, _surface: Surface) {}
 fn trace_surface_request(_event: &str, _surface: Surface, _requested: Surface, _control: &str) {}
 
 const MAILBOX_SLOTS: u32 = 2;
+// Firefox admits active, candidate, and retiring arenas, each with two slots.
+const ARENA_CAPACITY: usize = 3;
+const SAMPLE_CAPACITY: usize = ARENA_CAPACITY * MAILBOX_SLOTS as usize;
 const INTEGRATION_REDRAW_PASSES: u8 = 4;
 thread_local! {
     static DRAWN_DETAIL: std::cell::Cell<Option<(Surface, [u32; 4])>> = const { std::cell::Cell::new(None) };
-    static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; 2]> = const { std::cell::Cell::new([None; 2]) };
-    static BORROWS: std::cell::Cell<[Option<FrameReady>; 2]> = const { std::cell::Cell::new([None; 2]) };
+    static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; SAMPLE_CAPACITY]> = const { std::cell::Cell::new([None; SAMPLE_CAPACITY]) };
+    static BORROWS: std::cell::Cell<[Option<FrameReady>; SAMPLE_CAPACITY]> = const { std::cell::Cell::new([None; SAMPLE_CAPACITY]) };
 }
 
 // Publication metadata is copyable; permission to read an external layer is not.
 pub(crate) fn accept_publication(frame: FrameReady) -> bool {
-    let Some(binding) = mailbox_binding(frame) else {
+    if mailbox_binding(frame).is_none() || LIVE_READS.with(|reads| reads.borrow().iter().flatten()
+        .filter_map(std::sync::Weak::upgrade).any(|read| same_mailbox_slot(read.0, frame))) {
         return false;
-    };
-    if RELEASED_FRAMES.with(|released| {
-        released.get()[binding].is_some_and(|prior| {
-            same_mailbox_slot(prior, frame)
-                && prior.presentation_revision >= frame.presentation_revision
-        })
-    }) {
+    }
+    if RELEASED_FRAMES.with(|released| released.get().iter().flatten().any(|prior|
+        same_mailbox_slot(*prior, frame) && prior.presentation_revision >= frame.presentation_revision)) {
         return false;
     }
     BORROWS.with(|borrows| {
         let mut slots = borrows.get();
-        if slots[binding].is_some() {
-            return false;
-        }
-        slots[binding] = Some(frame);
+        if slots.iter().flatten().any(|prior| same_mailbox_slot(*prior, frame)) { return false; }
+        let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) else { return false; };
+        *slot = Some(frame);
+        borrows.set(slots);
+        true
+    })
+}
+
+fn take_publication(frame: FrameReady) -> bool {
+    BORROWS.with(|borrows| {
+        let mut slots = borrows.get();
+        let Some(slot) = slots.iter_mut().find(|slot| **slot == Some(frame)) else { return false; };
+        *slot = None;
         borrows.set(slots);
         true
     })
 }
 
 pub(crate) fn retire_publication(frame: FrameReady) {
-    let unused = BORROWS.with(|borrows| {
-        let mut slots = borrows.get();
-        let Some(binding) = mailbox_binding(frame) else {
-            return false;
-        };
-        if slots[binding] != Some(frame) {
-            return false;
-        }
-        slots[binding] = None;
-        borrows.set(slots);
-        true
-    });
-    // Captured publications have moved to the GPU completion owner. Metadata
-    // retirement must not release that owner's live external sample.
-    if unused {
-        release(frame);
+    // Acquired publications belong to their shared display/read owner.
+    if take_publication(frame) { release(frame); }
+}
+
+// Only exact copyable facts cross the unconditional Send callback boundary.
+// WebGPU command buffers retain their texture handles; this token retains the
+// browser slot permission independently from page-local wrappers.
+struct SampleRead(FrameReady);
+
+thread_local! {
+    static LIVE_READS: std::cell::RefCell<[Option<std::sync::Weak<SampleRead>>; SAMPLE_CAPACITY]> = const { std::cell::RefCell::new([const { None }; SAMPLE_CAPACITY]) };
+    static COPY_RECEIPTS: std::cell::Cell<[Option<FrameReady>; SAMPLE_CAPACITY]> = const { std::cell::Cell::new([None; SAMPLE_CAPACITY]) };
+}
+
+fn copy_completed(frame: FrameReady) -> bool {
+    COPY_RECEIPTS.with(|receipts| receipts.get().contains(&Some(frame)))
+}
+
+impl SampleRead {
+    fn acquire(frame: FrameReady) -> Option<std::sync::Arc<Self>> {
+        if !take_publication(frame) || !reserve_release(frame) { return None; }
+        let read = std::sync::Arc::new(Self(frame));
+        LIVE_READS.with(|reads| {
+            let mut reads = reads.borrow_mut();
+            let slot = reads.iter_mut().find(|slot| slot.as_ref().is_none_or(|read| read.strong_count() == 0))
+                .expect("bounded active, candidate and retiring arena slots");
+            *slot = Some(std::sync::Arc::downgrade(&read));
+        });
+        Some(read)
     }
 }
 
-struct CaptureBorrow(FrameReady);
+fn settle_sample(frame: FrameReady) {
+    RELEASED_FRAMES.with(|released| {
+        let mut slots = released.get();
+        remember_frame(&mut slots, frame);
+        released.set(slots);
+    });
+    COPY_RECEIPTS.with(|receipts| {
+        let mut slots = receipts.get();
+        for slot in &mut slots {
+            if *slot == Some(frame) { *slot = None; }
+        }
+        receipts.set(slots);
+    });
+    dispatch_release(frame);
+    drain_retired_textures();
+}
 
-impl CaptureBorrow {
-    fn acquire(frame: FrameReady) -> Option<Self> {
-        let binding = mailbox_binding(frame)?;
-        BORROWS.with(|borrows| {
-            let mut slots = borrows.get();
-            if slots[binding] != Some(frame) {
-                return None;
-            }
-            slots[binding] = None;
-            borrows.set(slots);
-            if reserve_release(frame) {
-                Some(Self(frame))
+impl Drop for SampleRead {
+    fn drop(&mut self) { settle_sample(self.0); }
+}
+
+// Texture wrappers and their destruction stay on the owning page thread. The
+// Send completion payload remains SampleRead's copyable publication facts.
+thread_local! {
+    static RETIRED_TEXTURES: std::cell::RefCell<[Option<RetiredTexture>; ARENA_CAPACITY]> =
+        const { std::cell::RefCell::new([const { None }; ARENA_CAPACITY]) };
+}
+
+struct RetiredTexture {
+    surface: Surface,
+    texture: wgpu::Texture,
+}
+
+fn arena_has_readers(surface: Surface) -> bool {
+    LIVE_READS.with(|reads| {
+        reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade)
+            .any(|read| read.0.high == surface.high && read.0.low == surface.low)
+    })
+}
+
+fn drain_retired_textures() {
+    // Remove owners before calling the browser, so destruction cannot re-enter
+    // a borrowed retirement list. The fixed local staging allocates nothing.
+    let ready = RETIRED_TEXTURES.with(|retired| {
+        let mut retired = retired.borrow_mut();
+        std::array::from_fn::<_, ARENA_CAPACITY, _>(|index| {
+            if retired[index].as_ref().is_some_and(|entry| !arena_has_readers(entry.surface)) {
+                retired[index].take()
             } else {
                 None
             }
         })
+    });
+    for retired in ready.into_iter().flatten() {
+        retired.texture.destroy();
     }
 }
 
-impl Drop for CaptureBorrow {
+// The final field of Imported: its Drop runs after display, view, and probe
+// owners are gone. This guard supplies the explicit WebGPU destruction that
+// dropping a JS-backed wgpu::Texture handle alone does not perform.
+struct ArenaTexture {
+    surface: Surface,
+    texture: Option<wgpu::Texture>,
+}
+
+impl Drop for ArenaTexture {
     fn drop(&mut self) {
-        dispatch_release(self.0);
+        let Some(texture) = self.texture.take() else { return; };
+        if !arena_has_readers(self.surface) {
+            texture.destroy();
+            return;
+        }
+        RETIRED_TEXTURES.with(|retired| {
+            let mut retired = retired.borrow_mut();
+            let slot = retired.iter_mut().find(|slot| slot.is_none())
+                .expect("Firefox admits at most three live sample arenas");
+            *slot = Some(RetiredTexture { surface: self.surface, texture });
+        });
     }
 }
 
@@ -437,8 +514,7 @@ pub fn subscription() -> iced::Subscription<Notification> {
 pub enum Notification {
     Native(FrameReady),
     Copied(FrameReady),
-    Completed(FrameReady),
-    CaptureRejected(FrameReady),
+    SampleRejected(FrameReady),
     Drawn,
 }
 
@@ -455,13 +531,9 @@ fn notify_surface(notification: Notification) {
         {
             let mut mailbox = mailbox.borrow_mut();
             match notification {
-                Notification::Completed(frame) => {
-                    mailbox.complete(frame);
-                    trace_frame("completion_enqueued", frame);
-                }
-                Notification::CaptureRejected(frame) => {
+                Notification::SampleRejected(frame) => {
                     mailbox.rejected = Some(frame);
-                    trace_frame("capture_rejection_enqueued", frame);
+                    trace_frame("sample_rejection_enqueued", frame);
                 }
                 Notification::Drawn => mailbox.drawn = true,
                 Notification::Native(_) | Notification::Copied(_) => {
@@ -478,30 +550,38 @@ fn notify_surface(_notification: Notification) {}
 
 #[derive(Default)]
 struct FrameMailbox {
-    completed: Option<FrameReady>,
     rejected: Option<FrameReady>,
     drawn: bool,
     frames: [Option<FrameReady>; 1],
-    copied: [Option<FrameReady>; 2],
+    copied: [Option<FrameReady>; SAMPLE_CAPACITY],
     next_layer: usize,
+}
+
+fn remember_frame(slots: &mut [Option<FrameReady>; SAMPLE_CAPACITY], frame: FrameReady) {
+    if let Some(slot) = slots.iter_mut().find(|slot| {
+        slot.is_some_and(|prior| same_mailbox_slot(prior, frame))
+    }) {
+        if slot.is_none_or(|prior| prior.presentation_revision <= frame.presentation_revision) {
+            *slot = Some(frame);
+        }
+        return;
+    }
+    let index = slots.iter().position(Option::is_none).unwrap_or_else(|| {
+        slots.iter().enumerate()
+            .min_by_key(|(_, slot)| slot.map(|frame| frame.presentation_revision))
+            .expect("bounded receipt storage").0
+    });
+    // Independent arena notifications can arrive out of presentation order.
+    slots[index] = Some(frame);
 }
 
 impl FrameMailbox {
     fn complete(&mut self, frame: FrameReady) {
-        if self
-            .completed
-            .is_none_or(|prior| prior.presentation_revision < frame.presentation_revision)
-        {
-            self.completed = Some(frame);
-        }
+        remember_frame(&mut self.copied, frame);
     }
-
     fn next_notification(&mut self) -> Option<Notification> {
-        self.completed
-            .take()
-            .map(Notification::Completed)
-            .or_else(|| self.copied.iter_mut().find_map(Option::take).map(Notification::Copied))
-            .or_else(|| self.rejected.take().map(Notification::CaptureRejected))
+        self.copied.iter_mut().find_map(Option::take).map(Notification::Copied)
+            .or_else(|| self.rejected.take().map(Notification::SampleRejected))
             .or_else(|| std::mem::take(&mut self.drawn).then_some(Notification::Drawn))
             .or_else(|| self.pop().map(Notification::Native))
     }
@@ -561,7 +641,7 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return;
             };
             if event.type_() == COPY_EVENT {
-                pending.borrow_mut().copied[ready.slot as usize] = Some(ready);
+                pending.borrow_mut().complete(ready);
                 notify.wake();
                 return;
             }
@@ -629,7 +709,7 @@ pub struct Surface {
     pub height: u32,
     pub timeline_ready: u64,
     // Desired publication geometry/identity, not authority to borrow its slot.
-    // Only accept_publication + CaptureBorrow can authorize an external read.
+    // Only accept_publication + SampleRead can authorize an external read.
     pub frame: Option<FrameReady>,
     pub integration: bool,
     pub crop: Option<[u32; 4]>,
@@ -1202,7 +1282,6 @@ impl shader::Primitive for Primitive {
                 physical_bounds(*bounds, viewport.scale_factor()),
                 viewport.scale_factor(),
                 self.placement,
-                transform,
             );
             renderer.prepare_draw(device, queue, self.control_id, self.placement, transform);
         });
@@ -1221,6 +1300,7 @@ impl shader::Primitive for Primitive {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
+        resources: &mut shader::Resources,
     ) {
         let _ = pipeline;
         RENDERER.with(|renderer| {
@@ -1228,7 +1308,7 @@ impl shader::Primitive for Primitive {
             let Some(renderer) = renderer.as_ref() else {
                 return;
             };
-            renderer.render(encoder, target, *clip_bounds, self.control_id);
+            renderer.render(encoder, target, *clip_bounds, self.control_id, resources);
         });
     }
 }
@@ -1247,7 +1327,7 @@ fn physical_pan(transform: ViewTransform, scale: f32) -> (f32, f32) {
 }
 
 // Iced pipeline installation establishes this component's device owner.
-// Shader reconstruction preserves its single-claim imports and completed copies;
+// Shader reconstruction preserves its single-claim imports and completed samples;
 // explicit application retirement can clear it while the wrapper stays installed.
 thread_local! {
     static RENDERER: std::cell::RefCell<Option<SurfaceRenderer>> = const { std::cell::RefCell::new(None) };
@@ -1331,7 +1411,6 @@ struct SurfaceRenderer {
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
     render: wgpu::RenderPipeline,
-    capture: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     imported: Option<Imported>,
@@ -1345,23 +1424,20 @@ struct SurfaceRenderer {
 
 struct Imported {
     image: ImagePublication,
-    _texture: wgpu::Texture,
-    geometry: wgpu::Buffer,
-    mailbox: Option<MailboxBindings>,
-    owned: [OwnedImage; 2],
-    geometry_key: GeometryKey,
+    views: [wgpu::TextureView; 2],
     drawn_revision: AtomicU64,
     draw_count: AtomicU64,
     pixel_trace: Option<pixel_trace::PixelTrace>,
+    _arena: ArenaTexture,
 }
 
-// CPU facts travel with their receiver-owned pixels, including across an
-// advertised replacement and while a newer capture awaits native metadata.
+// CPU facts travel with their leased browser pixels, including across an
+// advertised replacement and while a newer sample awaits native metadata.
 struct ImagePublication {
     surface: Surface,
-    owned_index: usize,
-    pending_capture: Option<PendingImage>,
-    captured: Option<FrameReady>,
+    pending_sample: Option<PendingImage>,
+    completed: Option<FrameReady>,
+    retained_read: Option<std::sync::Arc<SampleRead>>,
     gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
     detail: Option<DetailContent>,
     placement: Placement,
@@ -1416,23 +1492,17 @@ impl DetailContent {
     }
 }
 
-struct OwnedImage {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
-}
-
 struct PendingImage {
+    read: std::sync::Arc<SampleRead>,
     surface: Surface,
     gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
     detail: Option<DetailContent>,
     placement: Placement,
-    index: usize,
     complete: bool,
     view_ready: bool,
 }
 
 struct PreparedDraw {
-    owned_index: usize,
     surface: Surface,
     requested: Surface,
     bounds: Rectangle,
@@ -1444,18 +1514,19 @@ struct PreparedDraw {
     key: GeometryKey,
 }
 
-struct MailboxBindings {
-    _views: [wgpu::TextureView; 2],
-    bind_groups: [wgpu::BindGroup; 2],
+impl Drop for SurfaceRenderer {
+    fn drop(&mut self) {
+        // Bindings are page-local caches, not encoded readers. Drop them before
+        // imported fields begin their last-reader texture retirement.
+        self.draws.clear();
+    }
 }
 
 impl Drop for Imported {
     fn drop(&mut self) {
         trace_surface("retired", self.image.surface);
-        self._texture.destroy();
-        for owned in &self.owned {
-            owned.texture.destroy();
-        }
+        // Field destruction drops display/view/probe owners before _arena
+        // transfers the texture to exact last-reader retirement.
     }
 }
 
@@ -1511,13 +1582,12 @@ impl SurfaceRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
-        let (render, capture) = Self::create_pipelines(device, format, &layout);
+        let render = Self::create_pipeline(device, format, &layout);
         Self {
             device: device.clone(),
             queue: queue.clone(),
             format,
             render,
-            capture,
             layout,
             sampler,
             imported: None,
@@ -1530,11 +1600,11 @@ impl SurfaceRenderer {
         }
     }
 
-    fn create_pipelines(
+    fn create_pipeline(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         layout: &wgpu::BindGroupLayout,
-    ) -> (wgpu::RenderPipeline, wgpu::RenderPipeline) {
+    ) -> wgpu::RenderPipeline {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mmltk presentation shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
@@ -1544,43 +1614,35 @@ impl SurfaceRenderer {
             bind_group_layouts: &[Some(layout)],
             immediate_size: 0,
         });
-        let make_pipeline = |format, fragment| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("mmltk presentation pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(fragment),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-        (
-            make_pipeline(format, "fs_main"),
-            make_pipeline(wgpu::TextureFormat::Rgba8Unorm, "fs_capture"),
-        )
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mmltk presentation pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
     }
 
     fn replace_pipelines(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
-        let (render, capture) = Self::create_pipelines(device, format, &self.layout);
-        self.render = render;
-        self.capture = capture;
+        self.render = Self::create_pipeline(device, format, &self.layout);
         self.format = format;
     }
 
@@ -1588,11 +1650,11 @@ impl SurfaceRenderer {
         let Some(imported) = self.imported.as_ref() else {
             return;
         };
-        if imported.image.captured.is_none() || same_allocation(imported.image.surface, requested) {
+        if imported.image.completed.is_none() || same_allocation(imported.image.surface, requested) {
             return;
         }
         if !self.pending.as_ref().is_some_and(|pending| {
-            same_allocation(pending.image.surface, requested) && pending.image.captured.is_none()
+            same_allocation(pending.image.surface, requested) && pending.image.completed.is_none()
         }) {
             return;
         }
@@ -1630,7 +1692,7 @@ impl SurfaceRenderer {
             .find(|candidate| same_allocation(candidate.image.surface, surface))
     }
 
-    fn reconcile_capture(
+    fn reconcile_sample(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1640,15 +1702,7 @@ impl SurfaceRenderer {
         if let Some(imported) =
             Self::matching_import(&mut self.imported, &mut self.pending, surface)
         {
-            imported.reconcile_capture(
-                device,
-                queue,
-                &self.capture,
-                &self.layout,
-                &self.sampler,
-                surface,
-                placement,
-            );
+            imported.reconcile_sample(surface, placement);
             return;
         }
         self.prepare(
@@ -1658,7 +1712,6 @@ impl SurfaceRenderer {
             self.bounds,
             self.scale_factor,
             placement,
-            ViewTransform::FIT,
         );
     }
 
@@ -1688,13 +1741,12 @@ impl SurfaceRenderer {
             self.draws.remove(control);
             return;
         };
-        let (surface, owned_index, gallery) = submitted.map_or(
+        let (surface, gallery) = submitted.map_or(
             (
                 imported.image.surface,
-                imported.image.owned_index,
                 imported.image.gallery.as_ref(),
             ),
-            |(_, pending)| (pending.surface, pending.index, pending.gallery.as_ref()),
+            |(_, pending)| (pending.surface, pending.gallery.as_ref()),
         );
         if !retained_draw_admitted(surface, requested, placement) {
             self.draws.remove(control);
@@ -1714,7 +1766,7 @@ impl SurfaceRenderer {
             placement_geometry(bounds, surface.content_extent(), placement, transform)
         else {
             trace_image(
-                "owned_draw_rejected",
+                "sample_draw_rejected",
                 control,
                 surface,
                 requested,
@@ -1739,16 +1791,14 @@ impl SurfaceRenderer {
                     &self.layout,
                     &self.sampler,
                     &uniform,
-                    &imported.owned[index].view,
+                    &imported.views[index],
                 )
             });
             PreparedDraw {
-                owned_index,
                 surface,
                 requested,
                 bounds,
-                geometry,
-                placement,
+                    placement,
                 gallery: matches!(placement, Placement::GalleryGrid { .. })
                     .then(|| gallery.cloned())
                     .flatten(),
@@ -1764,7 +1814,7 @@ impl SurfaceRenderer {
                     &self.layout,
                     &self.sampler,
                     &draw.uniform,
-                    &imported.owned[index].view,
+                    &imported.views[index],
                 )
             });
         }
@@ -1772,7 +1822,6 @@ impl SurfaceRenderer {
             write_content_geometry(queue, &draw.uniform, key);
             draw.key = key;
         }
-        draw.owned_index = owned_index;
         draw.surface = surface;
         draw.requested = requested;
         draw.bounds = bounds;
@@ -1791,7 +1840,6 @@ impl SurfaceRenderer {
         bounds: Rectangle,
         scale_factor: f32,
         placement: Placement,
-        transform: ViewTransform,
     ) {
         self.bounds = bounds;
         self.scale_factor = scale_factor;
@@ -1809,17 +1857,7 @@ impl SurfaceRenderer {
         if let Some(imported) =
             Self::matching_import(&mut self.imported, &mut self.pending, surface)
         {
-            imported.prepare(
-                device,
-                queue,
-                &self.capture,
-                &self.layout,
-                &self.sampler,
-                surface,
-                bounds,
-                placement,
-                transform,
-            );
+            imported.prepare(surface, placement);
             return;
         }
         trace_surface("texture_create", surface);
@@ -1838,69 +1876,50 @@ impl SurfaceRenderer {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        let geometry = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("mmltk presentation content geometry"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let arena = ArenaTexture { surface, texture: Some(texture) };
+        let texture = arena.texture.as_ref().expect("new page texture");
+        let views = std::array::from_fn(|slot| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: slot as u32,
+                array_layer_count: Some(1),
+                ..wgpu::TextureViewDescriptor::default()
+            })
         });
-        let geometry_key = geometry_key(surface, bounds, placement, transform);
-        write_content_geometry(queue, &geometry, geometry_key);
-        // Current and pending images alternate within one physical import.
-        // A capture never overwrites pixels whose labels are already recorded.
-        let owned = std::array::from_fn(|_| {
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("mmltk owned presentation pixels"),
-                size: wgpu::Extent3d {
-                    width: surface.width,
-                    height: surface.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | if pixel_trace::enabled() {
-                        wgpu::TextureUsages::COPY_SRC
-                    } else {
-                        wgpu::TextureUsages::empty()
-                    },
-                view_formats: &[],
-            });
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            OwnedImage { texture, view }
-        });
+        let pixel_trace = pixel_trace::PixelTrace::new(device, queue, texture);
         let mut imported = Imported {
             image: ImagePublication {
                 surface,
-                owned_index: 0,
-                pending_capture: None,
-                captured: None,
+                pending_sample: None,
+                completed: None,
+                retained_read: None,
                 gallery: gallery::matching(surface.frame),
                 detail: None,
                 placement,
             },
-            _texture: texture,
-            geometry,
-            mailbox: None,
-            owned,
-            geometry_key,
+            views,
             drawn_revision: AtomicU64::new(0),
             draw_count: AtomicU64::new(0),
-            pixel_trace: pixel_trace::PixelTrace::new(device, queue),
+            pixel_trace,
+            _arena: arena,
         };
-        imported.capture(device, queue, &self.capture, &self.layout, &self.sampler);
+        imported.sample();
         self.discard_pending();
         self.pending = Some(imported);
     }
 
+    fn prune_draws(&mut self) {
+        self.draws.retain(|_, draw| [&self.imported, &self.pending].into_iter().flatten()
+            .any(|imported| same_allocation(imported.image.surface, draw.surface)));
+    }
+
     fn discard_pending(&mut self) {
-        if let Some(pending) = self.pending.take() {
+        let pending = self.pending.take();
+        self.prune_draws();
+        if let Some(pending) = pending {
             trace_surface(
-                if pending.image.pending_capture.is_some() {
-                    "pending_capture_discarded"
+                if pending.image.pending_sample.is_some() {
+                    "pending_sample_discarded"
                 } else {
                     "pending_discarded"
                 },
@@ -1915,10 +1934,11 @@ impl SurfaceRenderer {
         target: &wgpu::TextureView,
         clip: Rectangle<u32>,
         control_id: &'static str,
+        resources: &mut shader::Resources,
     ) {
         let Some(draw) = self.draws.get(control_id) else {
             if let Some(requested) = self.requested {
-                trace_surface_request("owned_draw_missing", requested, requested, control_id);
+                trace_surface_request("sample_draw_missing", requested, requested, control_id);
             }
             return;
         };
@@ -1938,11 +1958,11 @@ impl SurfaceRenderer {
             height: clip.height as f32,
         };
         let Some(visible) = image.intersection(&clip) else {
-            trace_draw("owned_draw_clipped", control_id, draw, image, clip);
+            trace_draw("sample_draw_clipped", control_id, draw, image, clip);
             return;
         };
         if visible.width <= 0.0 || visible.height <= 0.0 {
-            trace_draw("owned_draw_clipped", control_id, draw, image, clip);
+            trace_draw("sample_draw_clipped", control_id, draw, image, clip);
             return;
         }
         let Some(imported) =
@@ -1950,20 +1970,24 @@ impl SurfaceRenderer {
                 .into_iter()
                 .flatten()
                 .find(|imported| {
-                    (imported.image.captured == Some(frame)
-                        && imported.image.owned_index == draw.owned_index)
+                    imported.image.completed == Some(frame)
                         || imported
                             .image
                             .submitted_draw(draw.requested)
                             .is_some_and(|pending| {
                                 pending.surface.frame == Some(frame)
-                                    && pending.index == draw.owned_index
                             })
                 })
         else {
-            trace_draw("owned_draw_rejected", control_id, draw, image, clip);
+            trace_draw("sample_draw_rejected", control_id, draw, image, clip);
             return;
         };
+        let read = if imported.image.completed == Some(frame) {
+            imported.image.retained_read.as_ref()
+        } else {
+            imported.image.pending_sample.as_ref().map(|pending| &pending.read)
+        };
+        let Some(read) = read.filter(|read| read.0 == frame) else { return; };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("mmltk presentation pass"),
             color_attachments: &[Some(preserving_color_attachment(target))],
@@ -1987,11 +2011,12 @@ impl SurfaceRenderer {
             clip.height as u32,
         );
         pass.set_pipeline(&self.render);
-        pass.set_bind_group(0, Some(&draw.bindings[draw.owned_index]), &[]);
+        pass.set_bind_group(0, Some(&draw.bindings[frame.slot as usize]), &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
+        resources.retain(read.clone());
         trace_surface_request(
-            "owned_draw_selected",
+            "sample_draw_selected",
             draw.surface,
             draw.requested,
             control_id,
@@ -2104,7 +2129,16 @@ fn preserving_color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColo
     }
 }
 
-pub(crate) fn complete_capture(frame: FrameReady) {
+pub(crate) fn complete_sample(frame: FrameReady) {
+    // A disposed publication's late copy receipt cannot resurrect its lease.
+    let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
+    let released = RELEASED_FRAMES.with(|receipts| receipts.get().iter().flatten().any(|prior| same_mailbox_slot(*prior, frame) && prior.presentation_revision >= frame.presentation_revision));
+    if released && !live { return; }
+    COPY_RECEIPTS.with(|receipts| {
+        let mut slots = receipts.get();
+        remember_frame(&mut slots, frame);
+        receipts.set(slots);
+    });
     trace_frame("completion_received", frame);
     RENDERER.with(|renderer| {
         if let Some(renderer) = renderer.borrow_mut().as_mut() {
@@ -2118,7 +2152,7 @@ pub(crate) fn complete_capture(frame: FrameReady) {
     });
 }
 
-pub(crate) fn discard_capture(frame: FrameReady) {
+pub(crate) fn discard_sample(frame: FrameReady) {
     RENDERER.with(|renderer| {
         if let Some(renderer) = renderer.borrow_mut().as_mut() {
             for imported in [&mut renderer.imported, &mut renderer.pending]
@@ -2150,14 +2184,14 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         let Some(renderer) = renderer.as_mut() else {
             return;
         };
-        // Submit the receiver-owned copy before Iced builds labels and layout.
+        // Acquire the submitted sample before Iced builds labels and layout.
         // Widget preparation remains the sole owner of view identity and geometry.
         let device = renderer.device.clone();
         let queue = renderer.queue.clone();
         let placement = gallery::matching(Some(frame))
             .as_ref()
             .map_or(Placement::Contain, |snapshot| gallery::placement(snapshot));
-        renderer.reconcile_capture(&device, &queue, surface, placement);
+        renderer.reconcile_sample(&device, &queue, surface, placement);
         for imported in [&mut renderer.imported, &mut renderer.pending]
             .into_iter()
             .flatten()
@@ -2165,7 +2199,7 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
             imported.image.reconcile_pending(frame, model);
         }
         if let Some(imported) = renderer.imported.as_mut()
-            && imported.image.captured == Some(frame)
+            && imported.image.completed == Some(frame)
         {
             imported.image.refresh_detail(model);
             return;
@@ -2184,7 +2218,7 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         {
             if renderer.imported.is_some() {
                 trace_surface(
-                    "owned_replacement",
+                    "sample_replacement",
                     renderer
                         .pending
                         .as_ref()
@@ -2193,7 +2227,10 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
                         .surface,
                 );
             }
+            let retired = renderer.imported.take();
             renderer.imported = renderer.pending.take();
+            renderer.prune_draws();
+            drop(retired);
         }
     });
 }
@@ -2205,7 +2242,7 @@ impl ImagePublication {
         model: &crate::view_model::ApplicationModel,
     ) {
         let Some(pending) = self
-            .pending_capture
+            .pending_sample
             .as_mut()
             .filter(|pending| pending.surface.frame == Some(frame))
         else {
@@ -2231,7 +2268,7 @@ impl ImagePublication {
     }
 
     fn submitted_draw(&self, requested: Surface) -> Option<&PendingImage> {
-        self.pending_capture.as_ref().filter(|pending| {
+        self.pending_sample.as_ref().filter(|pending| {
             pending.view_ready
                 && pending.surface.frame.is_some()
                 && pending.surface.frame == requested.frame
@@ -2260,7 +2297,7 @@ impl ImagePublication {
     }
 
     fn retained(&self) -> Option<Surface> {
-        (self.captured.is_some() && self.captured == self.surface.frame).then_some(self.surface)
+        (self.completed.is_some() && self.completed == self.surface.frame).then_some(self.surface)
     }
 
     fn completed_content(
@@ -2269,14 +2306,14 @@ impl ImagePublication {
         snapshot: &crate::generated::PresentationSnapshot,
     ) -> Option<Surface> {
         self.retained().filter(|surface| {
-            surface.frame.is_some_and(|captured| {
-                captured.matches_content(frame) && captured.matches_completed(snapshot)
+            surface.frame.is_some_and(|completed| {
+                completed.matches_content(frame) && completed.matches_completed(snapshot)
             })
         })
     }
 
     fn complete(&mut self, frame: FrameReady) {
-        if let Some(pending) = self.pending_capture.as_mut()
+        if let Some(pending) = self.pending_sample.as_mut()
             && pending.surface.frame == Some(frame)
         {
             pending.complete = true;
@@ -2285,11 +2322,11 @@ impl ImagePublication {
 
     fn discard(&mut self, frame: FrameReady) {
         if self
-            .pending_capture
+            .pending_sample
             .as_ref()
             .is_some_and(|pending| pending.surface.frame == Some(frame))
         {
-            self.pending_capture = None;
+            self.pending_sample = None;
         }
     }
 
@@ -2301,45 +2338,40 @@ impl ImagePublication {
                 .as_ref()
                 .is_none_or(|snapshot| !frame.matches_completed(snapshot))
             || !self
-                .pending_capture
+                .pending_sample
                 .as_ref()
                 .is_some_and(|pending| pending.complete && pending.surface.frame == Some(frame))
         {
             return false;
         }
         let pending = self
-            .pending_capture
+            .pending_sample
             .take()
-            .expect("matching completed capture");
-        trace_surface("owned_capture_promotion_started", pending.surface);
+            .expect("matching completed sample");
+        trace_surface("sample_promotion_started", pending.surface);
         if pending
             .gallery
             .as_ref()
             .is_some_and(|snapshot| !gallery::current_source(snapshot))
         {
-            trace_surface("owned_capture_promotion_rejected", pending.surface);
+            trace_surface("sample_promotion_rejected", pending.surface);
             return false;
         }
         self.surface = pending.surface;
         self.gallery = pending.gallery;
         self.detail = pending.detail;
         self.placement = pending.placement;
-        self.owned_index = pending.index;
-        self.captured = Some(frame);
+        self.completed = Some(frame);
+        self.retained_read = Some(pending.read);
         self.refresh_detail(model);
-        trace_surface("owned_capture_promoted", self.surface);
+        trace_surface("sample_promoted", self.surface);
         true
     }
 }
 
 impl Imported {
-    fn reconcile_capture(
+    fn reconcile_sample(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pipeline: &wgpu::RenderPipeline,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
         surface: Surface,
         placement: Placement,
     ) {
@@ -2349,66 +2381,48 @@ impl Imported {
         self.image.surface = surface;
         self.image.gallery = gallery::matching(surface.frame);
         self.image.placement = placement;
-        self.capture(device, queue, pipeline, layout, sampler);
+        self.sample();
         self.image.surface = retained_surface;
         self.image.gallery = retained_gallery;
         self.image.placement = retained_placement;
     }
 
-    fn prepare(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pipeline: &wgpu::RenderPipeline,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-        surface: Surface,
-        bounds: Rectangle,
-        placement: Placement,
-        transform: ViewTransform,
-    ) {
+    fn prepare(&mut self, surface: Surface, placement: Placement) {
         let retained = self.image.surface;
         let retained_gallery = self.image.gallery.clone();
         let retained_placement = self.image.placement;
         self.image.gallery = gallery::matching(surface.frame).or_else(|| {
-            (self.image.captured == surface.frame)
+            (self.image.completed == surface.frame)
                 .then(|| retained_gallery.clone())
                 .flatten()
         });
         self.image.placement = placement;
-        refresh_import(self, surface, bounds, placement, transform, queue);
-        self.capture(device, queue, pipeline, layout, sampler);
-        if let Some(pending) = self.image.pending_capture.as_mut()
+        self.image.surface = surface;
+        self.sample();
+        if let Some(pending) = self.image.pending_sample.as_mut()
             && pending.surface.frame == surface.frame
         {
             pending.surface = surface;
             pending.placement = placement;
         }
-        if self.image.captured.is_some()
-            && (self.image.captured != surface.frame
+        if self.image.completed.is_some()
+            && (self.image.completed != surface.frame
                 || !retained_draw_admitted(retained, surface, placement))
         {
             self.image.gallery = retained_gallery;
             self.image.placement = retained_placement;
-            refresh_import(self, retained, bounds, retained_placement, transform, queue);
+            self.image.surface = retained;
         }
     }
 
-    fn capture(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pipeline: &wgpu::RenderPipeline,
-        layout: &wgpu::BindGroupLayout,
-        sampler: &wgpu::Sampler,
-    ) {
+    fn sample(&mut self) {
         let Some(frame) = self.image.surface.frame else {
             return;
         };
-        if self.image.captured == Some(frame)
+        if self.image.completed == Some(frame)
             || self
                 .image
-                .pending_capture
+                .pending_sample
                 .as_ref()
                 .is_some_and(|pending| pending.surface.frame == Some(frame))
         {
@@ -2418,14 +2432,14 @@ impl Imported {
             && self.image.gallery.is_none()
         {
             trace_image(
-                "capture_rejected",
+                "sample_rejected",
                 "",
                 self.image.surface,
                 self.image.surface,
                 None,
                 None,
             );
-            notify_surface(Notification::CaptureRejected(frame));
+            notify_surface(Notification::SampleRejected(frame));
             return;
         }
         if frame.content_width == 0
@@ -2436,9 +2450,9 @@ impl Imported {
             retire_publication(frame);
             return;
         }
-        let Some(borrow) = CaptureBorrow::acquire(frame) else {
+        let Some(borrow) = SampleRead::acquire(frame) else {
             trace_image(
-                "capture_unavailable",
+                "sample_unavailable",
                 "",
                 self.image.surface,
                 self.image.surface,
@@ -2447,77 +2461,20 @@ impl Imported {
             );
             return;
         };
-        let mailbox = self.mailbox.get_or_insert_with(|| {
-            let views = std::array::from_fn(|layer| {
-                self._texture.create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::D2),
-                    base_array_layer: layer as u32,
-                    array_layer_count: Some(1),
-                    ..wgpu::TextureViewDescriptor::default()
-                })
-            });
-            let bind_groups = std::array::from_fn(|layer| {
-                bind_group(device, layout, sampler, &self.geometry, &views[layer])
-            });
-            MailboxBindings {
-                _views: views,
-                bind_groups,
-            }
-        });
-        let binding = mailbox_binding(frame).expect("acquired mailbox binding");
-        let owned_index = 1 - self.image.owned_index;
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("mmltk receiver-owned capture"),
-        });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("mmltk external sample final use"),
-                color_attachments: &[Some(preserving_color_attachment(
-                    &self.owned[owned_index].view,
-                ))],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_viewport(
-                0.0,
-                0.0,
-                frame.content_width as f32,
-                frame.content_height as f32,
-                0.0,
-                1.0,
-            );
-            pass.set_scissor_rect(0, 0, frame.content_width, frame.content_height);
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, Some(&mailbox.bind_groups[binding]), &[]);
-            pass.draw(0..3, 0..1);
-        }
-        queue.submit([encoder.finish()]);
-        // Subsequent Iced submissions on this queue see the completed capture.
-        // App rejection/replacement cannot return this slot while capture runs.
-        // The completion closure owns custody even if this pipeline is dropped.
-        let captured_surface = self.image.surface;
-        queue.on_submitted_work_done(move || {
-            trace_surface("owned_capture_completed", captured_surface);
-            drop(borrow);
-            notify_surface(Notification::Completed(frame));
-            trace_surface("owned_capture_notified", captured_surface);
-        });
         if let Some(probe) = &self.pixel_trace {
-            probe.sample(&self.owned[owned_index].texture, captured_surface);
+            probe.sample(self.image.surface, borrow.clone());
         }
-        self.image.pending_capture = Some(PendingImage {
+        self.image.pending_sample = Some(PendingImage {
+            read: borrow,
             surface: self.image.surface,
             gallery: self.image.gallery.clone(),
             detail: None,
             placement: self.image.placement,
-            index: owned_index,
-            complete: false,
+            complete: copy_completed(frame),
             view_ready: false,
         });
         trace_image(
-            "owned_capture_submitted",
+            "sample_acquired",
             "",
             self.image.surface,
             self.image.surface,
@@ -2533,22 +2490,6 @@ pub(crate) fn same_allocation(left: Surface, right: Surface) -> bool {
         && left.generation == right.generation
         && left.width == right.width
         && left.height == right.height
-}
-
-fn refresh_import(
-    imported: &mut Imported,
-    surface: Surface,
-    bounds: Rectangle,
-    placement: Placement,
-    transform: ViewTransform,
-    queue: &wgpu::Queue,
-) {
-    let geometry_key = geometry_key(surface, bounds, placement, transform);
-    if imported.geometry_key != geometry_key {
-        write_content_geometry(queue, &imported.geometry, geometry_key);
-        imported.geometry_key = geometry_key;
-    }
-    imported.image.surface = surface;
 }
 
 fn mailbox_binding(frame: FrameReady) -> Option<usize> {
@@ -2656,35 +2597,23 @@ fn write_content_geometry(queue: &wgpu::Queue, geometry: &wgpu::Buffer, key: Geo
 }
 
 pub(crate) fn release(frame: FrameReady) {
-    BORROWS.with(|borrows| {
-        let mut slots = borrows.get();
-        if let Some(binding) = mailbox_binding(frame)
-            && slots[binding] == Some(frame)
-        {
-            slots[binding] = None;
-            borrows.set(slots);
-        }
-    });
+    if LIVE_READS.with(|reads| reads.borrow().iter().flatten().filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame)) {
+        return;
+    }
+    take_publication(frame);
     if reserve_release(frame) {
-        dispatch_release(frame);
+        settle_sample(frame);
     }
 }
 
 // Reserve the notification at transfer of custody, not at callback dispatch.
-// A capture's completion token then owns exactly one eventual notification.
+// A sample's shared read token then owns exactly one eventual notification.
 fn reserve_release(frame: FrameReady) -> bool {
     RELEASED_FRAMES.with(|released| {
         let mut slots = released.get();
-        let Some(slot) = slots.get_mut((frame.layer * MAILBOX_SLOTS + frame.slot) as usize) else {
-            return true;
-        };
-        if slot.is_some_and(|prior| {
-            same_mailbox_slot(prior, frame)
-                && prior.presentation_revision >= frame.presentation_revision
-        }) {
-            return false;
-        }
-        *slot = Some(frame);
+        if slots.iter().flatten().any(|prior| same_mailbox_slot(*prior, frame)
+            && prior.presentation_revision >= frame.presentation_revision) { return false; }
+        remember_frame(&mut slots, frame);
         released.set(slots);
         true
     })
@@ -2692,6 +2621,7 @@ fn reserve_release(frame: FrameReady) -> bool {
 
 #[cfg(target_arch = "wasm32")]
 fn dispatch_release(frame: FrameReady) {
+    trace_frame("sample_released", frame);
     let detail = wasm_bindgen::JsValue::from_str(&format!(
         "{:016x}{:016x}:{}:{}:{}:{}:{}",
         frame.high,
@@ -2727,15 +2657,17 @@ fn dispatch_release(frame: FrameReady) {
 #[cfg(test)]
 pub(crate) fn reset_test_releases() {
     authorize_draw(None);
-    BORROWS.with(|borrows| borrows.set([None; 2]));
-    RELEASED_FRAMES.with(|released| released.set([None; 2]));
+    BORROWS.with(|borrows| borrows.set([None; SAMPLE_CAPACITY]));
+    RELEASED_FRAMES.with(|released| released.set([None; SAMPLE_CAPACITY]));
+    LIVE_READS.with(|reads| *reads.borrow_mut() = [const { None }; SAMPLE_CAPACITY]);
+    COPY_RECEIPTS.with(|receipts| receipts.set([None; SAMPLE_CAPACITY]));
     TEST_RELEASES.with(|released| released.borrow_mut().clear());
     clear_drawn_detail();
 }
 
 #[cfg(test)]
-pub(crate) fn test_capture_borrow(frame: FrameReady) -> impl Drop {
-    CaptureBorrow::acquire(frame).expect("accepted physical publication")
+pub(crate) fn test_sample_read(frame: FrameReady) -> impl Drop {
+    SampleRead::acquire(frame).expect("accepted physical publication")
 }
 
 #[cfg(test)]
@@ -2777,11 +2709,6 @@ fn vs_main(@builtin(vertex_index) index: u32) -> Output {
         vec2<f32>(0.0, -1.0)
     );
     return Output(vec4<f32>(positions[index], 0.0, 1.0), uv[index]);
-}
-
-@fragment
-fn fs_capture(input: Output) -> @location(0) vec4<f32> {
-    return textureLoad(image, vec2<i32>(input.position.xy), 0);
 }
 
 @fragment
@@ -2886,7 +2813,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_predecessor_survives_every_causal_metadata_and_capture_order() {
+    fn completed_predecessor_survives_every_metadata_and_copy_notification_order() {
         use crate::view_model::test_support::{
             annotation_object, explore_presentation, physical_surface,
         };
@@ -2896,7 +2823,7 @@ mod tests {
                 domain_position,
                 control_position,
                 physical_position,
-                capture_position,
+                copy_position,
             ] in crate::view_model::test_support::presentation_arrival_orders()
             {
                 reset_test_releases();
@@ -2950,12 +2877,12 @@ mod tests {
                 next_control.capability.condition =
                     crate::generated::PresentationCapabilityCondition::Ready;
                 assert!(accept_publication(old));
-                drop(CaptureBorrow::acquire(old).unwrap());
+                let old_read = SampleRead::acquire(old).unwrap();
                 let mut image = ImagePublication {
                     surface: previous,
-                    owned_index: 0,
-                    pending_capture: None,
-                    captured: Some(old),
+                        pending_sample: None,
+                    completed: Some(old),
+                    retained_read: Some(old_read),
                     gallery: None,
                     detail: DetailContent::from_model(&model),
                     placement: Placement::Contain,
@@ -2980,11 +2907,10 @@ mod tests {
                         )
                         .is_none()
                 );
-                let mut copy = None;
                 let mut replacement_image: Option<ImagePublication> = None;
                 let mut domain_arrived = false;
                 let mut control_arrived = false;
-                let mut capture_completed = false;
+                let mut copy_notified = false;
                 for position in 0..4 {
                     if position == domain_position {
                         model.explore.snapshot = Some(next_explore.clone());
@@ -2994,38 +2920,37 @@ mod tests {
                         control_arrived = true;
                     } else if position == physical_position {
                         assert!(accept_publication(next));
-                        copy = CaptureBorrow::acquire(next);
-                        assert!(copy.is_some());
+                        let read = SampleRead::acquire(next).unwrap();
                         let pending = Some(PendingImage {
+                            read,
                             surface: target,
                             gallery: None,
                             detail: None,
                             placement: Placement::Contain,
-                            index: 1,
-                            complete: false,
+                            complete: copy_completed(next),
                             view_ready: false,
                         });
                         if replacement {
                             replacement_image = Some(ImagePublication {
                                 surface: target,
-                                owned_index: 0,
-                                pending_capture: pending,
-                                captured: None,
+                                                pending_sample: pending,
+                                completed: None,
+                                retained_read: None,
                                 gallery: None,
                                 detail: None,
                                 placement: Placement::Contain,
                             });
                         } else {
-                            image.pending_capture = pending;
+                            image.pending_sample = pending;
                         }
                     } else {
-                        assert_eq!(position, capture_position);
-                        drop(copy.take());
+                        assert_eq!(position, copy_position);
+                        complete_sample(next);
                         replacement_image
                             .as_mut()
                             .unwrap_or(&mut image)
                             .complete(next);
-                        capture_completed = true;
+                        copy_notified = true;
                     }
                     if replacement {
                         if replacement_image
@@ -3037,10 +2962,10 @@ mod tests {
                     } else {
                         let _ = image.promote(next, &model);
                     }
-                    let promoted = domain_arrived && control_arrived && capture_completed;
+                    let promoted = domain_arrived && control_arrived && copy_notified && position >= physical_position;
                     assert_eq!(image.surface, if promoted { target } else { previous });
-                    assert_eq!(image.captured, Some(if promoted { next } else { old }));
-                    assert_eq!(image.owned_index, usize::from(promoted));
+                    assert_eq!(image.completed, Some(if promoted { next } else { old }));
+                    assert_eq!(image.surface.frame.unwrap().slot, u32::from(promoted));
                     let meaning = image.detail.as_ref().unwrap();
                     assert_eq!(
                         meaning.scene().categories[0].value,
@@ -3065,19 +2990,15 @@ mod tests {
                     );
                     assert_eq!(
                         test_releases(),
-                        if capture_completed {
-                            vec![old, next]
-                        } else {
-                            vec![old]
-                        }
+                        if promoted { vec![old] } else { vec![] }
                     );
                 }
                 image.complete(next); // A duplicate completion cannot promote or release twice.
                 assert!(!image.promote(next, &model));
                 retire_publication(next);
-                assert_eq!(test_releases(), vec![old, next]);
+                assert_eq!(test_releases(), vec![old]);
                 // Label-only metadata advances no physical frame. Update
-                // its coherent semantics without recapturing or releasing.
+                // its coherent semantics without replacing or releasing the sample.
                 let labels = model.explore.snapshot.as_mut().unwrap();
                 labels.revision += 1;
                 labels.overlay.showlabels = false;
@@ -3088,15 +3009,17 @@ mod tests {
                 image.refresh_detail(&model);
                 assert!(!image.detail.as_ref().unwrap().overlay().showlabels);
                 assert_eq!(image.retained(), Some(target));
-                assert_eq!(test_releases(), vec![old, next]);
+                assert_eq!(test_releases(), vec![old]);
                 let obsolete = FrameReady {
                     content_sequence: 3,
                     presentation_revision: 7,
+                    slot: 0,
                     ..next
                 };
                 assert!(accept_publication(obsolete));
-                let unsettled = CaptureBorrow::acquire(obsolete).unwrap();
-                image.pending_capture = Some(PendingImage {
+                let unsettled = SampleRead::acquire(obsolete).unwrap();
+                image.pending_sample = Some(PendingImage {
+                    read: unsettled.clone(),
                     surface: Surface {
                         frame: Some(obsolete),
                         ..target
@@ -3104,7 +3027,6 @@ mod tests {
                     gallery: None,
                     detail: None,
                     placement: Placement::Contain,
-                    index: 0,
                     complete: false,
                     view_ready: false,
                 });
@@ -3121,7 +3043,7 @@ mod tests {
                 );
                 image.discard(obsolete);
                 retire_publication(obsolete);
-                assert_eq!(test_releases(), vec![old, next]); // GPU custody still owns this release.
+                assert_eq!(test_releases(), vec![old]); // GPU custody still owns this release.
                 drop(unsettled);
                 image.complete(obsolete);
                 assert!(!image.promote(obsolete, &model));
@@ -3130,13 +3052,15 @@ mod tests {
                     image.detail.as_ref().unwrap().scene().categories[0].value,
                     "successor"
                 );
-                assert_eq!(test_releases(), vec![old, next, obsolete]);
+                assert_eq!(test_releases(), vec![old, obsolete]);
+                drop(image);
+                assert_eq!(test_releases(), vec![old, obsolete, next]);
             }
         }
     }
 
     #[test]
-    fn receiver_capture_is_reconciled_after_transport_continuity_recovery() {
+    fn sample_copy_is_reconciled_after_transport_continuity_recovery() {
         use crate::generated::{ExploreMode, FeatureId, PresentationSourceKind};
         use crate::view_model::test_support::{bootstrapped, physical_surface, visual_frame};
         for matching in [false, true] {
@@ -3160,14 +3084,14 @@ mod tests {
                 let restored_explore = model.explore.snapshot.clone();
                 let restored_control = model.presentation.clone();
                 assert!(accept_publication(frame));
-                let mut borrow = Some(CaptureBorrow::acquire(frame).unwrap());
+                let mut borrow = Some(SampleRead::acquire(frame).unwrap());
                 let mut image = ImagePublication {
                     surface,
-                    owned_index: 0,
-                    captured: None,
-                    pending_capture: Some(PendingImage {
+                        completed: None,
+                    retained_read: None,
+                    pending_sample: Some(PendingImage {
+                        read: borrow.as_ref().unwrap().clone(),
                         surface,
-                        index: 1,
                         gallery: None,
                         detail: None,
                         placement: Placement::Contain,
@@ -3182,9 +3106,9 @@ mod tests {
                 assert!(image.submitted_draw(surface).is_none());
                 authorize_draw(Some(frame));
                 assert!(image.submitted_draw(surface).is_none());
-                image.pending_capture.as_mut().unwrap().view_ready = true;
+                image.pending_sample.as_mut().unwrap().view_ready = true;
                 assert!(image.submitted_draw(surface).is_some());
-                assert!(!image.pending_capture.as_ref().unwrap().complete);
+                assert!(!image.pending_sample.as_ref().unwrap().complete);
                 assert!(image.retained().is_none());
                 authorize_draw(None);
                 if completed_before_disconnect {
@@ -3192,7 +3116,7 @@ mod tests {
                     image.complete(frame);
                 }
                 model
-                    .peer_disconnected(crate::view_model::UiError::transport("capture continuity"));
+                    .peer_disconnected(crate::view_model::UiError::transport("sample continuity"));
                 assert!(!image.promote(frame, &model));
                 model.peer_connected();
                 if !completed_before_disconnect {
@@ -3200,8 +3124,8 @@ mod tests {
                     image.complete(frame);
                 }
                 assert!(!image.promote(frame, &model));
-                assert_eq!(test_releases(), vec![frame]);
-                assert!(image.pending_capture.as_ref().unwrap().complete);
+                assert!(test_releases().is_empty());
+                assert!(image.pending_sample.as_ref().unwrap().complete);
                 model.presentation = restored_control;
                 model.explore.snapshot = restored_explore;
                 model.set_foreground_feature(FeatureId::Explore);
@@ -3221,9 +3145,11 @@ mod tests {
                 } else {
                     image.discard(frame);
                     assert!(image.retained().is_none());
-                    assert!(image.pending_capture.is_none());
+                    assert!(image.pending_sample.is_none());
                 }
                 retire_publication(frame);
+                if matching { assert!(test_releases().is_empty()); }
+                drop(image);
                 assert_eq!(test_releases(), vec![frame]);
             }
         }
@@ -3308,10 +3234,10 @@ mod tests {
         mailbox.complete(old);
         mailbox.rejected = Some(old);
         assert!(
-            matches!(mailbox.next_notification(), Some(Notification::Completed(frame)) if frame == newest)
+            matches!(mailbox.next_notification(), Some(Notification::Copied(frame)) if frame == newest)
         );
         assert!(
-            matches!(mailbox.next_notification(), Some(Notification::CaptureRejected(frame)) if frame == old)
+            matches!(mailbox.next_notification(), Some(Notification::SampleRejected(frame)) if frame == old)
         );
         assert!(
             matches!(mailbox.next_notification(), Some(Notification::Native(frame)) if frame == newest)
@@ -3322,11 +3248,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_mailbox_metadata_cannot_release_an_active_capture() {
+    fn stale_mailbox_metadata_cannot_release_an_active_sample() {
         reset_test_releases();
         let current = frame_ready(1, 10, 10, 640, 480);
         assert!(accept_publication(current));
-        let capture = CaptureBorrow::acquire(current).unwrap();
+        let read = SampleRead::acquire(current).unwrap();
         let mut mailbox = FrameMailbox::default();
         assert!(mailbox.push(current).is_none());
         assert!(mailbox.push(current).is_none());
@@ -3334,28 +3260,28 @@ mod tests {
         release(mailbox.push(newer).unwrap());
         assert!(test_releases().is_empty());
         assert_eq!(mailbox.pop(), Some(newer));
-        drop(capture);
+        drop(read);
         assert_eq!(test_releases(), vec![current]);
     }
 
     #[test]
-    fn publication_custody_is_consumed_once_and_release_waits_for_capture() {
+    fn publication_custody_is_consumed_once_and_release_waits_for_readers() {
         reset_test_releases();
         let frame = frame_ready(1, 1, 1, 640, 480);
-        assert!(CaptureBorrow::acquire(frame).is_none());
+        assert!(SampleRead::acquire(frame).is_none());
         assert!(accept_publication(frame));
-        let capture = CaptureBorrow::acquire(frame).unwrap();
-        assert!(CaptureBorrow::acquire(frame).is_none());
+        let read = SampleRead::acquire(frame).unwrap();
+        assert!(SampleRead::acquire(frame).is_none());
         assert!(!accept_publication(frame));
         // Replacement, navigation and shutdown may all ask to retire a sample
-        // while its submitted capture still owns the final external GPU use.
+        // while an encoded/submitted read still owns the external GPU use.
         retire_publication(frame);
         retire_publication(frame);
         assert!(test_releases().is_empty());
-        drop(capture);
+        drop(read);
         assert_eq!(test_releases(), vec![frame]);
         assert!(!accept_publication(frame));
-        assert!(CaptureBorrow::acquire(frame).is_none());
+        assert!(SampleRead::acquire(frame).is_none());
         release(frame);
         assert_eq!(test_releases(), vec![frame]);
     }
@@ -3366,7 +3292,7 @@ mod tests {
         let old = frame_ready(1, 1, 1, 640, 480);
         assert!(accept_publication(old));
         release(old); // Rejected before any GPU work.
-        assert!(CaptureBorrow::acquire(old).is_none());
+        assert!(SampleRead::acquire(old).is_none());
         let current = FrameReady {
             presentation_revision: 2,
             content_sequence: 2,
@@ -3379,41 +3305,207 @@ mod tests {
         );
         invalidate_drawn_slot(current);
         assert!(drawn_detail().is_none());
-        assert!(CaptureBorrow::acquire(old).is_none());
-        let capture = CaptureBorrow::acquire(current).unwrap();
+        assert!(SampleRead::acquire(old).is_none());
+        let read = SampleRead::acquire(current).unwrap();
         release(old);
         assert_eq!(test_releases(), vec![old]);
         // Dropping the completion owner (including device teardown) settles
         // custody, even when the surface/pipeline no longer exists.
-        drop(capture);
+        drop(read);
         assert_eq!(test_releases(), vec![old, current]);
         assert!(!accept_publication(old));
         assert!(!accept_publication(current));
     }
 
     #[test]
-    fn allocation_replacement_keeps_each_capture_completion_independent() {
+    fn allocation_replacement_keeps_each_sample_read_independent() {
         reset_test_releases();
         let old = frame_ready(1, 1, 1, 640, 480);
         assert!(accept_publication(old));
-        let old_capture = CaptureBorrow::acquire(old).unwrap();
+        let old_read = SampleRead::acquire(old).unwrap();
         let replacement = FrameReady {
             high: 3,
             low: 4,
             ..old
         };
         assert!(accept_publication(replacement));
-        let new_capture = CaptureBorrow::acquire(replacement).unwrap();
+        let new_read = SampleRead::acquire(replacement).unwrap();
         retire_publication(old);
         retire_publication(replacement);
         assert!(test_releases().is_empty());
-        assert!(CaptureBorrow::acquire(old).is_none());
-        assert!(CaptureBorrow::acquire(replacement).is_none());
-        drop(old_capture);
+        assert!(SampleRead::acquire(old).is_none());
+        assert!(SampleRead::acquire(replacement).is_none());
+        drop(old_read);
         assert_eq!(test_releases(), vec![old]);
         assert!(!accept_publication(replacement));
-        drop(new_capture);
+        drop(new_read);
         assert_eq!(test_releases(), vec![old, replacement]);
+    }
+
+    #[test]
+    fn display_draw_batches_and_probe_keep_independent_exact_sample_reads() {
+        reset_test_releases();
+        let frame = frame_ready(1, 1, 1, 640, 480);
+        assert!(accept_publication(frame));
+        let display = SampleRead::acquire(frame).unwrap();
+        let probe = display.clone();
+        let mut first_encoder = shader::Resources::default();
+        let mut second_encoder = shader::Resources::default();
+        // Multiple widgets share one publication and one batch callback.
+        for _ in 0..32 { first_encoder.retain(display.clone()); }
+        second_encoder.retain(display.clone());
+        complete_sample(frame);
+        drop(display);
+        retire_publication(frame);
+        release(frame);
+        assert!(test_releases().is_empty());
+        // An abandoned encoder drops only its own encoded reads. The same RAII
+        // batch settles when wgpu invokes its containing submission callback.
+        drop(first_encoder);
+        assert!(test_releases().is_empty());
+        drop(probe);
+        assert!(test_releases().is_empty());
+        drop(second_encoder);
+        assert_eq!(test_releases(), vec![frame]);
+        complete_sample(frame);
+        assert!(!copy_completed(frame));
+    }
+
+    #[test]
+    fn both_slots_wait_for_their_own_readers_across_arena_retirement() {
+        reset_test_releases();
+        let first = frame_ready(1, 1, 1, 640, 480);
+        let second = FrameReady { slot: 1, content_sequence: 2, presentation_revision: 2, ..first };
+        assert!(accept_publication(first));
+        let fallback = SampleRead::acquire(first).unwrap();
+        assert!(accept_publication(second));
+        let incoming = SampleRead::acquire(second).unwrap();
+        let mut encoded = shader::Resources::default();
+        encoded.retain(fallback.clone());
+        encoded.retain(incoming.clone());
+        let newer = FrameReady { content_sequence: 3, presentation_revision: 3, ..first };
+        assert!(!accept_publication(newer));
+        drop(fallback);
+        drop(incoming);
+        // A predecessor's actual encoder remains live after its display owner.
+        let replacement = FrameReady { high: 7, presentation_revision: 4, ..first };
+        assert!(accept_publication(replacement));
+        let display = SampleRead::acquire(replacement).unwrap();
+        complete_sample(replacement);
+        complete_sample(second);
+        complete_sample(first);
+        assert!(copy_completed(replacement) && copy_completed(second) && copy_completed(first));
+        release(first);
+        assert!(test_releases().is_empty());
+        drop(encoded);
+        assert_eq!(test_releases(), vec![first, second]);
+        assert!(copy_completed(replacement));
+        assert!(accept_publication(newer));
+        let current = SampleRead::acquire(newer).unwrap();
+        release(first);
+        complete_sample(first);
+        assert!(!copy_completed(first));
+        drop(current);
+        drop(display);
+        assert_eq!(test_releases(), vec![first, second, newer, replacement]);
+    }
+
+    #[test]
+    fn replaced_undrawn_pending_and_prepublication_copy_receipts_are_exact() {
+        reset_test_releases();
+        let first = frame_ready(1, 1, 1, 640, 480);
+        let other_arena = FrameReady { high: 7, presentation_revision: 2, ..first };
+        complete_sample(other_arena);
+        complete_sample(first);
+        assert!(copy_completed(first) && copy_completed(other_arena));
+        assert!(accept_publication(first));
+        let pending = SampleRead::acquire(first).unwrap();
+        drop(pending); // Prepared/metadata-only work encoded no read.
+        assert_eq!(test_releases(), vec![first]);
+        assert!(copy_completed(other_arena));
+        assert!(accept_publication(other_arena));
+        retire_publication(other_arena); // No widget is needed to return capacity.
+        assert_eq!(test_releases(), vec![first, other_arena]);
+    }
+
+    #[test]
+    fn arena_retirement_waits_for_both_slots_draw_batches_and_probe() {
+        reset_test_releases();
+        let first = frame_ready(1, 1, 1, 640, 480);
+        let second = FrameReady { slot: 1, presentation_revision: 2, ..first };
+        let arena = crate::view_model::test_support::physical_surface(first);
+        assert!(!arena_has_readers(arena)); // An undrawn import can retire now.
+        assert!(accept_publication(first));
+        let fallback = SampleRead::acquire(first).unwrap();
+        assert!(accept_publication(second));
+        let pending = SampleRead::acquire(second).unwrap();
+        let probe = pending.clone();
+        let mut submitted = shader::Resources::default();
+        let mut abandoned = shader::Resources::default();
+        for _ in 0..16 { submitted.retain(fallback.clone()); }
+        submitted.retain(pending.clone());
+        abandoned.retain(pending.clone());
+        assert!(arena_has_readers(arena));
+        drop(fallback);
+        drop(pending); // Removal of Imported's display state alone is insufficient.
+        drop(abandoned); // No queue callback or successful frame is needed.
+        assert!(arena_has_readers(arena));
+        drop(submitted);
+        assert!(arena_has_readers(arena)); // Probe custody is independent.
+        assert_eq!(test_releases(), vec![first]);
+        drop(probe);
+        assert!(!arena_has_readers(arena)); // Exact last-reader destroy frontier.
+        assert_eq!(test_releases(), vec![first, second]);
+        release(first);
+        release(second);
+        complete_sample(first);
+        assert!(!arena_has_readers(arena));
+        assert_eq!(test_releases(), vec![first, second]);
+    }
+
+    #[test]
+    fn retiring_predecessors_and_new_arena_have_independent_destroy_frontiers() {
+        reset_test_releases();
+        let first = frame_ready(1, 1, 1, 640, 480);
+        let frames = std::array::from_fn::<_, ARENA_CAPACITY, _>(|index| FrameReady {
+            high: first.high + index as u64,
+            presentation_revision: first.presentation_revision + index as u64,
+            ..first
+        });
+        let arenas = frames.map(crate::view_model::test_support::physical_surface);
+        let mut readers = frames.map(|frame| {
+            assert!(accept_publication(frame));
+            Some(SampleRead::acquire(frame).unwrap())
+        });
+        let readiness = || arenas.map(|arena| !arena_has_readers(arena));
+        assert_eq!(readiness(), [false, false, false]);
+        drop(readers[1].take());
+        assert_eq!(readiness(), [false, true, false]);
+        release(frames[1]);
+        complete_sample(frames[1]);
+        assert_eq!(readiness(), [false, true, false]);
+        drop(readers[0].take());
+        assert_eq!(readiness(), [true, true, false]);
+        // Stale predecessor settlement cannot destroy the newest arena,
+        // despite identical physical slot numbers and content dimensions.
+        release(frames[0]);
+        complete_sample(frames[0]);
+        assert_eq!(readiness(), [true, true, false]);
+        drop(readers[2].take());
+        assert_eq!(readiness(), [true, true, true]);
+        assert_eq!(test_releases(), vec![frames[1], frames[0], frames[2]]);
+    }
+
+    #[test]
+    fn undisplayed_publication_does_not_require_a_draw_to_retire_its_arena() {
+        reset_test_releases();
+        let frame = frame_ready(1, 1, 1, 640, 480);
+        let arena = crate::view_model::test_support::physical_surface(frame);
+        assert!(accept_publication(frame));
+        assert!(!arena_has_readers(arena));
+        retire_publication(frame);
+        assert!(!arena_has_readers(arena));
+        assert_eq!(test_releases(), vec![frame]);
     }
 
     fn surface_for_content_session(content_session: u64) -> Surface {

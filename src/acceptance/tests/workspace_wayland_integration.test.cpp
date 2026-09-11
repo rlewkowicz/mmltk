@@ -517,7 +517,7 @@ struct SurfaceAudit final {
         bool firefox_withdrawn = false;
         bool firefox_retired = false;
         std::size_t created = 0U;
-        std::size_t captured = 0U;
+        std::size_t acquired = 0U;
         std::size_t discarded = 0U;
         std::size_t retired = 0U;
         std::optional<Reconstruction> reconstruction;
@@ -919,16 +919,16 @@ struct SurfaceAudit final {
         if (event == "iced.surface.texture_create") {
             if (state.created != 0U || state.retired != 0U) reject("Iced physical texture created twice");
             state.created = browser_ordinal;
-        } else if (event == "iced.surface.owned_capture_submitted" || event == "iced.surface.owned_draw_selected") {
+        } else if (event == "iced.surface.sample_acquired" || event == "iced.surface.sample_draw_selected") {
             if (state.retired != 0U)
                 reject("Iced surface used after texture retirement");
             else if (state.created == 0U || state.firefox_stage != 5U)
                 reject("Iced sampled surface lacks texture or complete Firefox import");
             state.samples.emplace_back(scalar(record, "presentation_revision"), scalar(record, "frame_revision"));
-            if (event == "iced.surface.owned_capture_submitted")
-                state.captured = browser_ordinal;
+            if (event == "iced.surface.sample_acquired")
+                state.acquired = browser_ordinal;
             else {
-                if (state.captured == 0U) reject("Iced selected image without an owned capture");
+                if (state.acquired == 0U) reject("Iced selected image without an exact sample lease");
                 if (!valid_identity(record.value("requested_surface", "")))
                     reject("Iced selected draw lacks requested capability identity");
                 draws.push_back({id, record.value("requested_surface", ""), browser_ordinal});
@@ -940,12 +940,12 @@ struct SurfaceAudit final {
             const std::string requested = record.value("requested_surface", "");
             if (state.retired != 0U)
                 reject("Iced surface used after texture retirement");
-            else if (!valid_identity(requested) || requested == id || state.captured == 0U)
-                reject("pipeline reconstruction lacks its retained owned image");
+            else if (!valid_identity(requested) || requested == id || state.acquired == 0U)
+                reject("pipeline reconstruction lacks its retained sample");
             else {
                 if (!admit(requested)) return;
                 auto& pending = surfaces[requested];
-                if (pending.reconstruction || pending.created == 0U || state.captured >= pending.created || pending.captured != 0U ||
+                if (pending.reconstruction || pending.created == 0U || state.acquired >= pending.created || pending.acquired != 0U ||
                     pending.discarded != 0U || pending.retired != 0U)
                     reject("renderer reconstruction is duplicate or outside its exact pending ownership window");
                 else
@@ -1010,7 +1010,7 @@ struct SurfaceAudit final {
             if (!native_rejection || state.generation != state.iced_generation || state.width != state.browser_width ||
                 state.height != state.browser_height || !state.native_retired)
                 return "rejected import " + id + " lacks matching native admission and retirement";
-            if (state.firefox_stage != 2U || state.created == 0U || state.captured != 0U || state.discarded <= state.created ||
+            if (state.firefox_stage != 2U || state.created == 0U || state.acquired != 0U || state.discarded <= state.created ||
                 state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
                 return "rejected import " + id + " lacks exact receiver discard and texture retirement";
             return {};
@@ -1086,21 +1086,21 @@ struct SurfaceAudit final {
     [[nodiscard]] bool pending_supersession_completed() const {
         if (!failure.empty()) return false;
         for (const auto& [b, pending] : surfaces) {
-            if (!pending.candidate_withdrawn || pending.created == 0U || pending.captured != 0U || !pending.publications.empty() ||
+            if (!pending.candidate_withdrawn || pending.created == 0U || pending.acquired != 0U || !pending.publications.empty() ||
                 pending.discarded <= pending.created || pending.retired <= pending.discarded || !pending.reconstruction ||
                 pending.reconstruction->requested != b || pending.reconstruction->ordinal <= pending.created ||
                 pending.reconstruction->ordinal >= pending.discarded || !pending.firefox_retired || !pending.native_retired)
                 continue;
             const auto& active_identity = pending.reconstruction->completed;
             const auto& active = surfaces.at(active_identity);
-            std::size_t latest_prior_capture = 0U;
+            std::size_t latest_prior_acquisition = 0U;
             for (const auto& [_, candidate] : surfaces)
-                if (candidate.captured < pending.created) latest_prior_capture = std::max(latest_prior_capture, candidate.captured);
-            if (active.generation >= pending.generation || active.captured == 0U || active.captured != latest_prior_capture) continue;
+                if (candidate.acquired < pending.created) latest_prior_acquisition = std::max(latest_prior_acquisition, candidate.acquired);
+            if (active.generation >= pending.generation || active.acquired == 0U || active.acquired != latest_prior_acquisition) continue;
             for (const auto& draw : draws) {
                 const auto& latest = surfaces.at(draw.selected);
-                if (latest.generation > pending.generation && latest.created > pending.created && latest.captured > pending.retired &&
-                    draw.ordinal > latest.captured && draw.requested == draw.selected)
+                if (latest.generation > pending.generation && latest.created > pending.created && latest.acquired > pending.retired &&
+                    draw.ordinal > latest.acquired && draw.requested == draw.selected)
                     return true;
             }
         }
@@ -1424,14 +1424,14 @@ struct PixelBoundaryAudit final {
         if (publication.viewer) {
             const auto& canvas = publication.receivers[3];
             if (!canvas.identity.empty() && !raw[3]->identity.empty() && canvas.identity != raw[3]->identity)
-                reject("canvas does not name the captured physical publication");
+                reject("canvas does not name the sampled physical publication");
             for (std::size_t index = 0U; index < 25U; ++index) {
                 if (canvas.values[index] &&
                     (canvas.values[index]->x != coordinate(index % 5U, width) || canvas.values[index]->y != coordinate(index / 5U, height)))
                     reject("canvas probe does not name its logical source sample");
                 if (canvas.values[index] && raw[3]->values[index] && colored(raw[3]->values[index]->rgba) &&
                     black(canvas.values[index]->rgba))
-                    reject("successful owned capture produced an unexplained black viewer canvas");
+                    reject("completed sample produced an unexplained black viewer canvas");
             }
         }
         if (width == 384U && height == 384U && scalar(fact, "allocation_generation") > 1U && scalar(fact, "capacity_width") > width &&
@@ -2724,7 +2724,7 @@ struct NativeAudit final {
 
 struct AtlasDrawAudit final {
     using SourceKey = std::array<std::uint64_t, 4U>;
-    using CaptureKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
+    using SampleKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
     using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>;
     static constexpr std::initializer_list<const char*> source_fields{
         "content_session", "source_kind",      "source_instance",    "source_revision", "content_width",
@@ -2732,7 +2732,7 @@ struct AtlasDrawAudit final {
         "first_row",       "matching_count",   "visible_indices"};
     std::map<SourceKey, nlohmann::json> sources;
     std::map<std::pair<std::uint64_t, std::uint64_t>, SourceKey> sessions;
-    std::map<CaptureKey, nlohmann::json> captures;
+    std::map<SampleKey, nlohmann::json> acquisitions;
     std::set<std::uint64_t> drawn_rows;
     std::optional<AllocationKey> staged_allocation;
     std::uint64_t previous_staged_rows = 0U;
@@ -2748,7 +2748,7 @@ struct AtlasDrawAudit final {
                 scalar(record, "source_revision")};
     }
 
-    [[nodiscard]] static CaptureKey capture_key(const nlohmann::json& record) {
+    [[nodiscard]] static SampleKey sample_key(const nlohmann::json& record) {
         return {record.value("surface", ""), scalar(record, "generation"), scalar(record, "presentation_revision")};
     }
 
@@ -2850,13 +2850,13 @@ struct AtlasDrawAudit final {
             }
             return;
         }
-        if (event == "iced.surface.owned_capture_submitted") {
-            const auto key = capture_key(record);
-            if (captures.size() >= kAcceptanceRecordLimit || captures.contains(key)) {
+        if (event == "iced.surface.sample_acquired") {
+            const auto key = sample_key(record);
+            if (acquisitions.size() >= kAcceptanceRecordLimit || acquisitions.contains(key)) {
                 valid = false;
                 return;
             }
-            captures.emplace(key, record);
+            acquisitions.emplace(key, record);
             return;
         }
         if (event == "iced.surface.scroll_stage") {
@@ -2864,16 +2864,16 @@ struct AtlasDrawAudit final {
             return;
         }
         if (record.value("control", "") != kExploreGalleryControl) return;
-        if (event == "iced.surface.owned_draw_clipped" || event == "iced.surface.owned_draw_rejected") {
+        if (event == "iced.surface.sample_draw_clipped" || event == "iced.surface.sample_draw_rejected") {
             last_draw.reset();
             return;
         }
         if (event != "iced.surface.draw_encoded") return;
         const auto source = sources.find(source_key(record));
-        const auto capture = captures.find(capture_key(record));
+        const auto capture = acquisitions.find(sample_key(record));
         const auto columns = scalar(record, "columns"), rows = scalar(record, "rows");
         const auto width = scalar(record, "content_width"), height = scalar(record, "content_height");
-        bool matching = source != sources.end() && capture != captures.end() && visible(record) &&
+        bool matching = source != sources.end() && capture != acquisitions.end() && visible(record) &&
                         SurfaceAudit::valid_identity(record.value("surface", "")) && scalar(record, "generation") != 0U &&
                         scalar(record, "presentation_revision") != 0U && width <= scalar(record, "width") &&
                         height <= scalar(record, "height") && scalar(record, "source_revision") == scalar(record, "frame_revision") &&
@@ -3190,7 +3190,7 @@ struct BrowserAudit final {
                 owned_atlas_current = true;
             else if (control == EXPLORE_DETAIL_WORKSPACE || control == "workflow.visual.workspace")
                 owned_atlas_current = false;
-        } else if (surface_event == "iced.surface.owned_draw_missing") {
+        } else if (surface_event == "iced.surface.sample_draw_missing") {
             const auto control = record.value("control", "");
             owned_atlas_interrupted =
                 owned_atlas_interrupted || (owned_atlas_current && (control.empty() || control == kExploreGalleryControl));
@@ -5456,10 +5456,10 @@ void WaylandSession::AdvanceScenario() {
     pixel_audit = std::move(next_pixels);
 
     AtlasDrawAudit retained_atlas;
-    retained_atlas.captures = std::move(browser.atlas_draws.captures);
-    std::erase_if(retained_atlas.captures, [&](const auto& entry) { return !surface_audit.surfaces.contains(std::get<0>(entry.first)); });
+    retained_atlas.acquisitions = std::move(browser.atlas_draws.acquisitions);
+    std::erase_if(retained_atlas.acquisitions, [&](const auto& entry) { return !surface_audit.surfaces.contains(std::get<0>(entry.first)); });
     std::set<AtlasDrawAudit::SourceKey> retained_sources;
-    for (const auto& [_, capture] : retained_atlas.captures)
+    for (const auto& [_, capture] : retained_atlas.acquisitions)
         retained_sources.insert(AtlasDrawAudit::source_key(capture));
     std::map<std::array<std::uint64_t, 3U>, AtlasDrawAudit::SourceKey> latest_sources;
     for (const auto& [key, _] : browser.atlas_draws.sources) {
@@ -5806,7 +5806,7 @@ constexpr std::array browser_surface_events{
     "firefox.workspace.registry_inserted", "firefox.workspace.import_ready_emitted", "firefox.workspace.ready",
     "firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome", "firefox.workspace.source.ready",
     "firefox.workspace.frame_forwarded", "firefox.workspace.frame_dispatched", "firefox.workspace.copy_completed",
-    "iced.surface.owned_capture_submitted", "iced.surface.owned_draw_selected", "firefox.workspace.withdrawal",
+    "iced.surface.sample_acquired", "iced.surface.sample_draw_selected", "firefox.workspace.withdrawal",
     "iced.surface.retired", "firefox.workspace.retired"};
 
 void record_receiver_withdrawal(SurfaceAudit& audit) {
@@ -5835,7 +5835,7 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
     REQUIRE(audit.surfaces.contains(id));
     CHECK(audit.surfaces.at(id).publications == publications);
     CHECK(audit.draws.empty());
-    audit.browser(browser_surface_record("iced.surface.owned_draw_selected"));
+    audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
     CHECK(audit.evidence_settled());
     CHECK(audit.draws.size() == 1U);
     for (std::size_t stage = 15U; stage < native_surface_events.size(); ++stage)
@@ -5903,8 +5903,8 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
         CHECK_FALSE(audit.joined_failure().empty());
     }
     for (std::size_t omitted = 0U; omitted < browser_surface_events.size(); ++omitted) {
-        if (std::string_view{browser_surface_events[omitted]} == "iced.surface.owned_draw_selected")
-            continue;  // A capture alone is still a sample requiring the full join.
+        if (std::string_view{browser_surface_events[omitted]} == "iced.surface.sample_draw_selected")
+            continue;  // An acquired sample still requires the full source/copy join.
         SurfaceAudit audit;
         for (const char* event : native_surface_events)
             audit.native(native_surface_record(event));
@@ -6223,25 +6223,25 @@ enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBefor
     if (missing != MissingHandoffEvidence::Reconstruction)
         browser("iced.surface.renderer_reconstructed", missing == MissingHandoffEvidence::DifferentCompleted ? d : a, b);
     if (missing == MissingHandoffEvidence::DuplicateReconstruction) browser("iced.surface.renderer_reconstructed", a, b);
-    browser("iced.surface.owned_draw_selected", a, b);
+    browser("iced.surface.sample_draw_selected", a, b);
     browser("firefox.workspace.withdrawal", b);
     for (std::size_t stage = 0U; stage < 2U; ++stage)
         browser(browser_surface_events[stage], c);
     if (missing != MissingHandoffEvidence::PendingDiscard) browser("iced.surface.pending_discarded", b);
     browser("iced.surface.retired", b);
     browser("firefox.workspace.retired", b);
-    browser("iced.surface.owned_draw_selected", a, c);
+    browser("iced.surface.sample_draw_selected", a, c);
     for (std::size_t stage = 2U; stage < 6U; ++stage)
         browser(browser_surface_events[stage], c);
     for (std::size_t stage = 6U; stage < 12U; ++stage)
         browser(browser_surface_events[stage], c);
     if (missing == MissingHandoffEvidence::CaptureBeforeDraw) {
-        browser("iced.surface.owned_draw_selected", c);
-        browser("iced.surface.owned_capture_submitted", c);
+        browser("iced.surface.sample_draw_selected", c);
+        browser("iced.surface.sample_acquired", c);
     } else {
-        browser("iced.surface.owned_capture_submitted", c);
-        browser("iced.surface.owned_draw_selected", a, c);
-        browser("iced.surface.owned_draw_selected", c);
+        browser("iced.surface.sample_acquired", c);
+        browser("iced.surface.sample_draw_selected", a, c);
+        browser("iced.surface.sample_draw_selected", c);
     }
     for (const auto surface : {a, c})
         for (std::size_t stage = 14U; stage < browser_surface_events.size(); ++stage)
@@ -6370,8 +6370,8 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
     auto source = draw;
     source["event"] = "iced.gallery.source";
     auto capture = draw;
-    capture["event"] = "iced.surface.owned_capture_submitted";
-    const nlohmann::json missing{{"event", "iced.surface.owned_draw_missing"}, {"control", kExploreGalleryControl}};
+    capture["event"] = "iced.surface.sample_acquired";
+    const nlohmann::json missing{{"event", "iced.surface.sample_draw_missing"}, {"control", kExploreGalleryControl}};
     BrowserAudit observed;
     observed.consume(missing);
     CHECK_FALSE(observed.owned_atlas_seen);
@@ -6386,7 +6386,7 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
     for (const auto* control : {"", kExploreGalleryControl, "explore.detail.workspace"}) {
         auto browser = observed;
         REQUIRE(browser.owned_atlas_seen);
-        browser.consume({{"event", "iced.surface.owned_draw_missing"}, {"control", control}});
+        browser.consume({{"event", "iced.surface.sample_draw_missing"}, {"control", control}});
         CHECK(browser.owned_atlas_interrupted == (std::string_view{control} != "explore.detail.workspace"));
         browser.consume(missing);
         CHECK(browser.owned_atlas_interrupted);
@@ -6410,8 +6410,8 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         browser.consume(replacement);
         CHECK(browser.owned_atlas_interrupted);
     }
-    for (const auto* event : {"iced.gallery.source", "iced.surface.renderer_reconstructed", "iced.surface.owned_capture_submitted",
-                              "iced.surface.owned_draw_selected"}) {
+    for (const auto* event : {"iced.gallery.source", "iced.surface.renderer_reconstructed", "iced.surface.sample_acquired",
+                              "iced.surface.sample_draw_selected"}) {
         auto browser = observed;
         auto pending = atlas_draw_record(24U, 3U, 5U, -37.25);
         pending["event"] = event;
@@ -6439,7 +6439,7 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         if (kind == "source-instance") invalid["source_instance"] = 2U;
         if (kind == "session") invalid["content_session"] = 3U;
         if (kind == "pending") invalid["presentation_revision"] = 2U;
-        if (kind == "selection") invalid["event"] = "iced.surface.owned_draw_selected";
+        if (kind == "selection") invalid["event"] = "iced.surface.sample_draw_selected";
         audit.consume(invalid);
         CHECK_FALSE(audit.seen);
         if (kind != "selection") CHECK_FALSE(audit.valid);
@@ -6457,7 +6457,7 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
         auto source = draw;
         source["event"] = "iced.gallery.source";
         auto capture = draw;
-        capture["event"] = "iced.surface.owned_capture_submitted";
+        capture["event"] = "iced.surface.sample_acquired";
         complete.consume(source);
         complete.consume(capture);
         complete.consume(draw);
@@ -6478,7 +6478,7 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
             if (kind == "missing") invalid_audit.last_draw.reset();
             if (kind == "clipped") {
                 auto clipped = draw;
-                clipped["event"] = "iced.surface.owned_draw_clipped";
+                clipped["event"] = "iced.surface.sample_draw_clipped";
                 invalid_audit.consume(clipped);
             }
             invalid_audit.consume(invalid_stage);
@@ -6510,7 +6510,7 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
 TEST_CASE("atlas grid transitions belong only to consecutive stages on one allocation", "[workspace][audit]") {
     constexpr std::array names{"fractional", "row1", "row2", "row10", "end", "restored"};
     const auto publish = [](AtlasDrawAudit& audit, nlohmann::json draw) {
-        for (const auto* event : {"iced.gallery.source", "iced.surface.owned_capture_submitted", "iced.surface.draw_encoded"}) {
+        for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
             draw["event"] = event;
             audit.consume(draw);
         }
@@ -6589,7 +6589,7 @@ TEST_CASE("Source retirement remains independent of a retained sample arena", "[
     CHECK(audit.surfaces.size() == 1U);
     CHECK(audit.sources.size() == 1U);
     CHECK(audit.evidence_settled());
-    audit.browser(browser_surface_record("iced.surface.owned_draw_selected"));
+    audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
     CHECK(audit.failure.empty());
     CHECK(audit.evidence_settled());
     audit.browser(browser_surface_record("firefox.workspace.source.retired"));

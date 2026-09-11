@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 
 pub use crate::Action;
 pub use crate::graphics::Viewport;
-pub use primitive::{Pipeline, Primitive, Storage};
+pub use primitive::{Pipeline, Primitive, Resources, Storage};
 
 pub struct Shader<Message, P: Program<Message>> {
     width: Length,

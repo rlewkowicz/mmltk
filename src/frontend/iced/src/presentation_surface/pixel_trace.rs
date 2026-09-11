@@ -1,4 +1,4 @@
-use super::{Surface, wgpu};
+use super::{SampleRead, Surface, wgpu};
 use std::sync::{Arc, Mutex};
 
 thread_local! {
@@ -13,15 +13,15 @@ pub(crate) fn enabled() -> bool {
     ENABLED.with(std::cell::Cell::get)
 }
 
-// One active mapping and one newest owned image. No external mailbox borrow
-// enters this owner, and replacement drops the previous pending handle in O(1).
+// One active mapping and one newest exact sample read. Replacement returns
+// the previous pending lease in O(1); mapping never owns display authorization.
 pub(super) struct PixelTrace {
     state: Arc<Probe>,
 }
 
 struct Request {
-    texture: wgpu::Texture,
     surface: Surface,
+    read: Arc<SampleRead>,
 }
 
 struct Requests<T> {
@@ -78,26 +78,56 @@ struct Probe {
     queue: wgpu::Queue,
     buffer: wgpu::Buffer,
     requests: Mutex<Requests<Request>>,
+    pipeline: wgpu::ComputePipeline,
+    bindings: wgpu::BindGroup,
+    parameters: wgpu::Buffer,
+    pixels: wgpu::Buffer,
 }
 
 impl PixelTrace {
-    pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Self> {
-        enabled().then(|| Self {
-            state: Arc::new(Probe {
-                device: device.clone(),
-                queue: queue.clone(),
-                buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mmltk bounded pixel evidence"),
-                    size: 25 * 256,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                }),
-                requests: Mutex::new(Requests::default()),
-            }),
-        })
+    pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Option<Self> {
+        if !enabled() { return None; }
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mmltk sample pixel evidence"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(PROBE)),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("mmltk sample pixel evidence"),
+            layout: None,
+            module: &module,
+            entry_point: Some("probe"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label), size, usage, mapped_at_creation: false,
+        });
+        let parameters = buffer("mmltk probe extent and slot", 16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let pixels = buffer("mmltk probe pixels", 25 * 256,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mmltk probe sample"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: parameters.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: pixels.as_entire_binding() },
+            ],
+        });
+        Some(Self { state: Arc::new(Probe {
+            device: device.clone(), queue: queue.clone(), pipeline, bindings, parameters, pixels,
+            buffer: buffer("mmltk bounded pixel evidence", 25 * 256,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ),
+            requests: Mutex::new(Requests::default()),
+        }) })
     }
 
-    pub(super) fn sample(&self, texture: &wgpu::Texture, surface: Surface) {
+    pub(super) fn sample(&self, surface: Surface, read: Arc<SampleRead>) {
         let Some(frame) = surface.frame else {
             return;
         };
@@ -105,8 +135,8 @@ impl PixelTrace {
             return;
         }
         let request = Request {
-            texture: texture.clone(),
             surface,
+            read,
         };
         let request = self
             .state
@@ -133,7 +163,7 @@ impl Drop for PixelTrace {
 impl Probe {
     fn start(self: Arc<Self>, request: Request) {
         let surface = request.surface;
-        let frame = surface.frame.expect("validated owned probe frame");
+        let frame = surface.frame.expect("validated sample probe frame");
         let coordinate = |index: usize, size: u32| {
             [
                 0,
@@ -154,26 +184,25 @@ impl Probe {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("mmltk receiver pixel evidence"),
             });
-        for (index, &(x, y)) in coordinates.iter().enumerate() {
-            let mut source = request.texture.as_image_copy();
-            source.origin = wgpu::Origin3d { x, y, z: 0 };
-            encoder.copy_texture_to_buffer(
-                source,
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &self.buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: index as u64 * 256,
-                        bytes_per_row: Some(256),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 1,
-                    height: 1,
-                    depth_or_array_layers: 1,
-                },
-            );
+        let mut parameters = [0u8; 16];
+        for (index, value) in [frame.content_width, frame.content_height, frame.slot, 0].into_iter().enumerate() {
+            parameters[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
+        self.queue.write_buffer(&self.parameters, 0, &parameters);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("mmltk sample read evidence"), timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bindings, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        // The external image remains a shader resource, including on hidden
+        // pages. A texture-to-buffer copy would leave it in COPY_SRC layout.
+        encoder.copy_buffer_to_buffer(&self.pixels, 0, &self.buffer, 0, 25 * 256);
+        // The read's physical custody follows the copy's encoder separately
+        // from optional mapping success, request coalescing and owner disposal.
+        encoder.on_submitted_work_done(move || drop(request.read));
         self.queue.submit([encoder.finish()]);
         let buffer = self.buffer.clone();
         let callback_buffer = buffer.clone();
@@ -195,7 +224,7 @@ impl Probe {
                 }
                 callback_buffer.unmap();
             }
-            // Device-loss/error completion clears the one pending owned handle;
+            // Device-loss/error completion clears the one pending sample hold;
             // successful unmapping immediately admits the newest request.
             let next = self.requests.lock().unwrap_or_else(|error| error.into_inner()).finish(result.is_ok());
             if let Some(next) = next { self.start(next); }
@@ -234,3 +263,23 @@ mod tests {
         assert_eq!(requests.enqueue(3), None);
     }
 }
+
+const PROBE: &str = r#"
+@group(0) @binding(0) var sample: texture_2d_array<f32>;
+@group(0) @binding(1) var<uniform> parameters: vec4<u32>;
+@group(0) @binding(2) var<storage, read_write> pixels: array<u32>;
+fn coordinate(index: u32, size: u32) -> u32 {
+    switch index {
+        case 0u: { return 0u; }
+        case 1u: { return min(191u, size - 1u); }
+        case 2u: { return min(383u, size - 1u); }
+        case 3u: { return (size - 1u) / 2u; }
+        default: { return size - 1u; }
+    }
+}
+@compute @workgroup_size(25)
+fn probe(@builtin(local_invocation_index) index: u32) {
+    let xy = vec2<i32>(i32(coordinate(index % 5u, parameters.x)), i32(coordinate(index / 5u, parameters.y)));
+    pixels[index * 64u] = pack4x8unorm(textureLoad(sample, xy, i32(parameters.z), 0));
+}
+"#;

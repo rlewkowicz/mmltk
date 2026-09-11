@@ -194,22 +194,16 @@ impl Controller {
                 }
             }
             Message::Surface(crate::presentation_surface::Notification::Copied(frame)) => {
-                // The temporary capture owns its own stronger completion. Keep
-                // native copy completion distinct from that captured image.
-                crate::presentation_surface::trace_frame("native_copy_completed", frame);
-                update.redraw = true;
-            }
-            Message::Surface(crate::presentation_surface::Notification::Completed(frame)) => {
-                crate::presentation_surface::complete_capture(frame);
+                crate::presentation_surface::complete_sample(frame);
                 if self.pending.and_then(|surface| surface.frame) == Some(frame) {
                     self.pending_rejected = false;
                 }
                 update.redraw = true;
             }
-            Message::Surface(crate::presentation_surface::Notification::CaptureRejected(frame)) => {
+            Message::Surface(crate::presentation_surface::Notification::SampleRejected(frame)) => {
                 if self.pending.and_then(|surface| surface.frame) == Some(frame) {
                     crate::presentation_surface::trace_surface(
-                        "capture_rejection_received",
+                        "sample_rejection_received",
                         self.pending.expect("matching rejected publication"),
                     );
                     self.pending_rejected = true;
@@ -544,10 +538,10 @@ impl Controller {
             && previous != frame
         {
             // Batched UI updates may replace a frame before its first draw.
-            // Capture owns an in-flight borrow until GPU completion; otherwise
+            // Actual encoded readers own independent sample holds; otherwise
             // this returns an unused sample or deduplicates its settled release.
             crate::presentation_surface::retire_publication(previous);
-            crate::presentation_surface::discard_capture(previous);
+            crate::presentation_surface::discard_sample(previous);
         }
         if !crate::presentation_surface::accept_publication(frame) {
             return false;
@@ -574,7 +568,7 @@ impl Controller {
         self.pending_rejected = false;
         if let Some(frame) = self.pending.take().and_then(|surface| surface.frame) {
             crate::presentation_surface::retire_publication(frame);
-            crate::presentation_surface::discard_capture(frame);
+            crate::presentation_surface::discard_sample(frame);
         }
     }
 
@@ -591,7 +585,7 @@ impl Controller {
         recovery: bool,
     ) -> Result<(), UiError> {
         crate::presentation_surface::authorize_draw(None);
-        // Transport loss clears domain facts, not receiver-owned image custody.
+        // Transport loss clears domain facts, not retained sample custody.
         let Some(snapshot) = model.presentation.as_ref() else {
             return Ok(());
         };
@@ -669,9 +663,9 @@ impl Controller {
                         && (surface.high != pending.high || surface.low != pending.low)
                 })
         {
-            // An uncapturable incumbent must not hide an admitted replacement.
+            // An ineligible incumbent must not hide an admitted replacement.
             // A publication from an abandoned source selection will never receive
-            // matching completion metadata. Active copies keep CaptureBorrow.
+            // matching completion metadata. Actual encoded reads keep their independent leases.
             if let Some(pending) = self.pending {
                 crate::presentation_surface::trace_surface(
                     if selection_superseded {
@@ -1368,7 +1362,7 @@ mod tests {
                     app.present_native_frame(frame);
                     if rejected {
                         drop(app.on_presentation(Message::Surface(
-                            crate::presentation_surface::Notification::CaptureRejected(frame),
+                            crate::presentation_surface::Notification::SampleRejected(frame),
                         )));
                         assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
                         assert!(test_releases().is_empty());
@@ -1384,7 +1378,7 @@ mod tests {
                     app.present_native_frame(frame);
                     // A stale outcome cannot retire the current receipt.
                     drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::CaptureRejected(FrameReady {
+                        crate::presentation_surface::Notification::SampleRejected(FrameReady {
                             slot: 1,
                             ..frame
                         }),
@@ -1392,7 +1386,7 @@ mod tests {
                     assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
                     if rejected {
                         drop(app.on_presentation(Message::Surface(
-                            crate::presentation_surface::Notification::CaptureRejected(frame),
+                            crate::presentation_surface::Notification::SampleRejected(frame),
                         )));
                     }
                 }
@@ -1414,14 +1408,14 @@ mod tests {
                     );
                     assert_ne!(capture_surface.low, app.presentation.surface.unwrap().low);
                     assert!(test_releases().is_empty());
-                    let capture = crate::presentation_surface::test_capture_borrow(frame);
+                    let capture = crate::presentation_surface::test_sample_read(frame);
                     app.sync_surface();
                     assert_eq!(app.presentation.surface(), Some(capture_surface));
                     assert!(test_releases().is_empty());
                     drop(capture);
                 }
                 drop(app.on_presentation(Message::Surface(
-                    crate::presentation_surface::Notification::Completed(frame),
+                    crate::presentation_surface::Notification::Copied(frame),
                 )));
                 assert_eq!(test_releases(), vec![frame]);
                 app.presentation.discard();
@@ -1455,7 +1449,7 @@ mod tests {
                 app.reconcile_surface_frame();
                 assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
                 assert!(test_releases().is_empty());
-                let capture = crate::presentation_surface::test_capture_borrow(pending);
+                let capture = crate::presentation_surface::test_sample_read(pending);
                 let snapshot = app.model.presentation.as_mut().unwrap();
                 snapshot.capability.surfacelow += 1;
                 snapshot.capability.generation += 1;
@@ -1483,13 +1477,13 @@ mod tests {
             for complete_before_disconnect in [false, true] {
                 let (mut app, frame) = viewer_app();
                 app.present_native_frame(frame);
-                let mut capture = Some(crate::presentation_surface::test_capture_borrow(frame));
+                let mut capture = Some(crate::presentation_surface::test_sample_read(frame));
                 let control = app.model.presentation.clone();
                 let explore = app.model.explore.snapshot.clone();
                 if complete_before_disconnect {
                     drop(capture.take());
                     drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::Completed(frame),
+                        crate::presentation_surface::Notification::Copied(frame),
                     )));
                 }
                 app.retire_peer(UiError::transport("capture continuity"));
@@ -1531,7 +1525,7 @@ mod tests {
                 );
                 drop(capture);
                 drop(app.on_presentation(Message::Surface(
-                    crate::presentation_surface::Notification::Completed(frame),
+                    crate::presentation_surface::Notification::Copied(frame),
                 )));
                 assert_eq!(test_releases(), vec![frame]);
                 app.presentation.discard();
@@ -1572,12 +1566,12 @@ mod tests {
     }
 
     #[test]
-    fn domain_control_publication_and_capture_reconcile_in_every_causal_order() {
+    fn domain_control_publication_and_copy_reconcile_in_every_notification_order() {
         for [
             domain_position,
             control_position,
             physical_position,
-            capture_position,
+            copy_position,
         ] in crate::view_model::test_support::presentation_arrival_orders()
         {
             let (mut app, frame) = viewer_app();
@@ -1586,9 +1580,9 @@ mod tests {
                 presentation_revision: 6,
                 ..frame
             };
-            // Before-publication completion is an inert negative, never a successful schedule.
+            // Before-publication copy notification retains its fact without inventing a display lease.
             drop(app.on_presentation(Message::Surface(
-                crate::presentation_surface::Notification::Completed(next),
+                crate::presentation_surface::Notification::Copied(next),
             )));
             assert!(app.presentation.surface().unwrap().frame.is_none());
             assert!(test_releases().is_empty());
@@ -1607,9 +1601,9 @@ mod tests {
                 } else if position == physical_position {
                     app.present_native_frame(next);
                 } else {
-                    assert_eq!(position, capture_position);
+                    assert_eq!(position, copy_position);
                     drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::Completed(next),
+                        crate::presentation_surface::Notification::Copied(next),
                     )));
                 }
                 assert_eq!(

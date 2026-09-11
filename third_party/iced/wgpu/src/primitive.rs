@@ -5,6 +5,54 @@ use crate::graphics::futures::{MaybeSend, MaybeSync};
 use rustc_hash::FxHashMap;
 use std::any::{Any, TypeId};
 use std::fmt::Debug;
+use std::sync::{Arc, Mutex};
+
+/// Read custody belonging to one actual command encoder. Only add a resource
+/// after encoding its use. The deferred wgpu action retains the batch through
+/// submission settlement, or drops it when an unsubmitted encoder is abandoned.
+#[derive(Default)]
+pub struct Resources {
+    holds: Vec<Arc<dyn Any + Send + Sync>>,
+    pool: ResourcePool,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ResourcePool(Arc<Mutex<Vec<Arc<dyn Any + Send + Sync>>>>);
+
+impl ResourcePool {
+    pub(crate) fn take(&self) -> Resources {
+        Resources {
+            holds: std::mem::take(&mut *self.0.lock().expect("resource staging")),
+            pool: self.clone(),
+        }
+    }
+}
+
+impl Resources {
+    /// Retain a safely shareable resource token, without moving UI state.
+    pub fn retain<T: Any + Send + Sync>(&mut self, resource: Arc<T>) {
+        self.holds.push(resource);
+    }
+
+    pub(crate) fn attach(self, encoder: &wgpu::CommandEncoder) {
+        if !self.holds.is_empty() {
+            // Callback arrival also includes backend terminal failure. It is
+            // resource settlement, never a successful-render notification.
+            encoder.on_submitted_work_done(move || drop(self));
+        }
+    }
+}
+
+impl Drop for Resources {
+    fn drop(&mut self) {
+        self.holds.clear();
+        let mut spare = self.pool.0.lock().expect("resource staging");
+        if self.holds.capacity() > spare.capacity() {
+            std::mem::swap(&mut self.holds, &mut *spare);
+        }
+    }
+}
+
 
 pub type Batch = Vec<Instance>;
 
@@ -20,7 +68,7 @@ pub trait Primitive: Debug + MaybeSend + MaybeSync + 'static {
         viewport: &Viewport,
     );
 
-                                                        fn draw(&self, _pipeline: &Self::Pipeline, _render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+                                                        fn draw(&self, _pipeline: &Self::Pipeline, _render_pass: &mut wgpu::RenderPass<'_>, _resources: &mut Resources) -> bool {
         false
     }
 
@@ -30,6 +78,7 @@ pub trait Primitive: Debug + MaybeSend + MaybeSync + 'static {
         _encoder: &mut wgpu::CommandEncoder,
         _target: &wgpu::TextureView,
         _clip_bounds: &Rectangle<u32>,
+        _resources: &mut Resources,
     ) {
     }
 }
@@ -53,7 +102,7 @@ pub(crate) trait Stored: Debug + MaybeSend + MaybeSync + 'static {
         viewport: &Viewport,
     );
 
-    fn draw(&self, storage: &Storage, render_pass: &mut wgpu::RenderPass<'_>) -> bool;
+    fn draw(&self, storage: &Storage, render_pass: &mut wgpu::RenderPass<'_>, resources: &mut Resources) -> bool;
 
     fn render(
         &self,
@@ -61,6 +110,7 @@ pub(crate) trait Stored: Debug + MaybeSend + MaybeSync + 'static {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
+        resources: &mut Resources,
     );
 }
 
@@ -93,14 +143,14 @@ impl<P: Primitive> Stored for BlackBox<P> {
             .prepare(renderer, device, queue, bounds, viewport);
     }
 
-    fn draw(&self, storage: &Storage, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+    fn draw(&self, storage: &Storage, render_pass: &mut wgpu::RenderPass<'_>, resources: &mut Resources) -> bool {
         let renderer = storage
             .get::<P>()
             .expect("renderer should be initialized")
             .downcast_ref::<P::Pipeline>()
             .expect("renderer should have the proper type");
 
-        self.primitive.draw(renderer, render_pass)
+        self.primitive.draw(renderer, render_pass, resources)
     }
 
     fn render(
@@ -109,6 +159,7 @@ impl<P: Primitive> Stored for BlackBox<P> {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
+        resources: &mut Resources,
     ) {
         let renderer = storage
             .get::<P>()
@@ -117,7 +168,7 @@ impl<P: Primitive> Stored for BlackBox<P> {
             .expect("renderer should have the proper type");
 
         self.primitive
-            .render(renderer, encoder, target, clip_bounds);
+            .render(renderer, encoder, target, clip_bounds, resources);
     }
 }
 

@@ -65,6 +65,7 @@ pub struct Renderer {
     image_cache: std::cell::RefCell<image::Cache>,
 
     staging_belt: wgpu::util::StagingBelt,
+    primitive_resources: primitive::ResourcePool,
 }
 
 impl Renderer {
@@ -90,6 +91,7 @@ impl Renderer {
                 buffer::MAX_WRITE_SIZE as u64,
             ),
 
+            primitive_resources: primitive::ResourcePool::default(),
             engine,
         }
     }
@@ -108,7 +110,9 @@ impl Renderer {
                 });
 
         self.prepare(&mut encoder, viewport);
-        self.render(&mut encoder, target, clear_color, viewport);
+        let mut resources = self.primitive_resources.take();
+        self.render(&mut encoder, target, clear_color, viewport, &mut resources);
+        resources.attach(&encoder);
 
         self.quad.trim();
         self.triangle.trim();
@@ -364,6 +368,7 @@ impl Renderer {
         frame: &wgpu::TextureView,
         clear_color: Option<Color>,
         viewport: &Viewport,
+        resources: &mut primitive::Resources,
     ) {
         use std::mem::ManuallyDrop;
 
@@ -506,7 +511,7 @@ impl Renderer {
 
                         let drawn = instance
                             .primitive
-                            .draw(&primitive_storage, &mut render_pass);
+                            .draw(&primitive_storage, &mut render_pass, resources);
 
                         if !drawn {
                             need_render.push((instance, clip_bounds));
@@ -536,7 +541,7 @@ impl Renderer {
                     for (instance, clip_bounds) in need_render {
                         instance
                             .primitive
-                            .render(&primitive_storage, encoder, frame, &clip_bounds);
+                            .render(&primitive_storage, encoder, frame, &clip_bounds, resources);
                     }
 
                     render_pass =

@@ -106,22 +106,18 @@ pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_s
     (model, frame)
 }
 
-/// All twelve arrival orders in which publication precedes capture completion.
-/// The positions are domain metadata, control metadata, publication, and capture.
+/// All DOM-notification/model arrival orders. Physical GPU copy ordering is
+/// independent of when either notification is consumed by the presentation model.
 pub(crate) fn presentation_arrival_orders() -> impl Iterator<Item = [usize; 4]> {
     (0..4).flat_map(|domain| {
-        (0..4)
-            .filter(move |control| *control != domain)
-            .map(move |control| {
-                let mut remaining =
-                    (0..4).filter(|position| *position != domain && *position != control);
-                [
-                    domain,
-                    control,
-                    remaining.next().expect("publication position"),
-                    remaining.next().expect("capture position"),
-                ]
-            })
+        (0..4).filter(move |control| *control != domain).flat_map(move |control| {
+            (0..4).filter(move |publication| *publication != domain && *publication != control)
+                .map(move |publication| {
+                    let copied = (0..4).find(|position| *position != domain && *position != control && *position != publication)
+                        .expect("remaining copy notification position");
+                    [domain, control, publication, copied]
+                })
+        })
     })
 }
 
