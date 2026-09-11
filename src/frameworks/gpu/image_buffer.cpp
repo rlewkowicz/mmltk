@@ -18,8 +18,7 @@
 #include "src/common/system/execution_policy.h"
 
 namespace mmltk::frameworks::gpu {
-namespace {
-[[nodiscard]] std::uint64_t next_allocation_identity() {
+[[nodiscard]] std::uint64_t next_image_allocation_identity() {
     static std::atomic<std::uint64_t> next{1U};
     auto value = next.load(std::memory_order_relaxed);
     do {
@@ -28,6 +27,7 @@ namespace {
     } while (!next.compare_exchange_weak(value, value + 1U, std::memory_order_relaxed));
     return value;
 }
+namespace {
 class TransferTrace final {
    public:
     TransferTrace() {
@@ -319,6 +319,25 @@ DeviceContext::~DeviceContext() = default;
 int DeviceContext::device() const noexcept { return state_->device; }
 const DeviceExecution* DeviceContext::execution() const noexcept { return state_->execution ? &*state_->execution : nullptr; }
 void DeviceContext::Bind() const { state_->backend->BindContext(state_->context); }
+std::uintptr_t DeviceContext::CreateEvent() const {
+    const auto event = state_->backend->CreateEvent(state_->context);
+    if (event == 0U) throw std::runtime_error("image completion event creation returned no event");
+    return event;
+}
+DeviceContext DeviceContext::OnDevice(int device, std::optional<DeviceExecution> execution) const {
+    if (execution && execution->device != device) throw std::invalid_argument("display execution device mismatch");
+    if (device == this->device()) return *this;
+    return DeviceContext(device, state_->backend, DeviceContextMode::PrimaryInterop, -1, std::move(execution));
+}
+void DeviceContext::DestroyEvent(std::uintptr_t event) const noexcept {
+    if (event != 0U) state_->backend->DestroyEvent(state_->context, event);
+}
+void ImageStream::Record(std::uintptr_t event) {
+    context_.state_->backend->RecordEvent(context_.state_->context, stream_, event);
+}
+void ImageStream::AwaitEvent(std::uintptr_t event) {
+    context_.state_->backend->WaitEvent(context_.state_->context, stream_, event);
+}
 
 ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
     stream_ = context_.state_->backend->CreateStream(context_.state_->context);
@@ -366,7 +385,7 @@ struct ImageBuffer::State final {
     }
     ~State() {
         std::unique_lock lock(access);
-        if (plane.data != 0U) context.state_->backend->FreePlane(context.state_->context, plane.data);
+        if (plane.data != 0U && !external_storage) context.state_->backend->FreePlane(context.state_->context, plane.data);
         staging_owner.reset();
         context.state_->backend->DestroyEvent(context.state_->context, completion);
     }
@@ -386,11 +405,13 @@ struct ImageBuffer::State final {
         }
         const std::uint32_t next_width = std::max(capacity_width, width);
         const std::uint32_t next_height = std::max(capacity_height, height);
-        const auto identity = next_allocation_identity();
+        const auto identity = next_image_allocation_identity();
         ImagePlaneView candidate = context.state_->backend->AllocatePlane(context.state_->context, kind, next_width, next_height);
         if (!candidate.valid()) throw std::runtime_error("image plane allocation returned an invalid plane");
         candidate.allocation = {identity, next_width, next_height, allocation_owner};
-        if (plane.data != 0U) context.state_->backend->FreePlane(context.state_->context, plane.data);
+        if (plane.data != 0U && !external_storage) context.state_->backend->FreePlane(context.state_->context, plane.data);
+        external_storage.reset();
+        external_bytes = 0U;
         plane = candidate;
         capacity_width = next_width;
         capacity_height = next_height;
@@ -409,10 +430,12 @@ struct ImageBuffer::State final {
         staging_bytes = bytes;
     }
     DeviceContext context;
-    const std::uint64_t allocation_owner = next_allocation_identity();
+    const std::uint64_t allocation_owner = next_image_allocation_identity();
     mutable std::shared_mutex access;
     std::atomic_bool unavailable{false};
     ImagePlaneView plane{};
+    std::shared_ptr<void> external_storage;
+    std::size_t external_bytes = 0U;
     std::shared_ptr<void> staging_owner;
     void* staging = nullptr;
     std::size_t staging_bytes = 0U;
@@ -626,6 +649,8 @@ struct ImageProductBuffer::State final {
         return locks;
     }
     DeviceContext context_;
+    std::shared_ptr<ImageWorkspace> workspace_;
+    ImageWorkspaceFinalize finalize_;
     ImageProductLayout layout_;
     std::array<std::unique_ptr<ImageBuffer>, 2U> planes_{};
     std::size_t plane_count_;
@@ -768,6 +793,29 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
     std::unique_lock transaction(state_->transaction_);
     static_cast<void>(state_->BeginWrite());
     const auto plane_locks = state_->LockPlanes();
+    if (state_->workspace_ && state_->workspace_->admitted() && state_->plane_count_ == 1U &&
+        state_->workspace_->layout().device == state_->context_.device() &&
+        width <= state_->workspace_->layout().width && height <= state_->workspace_->layout().height) {
+        auto& raw = *state_->planes_[0U]->state_;
+        if (raw.external_storage != state_->workspace_) {
+            auto destination = state_->workspace_->plane(width, height);
+            // A late alias cutover preserves the old authoritative plane before
+            // releasing it. Already borrowed raw pointers cannot reach this lock.
+            if (raw.plane.valid() && !initialize && raw.plane.descriptor.width == width && raw.plane.descriptor.height == height) {
+                state_->context_.state_->backend->CopySameDevice(state_->context_.state_->context, stream.native_handle(),
+                    destination, state_->context_.state_->context, raw.plane);
+                stream.Synchronize();
+            }
+            if (raw.plane.data != 0U && !raw.external_storage)
+                state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.plane.data);
+            raw.external_storage = state_->workspace_;
+            raw.external_bytes = state_->workspace_->allocation_bytes();
+            destination.allocation.owner = raw.allocation_owner;
+            raw.plane = destination;
+            raw.capacity_width = state_->workspace_->layout().width;
+            raw.capacity_height = state_->workspace_->layout().height;
+        }
+    }
     state_->planes_[0U]->state_->EnsurePlane(ImagePlaneKind::Clean, width, height);
     ImagePlaneView semantic;
     if (state_->plane_count_ == 2U) {
@@ -892,6 +940,48 @@ BorrowedImageProductReadView ImageProductBuffer::Borrow() const {
     if (!result.valid()) return {};
     return result;
 }
+void ImageProductBuffer::AdoptExternalPlane(std::shared_ptr<void> custody, std::size_t bytes, ImagePlaneView plane) {
+    std::unique_lock transaction(state_->transaction_);
+    state_->AwaitReceiverReads();
+    const auto locks = state_->LockPlanes();
+    auto& raw = *state_->planes_[0U]->state_;
+    if (state_->plane_count_ != 1U || raw.plane.valid() || !custody || !plane.valid())
+        throw std::invalid_argument("external plane adoption requires empty clean storage");
+    plane.allocation.owner = raw.allocation_owner;
+    raw.external_storage = std::move(custody);
+    raw.external_bytes = bytes;
+    raw.plane = plane;
+    raw.capacity_width = plane.allocation.width;
+    raw.capacity_height = plane.allocation.height;
+}
+void ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> workspace, ImageWorkspaceFinalize finalize) {
+    if (!workspace || !workspace->admitted() || !finalize) throw std::invalid_argument("workspace configuration is incomplete");
+    std::unique_lock transaction(state_->transaction_);
+    state_->AwaitReceiverReads();
+    workspace->Attach(state_->planes_[0U]->state_->allocation_owner);
+    // Retained raw plane custody is unchanged until the next exclusive write.
+    state_->workspace_ = std::move(workspace);
+    state_->finalize_ = std::move(finalize);
+}
+void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
+    {
+        std::shared_lock transaction(state_->transaction_);
+        if (!state_->workspace_ || state_->workspace_->revision() == state_->generation_) return;
+    }
+    auto source = Borrow();
+    if (!source.valid() || !state_->workspace_ || state_->workspace_->revision() == source.plane(0U).revision()) return;
+    const auto extent = source.plane(0U).plane().descriptor;
+    if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
+    state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
+}
+BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
+    auto source = Borrow();
+    if (!source.valid()) return {};
+    return BorrowedImageWorkspace(std::move(source), state_->workspace_);
+}
+ImageStreamSettlement ImageProductBuffer::SettleWorkspace() noexcept {
+    return state_->workspace_ ? state_->workspace_->Settle() : ImageStreamSettlement{.completion_reached = true};
+}
 ImageProductLayout ImageProductBuffer::layout() const noexcept { return state_->layout_; }
 std::uint32_t ImageProductBuffer::capacity_width() const noexcept { return state_->planes_[0U]->capacity_width(); }
 std::uint32_t ImageProductBuffer::capacity_height() const noexcept { return state_->planes_[0U]->capacity_height(); }
@@ -906,8 +996,15 @@ ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
         const auto& plane = *state_->planes_[index]->state_;
         std::shared_lock lock(plane.access);
-        if (plane.plane.data != 0U) result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
+        if (plane.external_storage) {
+            if (plane.external_storage != state_->workspace_) result.device_bytes += plane.external_bytes;
+        } else if (plane.plane.data != 0U) result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
         result.pinned_bytes += plane.staging_bytes;
+    }
+    if (state_->workspace_) {
+        const auto workspace = state_->workspace_->StorageFootprint();
+        result.device_bytes += workspace.device_bytes;
+        result.pinned_bytes += workspace.pinned_bytes;
     }
     return result;
 }

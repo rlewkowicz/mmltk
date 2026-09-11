@@ -1,4 +1,5 @@
 module;
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -186,6 +187,29 @@ std::int32_t composite_rgba(const CompositeRgbaWork& work) noexcept {
         return cudaErrorInvalidValue;
     }
     return detail::launch_composite_rgba({as_launch_target(work.base_rgba), as_launch_surface(work.overlay_rgba), as_stream(work.stream)});
+}
+
+std::int32_t finalize_rgba(const FinalizeRgbaWork& work) noexcept {
+    if (!work.clean.valid(4U) || !work.destination.valid(4U) || !work.stream ||
+        !same_extent(work.clean.width, work.clean.height, work.destination.width, work.destination.height) ||
+        (work.semantic.pixels && (!work.semantic.valid(4U) ||
+         !same_extent(work.clean.width, work.clean.height, work.semantic.width, work.semantic.height))))
+        return cudaErrorInvalidValue;
+    const auto submit = [&](IntRect region) {
+        region.x1 = std::clamp(region.x1, 0, work.clean.width);
+        region.y1 = std::clamp(region.y1, 0, work.clean.height);
+        region.x2 = std::clamp(region.x2, 0, work.clean.width);
+        region.y2 = std::clamp(region.y2, 0, work.clean.height);
+        if (region.x2 <= region.x1 || region.y2 <= region.y1) return cudaSuccess;
+        return detail::launch_finalize_rgba({as_launch_surface(work.clean), as_launch_surface(work.semantic),
+            as_launch_surface(work.destination), region, as_stream(work.stream)});
+    };
+    if (work.full_image) return submit({0, 0, work.clean.width, work.clean.height});
+    for (const auto region : work.regions) {
+        const auto status = submit(region);
+        if (status != cudaSuccess) return status;
+    }
+    return cudaSuccess;
 }
 
 std::int32_t copy_bgr_to_rgba(const CopyBgrToRgbaWork& work) noexcept {

@@ -10,6 +10,7 @@
 namespace mmltk::frameworks::gpu {
 class SystemImageRuntime;
 class ImageProductRevisionSequence;
+struct SystemImageRuntimeConfig;
 }  // namespace mmltk::frameworks::gpu
 
 namespace mmltk::controller {
@@ -26,6 +27,8 @@ struct VisualDeviceSettings final {
 
 using VisualRuntimeFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>(
     std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence>)>;
+
+void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImageRuntimeConfig&);
 
 [[nodiscard]] mmltk::frameworks::gpu::DeviceExecution resolve_visual_device_execution(const VisualDeviceSettings&);
 

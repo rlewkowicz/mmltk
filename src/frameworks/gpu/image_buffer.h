@@ -14,13 +14,9 @@
 #include "src/frameworks/gpu/image_geometry.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image_workspace.h"
 
 namespace mmltk::frameworks::gpu {
-
-struct ImageStorageFootprint final {
-    std::size_t device_bytes = 0U;
-    std::size_t pinned_bytes = 0U;
-};
 
 class ImageCopyBackend {
    public:
@@ -53,10 +49,7 @@ class ImageCopyBackend {
                                   std::size_t source_pitch, const ImagePlaneView& destination) = 0;
     virtual void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) = 0;
     virtual void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) = 0;
-    struct StreamSettlement final {
-        bool completion_reached = false;
-        std::exception_ptr failure{};
-    };
+    using StreamSettlement = ImageStreamSettlement;
     [[nodiscard]] virtual StreamSettlement SettleStream(std::uintptr_t context, std::uintptr_t stream) noexcept = 0;
 };
 
@@ -74,6 +67,9 @@ class DeviceContext final {
     [[nodiscard]] int device() const noexcept;
     [[nodiscard]] const DeviceExecution* execution() const noexcept;
     void Bind() const;
+    [[nodiscard]] DeviceContext OnDevice(int device, std::optional<DeviceExecution> execution = {}) const;
+    [[nodiscard]] std::uintptr_t CreateEvent() const;
+    void DestroyEvent(std::uintptr_t) const noexcept;
 
    private:
     struct State;
@@ -98,7 +94,11 @@ class ImageStream final {
     // Enqueue the producer dependency; the caller retains the view until its
     // receiver reads settle, including partial submission and exceptions.
     void Await(const BorrowedImageProductReadView&);
+    void Await(const BorrowedImageWorkspace&);
     [[nodiscard]] ImageCopyBackend::StreamSettlement Settle() noexcept;
+    // Completion event belongs to this stream's retained device context.
+    void Record(std::uintptr_t event);
+    void AwaitEvent(std::uintptr_t event);
     [[noreturn]] void RethrowAfterSettlement(std::exception_ptr);
     [[nodiscard]] std::uintptr_t native_handle() const noexcept { return stream_; }
 
@@ -227,6 +227,10 @@ class ImageProductBuffer final {
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {},
                                                          bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
+    void ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    void FinalizeWorkspace(ImageWorkspaceCoverage = {});
+    [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
+    [[nodiscard]] ImageStreamSettlement SettleWorkspace() noexcept;
     [[nodiscard]] ImageProductLayout layout() const noexcept;
     [[nodiscard]] std::uint32_t capacity_width() const noexcept;
     [[nodiscard]] std::uint32_t capacity_height() const noexcept;
@@ -237,6 +241,8 @@ class ImageProductBuffer final {
     [[nodiscard]] std::uint64_t revision() const noexcept;
 
    private:
+    friend class ImageWorkspace;
+    void AdoptExternalPlane(std::shared_ptr<void> custody, std::size_t bytes, ImagePlaneView);
     friend class ImageProductPool;
     friend class BorrowedImageProductReadView;
     friend class ImageStream;

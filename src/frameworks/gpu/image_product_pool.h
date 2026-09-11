@@ -47,6 +47,7 @@ class ImageProductPool final {
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] std::uint64_t revision() const noexcept;
         [[nodiscard]] BorrowedImageProductReadView Borrow() const;
+        [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
 
        private:
         Product(std::shared_ptr<Slot>, std::uint64_t) noexcept;
@@ -97,6 +98,12 @@ class ImageProductPool final {
     void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
+    void ConfigureWorkspace(Candidate&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    // Late admission fills an unpublished display allocation from retained raw
+    // pixels; the completed product revision and raw plane addresses stay intact.
+    void PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    void FinalizeWorkspace(Candidate&, ImageWorkspaceCoverage);
+    [[nodiscard]] ImageStreamSettlement SettleWorkspaces() noexcept;
     void Select(const Product&);
     [[nodiscard]] Product Selected() const;
     [[nodiscard]] Availability ObserveAvailability() const noexcept;

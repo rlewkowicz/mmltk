@@ -8,6 +8,9 @@ set -euo pipefail
 : "${MMLTK_TRACED_COMMAND:?MMLTK_TRACED_COMMAND is required}"
 : "${MMLTK_JOBS:?MMLTK_JOBS is required}"
 
+: "${MMLTK_WORKSPACE_GRAPHICS_ABI:?MMLTK_WORKSPACE_GRAPHICS_ABI is required}"
+export MMLTK_WORKSPACE_GRAPHICS_ABI
+
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${MMLTK_JOBS}"
 
 runtime_root="${MMLTK_FIREFOX_CACHE_ROOT}/obj-minimal-opt/dist/firefox"
@@ -27,8 +30,18 @@ runtime_complete() {
     done
 }
 
+next_built_input="${MMLTK_FIREFOX_BUILT_INPUT}.next.$$"
+cleanup_next_built_input() {
+    rm -f -- "${next_built_input}"
+}
+trap cleanup_next_built_input EXIT
+{
+    cat -- "${MMLTK_FIREFOX_BUILD_INPUT}"
+    sha256sum -- "${MMLTK_WORKSPACE_GRAPHICS_ABI}" | cut -d' ' -f1
+} > "${next_built_input}"
+
 if [[ -f "${MMLTK_FIREFOX_BUILT_INPUT}" ]] \
-    && cmp -s -- "${MMLTK_FIREFOX_BUILD_INPUT}" \
+    && cmp -s -- "${next_built_input}" \
         "${MMLTK_FIREFOX_BUILT_INPUT}" \
     && runtime_complete; then
     exit 0
@@ -40,11 +53,5 @@ fi
         --priority normal
 "${MMLTK_FIREFOX_MACH}" mmltk-stage-runtime
 
-next_built_input="${MMLTK_FIREFOX_BUILT_INPUT}.next.$$"
-cleanup_next_built_input() {
-    rm -f -- "${next_built_input}"
-}
-trap cleanup_next_built_input EXIT
-cp -- "${MMLTK_FIREFOX_BUILD_INPUT}" "${next_built_input}"
 mv -f -- "${next_built_input}" "${MMLTK_FIREFOX_BUILT_INPUT}"
 trap - EXIT

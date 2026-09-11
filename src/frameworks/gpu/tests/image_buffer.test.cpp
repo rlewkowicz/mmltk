@@ -3,6 +3,7 @@
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/exported_image_buffer.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
+#include "src/acceptance/tests/cuda_test_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -1114,6 +1115,7 @@ TEST_CASE("failed exported image release remains finite and inert") {
     ExportedImageBufferTestAccess::Adopt(buffer);
 
     CHECK(ExportedImageBufferTestAccess::Release(buffer) == cudaErrorUnknown);
+    CHECK(buffer.release_failure() == cudaErrorUnknown);
     CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
     CHECK(ExportedImageBufferTestAccess::address_frees == 0U);
     CHECK(ExportedImageBufferTestAccess::allocation_releases == 1U);
@@ -1421,6 +1423,191 @@ TEST_CASE("final borrowed view retires on the owning runtime path") {
     REQUIRE(retirement.wait_for(1s) == std::future_status::ready);
     retirement.get();
     CHECK(backend->contexts_destroyed == 1U);
+}
+
+TEST_CASE("Display context rebinding shares same-device custody and cleans partial event construction", "[gpu][workspace]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    {
+        DeviceContext producer(0, backend);
+        auto same = producer.OnDevice(0);
+        CHECK(backend->contexts_created == 1U);
+        auto display = producer.OnDevice(1);
+        CHECK(backend->contexts_created == 2U);
+        backend->FailAfter(FakeImageBackend::FailurePoint::CreateEvent);
+        CHECK_THROWS(display.CreateEvent());
+        CHECK(backend->events_created == 0U);
+        const auto event = display.CreateEvent();
+        ImageStream stream(display);
+        stream.Record(event);
+        stream.AwaitEvent(event);
+        stream.Synchronize();
+        display.DestroyEvent(event);
+        CHECK(backend->events_destroyed == 1U);
+    }
+    CHECK(backend->contexts_destroyed == 2U);
+    CHECK(backend->streams_destroyed == 1U);
+}
+
+TEST_CASE("Workspace transfer routes preserve independent source and receiver pitch guards", "[gpu][workspace][copy]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->pitch_padding_bytes = 16U;
+    SystemImageRuntime source({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic});
+    source.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
+        for (const auto plane : {clean, semantic}) {
+            for (std::uint32_t row = 0U; row < plane.descriptor.height; ++row)
+                std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes,
+                            plane.descriptor.kind == ImagePlaneKind::Clean ? 29 : 78, plane.descriptor.row_bytes());
+        }
+    });
+    backend->pitch_padding_bytes = 32U;
+    for (const int device : {0, 1, 2}) {
+        backend->peer_access = device == 1;
+        SystemImageRuntime receiver({.device = device, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic});
+        receiver.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
+            for (const auto plane : {clean, semantic})
+                std::memset(reinterpret_cast<void*>(plane.data), 219, plane.descriptor.pitch_bytes * plane.descriptor.height);
+        });
+        const auto paths = receiver.CopyFrom(source.Borrow());
+        const auto expected = device == 0 ? ImageCopyPath::SameDevice : device == 1 ? ImageCopyPath::Peer : ImageCopyPath::PinnedStaging;
+        CHECK(paths[0U] == expected);
+        CHECK(paths[1U] == expected);
+        auto read = receiver.Borrow();
+        for (std::size_t index = 0U; index != read.plane_count(); ++index) {
+            const auto plane = read.plane(index).plane();
+            REQUIRE(plane.descriptor.pitch_bytes == 48U);
+            for (std::uint32_t row = 0U; row < plane.descriptor.height; ++row) {
+                const auto* bytes = reinterpret_cast<const std::uint8_t*>(plane.data) + row * plane.descriptor.pitch_bytes;
+                for (std::size_t byte = 0U; byte < plane.descriptor.pitch_bytes; ++byte)
+                    CHECK(bytes[byte] == (byte < plane.descriptor.row_bytes() ? (index == 0U ? 29U : 78U) : 219U));
+            }
+        }
+    }
+}
+
+TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds", "[gpu][workspace]") {
+    ImageWorkspaceLayout layout{.device_incarnation = 7U, .device_uuid = {1U}, .device = 0,
+        .width = 4U, .height = 3U, .pitch_bytes = 32U, .offset_bytes = 128U, .required_allocation_bytes = 256U,
+        .alignment_bytes = 64U};
+    REQUIRE(layout.valid());
+    auto invalid = layout;
+    invalid.offset_bytes = std::numeric_limits<std::size_t>::max() - 1U;
+    CHECK_FALSE(invalid.valid());
+    invalid = layout;
+    invalid.required_allocation_bytes = 128U;
+    CHECK_FALSE(invalid.valid());
+    invalid = layout;
+    invalid.pitch_bytes = 15U;
+    CHECK_FALSE(invalid.valid());
+    invalid = layout;
+    invalid.device_uuid = {};
+    CHECK_FALSE(invalid.valid());
+    invalid = layout;
+    invalid.alignment_bytes = 3U;
+    CHECK_FALSE(invalid.valid());
+    ExportedImageBuffer allocation;
+    std::string error;
+    CHECK_FALSE(allocation.allocate(0, 4U, 3U, 32U, 256U, &error, std::numeric_limits<std::size_t>::max()));
+    CHECK_FALSE(allocation.owns_resources());
+}
+
+TEST_CASE("Late workspace admission preserves raw storage then aliases the next clean publication", "[gpu][workspace][hardware]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cuInit(0U) == CUDA_SUCCESS);
+    int supported = 0;
+    REQUIRE(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, 0) == CUDA_SUCCESS);
+    if (!supported) SKIP("CUDA opaque-FD allocation is unavailable");
+    CUuuid uuid{};
+    REQUIRE(cuDeviceGetUuid(&uuid, 0) == CUDA_SUCCESS);
+    ImageWorkspaceLayout layout{.device_incarnation = 7U, .device = 0, .width = 4U, .height = 3U,
+        .pitch_bytes = 64U, .offset_bytes = 128U, .required_allocation_bytes = 4096U, .alignment_bytes = 256U};
+    std::memcpy(layout.device_uuid.data(), uuid.bytes, layout.device_uuid.size());
+    std::size_t finalizations = 0U;
+    bool fail_finalization = false;
+    SystemImageRuntimeConfig config{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop};
+    config.workspace_finalize = [&](ImagePlaneView clean, ImagePlaneView, ImagePlaneView destination,
+                                    ImageWorkspaceCoverage coverage, std::uintptr_t stream) {
+        CHECK(coverage.full_image);
+        ++finalizations;
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = clean.data;
+        copy.srcPitch = clean.descriptor.pitch_bytes;
+        copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.dstDevice = destination.data;
+        copy.dstPitch = destination.descriptor.pitch_bytes;
+        copy.WidthInBytes = clean.descriptor.row_bytes();
+        copy.Height = clean.descriptor.height;
+        REQUIRE(cuMemcpy2DAsync(&copy, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+        if (fail_finalization) throw std::runtime_error("injected finalization failure after submission");
+    };
+    SystemImageRuntime runtime(std::move(config));
+    const auto fill = [](ImagePlaneView clean, ImagePlaneView, std::uintptr_t stream) {
+        REQUIRE(cuMemsetD2D8Async(clean.data, clean.descriptor.pitch_bytes, 37U, clean.descriptor.row_bytes(),
+                                 clean.descriptor.height, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+    };
+    runtime.Publish(4U, 3U, fill);
+    auto completed = runtime.Completed();
+    const auto raw = runtime.Borrow().plane(0U).plane().data;
+    auto workspace = runtime.CreateWorkspace(layout);
+    CHECK_THROWS(workspace->Admit(workspace->identity(), 8U));
+    workspace->Admit(workspace->identity(), layout.device_incarnation);
+    auto descriptor = workspace->ExportDescriptor();
+    REQUIRE(descriptor.get() >= 0);
+    mmltk::common::io::ScopedFd transferred(descriptor.release());
+    CHECK(descriptor.get() == -1);
+    runtime.PrepareWorkspace(completed, workspace);
+    CHECK(runtime.Borrow().plane(0U).plane().data == raw);
+    CHECK(runtime.BorrowWorkspace().plane().data != raw);
+    CHECK(finalizations == 1U);
+    completed = {};
+    runtime.Publish(4U, 3U, fill);
+    CHECK(runtime.Borrow().plane(0U).plane().data == runtime.BorrowWorkspace().plane().data);
+    CHECK(finalizations == 1U);
+    auto borrowed = runtime.BorrowWorkspace();
+    REQUIRE(borrowed.valid());
+    CHECK(borrowed.layout().offset_bytes == 128U);
+    auto completion = std::move(borrowed).TakeCompletion();
+    SystemImageRuntime::CompletedOutput baseline;
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    completion->Complete();
+    CHECK(runtime.TryAcquireOutput(baseline).valid());
+    completion.reset();
+    borrowed = {};
+    runtime.Publish(8U, 3U, fill);
+    CHECK_FALSE(runtime.BorrowWorkspace().valid());
+    const auto grown_raw = runtime.Borrow().plane(0U).plane().data;
+    const auto grown_revision = runtime.OutputFacts().revision;
+    layout.width = 8U;
+    auto wrong_device = layout;
+    wrong_device.device_uuid[0U] ^= 1U;
+    CHECK_THROWS(runtime.CreateWorkspace(wrong_device));
+    auto replacement = runtime.CreateWorkspace(layout);
+    CHECK(replacement->identity() != workspace->identity());
+    replacement->Admit(replacement->identity(), layout.device_incarnation);
+    fail_finalization = true;
+    CHECK_THROWS(runtime.PrepareWorkspace(runtime.Completed(), replacement));
+    CHECK_FALSE(runtime.BorrowWorkspace().valid());
+    CHECK(runtime.OutputFacts().revision == grown_revision);
+    CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
+    fail_finalization = false;
+    runtime.PrepareWorkspace(runtime.Completed(), replacement);
+    CHECK(runtime.BorrowWorkspace().revision() == grown_revision);
+    CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
+    CHECK(finalizations == 3U);
+    if (mmltk::testsupport::checked_cuda_device_count() > 1) {
+        auto remote_layout = layout;
+        remote_layout.device = 1;
+        remote_layout.device_incarnation = 8U;
+        REQUIRE(cuDeviceGetUuid(&uuid, 1) == CUDA_SUCCESS);
+        std::memcpy(remote_layout.device_uuid.data(), uuid.bytes, remote_layout.device_uuid.size());
+        auto remote = runtime.CreateWorkspace(remote_layout);
+        remote->Admit(remote->identity(), remote_layout.device_incarnation);
+        runtime.PrepareWorkspace(runtime.Completed(), remote);
+        CHECK(runtime.BorrowWorkspace().layout().device == 1);
+        CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
+        CHECK(finalizations == 3U);
+        CHECK(remote->StorageFootprint().device_bytes == remote->allocation_bytes());
+    }
 }
 
 }  // namespace

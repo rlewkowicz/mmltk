@@ -31,13 +31,15 @@ mmltk_register_public_headers(mmltk_controller_visual_runtime
 mmltk_register_private_headers(mmltk_controller_visual_runtime
     detail/visual_runtime_owner.h)
 mmltk_register_ordinary_sources(mmltk_controller_visual_runtime
-    visual_runtime.cpp visual_diagnostics.cpp detail/visual_runtime_owner.cpp)
+    visual_diagnostics.cpp detail/visual_runtime_owner.cpp)
+mmltk_register_retained_module_importers(mmltk_controller_visual_runtime visual_runtime.cpp)
 target_link_libraries(mmltk_controller_visual_runtime
     PUBLIC
         mmltk::controller::contracts
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection)
+target_link_libraries(mmltk_controller_visual_runtime PRIVATE mmltk::backend::imaging::raster)
 mmltk_link_declarations(mmltk_controller_visual_runtime PUBLIC
     mmltk::controller::direct_services)
 mmltk_register_header_isolation(mmltk_controller_visual_runtime)

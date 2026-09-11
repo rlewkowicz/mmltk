@@ -49,6 +49,7 @@ class FakeImageBackend final : public ImageCopyBackend {
         CreateContext,
         Bind,
         CreateStream,
+        CreateEvent,
         AllocatePlane,
         Clear,
         Copy,
@@ -63,6 +64,9 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::atomic<std::size_t> contexts_bound{0U};
     std::atomic<std::uintptr_t> last_bound_context{0U};
     std::atomic<std::size_t> streams_destroyed{0U};
+    std::atomic<std::size_t> events_created{0U};
+    std::atomic<std::size_t> events_destroyed{0U};
+    std::size_t pitch_padding_bytes = 0U;
     std::atomic<std::size_t> planes_allocated{0U};
     std::atomic<std::size_t> planes_freed{0U};
     std::atomic<std::size_t> pinned_allocated{0U};
@@ -139,6 +143,8 @@ class FakeImageBackend final : public ImageCopyBackend {
     }
     void DestroyStream(std::uintptr_t, std::uintptr_t) noexcept override { ++streams_destroyed; }
     [[nodiscard]] std::uintptr_t CreateEvent(std::uintptr_t) override {
+        MaybeFail(FailurePoint::CreateEvent);
+        ++events_created;
         const auto event = next_.fetch_add(1U);
         std::scoped_lock lock(mutex_);
         events_[event] = !defer_events;
@@ -147,11 +153,12 @@ class FakeImageBackend final : public ImageCopyBackend {
     void DestroyEvent(std::uintptr_t, const std::uintptr_t event) noexcept override {
         std::scoped_lock lock(mutex_);
         events_.erase(event);
+        ++events_destroyed;
     }
     [[nodiscard]] ImagePlaneView AllocatePlane(std::uintptr_t, const ImagePlaneKind kind, const std::uint32_t width,
                                                const std::uint32_t height) override {
         MaybeFail(FailurePoint::AllocatePlane);
-        const std::size_t pitch = static_cast<std::size_t>(width) * 4U;
+        const std::size_t pitch = static_cast<std::size_t>(width) * 4U + pitch_padding_bytes;
         auto* storage = new std::byte[pitch * height];
         ++planes_allocated;
         return {

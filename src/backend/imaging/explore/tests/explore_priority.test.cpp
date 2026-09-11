@@ -171,6 +171,63 @@ class CudaStream final {
     cudaStream_t stream_ = nullptr;
 };
 
+TEST_CASE("Fused workspace raster preserves pitched guards and clipped coverage", "[backend][imaging][explore][cuda][workspace]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    namespace raster = mmltk::backend::imaging::raster;
+    constexpr int width = 4, height = 3;
+    constexpr std::size_t clean_pitch = 24, semantic_pitch = 32, target_pitch = 40, offset = 16;
+    std::vector<std::uint8_t> clean(offset + clean_pitch * height, 19U);
+    std::vector<std::uint8_t> semantic(offset + semantic_pitch * height, 0U);
+    std::vector<std::uint8_t> guard(offset + target_pitch * height, 203U);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const auto ci = offset + static_cast<std::size_t>(y) * clean_pitch + static_cast<std::size_t>(x) * 4U;
+            const auto si = offset + static_cast<std::size_t>(y) * semantic_pitch + static_cast<std::size_t>(x) * 4U;
+            clean[ci] = static_cast<std::uint8_t>(x + 30);
+            clean[ci + 1U] = static_cast<std::uint8_t>(y + 60);
+            clean[ci + 2U] = 110U;
+            clean[ci + 3U] = 255U;
+            semantic[si] = 240U;
+            semantic[si + 1U] = 20U;
+            semantic[si + 2U] = 70U;
+            semantic[si + 3U] = x % 2 == 0 ? 0U : 127U;
+        }
+    }
+    CudaBuffer clean_device, semantic_device, oracle_device, result_device;
+    clean_device.upload<std::uint8_t>(clean);
+    semantic_device.upload<std::uint8_t>(semantic);
+    oracle_device.upload<std::uint8_t>(guard);
+    result_device.upload<std::uint8_t>(guard);
+    CudaStream stream;
+    auto* oracle = static_cast<std::uint8_t*>(oracle_device.data()) + offset;
+    auto* result = static_cast<std::uint8_t*>(result_device.data()) + offset;
+    const raster::ConstBytes source{static_cast<const std::uint8_t*>(clean_device.data()) + offset, clean_pitch, width, height};
+    const raster::ConstBytes overlay{static_cast<const std::uint8_t*>(semantic_device.data()) + offset, semantic_pitch, width, height};
+    REQUIRE(cudaMemcpy2DAsync(oracle, target_pitch, source.pixels, clean_pitch, width * 4U, height,
+                              cudaMemcpyDeviceToDevice, stream.get()) == cudaSuccess);
+    REQUIRE(raster::composite_rgba({.base_rgba = raster::pitched_rgba_target(oracle, target_pitch, width, height),
+                                   .overlay_rgba = overlay, .stream = stream.get()}) == cudaSuccess);
+    const std::array regions{raster::IntRect{-5, 0, 3, 2}, raster::IntRect{3, 2, 20, 20}, raster::IntRect{2, 1, 2, 3}};
+    raster::FinalizeRgbaWork work{.clean = source, .semantic = overlay,
+        .destination = {result, target_pitch, width, height}, .regions = regions, .full_image = false, .stream = stream.get()};
+    REQUIRE(raster::finalize_rgba(work) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    std::vector<std::uint8_t> expected(guard.size()), actual(guard.size());
+    REQUIRE(cudaMemcpy(expected.data(), oracle_device.data(), expected.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(actual.data(), result_device.data(), actual.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+    for (std::size_t byte = 0; byte < actual.size(); ++byte) {
+        const auto relative = byte >= offset ? byte - offset : actual.size();
+        const auto y = relative / target_pitch, x = (relative % target_pitch) / 4U;
+        const bool changed = byte >= offset && y < height && x < width && ((x < 3U && y < 2U) || (x == 3U && y == 2U));
+        CHECK(actual[byte] == (changed ? expected[byte] : guard[byte]));
+    }
+    work.full_image = true;
+    REQUIRE(raster::finalize_rgba(work) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    REQUIRE(cudaMemcpy(actual.data(), result_device.data(), actual.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(actual == expected);
+}
+
 TEST_CASE("Host render demand samples only the current atomic generation", "[backend][imaging][explore][demand]") {
     CHECK(detail::ExploreRenderDemand{}.valid());
     std::atomic<std::uint64_t> generation{9U};

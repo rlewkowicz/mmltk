@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "src/controller/presentation/detail/workspace_surface_import_channel.h"
+#include "src/controller/presentation/workspace_presentation_types.h"
 
 namespace mmltk::controller::presentation::detail {
 

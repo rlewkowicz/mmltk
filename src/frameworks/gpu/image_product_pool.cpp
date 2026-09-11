@@ -90,6 +90,9 @@ BorrowedImageProductReadView ImageProductPool::Product::Borrow() const {
     if (!valid()) return {};
     return slot_->buffer.Borrow();
 }
+BorrowedImageWorkspace ImageProductPool::Product::BorrowWorkspace() const {
+    return valid() ? slot_->buffer.BorrowWorkspace() : BorrowedImageWorkspace{};
+}
 void ImageProductPool::Product::Retain() {
     if (!slot_) return;
     std::scoped_lock lock(slot_->admission->mutex);
@@ -252,8 +255,36 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
     }
     auto paths = slot.buffer.CopyFromAs(stream, std::move(source), {}, revision);
     candidate.revision_ = revision;
+    slot.buffer.FinalizeWorkspace();
     static_cast<void>(Commit(std::move(candidate)));
     return paths;
+}
+void ImageProductPool::ConfigureWorkspace(Candidate& candidate, std::shared_ptr<ImageWorkspace> workspace,
+                                          ImageWorkspaceFinalize finalize) {
+    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
+        throw std::invalid_argument("workspace candidate is invalid");
+    candidate.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
+}
+void ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace,
+                                        ImageWorkspaceFinalize finalize) {
+    ValidateBaseline(product);
+    if (!product.valid()) throw std::invalid_argument("workspace product is unavailable");
+    product.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
+    product.slot_->buffer.FinalizeWorkspace();
+}
+void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCoverage coverage) {
+    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)
+        throw std::invalid_argument("workspace candidate has no completed raw product");
+    candidate.slot_->buffer.FinalizeWorkspace(coverage);
+}
+ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
+    ImageStreamSettlement result{.completion_reached = true};
+    for (const auto& slot : slots_) {
+        const auto settled = slot->buffer.SettleWorkspace();
+        result.completion_reached = result.completion_reached && settled.completion_reached;
+        result.failure = combine_image_failures(result.failure, settled.failure);
+    }
+    return result;
 }
 ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)

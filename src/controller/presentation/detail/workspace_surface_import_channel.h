@@ -107,7 +107,7 @@ struct WorkspaceRendererPresentation {
 };
 
 // Host-owned mapping for the generic identity paired with the native eventfd.
-// The shell maps its transferred descriptor read-only; the presentation owner
+// The shell uses atomic loads from its transferred mapping; the presentation owner
 // writes the fixed storage before raising an edge, so backbuffer replacement
 // and completed-copy redraws use the native boundary without per-frame
 // WebSocket traffic.
@@ -173,7 +173,7 @@ class WorkspaceSurfaceImportChannel final {
     // duplicate while a nonblocking record is queued; SCM_RIGHTS then installs
     // the shell's descriptor for the same open file. The eventfd is the only
     // per-frame wakeup that crosses the boundary, and the host never reads or
-    // waits on it. `frame_signal` is the read-only shared snapshot identifying
+    // waits on it. `frame_signal` is the shared snapshot, read only by the shell, identifying
     // the exact timeline copy authorized by that edge.
     [[nodiscard]] bool admit(WorkspaceSurfaceImportId id, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
                              std::uint64_t stride, std::uint64_t size, mmltk::common::io::ScopedFd descriptor, int frame_edge,

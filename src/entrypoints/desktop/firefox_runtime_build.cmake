@@ -79,11 +79,14 @@ if(BUILD_MMLTK_FIREFOX_RUNTIME)
             "SCCACHE_DIR=${MMLTK_FIREFOX_CACHE_ROOT}/sccache"
             "MMLTK_JOBS=${MMLTK_BUILD_JOBS}"
             "MMLTK_FIREFOX_BUILD_INPUT=${MMLTK_FIREFOX_BUILD_INPUT}"
+            "MMLTK_WORKSPACE_GRAPHICS_ABI=${MMLTK_WORKSPACE_GRAPHICS_ABI}"
             "MMLTK_FIREFOX_BUILT_INPUT=${_mmltk_firefox_build_stamp}"
             "MMLTK_FIREFOX_MACH=${_mmltk_firefox_mach}"
             "MMLTK_TRACED_COMMAND=${_mmltk_traced_command}"
             bash "${_mmltk_firefox_build_command}"
         DEPENDS
+            mmltk_generate_application_bindings
+            "${MMLTK_WORKSPACE_GRAPHICS_ABI}"
             "${MMLTK_FIREFOX_BUILD_INPUT}"
             "${_mmltk_firefox_build_command}"
         BYPRODUCTS ${_mmltk_firefox_runtime_byproducts}

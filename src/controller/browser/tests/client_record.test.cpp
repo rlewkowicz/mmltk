@@ -1,4 +1,5 @@
 #include "src/controller/browser/client_record.h"
+#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
@@ -658,3 +659,22 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
 
 }  // namespace
 }  // namespace mmltk::controller::browser
+
+TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
+    namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
+    abi::Record record{.id_high = 1U, .width = 4U, .height = 3U, .stride = 32U, .size = 96U,
+                       .descriptors = abi::kImportDescriptorCount};
+    REQUIRE(abi::valid(record));
+    record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
+    CHECK_FALSE(abi::valid(record));
+    record.opcode = abi::Opcode::Import;
+    --record.descriptors;
+    CHECK_FALSE(abi::valid(record));
+    record.descriptors = abi::kImportDescriptorCount;
+    record.size = 95U;
+    CHECK_FALSE(abi::valid(record));
+    auto packet = abi::layout_packet();
+    REQUIRE(abi::valid(packet));
+    ++packet.presentation_revision_offset;
+    CHECK_FALSE(abi::valid(packet));
+}

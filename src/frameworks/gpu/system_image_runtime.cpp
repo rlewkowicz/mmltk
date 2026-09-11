@@ -50,6 +50,7 @@ struct SystemImageRuntime::State final {
         input = std::make_unique<ImageProductBuffer>(*context, config.input_layout);
         output = std::make_unique<ImageProductPool>(*context, config.output_layout, config.output_buffer_count);
         stream = std::make_unique<ImageStream>(*context);
+        workspace_finalize = std::move(config.workspace_finalize);
     }
 
     std::optional<DeviceContext> context;
@@ -57,6 +58,7 @@ struct SystemImageRuntime::State final {
     std::unique_ptr<ImageProductBuffer> input;
     std::unique_ptr<ImageProductPool> output;
     std::unique_ptr<ImageStream> stream;
+    ImageWorkspaceFinalize workspace_finalize;
     bool retired = false;
 };
 
@@ -144,7 +146,12 @@ SystemImageRuntime::Retirement SystemImageRuntime::Retire() noexcept {
         const auto failure = missing_retention_failure();
         return {.failure = failure, .custody = Retain(failure)};
     }
-    const auto settled = state_->stream ? state_->stream->Settle() : ImageCopyBackend::StreamSettlement{.completion_reached = true};
+    auto settled = state_->stream ? state_->stream->Settle() : ImageCopyBackend::StreamSettlement{.completion_reached = true};
+    if (state_->output) {
+        const auto display = state_->output->SettleWorkspaces();
+        settled.completion_reached = settled.completion_reached && display.completion_reached;
+        settled.failure = combine_image_failures(settled.failure, display.failure);
+    }
     if (!settled.completion_reached) {
         const auto failure = settled.failure ? settled.failure : missing_retention_failure();
         return {.failure = failure, .custody = Retain(failure)};
@@ -205,6 +212,7 @@ void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t
     state.output->Publish(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
 }
 SystemImageRuntime::CompletedOutput SystemImageRuntime::CommitOutput(OutputCandidate&& candidate) {
+    ActiveState().output->FinalizeWorkspace(candidate, {});
     return ActiveState().output->Commit(std::move(candidate));
 }
 void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
@@ -212,6 +220,22 @@ void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::
     auto& state = ActiveState();
     state.output->PublishRetained(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
 }
+std::shared_ptr<ImageWorkspace> SystemImageRuntime::CreateWorkspace(ImageWorkspaceLayout layout, std::optional<DeviceExecution> execution) {
+    auto& state = ActiveState();
+    return std::make_shared<ImageWorkspace>(state.context->OnDevice(layout.device, std::move(execution)), std::move(layout));
+}
+void SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
+    auto& state = ActiveState();
+    state.output->ConfigureWorkspace(candidate, std::move(workspace), state.workspace_finalize);
+}
+void SystemImageRuntime::PrepareWorkspace(const CompletedOutput& product, std::shared_ptr<ImageWorkspace> workspace) {
+    auto& state = ActiveState();
+    state.output->PrepareWorkspace(product, std::move(workspace), state.workspace_finalize);
+}
+void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
+    ActiveState().output->FinalizeWorkspace(candidate, coverage);
+}
+BorrowedImageWorkspace SystemImageRuntime::BorrowWorkspace() const { return Completed().BorrowWorkspace(); }
 void SystemImageRuntime::SelectOutput(const CompletedOutput& product) { ActiveState().output->Select(product); }
 void SystemImageRuntime::SetOutputAvailableSink(std::function<void()> sink) { ActiveState().output->SetAvailabilitySink(std::move(sink)); }
 BorrowedImageProductReadView SystemImageRuntime::BorrowInput() const { return ActiveState().input->Borrow(); }
@@ -239,7 +263,7 @@ void SystemImageRuntime::Publish(const std::uint32_t width, const std::uint32_t 
     auto candidate = state.output->Acquire();
     if (!candidate.valid()) throw std::runtime_error("image output candidate is unavailable");
     state.output->Publish(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
-    static_cast<void>(state.output->Commit(std::move(candidate)));
+    static_cast<void>(CommitOutput(std::move(candidate)));
 }
 std::uint64_t SystemImageRuntime::TakeProductRevision() { return product_revision_sequence_->Take(); }
 }  // namespace mmltk::frameworks::gpu

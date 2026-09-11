@@ -118,6 +118,16 @@ struct CompositeRgbaWork final {
     NativeStream stream{};
 };
 
+// Coordinates are half-open and clipped to the image. Empty coverage writes nothing.
+struct FinalizeRgbaWork final {
+    ConstBytes clean{};
+    ConstBytes semantic{};
+    MutableBytes destination{};
+    std::span<const IntRect> regions{};
+    bool full_image = true;
+    NativeStream stream{};
+};
+
 struct CopyBgrToRgbaWork final {
     ConstBytes source_bgr{};
     RgbaTargetView target_rgba{};
@@ -199,6 +209,7 @@ struct BoolMaskPackWork final {
 [[nodiscard]] std::int32_t raster_instance_overlay_rgba(const InstanceOverlayRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t composite_rgba_over_bgr(const CompositeRgbaOverBgrWork& work) noexcept;
 [[nodiscard]] std::int32_t composite_rgba(const CompositeRgbaWork& work) noexcept;
+[[nodiscard]] std::int32_t finalize_rgba(const FinalizeRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t copy_bgr_to_rgba(const CopyBgrToRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t raster_mask_rgba(const MaskRgbaWork& work) noexcept;
 [[nodiscard]] std::int32_t raster_mask_runs_rgba(const MaskRunsRgbaWork& work) noexcept;

@@ -5,15 +5,10 @@
 #include <limits>
 #include <type_traits>
 
-// The application's normative declaration of the frozen import ABI. Firefox's
-// repr(C) record is an explicit transport mirror of this layout. The two remain
-// separate build inputs, while layout packets and compile-time assertions audit
-// their exact agreement.
-//
-// `kAbiVersion` changes only when the layout or an opcode meaning changes, and
-// both sides reject a record that does not carry the exact value they were
-// built with. The static assertions below are the only thing keeping the two
-// declarations honest, so they must match the Rust record field for field.
+// Canonical frozen import ABI. The native generator projects data-only Rust
+// records, integer wire fields, enum values, and every size/alignment/offset
+// assertion into the build-owned graphics artifact consumed by Firefox.
+// kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
 
 inline constexpr std::uint32_t kAbiVersion = 9U;
@@ -77,7 +72,7 @@ inline constexpr std::uint64_t kModifierLinear = 0U;
 
 // Descriptor positions for the two record kinds that carry SCM_RIGHTS:
 // `Import` carries memory, its edge, and a frame-identity descriptor that the
-// shell maps read-only;
+// shell accesses with atomic loads only;
 // `Ready` carries the timeline.
 //
 // The frame edge is an eventfd the host signals once per completed arena mirror

@@ -4,8 +4,21 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 
 namespace mmltk::frameworks::gpu {
+
+struct ImageStreamSettlement final {
+    bool completion_reached = false;
+    std::exception_ptr failure{};
+};
+
+struct ImageStorageFootprint final {
+    std::size_t device_bytes = 0U;
+    std::size_t pinned_bytes = 0U;
+};
+
+[[nodiscard]] std::uint64_t next_image_allocation_identity();
 
 enum class ImageFormat : std::uint8_t { Rgba8 };
 enum class ImagePlaneKind : std::uint8_t { Clean, Semantic };

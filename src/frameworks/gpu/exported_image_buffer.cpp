@@ -36,17 +36,17 @@ ExportedImageBuffer::~ExportedImageBuffer() noexcept { static_cast<void>(Release
 
 bool ExportedImageBuffer::allocate(const int device_id, const std::uint32_t width, const std::uint32_t height,
                                    const std::size_t pitch_bytes, const std::size_t minimum_allocation_bytes,
-                                   std::string* const error_message) {
+                                   std::string* const error_message, const std::size_t offset_bytes) {
     if (!empty() || owns_resources()) {
         if (error_message != nullptr) *error_message = "presentation allocation was already made";
         return false;
     }
     if (device_id < 0 || width == 0U || height == 0U || pitch_bytes < static_cast<std::size_t>(width) * 4U ||
-        height > std::numeric_limits<std::size_t>::max() / pitch_bytes) {
+        height > (std::numeric_limits<std::size_t>::max() - offset_bytes) / pitch_bytes) {
         if (error_message != nullptr) *error_message = "presentation allocation metadata is invalid";
         return false;
     }
-    const std::size_t requested = std::max(pitch_bytes * static_cast<std::size_t>(height), minimum_allocation_bytes);
+    const std::size_t requested = std::max(offset_bytes + pitch_bytes * static_cast<std::size_t>(height), minimum_allocation_bytes);
     const CUmemAllocationProp property = exportable_property(device_id);
     std::size_t granularity = 0U;
     CUresult status = cuMemGetAllocationGranularity(&granularity, &property, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED);
@@ -88,7 +88,7 @@ bool ExportedImageBuffer::allocate(const int device_id, const std::uint32_t widt
         static_cast<void>(Release());
         return false;
     }
-    device_ptr_ = address_;
+    device_ptr_ = address_ + offset_bytes;
     pitch_bytes_ = pitch_bytes;
     width_ = width;
     height_ = height;
@@ -148,6 +148,7 @@ cudaError_t ExportedImageBuffer::Release(const ReleaseOperations& operations) no
     if (allocation != 0U && (operations.release_allocation == nullptr || operations.release_allocation(allocation) != CUDA_SUCCESS) &&
         first_failure == cudaSuccess)
         first_failure = cudaErrorUnknown;
+    if (release_failure_ == cudaSuccess) release_failure_ = first_failure;
     return first_failure;
 }
 

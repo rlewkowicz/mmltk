@@ -16,6 +16,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         image_failure.h
         image_product_pool.h
         image_types.h
+        image_workspace.h
         exported_image_buffer.h
         external_graphics_timeline.h
         system_image_worker.h
@@ -42,6 +43,7 @@ mmltk_register_ordinary_sources(
     exported_image_buffer.cpp
     external_graphics_timeline.cpp
     image_buffer.cpp
+    image_workspace.cpp
     image_product_pool.cpp
     system_image_runtime.cpp
     system_image_worker.cpp)

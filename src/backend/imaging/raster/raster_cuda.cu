@@ -302,6 +302,34 @@ __global__ void composite_rgba_over_bgr_pitched_kernel(const draw_launch::Compos
                                                                  cuda_launch::composite_rgba_over_bgr(base_pixel, overlay_pixel));
 }
 
+__global__ void finalize_rgba_kernel(const draw_launch::FinalizeRgbaLaunch launch) {
+    const auto dx = blockIdx.x * blockDim.x + threadIdx.x;
+    const auto dy = blockIdx.y * blockDim.y + threadIdx.y;
+    if (dx >= static_cast<unsigned>(launch.region.x2 - launch.region.x1) ||
+        dy >= static_cast<unsigned>(launch.region.y2 - launch.region.y1)) return;
+    const int x = launch.region.x1 + static_cast<int>(dx);
+    const int y = launch.region.y1 + static_cast<int>(dy);
+    auto pixel = cuda_launch::load_rgba_pixel(launch.clean.pixels, launch.clean.pitch_bytes, x, y);
+    if (launch.semantic.pixels) {
+        const auto overlay = cuda_launch::load_rgba_pixel(launch.semantic.pixels, launch.semantic.pitch_bytes, x, y);
+        if (overlay.a != 0U) pixel = cuda_launch::composite_rgba_over_rgba(pixel, overlay);
+    }
+    cuda_launch::store_rgba_pixel(launch.destination.pixels, launch.destination.pitch_bytes, x, y, pixel);
+}
+
+cudaError_t launch_finalize_rgba(const draw_launch::FinalizeRgbaLaunch& launch) noexcept {
+    if (!launch.clean.valid(4U) || !launch.destination.valid(4U) ||
+        launch.region.x1 < 0 || launch.region.y1 < 0 || launch.region.x2 <= launch.region.x1 ||
+        launch.region.y2 <= launch.region.y1 || launch.region.x2 > launch.clean.width ||
+        launch.region.y2 > launch.clean.height || launch.destination.width != launch.clean.width ||
+        launch.destination.height != launch.clean.height ||
+        (launch.semantic.pixels && (!launch.semantic.valid(4U) || launch.semantic.width != launch.clean.width ||
+                                   launch.semantic.height != launch.clean.height))) return cudaErrorInvalidValue;
+    finalize_rgba_kernel<<<draw_kernel_grid(launch.region.x2 - launch.region.x1, launch.region.y2 - launch.region.y1),
+        draw_kernel_block(), 0, launch.stream>>>(launch);
+    return cudaGetLastError();
+}
+
 __global__ void composite_rgba_over_rgba_pitched_kernel(const draw_launch::CompositeRgbaOverRgbaPitchedLaunch launch) {
     const CompositeRgbaOverlaySample sample = load_composite_rgba_overlay_sample(launch);
     if (!sample.visible) { return; }

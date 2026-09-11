@@ -83,114 +83,17 @@ pub fn trace_state(event: &str, id: SurfaceId, detail: &str) {
     ));
 }
 
-/// Bumped only when the record layout or opcode meaning changes. Both sides
-/// reject a record that does not carry the exact value they were built with.
-pub const ABI_VERSION: u32 = 9;
-
-/// Host to shell: the three descriptors in the ancillary data back the described
-/// allocation, carry its frame edge, and expose its generic frame identity,
-/// admitted under `id`.
-const OPCODE_IMPORT: u32 = 1;
-/// Host to shell: `id` is withdrawn. A live capability completes through the
-/// exact Retired terminal after page sampling and mirror cleanup.
-const OPCODE_DROP: u32 = 2;
-/// Shell to host: `id` is imported and the page's texture exists.
-const OPCODE_READY: u32 = 3;
-/// Shell to host: `id` could not be imported, with a reason in `code`.
-const OPCODE_FAILED: u32 = 4;
-/// Shell to host: a capacity-exhausted generic layer mailbox regained a writable slot.
-const OPCODE_AVAILABLE: u32 = 5;
-/// Shell to host: one exact private mailbox sample was occupied and offered to the page.
-const OPCODE_PRESENTED: u32 = 6;
-/// Shell to host: the page released that exact sample after rejection or final GPU use.
-const OPCODE_COMPLETED: u32 = 7;
-/// Shell to host: all page samples and the private mirror are released.
-const OPCODE_RETIRED: u32 = 8;
-
-/// Why this shell could not produce a texture for an admitted allocation. The
-/// codes describe what happened here, not what the host should do about it.
-pub const FAILED_NOT_ADMITTED: u32 = 1;
-pub const FAILED_UNSUPPORTED_DESCRIPTOR: u32 = 2;
-pub const FAILED_IMPORT: u32 = 3;
-/// The descriptor is importable but its row pitch or size does not match what
-/// this device requires for a linear image of the described extent. The
-/// accompanying `stride` and `size` are the ones that would be accepted; the
-/// host may describe a fresh allocation using them. This is the only reply that
-/// carries a layout, and it exists because the required pitch is a property of
-/// the importing driver that the exporting side cannot compute.
-pub const FAILED_LAYOUT: u32 = 4;
-
-/// The only modifier this shell imports. The host exports a linear CUDA range,
-/// and a linear-tiled image is the only layout both sides agree on without a
-/// modifier negotiation neither side needs.
-pub const MODIFIER_LINEAR: u64 = 0;
-
-/// Descriptor positions for the two record kinds that carry `SCM_RIGHTS`:
-/// `Import` carries memory, its edge, and a read-only frame-identity mapping;
-/// `Ready` carries the timeline.
-///
-/// The frame edge is an eventfd the host signals once per completed mirror of
-/// the admitted allocation and never reads or waits on. This shell watches it
-/// and blits the allocation into the texture the page samples; an eventfd read
-/// returns the number of signals since the last read, so a backlog coalesces
-/// into one blit.
-const IMPORT_MEMORY_DESCRIPTOR: usize = 0;
-const IMPORT_FRAME_EDGE_DESCRIPTOR: usize = 1;
-const IMPORT_FRAME_SIGNAL_DESCRIPTOR: usize = 2;
-const IMPORT_DESCRIPTOR_COUNT: usize = 3;
-const READY_TIMELINE_DESCRIPTOR: usize = 0;
-const READY_DESCRIPTOR_COUNT: usize = 1;
+pub(super) mod graphics_abi {
+    #![allow(dead_code)]
+    include!(env!("MMLTK_WORKSPACE_GRAPHICS_ABI"));
+}
+pub use graphics_abi::*;
 
 /// An `Import`'s descriptors are the most any record carries.
 const CONTROL_BYTES: usize = 32;
 const PENDING_RECORD_CAPACITY: usize = 256;
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Record {
-    abi_version: u32,
-    opcode: u32,
-    id_high: u64,
-    id_low: u64,
-    width: u32,
-    height: u32,
-    stride: u64,
-    size: u64,
-    modifier: u64,
-    code: u32,
-    /// How many descriptors accompany this record. A record whose ancillary
-    /// data does not carry exactly this many is a framing violation, which is
-    /// what keeps the two independent declarations of this ABI honest about the
-    /// one message that carries more than a payload.
-    descriptors: u32,
-    /// Exact generation-scoped arena publication copied into this mailbox
-    /// sample. Meaningful only for mailbox lifecycle records.
-    presentation_revision: u64,
-}
-
 const RECORD_BYTES: usize = mem::size_of::<Record>();
-
-const _: () = assert!(RECORD_BYTES == 72);
-const _: () = assert!(mem::align_of::<Record>() == 8);
-const _: () = assert!(mem::offset_of!(Record, abi_version) == 0);
-const _: () = assert!(mem::offset_of!(Record, opcode) == 4);
-const _: () = assert!(mem::offset_of!(Record, id_high) == 8);
-const _: () = assert!(mem::offset_of!(Record, id_low) == 16);
-const _: () = assert!(mem::offset_of!(Record, width) == 24);
-const _: () = assert!(mem::offset_of!(Record, height) == 28);
-const _: () = assert!(mem::offset_of!(Record, stride) == 32);
-const _: () = assert!(mem::offset_of!(Record, size) == 40);
-const _: () = assert!(mem::offset_of!(Record, modifier) == 48);
-const _: () = assert!(mem::offset_of!(Record, code) == 56);
-const _: () = assert!(mem::offset_of!(Record, descriptors) == 60);
-const _: () = assert!(mem::offset_of!(Record, presentation_revision) == 64);
-const _: () = assert!(IMPORT_MEMORY_DESCRIPTOR < IMPORT_DESCRIPTOR_COUNT);
-const _: () = assert!(IMPORT_FRAME_EDGE_DESCRIPTOR < IMPORT_DESCRIPTOR_COUNT);
-const _: () = assert!(IMPORT_FRAME_SIGNAL_DESCRIPTOR < IMPORT_DESCRIPTOR_COUNT);
-const _: () = assert!(IMPORT_MEMORY_DESCRIPTOR != IMPORT_FRAME_EDGE_DESCRIPTOR);
-const _: () = assert!(IMPORT_MEMORY_DESCRIPTOR != IMPORT_FRAME_SIGNAL_DESCRIPTOR);
-const _: () = assert!(IMPORT_FRAME_EDGE_DESCRIPTOR != IMPORT_FRAME_SIGNAL_DESCRIPTOR);
-const _: () = assert!(READY_TIMELINE_DESCRIPTOR < READY_DESCRIPTOR_COUNT);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SurfaceId {

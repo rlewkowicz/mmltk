@@ -169,6 +169,14 @@ struct CompositeRgbaOverRgbaPitchedLaunch {
     cudaStream_t stream = nullptr;
 };
 
+struct FinalizeRgbaLaunch {
+    ConstSurfaceU8 clean;
+    ConstSurfaceU8 semantic;
+    MutableSurfaceU8 destination;
+    IntRect region;
+    cudaStream_t stream = nullptr;
+};
+
 struct CompositeRgbaLaunchAbi {
     RgbaTargetViewAbi base_rgba;
     ConstSurfaceU8 overlay_rgba;
@@ -260,6 +268,7 @@ MMLTK_RASTER_CUDA_LAUNCHER(launch_draw_analysis_overlay_rgba_pitched, AnalysisOv
 MMLTK_RASTER_CUDA_LAUNCHER(launch_composite_rgba_over_bgr_pitched, CompositeRgbaOverBgrPitchedLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_composite_rgba_over_rgba_pitched, CompositeRgbaOverRgbaPitchedLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_composite_rgba, CompositeRgbaLaunchAbi)
+MMLTK_RASTER_CUDA_LAUNCHER(launch_finalize_rgba, FinalizeRgbaLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_copy_bgr_to_rgba_pitched, CopyBgrToRgbaPitchedLaunch)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_copy_bgr_to_rgba, CopyBgrToRgbaLaunchAbi)
 MMLTK_RASTER_CUDA_LAUNCHER(launch_draw_manual_mask_rgba_pitched, ManualMaskRgbaPitchedLaunch)

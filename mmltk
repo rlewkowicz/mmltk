@@ -30,7 +30,6 @@ cargo_cache_root="${cache_root}/cargo"
 ccache_root="${cache_root}/ccache"
 firefox_cache_root="${cache_root}/firefox"
 firefox_build_input_file="${firefox_cache_root}/build-input.sha256"
-firefox_built_input_file="${firefox_cache_root}/obj-minimal-opt/.mmltk-build-input.sha256"
 image_fingerprint_root="${cache_root}/image-fingerprints"
 lock_root="${cache_root}/locks"
 requested_release_stage_root="${MMLTK_RELEASE_STAGE_ROOT:-${repo_root}/build/release}"
@@ -2086,6 +2085,17 @@ firefox_source_state_fingerprint_for() {
         printf 'firefox-build-command\0%s\0' \
             "$(fingerprint_path \
                 "${repo_root}/src/entrypoints/desktop/build_firefox_runtime.sh")"
+        local graphics_input
+        for graphics_input in \
+            src/controller/presentation/detail/workspace_surface_import_abi.h \
+            src/controller/presentation/detail/workspace_frame_signal.h \
+            src/controller/presentation/workspace_presentation_types.h \
+            src/controller/browser/application_workspace_abi_emitter.h \
+            src/controller/browser/application_binding_generator.cpp \
+            src/controller/browser/CMakeLists.txt; do
+            printf 'graphics-input\0%s\0%s\0' "${graphics_input}" \
+                "$(fingerprint_path "${repo_root}/${graphics_input}")"
+        done
         git -C "${repo_root}" rev-parse HEAD:third_party/firefox
         git -C "${repo_root}" diff --no-ext-diff --binary \
             HEAD -- third_party/firefox
@@ -2105,13 +2115,6 @@ firefox_source_state_fingerprint() {
         "$1"
 }
 
-firefox_legacy_source_state_fingerprint() {
-    firefox_source_state_fingerprint_for \
-        mmltk-firefox-build-input-v1 \
-        "${repo_root}/src/entrypoints/desktop/CMakeLists.txt" \
-        "$1"
-}
-
 firefox_toolchain_identity() {
     local toolchain_base_identity
     toolchain_base_identity="$(docker image inspect "${toolchain_base_image_name}" --format '{{.Id}}')"
@@ -2124,35 +2127,11 @@ firefox_toolchain_identity() {
     printf '%s\n' "${toolchain_base_identity}"
 }
 
-firefox_runtime_cache_complete() {
-    local runtime_root="${firefox_cache_root}/obj-minimal-opt/dist/firefox"
-    local required_path
-    for required_path in \
-        firefox \
-        firefox-bin \
-        libxul.so \
-        libmozgtk.so \
-        libmozwayland.so \
-        application.ini \
-        platform.ini \
-        omni.ja \
-        browser/omni.ja; do
-        [[ -e "${runtime_root}/${required_path}" ]] || return 1
-    done
-}
-
 prepare_firefox_build_input() {
     local toolchain_identity
     toolchain_identity="$(firefox_toolchain_identity)"
     local fingerprint
     fingerprint="$(firefox_source_state_fingerprint "${toolchain_identity}")"
-    local legacy_fingerprint
-    legacy_fingerprint="$(
-        firefox_legacy_source_state_fingerprint "${toolchain_identity}")"
-    local completed_fingerprint=
-    if [[ -f "${firefox_built_input_file}" ]]; then
-        completed_fingerprint="$(<"${firefox_built_input_file}")"
-    fi
     local next_fingerprint="${firefox_build_input_file}.next.$$"
     printf '%s\n' "${fingerprint}" >"${next_fingerprint}"
     if [[ -f "${firefox_build_input_file}" ]] \
@@ -2162,28 +2141,6 @@ prepare_firefox_build_input() {
         mv -f -- "${next_fingerprint}" "${firefox_build_input_file}"
         chown "${uid}:${gid}" "${firefox_build_input_file}" 2>/dev/null || true
         if (( ! gui_diagnostics_quiet )); then log "Firefox build inputs changed"; fi
-    fi
-
-    if [[ "${completed_fingerprint}" == "${legacy_fingerprint}" ]] \
-        && firefox_runtime_cache_complete; then
-        cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
-        chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
-        if (( ! gui_diagnostics_quiet )); then log "adopted the completed Firefox runtime into the isolated build definition"; fi
-    fi
-
-    local legacy_runtime_stamp=
-    legacy_runtime_stamp="${firefox_cache_root}/obj-minimal-opt/dist/.mmltk-runtime-stage.sha256"
-    if [[ ! -f "${firefox_built_input_file}" \
-        && -f "${legacy_runtime_stamp}" ]] \
-        && firefox_runtime_cache_complete; then
-        local newer_source
-        newer_source="$(find "${repo_root}/third_party/firefox" -type f \
-            -newer "${legacy_runtime_stamp}" -print -quit)"
-        if [[ -z "${newer_source}" ]]; then
-            cp -- "${firefox_build_input_file}" "${firefox_built_input_file}"
-            chown "${uid}:${gid}" "${firefox_built_input_file}" 2>/dev/null || true
-            if (( ! gui_diagnostics_quiet )); then log "adopted the completed Firefox runtime into fingerprinted build state"; fi
-        fi
     fi
 }
 

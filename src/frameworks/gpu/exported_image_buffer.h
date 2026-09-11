@@ -21,9 +21,10 @@ class ExportedImageBuffer final {
     ExportedImageBuffer& operator=(const ExportedImageBuffer&) = delete;
 
     [[nodiscard]] bool allocate(int device_id, std::uint32_t width, std::uint32_t height, std::size_t pitch_bytes,
-                                std::size_t minimum_allocation_bytes, std::string* error_message);
+                                std::size_t minimum_allocation_bytes, std::string* error_message, std::size_t offset_bytes = 0U);
     [[nodiscard]] int export_descriptor(std::string* error_message) const;
     [[nodiscard]] cudaError_t Release() noexcept;
+    [[nodiscard]] cudaError_t release_failure() const noexcept { return release_failure_; }
 
     [[nodiscard]] inline CUdeviceptr data() const noexcept { return device_ptr_; }
     [[nodiscard]] inline std::size_t pitch_bytes() const noexcept { return pitch_bytes_; }
@@ -49,6 +50,7 @@ class ExportedImageBuffer final {
     std::uint32_t width_ = 0U;
     std::uint32_t height_ = 0U;
     bool mapping_active_ = false;
+    cudaError_t release_failure_ = cudaSuccess;
 
     friend struct test_support::ExportedImageBufferTestAccess;
 };

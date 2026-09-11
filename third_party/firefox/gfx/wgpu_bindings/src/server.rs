@@ -1859,31 +1859,7 @@ enum MmltkWorkspaceDispatcherCommand {
     },
 }
 
-#[repr(C, align(64))]
-struct MmltkWorkspaceFrameSignalLayout {
-    sequence_lock: AtomicU64,
-    timeline_ready: AtomicU64,
-    transfer_sequence: AtomicU64,
-    layer: AtomicU64,
-    content_session: AtomicU64,
-    content_sequence: AtomicU64,
-    presentation_revision: AtomicU64,
-    content_width: AtomicU32,
-    content_height: AtomicU32,
-}
-
-const _: () = assert!(mem::size_of::<MmltkWorkspaceFrameSignalLayout>() == 64);
-const _: () = assert!(mem::align_of::<MmltkWorkspaceFrameSignalLayout>() == 64);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, sequence_lock) == 0);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, timeline_ready) == 8);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, transfer_sequence) == 16);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, layer) == 24);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, content_session) == 32);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, content_sequence) == 40);
-const _: () =
-    assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, presentation_revision) == 48);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, content_width) == 56);
-const _: () = assert!(mem::offset_of!(MmltkWorkspaceFrameSignalLayout, content_height) == 60);
+use mmltk_workspace_channel::graphics_abi::WorkspaceFrameSignal as MmltkWorkspaceFrameSignalLayout;
 
 struct MmltkWorkspaceFrameSignal {
     mapping: *mut MmltkWorkspaceFrameSignalLayout,
@@ -2065,7 +2041,8 @@ impl MmltkWorkspaceFrameSignal {
             libc::mmap(
                 ptr::null_mut(),
                 mem::size_of::<MmltkWorkspaceFrameSignalLayout>(),
-                libc::PROT_READ,
+                // Atomic references require writable mapping validity; this reader only loads.
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 descriptor.as_raw_fd(),
                 0,
@@ -2080,21 +2057,20 @@ impl MmltkWorkspaceFrameSignal {
     }
 
     fn read(&self) -> Option<MmltkWorkspaceFrameSnapshot> {
-        let signal = unsafe { &*self.mapping };
         for _ in 0..4 {
-            let begin = signal.sequence_lock.load(Ordering::SeqCst);
+            let begin = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).sequence_lock)).load(Ordering::SeqCst) };
             if begin & 1 != 0 {
                 continue;
             }
-            let timeline_ready = signal.timeline_ready.load(Ordering::SeqCst);
-            let transfer_sequence = signal.transfer_sequence.load(Ordering::SeqCst);
-            let layer = signal.layer.load(Ordering::SeqCst);
-            let content_session = signal.content_session.load(Ordering::SeqCst);
-            let content_sequence = signal.content_sequence.load(Ordering::SeqCst);
-            let presentation_revision = signal.presentation_revision.load(Ordering::SeqCst);
-            let content_width = signal.content_width.load(Ordering::SeqCst);
-            let content_height = signal.content_height.load(Ordering::SeqCst);
-            let end = signal.sequence_lock.load(Ordering::SeqCst);
+            let timeline_ready = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).timeline_ready)).load(Ordering::SeqCst) };
+            let transfer_sequence = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).transfer_sequence)).load(Ordering::SeqCst) };
+            let layer = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).layer)).load(Ordering::SeqCst) };
+            let content_session = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).content_session)).load(Ordering::SeqCst) };
+            let content_sequence = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).content_sequence)).load(Ordering::SeqCst) };
+            let presentation_revision = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).presentation_revision)).load(Ordering::SeqCst) };
+            let content_width = unsafe { AtomicU32::from_ptr(ptr::addr_of_mut!((*self.mapping).content_width)).load(Ordering::SeqCst) };
+            let content_height = unsafe { AtomicU32::from_ptr(ptr::addr_of_mut!((*self.mapping).content_height)).load(Ordering::SeqCst) };
+            let end = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).sequence_lock)).load(Ordering::SeqCst) };
             if begin == end
                 && end & 1 == 0
                 && timeline_ready & 1 != 0

@@ -24,6 +24,7 @@ struct SystemImageRuntimeConfig final {
     ImageProductLayout input_layout = ImageProductLayout::Clean;
     ImageProductLayout output_layout = ImageProductLayout::Clean;
     std::size_t output_buffer_count = 1U;
+    ImageWorkspaceFinalize workspace_finalize{};
     int numa_node = -1;
     std::optional<DeviceExecution> execution{};
     std::shared_ptr<ImageProductRevisionSequence> product_revisions{std::make_shared<ImageProductRevisionSequence>()};
@@ -79,6 +80,11 @@ class SystemImageRuntime final {
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
+    [[nodiscard]] std::shared_ptr<ImageWorkspace> CreateWorkspace(ImageWorkspaceLayout, std::optional<DeviceExecution> display_execution = {});
+    void ConfigureWorkspace(OutputCandidate&, std::shared_ptr<ImageWorkspace>);
+    void PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
+    void FinalizeWorkspace(OutputCandidate&, ImageWorkspaceCoverage = {});
+    [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     void SelectOutput(const CompletedOutput&);
     // Wake-only; never execute CUDA/product work from this notification.
     void SetOutputAvailableSink(std::function<void()>);

@@ -2,6 +2,7 @@
 #include "src/controller/browser/application_outer_routing_emitter.h"
 #include "src/controller/browser/application_visual_projection_emitter.h"
 #include "src/controller/browser/application_schema.h"
+#include "src/controller/browser/application_workspace_abi_emitter.h"
 
 #include <algorithm>
 #include <array>
@@ -1588,10 +1589,13 @@ class TemporaryOutput final {
 }  // namespace
 
 int main(const int argument_count, char* const* const arguments) {
-    if (argument_count != 3 || arguments[1] == nullptr || std::string_view(arguments[1]).empty() || arguments[2] == nullptr ||
-        std::string_view(arguments[2]).empty())
+    if (argument_count != 4 || arguments[1] == nullptr || std::string_view(arguments[1]).empty() || arguments[2] == nullptr ||
+        std::string_view(arguments[2]).empty() || arguments[3] == nullptr || std::string_view(arguments[3]).empty())
         return EXIT_FAILURE;
     try {
+        const std::filesystem::path graphics_destination(arguments[3]);
+        std::filesystem::create_directories(graphics_destination.parent_path());
+        TemporaryOutput graphics_temporary(graphics_destination.string() + ".tmp." + std::to_string(::getpid()));
         const std::filesystem::path destination(arguments[1]);
         const std::filesystem::path protocol_marker_destination(arguments[2]);
         std::filesystem::create_directories(destination.parent_path());
@@ -1612,6 +1616,15 @@ int main(const int argument_count, char* const* const arguments) {
             output.flush();
             if (!output) throw std::runtime_error("cannot write generated protocol marker");
         }
+        {
+            std::ofstream output(graphics_temporary.path(), std::ios::binary | std::ios::trunc);
+            if (!output) throw std::runtime_error("cannot open temporary graphics output");
+            mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
+            output.flush();
+            if (!output) throw std::runtime_error("cannot write generated graphics declarations");
+        }
+        std::filesystem::rename(graphics_temporary.path(), graphics_destination);
+        graphics_temporary.Released();
         std::filesystem::rename(temporary.path(), destination);
         temporary.Released();
         std::filesystem::rename(protocol_marker_temporary.path(), protocol_marker_destination);

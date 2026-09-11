@@ -1,4 +1,5 @@
 #include "src/controller/browser/application_schema.h"
+#include "src/controller/browser/application_workspace_abi_emitter.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_outer_routing_emitter.h"
 #include "src/controller/browser/application_visual_projection_emitter.h"
@@ -1285,3 +1286,17 @@ TEST_CASE("protocol-15 Bootstrap contains fingerprint and current snapshots only
 
 }  // namespace
 }  // namespace mmltk::controller::browser
+
+TEST_CASE("Workspace graphics projection derives every native field offset without application codecs", "[browser][workspace][generation]") {
+    std::ostringstream output;
+    mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
+    const auto generated = output.str();
+    CHECK(generated.find("pub const ABI_VERSION: u32 = 9;") != std::string::npos);
+    CHECK(generated.find("pub opcode: u32") != std::string::npos);
+    CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
+    CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);
+    CHECK(generated.find("offset_of!(Record, presentation_revision) == 64") != std::string::npos);
+    CHECK(generated.find("Atomic") == std::string::npos);
+    CHECK(generated.find("cbor") == std::string::npos);
+    CHECK(generated.find("application_bindings") == std::string::npos);
+}

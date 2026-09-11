@@ -55,6 +55,9 @@ target_link_libraries(mmltk_controller_browser_direct
         mmltk::controller::application_runtime)
 mmltk_register_header_isolation(mmltk_controller_browser_direct)
 
+set(MMLTK_WORKSPACE_GRAPHICS_ABI
+    "${CMAKE_BINARY_DIR}/generated/frontend/iced/workspace_graphics_abi.rs"
+    CACHE INTERNAL "Canonical generated native graphics layout")
 set(MMLTK_APPLICATION_BINDINGS
     "${CMAKE_BINARY_DIR}/generated/frontend/iced/application_bindings.rs"
     CACHE INTERNAL "Canonical generated Rust application bindings")
@@ -72,7 +75,7 @@ add_executable(mmltk_application_binding_generator EXCLUDE_FROM_ALL)
 mmltk_register_ordinary_sources(
     mmltk_application_binding_generator application_binding_generator.cpp)
 mmltk_register_private_headers(
-    mmltk_application_binding_generator application_outer_routing_emitter.h application_visual_projection_emitter.h)
+    mmltk_application_binding_generator application_outer_routing_emitter.h application_visual_projection_emitter.h application_workspace_abi_emitter.h)
 mmltk_configure_component(
     mmltk_application_binding_generator PRIVATE_DECLARATIONS)
 target_link_libraries(
@@ -84,24 +87,31 @@ add_custom_command(
     OUTPUT
         "${MMLTK_APPLICATION_BINDINGS}"
         "${MMLTK_BROWSER_PROTOCOL_MARKER}"
+        "${MMLTK_WORKSPACE_GRAPHICS_ABI}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${CMAKE_BINARY_DIR}/generated/frontend/iced"
     COMMAND "$<TARGET_FILE:mmltk_application_binding_generator>"
             "${MMLTK_APPLICATION_BINDINGS}"
             "${MMLTK_BROWSER_PROTOCOL_MARKER}"
+            "${MMLTK_WORKSPACE_GRAPHICS_ABI}"
     DEPENDS
         mmltk_application_binding_generator
         application_stable_identity.h
         application_schema.h
         application_outer_routing_emitter.h
         application_visual_projection_emitter.h
+        application_workspace_abi_emitter.h
+        ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_surface_import_abi.h
+        ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_frame_signal.h
+        ${CMAKE_SOURCE_DIR}/src/controller/presentation/workspace_presentation_types.h
         application_materializer.h
         ${CMAKE_SOURCE_DIR}/src/controller/contracts/application_systems.h
     VERBATIM)
 add_custom_target(mmltk_generate_application_bindings
     DEPENDS
         "${MMLTK_APPLICATION_BINDINGS}"
-        "${MMLTK_BROWSER_PROTOCOL_MARKER}")
+        "${MMLTK_BROWSER_PROTOCOL_MARKER}"
+        "${MMLTK_WORKSPACE_GRAPHICS_ABI}")
 
 add_executable(mmltk_controller_browser_protocol_v15_fixture EXCLUDE_FROM_ALL)
 mmltk_register_ordinary_sources(
@@ -141,7 +151,8 @@ function(mmltk_add_controller_browser_tests)
     mmltk_register_private_headers(
         mmltk_controller_browser_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_outer_routing_emitter.h
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_visual_projection_emitter.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_visual_projection_emitter.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_workspace_abi_emitter.h)
     mmltk_configure_component(
         mmltk_controller_browser_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_browser_tests PRIVATE
