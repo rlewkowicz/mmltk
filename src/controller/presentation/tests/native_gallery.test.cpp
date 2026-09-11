@@ -180,6 +180,14 @@ struct GalleryEvidence final {
             if (fact.operation == VisualDiagnosticOperation::ExploreRenderSubmitted && fact.context.condition != 0U) ++count;
         return count;
     }
+    [[nodiscard]] std::vector<std::uint64_t> ReadAdmissions(const std::uint64_t generation) {
+        std::scoped_lock lock(mutex);
+        std::vector<std::uint64_t> images;
+        for (const auto& fact : facts)
+            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == generation)
+                images.push_back(fact.detail);
+        return images;
+    }
     [[nodiscard]] VisualDiagnosticSink Sink() {
         return {.context = this,
                 .write =
@@ -560,6 +568,16 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
         directory.Commit();
         return runtime.CommitOutput(std::move(output));
     };
+    const auto check_selected = [&](const unsigned char value) {
+        auto selected = runtime.Borrow();
+        REQUIRE(selected.valid());
+        CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == value);
+        static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
+        CHECK(directory.Contains(0U, meaning, 0U));
+        CHECK(directory.Empty(1U, true));
+        CHECK(directory.Empty(2U, false));
+        directory.Commit();
+    };
     auto first = publish(17U);
     auto second = publish(33U);
     auto incumbent = publish(49U);
@@ -575,16 +593,7 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
     CHECK_THROWS(runtime.Publish(candidate, 24U, 8U, [&](auto, auto, auto) { entered = true; }));
     CHECK_FALSE(entered);
     CHECK(runtime.Completed().revision() == incumbent.revision());
-    {
-        auto selected = runtime.Borrow();
-        REQUIRE(selected.valid());
-        CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == 49U);
-        static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
-        CHECK(directory.Contains(0U, meaning, 0U));
-        CHECK(directory.Empty(1U, true));
-        CHECK(directory.Empty(2U, false));
-        directory.Commit();
-    }
+    check_selected(49U);
     directory.Rollback();
     candidate = {};
     candidate = runtime.TryAcquireOutput(baseline);
@@ -611,16 +620,11 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
     CHECK(replacement.valid());
     CHECK(second.valid());
     CHECK(runtime.Completed().revision() == replacement.revision());
-    auto selected = runtime.Borrow();
-    REQUIRE(selected.valid());
-    static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
-    CHECK(directory.Contains(0U, meaning, 0U));
-    CHECK(directory.Empty(1U, true));
-    CHECK(directory.Empty(2U, false));
-    CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == 71U);
-    directory.Commit();
+    check_selected(71U);
 }
 
+// CLEANUP-IGNORE: These independent gallery-return and initialization-rollback cases share only CUDA availability and dataset fixture
+// setup.
 TEST_CASE("Native gallery return selects its actual completed product and resumes partial demand", "[explore][native][atlas][detail]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1002,16 +1006,10 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
     CHECK(gallery.Begin().remaining_tiles == 4U);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     {
-        std::scoped_lock lock(gallery.evidence.mutex);
-        const auto admitted = std::ranges::find_if(gallery.evidence.facts, [&](const auto& fact) {
-            return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation;
-        });
-        REQUIRE(admitted != gallery.evidence.facts.end());
-        CHECK(admitted->detail == 40U);
-        CHECK(std::ranges::none_of(gallery.evidence.facts, [&](const auto& fact) {
-            return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation &&
-                   (fact.detail < 40U || fact.detail >= 44U);
-        }));
+        const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
+        REQUIRE_FALSE(admitted.empty());
+        CHECK(admitted.front() == 40U);
+        CHECK(std::ranges::all_of(admitted, [](const auto image) { return image >= 40U && image < 44U; }));
     }
     held.Release();
     gallery.Drain();
@@ -1157,12 +1155,9 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.publications == cold_publications);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     {
-        std::scoped_lock lock(gallery.evidence.mutex);
-        const auto first = std::ranges::find_if(gallery.evidence.facts, [&](const auto& fact) {
-            return fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == gallery.plan.generation;
-        });
-        REQUIRE(first != gallery.evidence.facts.end());
-        CHECK(first->detail == *gallery.plan.focused_image);
+        const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
+        REQUIRE_FALSE(admitted.empty());
+        CHECK(admitted.front() == *gallery.plan.focused_image);
     }
     gallery.Drain();
 

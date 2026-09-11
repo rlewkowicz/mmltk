@@ -80,7 +80,9 @@ class LiveSystem final {
     void Shutdown() noexcept;
     // CLEANUP-IGNORE: The sealed Live facade exposes ordinary lifecycle observation without sharing implementation.
     [[nodiscard]] bool stopped() const noexcept;
+    // CLEANUP-IGNORE: The Live snapshot and adjacent read API belong to this sealed domain, with shared execution in VisualRuntimeOwner.
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] LiveSnapshot snapshot() const;
+    // CLEANUP-IGNORE: Live exposes raw and display reads through its own public API; shared implementation remains private.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;

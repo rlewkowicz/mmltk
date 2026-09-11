@@ -1091,6 +1091,7 @@ TEST_CASE("native application fingerprint contribution changes with an inherited
 
     const auto inherited = inherited_field_contribution.template operator()<InheritedSystems, InheritedRequestBase>();
     const auto repeated = inherited_field_contribution.template operator()<InheritedSystems, InheritedRequestBase>();
+    // CLEANUP-IGNORE: This independent schema-change oracle is unrelated to the import-channel provenance field assertions.
     const auto changed = inherited_field_contribution.template operator()<ChangedInheritedSystems, ChangedInheritedRequestBase>();
     CHECK(inherited.endpoint_id == repeated.endpoint_id);
     CHECK(inherited.field_id == repeated.field_id);

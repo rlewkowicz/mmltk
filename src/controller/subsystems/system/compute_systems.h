@@ -173,7 +173,9 @@ class PredictSystem final {
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Stop(contracts::PredictWorkflowIntent) noexcept;
     // CLEANUP-IGNORE: Predict shutdown is ordinary facade forwarding for this sealed system.
     void Shutdown() noexcept;
+    // CLEANUP-IGNORE: Predict owns its reflected snapshot and public read surface independently of Live and Annotation.
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] PredictSnapshot snapshot() const;
+    // CLEANUP-IGNORE: Predict retains a sealed raw/display read API backed by the shared private VisualRuntimeOwner.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;

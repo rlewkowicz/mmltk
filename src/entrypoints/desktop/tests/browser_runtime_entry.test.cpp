@@ -188,20 +188,16 @@ TEST_CASE("browser runtime entry redirects Firefox logs and returns startup fail
     CHECK(log_text.find("mmltk fake Firefox stdout\n") != std::string::npos);
     CHECK(log_text.find("mmltk fake Firefox stderr\n") != std::string::npos);
 
-    TemporaryFirefoxLog persistence_refusal;
-    std::filesystem::create_directories(persistence_refusal.directory() / ".mmltk-data" / "gui.json");
-    const EntryResult refused_settings = run_entry(entry, {}, persistence_refusal.directory(), healthy_firefox);
-    REQUIRE(refused_settings.terminal == EntryTerminal::Reaped);
-    REQUIRE(refused_settings.exited());
-    CHECK(refused_settings.exit_code() != 0);
-    CHECK(std::filesystem::file_size(persistence_refusal.directory() / "native-output.txt") == 0U);
-
-    TemporaryFirefoxLog firefox_refusal;
-    const EntryResult refused_firefox = run_entry(entry, {}, firefox_refusal.directory(), invalid_firefox);
-    REQUIRE(refused_firefox.terminal == EntryTerminal::Reaped);
-    REQUIRE(refused_firefox.exited());
-    CHECK(refused_firefox.exit_code() != 0);
-    CHECK(std::filesystem::file_size(firefox_refusal.directory() / "native-output.txt") == 0U);
+    for (const bool refuse_settings : {false, true}) {
+        CAPTURE(refuse_settings);
+        TemporaryFirefoxLog refusal;
+        if (refuse_settings) std::filesystem::create_directories(refusal.directory() / ".mmltk-data" / "gui.json");
+        const EntryResult refused = run_entry(entry, {}, refusal.directory(), refuse_settings ? healthy_firefox : invalid_firefox);
+        REQUIRE(refused.terminal == EntryTerminal::Reaped);
+        REQUIRE(refused.exited());
+        CHECK(refused.exit_code() != 0);
+        CHECK(std::filesystem::file_size(refusal.directory() / "native-output.txt") == 0U);
+    }
 }
 
 TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing", "[gui][browser-runtime][entry][pixel]") {

@@ -165,6 +165,7 @@ class NativeExploreAudit final {
     }  // CLEANUP-IGNORE: The wait terminator and independent scalar observation getters are not a repeated operation.
 
     void RequireRetainedReady(const bool enabled) noexcept { require_retained_ready_.store(enabled, std::memory_order_release); }
+    // CLEANUP-IGNORE: Retained-ready loss is an independent atomic observation, not a repeated multi-field mapping.
     [[nodiscard]] bool LostRetainedReady() const noexcept { return lost_retained_ready_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t ReadAdmissions() const noexcept { return read_admissions_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t first_ready_frame() const noexcept { return first_ready_frame_.load(std::memory_order_acquire); }
@@ -195,10 +196,12 @@ class NativeExploreAudit final {
         return failure_detail_;
         // CLEANUP-IGNORE: This accessor boundary does not begin a repeated operation across the following getters.
     }
+    // CLEANUP-IGNORE: Augmentation counters are named atomic observations with independent meaning and storage.
     [[nodiscard]] std::uint64_t augmentation_count() const noexcept {
         // CLEANUP-IGNORE: Scalar audit getters observe distinct facts rather than repeating a field mapping.
         return augmentation_count_.load(std::memory_order_acquire);
     }
+    // CLEANUP-IGNORE: Seed and donor observations remain direct named getters rather than a runtime field registry.
     [[nodiscard]] std::uint64_t last_augmentation_seed() const noexcept { return last_augmentation_seed_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_valid_donors() const noexcept { return last_valid_donors_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_planned_pastes() const noexcept { return last_planned_pastes_.load(std::memory_order_acquire); }

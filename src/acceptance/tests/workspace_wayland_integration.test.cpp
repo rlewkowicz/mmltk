@@ -547,7 +547,11 @@ struct SurfaceAudit final {
     struct SourceState final {
         unsigned native_stage = 0U;
         unsigned browser_stage = 0U;
+        // CLEANUP-IGNORE: This independent source lifecycle oracle compares native and browser evidence; it cannot reuse their production
+        // schema.
         bool failed = false;
+        // CLEANUP-IGNORE: Independent observed source dimensions and allocation identity are acceptance evidence, not shared runtime
+        // storage.
         std::uint64_t generation = 0U;
         std::uint64_t width = 0U;
         std::uint64_t height = 0U;
@@ -2883,6 +2887,11 @@ struct AtlasDrawAudit final {
         "content_width",   "content_height", "dataset_identity", "gallery_generation",
         "columns",         "rows",           "first_row",        "matching_count",
         "visible_indices", "row_capacity",   "row_origin",       "card_extent"};
+    static constexpr std::initializer_list<const char*> image_fields{
+        "surface",         "generation",  "width",           "height",          "presentation_revision", "frame_revision",
+        "content_session", "source_kind", "source_instance", "source_revision", "content_width",         "content_height",
+        "columns",         "rows",        "first_row",       "matching_count",  "visible_indices",       "row_capacity",
+        "row_origin",      "card_extent"};
     std::map<SourceKey, nlohmann::json> sources;
     std::map<std::pair<std::uint64_t, std::uint64_t>, SourceKey> sessions;
     std::map<SampleKey, nlohmann::json> acquisitions;
@@ -3009,30 +3018,7 @@ struct AtlasDrawAudit final {
             return;
         }
         bool matching = stages.size() < names.size() && name == names[stages.size()] && last_draw &&
-                        same_fields(record, *last_draw,
-                                    {"surface",
-                                     "generation",
-                                     "width",
-                                     "height",
-                                     "presentation_revision",
-                                     "frame_revision",
-                                     "content_session",
-                                     "source_kind",
-                                     "source_instance",
-                                     "source_revision",
-                                     "content_width",
-                                     "content_height",
-                                     "columns",
-                                     "rows",
-                                     "first_row",
-                                     "matching_count",
-                                     "visible_indices",
-                                     "bounds",
-                                     "image",
-                                     "clip",
-                                     "row_capacity",
-                                     "row_origin",
-                                     "card_extent"});
+                        same_fields(record, *last_draw, image_fields) && same_fields(record, *last_draw, {"bounds", "image", "clip"});
         const auto allocation = allocation_key(record);
         matching = matching && (!staged_allocation || *staged_allocation == allocation);
         if (matching) {
@@ -3169,29 +3155,8 @@ struct AtlasDrawAudit final {
                         width / columns == scalar(record, "card_extent") && width % columns == 0U &&
                         height == scalar(record, "row_capacity") * scalar(record, "card_extent");
         if (matching) {
-            matching = same_fields(record, source->second, source_fields) && same_fields(record, capture->second,
-                                                                                         {"content_session",
-                                                                                          "source_kind",
-                                                                                          "source_instance",
-                                                                                          "source_revision",
-                                                                                          "surface",
-                                                                                          "generation",
-                                                                                          "width",
-                                                                                          "height",
-                                                                                          "presentation_revision",
-                                                                                          "frame_revision",
-                                                                                          "layer",
-                                                                                          "slot",
-                                                                                          "content_width",
-                                                                                          "content_height",
-                                                                                          "columns",
-                                                                                          "rows",
-                                                                                          "first_row",
-                                                                                          "matching_count",
-                                                                                          "visible_indices",
-                                                                                          "row_capacity",
-                                                                                          "row_origin",
-                                                                                          "card_extent"});
+            matching = same_fields(record, source->second, source_fields) && same_fields(record, capture->second, image_fields) &&
+                       same_fields(record, capture->second, {"layer", "slot"});
             const auto& image = record["image"];
             const auto& bounds = record["bounds"];
             matching = matching &&
@@ -6326,6 +6291,13 @@ constexpr std::array browser_surface_events{"firefox.workspace.admitted",
                                             "firefox.workspace.retired"};
 constexpr std::size_t browser_live_stages = 16U;
 
+void record_source_transfer(SurfaceAudit& audit) {
+    for (std::size_t stage = 0U; stage < 15U; ++stage)
+        audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < 9U; ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+}
+
 void record_receiver_withdrawal(SurfaceAudit& audit) {
     for (std::size_t index = 0U; index < 6U; ++index)
         audit.browser(browser_surface_record(browser_surface_events[index]));
@@ -7194,10 +7166,7 @@ TEST_CASE("Source publication joins survive independent drains and retirement be
 
 TEST_CASE("Capacity retry preserves logical publication with a new physical source transfer", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (std::size_t stage = 0U; stage < 15U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (std::size_t stage = 0U; stage < 9U; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    record_source_transfer(audit);
     // This first physical attempt returned the source read without a sample.
     auto released = browser_surface_record("firefox.workspace.frame_released");
     audit.browser(released);
@@ -7230,10 +7199,7 @@ TEST_CASE("Capacity retry preserves logical publication with a new physical sour
 TEST_CASE("Release-only settlement requires positive exact transfer evidence", "[workspace][audit]") {
     for (const std::string_view fault : {"none", "missing", "wrong-transfer", "wrong-content", "wrong-source"}) {
         SurfaceAudit audit;
-        for (std::size_t stage = 0U; stage < 15U; ++stage)
-            audit.native(native_surface_record(native_surface_events[stage]));
-        for (std::size_t stage = 0U; stage < 9U; ++stage)
-            audit.browser(browser_surface_record(browser_surface_events[stage]));
+        record_source_transfer(audit);
         auto record = browser_surface_record("firefox.workspace.frame_released");
         if (fault == "wrong-transfer") record["transfer_sequence"] = 2U;
         if (fault == "wrong-content") record["content_sequence"] = 24U;
@@ -7245,10 +7211,7 @@ TEST_CASE("Release-only settlement requires positive exact transfer evidence", "
 
 TEST_CASE("Detached pre-metadata release joins physical custody without inventing sample dimensions", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (std::size_t stage = 0U; stage < 15U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (std::size_t stage = 0U; stage < 9U; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    record_source_transfer(audit);
     audit.browser(browser_surface_record("firefox.workspace.source.withdrawal"));
     auto completion = browser_surface_record("firefox.workspace.frame_released");
     for (const auto* field : {"width", "height", "content_width", "content_height", "layer", "slot", "timeline_ready", "timeline_release"})

@@ -1485,12 +1485,20 @@ TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admi
     CHECK(runtime.Retire().safe_to_destroy);
 }
 
+struct WorkspaceRuntimeFixture final {
+    std::shared_ptr<FakeImageBackend> backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime{{.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}}};
+
+    WorkspaceRuntimeFixture() {
+        test_support::ImageWorkspaceTestAccess::Reset();
+        test_support::ImageWorkspaceTestAccess::Install(runtime);
+    }
+};
+
 TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the runtime", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
-    ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
-    ImageWorkspaceTestAccess::Install(runtime);
+    WorkspaceRuntimeFixture fixture;
+    auto& runtime = fixture.runtime;
     auto candidate = runtime.AcquireOutput();
     auto first = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     first->Admit(first->identity(), first->layout().device_incarnation);
@@ -1541,10 +1549,8 @@ TEST_CASE("Delayed workspace release reports physical failure through retained r
 
 TEST_CASE("Late workspace preparation stays pending through raw and counted access", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
-    ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
-    ImageWorkspaceTestAccess::Install(runtime);
+    WorkspaceRuntimeFixture fixture;
+    auto& runtime = fixture.runtime;
     runtime.Publish(4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
     auto observed = runtime.ObserveWorkspace();
     REQUIRE(observed.product_revision != 0U);
@@ -1621,10 +1627,8 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
 
 TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA in the callback", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
-    ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
-    ImageWorkspaceTestAccess::Install(runtime);
+    WorkspaceRuntimeFixture fixture;
+    auto& runtime = fixture.runtime;
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto candidate = runtime.AcquireOutput();
@@ -1643,7 +1647,7 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
     completion->Complete();
     CHECK(notifications.load() == before);
     CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 0U);
-    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(fixture.backend->contexts_destroyed == 0U);
     CHECK_FALSE(retirement.custody.FinishRetirement().completion_reached);
     completion.reset();
     CHECK(notifications.load() > before);

@@ -29,6 +29,7 @@ struct DiagnosticSource final {
     // CLEANUP-IGNORE: Trace source identity scalars cannot share storage with unrelated physical geometry records.
     std::uint64_t source_session = 0U;
     std::uint64_t source_instance = 0U;
+    // CLEANUP-IGNORE: Source revision and adjacent source/demand fields are canonical trace facts, not physical layout storage.
     std::uint64_t source_revision = 0U;
     std::uint64_t clean_revision = 0U;
     std::uint64_t source_observation_revision = 0U;
@@ -46,14 +47,19 @@ struct DiagnosticPublication final {
     std::uint64_t presentation_revision = 0U;
 };
 struct DiagnosticAllocation final {
+    // CLEANUP-IGNORE: Allocation identity and the following workspace schema are independent reflected records, not a repeated
+    // implementation.
     std::uint64_t allocation_generation = 0U;
 };
 struct DiagnosticWorkspace final {
+    // CLEANUP-IGNORE: Workspace provenance is its canonical reflected schema; ABI and acceptance inventories retain separate ownership.
     std::uint64_t workspace_source_high = 0U;
     std::uint64_t workspace_source_low = 0U;
     std::uint64_t workspace_allocation = 0U;
     std::uint64_t workspace_arena_high = 0U;
+    // CLEANUP-IGNORE: Workspace arena identity and byte layout are unrelated to the CUDA probe ABI and admission demand fields.
     std::uint64_t workspace_arena_low = 0U;
+    // CLEANUP-IGNORE: Workspace byte geometry and admission priority have distinct meanings from pixel evidence and trace capacity.
     std::uint64_t workspace_bytes = 0U;
     std::uint64_t workspace_pitch = 0U;
     std::uint64_t workspace_width = 0U;
@@ -95,6 +101,7 @@ struct DiagnosticPixel final {
 };
 // CLEANUP-IGNORE: DiagnosticContext is the canonical heterogeneous trace envelope, not a kernel ABI.
 struct DiagnosticContext final {
+    // CLEANUP-IGNORE: The diagnostic capacity envelope is not interchangeable with a scheduler lane or an external image ABI.
     std::uint64_t capacity_width = 0U;
     // CLEANUP-IGNORE: Trace capacity fields are not interchangeable with source or crop geometry.
     std::uint64_t capacity_height = 0U;
@@ -102,6 +109,7 @@ struct DiagnosticContext final {
     std::uint64_t cache_bytes = 0U;
     std::uint64_t descriptor_bytes = 0U;
     std::uint64_t gpu_bytes = 0U;
+    // CLEANUP-IGNORE: Augmentation capacity and source selection are diagnostic facts, not a physical source admission record.
     std::uint64_t augmentation_device_bytes = 0U;
     std::uint64_t augmentation_pinned_bytes = 0U;
     std::uint64_t surface_high = 0U;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stop_token>
 #include <vector>
 
@@ -54,6 +55,7 @@ class ImageProductPool final {
         Product(std::shared_ptr<Slot>, std::uint64_t) noexcept;
         void Retain();
         void Release() noexcept;
+        [[nodiscard]] std::unique_lock<std::mutex> LockWorkspace() const;
         std::shared_ptr<Slot> slot_;
         std::uint64_t revision_ = 0U;
         friend class ImageProductPool;

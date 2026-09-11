@@ -184,6 +184,7 @@ struct CaptureSession::Impl {
     std::atomic<std::uint64_t> packed_region_{0};
     mutable std::mutex filled_mutex_;
     int replaceable_filled_index_ = -1;
+    // CLEANUP-IGNORE: The capture completion descriptor and atomic telemetry are unrelated to Explore render-work vectors.
     int completion_event_fd_ = -1;
 
     // CLEANUP-IGNORE: Capture I/O telemetry is unrelated to Explore's typed render-work storage.

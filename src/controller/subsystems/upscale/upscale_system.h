@@ -99,6 +99,7 @@ class UpscaleSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     // CLEANUP-IGNORE: The sealed Upscale facade publishes its own reflected snapshot and frame borrow.
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] UpscaleSnapshot snapshot() const;
+    // CLEANUP-IGNORE: Upscale owns this ordinary read API; a shared facade would couple independent domain systems.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;

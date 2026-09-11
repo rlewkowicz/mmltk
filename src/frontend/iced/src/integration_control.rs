@@ -1341,6 +1341,16 @@ pub struct AtlasDraw {
     pub clip: Rectangle,
 }
 
+impl AtlasDraw {
+    fn visible_slot(&self, compiled_index: u32) -> Option<usize> {
+        self.snapshot
+            .order
+            .visibleindices
+            .iter()
+            .position(|value| *value == compiled_index)
+    }
+}
+
 pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
     let snapshot = draw.snapshot.clone();
     let frame = draw.surface.frame.expect("encoded atlas frame");
@@ -3261,6 +3271,12 @@ impl Controller {
     fn invalidate_atlas_draw(&mut self) {
         // The next ordinary physical draw can arm the same frame at settled geometry.
         SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None);
+    }
+
+    fn confirmed_atlas(&self, snapshot: &crate::generated::ExploreSnapshot) -> Option<&AtlasDraw> {
+        self.atlas_pixels.as_ref().filter(|draw| {
+            draw.snapshot.frame == snapshot.frame && self.atlas_receipt.as_ref() == Some(*draw)
+        })
     }
 
     pub(crate) fn accepts_message(&self, message: &Message) -> bool {
@@ -6968,19 +6984,10 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
-                let Some(slot) = draw
-                    .snapshot
-                    .order
-                    .visibleindices
-                    .iter()
-                    .position(|value| *value == index)
-                else {
+                let Some(slot) = draw.visible_slot(index) else {
                     self.fail("held read is not an immediate visible image");
                     return Task::none();
                 };
@@ -7083,19 +7090,10 @@ impl Controller {
                 if snapshot.mode != crate::generated::ExploreMode::Gallery {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
-                let Some(slot) = draw
-                    .snapshot
-                    .order
-                    .visibleindices
-                    .iter()
-                    .position(|value| *value == index)
-                else {
+                let Some(slot) = draw.visible_slot(index) else {
                     return Task::none();
                 };
                 if draw.snapshot.gallery.slots.get(slot) != Some(&false) {
@@ -7122,11 +7120,10 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && draw.snapshot.viewport == snapshot.viewport
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
+                    .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
+                else {
                     return Task::none();
                 };
                 crate::presentation_surface::trace_atlas_stage(
@@ -7150,19 +7147,10 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
-                let Some(slot) = draw
-                    .snapshot
-                    .order
-                    .visibleindices
-                    .iter()
-                    .position(|value| *value == index)
-                else {
+                let Some(slot) = draw.visible_slot(index) else {
                     return Task::none();
                 };
                 if draw.snapshot.gallery.slots.get(slot) != Some(&false) {
@@ -7186,19 +7174,10 @@ impl Controller {
                 if snapshot.busy {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
-                let Some(slot) = draw
-                    .snapshot
-                    .order
-                    .visibleindices
-                    .iter()
-                    .position(|value| *value == index)
-                else {
+                let Some(slot) = draw.visible_slot(index) else {
                     return Task::none();
                 };
                 if draw.snapshot.gallery.slots.get(slot) != Some(&true) {
@@ -7267,10 +7246,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
                 if matches!(self.phase, Phase::AwaitAtlasAwayReturn) {
@@ -7342,10 +7318,7 @@ impl Controller {
                 if snapshot.busy || model.has_explore_pending() {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self.confirmed_atlas(snapshot) else {
                     return Task::none();
                 };
                 let ready = draw.surface.frame.expect("drawn capacity retry");
@@ -7426,11 +7399,10 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
-                    draw.snapshot.frame == snapshot.frame
-                        && draw.snapshot.viewport == snapshot.viewport
-                        && self.atlas_receipt.as_ref() == Some(*draw)
-                }) else {
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
+                    .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
+                else {
                     return Task::none();
                 };
                 crate::presentation_surface::trace_atlas_stage(

@@ -113,6 +113,7 @@ class SystemImageRuntime final {
     [[nodiscard]] UnsafeCustody Retain(std::exception_ptr, bool deferred = false) noexcept;
     [[nodiscard]] State& ActiveState();
     [[nodiscard]] const State& ActiveState() const;
+    [[nodiscard]] State& WorkspaceState(const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] std::uint64_t TakeProductRevision();
     std::shared_ptr<State> state_;
     std::shared_ptr<RetentionControl> retention_;

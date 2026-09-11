@@ -2476,24 +2476,21 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
         CHECK(persisted.filter == policy.filter);
         CHECK(persisted.overlay == policy.overlay);
     }
-    SECTION("Stop while the predecessor waits cancels both accepted stages") {
+    SECTION("Stop cancels waiting stages and preserves the last completed predecessor") {
+        const bool predecessor_settled = GENERATE(false, true);
+        CAPTURE(predecessor_settled);
+        auto completed_frame = incumbent.frame;
+        if (predecessor_settled) {
+            fixture.held[0U] = {};
+            REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().viewport.first_row == 0U; }));
+            completed_frame = explore.snapshot().frame;
+            fixture.probe.WaitIdle(5U);
+        }
         static_cast<void>(explore.Stop());
         fixture.held = {};
         explore.Shutdown();
         CHECK_FALSE(explore.snapshot().busy);
-        CHECK(explore.snapshot().frame == incumbent.frame);
-        CHECK(explore.snapshot().filter == incumbent.filter);
-    }
-    SECTION("Stop after the predecessor settles cancels only the waiting filter") {
-        fixture.held[0U] = {};
-        REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().viewport.first_row == 0U; }));
-        const auto predecessor = explore.snapshot();
-        fixture.probe.WaitIdle(5U);
-        static_cast<void>(explore.Stop());
-        fixture.held = {};
-        explore.Shutdown();
-        CHECK_FALSE(explore.snapshot().busy);
-        CHECK(explore.snapshot().frame == predecessor.frame);
+        CHECK(explore.snapshot().frame == completed_frame);
         CHECK(explore.snapshot().filter == incumbent.filter);
     }
     SECTION("ordinary predecessor failure settles before the admitted filter") {
@@ -7139,36 +7136,93 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
     }
 }
 
+class WorkspaceChannelFixture final {
+    using Record = presentation::detail::workspace_surface_import::Record;
+    using Opcode = presentation::detail::workspace_surface_import::Opcode;
+    using Id = presentation::WorkspaceSurfaceImportId;
+    mmltk::testsupport::ScopedTempDir root_{"workspace-channel"};
+
+   public:
+    presentation::WorkspaceSurfaceImportChannel channel{root_.path() / "import.sock"};
+    mmltk::common::io::ScopedFd peer = mmltk::testsupport::connect_workspace_surface_shell(root_.path() / "import.sock");
+
+    WorkspaceChannelFixture() {
+        channel.pump();
+        REQUIRE(channel.connected());
+    }
+
+    [[nodiscard]] static Record Layout(const Id id) {
+        return {.opcode = Opcode::ArenaReady,
+                .id_high = id.high,
+                .id_low = id.low,
+                .width = 4U,
+                .height = 3U,
+                .stride = 32U,
+                .size = 96U,
+                .device_incarnation = 5U,
+                .alignment = 32U,
+                .device_uuid = {1U},
+                .memory_type_bits = 1U};
+    }
+
+    [[nodiscard]] static Record Sample(const Id arena) {
+        return {.opcode = Opcode::Presented,
+                .id_high = arena.high,
+                .id_low = arena.low,
+                .stride = 7U,
+                .size = 8U,
+                .code = 1U,
+                .presentation_revision = 9U};
+    }
+
+    Record AdmitArena(const Id id, const std::uint64_t generation) {
+        const auto layout = Layout(id);
+        REQUIRE(channel.admit_arena(id, generation, layout.width, layout.height));
+        ExpectRecord(id, Opcode::Arena);
+        REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), layout));
+        channel.pump();
+        const auto outcome = channel.take_outcome();
+        REQUIRE(outcome.has_value());
+        CHECK(outcome->id == id);
+        REQUIRE(outcome->imported);
+        return layout;
+    }
+
+    void Withdraw(const Id id) {
+        REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+        ExpectRecord(id, Opcode::Drop);
+    }
+
+    void Retire(const Id id, const std::uint64_t generation) {
+        REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), {.opcode = Opcode::Retired, .id_high = id.high, .id_low = id.low}));
+        channel.pump();
+        const auto retired = channel.take_retirement();
+        REQUIRE(retired.has_value());
+        CHECK(retired->id == id);
+        CHECK(retired->generation == generation);
+    }
+
+   private:
+    void ExpectRecord(const Id id, const Opcode opcode) {
+        Record received{};
+        CHECK(mmltk::testsupport::receive_workspace_record(peer.get(), received).descriptor_count == 0U);
+        CHECK(received.opcode == opcode);
+        CHECK(received.id_high == id.high);
+        CHECK(received.id_low == id.low);
+    }
+};
+
 TEST_CASE("Retired source admission does not retire its occupied sample arena", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
     using mmltk::testsupport::send_workspace_record;
-    mmltk::testsupport::ScopedTempDir root{"independent-workspace-retirement"};
-    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
-    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
-    channel.pump();
+    WorkspaceChannelFixture fixture;
+    auto& channel = fixture.channel;
+    auto& peer = fixture.peer;
     const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
     const presentation::WorkspaceSurfaceImportId source{3U, 4U};
-    REQUIRE(channel.admit_arena(arena, 1U, 4U, 3U));
     abi::Record received{};
-    CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
-    CHECK(received.opcode == abi::Opcode::Arena);
-    abi::Record layout{.opcode = abi::Opcode::ArenaReady,
-                       .id_high = arena.high,
-                       .id_low = arena.low,
-                       .width = 4U,
-                       .height = 3U,
-                       .stride = 32U,
-                       .size = 96U,
-                       .device_incarnation = 5U,
-                       .alignment = 32U,
-                       .device_uuid = {1U},
-                       .memory_type_bits = 1U};
-    REQUIRE(send_workspace_record(peer.get(), layout));
-    channel.pump();
-    const auto arena_outcome = channel.take_outcome();
-    REQUIRE(arena_outcome.has_value());
-    REQUIRE(arena_outcome->imported);
+    const auto layout = fixture.AdmitArena(arena, 1U);
     auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
     auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
@@ -7209,90 +7263,29 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
         CHECK_FALSE(abi::valid(malformed));
     }
     CHECK_FALSE(channel.copy_completed(source, {7U, 8U}, 9U, 0U));
-    abi::Record sample{.opcode = abi::Opcode::Presented,
-                       .id_high = arena.high,
-                       .id_low = arena.low,
-                       .stride = 7U,
-                       .size = 8U,
-                       .code = 1U,
-                       .presentation_revision = 9U};
+    auto sample = WorkspaceChannelFixture::Sample(arena);
     REQUIRE(send_workspace_record(peer.get(), sample));
     channel.pump();
-    CHECK(channel.withdraw(source).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
-    static_cast<void>(receive_workspace_record(peer.get(), received));
-    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = source.high, .id_low = source.low}));
-    channel.pump();
-    const auto retired_source = channel.take_retirement();
-    REQUIRE(retired_source.has_value());
-    CHECK(retired_source->id == source);
+    fixture.Withdraw(source);
+    fixture.Retire(source, 2U);
     CHECK(channel.claimable(arena));
     CHECK_FALSE(channel.terminal_error());
-    CHECK(channel.withdraw(arena).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
-    static_cast<void>(receive_workspace_record(peer.get(), received));
+    fixture.Withdraw(arena);
     sample.opcode = abi::Opcode::Completed;
     REQUIRE(send_workspace_record(peer.get(), sample));
-    REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = arena.high, .id_low = arena.low}));
-    channel.pump();
-    const auto retired_arena = channel.take_retirement();
-    REQUIRE(retired_arena.has_value());
-    CHECK(retired_arena->id == arena);
+    fixture.Retire(arena, 1U);
     CHECK_FALSE(channel.terminal_error());
 }
 
 TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
-    using mmltk::testsupport::receive_workspace_record;
     using mmltk::testsupport::send_workspace_record;
-    mmltk::testsupport::ScopedTempDir root{"retained-arena-capacity"};
-    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
-    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
-    channel.pump();
-    abi::Record received{};
-    const auto admit = [&](presentation::WorkspaceSurfaceImportId id) {
-        REQUIRE(channel.admit_arena(id, id.high, 4U, 3U));
-        CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
-        CHECK(received.opcode == abi::Opcode::Arena);
-        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::ArenaReady,
-                                                   .id_high = id.high,
-                                                   .id_low = id.low,
-                                                   .width = 4U,
-                                                   .height = 3U,
-                                                   .stride = 32U,
-                                                   .size = 96U,
-                                                   .device_incarnation = 5U,
-                                                   .alignment = 32U,
-                                                   .device_uuid = {1U},
-                                                   .memory_type_bits = 1U}));
-        channel.pump();
-        const auto outcome = channel.take_outcome();
-        REQUIRE(outcome.has_value());
-        CHECK(outcome->id == id);
-        CHECK(outcome->imported);
-    };
-    const auto withdraw = [&](presentation::WorkspaceSurfaceImportId id) {
-        REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
-        static_cast<void>(receive_workspace_record(peer.get(), received));
-        CHECK(received.opcode == abi::Opcode::Drop);
-        CHECK(received.id_high == id.high);
-        CHECK(received.id_low == id.low);
-    };
-    const auto retire = [&](presentation::WorkspaceSurfaceImportId id) {
-        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = id.high, .id_low = id.low}));
-        channel.pump();
-        const auto retired = channel.take_retirement();
-        REQUIRE(retired.has_value());
-        CHECK(retired->id == id);
-        CHECK(retired->generation == id.high);
-    };
+    WorkspaceChannelFixture fixture;
+    auto& channel = fixture.channel;
+    auto& peer = fixture.peer;
     const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
-    admit(arena);
-    abi::Record sample{.opcode = abi::Opcode::Presented,
-                       .id_high = arena.high,
-                       .id_low = arena.low,
-                       .stride = 7U,
-                       .size = 8U,
-                       .code = 1U,
-                       .presentation_revision = 9U};
+    fixture.AdmitArena(arena, arena.high);
+    auto sample = WorkspaceChannelFixture::Sample(arena);
     REQUIRE(send_workspace_record(peer.get(), sample));
     sample.opcode = abi::Opcode::Completed;
     REQUIRE(send_workspace_record(peer.get(), sample));
@@ -7306,9 +7299,9 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
         // proves channel retention, not the native writer's GPU interleaving.
         for (std::uint64_t iteration = 2U; iteration <= 301U; ++iteration) {
             const presentation::WorkspaceSurfaceImportId unrelated{iteration, 3U};
-            admit(unrelated);
-            withdraw(unrelated);
-            retire(unrelated);
+            fixture.AdmitArena(unrelated, unrelated.high);
+            fixture.Withdraw(unrelated);
+            fixture.Retire(unrelated, unrelated.high);
             channel.pump();
             REQUIRE_FALSE(channel.terminal_error());
         }
@@ -7327,13 +7320,13 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
         CHECK(*ticket == arena);
     }
     SECTION("withdrawal clears its own ticket and ignores queued stale availability") {
-        withdraw(arena);
+        fixture.Withdraw(arena);
         REQUIRE(send_workspace_record(peer.get(), available));
-        retire(arena);
+        fixture.Retire(arena, arena.high);
     }
     SECTION("a replacement outcome cannot relabel a stale arena ticket") {
         const presentation::WorkspaceSurfaceImportId replacement{2U, 3U};
-        admit(replacement);
+        fixture.AdmitArena(replacement, replacement.high);
         const auto ticket = channel.take_capacity_wake();
         REQUIRE(ticket.has_value());
         CHECK(*ticket == arena);
@@ -7341,15 +7334,15 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
     }
     SECTION("old arena withdrawal cannot erase the replacement ticket") {
         const presentation::WorkspaceSurfaceImportId replacement{2U, 3U};
-        admit(replacement);
+        fixture.AdmitArena(replacement, replacement.high);
         auto replacement_available = available;
         replacement_available.id_high = replacement.high;
         replacement_available.id_low = replacement.low;
         REQUIRE(send_workspace_record(peer.get(), replacement_available));
         channel.pump();
-        withdraw(arena);
+        fixture.Withdraw(arena);
         REQUIRE(send_workspace_record(peer.get(), available));
-        retire(arena);
+        fixture.Retire(arena, arena.high);
         const auto ticket = channel.take_capacity_wake();
         REQUIRE(ticket.has_value());
         CHECK(*ticket == replacement);
@@ -7365,10 +7358,9 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
     using mmltk::testsupport::send_workspace_record;
-    mmltk::testsupport::ScopedTempDir root{"workspace-capability-churn"};
-    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
-    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
-    channel.pump();
+    WorkspaceChannelFixture fixture;
+    auto& channel = fixture.channel;
+    auto& peer = fixture.peer;
     auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
@@ -7377,17 +7369,7 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
         for (const bool source : {false, true}) {
             for (const bool ready : {false, true}) {
                 const presentation::WorkspaceSurfaceImportId id{iteration, 1U + 2U * source + ready};
-                abi::Record layout{.opcode = abi::Opcode::ArenaReady,
-                                   .id_high = id.high,
-                                   .id_low = id.low,
-                                   .width = 4U,
-                                   .height = 3U,
-                                   .stride = 32U,
-                                   .size = 96U,
-                                   .device_incarnation = 5U,
-                                   .alignment = 32U,
-                                   .device_uuid = {1U},
-                                   .memory_type_bits = 1U};
+                auto layout = WorkspaceChannelFixture::Layout(id);
                 if (source) {
                     layout.arena_high = iteration;
                     layout.arena_low = 9U;
@@ -7411,8 +7393,7 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                     channel.pump();
                     REQUIRE(channel.take_outcome().has_value());
                 }
-                REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
-                static_cast<void>(receive_workspace_record(peer.get(), received));
+                fixture.Withdraw(id);
                 REQUIRE(
                     send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
                                                        .id_high = id.high,

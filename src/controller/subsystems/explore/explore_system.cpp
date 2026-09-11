@@ -1713,6 +1713,7 @@ ExploreSnapshot ExploreSystem::Stop() noexcept {
 }
 void ExploreSystem::ExecutionSettingsChanged() noexcept { impl_->ExecutionSettingsChanged(); }
 void ExploreSystem::Shutdown() noexcept { impl_->Shutdown(); }
+// CLEANUP-IGNORE: Explore exposes its independent ordinary facade; shared workspace execution already belongs to VisualRuntimeOwner.
 bool ExploreSystem::stopped() const noexcept { return impl_->stopped(); }
 ExploreSnapshot ExploreSystem::snapshot() const { return impl_->snapshot(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView ExploreSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

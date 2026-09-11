@@ -262,6 +262,7 @@ SystemImageRuntime::OutputCandidate SystemImageRuntime::AcquireOutput(const std:
     return ActiveState().output->Acquire(stop, std::move(baseline), preservation);
 }
 SystemImageRuntime::OutputCandidate SystemImageRuntime::TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation preservation) {
+    // CLEANUP-IGNORE: Acquisition, clearing publication and retained publication are distinct pool operations exposed by the runtime.
     return ActiveState().output->TryAcquire(baseline, preservation);
 }
 void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
@@ -286,25 +287,25 @@ std::shared_ptr<ImageWorkspace> SystemImageRuntime::CreateWorkspace(ImageWorkspa
             new ImageWorkspace(retention_->workspaces, *state.context, std::move(layout), std::move(execution), workspace_operations_));
     } catch (...) { std::rethrow_exception(combine_image_failures(std::current_exception(), retention_->workspaces->failure())); }
 }
-bool SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
+SystemImageRuntime::State& SystemImageRuntime::WorkspaceState(const std::shared_ptr<ImageWorkspace>& workspace) {
     auto& state = ActiveState();
     retention_->workspaces->Check();
     if (workspace) workspace->CheckOwner(retention_->workspaces);
+    return state;
+}
+bool SystemImageRuntime::ConfigureWorkspace(OutputCandidate& candidate, std::shared_ptr<ImageWorkspace> workspace) {
+    auto& state = WorkspaceState(workspace);
     return state.output->ConfigureWorkspace(candidate, std::move(workspace), state.workspace_finalize);
 }
 bool SystemImageRuntime::PrepareWorkspace(const CompletedOutput& product, std::shared_ptr<ImageWorkspace> workspace) {
-    auto& state = ActiveState();
-    retention_->workspaces->Check();
-    if (workspace) workspace->CheckOwner(retention_->workspaces);
+    auto& state = WorkspaceState(workspace);
     return state.output->PrepareWorkspace(product, std::move(workspace), state.workspace_finalize);
 }
 void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
     ActiveState().output->FinalizeWorkspace(candidate, coverage);
 }
 bool SystemImageRuntime::PrepareWorkspace(const ImageWorkspaceObservation& observation, std::shared_ptr<ImageWorkspace> workspace) {
-    auto& state = ActiveState();
-    retention_->workspaces->Check();
-    if (workspace) workspace->CheckOwner(retention_->workspaces);
+    auto& state = WorkspaceState(workspace);
     return state.output->PrepareWorkspace(observation, std::move(workspace), state.workspace_finalize);
 }
 BorrowedImageWorkspace SystemImageRuntime::BorrowWorkspace() const { return ActiveState().output->BorrowWorkspace(); }

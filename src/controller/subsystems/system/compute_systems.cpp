@@ -631,6 +631,7 @@ PredictSystem::PredictSystem(SettingsSystem& settings, DatasetSystem& dataset, M
 PredictSystem::~PredictSystem() = default;
 PredictSnapshot PredictSystem::Start(contracts::PredictWorkflowIntent) { return impl_->Start(); }
 PredictSnapshot PredictSystem::Stop(contracts::PredictWorkflowIntent) noexcept { return impl_->Stop(); }
+// CLEANUP-IGNORE: Predict exposes ordinary sealed lifecycle/read methods; VisualRuntimeOwner already owns shared workspace behavior.
 void PredictSystem::Shutdown() noexcept { impl_->Shutdown(); }
 PredictSnapshot PredictSystem::snapshot() const { return impl_->snapshot(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView PredictSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

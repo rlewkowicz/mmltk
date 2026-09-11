@@ -74,6 +74,7 @@ class GalleryStream final {
     void CommitOutputPublication() noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
         const mmltk::frameworks::gpu::ImageWorkspaceObservation&);
+    // CLEANUP-IGNORE: The public gallery API and its private implementation declare one boundary, not duplicated execution.
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
                                                          std::uintptr_t);

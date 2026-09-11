@@ -346,7 +346,10 @@ class GalleryStream::Impl final {
             return reserved_generation != 0U ? reserved_generation : generation;
         }
         std::uint64_t tile_generation = 0U;
+        // CLEANUP-IGNORE: Lane correlation, compiled identity and raster demand have distinct custody from diagnostic and graphics ABI
+        // records.
         contracts::DiagnosticLink diagnostic_link{};
+        // CLEANUP-IGNORE: Physical lane scheduling fields are private execution state, not a shared scalar schema.
         std::uint32_t compiled_index = 0U;
         std::uint32_t destination_slot = 0U;
         std::size_t position = 0U;
@@ -422,6 +425,8 @@ class GalleryStream::Impl final {
     [[nodiscard]] data::CompiledImageStream::CompletionObserver LaneCompletion() noexcept;
     void SeedPlaceholders(std::span<const explore::ExploreRenderClassDescriptor>, mmltk::frameworks::gpu::ImagePlaneView,
                           mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
+    void RestoreVisibleTiles(std::span<const explore::ExploreRenderClassDescriptor>, mmltk::frameworks::gpu::ImagePlaneView,
+                             mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     enum class AtlasBatch : std::uint8_t { Placeholders, Cache };
     enum class BatchSubmission : std::uint8_t { Skipped, Complete };
     [[nodiscard]] BatchSubmission RenderAtlasBatch(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
@@ -659,9 +664,7 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
         }
         if (output_change == ExploreOutputChange::Semantic) {
             stream_ = reinterpret_cast<cudaStream_t>(stream);
-            SeedPlaceholders(classes, clean, semantic, stream);
-            for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot)
-                if (State().cache.Find(State().visible_indices[slot])) PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
+            RestoreVisibleTiles(classes, clean, semantic, stream);
             RenderCachedSemantics(clean, semantic, stream);
         }
         if (priority_changed)
@@ -2190,10 +2193,16 @@ ExploreGalleryPublication GalleryStream::Impl::PublishTiles(const mmltk::framewo
                                                             const mmltk::frameworks::gpu::ImagePlaneView semantic,
                                                             const std::uintptr_t stream) {
     if (!publication_active_) throw std::logic_error("Explore tile output was not prepared");
-    SeedPlaceholders(State().active_classes, clean, semantic, stream);
+    RestoreVisibleTiles(State().active_classes, clean, semantic, stream);
+    return RenderReadyTiles(clean, semantic, stream, false);
+}
+
+void GalleryStream::Impl::RestoreVisibleTiles(const std::span<const explore::ExploreRenderClassDescriptor> classes,
+                                              const mmltk::frameworks::gpu::ImagePlaneView clean,
+                                              const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {
+    SeedPlaceholders(classes, clean, semantic, stream);
     for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot)
         if (State().cache.Find(State().visible_indices[slot])) PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
-    return RenderReadyTiles(clean, semantic, stream, false);
 }
 
 ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,

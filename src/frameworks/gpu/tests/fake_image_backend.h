@@ -162,6 +162,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     };
 
     std::atomic<std::size_t> contexts_created{0U};
+    // CLEANUP-IGNORE: Physical backend counters are independent from the controller worker lifecycle and publication gate.
     std::atomic<std::size_t> contexts_destroyed{0U};
     std::atomic<std::size_t> contexts_bound{0U};
     std::atomic<std::uintptr_t> last_bound_context{0U};

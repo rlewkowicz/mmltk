@@ -90,18 +90,22 @@ BorrowedImageProductReadView ImageProductPool::Product::Borrow() const {
     if (!valid()) return {};
     return slot_->buffer.Borrow();
 }
-BorrowedImageWorkspace ImageProductPool::Product::BorrowWorkspace() const {
+std::unique_lock<std::mutex> ImageProductPool::Product::LockWorkspace() const {
     if (!slot_ || revision_ == 0U) return {};
     std::unique_lock lock(slot_->admission->mutex, std::try_to_lock);
     if (!lock.owns_lock() || !slot_->Readable() || slot_->reserved || slot_->facts.revision != revision_) return {};
+    return lock;
+}
+BorrowedImageWorkspace ImageProductPool::Product::BorrowWorkspace() const {
+    auto lock = LockWorkspace();
+    if (!lock.owns_lock()) return {};
     lock.unlock();
     auto result = slot_->buffer.BorrowWorkspace();
     return result.revision() == revision_ ? std::move(result) : BorrowedImageWorkspace{};
 }
 ImageWorkspaceObservation ImageProductPool::Product::ObserveWorkspace() const {
-    if (!slot_ || revision_ == 0U) return {};
-    std::unique_lock lock(slot_->admission->mutex, std::try_to_lock);
-    if (!lock.owns_lock() || !slot_->Readable() || slot_->reserved || slot_->facts.revision != revision_) return {};
+    const auto lock = LockWorkspace();
+    if (!lock.owns_lock()) return {};
     return slot_->buffer.ObserveWorkspace();
 }
 ImageWorkspaceObservation ImageProductPool::ObserveWorkspace() const {
