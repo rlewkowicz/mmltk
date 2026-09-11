@@ -1,6 +1,6 @@
 # Source datasets and compilation
 
-[Quick start](../README.md#build) · [Commands](commands.md) · [GPU loading](gpu-execution.md)
+[Wiki index](README.md) · [Quick start](../README.md#build) · [Commands](commands.md) · [GPU loading](gpu-execution.md)
 
 The native compiler consumes a split directory of PNG images and JSONL
 instance annotations, with a category table at the dataset root:
@@ -268,10 +268,13 @@ that stream; the slot cannot be refilled until the GPU consumer has finished.
 Batch pointers are leases, not independently owned allocations. A checked-out
 batch must be released, and stale or foreign leases are rejected.
 
-Sequential epochs retain file order. Shuffled epochs randomize 256-image
-locality blocks and chunks of at least eight images while keeping images
-sequential inside each chunk. Batch sharding selects complete batch ordinals
-for a rank, and `drop_last` controls the partial final batch.
+Sequential epochs retain file order. Shuffled epochs use chunks sized to the
+larger of eight images or one batch, capped by the dataset size. They shuffle
+chunks within locality blocks targeting 256 images and shuffle the blocks,
+while retaining image order inside each chunk. A block contains at least one
+whole chunk, so its actual extent depends on batch size. Batch sharding selects
+complete batch ordinals for a rank, and `drop_last` controls the partial final
+batch.
 
 ## Why compiled loading is fast
 

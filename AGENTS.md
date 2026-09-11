@@ -1,5 +1,13 @@
 # AGENTS.md
 
+## Navigation
+
+Start with [CONTRACT.md](CONTRACT.md) for architecture and the
+[technical wiki](docs/README.md) for source ownership and reference material.
+Use [commands](docs/commands.md), [validation](docs/validation.md), and
+[logging](docs/logging.md) for wrapper operations and evidence. GUI work also
+uses [interaction and presentation](docs/gui-interaction.md).
+
 ## Sub Agents
 
 Use subagents only on explicit user request or while executing a specific

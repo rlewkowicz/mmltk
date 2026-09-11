@@ -1,6 +1,6 @@
 # Building and reusable state
 
-[Quick start](../README.md#build) · [Commands](commands.md) · [Validation](validation.md)
+[Wiki index](README.md) · [Quick start](../README.md#build) · [Commands](commands.md) · [Validation](validation.md)
 
 ## Host and container boundary
 
@@ -67,6 +67,15 @@ normalized paths, dependencies, and notices. Its selected closure includes
 NCCL and Torch's CPU MKL libraries; ONNX Runtime is packaged separately.
 Image and staged-output fingerprints govern reuse of the final runtime.
 
+ONNX Runtime 1.27.1 is built by
+[Dockerfile.onnxruntime](../docker/Dockerfile.onnxruntime). Its
+[CUDA graph capture patch](../docker/patches/onnxruntime-1.27.1-cuda-graph-capture.patch)
+and GCC compatibility patch are inputs to the wrapper's dependency
+fingerprint. The capture patch owns both thread-local capture and capture-end
+RAII cleanup; [GPU execution](gpu-execution.md#onnx-capture-and-verification-storage)
+explains the independent-worker behavior. The dependency retains its own
+C++/CUDA language policies.
+
 Inspect public header selection with:
 
 ```bash
@@ -117,11 +126,26 @@ operations in [validation](validation.md).
 
 The first builds typed application bindings in its dedicated
 `.cache/cmake/application-bindings-release` graph. The second selects the
-Release protocol-generation target and its cross-language fixtures. Generated
-Rust stays in build output: change canonical native declarations or generators,
-then regenerate. `--update-gui-lock` performs the containerized Cargo fetch
-used to refresh the native browser-test dependency lock; ordinary builds use
-the locked dependency set.
+Release protocol-generation target and its cross-language fixtures.
+
+Under the selected graph's `generated/frontend/iced/`, protocol generation writes
+`application_bindings.rs`, `browser_protocol.marker`,
+`protocol_v14_client_records.hex`, and `protocol_v14_server_records.cbor`.
+The marker is `MMLTK_HOST_API_PROTOCOL_14`; generated Rust also carries the
+schema fingerprint and native interaction limits. The current
+[typed boundary](gui-interaction.md#typed-application-boundary) must be
+packaged together with the native host and browser bundle. Generating
+bindings alone does not update the complete runtime package.
+
+Generated Rust stays in build output: change canonical native declarations
+or generators, then regenerate. `--update-gui-lock` performs the containerized
+Cargo fetch used to refresh the native browser-test dependency lock; ordinary
+builds use the locked dependency set.
+
+The private [Wayland validation image](headless-wayland.md) is separately
+fingerprinted from the packaged runtime and build images. It adds Weston and
+a validation-only input-seat module without replacing the application or
+Firefox. Its builder and runtime use the same pinned Weston package version.
 
 ## Isolated build timing
 

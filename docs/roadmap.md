@@ -1,6 +1,6 @@
 # Planned work
 
-[Repository introduction](../README.md)
+[Wiki index](README.md) · [Repository introduction](../README.md)
 
 The project's stated future directions include:
 

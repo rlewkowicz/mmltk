@@ -1,6 +1,6 @@
 # Architecture and source guide
 
-[Quick start](../README.md#codebase) · [Build graph](build.md) · [GPU execution](gpu-execution.md)
+[Wiki index](README.md) · [Quick start](../README.md#codebase) · [Build graph](build.md)
 
 [CONTRACT.md](../CONTRACT.md) defines desired ownership, product outcomes,
 resource lifetime, and shutdown behavior. This guide locates the implementation;
@@ -66,6 +66,13 @@ messages live in `app/`, `view/`, and the owning widgets. Use
 [generation commands](build.md#generated-bindings-and-dependency-maintenance)
 after changing the native schema.
 
+The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
+owns the current protocol, compact input representation, credit/command
+ordering, and state-publication details. The physical ring lives in
+[browser_record_ring.h](../src/frameworks/transport/browser_record_ring.h);
+the retained annotation input owner lives in
+[annotation_input.rs](../src/frontend/iced/src/annotation_input.rs).
+
 ## Presentation and browser integration
 
 [src/controller/presentation](../src/controller/presentation) contains native
@@ -76,13 +83,17 @@ The Rust browser-image boundary is
 [presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
 and its child modules. Firefox import and WebGPU/Vulkan integration live in
 the owned [third_party/firefox](../third_party/firefox) tree, including
-`gfx/wgpu_bindings/src/server.rs`. Iced remains responsible for displaying and
-transforming completed browser images.
+`gfx/wgpu_bindings/src/server.rs`. Iced owns view transforms and rendering;
+matching metadata authorizes queue-ordered browser-image draws.
 
 For lifetime and synchronization invariants, follow the contract's
 [GPU buffer flow](../CONTRACT.md#gpu-buffer-flow) and
 [shutdown rules](../CONTRACT.md#execution-failure-and-shutdown).
-The [logging guide](logging.md) explains how captures connect these boundaries.
+Detailed [input, buffer, and presentation mechanics](gui-interaction.md) have
+one home. The [logging guide](logging.md) explains diagnostic activation and
+how captures connect these boundaries. Frontend acceptance control lives in
+`integration_control.rs`; its private `integration_control/reporting.rs`
+owns effect-only collection and reporting.
 
 ## Tests and vendor changes
 

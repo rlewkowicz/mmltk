@@ -1,6 +1,6 @@
 # Command reference
 
-[Quick start](../README.md#build) · [Build details](build.md) · [Validation](validation.md)
+[Wiki index](README.md) · [Quick start](../README.md#build) · [Build details](build.md) · [Validation](validation.md)
 
 Run commands from the repository root through `./mmltk`. The wrapper rewrites
 supported host paths into container mounts; absolute host paths become
@@ -43,6 +43,10 @@ wrapper operations. Commands expose their own reflected argument help:
 ./mmltk rfdetr predict --help
 ```
 
+The wrapper prevents raw native CLI invocation while its GUI is active,
+including `--help`. Close that GUI before invoking the native CLI. Command
+declarations remain available in the source links below.
+
 Top-level commands compile source datasets, inspect compiled metadata,
 benchmark loading, or dispatch RF-DETR work. RF-DETR exposes `compile`, `info`,
 `build-engine`, `export-onnx`, `predict`, `evaluate`, `validate`, `train`, and
@@ -60,6 +64,9 @@ For example, with existing input artifacts:
 ```
 
 See [datasets](datasets.md) for compilation and annotation requirements.
+The native CLI also accepts `--log-level`, `--log-file`, and `--log-dir`.
+See [logging activation](logging.md#activation-and-quiet-execution), especially
+for ONNX metadata commands whose output requires explicit diagnostics.
 
 ## Desktop options and environment
 
@@ -76,9 +83,10 @@ runtime/session paths. `XDG_RUNTIME_DIR`, `WAYLAND_DISPLAY`, and, when needed,
 It runs display clients as the resolved host UID/GID; missing Wayland state
 fails launch.
 
-`MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, and `MMLTK_LOG_DIR` control native logging.
-`MMLTK_GUI_TRACE_FILE`, `MMLTK_GUI_PIXEL_TRACE`, and `MMLTK_FIREFOX_LOG_FILE`
-enable the more detailed capture paths described in [logging](logging.md).
+An ordinary launch leaves diagnostics and probes inactive. Use the explicit
+environment settings in [logging](logging.md) to capture native or Firefox
+output. GUI logging is environment-configured; the desktop execution parser
+accepts only the device, NUMA, and GDRCopy options listed above.
 The normal runtime image defaults to `mmltk`; `MMLTK_IMAGE` and
 `MMLTK_BUILD_IMAGE` override runtime and build image names.
 

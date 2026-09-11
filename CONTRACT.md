@@ -122,11 +122,12 @@ Visibility controls preserve the underlying objects. Annotation imports are
 atomic; editing, undo, redo, and saving preserve operation order and geometry.
 Derived results match the current source and requested processing parameters.
 
-Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of completed
-browser images. Native product dimensions remain independent of window size.
-Images and semantics use the same view geometry. Same-image revisions retain
-viewer identity and transforms; a new image resets them. Stable widget
-identities preserve interaction state through ordinary updates.
+Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of browser-owned
+images authorized by matching native state. Native product dimensions remain
+independent of window size. Images and semantics use the same view geometry.
+Same-image revisions retain viewer identity and transforms; a new image resets
+them. Stable widget identities preserve interaction state through ordinary
+updates.
 
 ## GPU buffer flow
 
@@ -140,7 +141,7 @@ PresentationSystem: receiver-owned GPU copy + final composition
 One published native application backbuffer
                       │ synchronized import and browser-owned GPU copies
                       ▼
-Completed browser image → Iced view transforms and rendering
+Queue-ordered browser image + matching model → Iced rendering
                       │
           Firefox swapchain/compositor → Wayland
 ```
@@ -163,6 +164,12 @@ with bounded outstanding work. The last valid completed browser image remains
 available during subsequent native work, capacity pressure, or presentation
 failure. Obsolete results retain their physical release identity and cannot
 replace a different current product.
+
+Matching model state authorizes browser image draws in graphics-queue order.
+Physical copy completion independently governs borrowed-image release and
+promotion of the retained completed image. Source changes reach native
+Presentation directly; selecting a source and advancing that source's content
+remain separate responsibilities.
 
 Capacity growth prepares an unpublished replacement, completes initialization
 and the required import, then atomically promotes the completed replacement.
@@ -210,13 +217,19 @@ observable.
 
 ## Performance and observability
 
-Execution is event-driven and bounded. Independent systems run concurrently;
-replaceable high-rate work coalesces in constant time, while ordered editing
-retains its order. Long-lived buffers retain useful high-water capacity and
-reuse tightly sized storage. Steady-state graphics work avoids allocation and
-unnecessary CPU/GPU transfers, blocking, and memory churn.
+Execution is event-driven, with bounded native admission and outstanding GPU
+work. Independent systems run concurrently; replaceable high-rate work
+coalesces in constant time, while ordered editing preserves every accepted
+path-dependent sample through temporary pressure.
+Input consumption, document-command settlement, and image publication progress
+independently while retaining their required order. Long-lived buffers retain
+useful high-water capacity and reuse tightly sized storage. Steady-state
+graphics work avoids allocation and unnecessary CPU/GPU transfers, blocking,
+and memory churn.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and
-failure context. Disabled diagnostics avoid material data collection and
-formatting. Fatal diagnostics capture bounded troubleshooting context before
-orderly shutdown.
+failure context. Disabled diagnostics create no active diagnostic or probe
+state and perform no diagnostic collection, formatting, clock reads, counter
+updates, or I/O. Diagnostic identities remain effect-only observations.
+Explicitly enabled fatal diagnostics capture bounded troubleshooting context
+before orderly shutdown.

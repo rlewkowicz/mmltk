@@ -1,10 +1,53 @@
 # Capturing and querying diagnostics
 
-[Commands](commands.md) · [Validation](validation.md) · [Headless Wayland](headless-wayland.md)
+[Wiki index](README.md) · [Commands](commands.md) · [Validation](validation.md) · [Headless Wayland](headless-wayland.md)
+
+## Activation and quiet execution
+
+Ordinary `./mmltk --gui` has no active diagnostic sink, integration driver,
+reporting state, or pixel-probe owner. Disabled paths skip diagnostic payload
+collection, formatting, clock reads, counter updates, and I/O. Application
+state, resource identities, input credits, and physical completion still work.
+Diagnostic identities never determine their behavior.
+
+| Explicit setting | Effect |
+| --- | --- |
+| `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, `MMLTK_LOG_DIR` | Native application logging to stderr and a rotating file |
+| CLI `--log-level`, `--log-file`, `--log-dir` | Override the corresponding native logging environment values |
+| `MMLTK_GUI_TRACE_FILE` | Native runtime JSONL and browser surface lifecycle diagnostics |
+| `MMLTK_GUI_PIXEL_TRACE=1` with a GUI trace path | Additional pixel probes |
+| `MMLTK_FIREFOX_LOG_FILE` | Redirect Firefox stdout/stderr to a separate file; does not itself enable native lifecycle or pixel collection |
+
+For native application logging, a level other than `off` enables output.
+A file or directory without an explicit level uses the build's default enabled
+level. Explicit `off` disables that logging even when a destination is set.
+These settings do not disable an independently requested GUI lifecycle trace.
+The desktop accepts logging through the environment; the native CLI and ONNX
+tools also accept the three logging flags.
+
+```bash
+MMLTK_LOG_LEVEL=info ./mmltk --gui
+./mmltk info --compiled ./compiled/train.bin --log-level info
+./mmltk rfdetr info --onnx ./model.onnx --log-level info
+```
+
+When only an enabled level is supplied, the wrapper prepares the writable
+repository directory `.mmltk-data/logs` for the resolved runtime UID/GID.
+Explicit file/directory overrides retain their destination and host-path
+rewriting. Native logs use the application name, a 10 MiB rotation threshold,
+and five archived files.
+
+The ONNX inspection and simplification tools remain silent by default and
+with `off`, including failures; inspect their exit status. Request diagnostics
+explicitly when consuming model metadata. `rfdetr info --onnx` forwards the
+CLI logging overrides to its sibling ONNX inspection tool. Ordinary CLI result
+stdout, such as compiled-dataset `info`, remains available independently of
+diagnostics.
 
 ## Capture one reproduction
 
 ```bash
+mkdir -p .mmltk-data/logs
 MMLTK_GUI_TRACE_FILE=.mmltk-data/logs/gui-trace.jsonl \
 MMLTK_FIREFOX_LOG_FILE=.mmltk-data/logs/firefox.log \
 ./mmltk --gui
@@ -14,19 +57,63 @@ MMLTK_FIREFOX_LOG_FILE=.mmltk-data/logs/firefox.log \
 presentation, cleanup, and failure diagnostics. The native sink opens a new
 capture and truncates that path; preserve earlier evidence before reusing it.
 `MMLTK_FIREFOX_LOG_FILE` captures the separate browser log.
-Without an enabled diagnostics target, the runtime avoids constructing its
-diagnostic records.
+The native trace file and Firefox output file must be separate destinations.
+Their parent directories must already exist and be writable by the runtime user.
 
 Add `MMLTK_GUI_PIXEL_TRACE=1` for pixel probes; desktop startup enables them
 only when the native trace path is also set. Lifecycle-only traces do not
 prove pixel continuity. Native surface high/low values and the browser's
 32-hex-digit surface identity describe the same surface.
 
-Ordinary native logging also accepts `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, and
-`MMLTK_LOG_DIR`. GPU-specific trace variables are covered in
-[GPU execution](gpu-execution.md). The Wayland acceptance harness captures and
-rotates its native/Firefox/JSONL artifact family under `build/validation`.
-The headless supervisor writes a separate unique directory for each invocation.
+GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
+
+## Delivery and acceptance ownership
+
+Ordinary enabled runtime diagnostics are bounded and best effort. The existing
+background writer has 256 queued records of at most 16 KiB each; contention or
+capacity pressure may drop ordinary diagnostics. Disabled execution creates
+none of that active state.
+
+Explicit Wayland integration with a lifecycle sink selects complete delivery
+on this same bounded queue and writer. It may wait for capacity. Encoding or
+delivery failure is an acceptance failure, and shutdown drains the writer.
+Complete delivery is an acceptance mode, not the ordinary GUI's policy.
+Sources are [diagnostics_client.h](../src/controller/services/diagnostics_client.h),
+[runtime_diagnostics.cpp](../src/controller/services/runtime_diagnostics.cpp),
+and [desktop startup](../src/entrypoints/desktop/browser_runtime_entry.cpp).
+
+Quiet acceptance still uses real control receipts, browser interaction,
+accepted-unsent input pressure, command settlement, and exact drawn-frame
+readiness. Its driver is independent of the private
+[reporting owner](../src/frontend/iced/src/integration_control/reporting.rs)
+and [JavaScript reporting state](../src/frontend/iced/src/integration_control/browser.mjs).
+With reporting disabled, payload callbacks, phase/revision/style deduplication,
+passive viewport queries, gallery scans, and diagnostic sinks stay inactive.
+Compact failed control receipts retain static source-line context without
+initializing reporting or probes.
+
+The Wayland session assigns one writer to each artifact under
+`build/validation`:
+
+| Default family member | Writer and contents |
+| --- | --- |
+| `latest-wayland-test.jsonl` | Native runtime lifecycle sink |
+| `latest-wayland-test-acceptance.jsonl` | Acceptance process decisions, stage blockers, and terminal evidence |
+| `latest-wayland-test-native.log` | Native host stdout/stderr |
+| `latest-wayland-test-application.log` | Native application logger |
+| `latest-wayland-test-firefox.log` | Captured Firefox output and browser evidence |
+| `latest-wayland-test-mozilla-…moz_log` | Explicit Mozilla module logs, with separate process/child and rotation identities |
+
+The harness rejects aliased writer destinations and rotates previous family
+members into their `.history` directories. A transcript captured by the caller
+is another source; it does not substitute for independently owned native or
+browser evidence. The headless supervisor owns a separate unique artifact
+directory, described in [headless Wayland](headless-wayland.md).
+
+Enabled acceptance requires complete physical and rendered evidence.
+Missing-record exceptions cannot establish a successful handoff or sample.
+Ordinary best-effort captures and the query tool's generic hypotheses have
+different purposes from these strict acceptance assertions.
 
 ## Start with a bounded investigation
 
@@ -128,6 +215,35 @@ identity. It joins original matches, excludes empty/zero identities, and
 does not expand transitively. Family/history correlations are scoped to each
 run. `--where` filters correlated and context rows too.
 
+## Automatic timeline context
+
+Human `--format timeline` queries with `--query` or `--errors` add bounded
+direct frame, publication, snapshot, and lifecycle matches beside the query
+rows. `--no-auto-correlate` disables this addition. Summary and JSONL formats
+require `--auto-correlate`; explicit correlation, related-run, pasted-error,
+and triage modes retain their own selection behavior.
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q 'probe_failed' --format timeline --limit 60
+./mmltk --logs --family latest-wayland-test \
+  -q 'probe_failed' --format jsonl --auto-correlate --limit 60
+```
+
+Original matches keep their order and priority. Added rows use spare `--limit`
+capacity, are labeled with their reason, and never become new seeds.
+Specific recent matches seed one extra streaming pass with bounded nearest
+identity indexes; the tool does not build an all-run index. Shared source,
+surface, publication, allocation, or trace identities must agree wherever both
+records provide them. Bare counters and generic numeric report slots do not
+establish identity.
+
+Phase/control proximity matches are weaker evidence and are labeled as such.
+They use at most 250 ms of comparable time, or eight same-source lines when
+clocks cannot be aligned. Cross-clock identity matches never align clocks.
+`--where` constrains every added row. Current limits and event-specific
+identity projections are in `./mmltk --logs --help`.
+
 ## Select captures and histories
 
 ```bash
@@ -139,23 +255,29 @@ run. `--where` filters correlated and context rows too.
 ```
 
 Use a returned archive ID with `--run` to select a historical capture;
-`--run` implies `--history`. `--family STEM` selects the `.jsonl`, `.log`,
-`-native.log`, and `-firefox.log` siblings under `build/validation`, or under an
-explicit repository path. Families are repeatable. `--history` adds rotated
-`.history` siblings.
+`--run` implies `--history`. `--family STEM` selects the artifact members above,
+plus `STEM.log`, under `build/validation` or an explicit repository path.
+Families are repeatable. `--history` adds rotated `.history` siblings.
+Mozilla main/child filenames retain physical and logical child identities;
+each process can have four bounded module-log rotation files. Native
+application rotations `STEM-application.1.log` through `.5.log` also belong
+to that family.
 
-Native, Firefox, and trace rotations sample their IDs independently. Adjacent
-same-PID rotations within 10 ms are grouped and labeled inferred. Identical
-event/steady-time anchors join transcript segments to native captures and
+The current Wayland harness uses one rotation identity for its artifact family.
+Older or independently produced captures can have separate rotation IDs.
+The tool groups adjacent same-PID rotations within 10 ms and labels that
+relationship inferred. Identical event/steady-time anchors join transcript
+segments to native captures and
 propagate known tests/tags; missing anchors leave them separate. IDs and
 monotonic timestamps may repeat between runs, so select one reproduction.
 `--related-run` includes other records from a matched run.
 
 Inputs are repository-relative/absolute paths or quoted globs inside the
 repository. Explicit files may have any suffix. Directories select
-`.jsonl`, `.log`, `.out`, and `.txt` files; `--recursive` includes nested
-histories. Repeated files are deduplicated. The default is `build/validation`
-without recursive archived captures.
+`.jsonl`, `.log`, `.out`, `.txt`, and Mozilla process logs; `--recursive`
+includes nested histories. Repeated files are deduplicated. Direct history
+directories can be queried even when the current artifact is absent.
+The default is `build/validation` without recursive archived captures.
 
 ## Triage conventions and limits
 

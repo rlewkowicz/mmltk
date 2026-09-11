@@ -1,10 +1,12 @@
 # GPU-local execution and image loading
 
-[Commands](commands.md) · [Datasets](datasets.md) · [Validation](validation.md)
+[Wiki index](README.md) · [Commands](commands.md) · [Datasets](datasets.md) · [Validation](validation.md)
 
 The architectural resource rules are in
 [CONTRACT.md](../CONTRACT.md#execution-failure-and-shutdown).
 The settings below select concrete devices, placement, and loading transport.
+The [GUI interaction guide](gui-interaction.md#native-gpu-custody-and-completion)
+owns native/browser image-copy, completion, and redraw mechanics.
 
 ## Device and NUMA placement
 
@@ -66,6 +68,30 @@ mapped allocation.
 `MMLTK_GDR_TRACE_FILE` enables mapped-buffer JSONL diagnostics and is forwarded
 with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
+
+## ONNX capture and verification storage
+
+The packaged ONNX CUDA provider captures on its calling thread and stream.
+Independent domain workers can allocate while another worker captures a
+graph. Capture-end cleanup owns both an unpublished raw graph and executable
+graph until installation succeeds, retaining the original error on failure.
+Graph replay remains enabled; domain workers keep their independent resource
+and execution ownership. The pinned source patch and its build fingerprint
+are described in [build inputs](build.md#toolchain-and-image-inputs).
+
+ShiftLUT operators retain their physical storage across replay and provider
+fallback. Ordinary operators have no allocation-counter state or updates.
+Verification callers may explicitly supply a scoped allocation counter that
+outlives the operator. These internals are declared in
+[shiftlut_onnx_ops.h](../src/backend/imaging/upscale/detail/shiftlut_onnx_ops.h);
+the existing Upscale executable owns the real-provider capture, replay,
+counter-isolation, and independent raster-oracle cases.
+
+The capture/counter cases do not require the external raster-oracle files.
+Running them establishes those specific behaviors, not the numerical coverage
+of the full oracle suite. See [validation evidence](validation.md#gui-behavior-and-evidence-ownership)
+and [ShiftLUT tooling](commands.md#shiftlut-model-tooling) for the respective
+commands.
 
 ## Read-only capability inspection
 
