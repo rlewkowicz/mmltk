@@ -2,28 +2,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 #include "src/controller/contracts/annotation.h"
-#include "src/controller/presentation/visual_system_types.h"
 
 namespace mmltk::controller {
 
 // One retained description has exclusive input custody while being filled and
 // exclusive renderer custody from submission through GPU settlement.
 struct AnnotationRenderState final {
-    contracts::AnnotationUiState ui{};
+    std::shared_ptr<const contracts::AnnotationSceneContent> scene;
+    contracts::AnnotationEditorFacts editor{};
+    std::uint64_t scene_revision = 0U;
     contracts::AnnotationObject preview{};
     std::optional<std::size_t> preview_object;
     std::uint64_t generation = 0U;
     std::uint64_t document_epoch = 0U;
-    VisualRegion crop{};
 
     [[nodiscard]] std::size_t ObjectCount() const noexcept {
-        return ui.scene.objects.size() + (preview_object == ui.scene.objects.size() ? 1U : 0U);
+        return scene->objects.size() + (preview_object == scene->objects.size() ? 1U : 0U);
     }
     [[nodiscard]] const contracts::AnnotationObject& ObjectAt(const std::size_t index) const {
-        return preview_object == index ? preview : ui.scene.objects.at(index);
+        return preview_object == index ? preview : scene->objects.at(index);
     }
 };
 

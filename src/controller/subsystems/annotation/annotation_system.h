@@ -20,9 +20,10 @@
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
-#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 
 namespace mmltk::controller {
+
+struct AnnotationRenderState;
 
 struct AnnotationPointer final {
     contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::Begin;

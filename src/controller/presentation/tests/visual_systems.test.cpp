@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
@@ -1260,6 +1261,7 @@ struct AnnotationRenderProbe final {
     std::atomic_uint64_t calls{0U};
     std::atomic_bool fail_open{false};
     std::atomic_bool fail_render{false};
+    std::atomic_bool exact_content{true};
     std::mutex mutex;
     std::shared_ptr<MutationCommitProbe> hold;
     std::shared_ptr<MutationCommitProbe> sample_hold;
@@ -1281,12 +1283,19 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (probe_) probe_->Wait(probe_->sample_hold);
         return {120.0F, 1.0F, 1.0F};
     }
-    void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source,
+    void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source,
                 const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
                 std::uintptr_t) const override {
         if (probe_) {
+            const auto scene = *description.scene;
+            const auto editor = description.editor;
+            const auto preview = description.preview;
+            const auto preview_object = description.preview_object;
             probe_->calls.fetch_add(1U, std::memory_order_release);
             probe_->Wait(probe_->hold);
+            if (*description.scene != scene || description.editor != editor || description.preview != preview ||
+                description.preview_object != preview_object)
+                probe_->exact_content = false;
             if (probe_->fail_render.exchange(false)) throw std::runtime_error("deterministic render failure");
         }
         if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
@@ -5197,6 +5206,59 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     CHECK(annotation.snapshot().input_document_epoch == document_epoch);
     CHECK(annotation.snapshot().frame.revision > initial.frame.revision);
     CHECK(older_completed.load());
+    CHECK(probe->exact_content.load());
+}
+
+TEST_CASE("Annotation admission reuses both credits without consuming rejected batch sequences") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    OpenedExplore source{backend, {32U, 32U}};
+    EventGate events;
+    auto pause = std::make_shared<MutationCommitProbe>();
+    auto entered = pause->committed.get_future();
+    std::atomic_uint64_t consumed{0U};
+    std::atomic_bool ordered{true};
+    AnnotationSystem annotation{kDevice,
+        RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                       [] { return std::make_unique<TestAnnotationAlgorithm>(); }),
+        borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) { events.Advance(); }};
+    mmltk::testsupport::ScopedTestCleanup release{[&] {
+        mmltk::testsupport::release_test_promise(pause->release);
+        annotation.Shutdown();
+    }};
+    static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ready && annotation.snapshot().frame.valid(); }));
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
+    const auto epoch = annotation.snapshot().input_document_epoch;
+    annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
+        if (!progress.consumed_sequence) return;
+        if (progress.consumed_sequence != consumed.load() + 1U) ordered = false;
+        consumed = progress.consumed_sequence;
+        if (progress.consumed_sequence == 1U) {
+            pause->committed.set_value();
+            pause->released.wait();
+        }
+        events.Advance();
+    });
+    const auto batch = [epoch](std::uint64_t sequence, contracts::AnnotationPointerPhase phase) {
+        return AnnotationInputBatch{.epoch = 1U, .document_epoch = epoch, .sequence = sequence,
+            .samples = {{.phase = phase, .interaction_id = 1U, .sequence = sequence,
+                         .point = {static_cast<float>(sequence * 2U), static_cast<float>(sequence * 3U)}}}};
+    };
+    annotation.Input(batch(1U, contracts::AnnotationPointerPhase::Begin));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    // The sink pauses after freeing the consumed slot, outside the admission
+    // lock. Both accepted batches remain queued while the third is rejected.
+    annotation.Input(batch(2U, contracts::AnnotationPointerPhase::Update));
+    annotation.Input(batch(3U, contracts::AnnotationPointerPhase::Update));
+    CHECK_THROWS_AS(annotation.Input(batch(4U, contracts::AnnotationPointerPhase::End)), contracts::InvalidIntentError);
+    CHECK(consumed.load() == 1U);
+    pause->release.set_value();
+    REQUIRE(events.Wait([&] { return consumed.load() == 3U; }));
+    annotation.Input(batch(4U, contracts::AnnotationPointerPhase::End));
+    REQUIRE(events.Wait([&] { return consumed.load() == 4U && annotation.snapshot().ui.scene.objects.size() == 1U; }));
+    CHECK(ordered.load());
+    CHECK(annotation.snapshot().ui.scene.objects.front().box == contracts::AnnotationBox{{2, 3}, {8, 12}});
 }
 
 TEST_CASE("Annotation color sampling completes before following document commands under output pressure") {

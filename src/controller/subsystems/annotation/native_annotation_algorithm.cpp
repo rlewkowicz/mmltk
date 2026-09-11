@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <cuda_runtime_api.h>
@@ -89,7 +90,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             status = cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data), semantic.descriptor.pitch_bytes, 0,
                                        semantic.descriptor.row_bytes(), semantic.descriptor.height, stream);
         if (status != cudaSuccess) throw std::runtime_error("Annotation image plane preparation failed");
-        const auto& scene = description.ui.scene;
+        const auto& scene = *description.scene;
         // Reuse pinned staging only after its prior transfer has consumed it;
         // the rendering kernels themselves remain ordered on the runtime stream.
         if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess)
@@ -106,7 +107,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             if (!object.enabled) continue;
             auto& geometry = geometry_[index];
             const bool preview = description.preview_object == index;
-            if (geometry.scene_revision != description.ui.scene_revision || geometry.preview || preview) {
+            if (geometry.scene_revision != description.scene_revision || geometry.preview || preview) {
                 geometry.words.clear();
                 geometry.count = geometry.edges = geometry.handles = 0;
                 geometry.edge_offset = geometry.handle_offset = 0U;
@@ -153,13 +154,13 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 if (object.shape == domain::AnnotationShape::Skeleton)
                     for (const auto& node : object.skeleton_nodes)
                         if (node.visible) handle(node.point);
-                if (description.ui.editor.selected_object == index && object.shape == domain::AnnotationShape::Spline)
+                if (description.editor.selected_object == index && object.shape == domain::AnnotationShape::Spline)
                     for (const auto& knot : object.spline_knots) {
                         handle(knot.point);
                         if (knot.in.enabled) handle(knot.in.point);
                         if (knot.out.enabled) handle(knot.out.point);
                     }
-                geometry.scene_revision = description.ui.scene_revision;
+                geometry.scene_revision = description.scene_revision;
                 geometry.preview = preview;
             }
             geometry.offset = geometry_words_.size();
@@ -233,7 +234,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                          native_stream}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
-            if (description.ui.editor.selected_object == index &&
+            if (description.editor.selected_object == index &&
                 raster::raster_selection_handles_rgba(
                     {overlay,
                      {static_cast<int>(object.box.first.x) - 5, static_cast<int>(object.box.first.y) - 5,

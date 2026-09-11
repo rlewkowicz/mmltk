@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <algorithm>
 #include <string_view>
 #include <utility>
 #include <fstream>
@@ -13,6 +14,7 @@
 #include "src/acceptance/tests/filesystem_test_utils.hpp"
 #include "src/controller/presentation/visual_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/frameworks/serialization/serialization.h"
 
@@ -344,6 +346,7 @@ TEST_CASE("Annotation render descriptions retain exact previews independently of
         CHECK(held.ObjectAt(0U) == captured);
         c::AnnotationRenderState latest;
         editor.CaptureRender(latest);
+        CHECK(latest.scene == held.scene);
         CHECK(latest.ObjectAt(0U) != captured);
         pointer.phase = c::contracts::AnnotationPointerPhase::Cancel;
         ++pointer.sequence;
@@ -353,11 +356,148 @@ TEST_CASE("Annotation render descriptions retain exact previews independently of
         CHECK_FALSE(latest.preview_object);
         CHECK(latest.ObjectCount() == 0U);
         CHECK(held.ObjectAt(0U) == captured);
+        CHECK(latest.scene == held.scene);
         ++pointer.sequence;
         const auto rejected = editor.Pointer(pointer);
         CHECK(rejected.outcome == d::DocumentOutcome::Rejected);
         CHECK_FALSE(rejected.render_changed);
     }
+}
+
+TEST_CASE("Annotation large committed scenes reuse bounded immutable storage across preview and source handoffs") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    d::AnnotationDocument editor;
+    auto scene = c::test_scene("test://retained-large");
+    scene.objects.resize(c::contracts::kAnnotationObjectCapacity - 1U,
+                         {.name = c::contracts::AnnotationText::From("mask"),
+                          .shape = c::contracts::AnnotationShape::Mask,
+                          .box = {{1, 1}, {8, 8}},
+                          .mask = {.runs = {{1, 1, 7}, {3, 1, 7}, {5, 1, 7}}, .present = true}});
+    REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);
+    c::AnnotationRenderState held, pending, scratch;
+    editor.CaptureRender(held);
+    const auto* original = held.scene.get();
+    const auto original_revision = held.scene_revision;
+    const auto* runs = held.scene->objects.front().mask.runs.data();
+    c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {4, 5}};
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    editor.CaptureRender(pending);
+    const auto first_preview = pending.preview;
+    pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+    for (unsigned index = 0; index < 64U; ++index) {
+        ++pointer.sequence;
+        pointer.point = {10.0F + static_cast<float>(index % 16U), 30.0F};
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        editor.CaptureRender(scratch);
+        CHECK(scratch.scene.get() == original);
+        CHECK(scratch.scene->objects.front().mask.runs.data() == runs);
+        CHECK(scratch.scene_revision == original_revision);
+        CHECK(pending.preview == first_preview);
+        CHECK(scratch.preview.box.second == pointer.point);
+    }
+    // A committed edit cancels the live preview while both prior descriptions
+    // retain their exact old scene and independently captured preview.
+    REQUIRE(editor.Edit({.value = c::AnnotationClassEdit{0U}}).render_changed);
+    editor.CaptureRender(scratch);
+    CHECK_FALSE(scratch.preview_object);
+    CHECK(scratch.scene == held.scene);
+    REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).render_changed);
+    editor.CaptureRender(scratch);
+    CHECK(scratch.scene != held.scene);
+    CHECK(scratch.editor.selected_object == 0U);
+    CHECK_FALSE(held.editor.selected_object);
+
+    std::array<const c::contracts::AnnotationSceneContent*, 4U> storage{original, scratch.scene.get()};
+    std::size_t used = 2U;
+    for (unsigned index = 0; index < 32U; ++index) {
+        REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, index % 2U != 0U}}).render_changed);
+        editor.CaptureRender(scratch);
+        const auto* address = scratch.scene.get();
+        if (std::ranges::find(storage, address) == storage.end()) {
+            CHECK(index < 4U);
+            REQUIRE(used < storage.size());
+            storage[used++] = address;
+        }
+        CHECK(held.scene->objects.front().enabled);
+        CHECK(pending.preview == first_preview);
+    }
+    CHECK(used <= 4U);
+    auto replacement = c::test_scene("test://replacement");
+    replacement.frame_width = 32U;
+    REQUIRE(editor.Open(std::move(replacement)).outcome == d::DocumentOutcome::Applied);
+    editor.CaptureRender(scratch);
+    CHECK(scratch.scene->frame_width == 32U);
+    CHECK(scratch.ObjectCount() == 0U);
+    CHECK(held.scene->frame_width == 64U);
+    CHECK(held.ObjectCount() == scene.objects.size());
+    CHECK(pending.preview == first_preview);
+}
+
+TEST_CASE("Annotation source replacement invalidates retained content even when scene revisions coincide") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    d::AnnotationDocument editor;
+    REQUIRE(editor.Open(c::test_scene("test://original")).outcome == d::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);
+    c::AnnotationRenderState held, replacement;
+    editor.CaptureRender(held);
+    REQUIRE(editor.Open(c::test_scene("test://replacement")).outcome == d::DocumentOutcome::Applied);
+    editor.CaptureRender(replacement);
+    REQUIRE(replacement.scene_revision == held.scene_revision);
+    CHECK(replacement.scene != held.scene);
+    CHECK(replacement.scene->document != held.scene->document);
+    CHECK(held.editor.tool == c::contracts::AnnotationTool::Box);
+    CHECK(replacement.editor.tool == c::contracts::AnnotationTool::Select);
+}
+
+TEST_CASE("Annotation changing mask previews reuse their private high-water storage and survive committed edits") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    d::AnnotationDocument editor;
+    REQUIRE(editor.Open(c::test_scene("test://retained-mask")).outcome == d::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::MaskPaint}}).render_changed);
+    c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {10, 10}, .brush_radius = 2U};
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    c::AnnotationRenderState held, latest;
+    editor.CaptureRender(held);
+    const auto initial = held.preview;
+    pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+    pointer.point = {30, 10};
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    editor.CaptureRender(latest);
+    const auto* buffer = latest.preview.mask.runs.data();
+    const auto capacity = latest.preview.mask.runs.capacity();
+    pointer.point = {20, 10};
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    editor.CaptureRender(latest);
+    CHECK(latest.preview.mask.runs.data() == buffer);
+    CHECK(latest.preview.mask.runs.capacity() == capacity);
+    CHECK(held.preview == initial);
+    CHECK(latest.scene == held.scene);
+    pointer.point = {30, 30};
+    pointer.brush_radius = 3U;
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    editor.CaptureRender(latest);
+    const auto completed_preview = latest.preview;
+    pointer.phase = c::contracts::AnnotationPointerPhase::End;
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    CHECK(editor.ui().scene.objects.front().mask == completed_preview.mask);
+    CHECK(held.preview == initial);
+    CHECK(held.scene->objects.empty());
+    editor.CaptureRender(latest);
+    CHECK_FALSE(latest.preview_object);
+    CHECK(latest.scene != held.scene);
+    CHECK(latest.ObjectAt(0U).mask == completed_preview.mask);
+    REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).render_changed);
+    CHECK(latest.ObjectAt(0U).mask == completed_preview.mask);
+    REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).render_changed);
+    CHECK(editor.ui().scene.objects.front().mask == completed_preview.mask);
 }
 
 TEST_CASE("Annotation creates each supported shape in the selected native class") {

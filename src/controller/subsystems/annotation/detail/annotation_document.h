@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -42,7 +43,8 @@ class AnnotationDocument final {
     [[nodiscard]] DocumentResult Save(std::string_view);
     [[nodiscard]] const contracts::AnnotationUiState& ui() const noexcept;
     [[nodiscard]] bool ToolAvailable(contracts::AnnotationTool, std::optional<std::uint16_t>) const noexcept;
-    void CaptureRender(AnnotationRenderState&) const;
+    // At most three descriptions are retained by the input/pending/render owners.
+    void CaptureRender(AnnotationRenderState&);
 
    private:
     class Impl;

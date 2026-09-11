@@ -1,5 +1,6 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_worker.h"
 
@@ -20,9 +21,6 @@ using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
     auto* algorithm = dynamic_cast<AnnotationAlgorithm*>(runtime.model());
     if (!algorithm) throw std::runtime_error("Annotation renderer is unavailable");
     return *algorithm;
-}
-void require_annotation_ui(const contracts::AnnotationUiState& ui) {
-    if (!ui.valid()) throw contracts::UnavailableError("Annotation document state is invalid");
 }
 }  // namespace
 
@@ -198,7 +196,7 @@ class AnnotationSystem::Impl final {
             if (command) { Execute(std::move(*command)); continue; }
             if (close) {
                 const bool preview = document_.PeerClosed();
-                if (preview && document_.ui().valid()) QueueRender();
+                if (preview) QueueRender();
                 { std::scoped_lock lock(mutex_); terminal_barrier_ = false; }
                 continue;
             }
@@ -314,12 +312,11 @@ class AnnotationSystem::Impl final {
                                                                      execution->placement.numa_node, -10, false};
             // Copy completion has committed receiver storage. A later Stop must
             // not leave that source paired with the old editable document.
-            return [this, scene = std::move(scene), crop, policy = std::move(policy)]() mutable {
-                Post([this, scene = std::move(scene), crop, policy = std::move(policy)]() mutable {
+            return [this, scene = std::move(scene), policy = std::move(policy)]() mutable {
+                Post([this, scene = std::move(scene), policy = std::move(policy)]() mutable {
                     if (policy && !input_policy_) input_policy_.emplace(*policy);
                     auto result = document_.Open(std::move(scene));
                     if (result.outcome != document::DocumentOutcome::Applied) throw std::runtime_error(result.detail);
-                    crop_ = crop;
                     {
                         std::scoped_lock lock(mutex_);
                         gpu_continuation_ = false;
@@ -370,11 +367,9 @@ class AnnotationSystem::Impl final {
         Publish(AnnotationChanged{std::move(installed)});
     }
     void QueueRender() {
-        require_annotation_ui(document_.ui());
         document_.CaptureRender(scratch_render_);
         scratch_render_.generation = render_generation_ = mmltk::common::types::advance_monotonic_identity(render_generation_);
         { std::scoped_lock lock(mutex_); scratch_render_.document_epoch = state_.input_document_epoch; }
-        scratch_render_.crop = crop_;
         {
             std::scoped_lock lock(render_mutex_);
             std::swap(scratch_render_, pending_description_);
@@ -400,7 +395,7 @@ class AnnotationSystem::Impl final {
             pending_render_ = false;
         }
         const auto& description = active_description_;
-        const VisualExtent extent{description.ui.scene.frame_width, description.ui.scene.frame_height};
+        const VisualExtent extent{description.scene->frame_width, description.scene->frame_height};
         const bool fresh_source = clean_epoch_ != description.document_epoch;
         const auto input = fresh_source ? runtime.BorrowInput() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
         runtime.Publish(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
@@ -419,7 +414,7 @@ class AnnotationSystem::Impl final {
             // the latest reduction while rendered facts identify these exact pixels.
             if (!state_.ready) return;
             state_.frame = frame;
-            const AnnotationRenderedFacts facts{description.generation, description.document_epoch, description.ui.scene_revision};
+            const AnnotationRenderedFacts facts{description.generation, description.document_epoch, description.scene_revision};
             const bool facts_changed = state_.rendered.scene_revision != facts.scene_revision ||
                                        state_.rendered.document_epoch != facts.document_epoch;
             state_.rendered = facts;
@@ -487,7 +482,6 @@ class AnnotationSystem::Impl final {
     bool command_before_terminal_ = false;
     document::AnnotationDocument document_;
     std::optional<mmltk::common::system::ScopedExecutionPolicy> input_policy_;
-    VisualRegion crop_{};
     std::uint64_t render_generation_ = 0U;
     AnnotationRenderState scratch_render_, pending_description_, active_description_;
     std::mutex render_mutex_;

@@ -19,6 +19,7 @@
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
 
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
+#include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 
 namespace mmltk::controller::subsystems::annotation {
@@ -1082,7 +1083,12 @@ class AnnotationDocument::Impl final {
             if (object.shape == domain::AnnotationShape::Mask) normalize_mask(object);
         if (content.palette.empty()) content.palette = domain::annotation_class_palette(content.categories.size());
         const auto outcome = reduce_open(state_, std::move(content));
-        if (outcome == DocumentOutcome::Applied) capabilities_revision_ = 0U;
+        if (outcome == DocumentOutcome::Applied) {
+            capabilities_revision_ = 0U;
+            // Open restarts scene revisions from the document revision, so a
+            // replacement source may reuse the prior scene revision.
+            render_scene_.reset();
+        }
         return Result(outcome, "open");
     }
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer& pointer) {
@@ -1188,8 +1194,23 @@ class AnnotationDocument::Impl final {
     [[nodiscard]] bool ToolAvailable(domain::AnnotationTool tool, std::optional<std::uint16_t> target) const noexcept {
         return tool_applicable(state_.ui.scene, tool, target, true);
     }
-    void CaptureRender(AnnotationRenderState& target) const {
-        target.ui = state_.ui;
+    void CaptureRender(AnnotationRenderState& target) {
+        target.scene.reset();
+        if (!render_scene_ || render_scene_revision_ != state_.ui.scene_revision) {
+            if (!state_.ui.valid()) throw contracts::UnavailableError("Annotation document state is invalid");
+            auto available = std::ranges::find_if(render_storage_, [](const auto& scene) {
+                return !scene || scene.use_count() == 1;
+            });
+            if (available == render_storage_.end())
+                throw std::logic_error("Annotation render description custody exceeded");
+            if (!*available) *available = std::make_shared<domain::AnnotationSceneContent>();
+            **available = state_.ui.scene;
+            render_scene_ = *available;
+            render_scene_revision_ = state_.ui.scene_revision;
+        }
+        target.scene = render_scene_;
+        target.editor = state_.ui.editor;
+        target.scene_revision = state_.ui.scene_revision;
         target.preview_object.reset();
         if (state_.pointer.brush || state_.pointer.preview) {
             target.preview_object = state_.pointer.target.object.value_or(static_cast<std::uint16_t>(state_.ui.scene.objects.size()));
@@ -1232,6 +1253,13 @@ class AnnotationDocument::Impl final {
 
     const bool diagnostics_enabled_ = annotation_diagnostics_enabled();
     DocumentState state_;
+    // The document's current content plus the three scratch/pending/active
+    // descriptions bound immutable version custody. Pool-only values are safe
+    // to refill: no renderer can acquire them, and releasing a description never
+    // destroys its vectors. No wait or scene-sized retirement enters input.
+    std::array<std::shared_ptr<domain::AnnotationSceneContent>, 4U> render_storage_{};
+    std::shared_ptr<const domain::AnnotationSceneContent> render_scene_;
+    std::uint64_t render_scene_revision_ = 0U;
     std::uint64_t next_save_generation_ = 1U;
     std::uint64_t capabilities_revision_ = 0U;
 };
@@ -1257,6 +1285,6 @@ const domain::AnnotationUiState& AnnotationDocument::ui() const noexcept { retur
 bool AnnotationDocument::ToolAvailable(domain::AnnotationTool tool, std::optional<std::uint16_t> target) const noexcept {
     return impl_->ToolAvailable(tool, target);
 }
-void AnnotationDocument::CaptureRender(AnnotationRenderState& target) const { impl_->CaptureRender(target); }
+void AnnotationDocument::CaptureRender(AnnotationRenderState& target) { impl_->CaptureRender(target); }
 
 }  // namespace mmltk::controller::subsystems::annotation
