@@ -38,4 +38,6 @@ TEST_CASE("ordinary shell and native presentation configuration disable acceptan
     const mmltk::controller::PresentationNativeConfiguration native_configuration;
     CHECK_FALSE(shell_configuration.pending_supersession_acceptance);
     CHECK_FALSE(native_configuration.pending_supersession_acceptance);
+    CHECK_FALSE(shell_configuration.completion_acceptance);
+    CHECK_FALSE(native_configuration.completion_acceptance);
 }

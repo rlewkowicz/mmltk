@@ -165,8 +165,8 @@ impl RendererObservation {
 impl crate::generated::IntegrationControl {
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         if self.protocolversion != crate::generated::BROWSER_PROTOCOL_VERSION
-            || self.receipt.sequence == 0
-            || self.receipt.kind == crate::generated::IntegrationControlKind::Advance
+            || !crate::generated::integration_receipt_valid(&self.receipt)
+            || crate::generated::integration_server_command(self.receipt.kind)
         {
             return Err(ProtocolError("invalid integration receipt".into()));
         }
@@ -324,8 +324,8 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             let record =
                 crate::generated::IntegrationControl::from_application_value(envelope.payload)
                     .map_err(ProtocolError)?;
-            if record.receipt.sequence == 0
-                || record.receipt.kind != crate::generated::IntegrationControlKind::Advance
+            if !crate::generated::integration_receipt_valid(&record.receipt)
+                || !crate::generated::integration_server_command(record.receipt.kind)
             {
                 return Err(ProtocolError("invalid integration advance".into()));
             }
@@ -673,7 +673,15 @@ mod tests {
     #[test]
     fn bootstrap_reply_and_event_decode_without_session_state() {
         let native = native_server_fixtures();
-        assert_eq!(native.len(), 8);
+        let controls: Vec<_> = native.iter().filter_map(|bytes| match decode_server(bytes).unwrap() {
+            ServerRecord::IntegrationControl(record) => Some(record),
+            _ => None,
+        }).collect();
+        assert!(controls.iter().all(|record| crate::generated::integration_receipt_valid(&record.receipt)
+            && crate::generated::integration_server_command(record.receipt.kind)
+            && record.encode().is_err()));
+        assert!(controls.iter().any(|record| record.receipt.kind == crate::generated::IntegrationControlKind::VisibleReadHeld
+            && record.receipt.readgeneration == 7 && record.receipt.compiledindex == 0));
         assert!(
             matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
             if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2)

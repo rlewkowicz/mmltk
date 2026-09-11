@@ -1716,12 +1716,32 @@ void GalleryStream::Impl::StartIdleLanes() {
                 lane.state = LaneState::Queued;
             }
             diagnostics_.Emit([&] {
+                std::scoped_lock lock(lanes_mutex_);
+                contracts::DiagnosticExploreAdmission admission{
+                    .admission_position = position,
+                    .admission_first_row = State().viewport.first_row,
+                    .admission_row_count = State().viewport.row_count,
+                    .admission_columns = State().viewport.columns,
+                    .admission_tier = !prefetch ? 0U :
+                        ((position / State().viewport.columns >= State().viewport.first_row) ==
+                            (State().plan.scroll_direction == ExploreScrollDirection::Forward) ? 1U : 2U),
+                    .admission_forward = State().plan.scroll_direction == ExploreScrollDirection::Forward};
+                for (std::size_t offset = 0U; offset < State().window_indices.size(); ++offset) {
+                    const auto candidate = State().window_first + offset;
+                    if (State().cache.Find(State().window_indices[offset]) ||
+                        scheduled_slots_[State().cache.Slot(candidate)] == generation) continue;
+                    const auto row = candidate / admission.admission_columns;
+                    if (row < admission.admission_first_row) ++admission.admission_backward_eligible;
+                    else if (row >= admission.admission_first_row + admission.admission_row_count) ++admission.admission_forward_eligible;
+                    else ++admission.admission_immediate_eligible;
+                }
                 return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                             .operation = VisualDiagnosticOperation::GalleryReadScheduled,
                                             .device = device_,
                                             .generation = generation,
                                             .value = lane_index,
-                                            .detail = compiled_index};
+                                            .detail = compiled_index,
+                                            .context = {.admission = admission}};
             });
             SubmitRead(lane, true);
         } catch (...) {

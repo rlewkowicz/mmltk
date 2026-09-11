@@ -92,7 +92,7 @@ int main(const int argument_count, char* const* const arguments) {
     auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
     if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
     bootstrap.input_epoch = 1U;
-    const std::array<ServerRecord, 8U> records{
+    std::vector<ServerRecord> records{
         std::move(bootstrap),
         IntentReply{
             .correlation = 17U,
@@ -117,6 +117,15 @@ int main(const int argument_count, char* const* const arguments) {
                       .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
+    using ControlKind = contracts::IntegrationControlKind;
+    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^ControlKind))) {
+        constexpr auto kind = std::meta::extract<ControlKind>(enumerator);
+        constexpr auto policy = contracts::integration_command_direction<kind>();
+        if constexpr (policy.server && kind != ControlKind::Advance) {
+            records.emplace_back(IntegrationControl{.receipt = {.kind = kind, .sequence = 2U,
+                .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
+        }
+    }
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

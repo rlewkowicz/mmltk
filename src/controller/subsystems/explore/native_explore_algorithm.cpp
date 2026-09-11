@@ -128,18 +128,67 @@ class ExploreAcceptanceGate::Impl final {
         frontend_command_ = std::move(retained);
     }
 
+    std::uint64_t FrontendSequence() noexcept { std::scoped_lock lock(mutex_); return frontend_sequence_; }
+    void SetCompletionCommand(std::function<bool(ControlCommand)> callback) {
+        auto retained = callback ? std::make_shared<const std::function<bool(ControlCommand)>>(std::move(callback)) : nullptr;
+        std::scoped_lock lock(mutex_);
+        completion_command_ = std::move(retained);
+    }
+    bool ObserveControl(const ControlObservation& observation) noexcept { return SendControlObservation(observation); }
+
     void SetRedrawCommand(std::function<bool()> callback) {
         auto retained = callback ? std::make_shared<const std::function<bool()>>(std::move(callback)) : nullptr;
         std::scoped_lock lock(mutex_);
         redraw_command_ = std::move(retained);
     }
 
+    void AwaitVisibleRead(const std::uint64_t generation, const std::uint32_t index) {
+        std::shared_ptr<const FrontendCommand> frontend;
+        std::uint64_t sequence;
+        {
+            std::scoped_lock lock(mutex_);
+            if (terminal_ || visible_index_ != index) return;
+            if (visible_held_ && !visible_released_) {
+                // Another demand can request this same image while the original
+                // read is held. It must not bypass the exact image gate.
+                frontend = {};
+            } else if (!visible_armed_) return;
+            else frontend = frontend_command_;
+            visible_armed_ = false;
+            visible_held_ = true;
+            if (frontend) visible_generation_ = generation;
+            sequence = frontend_sequence_;
+        }
+        const ControlObservation observation{.event = ControlEvent::VisibleReadHeld,
+            .generation = generation, .compiled_index = index};
+        if (frontend && (!SendControlObservation(observation) || !(*frontend)({
+            .kind = contracts::IntegrationControlKind::VisibleReadHeld, .sequence = sequence,
+            .read_generation = generation, .compiled_index = index}))) {
+            Terminal();
+            return;
+        }
+        std::unique_lock lock(mutex_);
+        ++waiters_;
+        changed_.wait(lock, [this] { return terminal_ || visible_released_; });
+        --waiters_;
+        visible_held_ = false;
+        // The caller rechecks current demand outside this callback before read.
+    }
+
     [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
         std::scoped_lock lock(mutex_);
         using Kind = contracts::IntegrationControlKind;
-        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ || receipt.kind == Kind::Advance)
+        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ || contracts::integration_server_command(receipt.kind))
             return false;
-        if ((receipt.kind == Kind::Failed) != (receipt.failureline != 0U)) return false;
+        if (!contracts::integration_receipt_valid(receipt)) return false;
+        if (receipt.kind == Kind::CapacityArmRequested && std::exchange(capacity_requested_, true)) return false;
+        if (receipt.kind == Kind::VisibleReadArmRequested) {
+            if (visible_requested_) return false;
+            visible_requested_ = true;
+            visible_index_ = receipt.compiled_index;
+        }
+        if (receipt.kind == Kind::VisibleReadReleaseRequested && (!visible_held_ || visible_released_ ||
+            receipt.read_generation != visible_generation_ || receipt.compiled_index != visible_index_ || std::exchange(visible_release_requested_, true))) return false;
         if (receipt.kind == Kind::Progress) {
             if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;
             frontend_progress_ = receipt.progress;
@@ -203,7 +252,9 @@ class ExploreAcceptanceGate::Impl final {
             const auto command = ReadCommand();
             std::shared_ptr<const FrontendCommand> callback;
             std::shared_ptr<const std::function<bool()>> redraw;
+            std::shared_ptr<const std::function<bool(ControlCommand)>> completion;
             std::uint64_t sequence = 0U;
+            auto frontend_kind = contracts::IntegrationControlKind::Advance;
             {
                 std::scoped_lock lock(mutex_);
                 if (terminal_) return;
@@ -211,8 +262,21 @@ class ExploreAcceptanceGate::Impl final {
                     if (current_generation_ == 0U || initial_released_generation_ != current_generation_) release_one_ = true;
                 } else if (command == 2U) {
                     release_all_ = true;
+                } else if (command == static_cast<std::uint8_t>(ControlCommand::ArmVisibleRead) &&
+                           visible_requested_ && !visible_armed_ && !visible_held_ && frontend_command_) {
+                    visible_armed_ = true;
+                    visible_released_ = false;
+                    callback = frontend_command_;
+                    sequence = frontend_sequence_;
+                    frontend_kind = contracts::IntegrationControlKind::VisibleReadArmed;
+                } else if (command == static_cast<std::uint8_t>(ControlCommand::ReleaseVisibleRead) && visible_held_ && !visible_released_ && visible_release_requested_) {
+                    visible_released_ = true;
                 } else if (command == 4U) {
                     release_held_ = true;
+                } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) ||
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseSample)) && completion_command_) {
+                    completion = completion_command_;
                 } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ &&
                            initial_released_generation_ == 0U && redraw_command_) {
                     redraw_claimed_ = true;
@@ -228,6 +292,9 @@ class ExploreAcceptanceGate::Impl final {
                     frontend_settled_ = false;
                     frontend_progress_ = 0U;
                     frontend_pressure_ = false;
+                    visible_requested_ = false;
+                    visible_release_requested_ = false;
+                    capacity_requested_ = false;
                     sequence = ++frontend_sequence_;
                     callback = frontend_command_;
                 } else {
@@ -236,10 +303,10 @@ class ExploreAcceptanceGate::Impl final {
                 changed_.notify_all();
                 if (terminal_) return;
             }
-            if (redraw || callback) {
+            if (redraw || callback || completion) {
                 try {
                     const bool accepted =
-                        redraw ? (*redraw)() : (*callback)({.kind = contracts::IntegrationControlKind::Advance, .sequence = sequence});
+                        completion ? (*completion)(static_cast<ControlCommand>(command)) : redraw ? (*redraw)() : (*callback)({.kind = frontend_kind, .sequence = sequence});
                     if (accepted) continue;
                 } catch (...) {}
                 Terminal();
@@ -272,7 +339,16 @@ class ExploreAcceptanceGate::Impl final {
     std::uint64_t initial_released_generation_ = 0U;
     std::shared_ptr<const FrontendCommand> frontend_command_;
     std::shared_ptr<const std::function<bool()>> redraw_command_;
+    std::shared_ptr<const std::function<bool(ControlCommand)>> completion_command_;
     bool redraw_claimed_ = false;
+    bool visible_requested_ = false;
+    bool visible_release_requested_ = false;
+    bool capacity_requested_ = false;
+    bool visible_armed_ = false;
+    bool visible_held_ = false;
+    bool visible_released_ = false;
+    std::uint32_t visible_index_ = 0U;
+    std::uint64_t visible_generation_ = 0U;
     std::uint64_t frontend_sequence_ = 1U;
     bool frontend_settled_ = false;
     bool frontend_pressure_ = false;
@@ -300,6 +376,11 @@ bool ExploreAcceptanceGate::ClaimTerminalReport() { return impl_->ClaimTerminalR
 void ExploreAcceptanceGate::Stop() noexcept { impl_->Stop(); }
 void ExploreAcceptanceGate::StopAndJoin() noexcept { impl_->StopAndJoin(); }
 void ExploreAcceptanceGate::SetFrontendCommand(FrontendCommand callback) { impl_->SetFrontendCommand(std::move(callback)); }
+std::uint64_t ExploreAcceptanceGate::FrontendSequence() const noexcept { return impl_->FrontendSequence(); }
+void ExploreAcceptanceGate::SetCompletionCommand(std::function<bool(ControlCommand)> callback) {
+    impl_->SetCompletionCommand(std::move(callback));
+}
+bool ExploreAcceptanceGate::ObserveControl(const ControlObservation& observation) noexcept { return impl_->ObserveControl(observation); }
 void ExploreAcceptanceGate::SetRedrawCommand(std::function<bool()> callback) { impl_->SetRedrawCommand(std::move(callback)); }
 bool ExploreAcceptanceGate::ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
     return impl_->ObserveFrontend(receipt);
@@ -321,6 +402,9 @@ void ExploreAcceptanceGate::ObserveSubmission(const std::uintptr_t stream, const
 void ExploreAcceptanceGate::SetReadObserver(void* context, void (*observer)(void*, std::uint64_t, std::uint32_t)) noexcept {
     impl_->read_context = context;
     impl_->read_observer = observer;
+}
+void ExploreAcceptanceGate::AwaitVisibleRead(const std::uint64_t generation, const std::uint32_t index) {
+    impl_->AwaitVisibleRead(generation, index);
 }
 void ExploreAcceptanceGate::ObserveRead(const std::uint64_t generation, const std::uint32_t index) const {
     if (impl_->read_observer) impl_->read_observer(impl_->read_context, generation, index);

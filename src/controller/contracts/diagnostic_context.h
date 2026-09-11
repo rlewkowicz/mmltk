@@ -52,6 +52,23 @@ struct DiagnosticWorkspace final {
     std::uint64_t workspace_source_high = 0U;
     std::uint64_t workspace_source_low = 0U;
     std::uint64_t workspace_allocation = 0U;
+    std::uint64_t workspace_arena_high = 0U;
+    std::uint64_t workspace_arena_low = 0U;
+    std::uint64_t workspace_bytes = 0U;
+    std::uint64_t workspace_pitch = 0U;
+    std::uint64_t workspace_width = 0U;
+    std::uint64_t workspace_height = 0U;
+};
+struct DiagnosticExploreAdmission final {
+    std::uint64_t admission_position = 0U;
+    std::uint64_t admission_first_row = 0U;
+    std::uint64_t admission_row_count = 0U;
+    std::uint64_t admission_columns = 0U;
+    std::uint64_t admission_tier = 0U;
+    bool admission_forward = true;
+    std::uint64_t admission_immediate_eligible = 0U;
+    std::uint64_t admission_forward_eligible = 0U;
+    std::uint64_t admission_backward_eligible = 0U;
 };
 struct DiagnosticTransfer final {
     std::uint64_t transfer_sequence = 0U;
@@ -103,6 +120,7 @@ struct DiagnosticContext final {
     DiagnosticAllocation allocation{};
     DiagnosticTransfer transfer{};
     DiagnosticWorkspace workspace{};
+    DiagnosticExploreAdmission admission{};
     DiagnosticLink link{};
     DiagnosticSpanTiming span{};
     DiagnosticPixel pixel{};
@@ -115,6 +133,7 @@ MMLTK_REFLECT_FIELDS(DiagnosticDemand)
 MMLTK_REFLECT_FIELDS(DiagnosticPublication)
 MMLTK_REFLECT_FIELDS(DiagnosticAllocation)
 MMLTK_REFLECT_FIELDS(DiagnosticWorkspace)
+MMLTK_REFLECT_FIELDS(DiagnosticExploreAdmission)
 MMLTK_REFLECT_FIELDS(DiagnosticTransfer)
 MMLTK_REFLECT_FIELDS(DiagnosticLink)
 MMLTK_REFLECT_FIELDS(DiagnosticSpanTiming)

@@ -48,6 +48,7 @@ struct ApplicationShellConfig final {
     services::SettingsLocation settings_location{std::string_view{}};
     bool h2d_dataloader = true;
     bool pending_supersession_acceptance = false;
+    std::shared_ptr<PresentationAcceptanceGate> completion_acceptance{};
     std::filesystem::path training_executable{};
 };
 MMLTK_REFLECT_FIELDS(ApplicationShellConfig::PresentationConfig)

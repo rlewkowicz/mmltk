@@ -5,6 +5,7 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -558,12 +559,14 @@ TEST_CASE("direct host closes a real peer on malformed Protocol-15 input") {
 }
 
 TEST_CASE("ordinary browser host rejects explicit integration control", "[controller][browser][protocol]") {
+    using Kind = mmltk::controller::contracts::IntegrationControlKind;
+    const auto kind = GENERATE(Kind::Settled, Kind::CapacityArmRequested, Kind::VisibleReadArmRequested);
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
     wire::ByteBuffer encoded;
     REQUIRE(encode_client_record(ClientRecord{IntegrationControl{
-                                     .receipt = {.kind = mmltk::controller::contracts::IntegrationControlKind::Settled, .sequence = 1U}}},
+                                     .receipt = {.kind = kind, .sequence = 1U}}},
                                  encoded));
     peer.send_binary(encoded);
     const auto terminal = peer.receive();

@@ -382,7 +382,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         )?);
         cursor += size;
     }
-    require(records.len() == 8, "native fixture record count changed")?;
+    require(records.len() >= 8, "native fixture record count changed")?;
     require(
         matches!(&records[7], ServerRecord::IntegrationControl(record)
             if record.receipt.kind == generated::IntegrationControlKind::Advance && record.receipt.sequence == 2),
@@ -849,10 +849,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sequence: 1,
                 progress: 0,
                 failureline: 0,
+                readgeneration: 0,
+                compiledindex: 0,
             },
         }
         .encode()?,
     ));
+    for (name, kind, generation, index) in [
+        ("IntegrationControl:capacity", generated::IntegrationControlKind::CapacityArmRequested, 0, 0),
+        ("IntegrationControl:visible-arm", generated::IntegrationControlKind::VisibleReadArmRequested, 0, 0),
+        ("IntegrationControl:visible-release", generated::IntegrationControlKind::VisibleReadReleaseRequested, 7, 0),
+    ] {
+        records.push((name, generated::IntegrationControl {
+            protocolversion: generated::BROWSER_PROTOCOL_VERSION,
+            receipt: generated::IntegrationControlReceipt {
+                kind, sequence: 1, progress: 0, failureline: 0,
+                readgeneration: generation, compiledindex: index,
+            },
+        }.encode()?));
+    }
     for (kind, record) in records {
         write!(&mut output, "{kind} ")?;
         for byte in record {

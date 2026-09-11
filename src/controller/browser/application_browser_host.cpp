@@ -395,6 +395,7 @@ struct ApplicationBrowserHost::Impl final {
     std::uint64_t consumed_sequence = 0U;
     bool input_active = false;
     std::shared_ptr<ExploreAcceptanceGate> integration;
+    std::shared_ptr<PresentationAcceptanceGate> completion_acceptance;
     transport::BrowserServer* server = nullptr;
     services::RuntimeDiagnosticTarget diagnostics;
     std::atomic<ApplicationSystems*> systems = nullptr;
@@ -406,7 +407,8 @@ ApplicationBrowserHost::ApplicationBrowserHost(transport::BrowserServer& server,
 
 bool ApplicationBrowserHost::install(ApplicationSystems& systems) noexcept { return impl_->install(systems); }
 
-void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate) {
+void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate,
+                                                  std::shared_ptr<PresentationAcceptanceGate> completion) {
     if (!gate || impl_->integration) throw std::invalid_argument("integration gate installation is unique");
     std::weak_ptr<Impl> weak = impl_;
     gate->SetFrontendCommand([weak](const contracts::IntegrationControlReceipt receipt) {
@@ -422,6 +424,36 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
         installed->presentation->Observe({.redraw_requested = true});
         return true;
     });
+    if (completion) {
+        std::weak_ptr<ExploreAcceptanceGate> receiver = gate;
+        completion->SetObserver([receiver](const PresentationAcceptanceGate::Receipt receipt) {
+            if (const auto target = receiver.lock()) {
+                if (!target->ObserveControl({.event = receipt.capacity_available ? ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable
+                                                                         : ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld,
+                    .source_high = receipt.source_high, .source_low = receipt.source_low,
+                    .transfer = receipt.transfer, .publication = receipt.publication})) target->Stop();
+            }
+        });
+        gate->SetCompletionCommand([weak, completion](const ExploreAcceptanceGate::ControlCommand command) {
+            const auto owner = weak.lock();
+            if (!owner || !owner->admission.load(std::memory_order_acquire)) return false;
+            using Command = ExploreAcceptanceGate::ControlCommand;
+            using Kind = contracts::IntegrationControlKind;
+            Kind kind;
+            if (command == Command::ArmNativeCompletion) {
+                if (!completion->Arm()) return false;
+                kind = Kind::CapacityArmed;
+            } else if (command == Command::ReleaseNativeCompletion) {
+                if (!completion->Release()) return false;
+                kind = Kind::CapacityCompletionReleased;
+            } else if (command == Command::ReleaseSample) {
+                kind = Kind::CapacityReleaseSample;
+            } else return false;
+            return owner->publish_record(IntegrationControl{.receipt = {
+                .kind = kind, .sequence = owner->integration->FrontendSequence()}}, transport::BrowserRecordPriority::Critical);
+        });
+        impl_->completion_acceptance = std::move(completion);
+    }
     impl_->integration = std::move(gate);
 }
 
@@ -444,6 +476,8 @@ void ApplicationBrowserHost::close_admission() noexcept {
     if (impl_->integration) {
         impl_->integration->SetFrontendCommand({});
         impl_->integration->SetRedrawCommand({});
+        impl_->integration->SetCompletionCommand({});
+        if (impl_->completion_acceptance) impl_->completion_acceptance->Stop();
         impl_->integration->StopAndJoin();
     }
 }

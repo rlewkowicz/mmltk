@@ -368,6 +368,7 @@ class ExploreAcceptanceGate final {
     // Install before admitting reads; invoked outside the lane control mutex.
     void SetReadObserver(void*, void (*)(void*, std::uint64_t, std::uint32_t)) noexcept;
     void ObserveRead(std::uint64_t, std::uint32_t) const;
+    void AwaitVisibleRead(std::uint64_t, std::uint32_t);
     // Construction-only acceptance receipt, invoked before the initial wait
     // without holding either the physical lane or gate control mutex.
     void SetInitialWaitObserver(void*, void (*)(void*, std::uint64_t)) noexcept;
@@ -385,7 +386,18 @@ class ExploreAcceptanceGate final {
         HeldProceed = 0x82U,
         HeldStale = 0x83U,
         Frontend = 0x84U,
+        NativeCompletionHeld = 0x85U,
+        NativeCapacityAvailable = 0x86U,
+        VisibleReadHeld = 0x87U,
     };
+    enum class ControlCommand : std::uint8_t {
+        InitialRelease = 1U, ReleaseAll = 2U, ArmVisibleRead = 3U, HeldRelease = 4U, ReleaseVisibleRead = 5U, Advance = 8U,
+        Redraw = 16U, ArmNativeCompletion = 32U, ReleaseNativeCompletion = 64U, ReleaseSample = 128U,
+    };
+    [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
+    void SetCompletionCommand(std::function<bool(ControlCommand)>);
+    struct ControlObservation;
+    [[nodiscard]] bool ObserveControl(const ControlObservation&) noexcept;
     using FrontendCommand = std::function<bool(contracts::IntegrationControlReceipt)>;
     // Installed only by the explicit integration host. The descriptor reader
     // remains the sole receiver of parent commands throughout the session.
@@ -401,6 +413,10 @@ class ExploreAcceptanceGate final {
         // Frontend observations carry the static failure source line here;
         // worker observations carry physical staging capacity.
         std::uint64_t staging_bytes = 0U;
+        std::uint64_t source_high = 0U;
+        std::uint64_t source_low = 0U;
+        std::uint64_t transfer = 0U;
+        std::uint64_t publication = 0U;
     };
 
     explicit ExploreAcceptanceGate(int command_descriptor);

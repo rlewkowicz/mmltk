@@ -96,7 +96,7 @@ impl Renderer {
         }
     }
 
-                    pub fn draw(
+    pub fn draw(
         &mut self,
         clear_color: Option<Color>,
         target: &wgpu::TextureView,
@@ -144,7 +144,11 @@ impl Renderer {
         submission
     }
 
-                pub fn screenshot(&mut self, viewport: &Viewport, background_color: Color) -> Vec<u8> {
+    pub fn screenshot(
+        &mut self,
+        viewport: &Viewport,
+        background_color: Color,
+    ) -> Vec<u8> {
         #[derive(Clone, Copy, Debug)]
         struct BufferDimensions {
             width: u32,
@@ -609,11 +613,11 @@ impl Renderer {
         });
     }
 
-                                pub fn finish(&mut self) {
+    pub fn finish(&mut self) {
         self.staging_belt.finish();
     }
 
-                                pub fn recall(&mut self) {
+    pub fn recall(&mut self) {
         self.staging_belt.recall();
     }
 }

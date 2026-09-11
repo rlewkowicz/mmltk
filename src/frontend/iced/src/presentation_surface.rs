@@ -106,14 +106,16 @@ fn emit_surface_trace(line: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreSnapshot>) -> String {
+pub(crate) fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreSnapshot>) -> String {
     snapshot.map_or_else(String::new, |snapshot| format!(
-        ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"source_observation_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?}",
+        ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"source_observation_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?},\"row_capacity\":{},\"row_origin\":{},\"card_extent\":{},\"augmentation_enabled\":{},\"augmentation_seed\":{}",
         crate::generated::presentation_source_session(snapshot.frame.source.kind), snapshot.frame.source.instance, snapshot.frame.revision,
         crate::generated::visual_clean_content_identity(&snapshot.frame).revision, snapshot.revision,
         snapshot.dataset.identity, snapshot.gallery.generation, snapshot.gallery.slots,
         snapshot.viewport.columns, snapshot.viewport.rowcount, snapshot.viewport.firstrow,
         snapshot.order.matchingcount, snapshot.order.visibleindices,
+        snapshot.gallery.layout.rowcapacity, snapshot.gallery.layout.roworigin, snapshot.gallery.layout.cardextent,
+        snapshot.augmentation.enabled, snapshot.augmentation.seed,
     ))
 }
 
@@ -261,6 +263,54 @@ thread_local! {
     static COPY_RECEIPTS: std::cell::Cell<[Option<FrameReady>; SAMPLE_CAPACITY]> = const { std::cell::Cell::new([None; SAMPLE_CAPACITY]) };
 }
 
+thread_local! {
+    static CAPACITY_ACCEPTANCE: std::cell::RefCell<Option<[Option<std::sync::Arc<SampleRead>>; 2]>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn retain_capacity_sample(read: &std::sync::Arc<SampleRead>) {
+    CAPACITY_ACCEPTANCE.with(|owner| {
+        let mut owner = owner.borrow_mut();
+        let Some(slots) = owner.as_mut() else { return; };
+        if slots.iter().flatten().any(|prior| prior.0 == read.0) { return; }
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.is_none()) { *slot = Some(read.clone()); }
+    });
+}
+
+pub(crate) fn begin_capacity_acceptance() -> bool {
+    if CAPACITY_ACCEPTANCE.with(|owner| owner.borrow().is_some()) { return false; }
+    let read = RENDERER.with(|renderer| renderer.borrow().as_ref()
+        .and_then(|renderer| renderer.imported.as_ref())
+        .and_then(|imported| imported.image.retained_read.clone()));
+    let Some(read) = read else { return false; };
+    CAPACITY_ACCEPTANCE.with(|owner| *owner.borrow_mut() = Some([Some(read), None]));
+    true
+}
+
+pub(crate) fn capacity_acceptance_slots() -> usize {
+    CAPACITY_ACCEPTANCE.with(|owner| {
+        let owner = owner.borrow();
+        let Some(slots) = owner.as_ref() else { return 0; };
+        match (&slots[0], &slots[1]) {
+            (Some(first), Some(second)) if first.0.high == second.0.high && first.0.low == second.0.low
+                && first.0.slot != second.0.slot => 2,
+            (Some(_), None) => 1,
+            _ => 0,
+        }
+    })
+}
+
+pub(crate) fn release_capacity_sample() -> bool {
+    // Take before dropping: release dispatch may re-enter page-local owners.
+    let read = CAPACITY_ACCEPTANCE.with(|owner| owner.borrow_mut().as_mut().and_then(|slots| slots[0].take()));
+    read.is_some()
+}
+
+pub(crate) fn end_capacity_acceptance() {
+    let retired = CAPACITY_ACCEPTANCE.with(|owner| owner.borrow_mut().take());
+    drop(retired);
+}
+
 fn copy_completed(frame: FrameReady) -> bool {
     COPY_RECEIPTS.with(|receipts| receipts.get().contains(&Some(frame)))
 }
@@ -275,6 +325,7 @@ impl SampleRead {
                 .expect("bounded active, candidate and retiring arena slots");
             *slot = Some(std::sync::Arc::downgrade(&read));
         });
+        retain_capacity_sample(&read);
         Some(read)
     }
 }
@@ -334,6 +385,7 @@ fn drain_retired_textures() {
     });
     for retired in ready.into_iter().flatten() {
         retired.texture.destroy();
+        trace_surface("texture_destroyed", retired.surface);
     }
 }
 
@@ -350,6 +402,7 @@ impl Drop for ArenaTexture {
         let Some(texture) = self.texture.take() else { return; };
         if !arena_has_readers(self.surface) {
             texture.destroy();
+            trace_surface("texture_destroyed", self.surface);
             return;
         }
         RETIRED_TEXTURES.with(|retired| {
@@ -1524,7 +1577,7 @@ impl Drop for SurfaceRenderer {
 
 impl Drop for Imported {
     fn drop(&mut self) {
-        trace_surface("retired", self.image.surface);
+        trace_surface("import_dropped", self.image.surface);
         // Field destruction drops display/view/probe owners before _arena
         // transfers the texture to exact last-reader retirement.
     }
@@ -1798,7 +1851,8 @@ impl SurfaceRenderer {
                 surface,
                 requested,
                 bounds,
-                    placement,
+                geometry,
+                placement,
                 gallery: matches!(placement, Placement::GalleryGrid { .. })
                     .then(|| gallery.cloned())
                     .flatten(),
@@ -2015,6 +2069,17 @@ impl SurfaceRenderer {
         pass.draw(0..3, 0..1);
         drop(pass);
         resources.retain(read.clone());
+        #[cfg(target_arch = "wasm32")]
+        if surface_trace_enabled() {
+            // The closure carries exact immutable publication facts only. The
+            // generic batch owns submission/abandonment, not application state.
+            resources.observe_settlement(move |outcome| trace_frame(
+                match outcome {
+                    shader::Settlement::Submitted => "draw_settled",
+                    shader::Settlement::Abandoned => "draw_abandoned",
+                }, frame,
+            ));
+        }
         trace_surface_request(
             "sample_draw_selected",
             draw.surface,
@@ -3351,6 +3416,9 @@ mod tests {
         let probe = display.clone();
         let mut first_encoder = shader::Resources::default();
         let mut second_encoder = shader::Resources::default();
+        let settlements = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = settlements.clone();
+        first_encoder.observe_settlement(move |outcome| observed.lock().unwrap().push(outcome));
         // Multiple widgets share one publication and one batch callback.
         for _ in 0..32 { first_encoder.retain(display.clone()); }
         second_encoder.retain(display.clone());
@@ -3362,6 +3430,7 @@ mod tests {
         // An abandoned encoder drops only its own encoded reads. The same RAII
         // batch settles when wgpu invokes its containing submission callback.
         drop(first_encoder);
+        assert_eq!(*settlements.lock().unwrap(), [shader::Settlement::Abandoned]);
         assert!(test_releases().is_empty());
         drop(probe);
         assert!(test_releases().is_empty());

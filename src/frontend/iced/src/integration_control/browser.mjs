@@ -148,7 +148,7 @@ function dispatchIntegrationSurfaceClick() {
     const canvas = document.querySelector('canvas');
     if (!canvas) return;
     if (integrationState) report({
-      event: 'integration.surface_click_dispatched',
+      event: pending.hover ? 'integration.surface_hover_dispatched' : 'integration.surface_click_dispatched',
       control: pending.control,
       detail: 'real-canvas-pointer',
       a: String(drawn.sourceRevision),
@@ -156,7 +156,8 @@ function dispatchIntegrationSurfaceClick() {
       c: String(pending.x),
       d: String(pending.y),
     });
-    integrationClick(canvas, canvas.getBoundingClientRect(), pending.x, pending.y);
+    if (pending.hover) canvas.dispatchEvent(integrationPointer(canvas.getBoundingClientRect(), pending.x, pending.y, 'pointermove', 0));
+    else integrationClick(canvas, canvas.getBoundingClientRect(), pending.x, pending.y);
   });
 }
 
@@ -191,11 +192,12 @@ export function mmltkIntegrationReport(event, control, detail, a, b, c, d) {
   report({event, control, detail, a: String(a), b: String(b), c: String(c), d: String(d)});
 }
 
-export function mmltkIntegrationAtlasPixels(receipt, rectangles, sourceRevision, presentationRevision, completed) {
+export function mmltkIntegrationAtlasPixels(receipt, rectangles, cards, fields, sourceRevision, presentationRevision, completed) {
   completed = integrationCompletion(completed);
   if (!integrationState) return;
   if (!probeCurrent(receipt)) { completed('invalidated'); return; }
   rectangles = rectangles.slice();
+  cards = Array.from(cards);
   // The draw report is emitted while encoding Iced's current submission.
   // Sample the actual canvas at its next presentation opportunity, without
   // dispatching input, scheduling an Iced redraw, or introducing a timer.
@@ -211,22 +213,35 @@ export function mmltkIntegrationAtlasPixels(receipt, rectangles, sourceRevision,
         return;
       }
       if (integrationState.initialAtlasInputCount !== 0) { completed('failed'); return; }
-      const probe = new OffscreenCanvas(8, 8);
-      const context = probe.getContext('2d', {willReadFrequently: true});
-      if (!context) throw new Error('missing diagnostic pixel reader');
+      const context = canvasSnapshot(canvas);
+      const identity = JSON.parse(fields);
+      if (cards.length * 4 !== rectangles.length) throw new Error('ready-cell identity count');
       let nonblack = 0;
       for (let i = 0; i < rectangles.length; i += 4) {
-        context.clearRect(0, 0, 8, 8);
-        context.drawImage(canvas, rectangles[i], rectangles[i + 1],
-          rectangles[i + 2], rectangles[i + 3], 0, 0, 8, 8);
-        const pixels = context.getImageData(0, 0, 8, 8).data;
+        const width = Math.min(8, Math.floor(rectangles[i + 2]));
+        const height = Math.min(8, Math.floor(rectangles[i + 3]));
+        const x = Math.floor(rectangles[i] + (rectangles[i + 2] - width) / 2);
+        const y = Math.floor(rectangles[i + 1] + (rectangles[i + 3] - height) / 2);
+        const pixels = context.getImageData(x, y, width, height).data;
         let colored = 0;
         for (let p = 0; p < pixels.length; p += 4) {
           if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8) {
             colored++;
           }
         }
-        nonblack += Number(colored >= 32);
+        const matched = colored * 2 >= width * height;
+        nonblack += Number(matched);
+        const center = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4;
+        const rgba = (pixels[center] | pixels[center + 1] << 8 | pixels[center + 2] << 16 | pixels[center + 3] << 24) >>> 0;
+        const side = identity.image?.[2] / identity.columns;
+        const sample = Number.isFinite(side) && side > 0 ? {
+          cell_sample_x: Math.round(((x + Math.floor(width / 2) + .5 - identity.image[0]) % side) / side * identity.card_extent * 1000),
+          cell_sample_y: Math.round(((y + Math.floor(height / 2) + .5 - identity.image[1]) % side) / side * identity.card_extent * 1000),
+          cell_sample_rgba: rgba,
+        } : {};
+        report({event: 'integration.atlas_ready_cell', ...identity, ...sample,
+          compiled_index: cards[i / 4], canvas_x: x, canvas_y: y,
+          sampled_pixels: width * height, colored_pixels: colored, matched});
       }
       report({event: 'integration.atlas_canvas_sample', control: 'explore.gallery.workspace',
         detail: 'javascript-pixel-counts', a: String(sourceRevision), b: String(presentationRevision),
@@ -559,6 +574,12 @@ export function mmltkIntegrationClickAfterSurfaceDraw(x, y, control, sourceRevis
       !Number.isSafeInteger(sourceRevision) || sourceRevision <= 0) return 0;
   integrationDriver.pendingSurfaceClick = {x, y, control, sourceRevision, allowNewer};
   dispatchIntegrationSurfaceClick();
+  return 1;
+}
+
+export function mmltkIntegrationHoverAfterSurfaceDraw(x, y, control, sourceRevision) {
+  if (!mmltkIntegrationClickAfterSurfaceDraw(x, y, control, sourceRevision, false)) return 0;
+  integrationDriver.pendingSurfaceClick.hover = true;
   return 1;
 }
 

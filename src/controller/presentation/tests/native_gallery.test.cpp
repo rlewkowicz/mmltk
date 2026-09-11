@@ -35,6 +35,7 @@
 #include "src/backend/data/compiled_format.h"
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/presentation/presentation_system.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -1971,6 +1972,80 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
     }
     CHECK(gate.ClaimTerminalReport());
     CHECK(gate.AwaitInitialRelease(7U) == ExploreAcceptanceGate::WaitResult::Stale);
+}
+
+}  // namespace
+}  // namespace mmltk::controller
+
+namespace mmltk::controller {
+namespace {
+
+TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts", "[explore][acceptance][control]") {
+    using Kind = contracts::IntegrationControlKind;
+    AcceptanceGateFixture fixture{SOCK_SEQPACKET};
+    auto& gate = fixture.gate();
+    std::promise<void> armed, observed;
+    auto arm = armed.get_future(), held = observed.get_future();
+    gate.SetFrontendCommand([&](const auto receipt) {
+        // This reentrant owner access proves callbacks run outside the gate mutex.
+        CHECK(gate.FrontendSequence() == 1U);
+        if (receipt.kind == Kind::VisibleReadArmed) armed.set_value();
+        if (receipt.kind == Kind::VisibleReadHeld) {
+            CHECK(receipt.read_generation == 7U);
+            CHECK(receipt.compiled_index == 0U);
+            observed.set_value();
+        }
+        return true;
+    });
+    gate.AdvanceGeneration(7U);
+    REQUIRE(gate.ObserveFrontend({.kind = Kind::VisibleReadArmRequested, .sequence = 1U, .compiled_index = 0U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::VisibleReadArmRequested, .sequence = 1U}));
+    const auto send = [&](const ExploreAcceptanceGate::ControlCommand command) {
+        const auto value = static_cast<std::uint8_t>(command);
+        REQUIRE(::send(fixture.commands().get(), &value, sizeof(value), MSG_NOSIGNAL) == sizeof(value));
+    };
+    send(ExploreAcceptanceGate::ControlCommand::ArmVisibleRead);
+    fixture.Await(arm);
+    gate.AwaitVisibleRead(7U, 1U);  // Another compiled descriptor is not held.
+    auto reading = std::async(std::launch::async, [&] { gate.AwaitVisibleRead(7U, 0U); });
+    fixture.Await(held);
+    gate.AdvanceGeneration(8U);
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::VisibleReadReleaseRequested, .sequence = 1U, .read_generation = 8U}));
+    REQUIRE(gate.ObserveFrontend({.kind = Kind::VisibleReadReleaseRequested, .sequence = 1U, .read_generation = 7U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::VisibleReadReleaseRequested, .sequence = 1U, .read_generation = 7U}));
+    send(ExploreAcceptanceGate::ControlCommand::ReleaseVisibleRead);
+    fixture.Await(reading);
+    CHECK(gate.ObserveFrontend({.kind = Kind::CapacityArmRequested, .sequence = 1U}));
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::CapacityArmRequested, .sequence = 1U}));
+    gate.StopAndJoin();
+    CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
+}
+
+TEST_CASE("native completion gate preserves the capacity-before-consumption wake", "[presentation][acceptance][control]") {
+    PresentationAcceptanceGate gate;
+    std::vector<PresentationAcceptanceGate::Receipt> receipts;
+    unsigned wakes = 0U;
+    gate.SetWake([&] { ++wakes; gate.SetWake({}); });
+    gate.SetObserver([&](const auto receipt) { receipts.push_back(receipt); gate.SetObserver({}); });
+    CHECK_FALSE(gate.Release());
+    REQUIRE(gate.Arm());
+    CHECK_FALSE(gate.Arm());
+    const PresentationAcceptanceGate::Receipt held{3U, 4U, 5U, 6U};
+    REQUIRE(gate.Hold(held));
+    REQUIRE(receipts.size() == 1U);
+    CHECK_FALSE(receipts.front().capacity_available);
+    gate.SetObserver([&](const auto receipt) { receipts.push_back(receipt); });
+    gate.ObserveCapacity();
+    gate.ObserveCapacity();
+    REQUIRE(receipts.size() == 2U);
+    CHECK(receipts.back().capacity_available);
+    CHECK(receipts.back().publication == held.publication);
+    REQUIRE(gate.Release());
+    CHECK(wakes == 1U);  // Explicit wake survives an already drained completion edge.
+    CHECK_FALSE(gate.Hold(held));
+    CHECK_FALSE(gate.Release());
+    gate.Stop();
+    CHECK_FALSE(gate.Arm());
 }
 
 }  // namespace

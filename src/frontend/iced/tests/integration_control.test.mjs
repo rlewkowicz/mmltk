@@ -150,7 +150,7 @@ test('missing physical receipts fail closed before scheduling or sampling', t =>
   const f = canvasFixture(t, true);
   const results = [];
   const completed = (...values) => results.push(values);
-  browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], 7, 11, completed);
+  browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], [0], '{}', 7, 11, completed);
   browser.mmltkIntegrationAtlasComposition(browser.mmltkIntegrationProbe(gallery), [0, 0, 1, 1, 64, 64, 64, 255, 4, 0], [], '{}', 7, 11, 1, completed);
   browser.mmltkIntegrationUpscalePixels(browser.mmltkIntegrationProbe(detail), [0, 0, 8, 8], [0, 0, 8, 8], 7, 11, completed);
   browser.mmltkIntegrationAnnotationSwatch(browser.mmltkIntegrationProbe(workspace), [0, 0, 8, 8], [64, 64, 64], 'tool', '', false, completed);
@@ -168,7 +168,7 @@ test('missing physical receipts fail closed before scheduling or sampling', t =>
 test('same-frame geometry change rejects old pixel work and admits the replacement', t => {
   const f = canvasFixture(t, true);
   const results = [];
-  const pixels = () => browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], 7, 11, (...values) => results.push(values));
+  const pixels = () => browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], [0], '{}', 7, 11, (...values) => results.push(values));
   browser.mmltkIntegrationReceipt(gallery, 'geometry-A', 7, 11);
   pixels();
   browser.mmltkIntegrationReceipt(gallery, 'geometry-B', 7, 11);
@@ -234,7 +234,7 @@ test('diagnostic replacement preserves pending probes and does not cancel quiet 
 });
 
 const probeCalls = [
-  [gallery, callback => browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], 7, 11, callback)],
+  [gallery, callback => browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery), [0, 0, 8, 8], [0], '{}', 7, 11, callback)],
   [gallery, callback => browser.mmltkIntegrationAtlasComposition(browser.mmltkIntegrationProbe(gallery), [0, 0, 1, 1, 64, 64, 64, 255, 4, 0], [], '{}', 7, 11, 4, callback)],
   [workspace, callback => browser.mmltkIntegrationAnnotationSwatch(browser.mmltkIntegrationProbe(workspace), [0, 0, 8, 8], [64, 64, 64], 'tool', '', false, callback)],
   [workspace, callback => browser.mmltkIntegrationAnnotationPixels(browser.mmltkIntegrationProbe(workspace), [0, 0, 8, 8], [8, 8], [4, 4, 64, 64, 64, 0, 1], 7, 11, callback)],
@@ -388,4 +388,33 @@ test('pre-location canvas requests retain their original geometry across another
   browser.mmltkIntegrationResetScenario();
   f.flushFrames();
   assert.equal(results.length, 4);
+});
+
+test('held placeholder hover uses the exact draw without selecting it', t => {
+  const f = canvasFixture(t);
+  assert.equal(browser.mmltkIntegrationHoverAfterSurfaceDraw(10, 20, gallery, 7), 1);
+  browser.mmltkIntegrationDriverDraw(gallery, 6, 10);
+  f.flushMicrotasks();
+  assert.deepEqual(f.events, []);
+  browser.mmltkIntegrationDriverDraw(gallery, 7, 11);
+  f.flushMicrotasks();
+  assert.deepEqual(f.events, ['pointermove']);
+  assertQuiet(f);
+});
+
+test('partial atlas sampling reports each exact ready card and reuses canvas storage', t => {
+  const f = canvasFixture(t, true);
+  const results = [];
+  browser.mmltkIntegrationReceipt(gallery, 'partial', 7, 11);
+  browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery),
+    [0, 0, 8, 8, 10, 10, 4, 4], [3, 9], '{"presentation_revision":11}', 7, 11,
+    (...values) => results.push(values));
+  f.flushFrames();
+  assert.deepEqual(results, [['observed', 2, 2]]);
+  const cells = f.reports.filter(record => record.event === 'integration.atlas_ready_cell');
+  assert.deepEqual(cells.map(record => record.compiled_index), [3, 9]);
+  assert.ok(cells.every(record => record.matched && record.presentation_revision === 11));
+  assert.equal(f.allocations.scratch, 1);
+  assert.equal(f.allocations.reads, 2);
+  assert.deepEqual(f.events, []);
 });

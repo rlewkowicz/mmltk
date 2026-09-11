@@ -801,6 +801,29 @@ class BindingEmitter final {
         BindingOuterRoutingWriter writer(output_, symbols_);
         mmltk::controller::browser::emit_application_outer_routing<ApplicationSystems>(writer);
         mmltk::controller::browser::emit_application_visual_projection<ApplicationSystems>(writer);
+        using mmltk::controller::contracts::IntegrationControlKind;
+        symbols_.Reserve("module", "integration_server_command", "canonical integration command direction");
+        const auto kind_type = writer.rust_type<IntegrationControlKind>();
+        output_ << "pub const fn integration_server_command(kind: " << kind_type << ") -> bool { match kind {\n";
+        template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^IntegrationControlKind))) {
+            constexpr auto kind = std::meta::extract<IntegrationControlKind>(enumerator);
+            output_ << kind_type << "::" << writer.identifier(std::meta::identifier_of(enumerator), true) << " => "
+                    << (mmltk::controller::contracts::integration_server_command(kind) ? "true" : "false") << ",\n";
+        }
+        output_ << "} }\n";
+        symbols_.Reserve("module", "integration_receipt_valid", "canonical integration receipt policy");
+        output_ << "pub const fn integration_receipt_valid(receipt: &" << writer.rust_type<mmltk::controller::contracts::IntegrationControlReceipt>()
+                << ") -> bool { receipt.sequence != 0 && (matches!(receipt.kind, " << kind_type
+                << "::Failed) == (receipt.failureline != 0)) && match receipt.kind {\n";
+        template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^IntegrationControlKind))) {
+            constexpr auto kind = std::meta::extract<IntegrationControlKind>(enumerator);
+            constexpr auto policy = mmltk::controller::contracts::integration_command_direction<kind>();
+            output_ << kind_type << "::" << writer.identifier(std::meta::identifier_of(enumerator), true) << " => receipt.readgeneration "
+                    << (policy.read_generation ? "!=" : "==") << " 0"
+                    << (policy.compiled_index ? "" : " && receipt.compiledindex == 0")
+                    << (policy.server ? " && receipt.progress == 0" : "") << ",\n";
+        }
+        output_ << "} }\n";
     }
 
     void EmitInteractionEnvelope() {

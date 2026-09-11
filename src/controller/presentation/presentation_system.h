@@ -7,6 +7,7 @@
 #include <functional>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -121,10 +122,38 @@ class PresentationNativeWriter {
     [[nodiscard]] virtual Retirement BrowserPeerLost() noexcept = 0;
 };
 using PresentationNativeWriterFactory = std::function<std::unique_ptr<PresentationNativeWriter>()>;
+// Acceptance-only custody of a completion notification. Physical GPU work and
+// the publisher socket remain live while consumption of this receipt is held.
+class PresentationAcceptanceGate final {
+   public:
+    struct Receipt final {
+        std::uint64_t source_high = 0U;
+        std::uint64_t source_low = 0U;
+        std::uint64_t transfer = 0U;
+        std::uint64_t publication = 0U;
+        bool capacity_available = false;
+    };
+    void SetWake(std::function<void()>);
+    void SetObserver(std::function<void(Receipt)>);
+    [[nodiscard]] bool Arm();
+    [[nodiscard]] bool Release();
+    [[nodiscard]] bool Hold(Receipt);
+    void ObserveCapacity();
+    void Stop() noexcept;
+   private:
+    std::mutex mutex_;
+    std::function<void()> wake_;
+    std::function<void(Receipt)> observer_;
+    bool armed_ = false;
+    bool held_ = false;
+    Receipt receipt_{};
+    bool stopped_ = false;
+};
 struct PresentationNativeConfiguration final {
     std::filesystem::path import_socket;
     std::size_t minimum_allocation_bytes = 0U;
     bool pending_supersession_acceptance = false;
+    std::shared_ptr<PresentationAcceptanceGate> completion_acceptance{};
 };
 [[nodiscard]] PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings, PresentationNativeConfiguration,
                                                                                       VisualDiagnosticSink = {});

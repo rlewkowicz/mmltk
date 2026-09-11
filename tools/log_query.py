@@ -99,7 +99,7 @@ AUTO_FIELDS = (
     "source_observation_revision", "snapshot_revision", "observation_revision",
     "presentation_revision", "allocation_generation", "transfer_sequence", "timeline_ready",
     "trace_id", "span_id", "parent_span_id", "request_id", "operation_id",
-    "dataset_identity", "gallery_identity", "gallery_generation", "phase", "phase_id", "control",
+    "workspace_allocation", "dataset_identity", "gallery_identity", "gallery_generation", "phase", "phase_id", "control",
 )
 # The integration reporter is a distinct external format: these event-specific
 # f64 slots are translated once, never treated as generic numeric identities.
@@ -376,15 +376,36 @@ def record_time(data, source):
     return "none", None
 
 
+def physical_identity(data, text, high_name, low_name):
+    value = value_from(data, text, "fields." + text)
+    textual = value.lower() if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{32}", value) and int(value, 16) != 0 else MISSING
+    high = value_from(data, high_name, "fields." + high_name)
+    low = value_from(data, low_name, "fields." + low_name)
+    valid_numeric = all(type(part) is int and 0 <= part < 2**64 for part in (high, low))
+    numeric = f"{high:016x}{low:016x}" if valid_numeric and (high or low) else MISSING
+    if ((value is not MISSING and textual is MISSING) or
+            ((high is not MISSING or low is not MISSING) and numeric is MISSING) or
+            (textual is not MISSING and numeric is not MISSING and textual != numeric)):
+        return MISSING
+    return textual if textual is not MISSING else numeric
+
+
+def source_lifecycle(data):
+    event = value_from(data, "fields.event", "fields.name", "event", "name")
+    return isinstance(event, str) and (event.startswith("firefox.workspace.source.") or
+        event.startswith("presentation.source.") and not event.endswith("read_submitted"))
+
+
 def surface_identity(data):
-    value = value_from(data, "surface", "fields.surface")
-    if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{32}", value):
-        return value.lower()
-    high = value_from(data, "surface_high", "fields.surface_high")
-    low = value_from(data, "surface_low", "fields.surface_low")
-    if all(type(part) is int and 0 <= part < 2**64 for part in (high, low)):
-        return f"{high:016x}{low:016x}"
-    return MISSING
+    if source_lifecycle(data):
+        return physical_identity(data, "arena", "workspace_arena_high", "workspace_arena_low")
+    return physical_identity(data, "surface", "surface_high", "surface_low")
+
+
+def workspace_source_identity(data):
+    if source_lifecycle(data):
+        return physical_identity(data, "surface", "workspace_source_high", "workspace_source_low")
+    return physical_identity(data, "source", "workspace_source_high", "workspace_source_low")
 
 
 @dataclass
@@ -419,6 +440,8 @@ class Record:
             return self.parse_error or MISSING
         if name == "@surface":
             return surface_identity(self.data)
+        if name == "@workspace_source":
+            return workspace_source_identity(self.data)
         if name == "@event":
             return value_from(self.data, "fields.event", "fields.name", "event", "name")
         if name == "@owner":
@@ -1512,6 +1535,8 @@ def strong_identities(record, explicit=()):
                 result.append(identity)
 
     add(("@surface",))
+    add(("@workspace_source",))
+    add(("@workspace_source", "transfer_sequence"))
     for names in explicit:
         add(names)
     # Source instance numbers are only meaningful within a source session.
@@ -1664,6 +1689,8 @@ def auto_facts(record):
     surface = auto_value(record.get("@surface"))
     if surface:
         facts["@surface"] = surface
+    if source := auto_value(record.get("@workspace_source")):
+        facts["@workspace_source"] = source
     owner = record.get("@owner")
     domain = owner if isinstance(owner, str) and owner in AUTO_SOURCE_DOMAINS else ""
     if event == "iced.gallery.source":
@@ -1696,13 +1723,15 @@ def auto_facts(record):
         add(0, ("source_session", "source_instance", field))
         if domain and field in facts:
             add(1, (domain + "." + field,), (facts[field],))
-    for field in ("presentation_revision", "allocation_generation", "transfer_sequence", "timeline_ready"):
+    for field in ("presentation_revision", "allocation_generation"):
         add(0, ("@surface", field))
+    for field in ("transfer_sequence", "timeline_ready", "workspace_allocation"):
+        add(0, ("@workspace_source", field))
     for field in ("span_id", "request_id", "operation_id", "presentation_revision"):
         add(2, (field,))
     if "parent_span_id" in facts:
         add(2, ("span_id",), (facts["parent_span_id"],))
-    for field in ("trace_id", "@surface", "dataset_identity", "gallery_identity"):
+    for field in ("trace_id", "@surface", "@workspace_source", "dataset_identity", "gallery_identity"):
         add(3, (field,))
     add(1, ("dataset_identity", "gallery_generation"))
     if domain and "observation_revision" in facts:
@@ -1824,7 +1853,7 @@ class AutoCorrelation:
         original = self.facts[index]
         # A coarse surface/trace/dataset match must not override contradictory
         # recorded source, frame, publication, allocation, or dataset identities.
-        for name in ("domain", "@surface", "source_session", "source_instance", "frame",
+        for name in ("domain", "@surface", "@workspace_source", "workspace_allocation", "transfer_sequence", "source_session", "source_instance", "frame",
                      "presentation_revision", "allocation_generation", "dataset_identity", "gallery_identity"):
             if name in facts and name in original and facts[name] != original[name]:
                 return None
@@ -2116,6 +2145,11 @@ class Triage:
         self.pending = {}
         self.observed_ends = {}
         self.pixel_samples = {}
+        self.pixel_sources = {}
+        self.pixel_sources_truncated = False
+        self.pixel_pending = {}
+        self.pixel_pending_count = 0
+        self.pixel_stage_count = 0
         self.pixel_divergences = set()
 
     def records(self, files, apply_where=True):
@@ -2158,15 +2192,15 @@ class Triage:
                                           observations=count, last_position=position)
 
     @staticmethod
-    def pixel_sample(record):
+    def pixel_sample(record, source=None):
         event = record.get("@event")
         boundary = record.get("boundary")
         if event == "presentation.pixel":
-            stage = ("native", record.get("transfer_sequence"))
+            stage = ("native", (record.get("@workspace_source"), record.get("transfer_sequence")))
         elif event == "firefox.workspace.pixel" and boundary in ("import", "mailbox"):
-            stage = (boundary, record.get("transfer_sequence"))
+            stage = (boundary, (source, record.get("transfer_sequence")))
         elif event == "iced.surface.pixel":
-            stage = ("owned", None)
+            stage = ("sample", None)
         else:
             return None
         surface = record.get("@surface")
@@ -2176,7 +2210,7 @@ class Triage:
         if (not isinstance(surface, str) or type(revision) is not int or revision <= 0 or
                 type(index) is not int or not 0 <= index < 25 or
                 any(type(value) is not int for value in sample) or
-                (stage[0] != "owned" and (type(stage[1]) is not int or stage[1] <= 0))):
+                (stage[0] != "sample" and (not isinstance(stage[1][0], str) or type(stage[1][1]) is not int or stage[1][1] <= 0))):
             return None
         run = str(record.metadata.get("run", record.source))
         return (run, surface, revision, index), stage, sample
@@ -2193,8 +2227,55 @@ class Triage:
                 "deterministic pixel-chain divergence", ("pixel-chain", *publication),
             )
 
-    def observe_pixel_chain(self, record, emit):
-        parsed = self.pixel_sample(record)
+    def observe_pixel_chain(self, record, emit, bridge=None):
+        event = record.get("@event")
+        source = None
+        if event in ("firefox.workspace.frame_forwarded", "firefox.workspace.pixel"):
+            run = str(record.metadata.get("run", record.source))
+            key = (run, record.get("@surface"), record.get("presentation_revision"), record.get("transfer_sequence"))
+            if (not isinstance(key[1], str) or type(key[2]) is not int or key[2] <= 0 or
+                    type(key[3]) is not int or key[3] <= 0):
+                return
+            if event == "firefox.workspace.frame_forwarded":
+                source = record.get("@workspace_source")
+                if not isinstance(source, str):
+                    return
+                previous = self.pixel_sources.get(key)
+                if previous is not None and previous[0] != source:
+                    self.pixel_divergence("pixel-transfer-conflict", "forwarded physical transfer names conflicting native sources",
+                                          record, previous[1], key[:3], emit)
+                    return
+                if previous is None:
+                    previous = source, triage_snapshot(record)
+                    if len(self.pixel_sources) >= MAX_TRIAGE_PIXEL_SAMPLES:
+                        self.pixel_sources_truncated = True
+                        self.notes.add("Pixel transfer bridge capacity reached; narrow the capture to compare additional transfers.")
+                    else:
+                        self.pixel_sources[key] = previous
+                for pending in self.pixel_pending.pop(key, ()):
+                    self.pixel_pending_count -= 1
+                    self.observe_pixel_chain(pending, emit, bridge=previous)
+                return
+            if bridge is None:
+                bridge = self.pixel_sources.get(key)
+            if bridge is None:
+                if self.pixel_pending_count < MAX_TRIAGE_PIXEL_SAMPLES:
+                    self.pixel_pending.setdefault(key, []).append(triage_snapshot(record))
+                    self.pixel_pending_count += 1
+                else:
+                    self.notes.add("Unbridged pixel sample capacity reached; no native transfer inferred from proximity.")
+                return
+            source, forwarded = bridge
+            declared = record.get("@workspace_source")
+            corroborating = ("generation", "slot", "frame_id", "session_epoch", "layer_generation", "content_width", "content_height")
+            conflict = declared is not MISSING and declared != source
+            conflict |= any(record.get(field) is not MISSING and forwarded.get(field) is not MISSING and
+                            record.get(field) != forwarded.get(field) for field in corroborating)
+            if conflict:
+                self.pixel_divergence("pixel-transfer-conflict", "pixel sample conflicts with its exact forwarded transfer",
+                                      record, forwarded, key[:3], emit)
+                return
+        parsed = self.pixel_sample(record, source)
         if parsed is None:
             return
         key, stage, sample = parsed
@@ -2207,6 +2288,11 @@ class Triage:
         chain = self.pixel_samples[key]
         stages = chain.stages
         previous = stages.get(stage)
+        if previous is None:
+            if self.pixel_stage_count >= MAX_TRIAGE_PIXEL_SAMPLES * 4:
+                self.notes.add("Pixel-chain stage capacity reached; additional physical transfers were not compared.")
+                return
+            self.pixel_stage_count += 1
         if previous is not None and previous[0] != sample:
             self.pixel_divergence(
                 "pixel-owner-mutation",
@@ -2238,8 +2324,30 @@ class Triage:
             compare(("native", transfer), ("import", transfer))
         if name in ("import", "mailbox"):
             compare(("import", transfer), ("mailbox", transfer))
-        if chain.mailbox_count == 1 and name in ("mailbox", "owned"):
-            compare(chain.mailbox, ("owned", None))
+        if chain.mailbox_count == 1 and name in ("mailbox", "sample"):
+            compare(chain.mailbox, ("sample", None))
+
+    def finalize_pixel_chain(self, emit):
+        """Resolve absence only after every applicable bridge could be read."""
+        kind = "pixel-transfer-incomplete" if self.pixel_sources_truncated else "pixel-transfer-missing"
+        reason = ("exact frame_forwarded correlation incomplete because bridge index was truncated"
+                  if self.pixel_sources_truncated else "no exact frame_forwarded bridge in scanned scope")
+        for key, pending in self.pixel_pending.items():
+            run, surface, revision, transfer = key
+            representative = min(pending, key=physical_position)
+            message = (f"{reason}: surface={surface} "
+                       f"presentation_revision={revision} transfer_sequence={transfer} run={run}; "
+                       f"{len(pending)} pixel receipt(s) have no proven native source")
+            if emit:
+                self.finding(kind, 115, message, representative)
+            else:
+                self.seed_pool.add(
+                    representative, (-120, False, -representative.metadata["mtime_ns"],
+                                     *physical_position(representative)),
+                    kind + ": " + message, (kind, *key),
+                )
+        self.pixel_pending.clear()
+        self.pixel_pending_count = 0
 
     def choose_anchors(self, files, query):
         explicit = bool(self.options.query.strip() or self.options.errors or self.lookup)
@@ -2274,6 +2382,10 @@ class Triage:
                     self.pending[key].pending -= 1
                     if not self.pending[key].pending:
                         del self.pending[key]
+        # Explicit predicates may select pixels while excluding their bridge.
+        # Their missing joins are judged by the full analysis pass instead.
+        if not explicit:
+            self.finalize_pixel_chain(emit=False)
         for state in self.pending.values():
             row = state.first
             self.seed_pool.add(row, (-30, False, -row.metadata["mtime_ns"], *physical_position(row)),
@@ -2282,6 +2394,11 @@ class Triage:
         self.pending.clear()
         candidates = self.seed_pool.rows()
         self.pixel_samples.clear()
+        self.pixel_sources.clear()
+        self.pixel_sources_truncated = False
+        self.pixel_pending.clear()
+        self.pixel_pending_count = 0
+        self.pixel_stage_count = 0
         self.pixel_divergences.clear()
         if not candidates:
             return
@@ -2483,6 +2600,7 @@ class Triage:
                     identity, strong, link = refinement
                     why = f"counter refinement {identity.label()} + {link} proximity to {strong.label()} (not identity)"
                     counter_evidence.add(row, physical_position(row), why, (row.source, str(row.get("@event"))))
+        self.finalize_pixel_chain(emit=True)
         for chain in self.identities.values():
             chain.finish(self)
             if chain.hop:

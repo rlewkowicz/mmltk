@@ -95,6 +95,35 @@ class LogFormatTests(unittest.TestCase):
         self.assertIs(record({"surface_high": -1, "surface_low": 5}).get("@surface"), logs.MISSING)
         self.assertIs(record({"surface": "12"}).get("@surface"), logs.MISSING)
 
+    def test_workspace_source_is_separate_from_artifact_and_arena(self):
+        native = record({"workspace_source_high": 11, "workspace_source_low": 12,
+                         "surface_high": 21, "surface_low": 22})
+        browser = record({"source": "000000000000000b000000000000000c",
+                          "surface": "00000000000000150000000000000016"}, source="firefox.log")
+        self.assertEqual(native.get("@workspace_source"), browser.get("@workspace_source"))
+        self.assertEqual(native.get("@surface"), browser.get("@surface"))
+        self.assertNotEqual(native.get("@surface"), native.get("@workspace_source"))
+        self.assertEqual(browser.source, "firefox.log")
+        self.assertIs(record({"source": "wrong"}).get("@workspace_source"), logs.MISSING)
+        self.assertIs(record({"source": "000000000000000b000000000000000c",
+                              "workspace_source_high": 11, "workspace_source_low": 13}).get("@workspace_source"), logs.MISSING)
+
+    def test_transfer_correlation_uses_source_and_rejects_arena_counter_aliases(self):
+        def identities(source, arena=20, transfer=3):
+            return logs.auto_facts(record({"event": "presentation.release_wait.completed",
+                "workspace_source_high": 1, "workspace_source_low": source,
+                "surface_high": 1, "surface_low": arena, "transfer_sequence": transfer,
+                "presentation_revision": 7}))[1]
+        first = {identity for _, identity in identities(10) if "transfer_sequence" in identity.names}
+        self.assertTrue(first)
+        self.assertTrue(all("@workspace_source" in identity.names for identity in first))
+        self.assertFalse(first.intersection(identity for _, identity in identities(11)))
+        self.assertFalse(first.intersection(identity for _, identity in identities(10, transfer=4)))
+        # Source identity survives an arena replacement; the separate arena fact
+        # remains available to the automatic correlator's contradiction guard.
+        self.assertEqual(first, {identity for _, identity in identities(10, arena=21)
+                                 if "transfer_sequence" in identity.names})
+
     def test_native_header_and_key_value_messages(self):
         row = logs.parse_record("native.log", 4,
             "1970-01-01 00:00:01.123456789 [694:836] [mmltk-browser-host] [debug] "
@@ -294,27 +323,199 @@ class TriageSelectionTests(unittest.TestCase):
     def pixel_row(self, boundary, transfer=1, rgba=10, line=1):
         data = {
             "surface": "00000000000000010000000000000002", "presentation_revision": 1,
+            "source": "00000000000000030000000000000004",
             "sample_index": 0, "sample_x": 4, "sample_y": 5, "sample_rgba": rgba,
             "transfer_sequence": transfer, "boundary": boundary,
-            "event": "presentation.pixel" if boundary == "native" else
-                     "iced.surface.pixel" if boundary == "owned" else "firefox.workspace.pixel",
+            "event": "firefox.workspace.frame_forwarded" if boundary == "forwarded" else
+                     "presentation.pixel" if boundary == "native" else
+                     "iced.surface.pixel" if boundary == "sample" else "firefox.workspace.pixel",
         }
+        if boundary in ("import", "mailbox"):
+            del data["source"]
         return self.row(data, line)
 
     def test_pixel_edges_keep_the_same_evidence_for_every_arrival_order(self):
-        for order in permutations(("native", "import", "mailbox", "owned")):
+        for order in permutations(("native", "forwarded", "import", "mailbox", "sample")):
             with self.subTest(order=order):
                 self.triage.pixel_samples.clear()
+                self.triage.pixel_sources.clear()
+                self.triage.pixel_pending.clear()
+                self.triage.pixel_pending_count = 0
+                self.triage.pixel_stage_count = 0
                 self.triage.pixel_divergences.clear()
                 self.triage.findings.clear()
                 for line, boundary in enumerate(order, 1):
                     row = self.pixel_row(boundary, rgba=10 if boundary == "native" else 11, line=line)
                     self.triage.observe_pixel_chain(row, emit=True)
+                self.triage.finalize_pixel_chain(emit=True)
                 finding, = self.triage.findings.values()
                 self.assertEqual(finding.kind, "pixel-chain-divergence")
                 self.assertIn("native -> import", finding.message)
                 self.assertEqual(finding.record.get("boundary"), "import")
                 self.assertEqual(finding.other.get("boundary"), "native")
+                self.assertEqual(self.triage.pixel_pending_count, 0)
+
+    def test_absent_pixel_bridges_finalize_each_exact_transfer_once(self):
+        for boundary, transfer, line in (("import", 7, 9), ("mailbox", 7, 3), ("import", 8, 4)):
+            self.triage.observe_pixel_chain(self.pixel_row(boundary, transfer, line=line), emit=True)
+        self.assertEqual(self.triage.pixel_pending_count, 3)
+        self.assertFalse(self.triage.findings)
+        self.triage.finalize_pixel_chain(emit=True)
+        findings = sorted(self.triage.findings.values(), key=lambda item: item.record.line)
+        self.assertEqual([item.kind for item in findings], ["pixel-transfer-missing"] * 2)
+        self.assertEqual([item.record.line for item in findings], [3, 4])
+        for finding, transfer in zip(findings, (7, 8)):
+            self.assertIn("run=capture", finding.message)
+            self.assertIn("surface=00000000000000010000000000000002", finding.message)
+            self.assertIn(f"presentation_revision=1 transfer_sequence={transfer}", finding.message)
+            self.assertIs(finding.record.get("@workspace_source"), logs.MISSING)
+        self.assertIn("2 pixel receipt(s)", findings[0].message)
+        self.assertFalse(self.triage.pixel_pending)
+        self.assertEqual(self.triage.pixel_pending_count, 0)
+        self.triage.finalize_pixel_chain(emit=True)
+        self.assertEqual(len(self.triage.findings), 2)
+
+    def test_exact_pixel_bridge_succeeds_before_or_after_the_pixel(self):
+        for order in (("import", "forwarded"), ("forwarded", "import")):
+            with self.subTest(order=order):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                triage.observe_pixel_chain(self.pixel_row("native"), emit=True)
+                for boundary in order:
+                    triage.observe_pixel_chain(self.pixel_row(boundary), emit=True)
+                triage.finalize_pixel_chain(emit=True)
+                self.assertFalse(triage.findings)
+                self.assertFalse(triage.pixel_pending)
+                self.assertEqual(triage.pixel_pending_count, 0)
+                chain, = triage.pixel_samples.values()
+                self.assertEqual({stage[0] for stage in chain.stages}, {"native", "import"})
+
+    def test_pending_pixel_capacity_counts_replay_and_finalization_exactly(self):
+        with patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 3):
+            for line, transfer in enumerate((1, 1, 2, 3), 1):
+                self.triage.observe_pixel_chain(self.pixel_row("import", transfer, line=line), emit=True)
+            self.assertEqual(self.triage.pixel_pending_count, 3)
+            self.assertEqual(sum(map(len, self.triage.pixel_pending.values())), 3)
+            self.assertTrue(any("Unbridged pixel sample capacity reached" in note for note in self.triage.notes))
+            self.triage.observe_pixel_chain(self.pixel_row("forwarded", 1, line=5), emit=True)
+            self.assertEqual(self.triage.pixel_pending_count, 1)
+            self.triage.observe_pixel_chain(self.pixel_row("import", 3, line=6), emit=True)
+            self.assertEqual(self.triage.pixel_pending_count, 2)
+            self.triage.finalize_pixel_chain(emit=True)
+            self.assertEqual(len(self.triage.findings), 2)
+            self.assertFalse(self.triage.pixel_pending)
+            self.assertEqual(self.triage.pixel_pending_count, 0)
+
+    def test_saturated_bridge_index_reports_incomplete_for_later_pixels(self):
+        for emit in (False, True):
+            with self.subTest(emit=emit), patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 2):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for transfer in (1, 2, 3):
+                    triage.observe_pixel_chain(self.pixel_row("forwarded", transfer), emit=emit)
+                self.assertEqual(len(triage.pixel_sources), 2)
+                self.assertTrue(triage.pixel_sources_truncated)
+                for line, boundary in enumerate(("import", "mailbox"), 1):
+                    triage.observe_pixel_chain(self.pixel_row(boundary, 3, line=line), emit=emit)
+                self.assertEqual(triage.pixel_pending_count, 2)
+                triage.finalize_pixel_chain(emit=emit)
+                self.assertFalse(triage.pixel_pending)
+                self.assertEqual(triage.pixel_pending_count, 0)
+                self.assertFalse(triage.pixel_samples)
+                self.assertTrue(any("Pixel transfer bridge capacity reached" in note for note in triage.notes))
+                if emit:
+                    finding, = triage.findings.values()
+                    self.assertEqual(finding.kind, "pixel-transfer-incomplete")
+                    self.assertIn("bridge index was truncated", finding.message)
+                    self.assertIn("transfer_sequence=3", finding.message)
+                    self.assertIn("2 pixel receipt(s)", finding.message)
+                else:
+                    _, _, reason = triage.seed_pool.rows()[0]
+                    self.assertIn("pixel-transfer-incomplete", reason)
+                before = len(triage.findings), len(triage.seed_pool.entries)
+                triage.finalize_pixel_chain(emit=emit)
+                self.assertEqual((len(triage.findings), len(triage.seed_pool.entries)), before)
+                self.assertEqual(triage.pixel_pending_count, 0)
+
+    def test_saturated_bridge_index_resolves_pending_pixels_directly(self):
+        for rgba in (10, 11):
+            with self.subTest(rgba=rgba), patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 2):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for transfer in (1, 2):
+                    triage.observe_pixel_chain(self.pixel_row("forwarded", transfer), emit=True)
+                triage.observe_pixel_chain(self.pixel_row("native", 3), emit=True)
+                for boundary in ("import", "mailbox"):
+                    triage.observe_pixel_chain(self.pixel_row(boundary, 3, rgba=rgba), emit=True)
+                self.assertEqual(triage.pixel_pending_count, 2)
+                triage.observe_pixel_chain(self.pixel_row("forwarded", 3), emit=True)
+                self.assertEqual(len(triage.pixel_sources), 2)
+                self.assertTrue(triage.pixel_sources_truncated)
+                self.assertFalse(triage.pixel_pending)
+                self.assertEqual(triage.pixel_pending_count, 0)
+                triage.finalize_pixel_chain(emit=True)
+                chain, = triage.pixel_samples.values()
+                self.assertEqual({stage[0] for stage in chain.stages}, {"native", "import", "mailbox"})
+                self.assertEqual({item.kind for item in triage.findings.values()},
+                                 {"pixel-chain-divergence"} if rgba != 10 else set())
+                self.assertTrue(any("Pixel transfer bridge capacity reached" in note for note in triage.notes))
+
+    def test_saturated_bridge_direct_replay_preserves_corroborating_conflict(self):
+        with patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 1):
+            self.triage.observe_pixel_chain(self.pixel_row("forwarded"), emit=True)
+            pixel = self.pixel_row("import", 2)
+            pixel.data["generation"] = 4
+            self.triage.observe_pixel_chain(pixel, emit=True)
+            bridge = self.pixel_row("forwarded", 2)
+            bridge.data["generation"] = 5
+            self.triage.observe_pixel_chain(bridge, emit=True)
+            self.triage.finalize_pixel_chain(emit=True)
+            finding, = self.triage.findings.values()
+            self.assertEqual(finding.kind, "pixel-transfer-conflict")
+            self.assertFalse(self.triage.pixel_samples)
+            self.assertEqual(self.triage.pixel_pending_count, 0)
+
+    def test_full_but_untruncated_bridge_index_preserves_proven_missing(self):
+        with patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 2):
+            for transfer in (1, 2):
+                self.triage.observe_pixel_chain(self.pixel_row("forwarded", transfer), emit=True)
+            self.triage.observe_pixel_chain(self.pixel_row("import", 3), emit=True)
+            self.triage.finalize_pixel_chain(emit=True)
+            self.assertFalse(self.triage.pixel_sources_truncated)
+            finding, = self.triage.findings.values()
+            self.assertEqual(finding.kind, "pixel-transfer-missing")
+            self.assertEqual(self.triage.pixel_pending_count, 0)
+
+    def test_missing_pixel_finalization_respects_finding_and_anchor_budgets(self):
+        for emit in (False, True):
+            triage = logs.Triage(self.triage.options, self.triage.where, {})
+            with patch.object(logs, "MAX_TRIAGE_PIXEL_SAMPLES", 70):
+                for transfer in range(1, 72):
+                    triage.observe_pixel_chain(self.pixel_row("import", transfer, line=transfer), emit=emit)
+                self.assertEqual(triage.pixel_pending_count, 70)
+                triage.finalize_pixel_chain(emit=emit)
+            self.assertFalse(triage.pixel_pending)
+            self.assertEqual(triage.pixel_pending_count, 0)
+            if emit:
+                self.assertEqual(len(triage.findings), 64)
+                self.assertTrue(any("Finding inventory capped" in note for note in triage.notes))
+            else:
+                self.assertFalse(triage.findings)
+                self.assertEqual(len(triage.seed_pool.entries), triage.seed_pool.limit)
+                self.assertGreater(triage.seed_pool.discarded, 0)
+
+    def test_source_less_pixel_requires_an_exact_forwarded_transfer(self):
+        self.triage.observe_pixel_chain(self.pixel_row("native"), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("import", rgba=11), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("forwarded", transfer=2), emit=True)
+        self.assertFalse(self.triage.findings)
+        self.triage.observe_pixel_chain(self.pixel_row("forwarded"), emit=True)
+        self.assertEqual(next(iter(self.triage.findings.values())).kind, "pixel-chain-divergence")
+
+    def test_forwarded_source_conflict_is_rejected(self):
+        self.triage.observe_pixel_chain(self.pixel_row("forwarded"), emit=True)
+        conflicting = self.pixel_row("forwarded", line=2)
+        conflicting.data["source"] = "00000000000000050000000000000006"
+        self.triage.observe_pixel_chain(conflicting, emit=True)
+        self.triage.finalize_pixel_chain(emit=True)
+        self.assertEqual(next(iter(self.triage.findings.values())).kind, "pixel-transfer-conflict")
 
     def test_pixel_owner_mutation_wins_before_cross_stage_comparison(self):
         self.triage.observe_pixel_chain(self.pixel_row("native"), emit=True)
@@ -337,13 +538,13 @@ class TriageSelectionTests(unittest.TestCase):
                     self.operations += 1
                     yield key
 
-        first = self.pixel_row("owned")
+        first = self.pixel_row("sample")
         self.triage.observe_pixel_chain(first, emit=True)
         chain, = self.triage.pixel_samples.values()
         chain.stages = stages = CountedStages(chain.stages)
         transfers = 256
         for transfer in range(1, transfers + 1):
-            for boundary in ("native", "import", "mailbox"):
+            for boundary in ("native", "forwarded", "import", "mailbox"):
                 self.triage.observe_pixel_chain(self.pixel_row(boundary, transfer), emit=True)
         self.assertLessEqual(stages.operations, transfers * 3 * 7)
         self.assertEqual(chain.mailbox_count, transfers)
@@ -1469,13 +1670,65 @@ class FileQueryTests(unittest.TestCase):
         candidate = output.split("Earliest divergence candidates", 1)[1].splitlines()[1]
         self.assertIn("input.jsonl:2: incomplete-state", candidate)
 
+    @staticmethod
+    def pixel_bridge_records():
+        common = {"surface": "00000000000000010000000000000002",
+                  "presentation_revision": 7, "transfer_sequence": 9}
+        pixel = {"event": "firefox.workspace.pixel", "boundary": "import", **common,
+                 "sample_index": 0, "sample_x": 4, "sample_y": 5, "sample_rgba": 10}
+        bridge = {"event": "firefox.workspace.frame_forwarded", **common,
+                  "source": "00000000000000030000000000000004"}
+        return pixel, bridge
+
+    def test_triage_missing_pixel_bridge_is_a_visible_anchor_and_finding(self):
+        pixel, _ = self.pixel_bridge_records()
+        self.write("input.jsonl", [pixel])
+        for query in ((), ("-q", "@event=firefox.workspace.pixel")):
+            status, output, diagnostics = self.run_query("input.jsonl", "--triage", *query)
+            self.assertEqual(status, 0, diagnostics)
+            self.assertIn("pixel-transfer-missing", output)
+            self.assertIn("presentation_revision=7 transfer_sequence=9", output)
+            self.assertIn("Highlights:", output)
+        status, rows, diagnostics = self.exported("input.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        pending, = rows
+        self.assertEqual(pending["data"], pixel)
+        self.assertIn("pixel-transfer-missing", pending["_log"]["match"])
+        self.assertNotIn("source", pending["data"])
+
+    def test_triage_explicit_pixel_query_does_not_exclude_its_later_bridge(self):
+        pixel, bridge = self.pixel_bridge_records()
+        for records in ([pixel, bridge], [bridge, pixel]):
+            with self.subTest(records=records):
+                self.write("input.jsonl", records)
+                status, output, diagnostics = self.run_query(
+                    "input.jsonl", "--triage", "-q", "@event=firefox.workspace.pixel")
+                self.assertEqual(status, 0, diagnostics)
+                self.assertNotIn("pixel-transfer-missing", output)
+                self.assertNotIn("pixel-transfer-conflict", output)
+                status, output, diagnostics = self.run_query("input.jsonl", "--triage")
+                self.assertEqual(status, 1, diagnostics)
+                self.assertNotIn("pixel-transfer-missing", output)
+
+    def test_triage_pixel_query_keeps_conflicting_bridge_evidence(self):
+        pixel, bridge = self.pixel_bridge_records()
+        conflict = {**bridge, "source": "00000000000000050000000000000006"}
+        self.write("input.jsonl", [pixel, bridge, conflict])
+        status, output, diagnostics = self.run_query(
+            "input.jsonl", "--triage", "-q", "@event=firefox.workspace.pixel")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("pixel-transfer-conflict", output)
+        self.assertNotIn("pixel-transfer-missing", output)
+
     def test_triage_highlights_first_deterministic_pixel_chain_divergence(self):
         surface = "00000000000000010000000000000002"
         common = {
             "presentation_revision": 7, "transfer_sequence": 3,
+            "source": "00000000000000030000000000000004",
             "sample_index": 4, "sample_x": 8, "sample_y": 9,
         }
         self.write("input.jsonl", [
+            {"event": "firefox.workspace.frame_forwarded", "surface": surface, **common},
             {"event": "presentation.pixel", "surface_high": 1, "surface_low": 2,
              **common, "sample_rgba": 10},
             {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "import",
@@ -1492,6 +1745,7 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("presentation_revision=7 sample_index=4", output)
 
         self.write("input.jsonl", [
+            {"event": "firefox.workspace.frame_forwarded", "surface": surface, **common},
             {"event": "presentation.pixel", "surface_high": 1, "surface_low": 2,
              **common, "sample_rgba": 10},
             {"event": "firefox.workspace.pixel", "surface": surface, "boundary": "import",

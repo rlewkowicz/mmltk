@@ -27,6 +27,70 @@
 import mmltk.backend.imaging.raster;
 
 namespace mmltk::controller {
+void PresentationAcceptanceGate::SetWake(std::function<void()> wake) {
+    std::scoped_lock lock(mutex_);
+    wake_ = std::move(wake);
+}
+void PresentationAcceptanceGate::SetObserver(std::function<void(Receipt)> observer) {
+    std::scoped_lock lock(mutex_);
+    observer_ = std::move(observer);
+}
+bool PresentationAcceptanceGate::Arm() {
+    std::scoped_lock lock(mutex_);
+    if (stopped_ || armed_ || held_ || !observer_) return false;
+    armed_ = true;
+    return true;
+}
+bool PresentationAcceptanceGate::Release() {
+    std::function<void()> wake;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopped_ || !held_) return false;
+        held_ = false;
+        wake = wake_;
+    }
+    if (wake) wake();
+    return true;
+}
+bool PresentationAcceptanceGate::Hold(const Receipt receipt) {
+    std::function<void(Receipt)> observe;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopped_) return false;
+        if (held_) return true;
+        if (!armed_) return false;
+        armed_ = false;
+        held_ = true;
+        receipt_ = receipt;
+        observe = observer_;
+    }
+    if (observe) observe(receipt);
+    return true;
+}
+void PresentationAcceptanceGate::ObserveCapacity() {
+    std::function<void(Receipt)> observe;
+    Receipt receipt;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopped_ || !held_ || receipt_.capacity_available) return;
+        receipt_.capacity_available = true;
+        receipt = receipt_;
+        observe = observer_;
+    }
+    if (observe) observe(receipt);
+}
+void PresentationAcceptanceGate::Stop() noexcept {
+    std::function<void()> wake;
+    {
+        std::scoped_lock lock(mutex_);
+        stopped_ = true;
+        armed_ = false;
+        held_ = false;
+        wake = std::move(wake_);
+        observer_ = {};
+    }
+    if (wake) wake();
+}
 namespace {
 namespace gpu = mmltk::frameworks::gpu;
 namespace native = mmltk::controller::presentation;
@@ -71,8 +135,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (wake_->get() < 0) throw std::runtime_error("presentation completion eventfd creation failed");
         completion_.fd = wake_->get();
         sources_.reserve(kSourceCapacity);
+        if (configuration_.completion_acceptance) {
+            configuration_.completion_acceptance->SetWake([wake = wake_] {
+                static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
+            });
+        }
     }
     ~NativePresentationWriter() override {
+        if (configuration_.completion_acceptance) configuration_.completion_acceptance->SetWake({});
         if (!SettlePhysicalWork()) std::terminate();
         try {
             context_.Bind();
@@ -107,6 +177,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
         while (auto outcome = channel_.take_outcome()) Accept(std::move(*outcome));
         DrainCompletion();
+        if (configuration_.completion_acceptance && transfer_ && stage_ == Stage::ReleasePending &&
+            channel_.has_capacity_wake(transfer_->source->arena)) configuration_.completion_acceptance->ObserveCapacity();
         RetireSources();
         // Available remains in the channel while another submission owns the
         // writer. In particular, its socket edge can precede the release callback.
@@ -222,6 +294,10 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         ssize_t read;
         do { read = ::read(wake_->get(), &edge, sizeof(edge)); } while (read < 0 && errno == EINTR);
         if (read < 0 && errno != EAGAIN) throw std::runtime_error("presentation completion wake failed");
+        if (stage_ == Stage::ReleasePending && transfer_ && configuration_.completion_acceptance &&
+            completion_.ready.load(std::memory_order_acquire) &&
+            configuration_.completion_acceptance->Hold({transfer_->source->id.high, transfer_->source->id.low,
+                (transfer_->ready + 1U) / 2U, transfer_->publication})) return;
         if (completion_.ready.exchange(false, std::memory_order_acq_rel)) {
             if (completion_.status != cudaSuccess) throw std::runtime_error("presentation asynchronous graphics work failed");
             if (stage_ == Stage::ReadyPending) {
@@ -561,7 +637,10 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     }
     static contracts::DiagnosticWorkspace WorkspaceFact(const AdmittedSource& source) noexcept {
         return {.workspace_source_high = source.id.high, .workspace_source_low = source.id.low,
-                .workspace_allocation = source.workspace->identity()};
+                .workspace_allocation = source.workspace->identity(),
+                .workspace_arena_high = source.arena.high, .workspace_arena_low = source.arena.low, .workspace_bytes = source.workspace->allocation_bytes(),
+                .workspace_pitch = source.workspace->layout().pitch_bytes,
+                .workspace_width = source.workspace->layout().width, .workspace_height = source.workspace->layout().height};
     }
     void DiagnoseSource(VisualDiagnosticOperation operation, const AdmittedSource& source, std::uint64_t outcome) const noexcept {
         diagnostics_.Emit([&] {

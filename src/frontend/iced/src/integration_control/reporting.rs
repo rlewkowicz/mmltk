@@ -1161,6 +1161,8 @@ mod tests {
                     sequence: 1,
                     progress,
                     failureline,
+                    readgeneration: 0,
+                    compiledindex: 0,
                 },
             }
             .encode()

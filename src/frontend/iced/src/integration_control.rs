@@ -845,6 +845,8 @@ extern "C" {
     fn atlas_pixels_js(
         receipt: &wasm_bindgen::JsValue,
         rectangles: &[f32],
+        cards: &[u32],
+        fields: &str,
         source_revision: f64,
         presentation_revision: f64,
         completed: &wasm_bindgen::JsValue,
@@ -874,6 +876,8 @@ extern "C" {
         source_revision: f64,
         allow_newer: bool,
     ) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationHoverAfterSurfaceDraw)]
+    fn hover_after_surface_draw_js(x: f64, y: f64, control: &str, source_revision: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationSweep)]
     fn sweep_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWheel)]
@@ -1010,7 +1014,10 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
     let mut cards = [0u32; 256];
     let mut card_count = 0;
     let columns = snapshot.viewport.columns.max(1);
-    let side = frame.content_width as f32 / columns as f32;
+    if snapshot.gallery.layout.cardextent == 0 || snapshot.gallery.layout.rowcount == 0
+        || snapshot.gallery.layout.columns != columns { return None; }
+    let side = snapshot.gallery.layout.cardextent as f32;
+    let logical_height = side * snapshot.gallery.layout.rowcount as f32;
     for label in &snapshot.labels {
         let slot = (label.box_.first.y / side) as usize * columns as usize
             + (label.box_.first.x / side) as usize;
@@ -1026,11 +1033,11 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
                     / frame.content_width as f32,
             draw.image.y
                 + (slot / columns as usize) as f32 * side * draw.image.height
-                    / frame.content_height as f32,
+                    / logical_height,
         );
         let card_end = iced::Point::new(
             card_origin.x + side * draw.image.width / frame.content_width as f32 - 1.0,
-            card_origin.y + side * draw.image.height / frame.content_height as f32 - 1.0,
+            card_origin.y + side * draw.image.height / logical_height - 1.0,
         );
         // Eligibility is independent of whether individual probes succeed:
         // all ready annotated cards fully inside the visible clip.
@@ -1065,7 +1072,7 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
             let y = (label.box_.first.y + height * relative_y).floor() + 0.5;
             let screen = iced::Point::new(
                 draw.image.x + x * draw.image.width / frame.content_width as f32,
-                draw.image.y + y * draw.image.height / frame.content_height as f32,
+                draw.image.y + y * draw.image.height / logical_height,
             );
             if !draw.clip.contains(screen) {
                 continue;
@@ -1077,7 +1084,7 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
             let texel_x = (screen.x.floor() + 0.5 - draw.image.x) * frame.content_width as f32
                 / draw.image.width
                 - 0.5;
-            let texel_y = (screen.y.floor() + 0.5 - draw.image.y) * frame.content_height as f32
+            let texel_y = (screen.y.floor() + 0.5 - draw.image.y) * logical_height
                 / draw.image.height
                 - 0.5;
             let alpha_at = |px: f32, py: f32| {
@@ -1364,7 +1371,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
                 frame.presentation_revision as f64,
                 frame.content_sequence as f64,
                 (image.width / frame.content_width.max(1) as f32) as f64,
-                (image.height / frame.content_height.max(1) as f32) as f64,
+                (image.height / (snapshot.gallery.layout.cardextent.max(1) as f32 * snapshot.viewport.rowcount.max(1) as f32)) as f64,
             ],
         )
     });
@@ -1434,7 +1441,7 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
     if new_draw
         && (COMPLETION_WITHOUT_INPUT.with(std::cell::Cell::get) || pixel_fixture_enabled())
         && !snapshot.gallery.slots.is_empty()
-        && snapshot.gallery.slots.iter().all(|ready| *ready)
+        && (pixel_fixture_enabled() || snapshot.gallery.slots.iter().all(|ready| *ready))
     {
         sample_atlas_pixels(draw);
     }
@@ -1444,6 +1451,19 @@ pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
 fn sample_atlas_pixels(draw: AtlasDraw) {
     let rectangles = atlas_pixel_rectangles(&draw);
     let frame = draw.surface.frame.expect("drawn atlas publication");
+    let columns = draw.snapshot.viewport.columns.max(1);
+    let side = draw.image.width / columns as f32;
+    let cards: Vec<u32> = rectangles.chunks_exact(4).map(|rect| {
+        let column = ((rect[0] + rect[2] * 0.5 - draw.image.x) / side) as usize;
+        let row = ((rect[1] + rect[3] * 0.5 - draw.image.y) / side) as usize;
+        draw.snapshot.order.visibleindices[row * columns as usize + column]
+    }).collect();
+    let fields = format!(
+        "{{{}{},\"image\":[{},{},{},{}],\"overlay_boxes\":{},\"overlay_masks\":{},\"overlay_labels\":{}}}",
+        crate::presentation_surface::surface_trace_fields(draw.surface, draw.surface),
+        crate::presentation_surface::gallery_trace_fields(Some(&draw.snapshot)),
+        draw.image.x, draw.image.y, draw.image.width, draw.image.height,
+        draw.snapshot.overlay.showboxes, draw.snapshot.overlay.showmasks, draw.snapshot.overlay.showlabels);
     let Some(mut output) = atlas_probe_output(false) else {
         return;
     };
@@ -1457,6 +1477,8 @@ fn sample_atlas_pixels(draw: AtlasDraw) {
     atlas_pixels_js(
         &canvas_probe,
         &rectangles,
+        &cards,
+        &fields,
         frame.content_sequence as f64,
         frame.presentation_revision as f64,
         &completed,
@@ -2093,6 +2115,31 @@ enum Phase {
         next_stage: u8,
     },
     AwaitAtlasScroll(u8),
+    AwaitAtlasReturnMeasured,
+    AtlasReturnSelect,
+    AtlasAwaySelect,
+    AwaitAtlasAwayDetail(u8, u64),
+    AwaitAtlasAwayReturn,
+    AwaitAtlasAwayRestore,
+    AwaitAtlasReturnDetail,
+    AwaitAtlasOscillation(u8),
+    AwaitVisibleReadArm(u32),
+    VisibleReadScroll(u32),
+    AwaitVisibleRead(u32),
+    AwaitVisibleReadPixels(u32, u64),
+    AwaitVisibleReadFocus(u32, u64),
+    AwaitVisibleReadSelection(u32, u64),
+    AwaitVisibleReadReturn(u32, u64),
+    AwaitVisibleReadOscillation(u32, u64, u8),
+    AwaitVisibleReadReleaseReady(u32, u64),
+    VisibleReadRelease(u32, u64),
+    AwaitVisibleReadComplete(u32),
+    AwaitCapacitySlots(u64),
+    AwaitCapacityArm,
+    CapacityPublish,
+    AwaitCapacityRelease,
+    AwaitCapacityCompletion,
+    AwaitCapacityRetry,
     AtlasOverlay(usize),
     AwaitAtlasOverlay(usize),
     ViewerOverlay(usize),
@@ -2236,6 +2283,26 @@ impl Phase {
             | Self::AwaitAtlasWindow(_)
             | Self::AwaitAtlasRows { .. }
             | Self::AwaitAtlasScroll(_)
+            | Self::AwaitAtlasReturnMeasured
+            | Self::AwaitAtlasAwayDetail(_, _)
+            | Self::AwaitAtlasAwayReturn
+            | Self::AwaitAtlasAwayRestore
+            | Self::AwaitAtlasReturnDetail
+            | Self::AwaitAtlasOscillation(_)
+            | Self::AwaitVisibleReadArm(_)
+            | Self::AwaitVisibleRead(_)
+            | Self::AwaitVisibleReadPixels(_, _)
+            | Self::AwaitVisibleReadFocus(_, _)
+            | Self::AwaitVisibleReadSelection(_, _)
+            | Self::AwaitVisibleReadOscillation(_, _, _)
+            | Self::AwaitVisibleReadReleaseReady(_, _)
+            | Self::AwaitVisibleReadReturn(_, _)
+            | Self::AwaitVisibleReadComplete(_)
+            | Self::AwaitCapacitySlots(_)
+            | Self::AwaitCapacityArm
+            | Self::AwaitCapacityRelease
+            | Self::AwaitCapacityCompletion
+            | Self::AwaitCapacityRetry
             | Self::AwaitAtlasOverlay(_)
             | Self::AwaitViewerOverlay(_)
             | Self::AwaitNext(_)
@@ -2766,6 +2833,32 @@ impl Controller {
         &mut self,
         receipt: crate::generated::IntegrationControlReceipt,
     ) -> Result<(), &'static str> {
+        use crate::generated::IntegrationControlKind as Kind;
+        if !crate::generated::integration_receipt_valid(&receipt) || !crate::generated::integration_server_command(receipt.kind) {
+            self.fail("invalid integration control policy");
+            return Err("invalid integration control policy");
+        }
+        if receipt.kind != Kind::Advance {
+            if receipt.sequence != self.control_sequence || receipt.failureline != 0 || receipt.progress != 0 {
+                self.fail("invalid capacity control identity");
+                return Err("invalid capacity control identity");
+            }
+            self.phase = match (receipt.kind, &self.phase) {
+                (Kind::VisibleReadArmed, Phase::AwaitVisibleReadArm(index)) => Phase::VisibleReadScroll(*index),
+                (Kind::VisibleReadHeld, Phase::AwaitVisibleRead(index))
+                    if receipt.compiledindex == *index && receipt.readgeneration != 0 =>
+                        Phase::AwaitVisibleReadPixels(*index, receipt.readgeneration),
+                (Kind::CapacityArmed, Phase::AwaitCapacityArm) => Phase::CapacityPublish,
+                (Kind::CapacityReleaseSample, Phase::AwaitCapacityRelease)
+                    if crate::presentation_surface::release_capacity_sample() => Phase::AwaitCapacityCompletion,
+                (Kind::CapacityCompletionReleased, Phase::AwaitCapacityCompletion) => Phase::AwaitCapacityRetry,
+                _ => {
+                    self.fail("duplicate, stale, or reordered capacity control");
+                    return Err("duplicate, stale, or reordered capacity control");
+                }
+            };
+            return Ok(());
+        }
         if receipt.kind != crate::generated::IntegrationControlKind::Advance
             || receipt.failureline != 0
             || self.control_sequence.checked_add(1) != Some(receipt.sequence)
@@ -2821,6 +2914,9 @@ impl Controller {
             Phase::Disabled => return,
             Phase::Complete => Kind::Settled,
             Phase::Failed => Kind::Failed,
+            Phase::AwaitCapacityArm => Kind::CapacityArmRequested,
+            Phase::AwaitVisibleReadArm(_) => Kind::VisibleReadArmRequested,
+            Phase::VisibleReadRelease(_, _) => Kind::VisibleReadReleaseRequested,
             _ => Kind::Progress,
         };
         let class = match self.phase.deadline_class() {
@@ -2840,6 +2936,11 @@ impl Controller {
             kind,
             sequence: self.control_sequence,
             progress,
+            readgeneration: match self.phase { Phase::VisibleReadRelease(_, generation) => generation, _ => 0 },
+            compiledindex: match self.phase {
+                Phase::AwaitVisibleReadArm(index) | Phase::VisibleReadRelease(index, _) => index,
+                _ => 0,
+            },
             failureline: if matches!(self.phase, Phase::Failed) {
                 self.failure_line
             } else {
@@ -2906,6 +3007,7 @@ impl Controller {
             self.failure_line = std::panic::Location::caller().line();
         }
         reporting::emit(|sink| sink.record("integration.failed", "", &detail(), [0.0; 4]));
+        crate::presentation_surface::end_capacity_acceptance();
         self.phase = Phase::Failed;
         self.location_pending = false;
     }
@@ -3500,7 +3602,7 @@ impl Controller {
             Phase::GalleryImage(_) => EXPLORE_GALLERY.to_owned(),
             Phase::DetailOriginal { .. } => EXPLORE_DETAIL_ORIGINAL.to_owned(),
             Phase::DetailFit => explore::DETAIL_FIT_ID.to_owned(),
-            Phase::ViewerSelect => EXPLORE_GALLERY.to_owned(),
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => EXPLORE_GALLERY.to_owned(),
             Phase::AtlasCapacity => explore::GALLERY_CAPACITY_ID.to_owned(),
             Phase::AtlasEmpty => explore::GALLERY_EMPTY_ID.to_owned(),
             Phase::AtlasOverlay(index) => overlay_control(index, false).to_owned(),
@@ -4098,7 +4200,9 @@ impl Controller {
                 }
                 None
             }
-            Phase::ViewerSelect => {
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => {
+                let returning = matches!(self.phase, Phase::AtlasReturnSelect);
+                let away = matches!(self.phase, Phase::AtlasAwaySelect);
                 let Some((columns, _rows, _, _, revision)) = self.selection_grid else {
                     return None;
                 };
@@ -4110,7 +4214,7 @@ impl Controller {
                     width: side,
                     height: side,
                 };
-                self.phase = Phase::AwaitDetail(index);
+                self.phase = if returning { Phase::AwaitAtlasReturnDetail } else if away { Phase::AwaitAtlasAwayDetail(0, 0) } else { Phase::AwaitDetail(index) };
                 if !click_after_surface_draw(selected, EXPLORE_GALLERY, revision, true) {
                     self.fail("viewer first-image click failed");
                 }
@@ -6659,7 +6763,7 @@ impl Controller {
                 self.arm(explore::DETAIL_FIT_ID)
             }
             Phase::DetailFit => self.arm(explore::DETAIL_FIT_ID),
-            Phase::ViewerSelect => self.arm(EXPLORE_GALLERY),
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => self.arm(EXPLORE_GALLERY),
             Phase::AwaitAtlasCapacity
                 if !settings.has_local_edits()
                     && model.settings_edit_available()
@@ -6811,6 +6915,249 @@ impl Controller {
                     ))
                 }
             }
+            Phase::VisibleReadScroll(index) => {
+                self.phase = Phase::AwaitVisibleRead(index);
+                iced::widget::operation::scroll_to(EXPLORE_GALLERY, AbsoluteOffset {
+                    x: 0.0, y: self.atlas_row_extent * 5.5,
+                })
+            }
+            Phase::AwaitVisibleReadPixels(index, generation) | Phase::AwaitVisibleReadFocus(index, generation) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                let Some(slot) = draw.snapshot.order.visibleindices.iter().position(|value| *value == index) else {
+                    self.fail("held read is not an immediate visible image");
+                    return Task::none();
+                };
+                if draw.snapshot.gallery.slots.get(slot) != Some(&false) {
+                    self.fail("held read lost its explicit placeholder");
+                    return Task::none();
+                }
+                let columns = draw.snapshot.gallery.layout.columns;
+                let scale = draw.image.width / (self.atlas_row_extent * columns as f32);
+                let side = self.atlas_row_extent;
+                let target = Rectangle {
+                    x: draw.image.x / scale + (slot as u32 % columns) as f32 * side,
+                    y: draw.image.y / scale + (slot as u32 / columns) as f32 * side,
+                    width: side, height: side,
+                };
+                let visible_clip = Rectangle { x: draw.clip.x / scale, y: draw.clip.y / scale,
+                    width: draw.clip.width / scale, height: draw.clip.height / scale };
+                let Some(target) = target.intersection(&visible_clip) else { return Task::none(); };
+                if matches!(self.phase, Phase::AwaitVisibleReadPixels(_, _)) {
+                    crate::presentation_surface::trace_atlas_stage("held-visible", draw);
+                    self.phase = Phase::AwaitVisibleReadFocus(index, generation);
+                    #[cfg(target_arch = "wasm32")]
+                    if hover_after_surface_draw_js(f64::from(target.center_x()), f64::from(target.center_y()),
+                        EXPLORE_GALLERY, snapshot.frame.revision as f64) != 1 {
+                        self.fail("held-placeholder hover dispatch failed");
+                    }
+                } else if snapshot.focusedimage == Some(index) {
+                    reporting::emit(|sink| sink.record("integration.pending_focus", EXPLORE_GALLERY,
+                        "native-focus-from-displayed-placeholder", [index as f64, generation as f64,
+                            snapshot.frame.revision as f64, draw.surface.frame.unwrap().presentation_revision as f64]));
+                    self.phase = Phase::AwaitVisibleReadSelection(index, generation);
+                    if !click_after_surface_draw(target, EXPLORE_GALLERY, snapshot.frame.revision, false) {
+                        self.fail("held-placeholder selection dispatch failed");
+                    }
+                }
+                Task::none()
+            }
+            Phase::AwaitVisibleReadSelection(index, generation) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Detail || snapshot.selectedimage != Some(index) ||
+                    snapshot.busy || self.viewer_drawn.is_none_or(|(_, revision, _)| revision != snapshot.frame.revision) {
+                    return Task::none();
+                }
+                reporting::emit(|sink| sink.record("integration.pending_selection", EXPLORE_GALLERY,
+                    "typed-image-before-thumbnail-read", [index as f64, generation as f64, snapshot.frame.revision as f64, 0.0]));
+                self.phase = Phase::AwaitVisibleReadReturn(index, generation);
+                explore_message(explore::Message::Detail(explore::detail::Message::CloseRequested))
+            }
+            Phase::AwaitVisibleReadReturn(index, generation) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                let Some(slot) = draw.snapshot.order.visibleindices.iter().position(|value| *value == index) else { return Task::none(); };
+                if draw.snapshot.gallery.slots.get(slot) != Some(&false) {
+                    self.fail("pending gallery return completed before held read release");
+                    return Task::none();
+                }
+                crate::presentation_surface::trace_atlas_stage("held-return", draw);
+                self.phase = Phase::AwaitVisibleReadOscillation(index, generation, 0);
+                iced::widget::operation::scroll_to(EXPLORE_GALLERY, AbsoluteOffset {
+                    x: 0.0, y: self.atlas_row_extent * 5.0,
+                })
+            }
+            Phase::AwaitVisibleReadOscillation(index, generation, stage) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery || snapshot.viewport.firstrow != 5 ||
+                    snapshot.viewport.rowcount != if stage == 1 { 6 } else { 5 } { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    draw.snapshot.viewport == snapshot.viewport && self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                crate::presentation_surface::trace_atlas_stage(
+                    ["held-five", "held-six", "held-five-restored"][stage as usize], draw);
+                self.phase = if stage == 2 { Phase::AwaitVisibleReadReleaseReady(index, generation) }
+                    else { Phase::AwaitVisibleReadOscillation(index, generation, stage + 1) };
+                iced::widget::operation::scroll_to(EXPLORE_GALLERY, AbsoluteOffset {
+                    x: 0.0, y: self.atlas_row_extent * if stage == 1 { 5.0 } else { 5.5 },
+                })
+            }
+            Phase::AwaitVisibleReadReleaseReady(index, generation) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                let Some(slot) = draw.snapshot.order.visibleindices.iter().position(|value| *value == index) else { return Task::none(); };
+                if draw.snapshot.gallery.slots.get(slot) != Some(&false) {
+                    self.fail("held read escaped before pending-return oscillation completed");
+                    return Task::none();
+                }
+                crate::presentation_surface::trace_atlas_stage("held-release", draw);
+                self.phase = Phase::VisibleReadRelease(index, generation);
+                Task::none()
+            }
+            Phase::VisibleReadRelease(index, _) => {
+                if self.control_phase.as_ref() == Some(&self.phase) { self.phase = Phase::AwaitVisibleReadComplete(index); }
+                Task::none()
+            }
+            Phase::AwaitVisibleReadComplete(index) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                let Some(slot) = draw.snapshot.order.visibleindices.iter().position(|value| *value == index) else { return Task::none(); };
+                if draw.snapshot.gallery.slots.get(slot) != Some(&true) { return Task::none(); }
+                crate::presentation_surface::trace_atlas_stage("held-complete", draw);
+                self.selection_grid = Some((snapshot.viewport.columns, snapshot.viewport.rowcount, 0,
+                    snapshot.revision, snapshot.frame.revision));
+                self.phase = Phase::AtlasAwaySelect;
+                self.arm(EXPLORE_GALLERY)
+            }
+            Phase::AwaitAtlasAwayDetail(step, baseline) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Detail || snapshot.busy || settings.has_local_edits()
+                    || model.has_explore_pending() || snapshot.revision <= baseline
+                    || self.viewer_drawn.is_none_or(|(_, revision, _)| revision != snapshot.frame.revision) {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitAtlasAwayDetail(step + 1, snapshot.revision);
+                match step {
+                    0 => explore_message(explore::Message::Dataset(explore::dataset::Message::MinimumCompiledIndexChanged(1))),
+                    1 => explore_message(explore::Message::Dataset(explore::dataset::Message::OrderSelected(crate::generated::ExploreOrder::Shuffled))),
+                    2 => explore_message(explore::Message::Dataset(explore::dataset::Message::ShuffleSeedChanged(173))),
+                    3 => explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
+                        explore::overlay::Message::BoxesToggled(!snapshot.overlay.showboxes)))),
+                    _ => {
+                        self.phase = Phase::AwaitAtlasAwayReturn;
+                        explore_message(explore::Message::Detail(explore::detail::Message::CloseRequested))
+                    }
+                }
+            }
+            Phase::AwaitAtlasAwayReturn | Phase::AwaitAtlasAwayRestore => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery || snapshot.busy || settings.has_local_edits()
+                    || model.has_explore_pending() { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                if matches!(self.phase, Phase::AwaitAtlasAwayReturn) {
+                    if snapshot.filter.minimumcompiledindex != 1 || snapshot.filter.order != crate::generated::ExploreOrder::Shuffled
+                        || snapshot.order.shuffleseed != 173 {
+                        self.fail("gallery return lost filter, order, or seed changed in detail");
+                        return Task::none();
+                    }
+                    crate::presentation_surface::trace_atlas_stage("away-return", draw);
+                    self.phase = Phase::AwaitAtlasAwayRestore;
+                }
+                if let Some(message) = explore_scenario_preparation(snapshot) { return explore_message(message); }
+                self.phase = Phase::AwaitAtlasRows { rows: 4, next_stage: 0 };
+                let columns = snapshot.viewport.columns;
+                explore_message(explore::Message::Gallery(explore::gallery::Message::Measured {
+                    size: iced::Size::new(self.atlas_row_extent * columns as f32, self.atlas_row_extent * 3.5),
+                    maximum_extent: snapshot.maximumatlasextent.clone(), columns,
+                })).chain(iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START))
+            }
+            Phase::AwaitCapacitySlots(baseline) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy || model.has_explore_pending() || snapshot.frame.revision == baseline ||
+                    crate::presentation_surface::capacity_acceptance_slots() != 2 ||
+                    self.gallery_drawn.is_none_or(|(_, source)| source != snapshot.frame.revision) {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitCapacityArm;
+                Task::none()
+            }
+            Phase::CapacityPublish => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                self.phase = Phase::AwaitCapacityRelease;
+                explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
+                    explore::overlay::Message::BoxesToggled(!snapshot.overlay.showboxes))))
+            }
+            Phase::AwaitCapacityRetry => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy || model.has_explore_pending() { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame &&
+                    self.atlas_receipt.as_ref() == Some(*draw)) else { return Task::none(); };
+                let ready = draw.surface.frame.expect("drawn capacity retry");
+                reporting::emit(|sink| sink.record("integration.capacity_retry", EXPLORE_GALLERY,
+                    "same-publication-new-physical-transfer", [ready.content_sequence as f64,
+                        ready.presentation_revision as f64, snapshot.revision as f64, 0.0]));
+                crate::presentation_surface::end_capacity_acceptance();
+                self.phase = Phase::AwaitAtlasWindow(true);
+                #[cfg(target_arch = "wasm32")]
+                fullscreen_js(true);
+                Task::none()
+            }
+            Phase::AwaitAtlasReturnMeasured => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy || model.has_explore_pending() || snapshot.viewport.rowcount != 5
+                    || snapshot.viewport.firstrow != 0 { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| draw.snapshot.frame == snapshot.frame) else {
+                    return Task::none();
+                };
+                crate::presentation_surface::trace_atlas_stage("return-cached", draw);
+                self.selection_grid = Some((snapshot.viewport.columns, 5, 0, snapshot.revision, snapshot.frame.revision));
+                self.phase = Phase::AtlasReturnSelect;
+                self.arm(EXPLORE_GALLERY)
+            }
+            Phase::AwaitAtlasReturnDetail => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Detail || snapshot.busy
+                    || self.viewer_drawn.is_none_or(|(_, source, _)| source != snapshot.frame.revision) {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitAtlasOscillation(0);
+                explore_message(explore::Message::Detail(explore::detail::Message::CloseRequested))
+            }
+            Phase::AwaitAtlasOscillation(stage) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                let expected = if stage == 1 { 6 } else { 5 };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery || snapshot.viewport.rowcount != expected
+                    || snapshot.viewport.firstrow != 0 || model.has_explore_pending() { return Task::none(); }
+                let Some(draw) = self.atlas_pixels.as_ref().filter(|draw| {
+                    draw.snapshot.frame == snapshot.frame && draw.snapshot.viewport == snapshot.viewport
+                        && self.atlas_receipt.as_ref() == Some(*draw)
+                }) else { return Task::none(); };
+                crate::presentation_surface::trace_atlas_stage(
+                    ["return-five", "return-six", "return-five-restored"][stage as usize], draw);
+                if stage < 2 {
+                    self.phase = Phase::AwaitAtlasOscillation(stage + 1);
+                    iced::widget::operation::scroll_to(EXPLORE_GALLERY, AbsoluteOffset {
+                        x: 0.0, y: if stage == 0 { self.atlas_row_extent * 0.5 } else { 0.0 },
+                    })
+                } else {
+                    if self.session.profile == "retained" && self.viewer_scenario == "rapid" {
+                        self.phase = Phase::AwaitVisibleReadArm(snapshot.viewport.columns * 10);
+                        return Task::none();
+                    }
+                    self.phase = Phase::AwaitAtlasRows { rows: 4, next_stage: 0 };
+                    let columns = snapshot.viewport.columns.max(1);
+                    explore_message(explore::Message::Gallery(explore::gallery::Message::Measured {
+                        size: iced::Size::new(self.atlas_row_extent * columns as f32, self.atlas_row_extent * 3.5),
+                        maximum_extent: snapshot.maximumatlasextent.clone(), columns,
+                    }))
+                }
+            }
             Phase::AwaitAtlasRows { rows, next_stage } => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -6928,10 +7275,20 @@ impl Controller {
                         iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START)
                     }
                     _ => {
-                        self.phase = Phase::AwaitAtlasWindow(true);
-                        #[cfg(target_arch = "wasm32")]
-                        fullscreen_js(true);
-                        Task::none()
+                        if self.session.profile == "retained" && self.viewer_scenario == "rapid" {
+                            if !crate::presentation_surface::begin_capacity_acceptance() {
+                                self.fail("capacity acceptance lacks retained fallback");
+                                return Task::none();
+                            }
+                            self.phase = Phase::AwaitCapacitySlots(snapshot.frame.revision);
+                            explore_message(explore::Message::Gallery(explore::gallery::Message::Overlay(
+                                explore::overlay::Message::BoxesToggled(!snapshot.overlay.showboxes))))
+                        } else {
+                            self.phase = Phase::AwaitAtlasWindow(true);
+                            #[cfg(target_arch = "wasm32")]
+                            fullscreen_js(true);
+                            Task::none()
+                        }
                     }
                 }
             }
@@ -6972,15 +7329,12 @@ impl Controller {
                 });
                 self.atlas_baseline = Some((snapshot.frame.revision, snapshot.augmentation.seed));
                 if index == 7 {
-                    self.phase = Phase::AwaitAtlasRows {
-                        rows: 4,
-                        next_stage: 0,
-                    };
+                    self.phase = Phase::AwaitAtlasReturnMeasured;
                     let columns = snapshot.viewport.columns.max(1);
                     let row_extent = self.atlas_row_extent.max(1.0);
                     explore_message(explore::Message::Gallery(
                         explore::gallery::Message::Measured {
-                            size: iced::Size::new(row_extent * columns as f32, row_extent * 3.5),
+                            size: iced::Size::new(row_extent * columns as f32, row_extent * 4.75),
                             maximum_extent: snapshot.maximumatlasextent.clone(),
                             columns,
                         },
@@ -8548,6 +8902,26 @@ mod tests {
     }
 
     #[test]
+    fn typed_capacity_commands_reject_duplicates_and_wrong_scenario() {
+        use crate::generated::{IntegrationControlKind as Kind, IntegrationControlReceipt};
+        for sequence in [1, 2] {
+            let mut driver = Controller::new(true, false, String::new(), String::new(), "512".into(), "rapid".into());
+            driver.phase = Phase::AwaitCapacityArm;
+            let receipt = IntegrationControlReceipt {
+                kind: Kind::CapacityArmed, sequence, progress: 0, failureline: 0,
+                readgeneration: 0, compiledindex: 0,
+            };
+            let result = driver.receive_control(receipt.clone());
+            assert_eq!(result.is_ok(), sequence == 1);
+            if sequence == 1 {
+                assert!(matches!(driver.phase, Phase::CapacityPublish));
+                assert!(driver.receive_control(receipt).is_err());
+            }
+            assert!(matches!(driver.phase, Phase::Failed));
+        }
+    }
+
+    #[test]
     fn destructive_profile_continues_viewer_completion_into_annotation() {
         initialize_reporting(false, false);
         for window_close in [false, true] {
@@ -8587,6 +8961,8 @@ mod tests {
                         sequence: 2,
                         progress: 0,
                         failureline: 0,
+                        readgeneration: 0,
+                        compiledindex: 0,
                     })
                     .is_err(),
                 "viewer evidence cannot settle a destructive Annotation workflow"
@@ -8615,6 +8991,8 @@ mod tests {
             sequence: 2,
             progress: 0,
             failureline: 0,
+            readgeneration: 0,
+            compiledindex: 0,
         };
         driver.phase = Phase::Complete;
         driver.control_phase = Some(Phase::Complete);
@@ -8784,6 +9162,8 @@ mod tests {
                     sequence: 2,
                     progress: 0,
                     failureline: 0,
+                    readgeneration: 0,
+                    compiledindex: 0,
                 })
                 .is_err(),
             "local completion is insufficient before the typed receipt was admitted"
@@ -9444,14 +9824,24 @@ mod tests {
             for dpi in [1.0, 1.5] {
                 let mut snapshot = crate::view_model::test_support::explore_snapshot();
                 snapshot.viewport.columns = columns;
+                snapshot.viewport.rowcount = columns;
+                snapshot.gallery.layout.columns = columns;
+                snapshot.gallery.layout.rowcount = columns;
+                snapshot.gallery.layout.rowcapacity = columns;
+                snapshot.gallery.layout.roworigin = 0;
+                snapshot.gallery.layout.cardextent = 100;
                 snapshot.augmentation.enabled = false;
                 snapshot.overlay.showlabels = false;
                 snapshot.overlay.showmasks = true;
                 snapshot.overlay.showboxes = true;
                 snapshot.labels.clear(); // Background row, no annotation or source padding.
-                snapshot.gallery.slots = vec![true; columns as usize];
-                let (_, frame) = crate::view_model::test_support::explore_presentation();
-                let surface = crate::view_model::test_support::physical_surface(frame);
+                snapshot.gallery.slots = vec![true; (columns * columns) as usize];
+                let (_, mut frame) = crate::view_model::test_support::explore_presentation();
+                frame.content_width = columns * 100;
+                frame.content_height = columns * 100;
+                let mut surface = crate::view_model::test_support::physical_surface(frame);
+                surface.width = frame.content_width;
+                surface.height = frame.content_height;
                 let width = 800.0 * dpi;
                 let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, width));
                 let draw = AtlasDraw {

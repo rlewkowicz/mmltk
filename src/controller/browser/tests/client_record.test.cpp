@@ -177,22 +177,34 @@ TEST_CASE("browser client records are one complete canonical CBOR item", "[contr
 TEST_CASE("integration control retains typed direction and sequence validation", "[controller][browser][protocol]") {
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     wire::ByteBuffer encoded;
-    for (const auto kind : {Kind::Settled, Kind::Failed, Kind::Progress, Kind::PressureEntered}) {
-        const ClientRecord source =
-            IntegrationControl{.receipt = {.kind = kind, .sequence = 3U, .progress = 5U, .failureline = kind == Kind::Failed ? 123U : 0U}};
-        REQUIRE(encode_client_record(source, encoded));
-        const auto decoded = decode_client_record({.first = encoded, .second = {}});
-        REQUIRE(decoded);
-        CHECK(*decoded == source);
-        CHECK_FALSE(encode_server_record(ServerRecord{std::get<IntegrationControl>(source)}, encoded));
+    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^Kind))) {
+        constexpr auto kind = std::meta::extract<Kind>(enumerator);
+        constexpr auto policy = mmltk::controller::contracts::integration_command_direction<kind>();
+        const IntegrationControl source{.receipt = {.kind = kind, .sequence = 3U,
+            .progress = policy.server ? 0U : 5U, .failureline = kind == Kind::Failed ? 123U : 0U,
+            .read_generation = policy.read_generation ? 7U : 0U, .compiled_index = 0U}};
+        if constexpr (policy.server) {
+            REQUIRE(encode_server_record(ServerRecord{source}, encoded));
+            const auto decoded = decode_server_record({.first = encoded, .second = {}});
+            REQUIRE(decoded);
+            CHECK(std::get<IntegrationControl>(*decoded) == source);
+            CHECK_FALSE(decode_client_record({.first = encoded, .second = {}}));
+            CHECK_FALSE(encode_client_record(ClientRecord{source}, encoded));
+        } else {
+            REQUIRE(encode_client_record(ClientRecord{source}, encoded));
+            const auto decoded = decode_client_record({.first = encoded, .second = {}});
+            REQUIRE(decoded);
+            CHECK(std::get<IntegrationControl>(*decoded) == source);
+            CHECK_FALSE(decode_server_record({.first = encoded, .second = {}}));
+            CHECK_FALSE(encode_server_record(ServerRecord{source}, encoded));
+        }
+        auto invalid = source.receipt;
+        invalid.read_generation = policy.read_generation ? 0U : 7U;
+        CHECK_FALSE(mmltk::controller::contracts::integration_receipt_valid(invalid));
+        invalid = source.receipt;
+        invalid.compiled_index = 9U;
+        CHECK(mmltk::controller::contracts::integration_receipt_valid(invalid) == policy.compiled_index);
     }
-    const IntegrationControl advance{.receipt = {.kind = Kind::Advance, .sequence = 2U}};
-    REQUIRE(encode_server_record(ServerRecord{advance}, encoded));
-    const auto decoded = decode_server_record({.first = encoded, .second = {}});
-    REQUIRE(decoded);
-    CHECK(std::get<IntegrationControl>(*decoded) == advance);
-    CHECK_FALSE(decode_client_record({.first = encoded, .second = {}}));
-    CHECK_FALSE(encode_client_record(ClientRecord{advance}, encoded));
     CHECK_FALSE(encode_client_record(ClientRecord{IntegrationControl{.receipt = {.kind = Kind::Settled}}}, encoded));
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
@@ -201,7 +213,16 @@ TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[con
     STATIC_REQUIRE(kBrowserProtocolVersion == 15U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
-    REQUIRE(fixtures.size() == 7U + annotation_alternatives);
+    REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) ==
+        7U + annotation_alternatives);
+    for (const auto* name : {"IntegrationControl:capacity", "IntegrationControl:visible-arm", "IntegrationControl:visible-release"}) {
+        const auto decoded = decode_client_record({.first = fixture_named(fixtures, name).bytes, .second = {}});
+        REQUIRE(decoded);
+        const auto* receipt = std::get_if<IntegrationControl>(&*decoded);
+        REQUIRE(receipt);
+        CHECK(receipt->receipt.compiled_index == 0U);
+        CHECK(receipt->receipt.read_generation == (std::string_view{name}.ends_with("release") ? 7U : 0U));
+    }
     const auto& control_fixture = fixture_named(fixtures, "IntegrationControl");
     const auto control = decode_client_record(wire::ByteSegments{.first = control_fixture.bytes, .second = {}});
     REQUIRE(control);

@@ -748,6 +748,10 @@ std::optional<WorkspaceSurfaceImportOutcome> WorkspaceSurfaceImportChannel::take
     return outcome;
 }
 
+bool WorkspaceSurfaceImportChannel::has_capacity_wake(const WorkspaceSurfaceImportId id) const noexcept {
+    return impl_->capacity_wake == id;
+}
+
 std::optional<WorkspaceSurfaceImportId> WorkspaceSurfaceImportChannel::take_capacity_wake() {
     return std::exchange(impl_->capacity_wake, std::nullopt);
 }

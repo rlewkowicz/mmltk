@@ -191,6 +191,7 @@ class WorkspaceSurfaceImportChannel final {
     // readiness.
     void pump();
     [[nodiscard]] std::optional<WorkspaceSurfaceImportOutcome> take_outcome();
+    [[nodiscard]] bool has_capacity_wake(WorkspaceSurfaceImportId) const noexcept;
     [[nodiscard]] std::optional<WorkspaceSurfaceImportId> take_capacity_wake();
     [[nodiscard]] std::optional<WorkspaceSurfaceRetired> take_retirement();
     // Set once the active protocol session fails.

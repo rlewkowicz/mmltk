@@ -30,8 +30,8 @@ namespace {
             } else if constexpr (std::same_as<T, Interaction>) {
                 return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
             } else if constexpr (std::same_as<T, IntegrationControl>) {
-                return value.protocol_version == kBrowserProtocolVersion && value.receipt.sequence != 0U &&
-                       value.receipt.kind != contracts::IntegrationControlKind::Advance;
+                return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
+                       !contracts::integration_server_command(value.receipt.kind);
             } else {
                 return value.protocol_version == kBrowserProtocolVersion && std::isfinite(value.scale) && value.scale > 0.0 &&
                        (value.kind == RendererObservationKind::Ready ||
@@ -62,8 +62,8 @@ namespace {
             } else if constexpr (std::same_as<T, InputProgress>) {
                 return value.protocol_version == kBrowserProtocolVersion && value.progress.epoch != 0U;
             } else if constexpr (std::same_as<T, IntegrationControl>) {
-                return value.protocol_version == kBrowserProtocolVersion && value.receipt.sequence != 0U &&
-                       value.receipt.kind == contracts::IntegrationControlKind::Advance;
+                return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
+                       contracts::integration_server_command(value.receipt.kind);
             } else {
                 return value.protocol_version == kBrowserProtocolVersion && value.system_id != 0U && value.event_id != 0U;
             }

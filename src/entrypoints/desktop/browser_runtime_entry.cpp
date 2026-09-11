@@ -212,6 +212,14 @@ int main(int argc, char** argv) {
                 return 1;
             }
             config.explore.acceptance = std::make_shared<mmltk::controller::ExploreAcceptanceGate>(explore_control);
+            const char* const completion_gate = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE");
+            if (completion_gate != nullptr && std::string_view{completion_gate} == "1") {
+                config.completion_acceptance = std::make_shared<mmltk::controller::PresentationAcceptanceGate>();
+                config.explore.acceptance->SetReadObserver(config.explore.acceptance.get(),
+                    [](void* owner, std::uint64_t generation, std::uint32_t index) {
+                        static_cast<mmltk::controller::ExploreAcceptanceGate*>(owner)->AwaitVisibleRead(generation, index);
+                    });
+            }
             const char* const pending_supersession = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION");
             config.pending_supersession_acceptance = pending_supersession != nullptr && std::string_view{pending_supersession} == "1";
         }

@@ -57,7 +57,7 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
     };
     const VisualDiagnosticSink diagnostics = visual_diagnostic_sink(visual_diagnostic_target_);
     auto explore_configuration = std::move(config.explore);
-    if (explore_configuration.acceptance) browser_host_.install_integration(explore_configuration.acceptance);
+    if (explore_configuration.acceptance) browser_host_.install_integration(explore_configuration.acceptance, config.completion_acceptance);
     explore_configuration.diagnostics = diagnostics;
     systems_ = std::make_unique<ApplicationSystemStorage>(
         ApplicationSystemConfiguration{.base_visual = base_visual,
@@ -67,7 +67,8 @@ ApplicationShell::ApplicationShell(ApplicationShellConfig config)
                                        .live = live_configuration_,
                                        .presentation = {.import_socket = presentation_config_.import_socket,
                                                         .minimum_allocation_bytes = presentation_config_.minimum_allocation_bytes,
-                                                        .pending_supersession_acceptance = config.pending_supersession_acceptance},
+                                                        .pending_supersession_acceptance = config.pending_supersession_acceptance,
+                                                        .completion_acceptance = config.completion_acceptance},
                                        .settings_location = std::move(config.settings_location),
                                        .h2d_dataloader = config.h2d_dataloader,
                                        .file_dialog = file_dialog_owner_.client(),
