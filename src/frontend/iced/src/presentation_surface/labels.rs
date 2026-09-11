@@ -232,7 +232,11 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             return;
         };
         super::gallery::observe(None, crate::fluent_theme::conformance(theme).dark);
-        let region = self.surface.content_region();
+        let mut region = self.surface.content_region();
+        if matches!(self.source, Source::Gallery(_)) {
+            let extent = placement.logical_extent(self.surface.content_extent());
+            region = [0, 0, extent.0, extent.1];
+        }
         renderer.with_layer(clip, |renderer| {
             self.source
                 .visit(|category, bounds, name, color, catalog_count, overlay| {
@@ -322,6 +326,8 @@ mod tests {
                 first_row: 0,
                 columns: 4,
                 rows: 4,
+                row_capacity: 4,
+                row_origin: 0,
             },
             super::super::ViewTransform::FIT,
         )

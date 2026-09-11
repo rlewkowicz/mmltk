@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 
 #include <array>
+#include <bit>
+#include "src/controller/subsystems/explore/detail/gallery_atlas.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -36,6 +38,7 @@
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/common/io/scoped_fd.h"
 
 namespace native_gallery_allocations {
@@ -279,6 +282,19 @@ class NativeGallery final {
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> runtime;
     ExploreAlgorithm* algorithm = nullptr;
     ExploreRenderPlan plan{};
+    mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput gallery_product, detail_product;
+    ExploreAtlasLayout displayed_layout{};
+    ExploreMode displayed_mode = ExploreMode::Gallery;
+    std::uint32_t atlas_rows = 0U, atlas_side = 0U, atlas_columns = 0U;
+    VisualExtent GalleryExtent() {
+        const auto side = explore_atlas_card_extent(plan.viewport);
+        if (atlas_side != side || atlas_columns != plan.viewport.columns) atlas_rows = 0U;
+        atlas_side = side;
+        atlas_columns = plan.viewport.columns;
+        atlas_rows = std::max(atlas_rows, std::min(std::bit_ceil(plan.viewport.row_count),
+            static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns)));
+        return {plan.viewport.extent.width, atlas_rows * side};
+    }
     std::size_t publications = 0U;
     std::size_t acquisitions = 0U;
     ExploreOverlay issued_semantics{};
@@ -349,34 +365,44 @@ class NativeGallery final {
             ++plan.semantic_identity;
         }
         const auto change = algorithm->OutputChange(plan, order);
-        algorithm->PrepareOutputPublication(change);
+        algorithm->PrepareOutputPublication(change, plan.mode);
         ExploreGalleryPublication publication;
         if (change == ExploreOutputChange::Unchanged) {
             if (plan.mode == ExploreMode::Gallery)
                 publication = algorithm->BeginGallery(plan, order, 2U, {}, {}, 0U);
             else
                 algorithm->RenderDetail(plan, 2U, {}, {}, 0U);
+            if (commit) runtime->SelectOutput(plan.mode == ExploreMode::Gallery ? gallery_product : detail_product);
         } else {
             ++acquisitions;
-            auto output = runtime->AcquireOutput({}, change == ExploreOutputChange::Semantic
-                                                         ? runtime->Completed()
-                                                         : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
-            const auto extent = plan.mode == ExploreMode::Gallery ? plan.viewport.extent : algorithm->DetailExtent(plan);
-            runtime->Publish(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
+            auto baseline = plan.mode == ExploreMode::Detail && change == ExploreOutputChange::Semantic
+                                ? detail_product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{};
+            auto output = runtime->TryAcquireOutput(baseline);
+            REQUIRE(output.valid());
+            const auto extent = plan.mode == ExploreMode::Gallery ? GalleryExtent() : algorithm->DetailExtent(plan);
+            const auto submit = [&](auto clean, auto semantic, auto stream) {
                 if (plan.mode == ExploreMode::Gallery)
                     publication = algorithm->BeginGallery(plan, order, 2U, clean, semantic, stream);
                 else
                     algorithm->RenderDetail(plan, 2U, clean, semantic, stream);
-            });
+            };
+            if (plan.mode == ExploreMode::Gallery)
+                runtime->PublishRetained(output, extent.width, extent.height, submit);
+            else {
+                algorithm->PrepareDetailOutput(output.allocations()[0U]);
+                runtime->Publish(output, extent.width, extent.height, submit);
+            }
             if (evidence.enabled.load()) transaction_storage = algorithm->StorageFootprint();
             if (commit) {
-                runtime->CommitOutput(std::move(output));
+                (plan.mode == ExploreMode::Gallery ? gallery_product : detail_product) = runtime->CommitOutput(std::move(output));
                 ++publications;
             }
         }
-        if (commit)
+        if (commit) {
             algorithm->CommitOutputPublication();
-        else
+            displayed_mode = plan.mode;
+            if (plan.mode == ExploreMode::Gallery) displayed_layout = publication.layout;
+        } else
             REQUIRE(algorithm->RollbackOutputPublication());
         return publication;
     }
@@ -385,14 +411,17 @@ class NativeGallery final {
         if (algorithm->HasGalleryTiles()) {
             algorithm->PrepareOutputPublication(ExploreOutputChange::Semantic);
             ++acquisitions;
-            auto output = runtime->AcquireOutput({}, runtime->Completed());
-            runtime->Publish(output, plan.viewport.extent.width, plan.viewport.extent.height, [&](auto clean, auto semantic, auto stream) {
+            mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+            auto output = runtime->TryAcquireOutput(baseline);
+            REQUIRE(output.valid());
+            const auto extent = GalleryExtent();
+            runtime->PublishRetained(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
                 if (pause) pause->Submit(stream);
                 static_cast<void>(algorithm->PublishGalleryTiles(clean, semantic, stream));
             });
             if (evidence.enabled.load()) transaction_storage = algorithm->StorageFootprint();
             if (commit && demand->load() == plan.generation) {
-                runtime->CommitOutput(std::move(output));
+                gallery_product = runtime->CommitOutput(std::move(output));
                 algorithm->CommitOutputPublication();
                 ++publications;
             } else {
@@ -419,9 +448,242 @@ class NativeGallery final {
         }
     }
     [[nodiscard]] std::vector<std::uint8_t> Pixels(const std::size_t plane_index) {
-        return copy_product_plane(runtime->Borrow(), plane_index);
+        auto physical = copy_product_plane(runtime->Borrow(), plane_index);
+        if (displayed_mode != ExploreMode::Gallery) return physical;
+        const auto row_bytes = static_cast<std::size_t>(displayed_layout.columns) * displayed_layout.card_extent * 4U;
+        const auto row_size = row_bytes * displayed_layout.card_extent;
+        std::vector<std::uint8_t> logical(row_size * displayed_layout.row_count);
+        for (std::size_t row = 0U; row < displayed_layout.row_count; ++row)
+            std::copy_n(physical.data() + (displayed_layout.row_origin + row) % displayed_layout.row_capacity * row_size,
+                        row_size, logical.data() + row * row_size);
+        return logical;
     }
 };
+
+TEST_CASE("Atlas directories reconcile exact allocations and invalidate only touched physical cells", "[explore][atlas]") {
+    using namespace explore_detail;
+    using namespace mmltk::frameworks::gpu;
+    GalleryAtlas directory;
+    const auto plane = [](const std::uint64_t owner, const std::uint64_t identity, const ImagePlaneKind kind) {
+        return ImagePlaneView{.data = 1U, .descriptor = {.kind = kind, .width = 16U, .height = 64U, .pitch_bytes = 64U},
+                              .allocation = {identity, 16U, 64U, owner}};
+    };
+    auto clean = plane(1U, 11U, ImagePlaneKind::Clean);
+    auto semantic = plane(2U, 12U, ImagePlaneKind::Semantic);
+    const auto other_clean = plane(3U, 13U, ImagePlaneKind::Clean);
+    const auto other_semantic = plane(4U, 14U, ImagePlaneKind::Semantic);
+    GalleryThumbnailCache::Identity pixels{.dataset = 3U, .seed = 5U, .extent = 8U};
+    ExploreViewport viewport{.extent = {16U, 40U}, .first_row = 6U, .row_count = 5U, .columns = 2U};
+    auto first = std::make_shared<const GalleryTileMeaning>();
+    auto overlap = std::make_shared<const GalleryTileMeaning>();
+    auto layout = directory.Begin(clean, semantic, viewport, pixels);
+    CHECK(layout.row_capacity == 8U);
+    CHECK(layout.row_origin == 6U);
+    CHECK(directory.Physical(4U) == 0U);
+    const auto first_cell = directory.Physical(0U);
+    const auto overlap_cell = directory.Physical(2U);
+    directory.Touch(first_cell);
+    directory.Stage(first_cell, first, 7U);
+    directory.Touch(overlap_cell);
+    directory.Stage(overlap_cell, overlap, 7U);
+    directory.Commit();
+    ++viewport.first_row;
+    viewport.row_count = 6U;
+    viewport.extent.height = 48U;
+    static_cast<void>(directory.Begin(other_clean, other_semantic, viewport, pixels));
+    CHECK_FALSE(directory.Contains(directory.Physical(0U), overlap, 7U));
+    directory.Rollback();
+    static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+    CHECK(directory.Physical(0U) == overlap_cell);
+    CHECK(directory.Contains(overlap_cell, overlap, 7U));
+    CHECK(directory.ContainsClean(overlap_cell, overlap));
+    CHECK_FALSE(directory.Contains(overlap_cell, overlap, 8U));
+    // A partially submitted or cancelled write cannot resurrect its old tag.
+    directory.Touch(overlap_cell);
+    directory.Stage(overlap_cell, overlap, 8U);
+    directory.Rollback();
+    viewport.row_count = 5U;
+    viewport.extent.height = 40U;
+    static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+    CHECK_FALSE(directory.Contains(overlap_cell, overlap, 7U));
+    CHECK_FALSE(directory.Contains(overlap_cell, overlap, 8U));
+    CHECK(directory.Contains(first_cell, first, 7U));
+    directory.Touch(overlap_cell);
+    directory.Stage(overlap_cell, {}, 0U, true);
+    directory.Commit();
+    static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+    CHECK(directory.Empty(overlap_cell, true));
+    CHECK_FALSE(directory.Empty(overlap_cell, false));
+    directory.Commit();
+    directory.Invalidate(clean.allocation);
+    static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+    CHECK_FALSE(directory.Contains(first_cell, first, 7U));
+    directory.Touch(first_cell);
+    directory.Stage(first_cell, first, 7U);
+    directory.Commit();
+    // Recycled addresses still have a new allocation identity after growth.
+    ++clean.allocation.identity;
+    static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+    CHECK_FALSE(directory.Contains(first_cell, first, 7U));
+}
+
+TEST_CASE("Detail framework prewrite failure invalidates its atlas before entering the renderer", "[explore][atlas]") {
+    using namespace explore_detail;
+    using namespace mmltk::frameworks::gpu;
+    auto backend = std::make_shared<test_support::FakeImageBackend>();
+    SystemImageRuntime runtime{{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+                                .output_buffer_count = 3U}};
+    GalleryAtlas directory;
+    const ExploreViewport viewport{.extent = {24U, 8U}, .columns = 3U};
+    const GalleryThumbnailCache::Identity pixels{.dataset = 1U, .extent = 8U};
+    const auto meaning = std::make_shared<const GalleryTileMeaning>();
+    const auto fill = [](const ImagePlaneView plane, const unsigned char value) {
+        for (std::uint32_t row = 0U; row != plane.descriptor.height; ++row)
+            std::memset(reinterpret_cast<void*>(plane.data + row * plane.descriptor.pitch_bytes), value, plane.descriptor.row_bytes());
+    };
+    const auto publish = [&](const unsigned char value) {
+        SystemImageRuntime::CompletedOutput baseline;
+        auto output = runtime.TryAcquireOutput(baseline);
+        REQUIRE(output.valid());
+        runtime.PublishRetained(output, 24U, 8U, [&](auto clean, auto semantic, auto) {
+            static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+            fill(clean, value);
+            fill(semantic, value);
+            for (std::size_t cell = 0U; cell != 3U; ++cell) {
+                directory.Touch(cell);
+                directory.Stage(cell, cell == 0U ? meaning : nullptr, 0U, cell == 1U);
+            }
+        });
+        directory.Commit();
+        return runtime.CommitOutput(std::move(output));
+    };
+    auto first = publish(17U);
+    auto second = publish(33U);
+    auto incumbent = publish(49U);
+    first = {};
+    SystemImageRuntime::CompletedOutput baseline;
+    auto candidate = runtime.TryAcquireOutput(baseline);
+    REQUIRE(candidate.valid());
+    const auto allocation = candidate.allocations()[0U];
+    directory.Invalidate(allocation);
+    bool entered = false;
+    // Clean is cleared, then semantic clear fails before the callback.
+    backend->FailAfter(test_support::FakeImageBackend::FailurePoint::Clear, 1U);
+    CHECK_THROWS(runtime.Publish(candidate, 24U, 8U, [&](auto, auto, auto) { entered = true; }));
+    CHECK_FALSE(entered);
+    CHECK(runtime.Completed().revision() == incumbent.revision());
+    {
+        auto selected = runtime.Borrow();
+        REQUIRE(selected.valid());
+        CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == 49U);
+        static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
+        CHECK(directory.Contains(0U, meaning, 0U));
+        CHECK(directory.Empty(1U, true));
+        CHECK(directory.Empty(2U, false));
+        directory.Commit();
+    }
+    directory.Rollback();
+    candidate = {};
+    candidate = runtime.TryAcquireOutput(baseline);
+    REQUIRE(candidate.valid());
+    CHECK(candidate.allocations()[0U] == allocation);
+    runtime.PublishRetained(candidate, 24U, 8U, [&](auto clean, auto semantic, auto) {
+        CHECK(*reinterpret_cast<const unsigned char*>(clean.data) == 0U);
+        CHECK(*reinterpret_cast<const unsigned char*>(semantic.data) == 17U);
+        static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
+        CHECK_FALSE(directory.Contains(0U, meaning, 0U));
+        CHECK_FALSE(directory.Empty(1U, true));
+        CHECK_FALSE(directory.Empty(2U, false));
+        fill(clean, 71U);
+        fill(semantic, 71U);
+        for (std::size_t cell = 0U; cell != 3U; ++cell) {
+            directory.Touch(cell);
+            directory.Stage(cell, cell == 0U ? meaning : nullptr, 0U, cell == 1U);
+        }
+        // Submission alone cannot install the new tags.
+        CHECK_FALSE(directory.Contains(0U, meaning, 0U));
+    });
+    directory.Commit();
+    auto replacement = runtime.CommitOutput(std::move(candidate));
+    CHECK(replacement.valid());
+    CHECK(second.valid());
+    CHECK(runtime.Completed().revision() == replacement.revision());
+    auto selected = runtime.Borrow();
+    REQUIRE(selected.valid());
+    static_cast<void>(directory.Begin(selected.plane(0U).plane(), selected.plane(1U).plane(), viewport, pixels));
+    CHECK(directory.Contains(0U, meaning, 0U));
+    CHECK(directory.Empty(1U, true));
+    CHECK(directory.Empty(2U, false));
+    CHECK(*reinterpret_cast<const unsigned char*>(selected.plane(0U).plane().data) == 71U);
+    directory.Commit();
+}
+
+TEST_CASE("Native gallery return selects its actual completed product and resumes partial demand", "[explore][native][atlas][detail]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    const bool complete = GENERATE(false, true);
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-return"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGallery gallery{4U};
+    gallery.plan.viewport.first_row = 3U;
+    gallery.plan.viewport.row_count = 5U;
+    gallery.plan.viewport.extent.height = 40U;
+    gallery.Open(path);
+    if (complete) {
+        gallery.Drain();
+    } else {
+        gallery.WaitForReadyTiles();
+        static_cast<void>(gallery.Step());
+    }
+    const auto revision = gallery.runtime->Completed().revision();
+    const auto before = gallery.Pixels(0U);
+    const auto layout = gallery.displayed_layout;
+    const auto readiness = gallery.algorithm->AdvanceGallery().ready_slots;
+    REQUIRE(complete || std::ranges::any_of(readiness, [](bool value) { return !value; }));
+    gallery.plan.mode = ExploreMode::Detail;
+    gallery.plan.selected_image = 12U;
+    gallery.demand->store(++gallery.plan.generation);
+    gallery.Begin();
+    REQUIRE(gallery.algorithm->Document());
+    const auto detail_revision = gallery.runtime->Completed().revision();
+    REQUIRE(detail_revision != revision);
+    gallery.plan.mode = ExploreMode::Gallery;
+    gallery.plan.selected_image.reset();
+    gallery.demand->store(++gallery.plan.generation);
+    const auto acquisitions = gallery.acquisitions;
+    gallery.Begin();
+    CHECK(gallery.acquisitions == acquisitions);
+    CHECK(gallery.runtime->Completed().revision() == revision);
+    CHECK(gallery.displayed_layout == layout);
+    CHECK(gallery.Pixels(0U) == before);
+    CHECK(gallery.algorithm->AdvanceGallery().ready_slots == readiness);
+    gallery.Drain();
+    const auto ready_pixels = gallery.Pixels(0U);
+    gallery.plan.viewport.row_count = 6U;
+    gallery.plan.viewport.extent.height = 48U;
+    gallery.demand->store(++gallery.plan.generation);
+    gallery.Begin();
+    const auto six = gallery.Pixels(0U);
+    CHECK(std::equal(ready_pixels.begin(), ready_pixels.end(), six.begin()));
+    gallery.plan.viewport.row_count = 5U;
+    gallery.plan.viewport.extent.height = 40U;
+    gallery.demand->store(++gallery.plan.generation);
+    gallery.Begin();
+    CHECK(gallery.Pixels(0U) == ready_pixels);
+    gallery.plan.mode = ExploreMode::Detail;
+    gallery.plan.selected_image = 12U;
+    gallery.demand->store(++gallery.plan.generation);
+    gallery.Begin();
+    ++gallery.plan.augmentation.seed;
+    gallery.plan.mode = ExploreMode::Gallery;
+    gallery.plan.selected_image.reset();
+    gallery.demand->store(++gallery.plan.generation);
+    const auto changed = gallery.Begin();
+    CHECK(changed.remaining_tiles == 20U);
+    CHECK(gallery.runtime->Completed().revision() != revision);
+    gallery.Drain();
+}
 
 TEST_CASE("Native gallery retains slot products across hot reuse semantic changes collisions and artifact replacement",
           "[explore][native][cache]") {

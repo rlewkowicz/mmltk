@@ -20,6 +20,7 @@ pub(crate) fn observe(snapshot: Option<&ExploreSnapshot>, dark: bool) {
                 value.frame == snapshot.frame
                     && value.dataset.identity == snapshot.dataset.identity
                     && value.viewport == snapshot.viewport
+                    && value.gallery.layout == snapshot.gallery.layout
                     && value.order.visibleindices == snapshot.order.visibleindices
                     && value.augmentation == snapshot.augmentation
                     && value.revision != snapshot.revision
@@ -36,6 +37,7 @@ pub(crate) fn observe(snapshot: Option<&ExploreSnapshot>, dark: bool) {
                     shown.frame == snapshot.frame
                         && shown.dataset.identity == snapshot.dataset.identity
                         && shown.viewport == snapshot.viewport
+                        && shown.gallery.layout == snapshot.gallery.layout
                         && shown.order.visibleindices == snapshot.order.visibleindices
                         && shown.augmentation == snapshot.augmentation
                         && shown.revision != snapshot.revision
@@ -64,7 +66,8 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
             if let Some(snapshot) = snapshot
                 && selected
                     .as_ref()
-                    .is_some_and(|value| snapshot.revision > value.revision)
+                    .is_some_and(|value| snapshot.revision > value.revision
+                        && snapshot.gallery.layout == value.gallery.layout)
             {
                 *selected = Some(Arc::new(snapshot.clone()));
             }
@@ -81,13 +84,22 @@ pub(crate) fn select(snapshot: Option<&ExploreSnapshot>, frame: &VisualFrame) {
 fn matches(snapshot: &ExploreSnapshot, frame: FrameReady) -> bool {
     snapshot.frame.source.kind == crate::generated::PresentationSourceKind::Explore
         && frame.matches_content(&snapshot.frame)
-        && snapshot.viewport.extent == snapshot.frame.extent
-        && snapshot.viewport.columns != 0
-        && snapshot.viewport.rowcount != 0
-        && frame.content_width % snapshot.viewport.columns == 0
-        && frame.content_height % snapshot.viewport.rowcount == 0
-        && frame.content_width / snapshot.viewport.columns
-            == frame.content_height / snapshot.viewport.rowcount
+        && valid_layout(snapshot)
+}
+
+fn valid_layout(snapshot: &ExploreSnapshot) -> bool {
+    let layout = &snapshot.gallery.layout;
+    layout.columns != 0
+        && layout.cardextent != 0
+        && layout.rowcount != 0
+        && layout.rowcount <= layout.rowcapacity
+        && layout.roworigin < layout.rowcapacity
+        && layout.columns.checked_mul(layout.cardextent) == Some(snapshot.frame.extent.width)
+        && layout.rowcapacity.checked_mul(layout.cardextent) == Some(snapshot.frame.extent.height)
+        && layout.firstrow == snapshot.viewport.firstrow
+        && layout.rowcount == snapshot.viewport.rowcount
+        && layout.columns == snapshot.viewport.columns
+        && snapshot.gallery.slots.len() == snapshot.order.visibleindices.len()
 }
 
 pub(super) fn matching(frame: Option<FrameReady>) -> Option<Arc<ExploreSnapshot>> {
@@ -162,6 +174,11 @@ pub(crate) fn confirm(
                     && matches(snapshot, frame)
             })
         {
+            if selected.as_ref().is_some_and(|snapshot| {
+                snapshot.frame == current.frame && snapshot.gallery.layout != current.gallery.layout
+            }) {
+                return;
+            }
             if selected
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.frame != current.frame)
@@ -189,10 +206,13 @@ pub(super) fn current_source(snapshot: &ExploreSnapshot) -> bool {
 }
 
 pub(super) fn placement(snapshot: &ExploreSnapshot) -> Placement {
+    let layout = &snapshot.gallery.layout;
     Placement::GalleryGrid {
-        first_row: snapshot.viewport.firstrow,
-        columns: snapshot.viewport.columns,
-        rows: snapshot.viewport.rowcount,
+        first_row: layout.firstrow,
+        columns: layout.columns,
+        rows: layout.rowcount,
+        row_capacity: layout.rowcapacity,
+        row_origin: layout.roworigin,
     }
 }
 
@@ -202,7 +222,7 @@ pub(super) fn row_offset(layout: Placement, snapshot: &ExploreSnapshot, width: f
             columns, first_row, ..
         } => {
             width
-                * (snapshot.viewport.firstrow as f32 / snapshot.viewport.columns.max(1) as f32
+                * (snapshot.gallery.layout.firstrow as f32 / snapshot.gallery.layout.columns.max(1) as f32
                     - first_row as f32 / columns.max(1) as f32)
         }
         Placement::Contain => 0.0,
@@ -249,6 +269,7 @@ mod tests {
             firstrow: 0,
             extent: snapshot.frame.extent.clone(),
         };
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
         snapshot
     }
 
@@ -308,6 +329,7 @@ mod tests {
         snapshot.frame.extent.height = 400;
         snapshot.viewport.extent = snapshot.frame.extent.clone();
         snapshot.frame.revision = 41;
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
         let frame = frame_ready();
         select(Some(&snapshot), &snapshot.frame);
         confirm(frame, &snapshot.frame, Some(&snapshot));
@@ -397,6 +419,7 @@ mod tests {
             content_height: 500,
             ..frame
         };
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
         confirm(next_frame, &snapshot.frame, Some(&snapshot));
         let next = matching(Some(FrameReady {
             content_sequence: 42,
@@ -415,18 +438,24 @@ mod tests {
         retained.viewport.columns = 4;
         retained.viewport.rowcount = 4;
         retained.viewport.firstrow = 1;
+        crate::view_model::test_support::gallery_layout(&mut retained);
         let newer = Placement::GalleryGrid {
             columns: 4,
             rows: 5,
+            row_capacity: 5,
+            row_origin: 0,
             first_row: 2,
         };
         assert_eq!(row_offset(newer, &retained, 600.0), -150.0);
         assert_eq!(row_offset(placement(&retained), &retained, 600.0), 0.0);
         retained.viewport.rowcount = 5;
         retained.viewport.firstrow = 10;
+        crate::view_model::test_support::gallery_layout(&mut retained);
         let earlier = Placement::GalleryGrid {
             columns: 4,
             rows: 4,
+            row_capacity: 4,
+            row_origin: 0,
             first_row: 2,
         };
         assert_eq!(row_offset(earlier, &retained, 600.0), 1200.0);
@@ -464,6 +493,40 @@ mod tests {
         confirm(native, &snapshot.frame, Some(&snapshot));
         assert!(matching(Some(native)).is_none());
 
+        clear();
+    }
+
+    #[test]
+    fn circular_layout_stays_with_the_exact_displayed_product() {
+        let mut snapshot = gallery_snapshot();
+        snapshot.viewport.rowcount = 5;
+        snapshot.viewport.extent.height = 500;
+        snapshot.frame.extent.height = 800;
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
+        snapshot.gallery.layout.roworigin = 7;
+        let physical = FrameReady { content_height: 800, ..frame_ready() };
+        assert!(matches(&snapshot, physical));
+        select(Some(&snapshot), &snapshot.frame);
+        confirm(physical, &snapshot.frame, Some(&snapshot));
+        let retained = matching(Some(physical)).unwrap();
+        assert_eq!(retained.gallery.layout.roworigin, 7);
+        let mut replacement = snapshot.clone();
+        replacement.revision += 1;
+        replacement.gallery.layout.roworigin = 0;
+        observe(Some(&replacement), false);
+        select(Some(&replacement), &replacement.frame);
+        confirm(physical, &replacement.frame, Some(&replacement));
+        assert_eq!(matching(Some(physical)).unwrap().gallery.layout.roworigin, 7);
+        replacement.frame.revision += 1;
+        replacement.viewport.rowcount = 6;
+        replacement.viewport.extent.height = 600;
+        replacement.gallery.layout.rowcount = 6;
+        let newer = FrameReady { content_sequence: replacement.frame.revision, ..physical };
+        select(Some(&replacement), &replacement.frame);
+        confirm(newer, &replacement.frame, Some(&replacement));
+        assert_eq!(matching(Some(newer)).unwrap().gallery.layout.rowcount, 6);
+        assert_eq!(retained.gallery.layout.rowcount, 5);
+        assert_eq!(retained.gallery.layout.roworigin, 7);
         clear();
     }
 }

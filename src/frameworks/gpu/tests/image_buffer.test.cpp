@@ -1331,6 +1331,83 @@ TEST_CASE("receiver retains a product lease through deferred source completion")
     CHECK(receiver.OutputFacts().revision == 1U);
 }
 
+TEST_CASE("retained candidates expose allocation-local storage without clear or baseline copy", "[gpu][product][retained]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+                                .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U});
+    const auto fill = [](const std::uint8_t value) {
+        return [value](auto clean, auto semantic, auto) {
+            for (auto plane : {clean, semantic})
+                std::memset(reinterpret_cast<void*>(plane.data), value, plane.descriptor.pitch_bytes * plane.descriptor.height);
+        };
+    };
+    SystemImageRuntime::CompletedOutput baseline;
+    auto first = runtime.TryAcquireOutput(baseline);
+    CHECK(first.allocations()[0].identity == 0U);
+    runtime.PublishRetained(first, 8U, 8U, fill(17U));
+    const auto first_allocation = first.allocations();
+    auto gallery = runtime.CommitOutput(std::move(first));
+    auto second = runtime.TryAcquireOutput(baseline);
+    runtime.PublishRetained(second, 8U, 8U, fill(33U));
+    auto detail = runtime.CommitOutput(std::move(second));
+    auto third = runtime.TryAcquireOutput(baseline);
+    runtime.PublishRetained(third, 8U, 8U, fill(49U));
+    auto selected = runtime.CommitOutput(std::move(third));
+    auto held = gallery.Borrow();
+    gallery = {};
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    held = {};
+    auto reused = runtime.TryAcquireOutput(baseline);
+    REQUIRE(reused.valid());
+    CHECK(reused.allocations() == first_allocation);
+    runtime.PublishRetained(reused, 8U, 8U, [](auto clean, auto semantic, auto) {
+        CHECK(*reinterpret_cast<const std::uint8_t*>(clean.data) == 17U);
+        CHECK(*reinterpret_cast<const std::uint8_t*>(semantic.data) == 17U);
+        *reinterpret_cast<std::uint8_t*>(clean.data) = 71U;
+    });
+    CHECK(reused.allocations() == first_allocation);
+    gallery = runtime.CommitOutput(std::move(reused));
+    CHECK(backend->plane_clears == 0U);
+    CHECK(backend->same_copies == 0U);
+    runtime.SelectOutput(detail);
+    CHECK(runtime.Completed().revision() == detail.revision());
+    gallery = {};
+    auto grown = runtime.TryAcquireOutput(baseline);
+    REQUIRE(grown.allocations() == first_allocation);
+    runtime.PublishRetained(grown, 16U, 9U, fill(85U));
+    CHECK(grown.allocations()[0].owner == first_allocation[0].owner);
+    CHECK(grown.allocations()[0].identity != first_allocation[0].identity);
+    CHECK(grown.allocations()[0].width == 16U);
+    CHECK(grown.allocations()[0].height == 9U);
+    CHECK(runtime.Completed().revision() == detail.revision());
+}
+
+TEST_CASE("failed retained publication preserves the selected product and exposes touched candidate storage", "[gpu][product][retained]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_buffer_count = 2U});
+    runtime.Publish(4U, 4U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 7, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    const auto selected = runtime.Completed();
+    SystemImageRuntime::CompletedOutput baseline;
+    auto candidate = runtime.TryAcquireOutput(baseline);
+    CHECK_THROWS(runtime.PublishRetained(candidate, 4U, 4U, [](auto clean, auto, auto) {
+        *reinterpret_cast<std::uint8_t*>(clean.data) = 123U;
+        throw std::runtime_error("partial atlas write");
+    }));
+    const auto allocation = candidate.allocations();
+    CHECK(candidate.revision() == 0U);
+    CHECK(runtime.Completed().revision() == selected.revision());
+    candidate = {};
+    candidate = runtime.TryAcquireOutput(baseline);
+    CHECK(candidate.allocations() == allocation);
+    runtime.PublishRetained(candidate, 4U, 4U, [](auto clean, auto, auto) {
+        CHECK(*reinterpret_cast<const std::uint8_t*>(clean.data) == 123U);
+        std::memset(reinterpret_cast<void*>(clean.data), 31, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    CHECK(runtime.CommitOutput(std::move(candidate)).valid());
+}
+
 TEST_CASE("final borrowed view retires on the owning runtime path") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();

@@ -127,6 +127,9 @@ ImageProductPool::Candidate& ImageProductPool::Candidate::operator=(Candidate&& 
 }
 bool ImageProductPool::Candidate::valid() const noexcept { return slot_ != nullptr; }
 std::uint64_t ImageProductPool::Candidate::revision() const noexcept { return revision_; }
+std::array<ImageAllocation, 2U> ImageProductPool::Candidate::allocations() const {
+    return slot_ ? slot_->buffer.Allocations() : std::array<ImageAllocation, 2U>{};
+}
 void ImageProductPool::Candidate::Release() noexcept {
     if (!slot_) return;
     auto slot = std::move(slot_);
@@ -209,6 +212,27 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
     }
     try {
         slot.buffer.PublishAs(stream, width, height, revision, !initialized, std::move(submit));
+        stream.Synchronize();
+    } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
+    candidate.revision_ = revision;
+}
+void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate, const std::uint32_t width,
+                                       const std::uint32_t height, const std::uint64_t revision,
+                                       ImageProductBuffer::ProductSubmit submit) {
+    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U ||
+        candidate.baseline_.slot_)
+        throw std::invalid_argument("retained image candidate is invalid or has a copy baseline");
+    if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
+    auto& slot = *candidate.slot_;
+    if (slot.buffer.terminal() || !slot.buffer.writable())
+        throw std::runtime_error("retained image candidate is unavailable");
+    {
+        std::scoped_lock lock(admission_->mutex);
+        slot.selected = false;
+        slot.facts.revision = 0U;
+    }
+    try {
+        slot.buffer.PublishAs(stream, width, height, revision, false, std::move(submit));
         stream.Synchronize();
     } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
     candidate.revision_ = revision;

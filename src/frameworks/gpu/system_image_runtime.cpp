@@ -207,6 +207,11 @@ void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t
 SystemImageRuntime::CompletedOutput SystemImageRuntime::CommitOutput(OutputCandidate&& candidate) {
     return ActiveState().output->Commit(std::move(candidate));
 }
+void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
+                                         ImageProductBuffer::ProductSubmit submit) {
+    auto& state = ActiveState();
+    state.output->PublishRetained(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
+}
 void SystemImageRuntime::SelectOutput(const CompletedOutput& product) { ActiveState().output->Select(product); }
 void SystemImageRuntime::SetOutputAvailableSink(std::function<void()> sink) { ActiveState().output->SetAvailabilitySink(std::move(sink)); }
 BorrowedImageProductReadView SystemImageRuntime::BorrowInput() const { return ActiveState().input->Borrow(); }

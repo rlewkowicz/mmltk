@@ -351,6 +351,17 @@ void check_published_frame(const controller::ExploreSystem& system) {
     CHECK(product.plane(0U).plane().descriptor.height == snapshot.frame.extent.height);
     CHECK(product.plane(1U).plane().descriptor.width == snapshot.frame.extent.width);
     CHECK(product.plane(1U).plane().descriptor.height == snapshot.frame.extent.height);
+    if (snapshot.mode == controller::ExploreMode::Gallery) {
+        const auto& layout = snapshot.gallery.layout;
+        CHECK(layout.first_row == snapshot.viewport.first_row);
+        CHECK(layout.row_count == snapshot.viewport.row_count);
+        CHECK(layout.columns == snapshot.viewport.columns);
+        REQUIRE(layout.row_capacity >= layout.row_count);
+        CHECK(layout.row_origin < layout.row_capacity);
+        CHECK(layout.columns * layout.card_extent == snapshot.frame.extent.width);
+        CHECK(layout.row_capacity * layout.card_extent == snapshot.frame.extent.height);
+        CHECK(snapshot.gallery.slots.size() == snapshot.order.visible_indices.size());
+    }
 }
 
 void load_explore_transport(controller::SettingsSystem& settings, const std::filesystem::path& settings_path, const bool h2d) {
@@ -581,6 +592,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(audit.augmentation_count() == disabled_augmentation_count);
 
     REQUIRE_FALSE(system.snapshot().order.visible_indices.empty());
+    const auto retained_gallery = system.snapshot();
     const auto selected_image = system.snapshot().order.visible_indices.front();
     const auto detail_admission = system.Select({.compiled_index = selected_image});
     REQUIRE(audit.Wait([&] { return audit.last_ready_frame() > detail_admission.frame.revision; }));
@@ -594,8 +606,16 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
 
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
-    static_cast<void>(system.CloseDetail());
-    wait_for_native_gallery(audit, system, placeholder_count, tile_count);
+    const auto returned = system.CloseDetail();
+    REQUIRE(audit.Wait([&] {
+        const auto snapshot = system.snapshot();
+        return snapshot.revision > returned.revision && snapshot.mode == controller::ExploreMode::Gallery &&
+               snapshot.frame == retained_gallery.frame && snapshot.gallery.slots == retained_gallery.gallery.slots;
+    }));
+    CHECK(system.snapshot().gallery.layout == retained_gallery.gallery.layout);
+    CHECK(audit.placeholder_count() == placeholder_count);
+    CHECK(audit.tile_count() == tile_count);
+    check_published_frame(system);
     CHECK(system.snapshot().mode == controller::ExploreMode::Gallery);
     CHECK_FALSE(audit.failed());
     CHECK(system.snapshot().failure.empty());

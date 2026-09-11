@@ -43,6 +43,19 @@ pub(crate) fn explore_snapshot() -> crate::generated::ExploreSnapshot {
         .expect("generated Explore snapshot")
 }
 
+pub(crate) fn gallery_layout(snapshot: &mut crate::generated::ExploreSnapshot) {
+    let viewport = &snapshot.viewport;
+    let side = viewport.extent.width / viewport.columns.max(1);
+    snapshot.gallery.layout = crate::generated::ExploreAtlasLayout {
+        firstrow: viewport.firstrow,
+        rowcount: viewport.rowcount,
+        rowcapacity: snapshot.frame.extent.height / side.max(1),
+        roworigin: 0,
+        columns: viewport.columns,
+        cardextent: side,
+    };
+}
+
 pub(crate) fn visual_frame(kind: PresentationSourceKind, revision: u64) -> VisualFrame {
     VisualFrame {
         source: PresentationSourceIdentity { kind, instance: 1 },

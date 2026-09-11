@@ -91,7 +91,7 @@ function(mmltk_add_controller_presentation_tests)
     target_link_libraries(
         mmltk_controller_visual_systems_tests PRIVATE
         mmltk_acceptance_support
-        mmltk::controller::browser::protocol_v14
+        mmltk::controller::browser::protocol_v15
         mmltk::controller::direct_services
         mmltk::controller::annotation_system
         mmltk::controller::explore_system

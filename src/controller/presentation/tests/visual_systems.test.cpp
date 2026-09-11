@@ -416,6 +416,13 @@ struct ExploreDetailExtentProbe final {
     VisualExtent original{48U, 32U};
 };
 
+[[nodiscard]] ExploreAtlasLayout test_atlas_layout(const ExploreRenderPlan& plan,
+                                                   const mmltk::frameworks::gpu::ImagePlaneView plane) {
+    const auto side = explore_atlas_card_extent(plan.viewport);
+    return {plan.viewport.first_row, plan.viewport.row_count, plane.descriptor.height / side,
+             0U, plan.viewport.columns, side};
+}
+
 class SynchronousExploreAlgorithm : public ExploreAlgorithm {
    public:
     void SetCurrentDemand(ExploreDemandCheck demand) override {
@@ -429,7 +436,8 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
     void AbortRenderGeneration() override { generation_ = 0U; }
     void DiscardCandidate() override {}
     void SetGalleryReadySink(GalleryReadySink) final {}
-    void PrepareOutputPublication(ExploreOutputChange) final {}
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept override {}
+    void PrepareOutputPublication(ExploreOutputChange, ExploreMode) final {}
     void CommitOutputPublication() noexcept final {}
     bool RollbackOutputPublication() noexcept final { return true; }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
@@ -437,7 +445,7 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
                                            const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
         RenderProduct(plan, candidate, nproc, clean, semantic, stream);
         generation_ = plan.generation;
-        return {.generation = generation_};
+        return {.generation = generation_, .layout = test_atlas_layout(plan, clean)};
     }
     ExploreGalleryPublication AdvanceGallery() final { return {.generation = generation_}; }
     bool HasGalleryTiles() const final { return false; }
@@ -488,6 +496,7 @@ struct StreamingExplorePublicationState {
     std::size_t nproc = 1U;
     std::size_t next_slot = 0U;
     std::size_t cumulative = 0U;
+    ExploreAtlasLayout layout{};
 };
 
 struct StreamingExploreProbe final : StreamingExplorePublicationState {
@@ -668,7 +677,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         std::scoped_lock lock(probe_->mutex);
         probe_->ready_sink = std::move(sink);
     }
-    void PrepareOutputPublication(ExploreOutputChange) override {
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept override {}
+    void PrepareOutputPublication(ExploreOutputChange, ExploreMode) override {
         std::scoped_lock lock(probe_->mutex);
         if (checkpoint_) return;
         checkpoint_.emplace(PublicationCheckpoint{
@@ -680,6 +690,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
             .nproc = probe_->nproc,
             .next_slot = probe_->next_slot,
             .cumulative = probe_->cumulative,
+            .layout = probe_->layout,
         });
     }
     void CommitOutputPublication() noexcept override {
@@ -708,6 +719,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
             probe_->nproc = checkpoint_->nproc;
             probe_->next_slot = checkpoint_->next_slot;
             probe_->cumulative = checkpoint_->cumulative;
+            probe_->layout = checkpoint_->layout;
             checkpoint_.reset();
             wake = probe_->ready_sink;
             probe_->changed.notify_all();
@@ -736,6 +748,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         {
             std::scoped_lock lock(probe_->mutex);
             if (probe_->generation == plan.generation) {
+                RestorePixels(clean, semantic);
                 PrioritizeLocked(plan);
                 probe_->next_slot = 0U;
                 return FactsLocked(0U);
@@ -745,6 +758,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         Fill(semantic, 0U);
         std::scoped_lock lock(probe_->mutex);
         probe_->generation = plan.generation;
+        probe_->layout = test_atlas_layout(plan, clean);
         probe_->visible = Visible(plan.viewport, candidate).visible_indices;
         probe_->completed_slots.assign(probe_->visible.size(), 0U);
         probe_->nproc = nproc;
@@ -785,6 +799,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         {
             std::scoped_lock lock(probe_->mutex);
             if (probe_->fail_callback_admission) throw std::runtime_error("deterministic Explore callback admission failure");
+            RestorePixels(clean, semantic);
             for (auto& assignment : probe_->assignments) {
                 if (!assignment.ready || assignment.gpu_pending || assignment.generation != probe_->generation) continue;
                 FillSlot(clean, assignment.slot, probe_->visible.size(), static_cast<std::uint8_t>(0x40U + assignment.compiled_index));
@@ -819,6 +834,21 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
 
    private:
     using PublicationCheckpoint = StreamingExplorePublicationState;
+
+    void RestorePixels(const mmltk::frameworks::gpu::ImagePlaneView clean,
+                        const mmltk::frameworks::gpu::ImagePlaneView semantic) const {
+        Fill(clean, 0x11U);
+        Fill(semantic, 0U);
+        const auto place = [&](const std::size_t slot, const std::uint32_t image) {
+            FillSlot(clean, slot, probe_->visible.size(), static_cast<std::uint8_t>(0x40U + image));
+            FillSlot(semantic, slot, probe_->visible.size(), static_cast<std::uint8_t>(0x80U + image));
+        };
+        for (std::size_t slot = 0U; slot < probe_->completed_slots.size(); ++slot)
+            if (probe_->completed_slots[slot]) place(slot, probe_->visible[slot]);
+        for (const auto& assignment : probe_->assignments)
+            if (assignment.gpu_pending && assignment.generation == probe_->generation)
+                place(assignment.slot, assignment.compiled_index);
+    }
 
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
         probe_->scroll_direction = plan.scroll_direction;
@@ -872,6 +902,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     [[nodiscard]] ExploreGalleryPublication FactsLocked(const std::size_t stale) const {
         return {
             .generation = probe_->generation,
+            .layout = probe_->layout,
             .ready_slots = probe_->completed_slots,
             .cumulative_tiles = probe_->cumulative,
             .remaining_tiles = probe_->visible.size() - probe_->cumulative,
@@ -892,7 +923,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
                                                                      std::shared_ptr<StreamingExploreProbe> probe) {
     return RuntimeFactory(
         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-        [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 2U);
+        [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 3U);
 }
 
 class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
@@ -2007,6 +2038,21 @@ class EventGate final {
     std::uint64_t revision_ = 0U;
 };
 
+class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
+   public:
+    CapacityExploreAlgorithm(EventGate& attempts, std::atomic_size_t& count)
+        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U)), attempts_(attempts), count_(count) {}
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override {
+        count_.fetch_add(1U, std::memory_order_release);
+        attempts_.Advance();
+        return ExploreOutputChange::Initialize;
+    }
+
+   private:
+    EventGate& attempts_;
+    std::atomic_size_t& count_;
+};
+
 class DiagnosticCapture final {
    public:
     [[nodiscard]] VisualDiagnosticSink sink() noexcept {
@@ -2096,7 +2142,7 @@ class OpenedExplore final {
         : explore_(settings_.system(), kDevice, 2U,
                    RuntimeFactory(
                        0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                       [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 2U),
+                       [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U),
                    [this](ExploreSystem::event_type) { events_.Advance(); }) {
         static_cast<void>(
             explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
@@ -2124,7 +2170,7 @@ class ExploreScenario final {
     ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {})
         : ExploreScenario(settings, 2U,
                           RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                         model ? std::move(model) : DefaultModel(), 2U),
+                                         model ? std::move(model) : DefaultModel(), 3U),
                           std::move(observer)) {}
 
     ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {})
@@ -2176,6 +2222,94 @@ class ExploreScenario final {
     EventGate events_;
     ExploreSystem explore_;
 };
+
+TEST_CASE("Explore announces the acquired detail allocation before framework prewrites can fail") {
+    class DetailWriteAlgorithm final : public TestExploreAlgorithm {
+       public:
+        DetailWriteAlgorithm(std::shared_ptr<ExploreWorkProbe> work, std::atomic_uint64_t& owner)
+            : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, std::move(work)),
+              owner_(owner) {}
+        void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override {
+            owner_.store(allocation.owner, std::memory_order_release);
+        }
+       private:
+        std::atomic_uint64_t& owner_;
+    };
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto work = std::make_shared<ExploreWorkProbe>();
+    std::atomic_uint64_t notified_owner{0U};
+    ExploreScenario scenario{settings, backend, [&] { return std::make_unique<DetailWriteAlgorithm>(work, notified_owner); }};
+    auto& explore = scenario.system();
+    const ExploreViewport viewport{.extent = {16U, 16U}};
+    scenario.OpenAndWait(viewport);
+    const auto first = explore.snapshot().frame;
+    auto next = viewport;
+    next.first_row = 1U;
+    explore.UpdateViewport({.viewport = next});
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().frame != first; }));
+    const auto incumbent = explore.snapshot();
+    const auto rendered = work->renders.load(std::memory_order_acquire);
+    backend->FailAfter(FakeImageBackend::FailurePoint::Clear, 1U);
+    static_cast<void>(explore.Select({.compiled_index = 1U}));
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().failure.empty(); }));
+    CHECK(notified_owner.load(std::memory_order_acquire) != 0U);
+    CHECK(work->renders.load(std::memory_order_acquire) == rendered);
+    CHECK(explore.snapshot().frame == incumbent.frame);
+    CHECK(explore.snapshot().mode == ExploreMode::Gallery);
+}
+
+TEST_CASE("Explore retries only the newest desired product after held reads release output capacity") {
+    LoadedSettings settings;
+    auto backend = std::make_shared<FakeImageBackend>();
+    EventGate attempts;
+    std::atomic_size_t count{0U};
+    ExploreScenario scenario{settings, backend, [&] { return std::make_unique<CapacityExploreAlgorithm>(attempts, count); }};
+    auto& explore = scenario.system();
+    const ExploreViewport viewport{.extent = {16U, 16U}};
+    scenario.OpenAndWait(viewport);
+    auto first = explore.BorrowFrame();
+    const auto move_to = [&](const std::uint32_t row) {
+        auto next = viewport;
+        next.first_row = row;
+        const auto prior = explore.snapshot().frame;
+        explore.UpdateViewport({.viewport = next});
+        REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport == next && explore.snapshot().frame != prior; }));
+    };
+    move_to(1U);
+    auto second = explore.BorrowFrame();
+    move_to(2U);
+    auto third = explore.BorrowFrame();
+    const auto held = explore.snapshot().frame;
+    const auto request = [&](const std::uint32_t row, const std::optional<std::uint32_t> focus) {
+        auto next = viewport;
+        next.first_row = row;
+        const auto before = count.load(std::memory_order_acquire);
+        explore.UpdateViewport({.viewport = next, .focused_compiled_index = focus});
+        REQUIRE(attempts.Wait([&] { return count.load(std::memory_order_acquire) > before; }));
+        CHECK(explore.snapshot().frame == held);
+    };
+    request(0U, {});
+    request(1U, {});
+    // Focus-only changes share the accepted viewport's generation.
+    request(1U, 1U);
+    first = {};
+    REQUIRE(scenario.Wait([&] {
+        const auto state = explore.snapshot();
+        return state.frame != held && state.viewport.first_row == 1U && state.focused_image == 1U;
+    }));
+    CHECK(second.valid());
+    CHECK(third.valid());
+    CHECK_FALSE(explore.snapshot().busy);
+    const auto retained = explore.snapshot();
+    auto filter = retained.filter;
+    filter.minimum_instances = 1U;
+    CHECK(explore.UpdateFilter({.filter = filter, .overlay = retained.overlay}).busy);
+    CHECK_THROWS_AS(explore.UpdateViewport({.viewport = viewport}), contracts::BusyError);
+    static_cast<void>(explore.Stop());
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
+    CHECK(explore.snapshot().frame == retained.frame);
+}
 
 [[nodiscard]] auto settle_explore_on_exit(ExploreSystem& explore, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&explore, &release] {
@@ -2726,7 +2860,7 @@ TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacem
     ExploreSystem explore{settings.system(), kDevice, 2U,
                           RuntimeFactory(
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                              [probe, retained] { return std::make_unique<CancellableExploreAlgorithm>(probe, retained); }, 2U),
+                              [probe, retained] { return std::make_unique<CancellableExploreAlgorithm>(probe, retained); }, 3U),
                           [&events](ExploreSystem::event_type) { events.Advance(); }};
     const ExploreViewport viewport{.extent = {32U, 32U}};
     static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/incumbent"}));
@@ -3216,7 +3350,7 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     CHECK(probe->assignments.empty());
 }
 
-TEST_CASE("Explore storage diagnostics aggregate renderer and both output slots lazily") {
+TEST_CASE("Explore storage diagnostics aggregate renderer and all three output slots lazily") {
     class StorageAlgorithm final : public TestExploreAlgorithm {
        public:
         explicit StorageAlgorithm(std::shared_ptr<std::atomic<std::size_t>> calls)
@@ -3255,7 +3389,7 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and both output slots 
     auto backend = std::make_shared<FakeImageBackend>();
     auto factory = RuntimeFactory(
         0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-        [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 2U);
+        [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 3U);
     mmltk::frameworks::gpu::SystemImageRuntime* physical = nullptr;
     LoadedSettings settings;
     EventGate events;
@@ -3311,7 +3445,7 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
     auto events = std::make_shared<std::atomic_uint64_t>(0U);
     auto factory = RuntimeFactory(
         0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-        [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 2U);
+        [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U);
     ExploreSystem explore{settings, kDevice, 2U,
                           [factory = std::move(factory), constructions](auto revisions) mutable {
                               constructions->fetch_add(1U, std::memory_order_release);
@@ -3340,7 +3474,7 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
                                   return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
                                                                                 nullptr, nullptr, work);
                               },
-                              2U),
+                              3U),
                           [&events](ExploreSystem::event_type) { events.Advance(); }};
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
@@ -3379,7 +3513,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                           4U,
                           RuntimeFactory(
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                              [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }, 2U),
+                              [observed_nproc] { return std::make_unique<TestExploreAlgorithm>(observed_nproc); }, 3U),
                           [&explore_events](ExploreSystem::event_type) { explore_events.Advance(); },
                           diagnostics.sink()};
     CHECK_FALSE(explore.BorrowFrame().valid());
@@ -4412,7 +4546,8 @@ TEST_CASE("Explore end-of-order clamping preserves square native atlas cells") {
     const auto end = scenario.system().snapshot();
     CHECK(end.viewport.row_count == 1U);
     CHECK(end.viewport.extent == VisualExtent{64U, 32U});
-    CHECK(end.frame.extent == end.viewport.extent);
+    CHECK(end.frame.extent == initial.frame.extent);
+    CHECK(end.gallery.layout.row_count == end.viewport.row_count);
 }
 
 TEST_CASE("Explore unavailable runtime and selected transport publish distinct typed failures") {

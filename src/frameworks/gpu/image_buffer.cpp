@@ -19,6 +19,15 @@
 
 namespace mmltk::frameworks::gpu {
 namespace {
+[[nodiscard]] std::uint64_t next_allocation_identity() {
+    static std::atomic<std::uint64_t> next{1U};
+    auto value = next.load(std::memory_order_relaxed);
+    do {
+        if (value == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error("image allocation identity exhausted");
+    } while (!next.compare_exchange_weak(value, value + 1U, std::memory_order_relaxed));
+    return value;
+}
 class TransferTrace final {
    public:
     TransferTrace() {
@@ -377,8 +386,10 @@ struct ImageBuffer::State final {
         }
         const std::uint32_t next_width = std::max(capacity_width, width);
         const std::uint32_t next_height = std::max(capacity_height, height);
+        const auto identity = next_allocation_identity();
         ImagePlaneView candidate = context.state_->backend->AllocatePlane(context.state_->context, kind, next_width, next_height);
         if (!candidate.valid()) throw std::runtime_error("image plane allocation returned an invalid plane");
+        candidate.allocation = {identity, next_width, next_height, allocation_owner};
         if (plane.data != 0U) context.state_->backend->FreePlane(context.state_->context, plane.data);
         plane = candidate;
         capacity_width = next_width;
@@ -398,6 +409,7 @@ struct ImageBuffer::State final {
         staging_bytes = bytes;
     }
     DeviceContext context;
+    const std::uint64_t allocation_owner = next_allocation_identity();
     mutable std::shared_mutex access;
     std::atomic_bool unavailable{false};
     ImagePlaneView plane{};
@@ -727,6 +739,15 @@ ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProduct
 ImageProductBuffer::~ImageProductBuffer() {
     std::unique_lock transaction(state_->transaction_);
     state_->AwaitReceiverReads();
+}
+std::array<ImageAllocation, 2U> ImageProductBuffer::Allocations() const {
+    std::shared_lock transaction(state_->transaction_);
+    std::array<ImageAllocation, 2U> result{};
+    for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
+        std::shared_lock access(state_->planes_[index]->state_->access);
+        result[index] = state_->planes_[index]->state_->plane.allocation;
+    }
+    return result;
 }
 void ImageProductBuffer::Publish(ImageStream& stream, const std::uint32_t width, const std::uint32_t height, ProductSubmit submit) {
     std::uint64_t next_generation = 0U;

@@ -592,7 +592,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             &dataset->store, std::span{order}.subspan(first, count));
     }
 
-    void PrepareOutputPublication(ExploreOutputChange change) override { gallery_.PrepareOutputPublication(change); }
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept override { gallery_.PrepareDetailOutput(allocation); }
+    void PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) override { gallery_.PrepareOutputPublication(change, mode); }
     void CommitOutputPublication() noexcept override { gallery_.CommitOutputPublication(); }
     [[nodiscard]] bool RollbackOutputPublication() noexcept override { return gallery_.RollbackOutputPublication(); }
 
@@ -731,7 +732,7 @@ VisualRuntimeFactory make_native_explore_runtime_factory(const VisualDeviceSetti
             .device = settings.device,
             .model = std::make_unique<explore_detail::NativeExploreAlgorithm>(configuration, nproc, execution, settings.maximum_height),
             .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-            .output_buffer_count = 2U,
+            .output_buffer_count = 3U,
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),

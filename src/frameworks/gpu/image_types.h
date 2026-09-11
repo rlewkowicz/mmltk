@@ -26,9 +26,20 @@ struct ImagePlaneDescriptor final {
     constexpr bool operator==(const ImagePlaneDescriptor&) const noexcept = default;
 };
 
+struct ImageAllocation final {
+    std::uint64_t identity = 0U;
+    std::uint32_t width = 0U;
+    std::uint32_t height = 0U;
+    std::uint64_t owner = 0U;
+    constexpr bool operator==(const ImageAllocation&) const noexcept = default;
+};
+
 struct ImagePlaneView final {
     CUdeviceptr data = 0U;
     ImagePlaneDescriptor descriptor{};
+    // Physical storage identity survives logical extent/revision changes and
+    // changes even when an allocator reuses the same device address.
+    ImageAllocation allocation{};
     [[nodiscard]] constexpr bool valid() const noexcept { return data != 0U && descriptor.valid(); }
 };
 

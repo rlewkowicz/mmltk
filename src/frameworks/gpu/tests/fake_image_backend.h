@@ -50,6 +50,7 @@ class FakeImageBackend final : public ImageCopyBackend {
         Bind,
         CreateStream,
         AllocatePlane,
+        Clear,
         Copy,
         RecordEvent,
         SynchronizeEvent,
@@ -69,6 +70,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     // CLEANUP-IGNORE: Synchronization and copy-path counters are distinct physical operations, not another allocation inventory.
     std::atomic<std::size_t> synchronized{0U};
     std::atomic<std::size_t> same_copies{0U};
+    std::atomic<std::size_t> plane_clears{0U};
     std::atomic<std::uintptr_t> watched_copy_source{0U};
     std::atomic<std::size_t> watched_source_copies{0U};
     std::atomic<std::size_t> peer_copies{0U};
@@ -169,6 +171,8 @@ class FakeImageBackend final : public ImageCopyBackend {
         ++planes_freed;
     }
     void ClearPlane(std::uintptr_t, std::uintptr_t, const ImagePlaneView& plane) override {
+        MaybeFail(FailurePoint::Clear);
+        ++plane_clears;
         for (std::uint32_t row = 0U; row != plane.descriptor.height; ++row)
             std::memset(reinterpret_cast<std::byte*>(plane.data) + row * plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes());
     }

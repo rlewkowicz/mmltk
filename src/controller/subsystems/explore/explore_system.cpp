@@ -4,6 +4,7 @@
 #include "src/frameworks/gpu/image_failure.h"
 
 #include <algorithm>
+#include <bit>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -544,8 +545,13 @@ class ExploreSystem::Impl final {
             // its readiness facts independently of this stream-demand decision.
             active_gallery_generation_ = 0U;
             latest_generation_->store(ReserveGeneration(), std::memory_order_release);
+            if (pending_discrete_) {
+                pending_discrete_ = {};
+                Complete(state_);
+            }
             if (desired_) {
                 desired_.reset();
+                desired_work_ = {};
                 desired_settings_.reset();
                 desired_persist_ = false;
                 desired_navigation_ = 0;
@@ -654,13 +660,14 @@ class ExploreSystem::Impl final {
         auto requested = *desired_;
         auto plan = make_render_plan(requested, desired_augmentation_config_, state_.dataset.identity, generation);
         plan.scroll_direction = scroll_direction_;
-        if (!worker_.SubmitLatest([this, plan, requested = std::move(requested), generation, offset, settings = desired_settings_,
+        const auto ticket = desired_work_sequence_ = mmltk::common::types::advance_monotonic_identity(desired_work_sequence_);
+        desired_work_ = [this, ticket, plan, requested = std::move(requested), generation, offset, settings = desired_settings_,
                                    persist = desired_persist_](mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                                std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
                 std::uint64_t committed_generation = generation;
                 {
                     std::scoped_lock lock(mutex_);
-                    if (generation != latest_generation_->load(std::memory_order_acquire)) return {};
+                    if ((generation != latest_generation_->load(std::memory_order_acquire) || ticket != desired_work_sequence_)) return {};
                 }
                 auto& algorithm = explore_algorithm(runtime);
                 try {
@@ -670,13 +677,13 @@ class ExploreSystem::Impl final {
                         plan.focused_image.reset();
                         requested.focused_image.reset();
                         std::scoped_lock lock(mutex_);
-                        if (generation == latest_generation_->load(std::memory_order_acquire) && desired_) desired_->focused_image.reset();
+                        if (generation == latest_generation_->load(std::memory_order_acquire) && ticket == desired_work_sequence_ && desired_) desired_->focused_image.reset();
                     }
                     if (offset != 0 && requested.selected_image) {
                         const auto selected = algorithm.Adjacent(*requested.selected_image, offset);
                         if (!selected) throw contracts::UnavailableError("Explore filtered order is empty");
                         std::scoped_lock lock(mutex_);
-                        if (generation != latest_generation_->load(std::memory_order_acquire)) return {};
+                        if ((generation != latest_generation_->load(std::memory_order_acquire) || ticket != desired_work_sequence_)) return {};
                         requested.selected_image = selected;
                         plan.selected_image = selected;
                         desired_->selected_image = selected;
@@ -687,7 +694,7 @@ class ExploreSystem::Impl final {
                     bool superseded = false;
                     {
                         std::scoped_lock lock(mutex_);
-                        if (generation != latest_generation_->load(std::memory_order_acquire) || stop.stop_requested()) {
+                        if ((generation != latest_generation_->load(std::memory_order_acquire) || ticket != desired_work_sequence_) || stop.stop_requested()) {
                             if (desired_ || state_.busy)
                                 superseded = true;
                             else
@@ -706,6 +713,7 @@ class ExploreSystem::Impl final {
                         RollbackOutput(algorithm);
                         return {};
                     }
+                    if (!rendered && output_waiting_ && committed_generation == generation) return {};
                     if (committed_generation != generation || !rendered) {
                         transaction.unlock();
                         return RestoreCommittedProduct(algorithm);
@@ -734,6 +742,7 @@ class ExploreSystem::Impl final {
                             augmentation_config_ = plan.augmentation_config;
                             if (settings) installed_settings_ = std::move(*settings);
                             desired_.reset();
+                            desired_work_ = {};
                             desired_settings_.reset();
                             desired_persist_ = false;
                         });
@@ -749,9 +758,10 @@ class ExploreSystem::Impl final {
                     bool superseded = false;
                     {
                         std::scoped_lock lock(mutex_);
-                        superseded = generation != latest_generation_->load(std::memory_order_acquire) && (desired_ || state_.busy);
+                        superseded = (generation != latest_generation_->load(std::memory_order_acquire) || ticket != desired_work_sequence_) && (desired_ || state_.busy);
                         if (!superseded) {
                             desired_.reset();
+                            desired_work_ = {};
                             desired_settings_.reset();
                             desired_persist_ = false;
                             desired_navigation_ = 0;
@@ -765,8 +775,10 @@ class ExploreSystem::Impl final {
                     transaction.unlock();
                     return RestoreCommittedProduct(algorithm, detail, true);
                 }
-            })) {
+            };
+        if (!worker_.SubmitLatest([this](auto& runtime, auto stop) { return RunDesired(runtime, stop); })) {
             desired_.reset();
+            desired_work_ = {};
             desired_settings_.reset();
             desired_persist_ = false;
             desired_navigation_ = 0;
@@ -842,6 +854,13 @@ class ExploreSystem::Impl final {
             std::move(prior));
     }
 
+    [[nodiscard]] detail::VisualRuntimeOwner::Notification RunDesired(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                                       std::stop_token stop) {
+        std::function<detail::VisualRuntimeOwner::Notification(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token)> work;
+        { std::scoped_lock lock(mutex_); work = desired_work_; }
+        return work ? work(runtime, stop) : detail::VisualRuntimeOwner::Notification{};
+    }
+
     struct PreparedProduct final {
         mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate output;
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput retained;
@@ -867,13 +886,22 @@ class ExploreSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (product.output.valid())
-                runtime.CommitOutput(std::move(product.output));
+                product.retained = runtime.CommitOutput(std::move(product.output));
             else
                 runtime.SelectOutput(product.retained);
             algorithm.CommitOutputPublication();
+            if (retained_runtime_ != &runtime) {
+                retained_gallery_ = {};
+                retained_detail_ = {};
+                retained_runtime_ = &runtime;
+            }
+            auto& retained = settled.mode == ExploreMode::Gallery ? retained_gallery_ : retained_detail_;
+            retained.output = std::move(product.retained);
+            retained.frame = product.frame;
+            retained.gallery = std::move(product.gallery);
             install();
             document_ = std::move(product.document);
-            active_gallery_generation_ = product.gallery.generation;
+            active_gallery_generation_ = retained.gallery.generation;
             state_ = std::move(settled);
         }
         if (continue_gallery) SubmitGalleryContinuation();
@@ -905,9 +933,9 @@ class ExploreSystem::Impl final {
             configured_algorithm_ = &algorithm;
         }
         const auto change = algorithm.OutputChange(plan, candidate);
-        algorithm.PrepareOutputPublication(change);
+        output_waiting_ = false;
         ExploreGalleryPublication publication;
-        const auto product_extent = ProductExtent(algorithm, plan);
+        auto product_extent = ProductExtent(algorithm, plan);
         std::size_t nproc = 0U;
         std::uint64_t previous_clean_revision = 0U;
         std::shared_ptr<const VisualDocument> previous_document;
@@ -930,23 +958,37 @@ class ExploreSystem::Impl final {
         mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate output;
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput retained;
         if (change == ExploreOutputChange::Unchanged) {
-            retained = runtime.Completed();
+            algorithm.PrepareOutputPublication(change, plan.mode);
+            const auto& prior = plan.mode == ExploreMode::Gallery ? retained_gallery_ : retained_detail_;
+            retained = prior.output.valid() ? prior.output : runtime.Completed();
+            if (prior.output.valid()) product_extent = prior.frame.extent;
             if (plan.mode == ExploreMode::Gallery)
                 publication = algorithm.BeginGallery(plan, candidate, nproc, {}, {}, 0U);
             else
                 algorithm.RenderDetail(plan, nproc, {}, {}, 0U);
+            if (plan.mode == ExploreMode::Gallery && prior.output.valid())
+                publication.ready_slots = prior.gallery.slots;
         } else {
-            output = runtime.AcquireOutput(stop, change == ExploreOutputChange::Semantic
-                                                     ? runtime.Completed()
-                                                     : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{});
-            if (!output.valid()) return std::nullopt;
-            runtime.Publish(output, product_extent.width, product_extent.height,
-                            [&](const auto clean, const auto semantic, const auto stream) {
+            auto baseline = plan.mode == ExploreMode::Detail && change == ExploreOutputChange::Semantic
+                                ? retained_detail_.output : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{};
+            output = reserved_output_.valid() ? std::move(reserved_output_) : runtime.TryAcquireOutput(baseline);
+            if (!output.valid()) {
+                output_waiting_ = true;
+                return std::nullopt;
+            }
+            algorithm.PrepareOutputPublication(change, plan.mode);
+            const auto submit = [&](const auto clean, const auto semantic, const auto stream) {
                                 if (plan.mode == ExploreMode::Gallery)
                                     publication = algorithm.BeginGallery(plan, candidate, nproc, clean, semantic, stream);
                                 else
                                     algorithm.RenderDetail(plan, nproc, clean, semantic, stream);
-                            });
+                            };
+            if (plan.mode == ExploreMode::Gallery)
+                runtime.PublishRetained(output, product_extent.width, product_extent.height, submit);
+            else {
+                algorithm.PrepareDetailOutput(output.allocations()[0U]);
+                runtime.Publish(output, product_extent.width, product_extent.height, submit);
+            }
         }
         DiagnoseStorage(runtime, algorithm, generation);
         auto document = plan.mode == ExploreMode::Detail ? algorithm.Document() : nullptr;
@@ -954,7 +996,9 @@ class ExploreSystem::Impl final {
         // A changed clean product takes its identity from the producer's
         // lifetime sequence; semantic-only output retains the selected identity.
         const auto revision = retained.valid() ? retained.revision() : output.revision();
-        const auto clean_revision = clean_changed ? revision : previous_clean_revision;
+        const auto& prior = plan.mode == ExploreMode::Gallery ? retained_gallery_ : retained_detail_;
+        const auto clean_revision = retained.valid() && prior.output.valid() ? prior.frame.clean_revision
+                                    : clean_changed ? revision : previous_clean_revision;
         auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, product_extent, revision);
         frame.content = plan.mode == ExploreMode::Detail ? algorithm.DetailContent(plan) : VisualRegion{};
         frame.clean_revision = clean_revision;
@@ -963,10 +1007,10 @@ class ExploreSystem::Impl final {
             .retained = std::move(retained),
             .frame = frame,
             .gallery = plan.mode == ExploreMode::Gallery
-                           ? ExploreGalleryReadiness{.generation = publication.generation, .slots = publication.ready_slots}
+                           ? ExploreGalleryReadiness{.generation = publication.generation, .layout = publication.layout, .slots = publication.ready_slots}
                            : ExploreGalleryReadiness{},
             .document = std::move(document),
-            .labels = change == ExploreOutputChange::Unchanged ? std::vector<ExploreLabel>{} : algorithm.Labels(),
+            .labels = algorithm.Labels(),
         };
         if (plan.mode == ExploreMode::Gallery) {
             bool stale = false;
@@ -1021,6 +1065,14 @@ class ExploreSystem::Impl final {
                                                 .device = settings_.device};
                 });
                 if (stop.stop_requested()) return {};
+                detail::VisualRuntimeOwner::Work discrete;
+                { std::scoped_lock lock(mutex_); discrete = std::move(pending_discrete_); }
+                if (discrete) return RunDiscrete(runtime, stop, std::move(discrete));
+                if (output_waiting_) {
+                    bool desired;
+                    { std::scoped_lock lock(mutex_); desired = bool(desired_work_); }
+                    if (desired) return RunDesired(runtime, stop);
+                }
                 auto& algorithm = explore_algorithm(runtime);
                 std::uint64_t generation;
                 VisualExtent extent;
@@ -1030,7 +1082,7 @@ class ExploreSystem::Impl final {
                     if (generation == 0U || generation != latest_generation_->load(std::memory_order_acquire) ||
                         state_.mode != ExploreMode::Gallery)
                         return {};
-                    extent = state_.viewport.extent;
+                    extent = state_.frame.extent;
                 }
                 const auto advanced = algorithm.AdvanceGallery();
                 DiagnoseStorage(runtime, algorithm, generation);
@@ -1067,10 +1119,12 @@ class ExploreSystem::Impl final {
                     std::scoped_lock lock(mutex_);
                     if (advanced.ready_slots != state_.gallery.slots) {
                         auto changed = state_;
-                        changed.gallery = {.generation = advanced.generation, .slots = advanced.ready_slots};
+                        changed.gallery = {.generation = advanced.generation, .layout = advanced.layout, .slots = advanced.ready_slots};
                         changed.labels = algorithm.Labels();
                         changed.revision = mmltk::common::types::advance_monotonic_identity(changed.revision);
+                        auto readiness = changed.gallery;
                         auto notification = ChangedNotification(changed);
+                        retained_gallery_.gallery = std::move(readiness);
                         state_ = std::move(changed);
                         diagnostics_.Emit([&] {
                             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
@@ -1099,7 +1153,6 @@ class ExploreSystem::Impl final {
                                                 .detail = 21U};
                 });
                 if (!ready_tiles) return {};
-                algorithm.PrepareOutputPublication(ExploreOutputChange::Semantic);
                 ExploreGalleryPublication published;
                 diagnostics_.Emit([&] {
                     return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
@@ -1111,13 +1164,12 @@ class ExploreSystem::Impl final {
                                                             .capacity_height = extent.height,
                                                             .staging_bytes = advanced.active_pinned_bytes}};
                 });
-                auto output = runtime.AcquireOutput(stop, runtime.Completed());
-                if (!output.valid()) {
-                    RollbackOutput(algorithm);
-                    return {};
-                }
+                mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+                auto output = runtime.TryAcquireOutput(baseline);
+                if (!output.valid()) return {};
+                algorithm.PrepareOutputPublication(ExploreOutputChange::Semantic);
                 try {
-                    runtime.Publish(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
+                    runtime.PublishRetained(output, extent.width, extent.height, [&](const auto clean, const auto semantic, const auto stream) {
                         services::RuntimeDiagnosticSpan compose_span{
                             diagnostics_, [&] {
                                 return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Explore,
@@ -1143,7 +1195,7 @@ class ExploreSystem::Impl final {
                         .output = std::move(output),
                         .retained = {},
                         .frame = frame,
-                        .gallery = {.generation = published.generation, .slots = published.ready_slots},
+                        .gallery = {.generation = published.generation, .layout = published.layout, .slots = published.ready_slots},
                         .document = {},
                         .labels = algorithm.Labels(),
                     };
@@ -1248,7 +1300,9 @@ class ExploreSystem::Impl final {
     }
     [[nodiscard]] ExploreSnapshot QueueAdmitted(detail::VisualRuntimeOwner::Work work, ExploreSnapshot prior, bool reconstruct = false) {
         if (!worker_.SubmitDiscrete(
-                std::move(work),
+                [this, work = std::move(work)](auto& runtime, auto stop) mutable {
+                    return RunDiscrete(runtime, stop, std::move(work));
+                },
                 [this] {
                     auto publication = FinalizeQueuedCancellation();
                     if (publication) publication();
@@ -1258,6 +1312,34 @@ class ExploreSystem::Impl final {
             throw contracts::BusyError("Explore is busy");
         }
         return state_;
+    }
+    [[nodiscard]] detail::VisualRuntimeOwner::Notification RunDiscrete(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                                        const std::stop_token stop,
+                                                                        detail::VisualRuntimeOwner::Work work) {
+        runtime.SetOutputAvailableSink([wake = std::weak_ptr{gallery_wake_}] {
+            if (const auto gate = wake.lock()) gate->Invoke();
+        });
+        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+        reserved_output_ = runtime.TryAcquireOutput(baseline);
+        if (!reserved_output_.valid()) {
+            {
+                std::scoped_lock lock(mutex_);
+                if (!state_.busy) return {};
+                if (!stop.stop_requested() && !state_.cancellation_requested) {
+                    pending_discrete_ = std::move(work);
+                    return {};
+                }
+            }
+            return FinalizeQueuedCancellation();
+        }
+        try {
+            auto notification = work(runtime, stop);
+            reserved_output_ = {};
+            return notification;
+        } catch (...) {
+            reserved_output_ = {};
+            throw;
+        }
     }
     struct Execution final {
         ExploreRenderPlan requested;
@@ -1279,8 +1361,19 @@ class ExploreSystem::Impl final {
         plan.scroll_direction = scroll_direction_;
         return plan;
     }
-    [[nodiscard]] static VisualExtent ProductExtent(ExploreAlgorithm& algorithm, const ExploreRenderPlan& plan) {
-        return plan.mode == ExploreMode::Gallery ? plan.viewport.extent : algorithm.DetailExtent(plan);
+    [[nodiscard]] VisualExtent ProductExtent(ExploreAlgorithm& algorithm, const ExploreRenderPlan& plan) {
+        if (plan.mode != ExploreMode::Gallery) return algorithm.DetailExtent(plan);
+        const auto side = explore_atlas_card_extent(plan.viewport);
+        std::uint32_t maximum_height;
+        { std::scoped_lock lock(mutex_); maximum_height = state_.maximum_atlas_extent.height; }
+        const auto maximum = std::min(maximum_height / side,
+                                       static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns));
+        const auto rows = std::min(std::bit_ceil(plan.viewport.row_count), maximum);
+        if (atlas_columns_ != plan.viewport.columns || atlas_side_ != side) atlas_rows_ = 0U;
+        atlas_columns_ = plan.viewport.columns;
+        atlas_side_ = side;
+        atlas_rows_ = std::max(atlas_rows_, rows);
+        return {plan.viewport.extent.width, atlas_rows_ * side};
     }
     [[nodiscard]] ExploreViewport ClampViewport(ExploreViewport viewport, const std::uint32_t matching_count) const {
         const auto card_extent = explore_atlas_card_extent(viewport);
@@ -1353,10 +1446,6 @@ class ExploreSystem::Impl final {
     }
     static void ProjectProduct(ExploreSnapshot& snapshot, const PreparedProduct& product) {
         snapshot.frame = product.frame;
-        if (product.retained.valid()) {
-            snapshot.gallery.generation = product.gallery.generation;
-            return;
-        }
         snapshot.gallery = product.gallery;
         snapshot.document = product.document ? product.document->facts() : VisualDocumentFacts{};
         snapshot.scene = product.document ? product.document->scene : contracts::AnnotationSceneContent{};
@@ -1454,7 +1543,9 @@ class ExploreSystem::Impl final {
             failed.failure_kind =
                 kind == ExploreFailureKind::Operation && !runtime_initialized_ ? ExploreFailureKind::RuntimeInitialization : kind;
             state_ = failed;
+            pending_discrete_ = {};
             desired_.reset();
+            desired_work_ = {};
             desired_settings_.reset();
             desired_persist_ = false;
             desired_navigation_ = 0;
@@ -1462,6 +1553,9 @@ class ExploreSystem::Impl final {
             if (!retain_product) {
                 active_gallery_generation_ = 0U;
                 runtime_initialized_ = false;
+                retained_gallery_ = {};
+                retained_detail_ = {};
+                retained_runtime_ = nullptr;
             }
             resume_gallery = retain_product && active_gallery_generation_ != 0U;
         }
@@ -1492,6 +1586,11 @@ class ExploreSystem::Impl final {
     ExploreSnapshot state_;
     ExploreScrollDirection scroll_direction_ = ExploreScrollDirection::Forward;
     std::optional<ExploreSnapshot> desired_;
+    std::function<detail::VisualRuntimeOwner::Notification(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token)> desired_work_;
+    std::uint64_t desired_work_sequence_ = 0U;
+    bool output_waiting_ = false;
+    detail::VisualRuntimeOwner::Work pending_discrete_;
+    mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate reserved_output_;
     std::optional<ExploreSettingsCandidate> desired_settings_;
     bool desired_persist_ = false;
     std::mutex desired_admission_mutex_;
@@ -1509,6 +1608,14 @@ class ExploreSystem::Impl final {
     ExploreAlgorithm* configured_algorithm_ = nullptr;
     std::uint64_t next_shuffle_seed_ = 1U;
     std::shared_ptr<GalleryWakeGate> gallery_wake_;
+    struct RetainedProduct final {
+        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput output;
+        VisualFrame frame{};
+        ExploreGalleryReadiness gallery{};
+    };
+    RetainedProduct retained_gallery_, retained_detail_;
+    const mmltk::frameworks::gpu::SystemImageRuntime* retained_runtime_ = nullptr;
+    std::uint32_t atlas_columns_ = 0U, atlas_side_ = 0U, atlas_rows_ = 0U;
     detail::VisualRuntimeOwner worker_;
 };
 

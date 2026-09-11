@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
+#include "src/controller/subsystems/explore/detail/gallery_atlas.h"
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -79,6 +80,7 @@ void GalleryProductState::ReserveFor(const GalleryProductState& source) {
 void GalleryProductState::Clear() noexcept {
     store.reset();
     viewport = {};
+    atlas = {};
     const auto clear_overlay = [](ExploreOverlay& value) {
         auto classes = std::move(value.class_selection.classes);
         value = {};
@@ -235,7 +237,7 @@ class GalleryStream::Impl final {
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                    const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
-        const auto& prior = State();
+        const auto& prior = plan.mode == selected_mode_ ? State() : retained_;
         if (plan.mode == ExploreMode::Detail && prior.plan.mode == ExploreMode::Detail && prior.store.get() == store && prior.document &&
             prior.detail_meaning && plan.selected_image == prior.plan.selected_image &&
             plan.dataset_identity == prior.plan.dataset_identity && plan.augmentation == prior.plan.augmentation &&
@@ -259,7 +261,8 @@ class GalleryStream::Impl final {
     // CLEANUP-IGNORE: The private execution surface mirrors the public facade at its one pimpl boundary.
     [[nodiscard]] ExploreGalleryPublication Advance();
     [[nodiscard]] bool HasReadyTiles() const;
-    void PrepareOutputPublication(ExploreOutputChange);
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept { atlas_.Invalidate(allocation); }
+    void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery);
     void CommitOutputPublication() noexcept;
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
@@ -381,6 +384,10 @@ class GalleryStream::Impl final {
     void Prioritize(std::optional<std::uint32_t>);
     void PlaceTile(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uint32_t, std::uintptr_t,
                    bool semantic_only = false);
+    [[nodiscard]] std::uint32_t AtlasY(const std::size_t logical) const noexcept {
+        return static_cast<std::uint32_t>((State().atlas.row_origin + logical / State().atlas.columns) %
+                                          State().atlas.row_capacity) * State().atlas.card_extent;
+    }
     void RenderCachedSemantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     [[nodiscard]] bool BeginReadLane(std::size_t);
     void FinishReadLane(std::size_t, std::exception_ptr, bool) noexcept;
@@ -485,6 +492,10 @@ class GalleryStream::Impl final {
     // only its pending non-pixel plan facts.
     GalleryProductState committed_;
     GalleryProductState candidate_;
+    GalleryProductState retained_;
+    ExploreMode selected_mode_ = ExploreMode::Gallery;
+    bool mode_switched_ = false;
+    GalleryAtlas atlas_;
     ExploreOutputChange publication_change_ = ExploreOutputChange::Initialize;
     [[nodiscard]] bool CompleteCandidate() const noexcept {
         return publication_active_ && publication_change_ == ExploreOutputChange::Initialize;
@@ -518,6 +529,7 @@ class GalleryStream::Impl final {
     }
     std::size_t prior_cumulative_ = 0U;
     std::size_t prior_reused_ = 0U;
+    ExploreAtlasLayout prior_atlas_{};
     bool overlay_undo_ = false;
     bool borrowed_cache_ = false;
     cudaStream_t incumbent_stream_ = nullptr;
@@ -618,6 +630,7 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
         if (output_change != ExploreOutputChange::Unchanged) throw std::logic_error("Explore exact reuse changed during preparation");
         PrepareReuse(plan);
         return {.generation = plan.generation,
+                .layout = State().atlas,
                 .cumulative_tiles = State().cumulative_tiles,
                 .remaining_tiles = State().visible_indices.size() - State().cumulative_tiles};
     }
@@ -639,6 +652,10 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
         }
         if (output_change == ExploreOutputChange::Semantic) {
             stream_ = reinterpret_cast<cudaStream_t>(stream);
+            SeedPlaceholders(classes, clean, semantic, stream);
+            for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot)
+                if (State().cache.Find(State().visible_indices[slot]))
+                    PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
             RenderCachedSemantics(clean, semantic, stream);
         }
         if (priority_changed)
@@ -714,7 +731,7 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
         for (std::size_t slot = 0U; slot < State().tile_meanings.size(); ++slot) {
             if (!State().tile_meanings[slot]) continue;
             const auto x = static_cast<std::uint32_t>(slot % State().viewport.columns) * side;
-            const auto y = static_cast<std::uint32_t>(slot / State().viewport.columns) * side;
+            const auto y = AtlasY(slot);
             DiagnoseRendered(clean, semantic, stream, plan.generation, slot, State().visible_indices[slot], std::nullopt, x, y, side, side);
         }
         FlushProbes(stream);
@@ -842,38 +859,64 @@ bool GalleryStream::Impl::HasReadyTiles() const {
     });
 }
 
-void GalleryStream::Impl::PrepareOutputPublication(const ExploreOutputChange change) {
+void GalleryStream::Impl::PrepareOutputPublication(const ExploreOutputChange change, const ExploreMode mode) {
     if (rollback_failed_) throw std::runtime_error("Explore publication rollback previously failed");
     if (publication_active_) return;
-    publication_change_ = change;
-    if (change != ExploreOutputChange::Unchanged) {
-        SettleDescriptors();
-        CompleteTiles(true);
-    }
-    if (change == ExploreOutputChange::Initialize) {
-        // Geometry changes need inactive logical metadata, but the cache itself
-        // remains one retained owner with a changed-entry rollback journal.
-        auto cache = std::move(committed_.cache);
-        try {
-            candidate_ = committed_;
-        } catch (...) {
-            committed_.cache = std::move(cache);
-            throw;
+    try {
+        if (mode != selected_mode_) {
+            SettleDescriptors();
+            CompleteTiles(true);
+            Suspend();
+            std::swap(committed_, retained_);
+            selected_mode_ = mode;
+            mode_switched_ = true;
+            scheduled_slots_.resize(committed_.cache.size());
+            undo_marks_.resize(committed_.cache.size());
+            std::ranges::fill(scheduled_slots_, 0U);
         }
-        committed_.cache = std::move(cache);
-        incumbent_stream_ = stream_;
+        publication_change_ = change;
+        if (change != ExploreOutputChange::Unchanged) {
+            SettleDescriptors();
+            CompleteTiles(true);
+        }
+        if (change == ExploreOutputChange::Initialize) {
+            // Geometry changes need inactive logical metadata, but the cache itself
+            // remains one retained owner with a changed-entry rollback journal.
+            auto cache = std::move(committed_.cache);
+            try {
+                candidate_ = committed_;
+            } catch (...) {
+                committed_.cache = std::move(cache);
+                throw;
+            }
+            committed_.cache = std::move(cache);
+            incumbent_stream_ = stream_;
+        }
+        prior_cumulative_ = committed_.cumulative_tiles;
+        prior_reused_ = committed_.reused_tiles;
+        prior_atlas_ = committed_.atlas;
+        if (change == ExploreOutputChange::Semantic && ++undo_sequence_ == 0U) {
+            std::ranges::fill(undo_marks_, 0U);
+            ++undo_sequence_;
+        }
+        publication_active_ = true;
+    } catch (...) {
+        if (mode_switched_) {
+            std::swap(committed_, retained_);
+            selected_mode_ = committed_.plan.mode;
+            mode_switched_ = false;
+            scheduled_slots_.resize(committed_.cache.size());
+            undo_marks_.resize(committed_.cache.size());
+            desired_generation_.store(committed_.plan.generation, std::memory_order_release);
+            if (committed_.plan.mode == ExploreMode::Gallery) Prioritize(committed_.plan.focused_image);
+        }
+        throw;
     }
-    prior_cumulative_ = committed_.cumulative_tiles;
-    prior_reused_ = committed_.reused_tiles;
-    if (change == ExploreOutputChange::Semantic && ++undo_sequence_ == 0U) {
-        std::ranges::fill(undo_marks_, 0U);
-        ++undo_sequence_;
-    }
-    publication_active_ = true;
 }
 
 void GalleryStream::Impl::CommitOutputPublication() noexcept {
     if (!publication_active_) return;
+    atlas_.Commit();
     if (publication_change_ == ExploreOutputChange::Initialize) {
         State().cache.CommitUpdate();
         borrowed_cache_ = false;
@@ -886,8 +929,8 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
         std::ranges::fill(scheduled_slots_, 0U);
         for (auto& lane : lanes_)
             lane->reserved_generation = 0U;
-        for (auto& lane : lanes_)
-            ReconcileInitializationLane(*lane);
+        if (committed_.plan.mode == ExploreMode::Gallery)
+            for (auto& lane : lanes_) ReconcileInitializationLane(*lane);
     } else if (publication_change_ == ExploreOutputChange::Unchanged) {
         const bool focus_changed = committed_.plan.focused_image != pending_plan_.focused_image ||
             committed_.plan.scroll_direction != pending_plan_.scroll_direction;
@@ -901,19 +944,20 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
         desired_generation_.store(pending_plan_.generation, std::memory_order_release);
         {
             std::scoped_lock lock(lanes_mutex_);
-            for (auto& lane : lanes_) {
+            if (committed_.plan.mode == ExploreMode::Gallery) for (auto& lane : lanes_) {
                 if (lane->state == LaneState::InputReady) RebindInput(*lane);
                 else if (lane->state == LaneState::Queued || lane->state == LaneState::Reading ||
                          lane->state == LaneState::AwaitingTransfer || lane->state == LaneState::GpuPending)
                     static_cast<void>(ReserveInput(*lane));
             }
         }
-        if (focus_changed && committed_.plan.mode == ExploreMode::Gallery)
+        if ((focus_changed || mode_switched_) && committed_.plan.mode == ExploreMode::Gallery)
             Prioritize(pending_plan_.focused_image);
         else
             next_priority_ = 0U;
     }
     publication_active_ = false;
+    mode_switched_ = false;
     ClearUndo();
     ClearInactiveProduct();
 }
@@ -921,6 +965,7 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
 bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
     if (rollback_failed_) return false;
     if (!publication_active_) return true;
+    atlas_.Rollback();
     try {
         if (publication_change_ != ExploreOutputChange::Unchanged) Suspend();
         if (publication_change_ == ExploreOutputChange::Semantic) {
@@ -933,6 +978,7 @@ bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
             }
             committed_.cumulative_tiles = prior_cumulative_;
             committed_.reused_tiles = prior_reused_;
+            committed_.atlas = prior_atlas_;
             if (overlay_undo_) {
                 std::swap(committed_.plan, candidate_.plan);
                 std::swap(committed_.active_classes, candidate_.active_classes);
@@ -944,10 +990,16 @@ bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
             borrowed_cache_ = false;
         }
         publication_active_ = false;
+        const bool restored_mode = mode_switched_;
+        if (restored_mode) {
+            std::swap(committed_, retained_);
+            selected_mode_ = committed_.plan.mode;
+            mode_switched_ = false;
+        }
         // Initialization may have shrunk these logical dimensions. Their
         // high-water capacity already includes the incumbent ring; restore
         // them before any callback can request automatic continuation.
-        if (publication_change_ == ExploreOutputChange::Initialize) {
+        if (publication_change_ == ExploreOutputChange::Initialize || restored_mode) {
             scheduled_slots_.resize(committed_.cache.size());
             undo_marks_.resize(committed_.cache.size());
             stream_ = incumbent_stream_;
@@ -955,12 +1007,14 @@ bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
         next_priority_ = 0U;
         if (publication_change_ != ExploreOutputChange::Unchanged) std::ranges::fill(scheduled_slots_, 0U);
         desired_generation_.store(State().plan.generation, std::memory_order_release);
-        if (publication_change_ != ExploreOutputChange::Unchanged) {
+        if ((publication_change_ != ExploreOutputChange::Unchanged || restored_mode) && State().plan.mode == ExploreMode::Gallery) {
             std::scoped_lock lock(lanes_mutex_);
             for (auto& lane : lanes_)
                 if (lane->state == LaneState::InputReady) RebindInput(*lane);
         }
-        if (publication_change_ == ExploreOutputChange::Initialize || overlay_undo_) Prioritize(State().plan.focused_image);
+        if ((publication_change_ == ExploreOutputChange::Initialize || overlay_undo_ || restored_mode) &&
+            State().plan.mode == ExploreMode::Gallery)
+            Prioritize(State().plan.focused_image);
         std::shared_ptr<const ExploreAlgorithm::GalleryReadySink> sink;
         {
             std::scoped_lock lock(lanes_mutex_);
@@ -1395,6 +1449,7 @@ ExploreGalleryPublication GalleryStream::Impl::PublicationFacts(const std::size_
     }
     return {
         .generation = desired_generation_.load(std::memory_order_acquire),
+        .layout = State().atlas,
         .ready_slots = State().completed_slots,
         .cumulative_tiles = State().cumulative_tiles,
         .remaining_tiles = State().visible_indices.size() - std::min(State().visible_indices.size(), State().cumulative_tiles),
@@ -1416,9 +1471,9 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
     staging_bytes += detail_lane_->pinned.capacity_bytes() + image_stream_.host_storage(detail_lane_->index).capacity_bytes();
     // Both logical products and the active journal retain meaning. Count their
     // shared pointees once, including protected incumbent versions.
-    std::array<std::shared_ptr<const GalleryTileMeaning>, 4U * kExploreVisibleItemCapacity + kExploreMaximumParallelism + 3U> meanings;
+    std::array<std::shared_ptr<const GalleryTileMeaning>, 10U * kExploreVisibleItemCapacity + kExploreMaximumParallelism + 4U> meanings;
     std::size_t meaning_count = 0U;
-    for (const auto* product : {&committed_, &candidate_}) {
+    for (const auto* product : {&committed_, &candidate_, &retained_}) {
         meanings[meaning_count++] = product->detail_meaning;
         for (const auto& meaning : product->tile_meanings)
             meanings[meaning_count++] = meaning;
@@ -1430,7 +1485,9 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
         meanings[meaning_count++] = slot_undo_[index].entry.meaning;
         meanings[meaning_count++] = slot_undo_[index].meaning;
     }
-    auto host_bytes = committed_.cache.MeaningBytes(&candidate_.cache, std::span{meanings}.first(meaning_count));
+    meaning_count += atlas_.AppendMeanings(std::span{meanings}.subspan(meaning_count));
+    const auto& gallery_cache = selected_mode_ == ExploreMode::Gallery ? committed_.cache : retained_.cache;
+    auto host_bytes = gallery_cache.MeaningBytes(&candidate_.cache, std::span{meanings}.first(meaning_count));
     const auto vector_bytes = [](const auto& values) {
         return values.capacity() * sizeof(typename std::remove_cvref_t<decltype(values)>::value_type);
     };
@@ -1438,7 +1495,7 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
                   vector_bytes(batch_donor_slots_) + vector_bytes(scheduled_slots_) + vector_bytes(batch_indices_) +
                   vector_bytes(semantic_slots_) + vector_bytes(batch_keys_) + vector_bytes(batch_donors_) +
                   vector_bytes(projected_annotations_) + vector_bytes(priority_rank_) + vector_bytes(lanes_) + (lanes_.size() + 1U) * sizeof(Lane);
-    host_bytes += committed_.MetadataBytes() + candidate_.MetadataBytes();
+    host_bytes += committed_.MetadataBytes() + candidate_.MetadataBytes() + retained_.MetadataBytes() + atlas_.MetadataBytes();
     const auto augmentation_device = augmenter_ ? augmenter_->device_capacity_bytes() : 0U;
     const auto augmentation_pinned = augmenter_ ? augmenter_->pinned_capacity_bytes() : 0U;
     device_bytes += augmentation_device;
@@ -1457,7 +1514,7 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
             .descriptor_bytes = descriptor_bytes,
             .augmentation_device_bytes = augmentation_device,
             .augmentation_pinned_bytes = augmentation_pinned,
-            .cache_cards = State().cache.size()};
+            .cache_cards = std::max(State().cache.size(), retained_.cache.size())};
 }
 
 void GalleryStream::Impl::Prioritize(const std::optional<std::uint32_t> focused_image) {
@@ -1745,7 +1802,10 @@ void GalleryStream::Impl::PlaceTile(const mmltk::frameworks::gpu::ImagePlaneView
     const auto* entry = State().cache.Find(State().visible_indices[slot]);
     if (!entry) throw std::logic_error("Explore atlas placement requires a completed cache tile");
     const auto x = slot % State().viewport.columns * side;
-    const auto y = slot / State().viewport.columns * side;
+    const auto physical = atlas_.Physical(slot);
+    const auto y = static_cast<std::uint32_t>(physical / State().viewport.columns) * side;
+    const bool unchanged = atlas_.Contains(physical, entry->meaning, entry->semantic_identity);
+    const bool clean_unchanged = semantic_only || atlas_.ContainsClean(physical, entry->meaning);
     const auto copy = [&](const auto plane, const bool semantic_plane) {
         const auto cache = CachePlane(semantic_plane);
         const auto bank = semantic_plane ? entry->semantic_bank : entry->bank;
@@ -1755,25 +1815,29 @@ void GalleryStream::Impl::PlaceTile(const mmltk::frameworks::gpu::ImagePlaneView
             cache.descriptor.pitch_bytes, side * 4U, side, cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(stream)),
             "Explore cache tile placement failed");
     };
-    if (!semantic_only) copy(clean, false);
-    copy(semantic, true);
-    SaveSlot(position);
+    if (!unchanged) {
+        atlas_.Touch(physical);
+        if (!clean_unchanged) copy(clean, false);
+        copy(semantic, true);
+        atlas_.Stage(physical, entry->meaning, entry->semantic_identity);
+    }
+    if (State().tile_meanings[slot] != entry->meaning || !State().completed_slots[slot]) SaveSlot(position);
     State().tile_meanings[slot] = entry->meaning;
     if (!State().completed_slots[slot]) {
         State().completed_slots[slot] = true;
         ++State().cumulative_tiles;
     }
-    if (acceptance_ && diagnostics_.valid() && publication_change_ != ExploreOutputChange::Initialize)
+    if (!unchanged && acceptance_ && diagnostics_.valid() && publication_change_ != ExploreOutputChange::Initialize)
         diagnostics_.Emit([&] {
             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                 .operation = VisualDiagnosticOperation::AcceptanceSlotPatched, .generation = State().plan.generation,
                 .value = slot, .detail = State().visible_indices[slot]};
         });
-    diagnostics_.Emit([&] {
+    if (!unchanged) diagnostics_.Emit([&] {
         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
             .operation = VisualDiagnosticOperation::ExploreCacheTransfer, .device = device_, .generation = State().plan.generation,
-            .value = (semantic_only ? 1U : 2U) * static_cast<std::size_t>(side) * side * 4U,
-            .detail = slot, .context = {.condition = semantic_only}};
+            .value = (clean_unchanged ? 1U : 2U) * static_cast<std::size_t>(side) * side * 4U,
+            .detail = slot, .context = {.condition = clean_unchanged}};
     });
 }
 
@@ -1876,7 +1940,7 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
                 DiagnoseDescriptors(State().plan.generation, slot, descriptor.annotation_offset, meaning.annotations.size(),
                                     meaning.runs.size());
                 DiagnoseRendered(clean, target, stream, State().plan.generation, slot, State().visible_indices[slot], index,
-                                 slot % State().viewport.columns * side, slot / State().viewport.columns * side, side, side);
+                                 slot % State().viewport.columns * side, AtlasY(slot), side, side);
             }
         FlushProbes(stream);
     }
@@ -2086,6 +2150,10 @@ ExploreGalleryPublication GalleryStream::Impl::PublishTiles(const mmltk::framewo
                                                             const mmltk::frameworks::gpu::ImagePlaneView semantic,
                                                             const std::uintptr_t stream) {
     if (!publication_active_) throw std::logic_error("Explore tile output was not prepared");
+    SeedPlaceholders(State().active_classes, clean, semantic, stream);
+    for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot)
+        if (State().cache.Find(State().visible_indices[slot]))
+            PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
     return RenderReadyTiles(clean, semantic, stream, false);
 }
 
@@ -2114,6 +2182,9 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
     const std::span ready_lanes{ready.data(), ready_count};
     if (ready_lanes.empty()) return PublicationFacts(0U);
     if (!Current(generation)) return PublicationFacts(0U);
+    // Allocation-local placeholders may have used the shared descriptor/scratch
+    // storage earlier in this publication.
+    SettleDescriptors();
     auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     const auto pixel_bytes = ready_lanes.front()->layout.pixel_bytes;
     const auto* augmentation_plan = PrepareImages(ready_lanes, source_budget, cuda_stream);
@@ -2265,7 +2336,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
             const Lane* const lane = ready_lanes[card_index];
             DiagnoseRendered(clean, semantic, stream, generation, lane->destination_slot, lane->compiled_index, card_index,
                              lane->destination_slot % State().viewport.columns * card_extent,
-                             lane->destination_slot / State().viewport.columns * card_extent, card_extent, card_extent);
+                             AtlasY(lane->destination_slot), card_extent, card_extent);
         }
     }
     FlushProbes(stream);
@@ -2449,37 +2520,57 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
 void GalleryStream::Impl::SeedPlaceholders(const std::span<const explore::ExploreRenderClassDescriptor> classes,
                                            const mmltk::frameworks::gpu::ImagePlaneView clean,
                                            const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {
-    if (!current_demand_(State().plan.generation)) return;
-    Clear(clean, stream);
-    if (!current_demand_(State().plan.generation)) return;
-    Clear(semantic, stream);
-    if (State().visible_indices.empty()) return;
-    PrepareDescriptors(State().visible_indices.size(), 0U, 0U, classes.size(), State().visible_indices.size());
-    for (std::size_t card = 0U; card != descriptor_layout_.cards.count; ++card)
+    State().atlas = atlas_.Begin(clean, semantic, State().viewport, State().cache.identity());
+    const auto side = State().atlas.card_extent;
+    const auto columns = State().atlas.columns;
+    const auto cells = static_cast<std::size_t>(State().atlas.row_capacity) * columns;
+    auto& placeholders = semantic_slots_;
+    placeholders.clear();
+    for (std::size_t physical = 0U; physical < cells; ++physical) {
+        const auto row = (physical / columns + State().atlas.row_capacity - State().atlas.row_origin) % State().atlas.row_capacity;
+        const auto logical = row * columns + physical % columns;
+        const bool visible = row < State().atlas.row_count && logical < State().visible_indices.size();
+        if (visible && State().cache.Find(State().visible_indices[logical])) continue;
+        if (atlas_.Empty(physical, visible)) continue;
+        atlas_.Touch(physical);
+        if (visible) {
+            placeholders.push_back(static_cast<std::uint32_t>(physical));
+        } else {
+            const auto clear_cell = [&](auto plane) {
+                plane.data += physical / columns * side * plane.descriptor.pitch_bytes + physical % columns * side * 4U;
+                plane.descriptor.width = side;
+                plane.descriptor.height = side;
+                Clear(plane, stream);
+            };
+            clear_cell(clean);
+            clear_cell(semantic);
+            atlas_.Stage(physical);
+        }
+    }
+    if (placeholders.empty() || !Current(State().plan.generation)) return;
+    PrepareDescriptors(placeholders.size(), 0U, 0U, classes.size(), placeholders.size());
+    for (std::size_t index = 0U; index < placeholders.size(); ++index) {
         store_payload(storage_.buffers_.descriptors_.data(),
-                      descriptor_layout_.cards.offset + card * sizeof(explore::ExploreRenderCardDescriptor),
+                      descriptor_layout_.cards.offset + index * sizeof(explore::ExploreRenderCardDescriptor),
                       explore::ExploreRenderCardDescriptor{.placeholder = 1U});
-    store_payload(storage_.buffers_.descriptors_.data(), descriptor_layout_.classes.offset, classes);
-    const auto card_extent = explore_atlas_card_extent(State().viewport);
-    for (std::size_t slot = 0U; slot != descriptor_layout_.tiles.count; ++slot) {
-        const auto destination = static_cast<std::uint32_t>(slot);
+        const auto physical = placeholders[index];
         const explore::ExploreRenderTileDescriptor tile{
-            .card_index = destination,
-            .destination_x = destination % State().viewport.columns * card_extent,
-            .destination_y = destination / State().viewport.columns * card_extent,
-            .destination_width = card_extent,
-            .destination_height = card_extent,
-            .generation = {.viewport = desired_generation_.load(std::memory_order_acquire), .tile = ++next_tile_generation_},
+            .card_index = static_cast<std::uint32_t>(index),
+            .destination_x = physical % columns * side,
+            .destination_y = physical / columns * side,
+            .destination_width = side,
+            .destination_height = side,
+            .generation = {.viewport = State().plan.generation, .tile = ++next_tile_generation_},
             .placeholder = 1U,
         };
-        store_payload(storage_.buffers_.descriptors_.data(),
-                      descriptor_layout_.tiles.offset + slot * sizeof(explore::ExploreRenderTileDescriptor), tile);
+        store_payload(storage_.buffers_.descriptors_.data(), descriptor_layout_.tiles.offset + index * sizeof(tile), tile);
     }
-    auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    UploadDescriptors(cuda_stream, true);
-    static_cast<void>(RenderAtlasBatch(clean, semantic, stream, static_cast<std::uint32_t>(descriptor_layout_.tiles.count),
-                                      desired_generation_.load(std::memory_order_acquire), AtlasBatch::Placeholders));
+    store_payload(storage_.buffers_.descriptors_.data(), descriptor_layout_.classes.offset, classes);
+    UploadDescriptors(reinterpret_cast<cudaStream_t>(stream), true);
     descriptors_pending_ = true;
+    if (RenderAtlasBatch(clean, semantic, stream, static_cast<std::uint32_t>(placeholders.size()),
+                         State().plan.generation, AtlasBatch::Placeholders) == BatchSubmission::Complete)
+        for (const auto physical : placeholders) atlas_.Stage(physical, {}, 0U, true);
 }
 
 auto GalleryStream::Impl::RenderAtlasBatch(const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -3022,6 +3113,10 @@ void GalleryStream::Impl::ClearLogicalState() {
     ClearUndo();
     candidate_.Clear();
     committed_.Clear();
+    retained_.Clear();
+    atlas_.Clear();
+    selected_mode_ = ExploreMode::Gallery;
+    mode_switched_ = false;
     publication_active_ = false;
     desired_generation_.store(0U, std::memory_order_release);
     stale_discarded_.store(0U, std::memory_order_release);
@@ -3173,7 +3268,8 @@ ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, st
 }
 ExploreGalleryPublication GalleryStream::Advance() { return impl_->Advance(); }
 bool GalleryStream::HasReadyTiles() const { return impl_->HasReadyTiles(); }
-void GalleryStream::PrepareOutputPublication(ExploreOutputChange change) { impl_->PrepareOutputPublication(change); }
+void GalleryStream::PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept { impl_->PrepareDetailOutput(allocation); }
+void GalleryStream::PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) { impl_->PrepareOutputPublication(change, mode); }
 void GalleryStream::CommitOutputPublication() noexcept { impl_->CommitOutputPublication(); }
 bool GalleryStream::RollbackOutputPublication() noexcept { return impl_->RollbackOutputPublication(); }
 ExploreGalleryPublication GalleryStream::PublishTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,

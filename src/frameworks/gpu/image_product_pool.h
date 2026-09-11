@@ -68,6 +68,7 @@ class ImageProductPool final {
         Candidate& operator=(Candidate&&) noexcept;
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] std::uint64_t revision() const noexcept;
+        [[nodiscard]] std::array<ImageAllocation, 2U> allocations() const;
 
        private:
         Candidate(std::shared_ptr<Slot>, Product, ImagePlanePreservation) noexcept;
@@ -91,6 +92,9 @@ class ImageProductPool final {
     // emitting a spurious availability notification from a temporary Product.
     [[nodiscard]] Candidate TryAcquire(Product& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
+    // Writes only this candidate's existing storage. The callback receives
+    // exact post-growth allocation facts and initializes newly acquired regions.
+    void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
     void Select(const Product&);

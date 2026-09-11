@@ -665,8 +665,20 @@ pub(crate) enum Placement {
     GalleryGrid {
         columns: u32,
         rows: u32,
+        row_capacity: u32,
+        row_origin: u32,
         first_row: u32,
     },
+}
+
+impl Placement {
+    fn logical_extent(self, physical: (u32, u32)) -> (u32, u32) {
+        match self {
+            Self::GalleryGrid { columns, rows, .. } if columns != 0 =>
+                (physical.0, physical.0 / columns * rows),
+            _ => physical,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1013,7 +1025,7 @@ impl ViewportOwner {
             self.transform(),
         )?;
         let (content_x, content_y) =
-            inverse_content_point(geometry, point, surface.content_extent())?;
+            inverse_content_point(geometry, point, placement.logical_extent(surface.content_extent()))?;
         let [crop_x, crop_y, _, _] = surface.content_region();
         Some(SurfaceSample {
             width: bounds.width.max(1.0) as u32,
@@ -1083,12 +1095,14 @@ fn placement_geometry(
                 (bounds.width, bounds.width / aspect)
             }
         }
-        Placement::GalleryGrid { columns, rows, .. }
+        Placement::GalleryGrid { columns, rows, row_capacity, row_origin, .. }
             if columns != 0
                 && rows != 0
+                && rows <= row_capacity
+                && row_origin < row_capacity
                 && content.0 % columns == 0
-                && content.1 % rows == 0
-                && content.0 / columns == content.1 / rows =>
+                && content.1 % row_capacity == 0
+                && content.0 / columns == content.1 / row_capacity =>
         {
             (bounds.width, bounds.width / columns as f32 * rows as f32)
         }
@@ -1699,7 +1713,7 @@ impl SurfaceRenderer {
         let draw = self.draws.entry(control).or_insert_with(|| {
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("mmltk widget image geometry"),
-                size: 48,
+                size: 64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
@@ -1811,7 +1825,7 @@ impl SurfaceRenderer {
         });
         let geometry = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("mmltk presentation content geometry"),
-            size: 48,
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2573,6 +2587,7 @@ struct GeometryKey {
     grid: [u32; 2],
     gallery: u32,
     image_origin: [f32; 2],
+    atlas: [u32; 2],
 }
 
 fn geometry_key(
@@ -2600,11 +2615,15 @@ fn geometry_key(
         gallery,
         image_origin: placement_geometry(bounds, content, placement, transform)
             .map_or([0.0, 0.0], |g| [g.x, g.y]),
+        atlas: match placement {
+            Placement::GalleryGrid { row_capacity, row_origin, .. } => [row_capacity, row_origin],
+            Placement::Contain => [0, 0],
+        },
     }
 }
 
 fn write_content_geometry(queue: &wgpu::Queue, geometry: &wgpu::Buffer, key: GeometryKey) {
-    let mut bytes = [0_u8; 48];
+    let mut bytes = [0_u8; 64];
     bytes[..4].copy_from_slice(&key.uv_scale[0].to_ne_bytes());
     bytes[4..8].copy_from_slice(&key.uv_scale[1].to_ne_bytes());
     bytes[8..12].copy_from_slice(&key.draw_extent[0].to_ne_bytes());
@@ -2616,6 +2635,8 @@ fn write_content_geometry(queue: &wgpu::Queue, geometry: &wgpu::Buffer, key: Geo
     bytes[36..40].copy_from_slice(&key.uv_offset[1].to_ne_bytes());
     bytes[40..44].copy_from_slice(&key.image_origin[0].to_ne_bytes());
     bytes[44..48].copy_from_slice(&key.image_origin[1].to_ne_bytes());
+    bytes[48..52].copy_from_slice(&key.atlas[0].to_ne_bytes());
+    bytes[52..56].copy_from_slice(&key.atlas[1].to_ne_bytes());
     queue.write_buffer(geometry, 0, &bytes);
 }
 
@@ -2718,6 +2739,8 @@ struct Geometry {
     padding: u32,
     uv_offset: vec2<f32>,
     image_origin: vec2<f32>,
+    atlas: vec2<u32>,
+    reserved: vec2<u32>,
 };
 @group(0) @binding(2) var<uniform> geometry: Geometry;
 
@@ -2750,7 +2773,15 @@ fn fs_capture(input: Output) -> @location(0) vec4<f32> {
 fn fs_main(input: Output) -> @location(0) vec4<f32> {
     let image_uv = (input.position.xy - geometry.image_origin) / geometry.draw_extent;
     let half_texel = vec2<f32>(0.5) / vec2<f32>(textureDimensions(image));
-    let uv = clamp(geometry.uv_offset + image_uv * geometry.uv_scale,
+    var source_uv = image_uv;
+    if geometry.gallery != 0u && geometry.atlas.x != 0u {
+        // A visible range occupies at most two continuous physical row spans.
+        let edge = half_texel.y / geometry.uv_scale.y * f32(geometry.atlas.x) / f32(geometry.grid.y);
+        let logical_y = clamp(image_uv.y, edge, 1.0 - edge);
+        source_uv.y = fract((f32(geometry.atlas.y) + logical_y * f32(geometry.grid.y))
+                            / f32(geometry.atlas.x));
+    }
+    let uv = clamp(geometry.uv_offset + source_uv * geometry.uv_scale,
         geometry.uv_offset + half_texel, geometry.uv_offset + geometry.uv_scale - half_texel);
     let sampled = textureSample(image, image_sampler, uv);
     if geometry.gallery == 0u || geometry.grid.x == 0u || geometry.grid.y == 0u {
@@ -3649,6 +3680,8 @@ mod tests {
                 first_row: 0,
                 columns: 4,
                 rows: 3,
+                row_capacity: 3,
+                row_origin: 0,
             },
             ViewTransform {
                 zoom: 4.0,
@@ -3730,6 +3763,8 @@ mod tests {
                     first_row: 0,
                     columns: 4,
                     rows: 4,
+                    row_capacity: 4,
+                    row_origin: 0,
                 },
                 ViewTransform::FIT,
             )
@@ -3777,7 +3812,9 @@ mod tests {
                 Placement::GalleryGrid {
                     first_row: 0,
                     columns: 2,
-                    rows: 1
+                    rows: 1,
+                    row_capacity: 1,
+                    row_origin: 0,
                 },
                 ViewTransform::FIT
             )
@@ -3794,6 +3831,8 @@ mod tests {
         let placement = Placement::GalleryGrid {
             columns: 4,
             rows: 5,
+            row_capacity: 5,
+            row_origin: 0,
             first_row: 2,
         };
         for scale in [1.0, 1.5, 2.0] {
@@ -3848,6 +3887,30 @@ mod tests {
     }
 
     #[test]
+    fn circular_gallery_geometry_maps_two_source_spans_without_stretching_cells() {
+        let mut surface = surface_for_content_session(1);
+        surface.width = 400;
+        surface.height = 800;
+        surface.frame = Some(frame_ready(1, 41, 51, 400, 800));
+        let placement = Placement::GalleryGrid {
+            columns: 4, rows: 5, row_capacity: 8, row_origin: 7, first_row: 7,
+        };
+        let bounds = Rectangle { x: 0.0, y: -37.5, width: 600.0, height: 700.0 };
+        let geometry = placement_geometry(bounds, surface.content_extent(), placement, ViewTransform::FIT).unwrap();
+        assert_eq!(geometry.height, 750.0);
+        assert_eq!(placement.logical_extent(surface.content_extent()), (400, 500));
+        let key = geometry_key(surface, bounds, placement, ViewTransform::FIT);
+        assert_eq!(key.atlas, [8, 7]);
+        // One row before wrap, followed by four rows at the allocation start.
+        let source_rows: Vec<_> = (0..5).map(|row| (key.atlas[1] + row) % key.atlas[0]).collect();
+        assert_eq!(source_rows, [7, 0, 1, 2, 3]);
+        assert_eq!(
+            inverse_content_point(geometry, Point::new(150.0, 262.5), placement.logical_extent(surface.content_extent())),
+            Some((100, 200))
+        );
+    }
+
+    #[test]
     fn resize_changes_only_uniform_geometry_for_one_import_identity() {
         let surface = surface_for_content_session(1);
         let transform = ViewTransform::FIT;
@@ -3855,6 +3918,8 @@ mod tests {
             first_row: 0,
             columns: 4,
             rows: 3,
+            row_capacity: 3,
+            row_origin: 0,
         };
         let first = geometry_key(
             surface,

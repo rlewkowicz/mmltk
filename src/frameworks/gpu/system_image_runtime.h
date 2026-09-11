@@ -77,6 +77,7 @@ class SystemImageRuntime final {
                                                 ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] OutputCandidate TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
+    void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
     void SelectOutput(const CompletedOutput&);
     // Wake-only; never execute CUDA/product work from this notification.

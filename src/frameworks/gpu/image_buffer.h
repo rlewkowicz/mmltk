@@ -241,6 +241,7 @@ class ImageProductBuffer final {
     friend class BorrowedImageProductReadView;
     friend class ImageStream;
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
+    [[nodiscard]] std::array<ImageAllocation, 2U> Allocations() const;
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t,
                                                            bool preserve_clean = false,
                                                            ImagePlanePreservation = ImagePlanePreservation::All);

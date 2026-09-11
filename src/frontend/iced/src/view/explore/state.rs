@@ -146,21 +146,6 @@ impl GalleryGeometry {
         })
     }
 
-    fn from_viewport(viewport: crate::generated::ExploreViewport) -> Self {
-        let columns = viewport.columns.max(1);
-        let card_extent = (viewport.extent.width / columns)
-            .min(viewport.extent.height / viewport.rowcount.max(1))
-            .max(1);
-        Self {
-            viewport,
-            card_extent,
-        }
-    }
-
-    pub(crate) fn viewport(&self) -> &crate::generated::ExploreViewport {
-        &self.viewport
-    }
-
     fn compiled_index_at(
         &self,
         content_x: u32,
@@ -547,20 +532,21 @@ fn selected_at(
 ) -> Option<u32> {
     let snapshot = snapshot?;
     if snapshot.mode != crate::generated::ExploreMode::Gallery
-        || snapshot.viewport.columns == 0
-        || snapshot.viewport.rowcount == 0
+        || snapshot.gallery.layout.columns == 0
+        || snapshot.gallery.layout.cardextent == 0
+        || snapshot.gallery.layout.rowcount == 0
     {
         return None;
     }
-    GalleryGeometry::from_viewport(crate::generated::ExploreViewport {
-        extent: snapshot.frame.extent.clone(),
-        ..snapshot.viewport.clone()
-    })
-    .compiled_index_at(
-        sample.content_x,
-        sample.content_y,
-        &snapshot.order.visibleindices,
-    )
+    let layout = &snapshot.gallery.layout;
+    let column = sample.content_x / layout.cardextent;
+    let row = sample.content_y / layout.cardextent;
+    if column >= layout.columns || row >= layout.rowcount {
+        return None;
+    }
+    let slot = row.checked_mul(layout.columns)?.checked_add(column)? as usize;
+    snapshot.gallery.slots.get(slot).copied().filter(|ready| *ready)?;
+    snapshot.order.visibleindices.get(slot).copied()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1102,6 +1088,8 @@ mod tests {
         snapshot.viewport.rowcount = 2;
         snapshot.frame.extent = snapshot.viewport.extent.clone();
         snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
+        snapshot.gallery.slots = vec![true; 8];
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
         let mut gesture = crate::presentation_surface::SurfaceGesture {
             kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
             sample: crate::presentation_surface::SurfaceSample {
@@ -1159,6 +1147,31 @@ mod tests {
             None
         );
         assert_eq!(state.gallery_gesture(Some(&snapshot), None, gesture), None);
+    }
+
+    #[test]
+    fn circular_gallery_hits_use_logical_cells_and_completed_identity() {
+        let mut snapshot = explore_snapshot();
+        snapshot.mode = crate::generated::ExploreMode::Gallery;
+        snapshot.viewport.columns = 4;
+        snapshot.viewport.rowcount = 5;
+        snapshot.viewport.firstrow = 7;
+        snapshot.viewport.extent = VisualExtent { width: 400, height: 500 };
+        snapshot.frame.extent = VisualExtent { width: 400, height: 800 };
+        snapshot.order.visibleindices = (28..47).collect();
+        snapshot.gallery.slots = vec![true; 19];
+        snapshot.gallery.slots[8] = false;
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
+        snapshot.gallery.layout.roworigin = 7;
+        let sample = |x, y| crate::presentation_surface::SurfaceSample {
+            width: 400, height: 500, x, y, content_x: x, content_y: y, pressed: true,
+        };
+        assert_eq!(selected_at(Some(&snapshot), sample(5, 5)), Some(28));
+        assert_eq!(selected_at(Some(&snapshot), sample(5, 105)), Some(32));
+        assert_eq!(selected_at(Some(&snapshot), sample(5, 205)), None);
+        assert_eq!(selected_at(Some(&snapshot), sample(205, 405)), Some(46));
+        assert_eq!(selected_at(Some(&snapshot), sample(305, 405)), None);
+        assert_eq!(selected_at(Some(&snapshot), sample(5, 505)), None);
     }
 
     #[test]

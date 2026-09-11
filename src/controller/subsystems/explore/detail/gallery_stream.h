@@ -19,6 +19,7 @@ namespace mmltk::controller::explore_detail {
 struct GalleryProductState final {
     std::shared_ptr<const mmltk::backend::data::CompiledDataset> store;
     ExploreViewport viewport{};
+    ExploreAtlasLayout atlas{};
     ExploreRenderPlan plan{};
     std::shared_ptr<const VisualDocument> document;
     std::shared_ptr<const GalleryTileMeaning> detail_meaning;
@@ -67,7 +68,8 @@ class GalleryStream final {
         mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     [[nodiscard]] ExploreGalleryPublication Advance();
     [[nodiscard]] bool HasReadyTiles() const;
-    void PrepareOutputPublication(ExploreOutputChange);
+    void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept;
+    void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery);
     void CommitOutputPublication() noexcept;
     [[nodiscard]] bool RollbackOutputPublication() noexcept;
     [[nodiscard]] ExploreGalleryPublication PublishTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,

@@ -374,6 +374,8 @@ fn gallery_viewport<'a>(
                         first_row,
                         columns: presented_grid.0,
                         rows: presented_grid.1,
+                        row_capacity: presented_grid.1,
+                        row_origin: 0,
                     },
                     control_id: super::GALLERY_WORKSPACE_ID,
                 },
@@ -701,6 +703,8 @@ mod tests {
             height: 200,
         };
         snapshot.frame.extent = snapshot.viewport.extent.clone();
+        snapshot.gallery.slots = vec![true; snapshot.order.visibleindices.len()];
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
         let mut state = state::State::default();
         assert!(state.measure_gallery(
             400.0,

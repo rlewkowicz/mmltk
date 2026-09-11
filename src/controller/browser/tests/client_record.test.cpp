@@ -116,7 +116,7 @@ struct FixtureApplicationSystems final {
 };
 
 [[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
-    std::ifstream input(MMLTK_PROTOCOL_V14_CLIENT_FIXTURE_PATH);
+    std::ifstream input(MMLTK_PROTOCOL_V15_CLIENT_FIXTURE_PATH);
     REQUIRE(input.good());
     const auto nibble = [](const char value) -> unsigned char {
         if (value >= '0' && value <= '9') return static_cast<unsigned char>(value - '0');
@@ -196,8 +196,8 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
 
-TEST_CASE("Rust Protocol-14 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
-    STATIC_REQUIRE(kBrowserProtocolVersion == 14U);
+TEST_CASE("Rust Protocol-15 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
+    STATIC_REQUIRE(kBrowserProtocolVersion == 15U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
     REQUIRE(fixtures.size() == 7U + annotation_alternatives);
@@ -517,7 +517,7 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
     REQUIRE(accepted.result);
 }
 
-TEST_CASE("Bootstrap uses the compact protocol-14 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
+TEST_CASE("Bootstrap uses the compact protocol-15 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
     STATIC_REQUIRE(kMaxRecordWireBytes >=
                    mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);

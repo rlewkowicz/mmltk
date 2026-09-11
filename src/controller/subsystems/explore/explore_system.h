@@ -130,8 +130,18 @@ struct ExploreAugmentationUpdate final {
 struct ExploreDetailUpdate final {
     bool show_original_dimensions = false;
 };
+struct ExploreAtlasLayout final {
+    std::uint32_t first_row = 0U;
+    std::uint32_t row_count = 0U;
+    std::uint32_t row_capacity = 0U;
+    std::uint32_t row_origin = 0U;
+    std::uint32_t columns = 0U;
+    std::uint32_t card_extent = 0U;
+    bool operator==(const ExploreAtlasLayout&) const = default;
+};
 struct ExploreGalleryReadiness final {
     std::uint64_t generation = 0U;
+    ExploreAtlasLayout layout{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<bool> slots{};
 };
 struct ExploreSnapshot final {
@@ -189,6 +199,7 @@ struct ExploreOrderCandidate final {
 };
 struct ExploreGalleryPublication final {
     std::uint64_t generation = 0U;
+    ExploreAtlasLayout layout{};
     std::vector<bool> ready_slots{};
     std::size_t cumulative_tiles = 0U;
     std::size_t reused_tiles = 0U;
@@ -270,7 +281,8 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     // Logical candidate meaning follows the prepared GPU output. Commit this
     // publication before committing its order; discard an order only after
     // checked rollback. False means physical completion requires retirement.
-    virtual void PrepareOutputPublication(ExploreOutputChange) = 0;
+    virtual void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept = 0;
+    virtual void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery) = 0;
     virtual void CommitOutputPublication() noexcept = 0;
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
