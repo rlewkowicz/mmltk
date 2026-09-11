@@ -151,7 +151,8 @@ bool VisualRuntimeOwner::SubmitLatest(Work work) {
     worker_.Wake();
     return true;
 }
-void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available) {
+void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dispatched, const bool wake_on_output_available,
+                                              const ContinuationCancellation cancellation) {
     if (!work) throw std::invalid_argument("visual continuation work is empty");
     std::scoped_lock lock(mutex_);
     if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ || (wake_on_output_available && runtime_))
@@ -162,6 +163,7 @@ void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dis
     }
     continuation_ = std::move(work);
     continuation_dispatched_ = std::move(dispatched);
+    continuation_cancellation_ = cancellation;
     continuation_state_.store(kContinuationEnabled, std::memory_order_release);
 }
 bool VisualRuntimeOwner::NotifyContinuation() noexcept {
@@ -341,7 +343,8 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_outcome_ = ActiveOutcome::Running;
         active_discrete_ = discrete;
         active_preserves_input_ =
-            (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) || (continuation_work && output_wake_);
+            (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
+            (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
         operation_stop = active_stop_.get_token();
     }
     Observe(ActivityStage::WorkSelected, ordered_work ? 1U : (latest_work ? 2U : (continuation_work ? 3U : 0U)));
@@ -357,7 +360,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
                     runtime && !worker_stop.stop_requested() && !operation_stop.stop_requested())
                     notification = ordered_work->run(*runtime, operation_stop);
                 const bool completed = TryCompleteActiveWork();
-                const bool promote = completed && replacement_ && replacement_->Completed().valid();
+                const bool promote = completed && replacement_ && replacement_->OutputFacts().revision != 0U;
                 if (!completed) notification = std::move(ordered_work->cancellation);
                 Observe(ActivityStage::StagedCompletionLatched, completed ? 1U : 0U);
                 if (auto failure = replacement.Finish(promote)) {
@@ -495,6 +498,7 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
 
 VisualRuntimeOwner::StagedReplacement::StagedReplacement(VisualRuntimeOwner& owner) : owner_(&owner) {
     if (owner.replacement_active_) throw std::logic_error("visual runtime replacement is already active");
+    owner.SetOutputRetry(false);
     owner.replacement_active_ = true;
 }
 VisualRuntimeOwner::StagedReplacement::~StagedReplacement() {
@@ -508,6 +512,7 @@ std::exception_ptr VisualRuntimeOwner::StagedReplacement::Finish(bool promote) n
     return std::exchange(owner_, nullptr)->FinishRuntimeReplacement(promote);
 }
 std::exception_ptr VisualRuntimeOwner::FinishRuntimeReplacement(bool promote) noexcept {
+    SetOutputRetry(false);
     std::unique_ptr<Runtime> retired;
     {
         std::scoped_lock lock(mutex_);

@@ -33,6 +33,7 @@
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -2038,19 +2039,51 @@ class EventGate final {
     std::uint64_t revision_ = 0U;
 };
 
+struct ExplorePressureProbe final {
+    EventGate events;
+    std::atomic_size_t attempts{0U};
+    std::atomic_size_t idle_attempts{0U};
+    std::atomic_bool fail_render{false};
+    std::atomic_size_t runtimes{0U};
+    std::shared_ptr<ExplorePostRenderGate> render_gate;
+    std::atomic_bool semantic_detail{false};
+
+    [[nodiscard]] VisualDiagnosticSink sink() noexcept {
+        return {.context = this, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+            auto& probe = *static_cast<ExplorePressureProbe*>(context);
+            if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted &&
+                fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) &&
+                fact.value == 0U) {
+                probe.idle_attempts.store(probe.attempts.load(std::memory_order_acquire), std::memory_order_release);
+                probe.events.Advance();
+            }
+        }};
+    }
+    void WaitIdle(const std::size_t expected) {
+        REQUIRE(events.Wait([&] { return idle_attempts.load(std::memory_order_acquire) >= expected; }));
+        CHECK(attempts.load(std::memory_order_acquire) == expected);
+    }
+};
+
 class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
    public:
-    CapacityExploreAlgorithm(EventGate& attempts, std::atomic_size_t& count)
-        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U)), attempts_(attempts), count_(count) {}
-    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override {
-        count_.fetch_add(1U, std::memory_order_release);
-        attempts_.Advance();
-        return ExploreOutputChange::Initialize;
+    explicit CapacityExploreAlgorithm(ExplorePressureProbe& probe)
+        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, nullptr, probe.render_gate), probe_(probe) {}
+    ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate*) const override {
+        probe_.attempts.fetch_add(1U, std::memory_order_release);
+        probe_.events.Advance();
+        return probe_.semantic_detail && plan.mode == ExploreMode::Detail ? ExploreOutputChange::Semantic : ExploreOutputChange::Initialize;
+    }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
+                       mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
+                       const std::uintptr_t stream) override {
+        if (probe_.fail_render.exchange(false, std::memory_order_acq_rel))
+            throw std::runtime_error("Explore pending predecessor failed");
+        TestExploreAlgorithm::RenderProduct(plan, candidate, nproc, clean, semantic, stream);
     }
 
    private:
-    EventGate& attempts_;
-    std::atomic_size_t& count_;
+    ExplorePressureProbe& probe_;
 };
 
 class DiagnosticCapture final {
@@ -2167,18 +2200,20 @@ class ExploreScenario final {
     using ModelFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>()>;
     using Observer = std::function<void(ExploreSystem::event_type)>;
 
-    ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {})
+    ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {},
+                    VisualDiagnosticSink diagnostics = {})
         : ExploreScenario(settings, 2U,
                           RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                          model ? std::move(model) : DefaultModel(), 3U),
-                          std::move(observer)) {}
+                          std::move(observer), diagnostics) {}
 
-    ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {})
+    ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {},
+                    VisualDiagnosticSink diagnostics = {})
         : observer_(std::move(observer)),
           explore_(settings.system(), kDevice, nproc, std::move(runtime), [this](ExploreSystem::event_type event) {
               if (observer_) observer_(std::move(event));
               events_.Advance();
-          }) {}
+          }, diagnostics) {}
 
     [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
 
@@ -2259,56 +2294,266 @@ TEST_CASE("Explore announces the acquired detail allocation before framework pre
     CHECK(explore.snapshot().mode == ExploreMode::Gallery);
 }
 
-TEST_CASE("Explore retries only the newest desired product after held reads release output capacity") {
+class ExplorePressureFixture final {
+   public:
+    struct Observation final {
+        ExploreSnapshot snapshot;
+        std::size_t runtimes;
+        bool failed;
+    };
+    explicit ExplorePressureFixture(const bool gated_resume = false)
+        : probe{.render_gate = gated_resume ? std::make_shared<ExplorePostRenderGate>(3U) : nullptr},
+          scenario{settings, backend, [&] {
+                       probe.runtimes.fetch_add(1U, std::memory_order_release);
+                       return std::make_unique<CapacityExploreAlgorithm>(probe);
+                   }, [this](ExploreSystem::event_type event) {
+                       std::scoped_lock lock(observation_mutex);
+                       const bool failed = std::holds_alternative<ExploreFailed>(event);
+                       observations.push_back({std::visit([](auto& value) { return std::move(value.snapshot); }, event),
+                                               probe.runtimes.load(std::memory_order_acquire), failed});
+                   }, probe.sink()} {}
+    ~ExplorePressureFixture() {
+        if (probe.render_gate) mmltk::testsupport::release_test_promise(probe.render_gate->release);
+        static_cast<void>(scenario.system().Stop());
+        held = {};
+        scenario.system().Shutdown();
+    }
+    void HoldGalleryPool() {
+        auto& explore = scenario.system();
+        scenario.OpenAndWait(viewport);
+        held[0U] = explore.BorrowFrame();
+        for (std::uint32_t row = 1U; row != 3U; ++row) {
+            auto next = viewport;
+            next.first_row = row;
+            explore.UpdateViewport({.viewport = next});
+            REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport == next; }));
+            held[row] = explore.BorrowFrame();
+        }
+        probe.WaitIdle(3U);
+    }
+    void RequestViewport(const std::uint32_t row, const std::optional<std::uint32_t> focus = {}) {
+        auto next = viewport;
+        next.first_row = row;
+        const auto before = probe.attempts.load(std::memory_order_acquire);
+        scenario.system().UpdateViewport({.viewport = next, .focused_compiled_index = focus});
+        probe.WaitIdle(before + 1U);
+    }
+    [[nodiscard]] std::vector<Observation> Recorded() {
+        std::scoped_lock lock(observation_mutex);
+        return observations;
+    }
     LoadedSettings settings;
-    auto backend = std::make_shared<FakeImageBackend>();
-    EventGate attempts;
-    std::atomic_size_t count{0U};
-    ExploreScenario scenario{settings, backend, [&] { return std::make_unique<CapacityExploreAlgorithm>(attempts, count); }};
-    auto& explore = scenario.system();
+    std::shared_ptr<FakeImageBackend> backend = std::make_shared<FakeImageBackend>();
+    ExplorePressureProbe probe;
+    std::mutex observation_mutex;
+    std::vector<Observation> observations;
+    ExploreScenario scenario;
     const ExploreViewport viewport{.extent = {16U, 16U}};
-    scenario.OpenAndWait(viewport);
-    auto first = explore.BorrowFrame();
-    const auto move_to = [&](const std::uint32_t row) {
-        auto next = viewport;
-        next.first_row = row;
-        const auto prior = explore.snapshot().frame;
-        explore.UpdateViewport({.viewport = next});
-        REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport == next && explore.snapshot().frame != prior; }));
-    };
-    move_to(1U);
-    auto second = explore.BorrowFrame();
-    move_to(2U);
-    auto third = explore.BorrowFrame();
+    std::array<mmltk::frameworks::gpu::BorrowedImageProductReadView, 3U> held;
+};
+
+TEST_CASE("Explore retries only the newest desired product after held reads release output capacity") {
+    ExplorePressureFixture fixture;
+    fixture.HoldGalleryPool();
+    auto& explore = fixture.scenario.system();
     const auto held = explore.snapshot().frame;
-    const auto request = [&](const std::uint32_t row, const std::optional<std::uint32_t> focus) {
-        auto next = viewport;
-        next.first_row = row;
-        const auto before = count.load(std::memory_order_acquire);
-        explore.UpdateViewport({.viewport = next, .focused_compiled_index = focus});
-        REQUIRE(attempts.Wait([&] { return count.load(std::memory_order_acquire) > before; }));
-        CHECK(explore.snapshot().frame == held);
-    };
-    request(0U, {});
-    request(1U, {});
-    // Focus-only changes share the accepted viewport's generation.
-    request(1U, 1U);
-    first = {};
-    REQUIRE(scenario.Wait([&] {
+    fixture.RequestViewport(0U);
+    fixture.RequestViewport(1U);
+    const auto generation = explore.LastInteractionGeneration();
+    fixture.RequestViewport(1U, 1U);
+    CHECK(explore.LastInteractionGeneration() == generation);
+    CHECK(explore.snapshot().frame == held);
+    fixture.held[0U] = {};
+    REQUIRE(fixture.scenario.Wait([&] {
         const auto state = explore.snapshot();
         return state.frame != held && state.viewport.first_row == 1U && state.focused_image == 1U;
     }));
-    CHECK(second.valid());
-    CHECK(third.valid());
+    CHECK(fixture.held[1U].valid());
+    CHECK(fixture.held[2U].valid());
     CHECK_FALSE(explore.snapshot().busy);
     const auto retained = explore.snapshot();
     auto filter = retained.filter;
     filter.minimum_instances = 1U;
     CHECK(explore.UpdateFilter({.filter = filter, .overlay = retained.overlay}).busy);
-    CHECK_THROWS_AS(explore.UpdateViewport({.viewport = viewport}), contracts::BusyError);
+    CHECK_THROWS_AS(explore.UpdateViewport({.viewport = fixture.viewport}), contracts::BusyError);
     static_cast<void>(explore.Stop());
-    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
+    REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(explore.snapshot().frame == retained.frame);
+}
+
+TEST_CASE("Explore retains semantic detail baseline custody through an idle output wait") {
+    ExplorePressureFixture fixture;
+    auto& explore = fixture.scenario.system();
+    fixture.scenario.OpenAndWait(fixture.viewport);
+    fixture.held[0U] = explore.BorrowFrame();
+    static_cast<void>(explore.Select({.compiled_index = 0U}));
+    REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().mode == ExploreMode::Detail; }));
+    fixture.held[1U] = explore.BorrowFrame();
+    fixture.probe.WaitIdle(2U);
+    fixture.probe.semantic_detail = true;
+    auto overlay = explore.snapshot().overlay;
+    overlay.show_boxes = !overlay.show_boxes;
+    static_cast<void>(explore.UpdateOverlay(overlay));
+    REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().overlay == overlay; }));
+    fixture.held[2U] = explore.BorrowFrame();
+    fixture.probe.WaitIdle(3U);
+    const auto retained = explore.snapshot();
+    overlay.show_masks = !overlay.show_masks;
+    static_cast<void>(explore.UpdateOverlay(overlay));
+    fixture.probe.WaitIdle(4U);
+    CHECK(explore.snapshot().frame == retained.frame);
+    SECTION("actual release resumes the retained semantic request") {
+        static_cast<void>(explore.UpdateDetail({.show_original_dimensions = true}));
+        fixture.held[1U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().overlay == overlay; }));
+        CHECK(explore.snapshot().selected_image == retained.selected_image);
+        CHECK(explore.snapshot().mode == ExploreMode::Detail);
+        CHECK(explore.snapshot().detail.show_original_dimensions);
+        CHECK(fixture.settings.system().explore_settings_candidate().preferences.policy.overlay == overlay);
+        CHECK(fixture.settings.system().explore_settings_candidate().show_original_dimensions);
+    }
+    SECTION("newer navigation accumulates once while retaining pending settings") {
+        static_cast<void>(explore.Navigate({.direction = ExploreNavigation::Next}));
+        fixture.probe.WaitIdle(5U);
+        static_cast<void>(explore.Navigate({.direction = ExploreNavigation::Next}));
+        fixture.probe.WaitIdle(6U);
+        fixture.held[1U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().selected_image == 2U; }));
+        CHECK(explore.snapshot().overlay == overlay);
+        CHECK(fixture.settings.system().explore_settings_candidate().preferences.policy.overlay == overlay);
+    }
+    SECTION("Stop releases the pending baseline and leaves the completed detail selected") {
+        static_cast<void>(explore.Stop());
+        fixture.held = {};
+        explore.Shutdown();
+        CHECK(explore.snapshot().frame == retained.frame);
+        CHECK(explore.snapshot().overlay == retained.overlay);
+    }
+}
+
+TEST_CASE("Explore settles an accepted viewport before a discrete filter under output pressure") {
+    ExplorePressureFixture fixture;
+    fixture.HoldGalleryPool();
+    auto& explore = fixture.scenario.system();
+    const auto incumbent = explore.snapshot();
+    fixture.RequestViewport(0U, 0U);
+    auto policy = ExploreFilterUpdate{.filter = incumbent.filter, .overlay = incumbent.overlay};
+    policy.filter.minimum_instances = 1U;
+    policy.overlay.show_boxes = !policy.overlay.show_boxes;
+    CHECK(explore.UpdateFilter(policy).busy);
+    CHECK_THROWS_AS(explore.Reroll(), contracts::BusyError);
+    SECTION("separate releases settle predecessor, filter and a later viewport coherently") {
+        fixture.held[0U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().viewport.first_row == 0U; }));
+        const auto predecessor = explore.snapshot();
+        CHECK(predecessor.busy);
+        CHECK(predecessor.filter == incumbent.filter);
+        CHECK(predecessor.overlay == incumbent.overlay);
+        CHECK(predecessor.focused_image == 0U);
+        fixture.held[1U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().filter == policy.filter; }));
+        const auto filtered = explore.snapshot();
+        CHECK(filtered.frame != predecessor.frame);
+        CHECK(filtered.viewport.first_row == 0U);
+        CHECK(filtered.overlay == policy.overlay);
+        CHECK_FALSE(filtered.selected_image);
+        CHECK_FALSE(filtered.focused_image);
+        fixture.RequestViewport(1U, 1U);
+        const auto later = explore.snapshot();
+        CHECK(later.filter == policy.filter);
+        CHECK(later.overlay == policy.overlay);
+        CHECK(later.viewport.first_row == 1U);
+        CHECK(later.order.visible_indices == std::vector<std::uint32_t>{1U});
+        CHECK_FALSE(later.selected_image);
+        CHECK(later.focused_image == 1U);
+        const auto persisted = fixture.settings.system().explore_settings_candidate().preferences.policy;
+        CHECK(persisted.filter == policy.filter);
+        CHECK(persisted.overlay == policy.overlay);
+    }
+    SECTION("Stop while the predecessor waits cancels both accepted stages") {
+        static_cast<void>(explore.Stop());
+        fixture.held = {};
+        explore.Shutdown();
+        CHECK_FALSE(explore.snapshot().busy);
+        CHECK(explore.snapshot().frame == incumbent.frame);
+        CHECK(explore.snapshot().filter == incumbent.filter);
+    }
+    SECTION("Stop after the predecessor settles cancels only the waiting filter") {
+        fixture.held[0U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return explore.snapshot().viewport.first_row == 0U; }));
+        const auto predecessor = explore.snapshot();
+        fixture.probe.WaitIdle(5U);
+        static_cast<void>(explore.Stop());
+        fixture.held = {};
+        explore.Shutdown();
+        CHECK_FALSE(explore.snapshot().busy);
+        CHECK(explore.snapshot().frame == predecessor.frame);
+        CHECK(explore.snapshot().filter == incumbent.filter);
+    }
+    SECTION("ordinary predecessor failure settles before the admitted filter") {
+        fixture.probe.fail_render.store(true, std::memory_order_release);
+        fixture.held[0U] = {};
+        REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().filter == policy.filter; }));
+        CHECK(explore.snapshot().viewport == incumbent.viewport);
+        CHECK(explore.snapshot().overlay == policy.overlay);
+        const auto observations = fixture.Recorded();
+        const auto failed = std::ranges::find_if(observations, [](const auto& event) { return event.failed; });
+        REQUIRE(failed != observations.end());
+        CHECK(failed->snapshot.busy);
+        CHECK(failed->snapshot.frame == incumbent.frame);
+        CHECK(failed->snapshot.filter == incumbent.filter);
+        REQUIRE(std::next(failed) != observations.end());
+        CHECK(observations.back().snapshot.filter == policy.filter);
+        fixture.held[1U] = {};
+        fixture.RequestViewport(1U);
+        CHECK(explore.snapshot().viewport.first_row == 1U);
+        CHECK(explore.snapshot().filter == policy.filter);
+        CHECK(explore.snapshot().overlay == policy.overlay);
+    }
+}
+
+TEST_CASE("Explore settles a pending predecessor on the incumbent before reconstructing Open") {
+    ExplorePressureFixture fixture;
+    fixture.HoldGalleryPool();
+    auto& explore = fixture.scenario.system();
+    fixture.RequestViewport(0U, 0U);
+    const bool initial_h2d = fixture.settings.system().explore_settings_candidate().loading.h2d_dataloader;
+    contracts::SettingsUpdateRequest update;
+    update.updates.push_back({.path = "workflows.explore.h2d_dataloader",
+                              .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    static_cast<void>(fixture.settings.system().Update(std::move(update)));
+    CHECK(explore.Open({.viewport = fixture.viewport, .compiled_source = "/replacement"}).busy);
+    CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 1U);
+    fixture.held = {};
+    REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
+    const auto observations = fixture.Recorded();
+    const auto predecessor = std::ranges::find_if(observations, [](const auto& event) {
+        return event.snapshot.busy && event.snapshot.viewport.first_row == 0U;
+    });
+    REQUIRE(predecessor != observations.end());
+    CHECK(predecessor->runtimes == 1U);
+    CHECK(predecessor->snapshot.order.visible_indices == std::vector<std::uint32_t>{0U});
+    CHECK(predecessor->snapshot.focused_image == 0U);
+    CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 2U);
+    CHECK(explore.snapshot().frame != predecessor->snapshot.frame);
+    CHECK_FALSE(explore.snapshot().focused_image);
+}
+
+TEST_CASE("Stop cancels Explore work resumed by an output availability continuation") {
+    ExplorePressureFixture fixture{true};
+    fixture.HoldGalleryPool();
+    auto& explore = fixture.scenario.system();
+    const auto incumbent = explore.snapshot();
+    fixture.RequestViewport(0U);
+    fixture.held[0U] = {};
+    mmltk::testsupport::await_test_promise(fixture.probe.render_gate->entered, "resumed Explore render");
+    static_cast<void>(explore.Stop());
+    fixture.probe.render_gate->release.set_value();
+    fixture.held = {};
+    explore.Shutdown();
+    CHECK(explore.snapshot().frame == incumbent.frame);
+    CHECK(explore.snapshot().viewport == incumbent.viewport);
+    CHECK_FALSE(explore.snapshot().busy);
 }
 
 [[nodiscard]] auto settle_explore_on_exit(ExploreSystem& explore, std::promise<void>& release) {
@@ -7543,6 +7788,34 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     REQUIRE(retry_events.Wait([&] { return reserved.load(std::memory_order_acquire); }));
     retry_owner.StopAndWait();
     CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
+}
+
+TEST_CASE("visual continuation cancellation policy is independent of output availability registration") {
+    const bool output_wake = GENERATE(false, true);
+    const bool preserve_input = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    std::promise<void> entered;
+    std::promise<void> release_work;
+    const auto released = release_work.get_future().share();
+    std::promise<bool> cancelled;
+    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {}};
+    auto settle_owner = settle_visual_on_exit(owner, release_work);
+    owner.RegisterContinuation([&](auto&, const std::stop_token stop) {
+        entered.set_value();
+        released.wait();
+        const bool observed_stop = stop.stop_requested();
+        const bool completed = owner.TryCompleteActiveWork();
+        return detail::VisualRuntimeOwner::Notification{[&, observed_stop, completed] {
+            cancelled.set_value(observed_stop && !completed);
+        }};
+    }, {}, output_wake, preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput
+                                       : detail::VisualRuntimeOwner::ContinuationCancellation::Cancel);
+    REQUIRE(owner.NotifyContinuation());
+    mmltk::testsupport::await_test_promise(entered, "continuation entered");
+    static_cast<void>(owner.RequestActiveStop());
+    release_work.set_value();
+    CHECK(mmltk::testsupport::await_test_promise(cancelled, "continuation cancellation") == !preserve_input);
 }
 
 // CLEANUP-IGNORE: Borrow locking requires independent promises and runtime ownership from continuation draining.

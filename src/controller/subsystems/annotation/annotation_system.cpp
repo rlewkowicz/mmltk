@@ -46,7 +46,7 @@ class AnnotationSystem::Impl final {
                 RenderPending(runtime, stop, false);
                 return detail::VisualRuntimeOwner::Notification{};
             },
-            {}, true);
+            {}, true, detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput);
     }
 
     [[nodiscard]] AnnotationSnapshot Open(const AnnotationOpen request) {

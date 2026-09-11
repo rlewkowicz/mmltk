@@ -62,7 +62,9 @@ class VisualRuntimeOwner final {
     [[nodiscard]] bool NotifyOrderedDrain();
     [[nodiscard]] bool SubmitTerminalBarrier(Work);
     bool SubmitLatest(Work);
-    void RegisterContinuation(Work, DispatchObservation = {}, bool wake_on_output_available = false);
+    enum class ContinuationCancellation : std::uint8_t { Cancel, PreserveOrderedInput };
+    void RegisterContinuation(Work, DispatchObservation = {}, bool wake_on_output_available = false,
+                              ContinuationCancellation = ContinuationCancellation::Cancel);
     [[nodiscard]] bool NotifyContinuation() noexcept;
     // Arm before testing output writability; disarm clears only availability retries.
     void SetOutputRetry(bool armed) noexcept;
@@ -121,6 +123,7 @@ class VisualRuntimeOwner final {
     bool drain_queued_ = false;
     Work continuation_;
     DispatchObservation continuation_dispatched_;
+    ContinuationCancellation continuation_cancellation_ = ContinuationCancellation::Cancel;
     static constexpr std::uint8_t kContinuationEnabled = 1U;
     static constexpr std::uint8_t kContinuationPending = 2U;
     static constexpr std::uint8_t kOutputRetryPending = 4U;
