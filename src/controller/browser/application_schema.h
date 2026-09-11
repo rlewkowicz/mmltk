@@ -23,6 +23,7 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/gui_settings_states.h"
+#include "src/controller/contracts/integration_control.h"
 #include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/contracts/workflows.h"
 #include "src/controller/presentation/visual_system_types.h"
@@ -833,6 +834,20 @@ void append_value(FingerprintSink& sink, const Value& value) {
     }
 }
 
+template <class Kind>
+    requires std::is_enum_v<Kind>
+void append_integration_command_policy(FingerprintSink& sink) {
+    constexpr auto enumerators = std::define_static_array(std::meta::enumerators_of(^^Kind));
+    sink.append("integration-command-policy");
+    sink.append_number(enumerators.size());
+    template for (constexpr auto enumerator : enumerators) {
+        constexpr auto kind = std::meta::extract<Kind>(enumerator);
+        sink.append(std::meta::identifier_of(enumerator));
+        append_value(sink, kind);
+        append_value(sink, mmltk::controller::contracts::integration_command_direction<kind>());
+    }
+}
+
 inline void append_wire_value(FingerprintSink& sink, const mmltk::frameworks::serialization::wire::Value& value) {
     std::visit(
         [&](const auto& storage) {
@@ -1533,165 +1548,176 @@ struct ApplicationSchemaFingerprint final {
     constexpr bool operator==(const ApplicationSchemaFingerprint&) const noexcept = default;
 };
 
+namespace application_schema_detail {
+
 template <class Composition>
-[[nodiscard]] ApplicationSchemaFingerprint application_schema_fingerprint() {
-    static const ApplicationSchemaFingerprint fingerprint = [] {
-        application_schema_detail::FingerprintSink sink;
-        std::map<std::uint64_t, std::string> identities;
-        const auto reserve_identity = [&identities](const std::uint64_t identity, const std::string& source) {
-            if (identity == 0U) throw std::logic_error("application schema emitted a zero identity for " + source);
-            const auto [prior, inserted] = identities.emplace(identity, source);
-            if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
-        };
-        sink.append_number(kBrowserProtocolVersion);
-        sink.append("compact-positional-interactions");
-        application_schema_detail::append_type<ClientRecord>(sink);
-        application_schema_detail::append_type<ServerRecord>(sink);
-        sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
-        sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
-        sink.append("visual-source-projections");
-        application_schema_detail::append_type<VisualSourceObservation>(sink);
-        application_schema_detail::append_type<VisualCleanContentIdentity>(sink);
-        sink.append_number(ApplicationSchema<Composition>::VisualSourceCount());
-        for (const auto metadata : presentation_source_metadata) {
-            sink.append(mmltk::frameworks::reflection::enum_name(metadata.kind));
-            sink.append_number(metadata.session);
-        }
-        ApplicationSchema<Composition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-            sink.append_number(Cell::stable_id);
-            sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
-            Projection::relation::VisitMembers([&]<class Entry>() {
-                constexpr auto source =
-                    mmltk::frameworks::reflection::reflected_member_path<typename Projection::snapshot_type, Entry::source>();
-                constexpr auto destination =
-                    mmltk::frameworks::reflection::reflected_member_path<VisualSourceObservation, Entry::destination>();
-                sink.append(source.view());
-                sink.append(destination.view());
-            });
-        });
-        sink.append("visual-clean-content-relation");
-        VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
-            constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, Entry::source>();
+[[nodiscard]] FingerprintSink application_schema_sink() {
+    FingerprintSink sink;
+    std::map<std::uint64_t, std::string> identities;
+    const auto reserve_identity = [&identities](const std::uint64_t identity, const std::string& source) {
+        if (identity == 0U) throw std::logic_error("application schema emitted a zero identity for " + source);
+        const auto [prior, inserted] = identities.emplace(identity, source);
+        if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
+    };
+    sink.append_number(kBrowserProtocolVersion);
+    sink.append("compact-positional-interactions");
+    application_schema_detail::append_type<ClientRecord>(sink);
+    application_schema_detail::append_type<ServerRecord>(sink);
+    sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
+    sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
+    sink.append("visual-source-projections");
+    application_schema_detail::append_type<VisualSourceObservation>(sink);
+    application_schema_detail::append_type<VisualCleanContentIdentity>(sink);
+    sink.append_number(ApplicationSchema<Composition>::VisualSourceCount());
+    for (const auto metadata : presentation_source_metadata) {
+        sink.append(mmltk::frameworks::reflection::enum_name(metadata.kind));
+        sink.append_number(metadata.session);
+    }
+    ApplicationSchema<Composition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+        sink.append_number(Cell::stable_id);
+        sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
+        Projection::relation::VisitMembers([&]<class Entry>() {
+            constexpr auto source =
+                mmltk::frameworks::reflection::reflected_member_path<typename Projection::snapshot_type, Entry::source>();
             constexpr auto destination =
-                mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
+                mmltk::frameworks::reflection::reflected_member_path<VisualSourceObservation, Entry::destination>();
             sink.append(source.view());
             sink.append(destination.view());
         });
-        constexpr auto fallback_source =
-            mmltk::frameworks::reflection::reflected_member_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
-        constexpr auto fallback_destination =
-            mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity,
-                                                                 VisualCleanContentRelation::zero_fallback_destination>();
-        sink.append("zero-fallback");
-        sink.append(fallback_source.view());
-        sink.append(fallback_destination.view());
-        ApplicationSchema<Composition>::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
-            using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;
-            static_assert(!Signature::has_request, "snapshot method must not accept a request");
-            constexpr auto metadata =
-                application_schema_detail::annotation_value<Snapshot, mmltk::controller::contracts::reflection::Snapshot>();
-            static_assert(metadata.byte_budget != 0U, "snapshot requires a positive byte budget");
-            reserve_identity(SystemCell::stable_id, "system " + std::string(SystemCell::name));
-            sink.append("system");
-            sink.append(SystemCell::name);
-            sink.append_number(SystemCell::stable_id);
-            sink.append_number(metadata.byte_budget);
-            application_schema_detail::append_type<typename Signature::result_type>(sink);
-            const typename Signature::result_type default_snapshot{};
-            auto encoded = mmltk::frameworks::serialization::reflected_value(default_snapshot);
-            if (!encoded) throw std::logic_error("unsupported reflected snapshot default");
-            sink.append("snapshot-default");
-            sink.append_number(SystemCell::stable_id);
-            application_schema_detail::append_wire_value(sink, *encoded);
+    });
+    sink.append("visual-clean-content-relation");
+    VisualCleanContentRelation::VisitMembers([&]<class Entry>() {
+        constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<VisualFrame, Entry::source>();
+        constexpr auto destination =
+            mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity, Entry::destination>();
+        sink.append(source.view());
+        sink.append(destination.view());
+    });
+    constexpr auto fallback_source =
+        mmltk::frameworks::reflection::reflected_member_path<VisualFrame, VisualCleanContentRelation::zero_fallback_source>();
+    constexpr auto fallback_destination =
+        mmltk::frameworks::reflection::reflected_member_path<VisualCleanContentIdentity,
+                                                             VisualCleanContentRelation::zero_fallback_destination>();
+    sink.append("zero-fallback");
+    sink.append(fallback_source.view());
+    sink.append(fallback_destination.view());
+    ApplicationSchema<Composition>::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
+        using Signature = SystemMethodSignature<decltype(&[:Snapshot:])>;
+        static_assert(!Signature::has_request, "snapshot method must not accept a request");
+        constexpr auto metadata =
+            application_schema_detail::annotation_value<Snapshot, mmltk::controller::contracts::reflection::Snapshot>();
+        static_assert(metadata.byte_budget != 0U, "snapshot requires a positive byte budget");
+        reserve_identity(SystemCell::stable_id, "system " + std::string(SystemCell::name));
+        sink.append("system");
+        sink.append(SystemCell::name);
+        sink.append_number(SystemCell::stable_id);
+        sink.append_number(metadata.byte_budget);
+        application_schema_detail::append_type<typename Signature::result_type>(sink);
+        const typename Signature::result_type default_snapshot{};
+        auto encoded = mmltk::frameworks::serialization::reflected_value(default_snapshot);
+        if (!encoded) throw std::logic_error("unsupported reflected snapshot default");
+        sink.append("snapshot-default");
+        sink.append_number(SystemCell::stable_id);
+        application_schema_detail::append_wire_value(sink, *encoded);
+    });
+    ApplicationSchema<Composition>::VisitEndpoints([&]<class Endpoint>() {
+        const std::string endpoint_source = "endpoint " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name);
+        reserve_identity(Endpoint::stable_id, endpoint_source);
+        sink.append(Endpoint::interaction ? "interaction" : "intent");
+        if constexpr (Endpoint::interaction) sink.append_number(Endpoint::replaceable);
+        sink.append(Endpoint::system_cell::name);
+        sink.append(Endpoint::name);
+        sink.append_number(Endpoint::stable_id);
+        if constexpr (Endpoint::signature::has_request) {
+            ApplicationSchema<Composition>::template VisitRequestFields<Endpoint>(
+                [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
+                    reserve_identity(field.stable_id, endpoint_source + "." + std::string(field.name));
+                    application_schema_detail::append_request_field_fingerprint<Declaration>(sink, field);
+                });
+            ApplicationSchema<Composition>::template VisitRequestDefaults<Endpoint>(
+                [&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
+                    sink.append("request-default");
+                    sink.append_number(field.endpoint_id);
+                    sink.append_number(field.stable_id);
+                    sink.append(field.name);
+                    auto encoded = mmltk::frameworks::serialization::reflected_value(value);
+                    if (!encoded) throw std::logic_error("unsupported reflected request default");
+                    application_schema_detail::append_wire_value(sink, *encoded);
+                });
+            application_schema_detail::append_type<typename Endpoint::request_type>(sink);
+        }
+        if constexpr (!std::is_void_v<typename Endpoint::result_type>)
+            application_schema_detail::append_type<typename Endpoint::result_type>(sink);
+    });
+    ApplicationSchema<Composition>::VisitEvents(
+        [&]<class Identity, class Event>(const mmltk::controller::contracts::reflection::Event metadata) {
+            reserve_identity(Identity::event_id, "event " + std::string(Identity::system_cell::name) + "." +
+                                                     std::string(mmltk::frameworks::reflection::type_name<Event>()));
+            sink.append("event");
+            sink.append_number(Identity::system_id);
+            sink.append_number(Identity::event_id);
+            sink.append_number(static_cast<std::uint8_t>(metadata.delivery));
+            application_schema_detail::append_type<Event>(sink);
         });
-        ApplicationSchema<Composition>::VisitEndpoints([&]<class Endpoint>() {
-            const std::string endpoint_source = "endpoint " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name);
-            reserve_identity(Endpoint::stable_id, endpoint_source);
-            sink.append(Endpoint::interaction ? "interaction" : "intent");
-            if constexpr (Endpoint::interaction) sink.append_number(Endpoint::replaceable);
-            sink.append(Endpoint::system_cell::name);
-            sink.append(Endpoint::name);
-            sink.append_number(Endpoint::stable_id);
-            if constexpr (Endpoint::signature::has_request) {
-                ApplicationSchema<Composition>::template VisitRequestFields<Endpoint>(
-                    [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
-                        reserve_identity(field.stable_id, endpoint_source + "." + std::string(field.name));
-                        application_schema_detail::append_request_field_fingerprint<Declaration>(sink, field);
-                    });
-                ApplicationSchema<Composition>::template VisitRequestDefaults<Endpoint>(
-                    [&]<class Owner, class Declaration, class Member>(const ApplicationRequestFieldFact& field, const Member& value) {
-                        sink.append("request-default");
-                        sink.append_number(field.endpoint_id);
-                        sink.append_number(field.stable_id);
-                        sink.append(field.name);
-                        auto encoded = mmltk::frameworks::serialization::reflected_value(value);
-                        if (!encoded) throw std::logic_error("unsupported reflected request default");
-                        application_schema_detail::append_wire_value(sink, *encoded);
-                    });
-                application_schema_detail::append_type<typename Endpoint::request_type>(sink);
+    ApplicationSchema<Composition>::VisitApplicationSettingsLeaves(
+        [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+            reserve_identity(field.stable_id, "settings field " + std::string(field.path));
+            sink.append("settings-field");
+            sink.append(field.path);
+            sink.append_number(field.stable_id);
+            sink.append_number(field.mutable_leaf);
+            sink.append_number(field.workflows.count);
+            for (std::size_t index = 0U; index < field.workflows.count; ++index)
+                sink.append_number(static_cast<std::uint8_t>(field.workflows.workflows[index]));
+            application_schema_detail::append_constraint(sink, field.constraint);
+            sink.append_number(static_cast<std::uint8_t>(field.presentation));
+            sink.append(field.catalog_provider);
+            application_schema_detail::append_annotations<Declaration>(sink);
+            if (field.file_dialog) {
+                sink.append("file-dialog");
+                sink.append(field.file_dialog->title);
+                sink.append(field.file_dialog->filter);
+                sink.append(field.file_dialog->pattern);
+                sink.append_number(static_cast<std::uint8_t>(field.file_dialog->mode));
             }
-            if constexpr (!std::is_void_v<typename Endpoint::result_type>)
-                application_schema_detail::append_type<typename Endpoint::result_type>(sink);
         });
-        ApplicationSchema<Composition>::VisitEvents(
-            [&]<class Identity, class Event>(const mmltk::controller::contracts::reflection::Event metadata) {
-                reserve_identity(Identity::event_id, "event " + std::string(Identity::system_cell::name) + "." +
-                                                         std::string(mmltk::frameworks::reflection::type_name<Event>()));
-                sink.append("event");
-                sink.append_number(Identity::system_id);
-                sink.append_number(Identity::event_id);
-                sink.append_number(static_cast<std::uint8_t>(metadata.delivery));
-                application_schema_detail::append_type<Event>(sink);
-            });
-        ApplicationSchema<Composition>::VisitApplicationSettingsLeaves(
-            [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-                reserve_identity(field.stable_id, "settings field " + std::string(field.path));
-                sink.append("settings-field");
-                sink.append(field.path);
-                sink.append_number(field.stable_id);
-                sink.append_number(field.mutable_leaf);
-                sink.append_number(field.workflows.count);
-                for (std::size_t index = 0U; index < field.workflows.count; ++index)
-                    sink.append_number(static_cast<std::uint8_t>(field.workflows.workflows[index]));
-                application_schema_detail::append_constraint(sink, field.constraint);
-                sink.append_number(static_cast<std::uint8_t>(field.presentation));
-                sink.append(field.catalog_provider);
-                application_schema_detail::append_annotations<Declaration>(sink);
-                if (field.file_dialog) {
-                    sink.append("file-dialog");
-                    sink.append(field.file_dialog->title);
-                    sink.append(field.file_dialog->filter);
-                    sink.append(field.file_dialog->pattern);
-                    sink.append_number(static_cast<std::uint8_t>(field.file_dialog->mode));
-                }
-            });
-        ApplicationSchema<Composition>::VisitApplicationSettingsDefaults(
-            [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
-                sink.append("settings-default");
-                sink.append_number(fact.stable_id);
-                sink.append(fact.path);
-                application_schema_detail::append_value(sink, value);
-            });
-        ApplicationSchema<Composition>::VisitCatalogProviders(
-            [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
-                reserve_identity(provider.stable_id, "catalog provider " + std::string(provider.name));
-                sink.append("catalog-provider");
-                sink.append(provider.name);
-                sink.append(provider.identity);
-                sink.append(provider.row_type);
-                sink.append_number(provider.stable_id);
-                application_schema_detail::append_type<Row>(sink);
-                ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
-                    [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
-                        reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
-                        sink.append("catalog-row");
-                        sink.append_number(fact.provider_id);
-                        sink.append_number(fact.stable_id);
-                        sink.append(fact.key);
-                        sink.append_number(fact.index);
-                        application_schema_detail::append_value(sink, row);
-                    });
-            });
+    ApplicationSchema<Composition>::VisitApplicationSettingsDefaults(
+        [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
+            sink.append("settings-default");
+            sink.append_number(fact.stable_id);
+            sink.append(fact.path);
+            application_schema_detail::append_value(sink, value);
+        });
+    ApplicationSchema<Composition>::VisitCatalogProviders(
+        [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
+            reserve_identity(provider.stable_id, "catalog provider " + std::string(provider.name));
+            sink.append("catalog-provider");
+            sink.append(provider.name);
+            sink.append(provider.identity);
+            sink.append(provider.row_type);
+            sink.append_number(provider.stable_id);
+            application_schema_detail::append_type<Row>(sink);
+            ApplicationSchema<Composition>::template VisitCatalogRows<Provider>(
+                [&]<class ActualProvider, class ActualRow>(const ApplicationCatalogRowFact& fact, const ActualRow& row) {
+                    reserve_identity(fact.stable_id, "catalog row " + std::string(provider.name) + "." + std::string(fact.key));
+                    sink.append("catalog-row");
+                    sink.append_number(fact.provider_id);
+                    sink.append_number(fact.stable_id);
+                    sink.append(fact.key);
+                    sink.append_number(fact.index);
+                    application_schema_detail::append_value(sink, row);
+                });
+        });
+    return sink;
+}
+
+}  // namespace application_schema_detail
+
+template <class Composition>
+[[nodiscard]] ApplicationSchemaFingerprint application_schema_fingerprint() {
+    static const ApplicationSchemaFingerprint fingerprint = [] {
+        auto sink = application_schema_detail::application_schema_sink<Composition>();
+        application_schema_detail::append_integration_command_policy<mmltk::controller::contracts::IntegrationControlKind>(sink);
         return ApplicationSchemaFingerprint{sink.words()};
     }();
     return fingerprint;

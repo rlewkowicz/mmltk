@@ -33,12 +33,14 @@ enum class IntegrationControlKind : std::uint8_t {
     VisibleReadReleaseRequested [[= IntegrationCommandDirection{false, true, true}]],
 };
 
-template <IntegrationControlKind Kind>
+template <auto Kind>
+    requires std::is_enum_v<decltype(Kind)>
 [[nodiscard]] consteval IntegrationCommandDirection integration_command_direction() {
+    using KindType = decltype(Kind);
     IntegrationCommandDirection result{};
     std::size_t count = 0U;
-    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^IntegrationControlKind))) {
-        if constexpr (std::meta::extract<IntegrationControlKind>(enumerator) == Kind) {
+    template for (constexpr auto enumerator : std::define_static_array(std::meta::enumerators_of(^^KindType))) {
+        if constexpr (std::meta::extract<KindType>(enumerator) == Kind) {
             template for (constexpr auto annotation : std::define_static_array(std::meta::annotations_of(enumerator))) {
                 if constexpr (std::same_as<std::remove_cvref_t<typename[:std::meta::type_of(annotation):]>, IntegrationCommandDirection>) {
                     result = std::meta::extract<IntegrationCommandDirection>(annotation);
@@ -81,6 +83,7 @@ struct IntegrationControlReceipt final {
     return false;
 }
 
+MMLTK_REFLECT_FIELDS(IntegrationCommandDirection)
 MMLTK_REFLECT_ENUM(IntegrationControlKind)
 MMLTK_REFLECT_FIELDS(IntegrationControlReceipt)
 

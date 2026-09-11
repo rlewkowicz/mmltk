@@ -124,6 +124,28 @@ struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test
 namespace mmltk::controller::browser {
 namespace {
 
+enum class IntegrationPolicyBaseline : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+};
+enum class IntegrationPolicyUnchanged : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+};
+enum class IntegrationPolicyServer : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{true, false, false}]] = 7U,
+};
+enum class IntegrationPolicyReadGeneration : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{false, true, false}]] = 7U,
+};
+enum class IntegrationPolicyCompiledIndex : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{false, false, true}]] = 7U,
+};
+enum class IntegrationPolicyRenamed : std::uint8_t {
+    Renamed [[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
+};
+enum class IntegrationPolicyReassigned : std::uint8_t {
+    Command [[= contracts::IntegrationCommandDirection{false, false, false}]] = 8U,
+};
+
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::OrphanSettings>());
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::MultipleClaimSettings>());
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::InvalidDestinationSettings>());
@@ -862,6 +884,29 @@ TEST_CASE("protocol-15 fingerprint is deterministic and covers stable compositio
         return std::pair{leaves, defaults};
     };
     CHECK(settings_facts.template operator()<TestSettingsSystems>() == settings_facts.template operator()<ChangedTestSettingsSystems>());
+}
+
+TEST_CASE("application fingerprint includes canonical integration command identity and complete policy",
+          "[controller][browser][reflection]") {
+    const auto schema = application_schema_detail::application_schema_sink<TestSettingsSystems>();
+    const auto with_policy = [&]<class Kind>() {
+        auto sink = schema;
+        application_schema_detail::append_integration_command_policy<Kind>(sink);
+        return ApplicationSchemaFingerprint{sink.words()};
+    };
+    const auto baseline = with_policy.template operator()<IntegrationPolicyBaseline>();
+    CHECK(baseline == with_policy.template operator()<IntegrationPolicyBaseline>());
+    CHECK(baseline == with_policy.template operator()<IntegrationPolicyUnchanged>());
+    CHECK(baseline != with_policy.template operator()<IntegrationPolicyServer>());
+    CHECK(baseline != with_policy.template operator()<IntegrationPolicyReadGeneration>());
+    CHECK(baseline != with_policy.template operator()<IntegrationPolicyCompiledIndex>());
+    CHECK(baseline != with_policy.template operator()<IntegrationPolicyRenamed>());
+    CHECK(baseline != with_policy.template operator()<IntegrationPolicyReassigned>());
+
+    const auto canonical = with_policy.template operator()<contracts::IntegrationControlKind>();
+    const auto actual = application_schema_fingerprint<TestSettingsSystems>();
+    CHECK(actual == canonical);
+    CHECK(actual != ApplicationSchemaFingerprint{schema.words()});
 }
 
 TEST_CASE("static outer routing derives intent-only ownership from an endpoint-only composition",
