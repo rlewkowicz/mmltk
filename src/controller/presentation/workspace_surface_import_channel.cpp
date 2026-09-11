@@ -48,6 +48,18 @@ namespace mmltk::controller::presentation {
 
 using mmltk::common::io::ScopedFd;
 
+contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surface_import::Record& record) noexcept {
+    return {.workspace_source_high = record.id_high,
+            .workspace_source_low = record.id_low,
+            .workspace_allocation = record.allocation_identity,
+            .workspace_arena_high = record.arena_high,
+            .workspace_arena_low = record.arena_low,
+            .workspace_bytes = record.size,
+            .workspace_pitch = record.stride,
+            .workspace_width = record.width,
+            .workspace_height = record.height};
+}
+
 namespace {
 
 using workspace_surface_import::FailureCode;
@@ -171,7 +183,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
         std::uint32_t width = 0U;
         std::uint32_t height = 0U;
         bool arena = false;
-        std::uint64_t workspace_allocation = 0U;
     };
 
     struct PendingRecord {
@@ -280,9 +291,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
         seen.push_back(id);
         admitted.emplace_back(id, Admission{.generation = generation, .selection_generation = selection_generation,
                                             .frame_revision = frame_revision, .width = record.width, .height = record.height,
-                                            .arena = record.opcode == Opcode::Arena,
-                                            .workspace_allocation = record.allocation_identity});
-        EmitAdmission(id, VisualDiagnosticOperation::PresentationAdmissionEnqueued);
+                                            .arena = record.opcode == Opcode::Arena});
+        EmitAdmission(record, VisualDiagnosticOperation::PresentationAdmissionEnqueued);
         if (send(record, descriptors)) return true;
         erase_id(seen, id);
         erase_admission(id);
@@ -310,8 +320,9 @@ struct WorkspaceSurfaceImportChannel::Impl {
         return !terminal.has_value();
     }
 
-    void EmitAdmission(const WorkspaceSurfaceImportId id, const VisualDiagnosticOperation operation) {
+    void EmitAdmission(const Record& record, const VisualDiagnosticOperation operation) {
         diagnostics.Emit([&] {
+            const WorkspaceSurfaceImportId id{record.id_high, record.id_low};
             const auto found = find_admission(id);
             const auto& admission = found->second;
             return VisualDiagnosticFact{
@@ -329,9 +340,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                             .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
                             .outcome = 1U,
                             .allocation = {.allocation_generation = admission.generation},
-                            .workspace = {.workspace_source_high = admission.arena ? 0U : id.high,
-                                          .workspace_source_low = admission.arena ? 0U : id.low,
-                                          .workspace_allocation = admission.workspace_allocation}}};
+                            .workspace = admission.arena ? contracts::DiagnosticWorkspace{} : workspace_source_diagnostic(record)}};
         });
     }
 
@@ -378,7 +387,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     .low = outbound.record.id_low,
                 };
                 if (!contains(committed, id)) committed.push_back(id);
-                EmitAdmission(id, VisualDiagnosticOperation::PresentationAdmissionWritten);
+                EmitAdmission(outbound.record, VisualDiagnosticOperation::PresentationAdmissionWritten);
             }
             pending.erase(pending.begin());
         }

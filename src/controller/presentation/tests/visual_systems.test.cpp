@@ -7015,32 +7015,83 @@ TEST_CASE("Presentation forwards every private visual product to the simulated b
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
 
-TEST_CASE("Synchronous admission writes retain allocation and frame provenance") {
+TEST_CASE("Source admission writes retain complete packet and frame provenance", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
+    const bool deferred = GENERATE(false, true);
+    enum class Diagnostics { Absent, Disabled, Enabled };
+    const auto diagnostics = GENERATE(Diagnostics::Absent, Diagnostics::Disabled, Diagnostics::Enabled);
+    CAPTURE(deferred, static_cast<int>(diagnostics));
     mmltk::testsupport::ScopedTempDir root{"presentation-admission-diagnostics"};
     const auto path = root.path() / "import.sock";
     struct Capture final {
         std::array<VisualDiagnosticFact, 2> facts{};
         std::size_t count = 0U;
+        bool enabled = false;
     } capture;
-    presentation::WorkspaceSurfaceImportChannel channel{
-        path, {.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+    capture.enabled = diagnostics == Diagnostics::Enabled;
+    const VisualDiagnosticSink sink{
+        .context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
                    auto& value = *static_cast<Capture*>(context);
-                   if (value.count < value.facts.size()) value.facts[value.count++] = fact;
-               }}};
+                   if (value.count < value.facts.size()) value.facts[value.count] = fact;
+                   ++value.count;
+               },
+        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled; }};
+    presentation::WorkspaceSurfaceImportChannel channel{
+        path, diagnostics == Diagnostics::Absent ? VisualDiagnosticSink{} : sink};
     auto peer = mmltk::testsupport::connect_workspace_surface_shell(path);
     channel.pump();
     REQUIRE(channel.connected());
-    mmltk::common::io::ScopedFd memory{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
-    mmltk::common::io::ScopedFd edge{::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)};
+    std::size_t queued_fillers = 0U;
+    const abi::Record filler{.opcode = abi::Opcode::Drop, .id_high = 101U, .id_low = 102U};
+    if (deferred) {
+        const int send_bytes = 4096;
+        REQUIRE(::setsockopt(channel.poll_fd(), SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0);
+        // Fill the real outbound socket before admitting the source. The bounded
+        // loop stops on EAGAIN; no sleeps or assumed kernel queue length.
+        while (queued_fillers < 256U && send_workspace_record(channel.poll_fd(), filler)) ++queued_fillers;
+        REQUIRE(queued_fillers > 0U);
+        REQUIRE(queued_fillers < 256U);
+    }
+    auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
+    auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     const presentation::WorkspaceSurfaceImportId id{11U, 12U};
-    presentation::detail::workspace_surface_import::Record record{
-        .id_high = id.high, .id_low = id.low, .width = 64U, .height = 32U, .stride = 256U, .size = 8192U,
+    abi::Record record{
+        .id_high = id.high, .id_low = id.low, .width = 64U, .height = 32U, .stride = 512U, .size = 32768U,
+        .descriptors = abi::kImportDescriptorCount,
         .arena_high = 1U, .arena_low = 2U, .allocation_identity = 3U, .device_incarnation = 4U,
-        .alignment = 256U, .device_uuid = {1U}, .memory_type_bits = 1U};
+        .offset = 256U, .alignment = 256U, .device_uuid = {1U}, .memory_type_bits = 1U};
+    const auto admitted = record;
     REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
-    CHECK(channel.claimable(id));
-    REQUIRE(capture.count == 2U);
+    CHECK(channel.claimable(id) == !deferred);
+    CHECK(channel.wants_write() == deferred);
+    REQUIRE(capture.count == (capture.enabled ? (deferred ? 1U : 2U) : 0U));
+    record = {};
+    if (deferred) {
+        for (std::size_t index = 0U; index < queued_fillers; ++index) {
+            abi::Record received{};
+            CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
+            CHECK(received.opcode == filler.opcode);
+            CHECK(received.id_high == filler.id_high);
+            CHECK(received.id_low == filler.id_low);
+        }
+        channel.pump();
+    }
+    REQUIRE(channel.claimable(id));
+    CHECK_FALSE(channel.wants_write());
+    CHECK_FALSE(channel.terminal_error());
+    abi::Record sent{};
+    const auto descriptors = receive_workspace_record(peer.get(), sent);
+    REQUIRE(descriptors.descriptor_count == abi::kImportDescriptorCount);
+    for (std::size_t index = 0U; index < descriptors.descriptor_count; ++index)
+        CHECK(::fcntl(descriptors.descriptors[index].get(), F_GETFD) >= 0);
+    CHECK(abi::valid(sent));
+    // Record is the frozen, padding-free 144-byte wire layout.
+    CHECK(std::memcmp(&sent, &admitted, sizeof(sent)) == 0);
+    REQUIRE(capture.count == (capture.enabled ? 2U : 0U));
+    if (!capture.enabled) return;
     CHECK(capture.facts[0].operation == VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued);
     CHECK(capture.facts[1].operation == VisualDiagnosticOperation::PresentationSourceAdmissionWritten);
     for (const auto& fact : capture.facts) {
@@ -7050,6 +7101,20 @@ TEST_CASE("Synchronous admission writes retain allocation and frame provenance")
         CHECK(fact.context.selection_generation == 19U);
         CHECK(fact.context.frame_revision == 23U);
         CHECK(fact.context.condition == static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted));
+        CHECK(fact.context.outcome == 1U);
+        CHECK(fact.context.allocation.allocation_generation == 7U);
+        CHECK(fact.context.capacity_width == sent.width);
+        CHECK(fact.context.capacity_height == sent.height);
+        const auto& workspace = fact.context.workspace;
+        CHECK(workspace.workspace_source_high == sent.id_high);
+        CHECK(workspace.workspace_source_low == sent.id_low);
+        CHECK(workspace.workspace_allocation == sent.allocation_identity);
+        CHECK(workspace.workspace_arena_high == sent.arena_high);
+        CHECK(workspace.workspace_arena_low == sent.arena_low);
+        CHECK(workspace.workspace_bytes == sent.size);
+        CHECK(workspace.workspace_pitch == sent.stride);
+        CHECK(workspace.workspace_width == sent.width);
+        CHECK(workspace.workspace_height == sent.height);
     }
 }
 

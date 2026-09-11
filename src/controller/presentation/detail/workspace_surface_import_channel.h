@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 
+#include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
@@ -22,6 +23,10 @@ namespace detail {
 struct WorkspaceFrameSignal;
 }
 namespace workspace_surface_import = detail::workspace_surface_import;
+
+// Project immutable source-import provenance only inside an enabled diagnostic sink.
+[[nodiscard]] contracts::DiagnosticWorkspace workspace_source_diagnostic(
+    const workspace_surface_import::Record&) noexcept;
 
 // The one identity an admitted allocation carries across the import boundary.
 // This random capability is deliberately unrelated to application generation,
