@@ -703,8 +703,14 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         CHECK_FALSE(abi::valid(layout));
     }
     abi::Record completed{.opcode = abi::Opcode::CopyCompleted, .id_high = 3U,
-                          .stride = 7U, .size = 8U, .presentation_revision = 9U};
+                          .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
     REQUIRE(abi::valid(completed));
-    completed.code = 1U;
-    CHECK_FALSE(abi::valid(completed));
+    SECTION("source completion requires a physical transfer") {
+        completed.offset = 0U;
+        CHECK_FALSE(abi::valid(completed));
+    }
+    SECTION("source completion has no sample slot code") {
+        completed.code = 1U;
+        CHECK_FALSE(abi::valid(completed));
+    }
 }

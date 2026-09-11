@@ -108,10 +108,16 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         while (auto outcome = channel_.take_outcome()) Accept(std::move(*outcome));
         DrainCompletion();
         RetireSources();
-        if (channel_.take_capacity_wake() && !pending_ && !transfer_ && last_) {
-            pending_ = *last_;
-            pending_->requested_owner = 0U;
-            if (diagnostics_.valid()) pending_->link = services::DiagnosticSpanIds::Next();
+        // Available remains in the channel while another submission owns the
+        // writer. In particular, its socket edge can precede the release callback.
+        if (!pending_ && !transfer_ && connected_.load(std::memory_order_acquire) && channel_.connected()) {
+            if (const auto arena = channel_.take_capacity_wake();
+                arena && last_ && last_->submitted.selection_generation == selection &&
+                active_ && *arena == last_->reuse_arena && active_->id == *arena && channel_.claimable(*arena)) {
+                pending_ = *last_;
+                pending_->requested_owner = 0U;
+                if (diagnostics_.valid()) pending_->link = services::DiagnosticSpanIds::Next();
+            }
         }
         PresentationNativeOutcome result;
         if (transfer_ && stage_ == Stage::ReadyComplete && connected_.load(std::memory_order_acquire)) result = Publish();
@@ -152,6 +158,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         contracts::DiagnosticLink link{};
         std::uint64_t requested_owner = 0U;
         std::uint64_t reuse_publication = 0U;
+        native::WorkspaceSurfaceImportId reuse_arena{};
     };
     enum class Stage : std::uint8_t { Idle, ReadyPending, ReadyComplete, ReleasePending, ReleaseComplete };
     struct Transfer final {
@@ -353,7 +360,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (!connected_.load(std::memory_order_acquire) || !channel_.connected()) return {};
         if (pending_->submitted.selection_generation != selection) return Supersede();
         const auto& frame = pending_->submitted.observation.frame;
-        auto* arena = EnsureArena(frame.extent);
+        // A retry retains the publication's actual arena even if an unrelated
+        // candidate was prepared while a newer submission was pending.
+        auto* arena = pending_->reuse_publication != 0U ? active_.get() : EnsureArena(frame.extent);
+        if (pending_->reuse_publication != 0U &&
+            (!arena || arena->id != pending_->reuse_arena || !channel_.claimable(arena->id))) return Supersede();
         if (!arena || !arena->ready) return {};
         const auto observed = pending_->reader->observe_workspace();
         if (observed.product_owner == 0U) return {};
@@ -451,6 +462,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         auto& transfer = *transfer_;
         auto& source = *transfer.source;
         const auto& frame = transfer.pending.submitted.observation.frame;
+        // This offer uses capacity reported before its publication. Any later
+        // release-only attempt owns a fresh Available, retained through completion.
+        static_cast<void>(channel_.take_capacity_wake());
         native::detail::publish_workspace_frame_signal(source.signal.mapping(), transfer.ready, (transfer.ready + 1U) / 2U,
             native::WorkspacePresentationLayer::Primary, {presentation_source_session(frame.source.kind), frame.revision},
             transfer.publication, frame.extent.width, frame.extent.height);
@@ -484,6 +498,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             .diagnostic_link = transfer.pending.link};
         last_ = transfer.pending;
         last_->reuse_publication = transfer.publication;
+        last_->reuse_arena = source.arena;
         if (transfer.pending.reuse_publication != 0U) return {};
         return outcome;
     }

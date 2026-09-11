@@ -24,6 +24,7 @@
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/model_selection.h"
+#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/services/file_dialog_catalog.h"
 #include "src/frameworks/reflection/field_policy.h"
 
@@ -1294,7 +1295,8 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     std::ostringstream output;
     mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
     const auto generated = output.str();
-    CHECK(generated.find("pub const ABI_VERSION: u32 = 9;") != std::string::npos);
+    CHECK(generated.find("pub const ABI_VERSION: u32 = " +
+        std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") != std::string::npos);
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
     CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);

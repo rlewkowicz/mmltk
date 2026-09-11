@@ -7139,6 +7139,115 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     CHECK_FALSE(channel.terminal_error());
 }
 
+TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
+    mmltk::testsupport::ScopedTempDir root{"retained-arena-capacity"};
+    presentation::WorkspaceSurfaceImportChannel channel{root.path() / "import.sock"};
+    auto peer = mmltk::testsupport::connect_workspace_surface_shell(root.path() / "import.sock");
+    channel.pump();
+    abi::Record received{};
+    const auto admit = [&](presentation::WorkspaceSurfaceImportId id) {
+        REQUIRE(channel.admit_arena(id, id.high, 4U, 3U));
+        CHECK(receive_workspace_record(peer.get(), received).descriptor_count == 0U);
+        CHECK(received.opcode == abi::Opcode::Arena);
+        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::ArenaReady,
+            .id_high = id.high, .id_low = id.low, .width = 4U, .height = 3U, .stride = 32U,
+            .size = 96U, .device_incarnation = 5U, .alignment = 32U, .device_uuid = {1U}, .memory_type_bits = 1U}));
+        channel.pump();
+        const auto outcome = channel.take_outcome();
+        REQUIRE(outcome.has_value());
+        CHECK(outcome->id == id);
+        CHECK(outcome->imported);
+    };
+    const auto withdraw = [&](presentation::WorkspaceSurfaceImportId id) {
+        REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+        static_cast<void>(receive_workspace_record(peer.get(), received));
+        CHECK(received.opcode == abi::Opcode::Drop);
+        CHECK(received.id_high == id.high);
+        CHECK(received.id_low == id.low);
+    };
+    const auto retire = [&](presentation::WorkspaceSurfaceImportId id) {
+        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Retired, .id_high = id.high, .id_low = id.low}));
+        channel.pump();
+        const auto retired = channel.take_retirement();
+        REQUIRE(retired.has_value());
+        CHECK(retired->id == id);
+        CHECK(retired->generation == id.high);
+    };
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    admit(arena);
+    abi::Record sample{.opcode = abi::Opcode::Presented, .id_high = arena.high, .id_low = arena.low,
+                       .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
+    REQUIRE(send_workspace_record(peer.get(), sample));
+    sample.opcode = abi::Opcode::Completed;
+    REQUIRE(send_workspace_record(peer.get(), sample));
+    auto available = sample;
+    available.opcode = abi::Opcode::Available;
+    REQUIRE(send_workspace_record(peer.get(), available));
+    channel.pump();
+
+    SECTION("one original availability survives unrelated outcomes and retirement") {
+        // Model an ineligible consumer by leaving the ticket untouched. This
+        // proves channel retention, not the native writer's GPU interleaving.
+        for (std::uint64_t iteration = 2U; iteration <= 301U; ++iteration) {
+            const presentation::WorkspaceSurfaceImportId unrelated{iteration, 3U};
+            admit(unrelated);
+            withdraw(unrelated);
+            retire(unrelated);
+            channel.pump();
+            REQUIRE_FALSE(channel.terminal_error());
+        }
+        const auto ticket = channel.take_capacity_wake();
+        REQUIRE(ticket.has_value());
+        CHECK(*ticket == arena);
+    }
+    SECTION("repeated availability coalesces into one exact ticket") {
+        for (std::uint64_t iteration = 0U; iteration < 300U; ++iteration) {
+            REQUIRE(send_workspace_record(peer.get(), available));
+            channel.pump();
+            REQUIRE_FALSE(channel.terminal_error());
+        }
+        const auto ticket = channel.take_capacity_wake();
+        REQUIRE(ticket.has_value());
+        CHECK(*ticket == arena);
+    }
+    SECTION("withdrawal clears its own ticket and ignores queued stale availability") {
+        withdraw(arena);
+        REQUIRE(send_workspace_record(peer.get(), available));
+        retire(arena);
+    }
+    SECTION("a replacement outcome cannot relabel a stale arena ticket") {
+        const presentation::WorkspaceSurfaceImportId replacement{2U, 3U};
+        admit(replacement);
+        const auto ticket = channel.take_capacity_wake();
+        REQUIRE(ticket.has_value());
+        CHECK(*ticket == arena);
+        CHECK(*ticket != replacement);
+    }
+    SECTION("old arena withdrawal cannot erase the replacement ticket") {
+        const presentation::WorkspaceSurfaceImportId replacement{2U, 3U};
+        admit(replacement);
+        auto replacement_available = available;
+        replacement_available.id_high = replacement.high;
+        replacement_available.id_low = replacement.low;
+        REQUIRE(send_workspace_record(peer.get(), replacement_available));
+        channel.pump();
+        withdraw(arena);
+        REQUIRE(send_workspace_record(peer.get(), available));
+        retire(arena);
+        const auto ticket = channel.take_capacity_wake();
+        REQUIRE(ticket.has_value());
+        CHECK(*ticket == replacement);
+    }
+    CHECK_FALSE(channel.take_capacity_wake().has_value());
+    CHECK_FALSE(channel.take_outcome().has_value());
+    CHECK_FALSE(channel.take_retirement().has_value());
+    CHECK_FALSE(channel.terminal_error());
+    CHECK(channel.connected());
+}
+
 TEST_CASE("Workspace capability ledgers survive sequential retirement beyond concurrent capacity", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
