@@ -282,6 +282,25 @@ struct GalleryGpuPause final {
     return bytes;
 }
 
+[[nodiscard]] std::vector<std::uint8_t> copy_atlas_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product,
+                                                       const std::size_t plane_index, const ExploreAtlasLayout& layout) {
+    REQUIRE(product.valid());
+    REQUIRE(layout.row_capacity != 0U);
+    REQUIRE(layout.row_count <= layout.row_capacity);
+    REQUIRE(layout.row_origin < layout.row_capacity);
+    const auto descriptor = product.plane(plane_index).plane().descriptor;
+    const auto row_bytes = static_cast<std::size_t>(layout.columns) * layout.card_extent * 4U;
+    REQUIRE(descriptor.row_bytes() == row_bytes);
+    REQUIRE(descriptor.height >= layout.row_capacity * layout.card_extent);
+    const auto physical = copy_product_plane(std::move(product), plane_index);
+    const auto row_size = row_bytes * layout.card_extent;
+    std::vector<std::uint8_t> logical(row_size * layout.row_count);
+    for (std::size_t row = 0U; row < layout.row_count; ++row)
+        std::copy_n(physical.data() + (layout.row_origin + row) % layout.row_capacity * row_size, row_size,
+                    logical.data() + row * row_size);
+    return logical;
+}
+
 class NativeGallery final {
    public:
     GalleryEvidence evidence;
@@ -458,15 +477,8 @@ class NativeGallery final {
         }
     }
     [[nodiscard]] std::vector<std::uint8_t> Pixels(const std::size_t plane_index) {
-        auto physical = copy_product_plane(runtime->Borrow(), plane_index);
-        if (displayed_mode != ExploreMode::Gallery) return physical;
-        const auto row_bytes = static_cast<std::size_t>(displayed_layout.columns) * displayed_layout.card_extent * 4U;
-        const auto row_size = row_bytes * displayed_layout.card_extent;
-        std::vector<std::uint8_t> logical(row_size * displayed_layout.row_count);
-        for (std::size_t row = 0U; row < displayed_layout.row_count; ++row)
-            std::copy_n(physical.data() + (displayed_layout.row_origin + row) % displayed_layout.row_capacity * row_size, row_size,
-                        logical.data() + row * row_size);
-        return logical;
+        if (displayed_mode != ExploreMode::Gallery) return copy_product_plane(runtime->Borrow(), plane_index);
+        return copy_atlas_plane(runtime->Borrow(), plane_index, displayed_layout);
     }
 };
 
@@ -692,6 +704,69 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
     gallery.Drain();
 }
 
+TEST_CASE("Native gallery rollback and detail retain an unfinished independent image read", "[explore][native][atlas][transaction][detail]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    const bool change_geometry = GENERATE(false, true);
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-held-return"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    GalleryReadPause pause{0U};
+    NativeGallery gallery{4U, false, true};
+    pause.Bind(*gallery.gate);
+    std::future<void> progress;
+    GalleryReadPause::ReleaseGuard release{pause};
+    gallery.Open(path);
+    static_cast<void>(gallery.Step());
+    pause.Wait();
+    for (;;) {
+        const auto observed = gallery.evidence.Epoch();
+        const auto partial = gallery.Step();
+        if (partial.remaining_tiles == 1U) break;
+        gallery.evidence.Wait(observed);
+    }
+    const auto prior_plan = gallery.plan;
+    const auto before = gallery.Pixels(0U);
+    progress = std::async(std::launch::async, [&] {
+        gallery.runtime->BindContext();
+        if (change_geometry) {
+            gallery.plan.viewport.row_count = 3U;
+            gallery.plan.viewport.extent.height = 24U;
+        } else {
+            gallery.plan.overlay.show_boxes = !gallery.plan.overlay.show_boxes;
+        }
+        gallery.demand->store(++gallery.plan.generation);
+        gallery.Begin(nullptr, false);
+        const auto next_generation = gallery.plan.generation + 1U;
+        gallery.plan = prior_plan;
+        gallery.plan.generation = next_generation;
+        gallery.demand->store(next_generation);
+        gallery.Begin();
+        CHECK(gallery.Pixels(0U) == before);
+        const auto retained_revision = gallery.runtime->Completed().revision();
+        gallery.plan.mode = ExploreMode::Detail;
+        gallery.plan.selected_image = 0U;
+        gallery.demand->store(++gallery.plan.generation);
+        gallery.Begin();
+        REQUIRE(gallery.algorithm->Document());
+        gallery.plan.mode = ExploreMode::Gallery;
+        gallery.plan.selected_image.reset();
+        gallery.demand->store(++gallery.plan.generation);
+        gallery.Begin();
+        CHECK(gallery.runtime->Completed().revision() == retained_revision);
+        CHECK(gallery.Pixels(0U) == before);
+        const auto returned = gallery.algorithm->AdvanceGallery();
+        REQUIRE(returned.ready_slots.size() == 8U);
+        CHECK_FALSE(returned.ready_slots[0U]);
+        CHECK(std::ranges::count(returned.ready_slots, true) == 7);
+    });
+    mmltk::testsupport::await_test_future(progress, "gallery rollback and detail while one disk read remains held");
+    gallery.runtime->BindContext();
+    pause.Release();
+    gallery.Drain();
+    CHECK(std::ranges::all_of(gallery.algorithm->AdvanceGallery().ready_slots, [](bool ready) { return ready; }));
+}
+
 TEST_CASE("Native gallery retains slot products across hot reuse semantic changes collisions and artifact replacement",
           "[explore][native][cache]") {
     int devices = 0;
@@ -762,12 +837,24 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     {
         std::scoped_lock lock(gallery.evidence.mutex);
         std::size_t semantic_copies = 0U;
+        std::size_t restored_tiles = 0U;
+        constexpr std::size_t tile_bytes = 8U * 8U * 4U;
         for (const auto& fact : gallery.evidence.facts)
             if (fact.operation == VisualDiagnosticOperation::ExploreCacheTransfer && fact.generation == gallery.plan.generation) {
-                CHECK(fact.context.condition == 1U);
-                semantic_copies += fact.value;
+                REQUIRE(fact.detail < columns * 2U);
+                if (fact.context.condition == 1U) {
+                    CHECK(fact.value == tile_bytes);
+                    semantic_copies += fact.value;
+                } else {
+                    CHECK(fact.context.condition == 0U);
+                    CHECK(fact.value == 2U * tile_bytes);
+                    ++restored_tiles;
+                }
             }
-        CHECK(semantic_copies == columns * 2U * 8U * 8U * 4U);
+        // Each physical candidate reconciles its own older cells before the
+        // semantic update. Every visible tile still gets one semantic copy.
+        CHECK(semantic_copies == columns * 2U * tile_bytes);
+        CHECK(restored_tiles <= columns * 2U);
     }
 
     gallery.plan.viewport.first_row = 18U;
@@ -1206,6 +1293,7 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
     const auto path = directory.path() / "compiled.bin";
     write_gallery_artifact(path, 0.25F, 9U);
     const bool hold_probe = GENERATE(false, true);
+    CAPTURE(hold_probe);
     NativeGallery gallery{4U, false, true};
     GalleryGpuPause held;
     if (hold_probe) gallery.probe_pause = &held;
@@ -1218,10 +1306,14 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
         }
     } else {
         gallery.Drain();
-        gallery.plan.viewport.first_row = 8U;
+        // These immediate rows are already in the four forward cached rows,
+        // so the held work can enter the background tier without starving
+        // a foreground publication on this same test thread.
+        gallery.plan.viewport.first_row = 4U;
         ++gallery.plan.generation;
         gallery.demand->store(gallery.plan.generation);
-        gallery.Begin();
+        const auto visible = gallery.Begin();
+        REQUIRE(std::ranges::all_of(visible.ready_slots, [](const bool ready) { return ready; }));
         gallery.pause = &held;
         const auto before = gallery.evidence.BackgroundSubmissions();
         for (;;) {
@@ -1490,7 +1582,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     }
     const auto pixels = [&](const std::size_t plane_index) {
         runtime->BindContext();
-        return copy_product_plane(system.BorrowFrame(), plane_index);
+        return copy_atlas_plane(system.BorrowFrame(), plane_index, system.snapshot().gallery.layout);
     };
     const auto prior_clean = pixels(0U);
     const auto prior_semantic = pixels(1U);
@@ -1520,7 +1612,8 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
             CHECK(std::equal(semantic.begin() + offset, semantic.begin() + offset + 32U, prior_semantic.begin() + offset));
         }
     }
-    wait([&] { return evidence.Count(VisualDiagnosticOperation::GalleryGpuCompleted) == 72U; });
+    const auto cached_tiles = explore_detail::GalleryThumbnailCache::WindowCount(incumbent.order.matching_count, viewport);
+    wait([&] { return evidence.Count(VisualDiagnosticOperation::GalleryGpuCompleted) == cached_tiles; });
     const auto reads_of_held = [&] {
         std::scoped_lock lock(evidence.mutex);
         return std::ranges::count_if(evidence.facts, [&](const auto& fact) {
@@ -1534,8 +1627,8 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     static_cast<void>(system.UpdateOverlay(overlay));
     wait([&] { return system.snapshot().frame.revision > first_revision; });
     CHECK(pixels(0U) == clean);
-    // Positions 68..71 address high slots in the restored 72-slot ring, beyond
-    // the failed 60-slot (or zero-slot) candidate's scheduler dimensions.
+    // Semantic updates continue using the restored demand's cached tiles after
+    // the smaller or empty candidate rolls back.
     const auto semantic_revision = system.snapshot().frame.revision;
     static_cast<void>(system.UpdateOverlay(restored.overlay));
     wait([&] { return system.snapshot().frame.revision > semantic_revision; });

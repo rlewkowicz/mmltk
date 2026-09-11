@@ -1,5 +1,6 @@
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <array>
 #include <catch2/catch_test_macros.hpp>
@@ -154,6 +155,17 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
 [[nodiscard]] bool ready(const int fd) {
     pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
     return ::poll(&descriptor, 1U, 2'000) > 0;
+}
+
+[[nodiscard]] TrainProcessClient launch_train_ignoring_term(mmltk::testsupport::ScopedTempDir& temp) {
+    const auto executable = script(temp, "trap '' TERM\nprintf ready\nexec sleep 30\n");
+    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
+                                            {.escalation_delay = std::chrono::milliseconds{10}});
+    REQUIRE(ready(client.stdout_fd()));
+    std::string readiness;
+    client.consume_output(readiness, 5U);
+    REQUIRE(readiness == "ready");
+    return client;
 }
 
 [[nodiscard]] VastBridgeConfig valid_vast_config() {
@@ -888,13 +900,13 @@ TEST_CASE("Train process run owns its stop token, forwards progress, and reaps s
 
 TEST_CASE("Train process run consumes a separately-owned stop capability and escalates", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-run-stop");
-    const auto executable = script(temp, "trap '' TERM\nexec sleep 30\n");
-    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
-                                             {.escalation_delay = std::chrono::milliseconds{10}});
+    auto client = launch_train_ignoring_term(temp);
     auto [source, token] = TrainProcessStopSource::Mint();
     REQUIRE(source.RequestCancel());
     const auto result = client.Run(std::move(token));
     CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled);
+    REQUIRE(WIFSIGNALED(result.terminal.wait_status));
+    CHECK(WTERMSIG(result.terminal.wait_status) == SIGKILL);
     CHECK_FALSE(client.active());
     CHECK_FALSE(source.RequestCancel());
 }
@@ -979,13 +991,7 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
 
 TEST_CASE("Train process client escalates a stopped process group", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
-    const auto executable = script(temp, "trap '' TERM\nprintf ready\nexec sleep 30\n");
-    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
-                                             {.escalation_delay = std::chrono::milliseconds{10}});
-    REQUIRE(ready(client.stdout_fd()));
-    std::string readiness;
-    client.consume_output(readiness, 5U);
-    REQUIRE(readiness == "ready");
+    auto client = launch_train_ignoring_term(temp);
     REQUIRE(client.request_stop(false));
     REQUIRE(ready(client.control_fd()));
     REQUIRE(client.consume_stop_request());
@@ -995,6 +1001,8 @@ TEST_CASE("Train process client escalates a stopped process group", "[gui][servi
     const auto terminal = client.consume_exit();
     REQUIRE(terminal.has_value());
     CHECK(terminal->outcome == services::TrainProcessExitOutcome::Cancelled);
+    REQUIRE(WIFSIGNALED(terminal->wait_status));
+    CHECK(WTERMSIG(terminal->wait_status) == SIGKILL);
 }
 
 TEST_CASE("Train process client retains group custody after its leader exits", "[gui][services]") {

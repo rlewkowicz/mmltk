@@ -160,6 +160,8 @@ struct CompiledImageStream::Impl {
         CompletionObserver transfer_observer;
         std::atomic<bool> cancelled{false};
         bool reading = false;
+        std::size_t read_callbacks = 0U;
+        std::size_t callbacks = 0U;
         bool read = false;
         bool host_materialized = false;
         std::exception_ptr read_failure;
@@ -217,6 +219,7 @@ struct CompiledImageStream::Impl {
     std::condition_variable changed;
     std::vector<Completion> completions;
     std::size_t head = 0, queued = 0, active = 0;
+    std::size_t consumers = 0U;
     bool stopping = false;
     std::exception_ptr failure;
     bool completion_failed = false;
@@ -232,22 +235,25 @@ struct CompiledImageStream::Impl {
         gpu::ensure_cuda_ok(cudaEventRecord(consumer ? slot.consumer : slot.transfer, stream), "compiled image completion event");
         completions[(head + queued) % completions.size()] = {index, consumer, observer};
         pending = true;
+        ++slot.callbacks;
+        if (consumer) ++consumers;
         if (slot.unfenced && slot.unfenced_stream == stream) slot.unfenced = false;
         ++queued;
         changed.notify_all();
     }
-    void settle_unfenced() {
-        for (auto& slot : slots) {
-            cudaStream_t stream = nullptr;
-            {
-                std::lock_guard lock(mutex);
-                if (!slot->unfenced) continue;
-                stream = slot->unfenced_stream;
-            }
-            gpu::ensure_cuda_ok(cudaStreamSynchronize(stream), "compiled image partial upload settlement");
+    void settle_unfenced(Slot& slot) {
+        cudaStream_t stream = nullptr;
+        {
             std::lock_guard lock(mutex);
-            slot->unfenced = false;
+            if (!slot.unfenced) return;
+            stream = slot.unfenced_stream;
         }
+        gpu::ensure_cuda_ok(cudaStreamSynchronize(stream), "compiled image partial upload settlement");
+        std::lock_guard lock(mutex);
+        slot.unfenced = false;
+    }
+    void settle_unfenced() {
+        for (auto& slot : slots) settle_unfenced(*slot);
     }
     void complete_loop() noexcept {
         try {
@@ -290,6 +296,8 @@ struct CompiledImageStream::Impl {
                 if (job.observer.complete) job.observer.complete(job.observer.context, job.slot, error);
                 {
                     std::lock_guard lock(mutex);
+                    --slots[job.slot]->callbacks;
+                    if (job.consumer) --consumers;
                     --active;
                 }
                 changed.notify_all();
@@ -308,6 +316,8 @@ struct CompiledImageStream::Impl {
                 lock.unlock();
                 if (job.observer.complete) job.observer.complete(job.observer.context, job.slot, error);
                 lock.lock();
+                --slot.callbacks;
+                if (job.consumer) --consumers;
             }
             changed.notify_all();
         }
@@ -518,6 +528,7 @@ void CompiledImageStream::submit(const std::size_t index, const CompiledDataset&
         slot.reads.assign(reads.begin(), reads.end());
         slot.cancelled.store(false, std::memory_order_release);
         slot.reading = true;
+        ++slot.read_callbacks;
         slot.read = false;
         slot.host_materialized = false;
         slot.read_failure = {};
@@ -531,6 +542,7 @@ void CompiledImageStream::submit(const std::size_t index, const CompiledDataset&
     } catch (...) {
         std::lock_guard lock(impl_->mutex);
         slot.reading = false;
+        --slot.read_callbacks;
         impl_->changed.notify_all();
         throw;
     }
@@ -584,6 +596,10 @@ void CompiledImageStream::read_slot(const std::size_t index) noexcept {
     }
     if (!transfer_submitted && transfer.complete) transfer.complete(transfer.context, index, failure);
     if (observer.complete) observer.complete(observer.context, index, failure, read);
+    {
+        std::lock_guard lock(impl_->mutex);
+        --current.read_callbacks;
+    }
     impl_->changed.notify_all();
 }
 void CompiledImageStream::cancel_reads() noexcept {
@@ -649,6 +665,20 @@ void CompiledImageStream::release(const std::size_t slot, void* stream, Completi
 }
 void CompiledImageStream::fence(const std::size_t slot, void* stream, CompletionObserver observer) {
     on_context(impl_->context, [&] { impl_->enqueue(slot, true, reinterpret_cast<cudaStream_t>(stream), observer); });
+}
+void CompiledImageStream::wait_consumers() {
+    std::unique_lock lock(impl_->mutex);
+    impl_->changed.wait(lock, [&] { return impl_->consumers == 0U; });
+    if (impl_->failure) std::rethrow_exception(impl_->failure);
+}
+void CompiledImageStream::synchronize(const std::size_t index) {
+    auto& slot = *impl_->slots.at(index);
+    {
+        std::unique_lock lock(impl_->mutex);
+        impl_->changed.wait(lock, [&] { return !slot.reading && slot.read_callbacks == 0U && slot.callbacks == 0U; });
+        if (impl_->failure) std::rethrow_exception(impl_->failure);
+    }
+    if (impl_->context) on_context(impl_->context, [&] { impl_->settle_unfenced(slot); });
 }
 void CompiledImageStream::synchronize() {
     wait_reads();

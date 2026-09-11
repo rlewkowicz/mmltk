@@ -127,11 +127,17 @@ impl GalleryGeometry {
         );
         let firstrow = logical.first_row;
         let rowcount = logical.row_count;
+        // Reserve the possible partially visible row before choosing raster
+        // resolution. Scrolling changes demand, not the size of cached pixels.
+        let raster_rows = ((logical_height / logical.row_extent).ceil() as u32)
+            .saturating_add(1)
+            .min(logical.total_rows)
+            .max(1);
         let logical_native_width = logical_width.floor() as u32;
         let card_extent = (logical_native_width / columns)
             .max(1)
             .min(maximum_extent.width / columns)
-            .min(maximum_extent.height / rowcount)
+            .min(maximum_extent.height / raster_rows)
             .max(1);
         let width = card_extent.checked_mul(columns)?;
         let height = card_extent.checked_mul(rowcount)?;
@@ -391,6 +397,12 @@ impl State {
         self.measured_gallery
             .as_ref()
             .map_or(1.0, |value| value.logical_width / columns.max(1) as f32)
+    }
+
+    pub(crate) fn gallery_size(&self) -> Option<iced::Size> {
+        self.measured_gallery
+            .as_ref()
+            .map(|value| iced::Size::new(value.logical_width, value.logical_height))
     }
 
     pub(crate) fn gallery_row_fraction(&self) -> f32 {
@@ -841,6 +853,22 @@ mod tests {
         let end = gallery_geometry_at_fraction(600.0, 450.0, maximum.clone(), 4, 1000, 249, 0.25)
             .unwrap();
         assert_eq!(end.viewport().rowcount, 1);
+        for first_row in [0, 8, 249] {
+            for fraction in [0.0, 0.25, 0.75] {
+                let bounded = gallery_geometry_at_fraction(
+                    600.0,
+                    450.0,
+                    capacity(600, 450),
+                    4,
+                    1000,
+                    first_row,
+                    fraction,
+                )
+                .unwrap();
+                assert_eq!(bounded.card_extent, 112);
+                assert!(bounded.viewport().extent.height <= 450);
+            }
+        }
         let empty = logical_gallery_geometry(600.0, 450.0, 4, 0, 0);
         assert_eq!(empty.virtual_height(), 0.0);
         let limit = VISIBLE_ITEM_CAPACITY as f32;
@@ -881,9 +909,9 @@ mod tests {
         assert!(state.measure_gallery(601.2, 601.2, capacity(601, 601), 5));
         assert_eq!(state.measured_viewport(5, 0, 1_000).unwrap().columns, 5);
         let geometry = gallery_geometry(601.9, 601.9, capacity(601, 601), 4, 1_000, 0).unwrap();
-        assert_eq!(geometry.viewport().extent.width, 600);
+        assert_eq!(geometry.viewport().extent.width, 480);
         assert_eq!(geometry.viewport().rowcount, 4);
-        assert_eq!(geometry.card_extent, 150);
+        assert_eq!(geometry.card_extent, 120);
         assert_eq!(
             logical_gallery_geometry(601.9, 601.9, 4, 1_000, 0).virtual_height(),
             37_618.75
@@ -891,6 +919,7 @@ mod tests {
         let end = gallery_geometry(601.9, 601.9, capacity(601, 601), 4, 1_000, u32::MAX).unwrap();
         assert_eq!(end.viewport().firstrow, 249);
         assert_eq!(end.viewport().rowcount, 1);
+        assert_eq!(end.card_extent, geometry.card_extent);
     }
 
     #[test]

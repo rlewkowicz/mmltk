@@ -2328,7 +2328,7 @@ fn submit_mmltk_workspace_transfer(
                     Ok(()) => Some(receipt),
                     Err((boundary, error)) => {
                         if error == vk::Result::ERROR_DEVICE_LOST { return Err(error); }
-                        MmltkWorkspacePixels::report_failure(arena.surface_id, boundary, Some((identity, slot, snapshot)));
+                        MmltkWorkspacePixels::report_failure(arena.surface_id, entry.surface_id, boundary, Some((identity, slot, snapshot)));
                         None
                     }
                 }
@@ -2670,7 +2670,8 @@ fn service_mmltk_workspace_admissions(
         let snapshot = receipt.snapshot.unwrap();
         let frame = receipt.frame.unwrap();
         if let (Some(pixels), Some(probe)) = (frame.pixels, &entry.blit.pixels) {
-            probe.report(arena.surface_id, frame.identity, slot, pixels);
+            let completed = entry.blit.submission().submitted_release_complete(pixels.release);
+            probe.report(source, arena.surface_id, frame.identity, slot, pixels, completed);
         }
         unsafe { wgpu_parent_external_texture_frame_ready(shared.owner, arena.device_id,
             arena.surface_id.high, arena.surface_id.low, 0, slot, session, sequence, revision,
@@ -3022,7 +3023,7 @@ fn mmltk_workspace_copy_transitions(
                 src_access: vk::AccessFlags::MEMORY_WRITE,
                 dst_access: vk::AccessFlags::TRANSFER_READ,
                 old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::GENERAL,
                 src_queue_family: vk::QUEUE_FAMILY_EXTERNAL,
                 dst_queue_family: queue_family,
             },
@@ -3047,7 +3048,7 @@ fn mmltk_workspace_copy_transitions(
             MmltkWorkspaceImageTransition {
                 src_access: vk::AccessFlags::TRANSFER_READ,
                 dst_access: vk::AccessFlags::empty(),
-                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                old_layout: vk::ImageLayout::GENERAL,
                 new_layout: vk::ImageLayout::GENERAL,
                 src_queue_family: queue_family,
                 dst_queue_family: vk::QUEUE_FAMILY_EXTERNAL,
@@ -3435,7 +3436,8 @@ struct MmltkWorkspacePixels {
 
 impl MmltkWorkspacePixels {
     const SAMPLES: usize = 25;
-    const SLOT_BYTES: usize = Self::SAMPLES * 4 * 2;
+    const SLOT_BYTES: usize = (Self::SAMPLES * 2 + 1) * 4;
+    const COMPLETED_MARKER: u32 = 0x4d4d4c54;
 
     fn check_failure(boundary: MmltkWorkspaceProbeFailure) -> Result<(), vk::Result> {
         static TARGET: OnceLock<Option<MmltkWorkspaceProbeFailure>> = OnceLock::new();
@@ -3460,17 +3462,18 @@ impl MmltkWorkspacePixels {
     }
 
     fn report_failure(surface: mmltk_workspace_channel::SurfaceId,
+                      source: mmltk_workspace_channel::SurfaceId,
                       boundary: MmltkWorkspaceProbeFailure,
                       frame: Option<(MmltkWorkspaceFrameIdentity, usize, MmltkWorkspaceFrameSnapshot)>) {
         if !mmltk_workspace_acceptance_trace_enabled() { return; }
         if let Some((identity, index, snapshot)) = frame {
             mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\",\"layer\":{},\"slot\":{},\"presentation_revision\":{},\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{}}}",
+                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\",\"source\":\"{source}\",\"layer\":{},\"slot\":{},\"presentation_revision\":{},\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{}}}",
                 identity.layer, index % MMLTK_WORKSPACE_MAILBOX_SLOTS, identity.presentation_revision,
                 snapshot.transfer_sequence, identity.session, identity.sequence));
         } else {
             mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\"}}"));
+                "{{\"event\":\"firefox.workspace.probe_failed\",\"boundary\":\"{boundary:?}\",\"surface\":\"{surface}\",\"source\":\"{source}\"}}"));
         }
     }
 
@@ -3529,12 +3532,17 @@ impl MmltkWorkspacePixels {
         unsafe { self.device.cmd_copy_image_to_buffer(commands, image, layout, self.buffer, &regions) };
     }
 
-    fn report(&self, surface: mmltk_workspace_channel::SurfaceId,
-              identity: MmltkWorkspaceFrameIdentity, slot: u32, receipt: MmltkWorkspacePixelReceipt) {
+    fn report(&self, source: mmltk_workspace_channel::SurfaceId,
+              surface: mmltk_workspace_channel::SurfaceId, identity: MmltkWorkspaceFrameIdentity,
+              slot: u32, receipt: MmltkWorkspacePixelReceipt, completed: Result<bool, vk::Result>) {
         // Caller established completion and still owns this exact mailbox.
         let samples = unsafe { std::slice::from_raw_parts(
-            (self.mapped + receipt.copy_index * Self::SLOT_BYTES) as *const u32, Self::SAMPLES * 2) };
-        for (index, rgba) in samples.iter().enumerate() {
+            (self.mapped + receipt.copy_index * Self::SLOT_BYTES) as *const u32, Self::SAMPLES * 2 + 1) };
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.workspace.pixel_completion\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"presentation_revision\":{},\"transfer_sequence\":{},\"timeline_release\":{},\"completion\":\"{completed:?}\",\"readback_marker\":{},\"expected_marker\":{}}}",
+            identity.presentation_revision, receipt.snapshot.transfer_sequence, receipt.release,
+            samples[Self::SAMPLES * 2], Self::COMPLETED_MARKER));
+        for (index, rgba) in samples[..Self::SAMPLES * 2].iter().enumerate() {
             mmltk_workspace_channel::write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.pixel\",\"boundary\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"sample_index\":{},\"sample_x\":{},\"sample_y\":{},\"sample_rgba\":{}}}",
                 if index < Self::SAMPLES { "import" } else { "mailbox" }, surface,
@@ -3604,7 +3612,8 @@ impl MmltkWorkspaceBlit {
     ///
     /// The destination returns from WebGPU in `SHADER_READ_ONLY_OPTIMAL`, is
     /// overwritten completely, then returns to the same layout tracked by
-    /// WebGPU. Queue serialization makes the one recording reusable.
+    /// WebGPU. The shared linear source stays in `GENERAL` across CUDA and
+    /// Vulkan ownership. Queue serialization makes the one recording reusable.
     fn record_copy(
         &self,
         commands: vk::CommandBuffer,
@@ -3664,13 +3673,13 @@ impl MmltkWorkspaceBlit {
             self.device.cmd_copy_image(
                 commands,
                 self.source,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::ImageLayout::GENERAL,
                 destination,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &region,
             );
             if let (Some(probe), Some(coordinates)) = (&self.pixels, coordinates) {
-                probe.record(commands, self.source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, 0, slot, 0, coordinates);
+                probe.record(commands, self.source, vk::ImageLayout::GENERAL, 0, slot, 0, coordinates);
                 let readable = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -3682,6 +3691,9 @@ impl MmltkWorkspaceBlit {
                 self.device.cmd_pipeline_barrier(commands, vk::PipelineStageFlags::TRANSFER,
                     vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[readable]);
                 probe.record(commands, destination, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, slot as u32, slot, 1, coordinates);
+                self.device.cmd_fill_buffer(commands, probe.buffer,
+                    (slot * MmltkWorkspacePixels::SLOT_BYTES + MmltkWorkspacePixels::SAMPLES * 2 * 4) as u64,
+                    4, MmltkWorkspacePixels::COMPLETED_MARKER);
                 let writable = vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -4145,7 +4157,7 @@ impl Global {
                     Ok(probe) => Some(probe),
                     Err(vk::Result::ERROR_DEVICE_LOST) => return None,
                     Err(_) => {
-                        MmltkWorkspacePixels::report_failure(arena.surface_id, MmltkWorkspaceProbeFailure::Allocation, None);
+                        MmltkWorkspacePixels::report_failure(arena.surface_id, surface_id, MmltkWorkspaceProbeFailure::Allocation, None);
                         None
                     }
                 }

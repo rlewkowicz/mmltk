@@ -1514,10 +1514,9 @@ mod tests {
             .workspace
             .explore_measured_layout_request(resize.model.explore.snapshot.as_ref(), 4, 100)
             .unwrap();
-        drop(resize.request_explore_viewport(resized));
+        drop(resize.request_explore_viewport(resized.clone()));
         let retained = resize.workspace.explore_dispatchable_viewport().unwrap();
-        assert_eq!(retained.viewport.extent.width, 664);
-        assert_eq!(retained.viewport.extent.height, 332);
+        assert_eq!(retained, resized);
 
         let (mut reconnect, task) = boot();
         drop(task);
@@ -1546,16 +1545,17 @@ mod tests {
                 _ => {}
             }
         }
+        let measured = reconnect
+            .workspace
+            .explore_measured_viewport(3, 11, 100)
+            .unwrap();
         reconnect.install_bootstrap(Bootstrap {
             input_epoch: 1,
             schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
             snapshots,
         });
         let rebased = reconnect.workspace.explore_dispatchable_viewport().unwrap();
-        assert_eq!(rebased.viewport.columns, 3);
-        assert_eq!(rebased.viewport.extent.width, 564);
-        assert_eq!(rebased.viewport.extent.height, 376);
-        assert_eq!(rebased.viewport.firstrow, 11);
+        assert_eq!(rebased.viewport, measured);
         assert_eq!(rebased.focusedcompiledindex, Some(34));
     }
 

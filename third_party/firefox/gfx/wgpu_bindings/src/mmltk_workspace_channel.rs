@@ -670,6 +670,13 @@ impl Channel {
             ..Record::default()
         };
         self.pending.push_back(PendingRecord { record, descriptor });
+        if opcode == OPCODE_FAILED {
+            write_diagnostic(|line| write!(line,
+                "{{\"event\":\"firefox.workspace.{}import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}",
+                if self.sources.contains(&id) { "source." } else { "" }));
+        } else if opcode == OPCODE_READY {
+            trace_state("ready", id, "vulkan_import_complete", self.sources.contains(&id));
+        }
         self.flush();
         if !self.pending.is_empty() {
             self.wake_dispatcher();
@@ -764,7 +771,6 @@ impl Channel {
             return;
         }
         self.replied.remove(&id);
-        trace_state("retired", id, "resources_released", self.sources.contains(&id));
         self.send(OPCODE_RETIRED, id, 0, 0, 0, 0, None);
     }
 
@@ -835,6 +841,7 @@ impl Channel {
             let id = SurfaceId { high: record.id_high, low: record.id_low };
             if record.opcode == OPCODE_RETIRED
                 || (record.opcode == OPCODE_FAILED && self.withdrawn.contains(&id)) {
+                trace_state("retired", id, "resources_released", self.sources.contains(&id));
                 // The terminal has left the socket queue and no physical owner
                 // can refer to this capability. A late independent page claim
                 // is simply unknown and its local failure sends no new terminal.
@@ -973,7 +980,6 @@ pub fn take_admission(id: SurfaceId, width: u32, height: u32) -> Option<Admissio
 pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
-            trace_state("ready", id, "vulkan_import_complete", true);
             channel.send_outcome(OPCODE_READY, id, 0, 0, 0, Some(timeline));
             if channel.sources.contains(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
                 channel.settled_releases.push_back(id);
@@ -989,9 +995,6 @@ pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
 pub fn send_failed(id: SurfaceId, code: u32, stride: u64, size: u64) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
-            write_diagnostic(|line| write!(line,
-                "{{\"event\":\"firefox.workspace.{}import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}", if channel.sources.contains(&id) { "source." } else { "" }
-            ));
             channel.send_outcome(OPCODE_FAILED, id, code, stride, size, None);
         }
     }

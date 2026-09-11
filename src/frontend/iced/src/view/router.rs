@@ -149,6 +149,10 @@ impl Router {
             .measured_viewport(columns, first_row, matching_count)
     }
 
+    pub(crate) fn explore_gallery_size(&self) -> Option<iced::Size> {
+        self.explore.gallery_size()
+    }
+
     #[cfg(test)]
     pub fn explore_measure_gallery(
         &mut self,

@@ -276,6 +276,10 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView VisualRuntimeOwner::Borrow(
         if (!available.Wait(stop)) return {};
     }
 }
+void VisualRuntimeOwner::SelectOutput(const Runtime::CompletedOutput& product) {
+    std::scoped_lock lock(mutex_);
+    if (runtime_) runtime_->SelectOutput(product);
+}
 mmltk::frameworks::gpu::BorrowedImageWorkspace VisualRuntimeOwner::BorrowWorkspace() const {
     std::unique_lock lock(mutex_, std::try_to_lock);
     return lock.owns_lock() && runtime_ ? runtime_->BorrowWorkspace() : mmltk::frameworks::gpu::BorrowedImageWorkspace{};

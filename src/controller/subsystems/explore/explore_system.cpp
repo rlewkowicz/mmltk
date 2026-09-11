@@ -584,8 +584,17 @@ class ExploreSystem::Impl final {
         worker_.StopAndWait();
         // A cancelled replacement may restore the incumbent while joining.
         // Reapply the same issued invalidation before releasing the issuer.
+        std::scoped_lock admission(desired_admission_mutex_);
         std::scoped_lock lock(mutex_);
         latest_generation_->store(generation, std::memory_order_release);
+        active_gallery_generation_ = 0U;
+        desired_.reset();
+        pending_discrete_.reset();
+        reserved_output_ = {};
+        retained_gallery_ = {};
+        retained_detail_ = {};
+        retained_runtime_ = nullptr;
+        configured_algorithm_ = nullptr;
     }
     [[nodiscard]] bool stopped() const noexcept { return worker_.stopped(); }
     [[nodiscard]] ExploreSnapshot snapshot() const {

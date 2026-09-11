@@ -78,6 +78,7 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     PresentationPixel[[= detail::VisualDiagnosticName{"presentation.pixel"}]],
     PresentationPixelProbeStarted[[= detail::VisualDiagnosticName{"presentation.pixel_probe.started"}]],
     PresentationPixelProbeSubmitted[[= detail::VisualDiagnosticName{"presentation.pixel_probe.submitted"}]],
+    PresentationPixelAfterRelease[[= detail::VisualDiagnosticName{"presentation.pixel_after_release"}]],
     UpscaleStopRequested[[= detail::VisualDiagnosticName{"upscale.stop.requested"}]],
     PresentationReplacement[[= detail::VisualDiagnosticName{"presentation.replacement"}]],
     PresentationRetirement[[= detail::VisualDiagnosticName{"presentation.retirement"}]],

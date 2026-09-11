@@ -169,6 +169,10 @@ impl Component {
             .measured_viewport(columns, first_row, matching_count)
     }
 
+    pub(crate) fn gallery_size(&self) -> Option<iced::Size> {
+        self.state.gallery_size()
+    }
+
     #[cfg(test)]
     pub fn measure_gallery(
         &mut self,

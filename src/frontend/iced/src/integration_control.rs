@@ -1223,8 +1223,9 @@ fn sample_atlas_composition(draw: &AtlasDraw) {
             &samples.points[..samples.count],
             &samples.cards[..samples.card_count],
             &format!(
-                "{{{},\"image_x\":{},\"image_y\":{},\"image_width\":{},\"image_height\":{}}}",
+                "{{{}{},\"image_x\":{},\"image_y\":{},\"image_width\":{},\"image_height\":{}}}",
                 crate::presentation_surface::surface_trace_fields(draw.surface, draw.surface),
+                crate::presentation_surface::gallery_trace_fields(Some(&draw.snapshot)),
                 draw.image.x,
                 draw.image.y,
                 draw.image.width,
@@ -1349,6 +1350,14 @@ impl AtlasDraw {
             .iter()
             .position(|value| *value == compiled_index)
     }
+}
+
+fn atlas_scroll_window(size: iced::Size, columns: u32) -> (u32, f32) {
+    let visible = size.height / (size.width / columns.max(1) as f32);
+    let rows = visible.ceil().max(1.0) as u32;
+    // Cross the next row boundary with margin on either side, using the
+    // widget's actual logical size rather than rounded GPU clip coordinates.
+    (rows, (rows as f32 - visible + 1.0) * 0.5)
 }
 
 pub(crate) fn report_atlas_draw(draw: AtlasDraw, dark: bool, scale: f32) {
@@ -2133,15 +2142,12 @@ enum Phase {
     AtlasRestoreFilter,
     AwaitAtlasRestored,
     AwaitAtlasWindow(bool),
-    AwaitAtlasRows {
-        rows: u32,
-        next_stage: u8,
-    },
     AwaitAtlasScroll(u8),
-    AwaitAtlasReturnMeasured,
+    AwaitAtlasReturnReady,
     AtlasReturnSelect,
-    AtlasAwaySelect,
+    AtlasAwaySelect(u8),
     AwaitAtlasAwayDetail(u8, u64),
+    AwaitAtlasAwayFilter(u8, u64),
     AwaitAtlasAwayReturn,
     AwaitAtlasAwayRestore,
     AwaitAtlasReturnDetail,
@@ -2154,7 +2160,6 @@ enum Phase {
     AwaitVisibleReadSelection(u32, u64),
     AwaitVisibleReadReturn(u32, u64),
     AwaitVisibleReadOscillation(u32, u64, u8),
-    AwaitVisibleReadReleaseReady(u32, u64),
     VisibleReadRelease(u32, u64),
     AwaitVisibleReadComplete(u32),
     AwaitCapacitySlots(u64),
@@ -2304,10 +2309,10 @@ impl Phase {
             | Self::AwaitAtlasEmpty
             | Self::AwaitAtlasRestored
             | Self::AwaitAtlasWindow(_)
-            | Self::AwaitAtlasRows { .. }
             | Self::AwaitAtlasScroll(_)
-            | Self::AwaitAtlasReturnMeasured
+            | Self::AwaitAtlasReturnReady
             | Self::AwaitAtlasAwayDetail(_, _)
+            | Self::AwaitAtlasAwayFilter(_, _)
             | Self::AwaitAtlasAwayReturn
             | Self::AwaitAtlasAwayRestore
             | Self::AwaitAtlasReturnDetail
@@ -2318,7 +2323,6 @@ impl Phase {
             | Self::AwaitVisibleReadFocus(_, _)
             | Self::AwaitVisibleReadSelection(_, _)
             | Self::AwaitVisibleReadOscillation(_, _, _)
-            | Self::AwaitVisibleReadReleaseReady(_, _)
             | Self::AwaitVisibleReadReturn(_, _)
             | Self::AwaitVisibleReadComplete(_)
             | Self::AwaitCapacitySlots(_)
@@ -2613,6 +2617,8 @@ pub struct Controller {
     atlas_drawn: Option<(u64, u8)>,
     atlas_clip: (f32, f32),
     atlas_row_extent: f32,
+    atlas_return_rows: u32,
+    atlas_scroll_fraction: f32,
     atlas_receipt: Option<AtlasDraw>,
     atlas_pixels: Option<AtlasDraw>,
     atlas_composition: Option<AtlasDraw>,
@@ -2775,6 +2781,8 @@ impl Controller {
             atlas_drawn: None,
             atlas_clip: (0.0, 0.0),
             atlas_row_extent: 0.0,
+            atlas_return_rows: 0,
+            atlas_scroll_fraction: 0.0,
             atlas_receipt: None,
             atlas_pixels: None,
             atlas_composition: None,
@@ -3273,10 +3281,52 @@ impl Controller {
         SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None);
     }
 
+    fn scroll_atlas(&mut self, stage: u8) -> Task<RootMessage> {
+        self.phase = Phase::AwaitAtlasScroll(stage);
+        match stage {
+            4 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::END),
+            5 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START),
+            _ => iced::widget::operation::scroll_to(
+                EXPLORE_GALLERY,
+                AbsoluteOffset {
+                    x: 0.0,
+                    y: self.atlas_row_extent
+                        * ([0.0, 1.0, 2.0, 10.0][stage as usize]
+                            + if matches!(stage, 0 | 2) {
+                                self.atlas_scroll_fraction
+                            } else {
+                                0.0
+                            }),
+                },
+            ),
+        }
+    }
+
     fn confirmed_atlas(&self, snapshot: &crate::generated::ExploreSnapshot) -> Option<&AtlasDraw> {
         self.atlas_pixels.as_ref().filter(|draw| {
             draw.snapshot.frame == snapshot.frame && self.atlas_receipt.as_ref() == Some(*draw)
         })
+    }
+
+    fn detail_drawn(
+        &self,
+        model: &ApplicationModel,
+        frame: Option<crate::presentation_surface::FrameReady>,
+        snapshot: &crate::generated::ExploreSnapshot,
+    ) -> bool {
+        snapshot.mode == crate::generated::ExploreMode::Detail
+            && sampleable_presentation(
+                model,
+                frame,
+                crate::generated::PresentationSourceKind::Explore,
+                snapshot.frame.revision,
+            )
+            .is_some_and(|sampleable| {
+                self.viewer_drawn.is_some_and(|(presentation, source, _)| {
+                    source == sampleable.source_revision
+                        && presentation == sampleable.presentation_revision
+                })
+            })
     }
 
     pub(crate) fn accepts_message(&self, message: &Message) -> bool {
@@ -3648,7 +3698,7 @@ impl Controller {
             Phase::GalleryImage(_) => EXPLORE_GALLERY.to_owned(),
             Phase::DetailOriginal { .. } => EXPLORE_DETAIL_ORIGINAL.to_owned(),
             Phase::DetailFit => explore::DETAIL_FIT_ID.to_owned(),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => EXPLORE_GALLERY.to_owned(),
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => EXPLORE_GALLERY.to_owned(),
             Phase::AtlasCapacity => explore::GALLERY_CAPACITY_ID.to_owned(),
             Phase::AtlasEmpty => explore::GALLERY_EMPTY_ID.to_owned(),
             Phase::AtlasOverlay(index) => overlay_control(index, false).to_owned(),
@@ -4246,9 +4296,12 @@ impl Controller {
                 }
                 None
             }
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => {
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => {
                 let returning = matches!(self.phase, Phase::AtlasReturnSelect);
-                let away = matches!(self.phase, Phase::AtlasAwaySelect);
+                let away = match self.phase {
+                    Phase::AtlasAwaySelect(step) => Some(step),
+                    _ => None,
+                };
                 let Some((columns, _rows, _, _, revision)) = self.selection_grid else {
                     return None;
                 };
@@ -4262,8 +4315,8 @@ impl Controller {
                 };
                 self.phase = if returning {
                     Phase::AwaitAtlasReturnDetail
-                } else if away {
-                    Phase::AwaitAtlasAwayDetail(0, 0)
+                } else if let Some(step) = away {
+                    Phase::AwaitAtlasAwayDetail(step, 0)
                 } else {
                     Phase::AwaitDetail(index)
                 };
@@ -6182,7 +6235,9 @@ impl Controller {
                 };
                 let columns = snapshot.viewport.columns.max(1);
                 let rows = snapshot.viewport.rowcount.max(1);
-                if snapshot.revision <= revision
+                // A different logical measurement may resolve to the same
+                // bounded raster. That no-op has no new native revision.
+                if snapshot.revision < revision
                     || snapshot.busy
                     || snapshot.viewport.extent.width > capacity.width
                     || snapshot.viewport.extent.height > capacity.height
@@ -6223,11 +6278,10 @@ impl Controller {
                         ],
                     )
                 });
-                self.phase = Phase::AwaitExploreExactGridPatch {
+                self.advance_to(Phase::AwaitExploreExactGridPatch {
                     revision: snapshot.revision,
                     frame_revision: snapshot.frame.revision,
-                };
-                Task::none()
+                })
             }
             Phase::ExploreDatasetPane => self.arm(EXPLORE_DATASET_PANE),
             Phase::ExploreDetailsPane => self.arm(EXPLORE_DETAILS_PANE),
@@ -6815,7 +6869,7 @@ impl Controller {
                 self.arm(explore::DETAIL_FIT_ID)
             }
             Phase::DetailFit => self.arm(explore::DETAIL_FIT_ID),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect => {
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => {
                 self.arm(EXPLORE_GALLERY)
             }
             Phase::AwaitAtlasCapacity
@@ -6970,12 +7024,16 @@ impl Controller {
                 }
             }
             Phase::VisibleReadScroll(index) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                let row = index / snapshot.viewport.columns.max(1);
                 self.phase = Phase::AwaitVisibleRead(index);
                 iced::widget::operation::scroll_to(
                     EXPLORE_GALLERY,
                     AbsoluteOffset {
                         x: 0.0,
-                        y: self.atlas_row_extent * 5.5,
+                        y: self.atlas_row_extent * (row as f32 + 0.5),
                     },
                 )
             }
@@ -7011,6 +7069,7 @@ impl Controller {
                     height: draw.clip.height / scale,
                 };
                 let Some(target) = target.intersection(&visible_clip) else {
+                    self.fail("held read target does not intersect the actual gallery clip");
                     return Task::none();
                 };
                 if matches!(self.phase, Phase::AwaitVisibleReadPixels(_, _)) {
@@ -7056,12 +7115,9 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.mode != crate::generated::ExploreMode::Detail
+                if !self.detail_drawn(model, frame, snapshot)
                     || snapshot.selectedimage != Some(index)
                     || snapshot.busy
-                    || self
-                        .viewer_drawn
-                        .is_none_or(|(_, revision, _)| revision != snapshot.frame.revision)
                 {
                     return Task::none();
                 }
@@ -7102,11 +7158,12 @@ impl Controller {
                 }
                 crate::presentation_surface::trace_atlas_stage("held-return", draw);
                 self.phase = Phase::AwaitVisibleReadOscillation(index, generation, 0);
+                let row = index / snapshot.viewport.columns.max(1);
                 iced::widget::operation::scroll_to(
                     EXPLORE_GALLERY,
                     AbsoluteOffset {
                         x: 0.0,
-                        y: self.atlas_row_extent * 5.0,
+                        y: self.atlas_row_extent * row as f32,
                     },
                 )
             }
@@ -7114,9 +7171,10 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
+                let row = index / snapshot.viewport.columns.max(1);
                 if snapshot.mode != crate::generated::ExploreMode::Gallery
-                    || snapshot.viewport.firstrow != 5
-                    || snapshot.viewport.rowcount != if stage == 1 { 6 } else { 5 }
+                    || snapshot.viewport.firstrow != row
+                    || snapshot.viewport.rowcount != self.atlas_return_rows + u32::from(stage == 1)
                 {
                     return Task::none();
                 }
@@ -7126,30 +7184,6 @@ impl Controller {
                 else {
                     return Task::none();
                 };
-                crate::presentation_surface::trace_atlas_stage(
-                    ["held-five", "held-six", "held-five-restored"][stage as usize],
-                    draw,
-                );
-                self.phase = if stage == 2 {
-                    Phase::AwaitVisibleReadReleaseReady(index, generation)
-                } else {
-                    Phase::AwaitVisibleReadOscillation(index, generation, stage + 1)
-                };
-                iced::widget::operation::scroll_to(
-                    EXPLORE_GALLERY,
-                    AbsoluteOffset {
-                        x: 0.0,
-                        y: self.atlas_row_extent * if stage == 1 { 5.0 } else { 5.5 },
-                    },
-                )
-            }
-            Phase::AwaitVisibleReadReleaseReady(index, generation) => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else {
-                    return Task::none();
-                };
-                let Some(draw) = self.confirmed_atlas(snapshot) else {
-                    return Task::none();
-                };
                 let Some(slot) = draw.visible_slot(index) else {
                     return Task::none();
                 };
@@ -7157,9 +7191,27 @@ impl Controller {
                     self.fail("held read escaped before pending-return oscillation completed");
                     return Task::none();
                 }
-                crate::presentation_surface::trace_atlas_stage("held-release", draw);
-                self.phase = Phase::VisibleReadRelease(index, generation);
-                Task::none()
+                crate::presentation_surface::trace_atlas_stage(
+                    ["held-aligned", "held-extra", "held-restored"][stage as usize],
+                    draw,
+                );
+                if stage == 2 {
+                    return self.advance_to(Phase::VisibleReadRelease(index, generation));
+                }
+                self.phase = Phase::AwaitVisibleReadOscillation(index, generation, stage + 1);
+                iced::widget::operation::scroll_to(
+                    EXPLORE_GALLERY,
+                    AbsoluteOffset {
+                        x: 0.0,
+                        y: self.atlas_row_extent
+                            * (row as f32
+                                + if stage == 1 {
+                                    0.0
+                                } else {
+                                    self.atlas_scroll_fraction
+                                }),
+                    },
+                )
             }
             Phase::VisibleReadRelease(index, _) => {
                 if self.control_phase.as_ref() == Some(&self.phase) {
@@ -7191,25 +7243,52 @@ impl Controller {
                     snapshot.revision,
                     snapshot.frame.revision,
                 ));
-                self.phase = Phase::AtlasAwaySelect;
+                self.phase = Phase::AtlasAwaySelect(0);
+                self.arm(EXPLORE_GALLERY)
+            }
+            Phase::AwaitAtlasAwayFilter(step, baseline) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery
+                    || snapshot.busy
+                    || settings.has_local_edits()
+                    || model.has_explore_pending()
+                    || snapshot.revision <= baseline
+                    || self.confirmed_atlas(snapshot).is_none()
+                {
+                    return Task::none();
+                }
+                // Filter/order updates deliberately return to Gallery. Observe
+                // that completed product before reopening detail for the next
+                // change; the acceptance driver follows the ordinary API.
+                self.selection_grid = Some((
+                    snapshot.viewport.columns,
+                    snapshot.viewport.rowcount,
+                    0,
+                    snapshot.revision,
+                    snapshot.frame.revision,
+                ));
+                self.phase = Phase::AtlasAwaySelect(step);
                 self.arm(EXPLORE_GALLERY)
             }
             Phase::AwaitAtlasAwayDetail(step, baseline) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.mode != crate::generated::ExploreMode::Detail
+                if !self.detail_drawn(model, frame, snapshot)
                     || snapshot.busy
                     || settings.has_local_edits()
                     || model.has_explore_pending()
                     || snapshot.revision <= baseline
-                    || self
-                        .viewer_drawn
-                        .is_none_or(|(_, revision, _)| revision != snapshot.frame.revision)
                 {
                     return Task::none();
                 }
-                self.phase = Phase::AwaitAtlasAwayDetail(step + 1, snapshot.revision);
+                self.phase = if step < 3 {
+                    Phase::AwaitAtlasAwayFilter(step + 1, snapshot.revision)
+                } else {
+                    Phase::AwaitAtlasAwayDetail(step + 1, snapshot.revision)
+                };
                 match step {
                     0 => explore_message(explore::Message::Dataset(
                         explore::dataset::Message::MinimumCompiledIndexChanged(1),
@@ -7263,25 +7342,7 @@ impl Controller {
                 if let Some(message) = explore_scenario_preparation(snapshot) {
                     return explore_message(message);
                 }
-                self.phase = Phase::AwaitAtlasRows {
-                    rows: 4,
-                    next_stage: 0,
-                };
-                let columns = snapshot.viewport.columns;
-                explore_message(explore::Message::Gallery(
-                    explore::gallery::Message::Measured {
-                        size: iced::Size::new(
-                            self.atlas_row_extent * columns as f32,
-                            self.atlas_row_extent * 3.5,
-                        ),
-                        maximum_extent: snapshot.maximumatlasextent.clone(),
-                        columns,
-                    },
-                ))
-                .chain(iced::widget::operation::snap_to(
-                    EXPLORE_GALLERY,
-                    RelativeOffset::START,
-                ))
+                self.scroll_atlas(0)
             }
             Phase::AwaitCapacitySlots(baseline) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
@@ -7341,28 +7402,34 @@ impl Controller {
                 fullscreen_js(true);
                 Task::none()
             }
-            Phase::AwaitAtlasReturnMeasured => {
+            Phase::AwaitAtlasReturnReady => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
+                let Some(size) = router.explore_gallery_size() else {
+                    return Task::none();
+                };
+                let (rows, fraction) = atlas_scroll_window(size, snapshot.viewport.columns);
                 if snapshot.busy
                     || model.has_explore_pending()
-                    || snapshot.viewport.rowcount != 5
+                    || snapshot.viewport.rowcount != rows
                     || snapshot.viewport.firstrow != 0
+                    || snapshot.gallery.slots.iter().any(|ready| !*ready)
                 {
                     return Task::none();
                 }
                 let Some(draw) = self
-                    .atlas_pixels
-                    .as_ref()
-                    .filter(|draw| draw.snapshot.frame == snapshot.frame)
+                    .confirmed_atlas(snapshot)
+                    .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
                     return Task::none();
                 };
                 crate::presentation_surface::trace_atlas_stage("return-cached", draw);
+                self.atlas_return_rows = rows;
+                self.atlas_scroll_fraction = fraction;
                 self.selection_grid = Some((
                     snapshot.viewport.columns,
-                    5,
+                    rows,
                     0,
                     snapshot.revision,
                     snapshot.frame.revision,
@@ -7374,12 +7441,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.mode != crate::generated::ExploreMode::Detail
-                    || snapshot.busy
-                    || self
-                        .viewer_drawn
-                        .is_none_or(|(_, source, _)| source != snapshot.frame.revision)
-                {
+                if snapshot.busy || !self.detail_drawn(model, frame, snapshot) {
                     return Task::none();
                 }
                 self.phase = Phase::AwaitAtlasOscillation(0);
@@ -7391,7 +7453,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let expected = if stage == 1 { 6 } else { 5 };
+                let expected = self.atlas_return_rows + u32::from(stage == 1);
                 if snapshot.mode != crate::generated::ExploreMode::Gallery
                     || snapshot.viewport.rowcount != expected
                     || snapshot.viewport.firstrow != 0
@@ -7406,7 +7468,7 @@ impl Controller {
                     return Task::none();
                 };
                 crate::presentation_surface::trace_atlas_stage(
-                    ["return-five", "return-six", "return-five-restored"][stage as usize],
+                    ["return-aligned", "return-extra", "return-restored"][stage as usize],
                     draw,
                 );
                 if stage < 2 {
@@ -7416,7 +7478,7 @@ impl Controller {
                         AbsoluteOffset {
                             x: 0.0,
                             y: if stage == 0 {
-                                self.atlas_row_extent * 0.5
+                                self.atlas_row_extent * self.atlas_scroll_fraction
                             } else {
                                 0.0
                             },
@@ -7427,49 +7489,8 @@ impl Controller {
                         self.phase = Phase::AwaitVisibleReadArm(snapshot.viewport.columns * 10);
                         return Task::none();
                     }
-                    self.phase = Phase::AwaitAtlasRows {
-                        rows: 4,
-                        next_stage: 0,
-                    };
-                    let columns = snapshot.viewport.columns.max(1);
-                    explore_message(explore::Message::Gallery(
-                        explore::gallery::Message::Measured {
-                            size: iced::Size::new(
-                                self.atlas_row_extent * columns as f32,
-                                self.atlas_row_extent * 3.5,
-                            ),
-                            maximum_extent: snapshot.maximumatlasextent.clone(),
-                            columns,
-                        },
-                    ))
+                    self.scroll_atlas(0)
                 }
-            }
-            Phase::AwaitAtlasRows { rows, next_stage } => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else {
-                    return Task::none();
-                };
-                if snapshot.busy
-                    || model.has_explore_pending()
-                    || snapshot.viewport.rowcount != rows
-                    || self
-                        .atlas_drawn
-                        .is_none_or(|(source, _)| source != snapshot.frame.revision)
-                {
-                    return Task::none();
-                }
-                self.phase = Phase::AwaitAtlasScroll(next_stage);
-                iced::widget::operation::scroll_to(
-                    EXPLORE_GALLERY,
-                    AbsoluteOffset {
-                        x: 0.0,
-                        y: next_stage as f32 * self.atlas_row_extent
-                            + if matches!(next_stage, 0 | 2) {
-                                37.25
-                            } else {
-                                0.0
-                            },
-                    },
-                )
             }
             Phase::AwaitAtlasScroll(stage) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
@@ -7494,8 +7515,17 @@ impl Controller {
                     .matchingcount
                     .div_ceil(snapshot.viewport.columns.max(1));
                 let settled = match stage {
-                    0 => self.atlas_clip.0 > 0.0,
-                    1..=3 => snapshot.viewport.firstrow == [0, 1, 2, 10][stage as usize],
+                    0..=3 => {
+                        let fractional = matches!(stage, 0 | 2);
+                        snapshot.viewport.firstrow == [0, 1, 2, 10][stage as usize]
+                            && snapshot.viewport.rowcount
+                                == self.atlas_return_rows + u32::from(fractional)
+                            && if fractional {
+                                self.atlas_clip.0 > 0.0
+                            } else {
+                                self.atlas_clip.0.abs() < 1.0
+                            }
+                    }
                     4 => {
                         snapshot.viewport.firstrow + snapshot.viewport.rowcount == total_rows
                             && self.atlas_clip.1.abs() < 1.0
@@ -7523,43 +7553,7 @@ impl Controller {
                     )
                 });
                 match stage {
-                    0 | 1 => {
-                        let rows = 5 - u32::from(stage);
-                        self.phase = Phase::AwaitAtlasRows {
-                            rows,
-                            next_stage: stage + 1,
-                        };
-                        let columns = snapshot.viewport.columns.max(1);
-                        let row_extent = self.atlas_row_extent.max(1.0);
-                        explore_message(explore::Message::Gallery(
-                            explore::gallery::Message::Measured {
-                                size: iced::Size::new(
-                                    row_extent * columns as f32,
-                                    row_extent * (rows as f32 - 0.5),
-                                ),
-                                maximum_extent: snapshot.maximumatlasextent.clone(),
-                                columns,
-                            },
-                        ))
-                    }
-                    2 => {
-                        self.phase = Phase::AwaitAtlasScroll(3);
-                        iced::widget::operation::scroll_to(
-                            EXPLORE_GALLERY,
-                            AbsoluteOffset {
-                                x: 0.0,
-                                y: 10.0 * self.atlas_row_extent,
-                            },
-                        )
-                    }
-                    3 => {
-                        self.phase = Phase::AwaitAtlasScroll(4);
-                        iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::END)
-                    }
-                    4 => {
-                        self.phase = Phase::AwaitAtlasScroll(5);
-                        iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START)
-                    }
+                    0..=4 => self.scroll_atlas(stage + 1),
                     _ => {
                         if self.session.profile == "retained" && self.viewer_scenario == "rapid" {
                             if !crate::presentation_surface::begin_capacity_acceptance() {
@@ -7620,16 +7614,9 @@ impl Controller {
                 });
                 self.atlas_baseline = Some((snapshot.frame.revision, snapshot.augmentation.seed));
                 if index == 7 {
-                    self.phase = Phase::AwaitAtlasReturnMeasured;
-                    let columns = snapshot.viewport.columns.max(1);
-                    let row_extent = self.atlas_row_extent.max(1.0);
-                    explore_message(explore::Message::Gallery(
-                        explore::gallery::Message::Measured {
-                            size: iced::Size::new(row_extent * columns as f32, row_extent * 4.75),
-                            maximum_extent: snapshot.maximumatlasextent.clone(),
-                            columns,
-                        },
-                    ))
+                    let continuation = self.advance_to(Phase::AwaitAtlasReturnReady);
+                    iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START)
+                        .chain(continuation)
                 } else {
                     self.phase = Phase::AtlasOverlay(index + 1);
                     self.arm(overlay_control(index + 1, false))
@@ -9422,6 +9409,32 @@ mod tests {
             );
             assert!(driver.reporting.state_is_absent());
         }
+        // The oversized measurement can resolve to the already committed
+        // raster, so native viewport deduplication need not publish a revision.
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.viewport = crate::generated::ExploreViewport {
+            extent: crate::generated::VisualExtent {
+                width: 810,
+                height: 810,
+            },
+            firstrow: 0,
+            rowcount: 3,
+            columns: 3,
+        };
+        snapshot.busy = false;
+        driver.oversized_capacity = Some(crate::generated::VisualExtent {
+            width: 1920,
+            height: 1080,
+        });
+        driver.phase = Phase::AwaitExploreExactGrid(revision);
+        drive(&mut driver, &model);
+        assert_eq!(
+            driver.phase,
+            Phase::AwaitExploreExactGridPatch {
+                revision,
+                frame_revision: source,
+            }
+        );
         let annotation = model.annotation.snapshot.as_mut().unwrap();
         annotation.ready = true;
         annotation.ui.documentrevision = 1;
@@ -9796,6 +9809,44 @@ mod tests {
                 .is_err()
         );
         initialize_reporting(false, false);
+    }
+
+    #[test]
+    fn atlas_scroll_uses_real_geometry_to_add_one_row_without_resizing_pixels() {
+        for size in [
+            iced::Size::new(896.0, 896.0),
+            iced::Size::new(896.0, 896.6667),
+            iced::Size::new(896.0, 895.3333),
+            iced::Size::new(600.0, 712.5),
+        ] {
+            for columns in [3, 4, 5, 10] {
+                let (rows, fraction) = atlas_scroll_window(size, columns);
+                assert!(fraction > 0.0 && fraction < 1.0);
+                let geometry = |fraction| {
+                    crate::view::explore::state::gallery_geometry_at_fraction(
+                        size.width,
+                        size.height,
+                        crate::generated::VisualExtent {
+                            width: 1920,
+                            height: 1080,
+                        },
+                        columns,
+                        1_000,
+                        0,
+                        fraction,
+                    )
+                    .unwrap()
+                };
+                let aligned = geometry(0.0);
+                let fractional = geometry(fraction);
+                assert_eq!(aligned.viewport().rowcount, rows);
+                assert_eq!(fractional.viewport().rowcount, rows + 1);
+                assert_eq!(
+                    aligned.viewport().extent.width,
+                    fractional.viewport().extent.width
+                );
+            }
+        }
     }
 
     #[test]

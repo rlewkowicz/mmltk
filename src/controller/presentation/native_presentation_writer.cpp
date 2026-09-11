@@ -329,6 +329,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 ReportPixels();
             } else if (stage_ == Stage::ReleasePending) {
                 stage_ = Stage::ReleaseComplete;
+                ReportPixels(VisualDiagnosticOperation::PresentationPixelAfterRelease);
                 // Includes optional probe reads and the browser's actual source
                 // read. Neither the ready callback nor probe success releases it.
                 ReleaseRead();
@@ -605,6 +606,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             transfer.pending.link);
         source.timeline->WaitForRelease(Stream(), transfer.ready + 1U);
         release_wait_submitted_ = true;
+        SamplePixels();
         stage_ = Stage::ReleasePending;
         EnqueueCompletion();
         if (candidate_ && source.arena() == candidate_->id) {
@@ -671,14 +673,14 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             probe_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });
         } catch (...) { probe_failed_ = true; }
     }
-    void ReportPixels() {
+    void ReportPixels(VisualDiagnosticOperation operation = VisualDiagnosticOperation::PresentationPixel) {
         if (!probe_pending_) return;
         probe_pending_ = false;
         if (!diagnostics_.pixel_probes_enabled()) return;
         const auto* values = static_cast<const std::uint32_t*>(pixels_->data());
         std::array<VisualDiagnosticFact, 25U> facts;
         for (std::size_t index = 0U; index != facts.size(); ++index) {
-            facts[index] = Fact(VisualDiagnosticOperation::PresentationPixel, *transfer_, 0U);
+            facts[index] = Fact(operation, *transfer_, 0U);
             facts[index].context.pixel = {.sample_index = static_cast<std::uint32_t>(index),
                                           .sample_x = pixel_coordinates_[2U * index],
                                           .sample_y = pixel_coordinates_[2U * index + 1U],

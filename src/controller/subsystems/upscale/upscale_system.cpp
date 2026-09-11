@@ -632,7 +632,10 @@ class UpscaleSystem::Impl final {
                                 .completed = request,
                                 .frame = record.frame,
                             };
-                            if (desired_ == request) Select(record);
+                            if (desired_ == request)
+                                Select(record);
+                            else if (selected_.valid())
+                                runtime.SelectOutput(selected_);
                             if (desired_) RefreshAvailability(*desired_);
                             AdvanceRevision();
                         }
@@ -810,6 +813,7 @@ class UpscaleSystem::Impl final {
     }
     void Select(const Record& record) {
         auto scene = record.document->scene;
+        worker_.SelectOutput(record.product);
         selected_ = record.product;
         state_.ready = true;
         state_.kernel = record.request.kernel;

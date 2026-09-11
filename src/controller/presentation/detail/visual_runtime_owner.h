@@ -76,6 +76,9 @@ class VisualRuntimeOwner final {
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] bool busy() const noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView Borrow() const;
+    // Select a retained product for both raw reads and workspace preparation.
+    // Selection changes no pixels and leaves an active candidate independent.
+    void SelectOutput(const Runtime::CompletedOutput&);
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
     void RequestWorkspace(VisualWorkspaceRequest);

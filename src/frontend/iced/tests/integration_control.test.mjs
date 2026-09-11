@@ -14,7 +14,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     original.push([name, Object.getOwnPropertyDescriptor(globalThis, name)]);
     Object.defineProperty(globalThis, name, {value, configurable: true, writable: true});
   };
-  const microtasks = [], frames = [], events = [], reports = [];
+  const microtasks = [], frames = [], events = [], reports = [], lines = [];
   const allocations = {maps: 0, sets: 0, scratch: 0, reads: 0, copies: 0, listeners: 0, clock: 0};
   const css = {x: 0, y: 0, left: 0, top: 0, width: 640, height: 480};
   const canvas = {
@@ -33,7 +33,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     removeEventListener: () => { allocations.listeners--; },
   });
   install('performance', {now: () => { allocations.clock++; return 0; }});
-  install('dump', line => reports.push(JSON.parse(line)));
+  install('dump', line => { lines.push(line); reports.push(JSON.parse(line)); });
   install('PointerEvent', class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
   install('queueMicrotask', callback => microtasks.push(callback));
   install('requestAnimationFrame', callback => frames.push(callback));
@@ -72,7 +72,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
       queue.shift()();
     }
   };
-  return {canvas, css, sampling, allocations, events, reports, frames, microtasks,
+  return {canvas, css, sampling, allocations, events, reports, lines, frames, microtasks,
     flushMicrotasks: () => drain(microtasks), flushFrames: () => drain(frames)};
 }
 
@@ -407,13 +407,17 @@ test('partial atlas sampling reports each exact ready card and reuses canvas sto
   const results = [];
   browser.mmltkIntegrationReceipt(gallery, 'partial', 7, 11);
   browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery),
-    [0, 0, 8, 8, 10, 10, 4, 4], [3, 9], '{"presentation_revision":11}', 7, 11,
+    [0, 0, 8, 8, 10, 10, 4, 4], [3, 9],
+    '{"presentation_revision":11,"dataset_identity":10848950138688527399}', 7, 11,
     (...values) => results.push(values));
   f.flushFrames();
   assert.deepEqual(results, [['observed', 2, 2]]);
   const cells = f.reports.filter(record => record.event === 'integration.atlas_ready_cell');
   assert.deepEqual(cells.map(record => record.compiled_index), [3, 9]);
   assert.ok(cells.every(record => record.matched && record.presentation_revision === 11));
+  const cellLines = f.lines.filter(line => line.includes('"event":"integration.atlas_ready_cell"'));
+  assert.equal(cellLines.length, 2);
+  assert.ok(cellLines.every(line => line.includes('"dataset_identity":10848950138688527399')));
   assert.equal(f.allocations.scratch, 1);
   assert.equal(f.allocations.reads, 2);
   assert.deepEqual(f.events, []);

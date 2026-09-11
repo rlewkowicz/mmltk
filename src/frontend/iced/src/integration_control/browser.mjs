@@ -172,7 +172,7 @@ export function mmltkIntegrationDriverDraw(control, sourceRevision, presentation
   dispatchIntegrationSurfaceClick();
 }
 
-function report(record) {
+function report(record, fields = '{}') {
   if (!integrationState) return;
   record.elapsed_ms = performance.now();
   if (!integrationState.initialAtlasCompleted && record.event === 'integration.explore_open_submission' && record.detail === 'submitted') {
@@ -182,7 +182,11 @@ function report(record) {
     integrationState.initialAtlasWithoutInput = false;
     integrationState.initialAtlasCompleted = true;
   }
-  const line = JSON.stringify(record);
+  // Rust owns these serialized identities. Parsing and stringifying them in
+  // JavaScript rounds native u64 values through Number.
+  const identity = fields.trim().slice(1, -1).trim();
+  const encoded = JSON.stringify(record);
+  const line = identity ? `{${identity},${encoded.slice(1)}` : encoded;
   if (typeof globalThis.dump === 'function') globalThis.dump(`${line}\n`);
   else console.error(line);
 }
@@ -239,9 +243,9 @@ export function mmltkIntegrationAtlasPixels(receipt, rectangles, cards, fields, 
           cell_sample_y: Math.round(((y + Math.floor(height / 2) + .5 - identity.image[1]) % side) / side * identity.card_extent * 1000),
           cell_sample_rgba: rgba,
         } : {};
-        report({event: 'integration.atlas_ready_cell', ...identity, ...sample,
+        report({event: 'integration.atlas_ready_cell', ...sample,
           compiled_index: cards[i / 4], canvas_x: x, canvas_y: y,
-          sampled_pixels: width * height, colored_pixels: colored, matched});
+          sampled_pixels: width * height, colored_pixels: colored, matched}, fields);
       }
       report({event: 'integration.atlas_canvas_sample', control: 'explore.gallery.workspace',
         detail: 'javascript-pixel-counts', a: String(sourceRevision), b: String(presentationRevision),
@@ -286,7 +290,6 @@ export function mmltkIntegrationAtlasComposition(receipt, points, cards, fields,
       const canvas = document.querySelector('canvas');
       if (!canvas) throw new Error('missing composition canvas');
       const context = canvasSnapshot(canvas);
-      const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 10) {
         const [x,y,screenX,screenY,r,g,b,a,kind,card] = points.slice(i,i+10);
         const observed = Array.from(context.getImageData(Math.floor(screenX),Math.floor(screenY),1,1).data);
@@ -294,11 +297,11 @@ export function mmltkIntegrationAtlasComposition(receipt, points, cards, fields,
         const valid = observed.every((value,index)=>Math.abs(value-expected[index])<=4);
         matched += Number(valid);
         emitted += Number(kind !== 4);
-        report({event:kind === 4 ? 'integration.atlas_grid_pixel' : 'integration.atlas_composition',...identity,columns,card,kind,
+        report({event:kind === 4 ? 'integration.atlas_grid_pixel' : 'integration.atlas_composition',columns,card,kind,
           sample_x:x,sample_y:y,canvas_x:screenX,canvas_y:screenY,expected,observed,
-          matched:valid});
+          matched:valid}, fields);
       }
-      report({event:'integration.atlas_composition_complete',...identity,columns,cards,emitted});
+      report({event:'integration.atlas_composition_complete',columns,cards,emitted}, fields);
       completed('observed', points.length/10,matched);
     } catch (error) {
       report({event:'integration.failure', detail:`atlas composition read: ${error}`});
@@ -326,13 +329,12 @@ function runBoundaryPixels({points,fields,control,source,presentation,receipt}) 
       const canvas = document.querySelector('canvas');
       if (!canvas) return;
       const context = canvasSnapshot(canvas);
-      const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 5) {
         const [x,y,screenX,screenY,sample_index] = points.slice(i,i+5);
         const rgba = context.getImageData(Math.floor(screenX),Math.floor(screenY),1,1).data;
-        report({event:'iced.surface.canvas_pixel',...identity,control,sample_index,sample_x:x,sample_y:y,
+        report({event:'iced.surface.canvas_pixel',control,sample_index,sample_x:x,sample_y:y,
           canvas_x:screenX,canvas_y:screenY,
-          sample_rgba:(rgba[0]|rgba[1]<<8|rgba[2]<<16|rgba[3]<<24)>>>0});
+          sample_rgba:(rgba[0]|rgba[1]<<8|rgba[2]<<16|rgba[3]<<24)>>>0}, fields);
       }
     } finally {
       if (integrationState === receipt.owner) {

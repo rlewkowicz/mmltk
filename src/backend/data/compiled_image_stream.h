@@ -93,6 +93,10 @@ class CompiledImageStream final {
     // Borrow only the slot's completion event for work that consumes no input
     // image, including retained Explore tiles after a cancelled read.
     void fence(std::size_t slot, void* stream, CompletionObserver observer);
+    // Settle submitted GPU consumers without waiting for unrelated disk reads.
+    // Callers retain every still-reading slot and its source/metadata custody.
+    void wait_consumers();
+    void synchronize(std::size_t slot);
     void synchronize();
     // Terminal physical release, called before the owning CUDA context leaves scope.
     void close();

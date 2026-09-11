@@ -3600,6 +3600,8 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
 }
 
 TEST_CASE("Explore storage diagnostics aggregate renderer and all three output slots lazily") {
+    const bool logging_enabled = GENERATE(false, true);
+    CAPTURE(logging_enabled);
     class StorageAlgorithm final : public TestExploreAlgorithm {
        public:
         explicit StorageAlgorithm(std::shared_ptr<std::atomic<std::size_t>> calls)
@@ -3624,6 +3626,7 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
         VisualDiagnosticFact storage{};
         std::atomic_bool enabled{true};
     } capture;
+    capture.enabled.store(logging_enabled);
     const VisualDiagnosticSink diagnostics{
         .context = &capture,
         .write =
@@ -3665,7 +3668,7 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
     REQUIRE(physical);
     const auto outputs = physical->OutputStorageFootprint();
     CHECK(outputs.device_bytes == 4U * 32U * 32U * 4U);
-    {
+    if (logging_enabled) {
         std::scoped_lock lock(capture.mutex);
         CHECK(capture.storage.value == 101U);
         CHECK(capture.storage.context.gpu_bytes == 1000U + outputs.device_bytes);
@@ -3675,16 +3678,16 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
         CHECK(capture.storage.context.augmentation_device_bytes == 50U);
         CHECK(capture.storage.context.augmentation_pinned_bytes == 25U);
     }
-    capture.enabled.store(false);
-    const auto collected = calls->load();
-    const auto before_disabled = explore.snapshot().frame.revision;
+    const auto before_restore = explore.snapshot().frame.revision;
     overlay.show_masks = !overlay.show_masks;
     static_cast<void>(explore.UpdateOverlay(overlay));
     REQUIRE(events.Wait([&] {
         const auto current = explore.snapshot();
-        return current.frame.revision > before_disabled && current.overlay == overlay;
+        return current.frame.revision > before_restore && current.overlay == overlay;
     }));
-    CHECK(calls->load() == collected);
+    // Settle every continuation before checking the complete logging mode.
+    explore.Shutdown();
+    CHECK((calls->load() != 0U) == logging_enabled);
 }
 
 TEST_CASE("Explore Open rejects never-loaded settings before runtime construction") {
@@ -5527,6 +5530,7 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
         static_cast<void>(upscale.Start(request));
         REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().kernel == selected; }));
         const auto completed = upscale.snapshot().frame;
+        CHECK(upscale.ObserveWorkspace().product_revision == completed.revision);
         const auto copied = copies.load();
         const auto inferred = runs->load();
         {
@@ -5632,6 +5636,7 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
     CHECK(selected.pending->kernel == UpscaleKernel::RealPlksr);
     CHECK(selected.frame == cached[0U]);
     CHECK(selected.frame.revision < cached[1U].revision);
+    CHECK(upscale.ObserveWorkspace().product_revision == selected.frame.revision);
     CHECK(diagnostics.reused_revision.load() == selected.frame.revision);
     CHECK(diagnostics.reused_meaning.load() == test_document({}).document->facts().meaning_identity);
     CHECK(diagnostics.reused_observation.load() == selected.revision);
@@ -5641,6 +5646,7 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
     gate->release.set_value();
     REQUIRE(events.Wait([&] { return !upscale.snapshot().busy; }));
     CHECK(upscale.snapshot().frame == cached[0U]);
+    CHECK(upscale.ObserveWorkspace().product_revision == cached[0U].revision);
     for (const auto& method : upscale.snapshot().methods)
         CHECK(method.available);
     CHECK(upscale.Start(test_upscale_request({source.frame(), UpscaleKernel::RealPlksr})).kernel == UpscaleKernel::RealPlksr);

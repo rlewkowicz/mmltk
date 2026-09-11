@@ -544,9 +544,44 @@ struct SurfaceAudit final {
         std::map<std::uint64_t, std::uint64_t> publications;
         std::map<std::uint64_t, std::uint64_t> samples;
     };
+    class SourceLifecycle final {
+       public:
+        [[nodiscard]] bool Observe(const unsigned step, const bool shutdown) {
+            if (retired_) return false;
+            if (step <= 3U) {
+                if (cancelled_ || admission_ + 1U != step) return false;
+                admission_ = step;
+                return true;
+            }
+            if (admission_ == 0U) return false;
+            if (step == 4U) {
+                if (withdrawn_) return false;
+                withdrawn_ = true;
+                return true;
+            }
+            if (step != 5U || (!withdrawn_ && !shutdown)) return false;
+            retired_ = true;
+            return true;
+        }
+        [[nodiscard]] bool ready() const noexcept { return admission_ == 3U; }
+        [[nodiscard]] bool live() const noexcept { return ready() && !withdrawn_ && !retired_; }
+        [[nodiscard]] bool retired() const noexcept { return retired_; }
+        [[nodiscard]] bool cancelled() const noexcept { return cancelled_; }
+        [[nodiscard]] bool Cancel() noexcept {
+            if (admission_ == 0U || ready() || !withdrawn_ || retired_ || cancelled_) return false;
+            cancelled_ = true;
+            return true;
+        }
+
+       private:
+        unsigned admission_ = 0U;
+        bool withdrawn_ = false;
+        bool retired_ = false;
+        bool cancelled_ = false;
+    };
     struct SourceState final {
-        unsigned native_stage = 0U;
-        unsigned browser_stage = 0U;
+        SourceLifecycle native;
+        SourceLifecycle browser;
         // CLEANUP-IGNORE: This independent source lifecycle oracle compares native and browser evidence; it cannot reuse their production
         // schema.
         bool failed = false;
@@ -564,13 +599,13 @@ struct SurfaceAudit final {
         std::string arena;
     };
     std::map<std::string, SourceState, std::less<>> sources;
-    void source_transition(const std::string& id, const std::string_view event, const bool browser) {
+    void source_transition(const std::string& id, const std::string_view event, const bool browser, const std::uint64_t code = 0U) {
         if (!valid_identity(id) || (!sources.contains(id) && sources.size() == kAcceptanceGenerationLimit)) {
             reject("source admission evidence has invalid identity or exceeds capacity");
             return;
         }
         auto& source = sources[id];
-        auto& stage = browser ? source.browser_stage : source.native_stage;
+        auto& lifecycle = browser ? source.browser : source.native;
         unsigned next = 0U;
         if (event.ends_with("admitted") || event.ends_with("admission.enqueued"))
             next = 1U;
@@ -583,15 +618,16 @@ struct SurfaceAudit final {
         else if (event.ends_with("retired") || event.ends_with("retirement"))
             next = 5U;
         else if (event.ends_with("import_failed")) {
+            if (code == 1U && lifecycle.Cancel()) return;
             source.failed = true;
+            reject("source import failed without a valid withdrawal");
             return;
         } else
             return;
-        if (next == 5U && native_shutdown && !browser) stage = 4U;
-        if (stage + 1U != next)
+        // Withdrawal closes admission while an already claimed import may
+        // still finish. Physical retirement is the terminal boundary.
+        if (!lifecycle.Observe(next, native_shutdown && !browser))
             reject("source admission or retirement is missing, duplicate, or reordered");
-        else
-            stage = next;
     }
     struct Draw final {
         std::string selected;
@@ -604,6 +640,7 @@ struct SurfaceAudit final {
     std::size_t browser_ordinal = 0U;
     bool native_shutdown = false;
     bool browser_shutdown = false;
+    bool browser_exited = false;
 
     void reject(const std::string_view why) {
         if (failure.empty()) failure = why;
@@ -651,6 +688,7 @@ struct SurfaceAudit final {
         if (event.starts_with("presentation.copy.")) reject("Presentation performed an obsolete pixel copy");
         native_shutdown = native_shutdown || event == "shutdown.requested";
         browser_shutdown = browser_shutdown || event == "shutdown.firefox_terminal";
+        browser_exited = browser_exited || event == "shutdown.firefox_terminal";
         if (event.starts_with("presentation.source.admission.") || event == "presentation.source.ready" ||
             event == "presentation.source.withdrawal" || event == "presentation.source.retirement") {
             if (scalar(record, "outcome") != 1U) reject("native source admission or retirement failed");
@@ -794,7 +832,7 @@ struct SurfaceAudit final {
                                           scalar(record, "source_revision"),
                                           scalar(record, "source_width"),
                                           scalar(record, "source_height")};
-                    if (admitted == sources.end() || admitted->second.native_stage != 3U || read.allocation == 0U ||
+                    if (admitted == sources.end() || !admitted->second.native.live() || read.allocation == 0U ||
                         admitted->second.allocation != read.allocation || read.session == 0U || read.frame == 0U || read.width == 0U ||
                         read.height == 0U || read.width > admitted->second.width || read.height > admitted->second.height)
                         reject("source read does not name its admitted workspace allocation");
@@ -853,7 +891,7 @@ struct SurfaceAudit final {
             if (event.ends_with("claim_outcome") && record.value("outcome", "") != "claimed")
                 reject("Firefox failed to claim an admitted source");
             const std::string id = record.value("surface", "");
-            source_transition(id, event, true);
+            source_transition(id, event, true, scalar(record, "code"));
             if (event == "firefox.workspace.source.admitted" && failure.empty()) {
                 auto& source = sources.at(id);
                 source.browser_width = scalar(record, "width");
@@ -925,8 +963,8 @@ struct SurfaceAudit final {
             const std::string source_id = record.value("source", "");
             const auto source = sources.find(source_id);
             const auto key = std::pair{scalar(record, "presentation_revision"), scalar(record, "transfer_sequence")};
-            if (source == sources.end() || source->second.arena != id || source->second.browser_stage < 3U ||
-                source->second.browser_stage > 4U || key.first == 0U || key.second == 0U || scalar(record, "content_session") == 0U ||
+            if (source == sources.end() || source->second.arena != id || !source->second.browser.ready() ||
+                source->second.browser.retired() || key.first == 0U || key.second == 0U || scalar(record, "content_session") == 0U ||
                 scalar(record, "content_sequence") == 0U)
                 reject("release-only completion lacks its exact admitted source transfer");
             else if (!state.releases
@@ -948,7 +986,7 @@ struct SurfaceAudit final {
             auto& receipt = state.receipts[publication];
             if (event == "firefox.workspace.frame_forwarded") {
                 const auto source = sources.find(observed.source);
-                if (receipt.stage != 0U || observed.transfer == 0U || source == sources.end() || source->second.browser_stage != 3U ||
+                if (receipt.stage != 0U || observed.transfer == 0U || source == sources.end() || !source->second.browser.live() ||
                     source->second.arena != id || observed.width > source->second.browser_width ||
                     observed.height > source->second.browser_height || scalar(record, "timeline_ready") != observed.transfer * 2U - 1U ||
                     scalar(record, "timeline_release") != observed.transfer * 2U)
@@ -1064,7 +1102,12 @@ struct SurfaceAudit final {
     }
 
     [[nodiscard]] bool source_joined(const SourceState& source) const {
-        return !source.failed && source.native_stage >= 3U && source.browser_stage >= 3U && source.generation != 0U &&
+        // A withdrawn native request consumes its terminal acknowledgement
+        // without installing a timeline. The receiver still proves whether
+        // initialization completed or the unclaimed import was cancelled.
+        const bool initialized = (source.native.ready() || source.native.retired()) && source.browser.ready();
+        const bool cancelled = source.native.retired() && source.browser.retired() && source.browser.cancelled() && !source.native.ready();
+        return !source.failed && (initialized || cancelled) && source.generation != 0U &&
                source.width == source.browser_width && source.height == source.browser_height && source.allocation != 0U &&
                source.allocation == source.browser_allocation && valid_identity(source.arena);
     }
@@ -1097,7 +1140,12 @@ struct SurfaceAudit final {
             if (!transfer.released || copied == state.releases.contains(key)) return false;
         }
         for (const auto& [publication, custody] : state.custody) {
-            if (custody.selected != custody.encoded || custody.encoded != custody.settled + custody.abandoned) return false;
+            if (custody.selected != custody.encoded) return false;
+            // Process exit ends the page's remaining readers without delivering
+            // JavaScript callbacks. It does not establish a successful draw.
+            // A live page or an explicitly destroyed texture still needs every
+            // ordinary submission receipt; bridge closure alone is insufficient.
+            if (custody.encoded != custody.settled + custody.abandoned && !(browser_exited && state.retired == 0U)) return false;
             if (state.retired != 0U && custody.acquired && !custody.released) return false;
         }
         for (const auto& [publication, frame] : state.samples) {
@@ -1152,7 +1200,7 @@ struct SurfaceAudit final {
         if (!failure.empty()) return false;
         for (const auto& [id, source] : sources) {
             if (!source_joined(source)) return false;
-            if (source.native_stage == 5U && source.browser_stage != 5U && !browser_shutdown) return false;
+            if (source.native.retired() && !source.browser.retired() && !browser_shutdown) return false;
         }
         for (const auto& [id, state] : surfaces) {
             if (state.native_stage != 4U || !receipts_joined(id, state)) return false;
@@ -1188,7 +1236,7 @@ struct SurfaceAudit final {
         }
         std::erase_if(sources, [&](const auto& item) {
             const auto& [id, source] = item;
-            return source.native_stage == 5U && source.browser_stage == 5U && source_joined(source) && !surfaces.contains(source.arena);
+            return source.native.retired() && source.browser.retired() && source_joined(source) && !surfaces.contains(source.arena);
         });
         draws.clear();
     }
@@ -1260,12 +1308,15 @@ struct PixelBoundaryAudit final {
         std::string boundary{expected};
         boundary.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(boundary.front())));
         if (failed.value("boundary", "") != boundary) return {};
-        const auto surface = failed.value("surface", "");
+        const auto source = failed.value("source", "");
+        if (!SurfaceAudit::valid_identity(source)) return {};
         const bool allocation = expected == "allocation";
         bool forwarded = false, recovered = false;
         for (const auto& [key, publication] : samples) {
+            if (publication.forwarded.empty()) continue;
             const auto& receipt = publication.receivers[0].identity;
-            if (key.first == surface) {
+            const bool same_source = publication.forwarded.value("workspace_source", "") == source;
+            if (same_source) {
                 for (const auto receiver : {0U, 1U}) {
                     const auto& evidence = publication.receivers[receiver].identity;
                     if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
@@ -1291,12 +1342,12 @@ struct PixelBoundaryAudit final {
                 scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
-            if (allocation && key.first != surface && !receipt.empty() &&
+            if (allocation && !same_source && !receipt.empty() &&
                 scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
         }
-        return {.forwarded = forwarded || (allocation && failed_probe_retirements.contains(surface)), .recovered = recovered};
+        return {.forwarded = forwarded || (allocation && failed_probe_retirements.contains(source)), .recovered = recovered};
     }
 
     [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
@@ -1550,10 +1601,12 @@ struct PixelBoundaryAudit final {
                     reject("completed sample produced an unexplained black viewer canvas");
             }
         }
-        if (width == 384U && height == 384U && scalar(fact, "allocation_generation") > 1U && scalar(fact, "capacity_width") > width &&
-            scalar(fact, "capacity_height") > height)
-            retained_logical_content = true;
-        if (source.complete() && width == 1536U && height == 1536U && scalar(fact, "allocation_generation") > 1U) upscale_growth = true;
+        if (std::ranges::all_of(publication.counted, [](const bool value) { return value; })) {
+            // Automatic Basic may supersede the raw detail before display.
+            // Any completely joined logical crop proves high-water sampling.
+            if (width < scalar(fact, "capacity_width") || height < scalar(fact, "capacity_height")) retained_logical_content = true;
+            if (width == 1536U && height == 1536U) upscale_growth = true;
+        }
     }
 
     void consume(const nlohmann::json& record) {
@@ -1566,10 +1619,10 @@ struct PixelBoundaryAudit final {
                 probe_failures.push_back(record);
             return;
         }
-        if (event == "firefox.workspace.retired") {
+        if (event == "firefox.workspace.source.retired") {
             const auto surface = record.value("surface", "");
             if (!surface.empty() &&
-                std::ranges::any_of(probe_failures, [&](const auto& failed) { return failed.value("surface", "") == surface; }))
+                std::ranges::any_of(probe_failures, [&](const auto& failed) { return failed.value("source", "") == surface; }))
                 failed_probe_retirements.insert(surface);
             return;
         }
@@ -1839,6 +1892,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     PixelBoundaryAudit partial;
     fill(partial, owned, true);
     CHECK(partial.joined.back() == 0U);
+    CHECK_FALSE(partial.retained_logical_content);
     for (const auto field :
          {"source_instance", "clean_revision", "source_observation_revision", "content_x", "capacity_width", "timeline_ready"}) {
         PixelBoundaryAudit audit;
@@ -1909,7 +1963,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         auto failed = pixel("firefox.workspace.probe_failed", boundary);
         failed["presentation_revision"] = 6U;
         failed["transfer_sequence"] = 3U;
-        if (allocation) failed["surface"] = "allocation-failed-surface";
+        if (allocation) failed["source"] = "00000000000000030000000000000005";
         audit.consume(failed);
         CHECK_FALSE(audit.probe_failure_complete(target));
         auto ordinary = failed;
@@ -1918,6 +1972,15 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         audit.consume(ordinary);
         CHECK(audit.probe_failure_complete(target));
         CHECK(audit.probe_failure_evidence(target).complete());
+        auto reused_counter = audit;
+        reused_counter.samples.try_emplace(PixelBoundaryAudit::Key{surface, 10U});
+        CHECK(reused_counter.probe_failure_evidence(target).complete());
+        auto unrelated = audit.samples.at({surface, 7U});
+        unrelated.forwarded["workspace_source"] = "00000000000000030000000000000006";
+        for (auto& receiver : unrelated.receivers)
+            receiver.identity["transfer_sequence"] = scalar(failed, "transfer_sequence");
+        reused_counter.samples.emplace(PixelBoundaryAudit::Key{surface, 8U}, std::move(unrelated));
+        CHECK(reused_counter.probe_failure_evidence(target).complete());
         auto before_viewer = audit;
         before_viewer.successful_viewer.reset();
         CHECK(before_viewer.probe_failure_evidence(target).complete());
@@ -2884,7 +2947,7 @@ struct AtlasDrawAudit final {
     using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>;
     static constexpr std::initializer_list<const char*> source_fields{
         "content_session", "source_kind",    "source_instance",  "source_revision",
-        "content_width",   "content_height", "dataset_identity", "gallery_generation",
+        "content_width",   "content_height", "dataset_identity",
         "columns",         "rows",           "first_row",        "matching_count",
         "visible_indices", "row_capacity",   "row_origin",       "card_extent"};
     static constexpr std::initializer_list<const char*> image_fields{
@@ -2934,8 +2997,8 @@ struct AtlasDrawAudit final {
         } else if (*staged_allocation != allocation) {
             return;
         } else {
-            if (previous_staged_rows == 4U && rows == 5U) staged_transitions |= 1U;
-            if (previous_staged_rows == 5U && rows == 4U) staged_transitions |= 2U;
+            if (rows == previous_staged_rows + 1U) staged_transitions |= 1U;
+            if (previous_staged_rows == rows + 1U) staged_transitions |= 2U;
         }
         grid_round_trip = staged_transitions == 3U;
         previous_staged_rows = rows;
@@ -2981,17 +3044,17 @@ struct AtlasDrawAudit final {
             return;
         }
         if (name.starts_with("held-")) {
-            constexpr std::array held_names{"held-visible",       "held-return",  "held-five",    "held-six",
-                                            "held-five-restored", "held-release", "held-complete"};
+            constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
             bool matching = held_stages.size() < held_names.size() && name == held_names[held_stages.size()] && last_draw &&
                             same_fields(record, *last_draw, source_fields) && sample_key(record) == sample_key(*last_draw) &&
                             ready_pixels_complete(record);
             if (matching && held_stages.contains("held-visible")) {
                 const auto& baseline = held_stages.at("held-visible");
-                matching = same_fields(record, baseline, {"columns", "card_extent", "dataset_identity"}) &&
-                           record["clip"][3] == baseline["clip"][3] && scalar(record, "first_row") == 5U;
-                if (name == "held-five" || name == "held-five-restored") matching = matching && scalar(record, "rows") == 5U;
-                if (name == "held-six") matching = matching && scalar(record, "rows") == 6U;
+                matching = same_fields(record, baseline, {"columns", "card_extent", "dataset_identity", "first_row"}) &&
+                           record["clip"][3] == baseline["clip"][3];
+                if (name == "held-aligned" || name == "held-extra" || name == "held-restored")
+                    matching = matching && return_baseline &&
+                               scalar(record, "rows") == scalar(*return_baseline, "rows") + (name == "held-extra" ? 1U : 0U);
             }
             valid = valid && matching;
             if (matching) held_stages.emplace(name, record);
@@ -2999,14 +3062,14 @@ struct AtlasDrawAudit final {
             return;
         }
         if (name.starts_with("return-")) {
-            constexpr std::array return_names{"return-cached", "return-five", "return-six", "return-five-restored"};
+            constexpr std::array return_names{"return-cached", "return-aligned", "return-extra", "return-restored"};
             bool matching = return_stage < return_names.size() && name == return_names[return_stage] && last_draw &&
                             same_fields(record, *last_draw, source_fields) && sample_key(record) == sample_key(*last_draw) &&
                             ready_pixels_complete(record);
             if (matching && return_baseline) {
                 matching = same_fields(record, *return_baseline, {"columns", "card_extent", "dataset_identity"}) &&
                            record["clip"][3] == (*return_baseline)["clip"][3] && scalar(record, "first_row") == 0U &&
-                           scalar(record, "rows") == (return_stage == 2U ? 6U : 5U);
+                           scalar(record, "rows") == scalar(*return_baseline, "rows") + (return_stage == 2U ? 1U : 0U);
             }
             valid = valid && matching;
             if (matching) {
@@ -3112,8 +3175,9 @@ struct AtlasDrawAudit final {
             if (std::ranges::any_of(key, [](const auto value) { return value == 0U; })) {
                 valid = false;
             } else if (existing != sources.end()) {
-                // Selection and completion can observe the same pixels with
-                // newer readiness metadata. Their source geometry must agree.
+                // Cached pixels retain their source revision when a new work
+                // generation observes them. Only their physical source facts
+                // are immutable; readiness is checked on each actual draw.
                 valid = valid && same_fields(record, existing->second, source_fields);
             } else if (sources.size() >= kAcceptanceRecordLimit || sessions.contains(session)) {
                 valid = false;
@@ -5565,8 +5629,12 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         FAIL("workspace Wayland acceptance exceeded its configured deadline during shutdown");
     }
     const int terminal = *terminal_result;
-    consume_records(last);
-    if (last) native_cursor.finish();
+    // Keep the settled prefix fixed through scenario checks and rollover.
+    // Later records remain in the retained cursors for the next scenario.
+    if (last) {
+        consume_records(true);
+        native_cursor.finish();
+    }
     const std::string native_text = read_tail(diagnostics);
     const std::string browser_text = read_tail(firefox_log);
 
@@ -5660,7 +5728,16 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE(native.admission_seen);
                 REQUIRE(native.admission_priority_valid);
                 REQUIRE(native.admitted_reads.contains({visible_read_held->generation, visible_read_held->compiled_index}));
-                REQUIRE(browser.atlas_draws.held_stages.size() == 7U);
+                REQUIRE(browser.atlas_draws.held_stages.size() == 6U);
+                for (const auto& [stage, draw] : browser.atlas_draws.held_stages) {
+                    CAPTURE(stage);
+                    const auto& indices = draw["visible_indices"];
+                    const auto held = std::ranges::find(indices, nlohmann::json(visible_read_held->compiled_index));
+                    REQUIRE(held != indices.end());
+                    const auto slot = static_cast<std::size_t>(held - indices.begin());
+                    REQUIRE(slot < draw["ready_slots"].size());
+                    CHECK(draw["ready_slots"][slot] == (stage == "held-complete"));
+                }
                 REQUIRE(capacity_held.has_value());
                 REQUIRE(capacity_available);
                 const auto source = SurfaceAudit::native_identity(
@@ -5685,7 +5762,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     std::uint64_t workspace_bytes = 0U, workspaces = 0U, arenas = 0U, copies = 0U, release_only = 0U;
                     std::uint64_t encodings = 0U, settlements = 0U, abandonments = 0U, reader_releases = 0U;
                     for (const auto& [id, allocation] : surface_audit.sources) {
-                        if (allocation.native_stage < 5U) {
+                        if (!allocation.native.retired()) {
                             ++workspaces;
                             workspace_bytes += allocation.bytes;
                         }
@@ -6341,6 +6418,28 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
     CHECK(audit.failure.empty());
 }
 
+TEST_CASE("receiver process exit terminates page readers without fabricating draw completion", "[workspace][audit]") {
+    const std::string boundary = GENERATE("shutdown", "bridge", "exit", "premature-texture-destruction");
+    SurfaceAudit audit;
+    for (const char* event : native_surface_events)
+        audit.native(native_surface_record(event));
+    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    REQUIRE(audit.failure.empty());
+    REQUIRE_FALSE(audit.evidence_settled());
+    audit.native({{"event", "shutdown.requested"}});
+    if (boundary == "bridge")
+        audit.browser({{"event", "firefox.workspace.channel_terminal"}, {"terminal", "orderly_bridge_close"}});
+    if (boundary == "premature-texture-destruction")
+        audit.browser(browser_surface_record("iced.surface.texture_destroyed"));
+    if (boundary == "exit" || boundary == "premature-texture-destruction")
+        audit.native({{"event", "shutdown.firefox_terminal"}});
+    CHECK(audit.joined_failure().empty() == (boundary == "exit"));
+    const auto& custody = audit.surfaces.begin()->second.custody.begin()->second;
+    CHECK(custody.settled == 0U);
+    CHECK(custody.abandoned == 0U);
+}
+
 TEST_CASE("physical lifecycle custody rejects capacity overflow instead of dropping provenance", "[workspace][audit]") {
     SurfaceAudit audit;
     for (std::size_t identity = 1U; identity <= kAcceptanceGenerationLimit; ++identity)
@@ -6445,16 +6544,22 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     record_receiver_withdrawal(dropped_candidate_retirement);
     CHECK_FALSE(dropped_candidate_retirement.joined_failure().empty());
 
-    SurfaceAudit used_pending;
-    for (const char* event : native_surface_events)
-        used_pending.native(native_surface_record(event));
-    for (std::size_t index = 0U; index < 14U; ++index)
-        used_pending.browser(browser_surface_record(browser_surface_events[index]));
-    used_pending.browser(browser_surface_record("firefox.workspace.withdrawal"));
-    used_pending.browser(browser_surface_record("iced.surface.pending_discarded"));
-    used_pending.browser(browser_surface_record("iced.surface.texture_destroyed"));
-    used_pending.browser(browser_surface_record("firefox.workspace.retired"));
-    CHECK(used_pending.joined_failure().empty());
+    for (const bool released : {false, true}) {
+        CAPTURE(released);
+        SurfaceAudit used_pending;
+        for (const char* event : native_surface_events)
+            used_pending.native(native_surface_record(event));
+        for (const char* event : browser_surface_events) {
+            used_pending.browser(browser_surface_record(event));
+            if (std::string_view{event} == "iced.surface.sample_acquired") break;
+        }
+        used_pending.browser(browser_surface_record("firefox.workspace.withdrawal"));
+        used_pending.browser(browser_surface_record("iced.surface.pending_discarded"));
+        if (released) used_pending.browser(browser_surface_record("iced.frame.sample_released"));
+        used_pending.browser(browser_surface_record("iced.surface.texture_destroyed"));
+        used_pending.browser(browser_surface_record("firefox.workspace.retired"));
+        CHECK(used_pending.joined_failure().empty() == released);
+    }
 
     for (const bool observed_native_outcome : {false, true}) {
         SurfaceAudit rejected;
@@ -6968,13 +7073,14 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
         stage["event"] = "iced.surface.scroll_stage";
         stage["control"] = names[index];
         for (const auto* defect : {"source", "surface", "width", "height", "presentation", "row", "clip", "missing", "clipped"}) {
+            CAPTURE(index, defect);
             auto invalid_audit = complete;
             auto invalid_stage = stage;
             const std::string_view kind{defect};
             if (kind == "source") invalid_stage["source_instance"] = 2U;
             if (kind == "surface") invalid_stage["surface"] = "000000000000000b000000000000000d";
             if (kind == "width") invalid_stage["width"] = 1024U;
-            if (kind == "height") invalid_stage["height"] = 1024U;
+            if (kind == "height") invalid_stage["height"] = scalar(stage, "height") + 1U;
             if (kind == "presentation") invalid_stage["presentation_revision"] = 1U;
             if (kind == "row") invalid_stage["first_row"] = 99U;
             if (kind == "clip") invalid_stage["clip"][1] = 20.0;
@@ -6992,9 +7098,16 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
         CHECK(complete.stages.contains(names[index]));
         auto duplicate = complete;
         source["ready_slots"] = std::vector<bool>{true, true};
+        source["gallery_generation"] = scalar(source, "gallery_generation") + 1U;
+        source["source_observation_revision"] = scalar(source, "source_observation_revision") + 1U;
         duplicate.consume(source);
         CHECK(duplicate.valid);
-        for (const auto* field : {"dataset_identity", "gallery_generation", "first_row", "content_width"}) {
+        auto observed_draw = draw;
+        observed_draw["gallery_generation"] = source["gallery_generation"];
+        observed_draw["source_observation_revision"] = source["source_observation_revision"];
+        duplicate.consume(observed_draw);
+        CHECK(duplicate.valid);
+        for (const auto* field : {"dataset_identity", "first_row", "content_width"}) {
             auto conflicting = complete;
             auto conflicting_source = source;
             conflicting_source[field] = scalar(source, field) + 1U;
@@ -7054,7 +7167,7 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
                 if (kind == "generation") draw["generation"] = 8U;
                 if (kind == "surface") draw["surface"] = "000000000000000b000000000000000d";
                 if (kind == "width") draw["width"] = 1024U;
-                if (kind == "height") draw["height"] = 1024U;
+                if (kind == "height") draw["height"] = scalar(draw, "height") + 1U;
             }
             publish(audit, draw);
             CHECK(audit.valid);
@@ -7099,6 +7212,71 @@ TEST_CASE("Source retirement remains independent of a retained sample arena", "[
     CHECK(audit.evidence_settled());
     audit.browser(browser_surface_record("firefox.workspace.source.retired"));
     CHECK_FALSE(audit.failure.empty());
+}
+
+TEST_CASE("Source withdrawal permits claimed initialization to finish before retirement", "[workspace][audit]") {
+    const auto native_early = GENERATE(false, true);
+    const auto browser_early = GENERATE(false, true);
+    const auto install_native_timeline = GENERATE(false, true);
+    SurfaceAudit audit;
+    for (const bool browser : {false, true}) {
+        const std::array events = browser
+            ? std::array{"firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome",
+                         "firefox.workspace.source.ready", "firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}
+            : std::array{"presentation.source.admission.enqueued", "presentation.source.admission.written",
+                         "presentation.source.ready", "presentation.source.withdrawal", "presentation.source.retirement"};
+        const auto observe = [&](SurfaceAudit& target, const std::size_t stage) {
+            if (browser)
+                target.browser(browser_surface_record(events[stage]));
+            else
+                target.native(native_surface_record(events[stage]));
+        };
+        observe(audit, 0U);
+        auto missing_claim = audit;
+        observe(missing_claim, 2U);
+        CHECK_FALSE(missing_claim.failure.empty());
+        observe(audit, 1U);
+        auto premature_retirement = audit;
+        observe(premature_retirement, 4U);
+        CHECK_FALSE(premature_retirement.failure.empty());
+        const bool early = browser ? browser_early : native_early;
+        if (!browser && !install_native_timeline) {
+            observe(audit, 3U);
+        } else {
+            observe(audit, early ? 3U : 2U);
+            observe(audit, early ? 2U : 3U);
+        }
+        auto duplicate = audit;
+        observe(duplicate, 3U);
+        CHECK_FALSE(duplicate.failure.empty());
+        observe(audit, 4U);
+        auto after_retirement = audit;
+        observe(after_retirement, 2U);
+        CHECK_FALSE(after_retirement.failure.empty());
+        REQUIRE(audit.failure.empty());
+    }
+    CHECK(audit.evidence_settled());
+}
+
+TEST_CASE("Source cancellation settles the exact unclaimed admission without a ready product", "[workspace][audit]") {
+    const auto omitted = GENERATE("", "failure", "withdrawal", "retirement");
+    SurfaceAudit audit;
+    for (const auto* event : {"presentation.source.admission.enqueued", "presentation.source.admission.written",
+                              "presentation.source.withdrawal", "presentation.source.retirement"})
+        audit.native(native_surface_record(event));
+    audit.browser(browser_surface_record("firefox.workspace.source.admitted"));
+    if (std::string_view{omitted} != "withdrawal")
+        audit.browser(browser_surface_record("firefox.workspace.source.withdrawal"));
+    auto cancelled = browser_surface_record("firefox.workspace.source.import_failed");
+    cancelled["code"] = 1U;
+    if (std::string_view{omitted} != "failure") audit.browser(cancelled);
+    if (std::string_view{omitted} != "retirement")
+        audit.browser(browser_surface_record("firefox.workspace.source.retired"));
+    CHECK(audit.evidence_settled() == std::string_view{omitted}.empty());
+    if (std::string_view{omitted}.empty()) {
+        audit.browser(cancelled);
+        CHECK_FALSE(audit.failure.empty());
+    }
 }
 
 TEST_CASE("Source publication audit requires exact physical receiver receipts", "[workspace][audit]") {
@@ -7248,7 +7426,7 @@ TEST_CASE("fixed gallery return rejects any intermediate readiness or ready-pixe
          {"none", "placeholder", "missing-cell", "black-cell", "wrong-cell", "origin", "capacity", "clip"}) {
         INFO(defect);
         AtlasDrawAudit audit;
-        constexpr std::array names{"return-cached", "return-five", "return-six", "return-five-restored"};
+        constexpr std::array names{"return-cached", "return-aligned", "return-extra", "return-restored"};
         for (std::size_t step = 0U; step < names.size(); ++step) {
             const auto rows = step == 2U ? 6U : 5U;
             auto draw = atlas_draw_record(300U + step, 0U, rows, step == 2U ? -75.0 : 0.0);

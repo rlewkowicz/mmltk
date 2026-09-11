@@ -1021,8 +1021,10 @@ bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
         desired_generation_.store(State().plan.generation, std::memory_order_release);
         if ((publication_change_ != ExploreOutputChange::Unchanged || restored_mode) && State().plan.mode == ExploreMode::Gallery) {
             std::scoped_lock lock(lanes_mutex_);
-            for (auto& lane : lanes_)
-                if (lane->state == LaneState::InputReady) RebindInput(*lane);
+            for (auto& lane : lanes_) {
+                lane->reserved_generation = 0U;
+                ReconcileInitializationLane(*lane);
+            }
         }
         if ((publication_change_ == ExploreOutputChange::Initialize || overlay_undo_ || restored_mode) &&
             State().plan.mode == ExploreMode::Gallery)
@@ -1659,8 +1661,8 @@ void GalleryStream::Impl::RebindInput(Lane& lane) {
 void GalleryStream::Impl::StartIdleLanes() {
     const auto generation = desired_generation_.load(std::memory_order_acquire);
     if (!Current(generation)) return;
-    // Rollback quiesces candidate ingress. Rebind the acceptance gate to the
-    // restored stream before resuming unfinished reads.
+    // Rebind the acceptance gate to restored demand. In-flight reads keep
+    // their physical lanes through cancellation and view changes.
     if (acceptance_) acceptance_->AdvanceGeneration(generation);
     for (std::size_t lane_index = 0U; lane_index != lanes_.size(); ++lane_index) {
         if (!Current(generation)) return;
@@ -2560,7 +2562,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
     DiagnoseRendered(clean, semantic, stream, plan.generation, *plan.selected_image, *plan.selected_image);
     FlushProbes(stream);
     EnsureCuda(cudaStreamSynchronize(cuda_stream), "Explore detail completion failed");
-    image_stream_.synchronize();
+    image_stream_.synchronize(lane.index);
     descriptors_pending_ = false;
     lane.state = reusable_lane ? LaneState::InputReady : LaneState::Idle;
 }
@@ -3122,11 +3124,10 @@ explore::ExploreRenderTargetView GalleryStream::Impl::Target(const mmltk::framew
 
 void GalleryStream::Impl::Suspend() {
     desired_generation_.store(0U, std::memory_order_release);
-    image_stream_.cancel_reads();
     if (acceptance_) acceptance_->AdvanceGeneration(0U);
-    image_stream_.wait_reads();
-    image_stream_.synchronize();
     if (stream_ != nullptr && cudaStreamSynchronize(stream_) != cudaSuccess) throw std::runtime_error("Explore gallery quiescence failed");
+    image_stream_.wait_consumers();
+    image_stream_.synchronize(detail_lane_->index);
     if (diagnostic_stream_ != nullptr && cudaStreamSynchronize(diagnostic_stream_) != cudaSuccess)
         throw std::runtime_error("Explore diagnostic quiescence failed");
     descriptors_pending_ = false;
@@ -3135,7 +3136,7 @@ void GalleryStream::Impl::Suspend() {
     descriptor_layout_ = {};
     std::scoped_lock lock(lanes_mutex_);
     for (auto& lane : lanes_) {
-        if (lane->state == LaneState::Idle) continue;
+        if (lane->state != LaneState::GpuPending && lane->state != LaneState::GpuComplete) continue;
         if (lane->failure)
             lane->state = LaneState::Failed;
         else
@@ -3148,6 +3149,8 @@ void GalleryStream::Impl::Suspend() {
 
 void GalleryStream::Impl::Quiesce() {
     Suspend();
+    image_stream_.cancel_reads();
+    image_stream_.synchronize();
     std::scoped_lock lock(lanes_mutex_);
     for (auto& lane : lanes_) {
         lane->state = LaneState::Idle;

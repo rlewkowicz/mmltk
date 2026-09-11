@@ -4,10 +4,12 @@
 
 #include "WebGPUChild.h"
 
+#include <cerrno>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <utility>
 
 #include "Adapter.h"
@@ -607,10 +609,13 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
     event->InitCustomEvent(api.cx(), aCopyComplete ? u"gpuexternaltexturecopycomplete"_ns : u"gpuexternaltextureframe"_ns, false,
                            false, detail);
     event->SetTrusted(true);
-    nsGlobalWindowInner::Cast(window)->DispatchEvent(*event);
     if (WorkspaceAcceptanceTraceEnabled()) {
-      std::fprintf(
-          stderr,
+      // Dispatch can synchronously release this sample. Record the receipt
+      // before entering page code, and append it in one write so other
+      // processes cannot split a diagnostic record between format fields.
+      char line[512];
+      const int length = std::snprintf(
+          line, sizeof(line),
           "{\"event\":\"firefox.workspace.%s\",\"surface\":\"%016" PRIx64
           "%016" PRIx64 "\",\"layer\":%" PRIu64
           ",\"slot\":%" PRIu32 ",\"content_session\":%" PRIu64
@@ -622,8 +627,14 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
           aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
           aContentSequence, aPresentationRevision, aContentWidth,
           aContentHeight);
-      std::fflush(stderr);
+      if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
+        ssize_t written;
+        do {
+          written = ::write(STDERR_FILENO, line, static_cast<size_t>(length));
+        } while (written < 0 && errno == EINTR);
+      }
     }
+    nsGlobalWindowInner::Cast(window)->DispatchEvent(*event);
   }
   return IPC_OK();
 }
