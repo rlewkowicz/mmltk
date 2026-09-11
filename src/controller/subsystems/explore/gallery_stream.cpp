@@ -327,9 +327,9 @@ class GalleryStream::Impl final {
         PayloadLayout layout{};
         std::size_t index = 0U;
         LaneState state = LaneState::Idle;
-        // Physical descriptor generation: render readiness and completed GPU
-        // publication require this to match, even when a newer demand adopts
-        // the source read. Failure/cancellation decisions use DemandGeneration.
+        // Physical descriptor generation gates admission and atlas publication.
+        // Fully submitted cache pixels may complete under newer demand.
+        // Failure/cancellation decisions use DemandGeneration.
         std::uint64_t generation = 0U;
         // A new scheduler may claim an in-flight read without changing any
         // payload/generation fields still observed by its completion callback.
@@ -410,10 +410,12 @@ class GalleryStream::Impl final {
     [[nodiscard]] data::CompiledImageStream::CompletionObserver LaneCompletion() noexcept;
     void SeedPlaceholders(std::span<const explore::ExploreRenderClassDescriptor>, mmltk::frameworks::gpu::ImagePlaneView,
                           mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
-    void RenderAtlasBatch(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::uint32_t,
-                          std::uint64_t);
+    enum class AtlasBatch : std::uint8_t { Placeholders, Cache };
+    enum class BatchSubmission : std::uint8_t { Skipped, Complete };
+    [[nodiscard]] BatchSubmission RenderAtlasBatch(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
+                                                  std::uintptr_t, std::uint32_t, std::uint64_t, AtlasBatch);
     void RenderAtlasPlane(explore::ExploreRenderAtlasView, const explore::ExploreRenderTileBatchView&, const ExploreOverlay&,
-                          mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, bool);
+                          mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, bool, explore::detail::ExploreRenderDemand);
     void RenderDetailPlane(explore::ExploreRenderDetailView, const ExploreOverlay&, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t,
                            bool);
     void DiagnoseDescriptors(std::uint64_t, std::uint64_t, std::size_t, std::size_t, std::size_t) const;
@@ -1017,9 +1019,9 @@ void GalleryStream::Impl::CompleteTiles(const bool synchronized) {
         if (lane->state != LaneState::GpuComplete && !(synchronized && lane->state == LaneState::GpuPending)) continue;
         const auto position = State().cache.Position(lane->compiled_index);
         if (position == std::numeric_limits<std::size_t>::max() || State().cache.Slot(position) != lane->cache_slot) continue;
-        // Pixel completion is independent of whether the old demand can still
-        // publish an atlas. Retain useful completed work before rebinding the
-        // next viewport; output readiness is installed only by PlaceTile.
+        // Only a completely submitted batch enters GpuPending. Its successful
+        // settlement is independent of whether the old demand can still
+        // publish an atlas; output readiness is installed only by PlaceTile.
         SaveSlot(position);
         State().cache.Complete(position, lane->compiled_index, std::move(lane->pending_meaning), lane->semantic_identity,
                                lane->cache_bank, lane->semantic_bank);
@@ -1849,7 +1851,7 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
                           .max_tile_width = side,
                           .max_tile_height = side,
                           .viewport_generation = State().plan.generation},
-                         State().plan.overlay, CachePlane(true), stream, true);
+                         State().plan.overlay, CachePlane(true), stream, true, Demand());
         descriptors_pending_ = true;
         SettleDescriptors();
         for (const auto slot : slots) {
@@ -2220,11 +2222,13 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
         descriptors_pending_ = true;
         return PublicationFacts(0U);
     }
+    // From descriptor upload through every raster pass, exceptions and skipped
+    // admission retain scratch and source custody for ordinary settlement.
+    descriptors_pending_ = true;
     UploadDescriptors(cuda_stream, true);
-    if (!Current(generation)) {
-        descriptors_pending_ = true;
-        return PublicationFacts(0U);
-    }
+    const auto submission = RenderAtlasBatch(CachePlane(false), CachePlane(true), stream, static_cast<std::uint32_t>(tile_count),
+                                             generation, AtlasBatch::Cache);
+    if (submission == BatchSubmission::Skipped) return PublicationFacts(0U);
     diagnostics_.Emit([&] {
         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                     .operation = VisualDiagnosticOperation::ExploreRenderSubmitted,
@@ -2234,14 +2238,14 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
                                     .detail = State().cumulative_tiles,
                                     .context = {.condition = background}};
     });
-    RenderAtlasBatch(CachePlane(false), CachePlane(true), stream, static_cast<std::uint32_t>(tile_count), generation);
     if (acceptance_)
         acceptance_->ObserveSubmission(
             stream, background ? ExploreAcceptanceGate::SubmissionStage::Background : ExploreAcceptanceGate::SubmissionStage::Foreground);
-    descriptors_pending_ = true;
     {
         std::scoped_lock lock(lanes_mutex_);
         for (Lane* const lane : ready_lanes) {
+            // Staged meaning alone is insufficient: only the return from all
+            // required cache passes allows a source release to complete a tile.
             lane->state = LaneState::GpuPending;
         }
     }
@@ -2473,15 +2477,22 @@ void GalleryStream::Impl::SeedPlaceholders(const std::span<const explore::Explor
     }
     auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     UploadDescriptors(cuda_stream, true);
-    RenderAtlasBatch(clean, semantic, stream, static_cast<std::uint32_t>(descriptor_layout_.tiles.count),
-                     desired_generation_.load(std::memory_order_acquire));
+    static_cast<void>(RenderAtlasBatch(clean, semantic, stream, static_cast<std::uint32_t>(descriptor_layout_.tiles.count),
+                                      desired_generation_.load(std::memory_order_acquire), AtlasBatch::Placeholders));
     descriptors_pending_ = true;
 }
 
-void GalleryStream::Impl::RenderAtlasBatch(const mmltk::frameworks::gpu::ImagePlaneView clean,
+auto GalleryStream::Impl::RenderAtlasBatch(const mmltk::frameworks::gpu::ImagePlaneView clean,
                                            const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream,
-                                           const std::uint32_t tile_count, const std::uint64_t generation) {
-    if (!Current(generation)) return;
+                                           const std::uint32_t tile_count, const std::uint64_t generation,
+                                           const AtlasBatch purpose) -> BatchSubmission {
+    const bool cache = purpose == AtlasBatch::Cache;
+    if (cache && acceptance_) acceptance_->ObserveSubmission(stream, ExploreAcceptanceGate::SubmissionStage::BeforeCacheAdmission);
+    if (!Current(generation)) return BatchSubmission::Skipped;
+    // Admission commits this bounded cache batch, including backend base and
+    // box passes. Later viewport demand controls atlas authorization, never
+    // whether retained pixels were completely produced.
+    const auto demand = cache ? explore::detail::ExploreRenderDemand{} : Demand();
     const auto card_extent = explore_atlas_card_extent(State().viewport);
     const explore::ExploreRenderAtlasView atlas{
         .card_extent = card_extent,
@@ -2496,16 +2507,19 @@ void GalleryStream::Impl::RenderAtlasBatch(const mmltk::frameworks::gpu::ImagePl
         .max_tile_height = card_extent,
         .viewport_generation = generation,
     };
-    RenderAtlasPlane(atlas, batch, State().plan.overlay, clean, stream, false);
-    if (!Current(generation)) return;
-    RenderAtlasPlane(atlas, batch, State().plan.overlay, semantic, stream, true);
+    RenderAtlasPlane(atlas, batch, State().plan.overlay, clean, stream, false, demand);
+    if (cache && acceptance_) acceptance_->ObserveSubmission(stream, ExploreAcceptanceGate::SubmissionStage::CacheCleanSubmitted);
+    if (!cache && !Current(generation)) return BatchSubmission::Skipped;
+    RenderAtlasPlane(atlas, batch, State().plan.overlay, semantic, stream, true, demand);
+    return BatchSubmission::Complete;
 }
 
 void GalleryStream::Impl::RenderAtlasPlane(explore::ExploreRenderAtlasView atlas, const explore::ExploreRenderTileBatchView& batch,
                                            const ExploreOverlay& overlay, const mmltk::frameworks::gpu::ImagePlaneView target,
-                                           const std::uintptr_t stream, const bool semantic) {
+                                           const std::uintptr_t stream, const bool semantic,
+                                           const explore::detail::ExploreRenderDemand demand) {
     atlas.draw_base = semantic ? 0U : 1U;
-    if (explore::render_explore_atlas_tiles(atlas, batch, Semantics(overlay, semantic), Scratch(), Target(target), stream, Demand()) !=
+    if (explore::render_explore_atlas_tiles(atlas, batch, Semantics(overlay, semantic), Scratch(), Target(target), stream, demand) !=
         explore::kExploreStorageSuccess)
         throw std::runtime_error("Explore retained atlas renderer failed");
 }

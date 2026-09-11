@@ -345,7 +345,7 @@ class ExploreAcceptanceGate final {
     // Test controls are installed before constructing the native runtime.
     void SetProductObserver(void*, void (*)(void*, ProductObservation) noexcept) noexcept;
     void ObserveProduct(ProductObservation) const noexcept;
-    enum class SubmissionStage : std::uint8_t { Foreground, Background, Probe };
+    enum class SubmissionStage : std::uint8_t { Foreground, Background, Probe, BeforeCacheAdmission, CacheCleanSubmitted };
     void SetSubmissionObserver(void*, void (*)(void*, std::uintptr_t, SubmissionStage)) noexcept;
     void ObserveSubmission(std::uintptr_t, SubmissionStage) const;
     // Install before admitting reads; invoked outside the lane control mutex.

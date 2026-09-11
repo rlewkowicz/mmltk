@@ -22,6 +22,7 @@
 #include <mutex>
 #include <new>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -284,6 +285,8 @@ class NativeGallery final {
     ExploreStorageFootprint transaction_storage{};
     GalleryGpuPause* pause = nullptr;
     GalleryGpuPause* probe_pause = nullptr;
+    std::optional<ExploreAcceptanceGate::SubmissionStage> supersede_at;
+    std::atomic_bool superseded{false};
     std::atomic<std::size_t> logical_copies{0U};
 
     explicit NativeGallery(const std::uint32_t columns, const bool delayed = false, const bool observed_submission = false) {
@@ -301,6 +304,10 @@ class NativeGallery final {
                 gate->SetSubmissionObserver(
                     this, [](void* context, const std::uintptr_t stream, const ExploreAcceptanceGate::SubmissionStage stage) {
                         auto& gallery = *static_cast<NativeGallery*>(context);
+                        if (gallery.supersede_at == stage) {
+                            gallery.demand->store(0U);
+                            gallery.superseded.store(true);
+                        }
                         if (stage == ExploreAcceptanceGate::SubmissionStage::Background && gallery.pause) gallery.pause->Submit(stream);
                         if (stage == ExploreAcceptanceGate::SubmissionStage::Probe && gallery.probe_pause)
                             gallery.probe_pause->Submit(stream);
@@ -1402,6 +1409,96 @@ TEST_CASE("Native superseded background work preserves incumbent planes and mean
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     CHECK(gallery.Pixels(1U) == semantic);
+}
+
+TEST_CASE("Native cache admission retains only completely submitted obsolete pixels", "[explore][native][cache]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    using Stage = ExploreAcceptanceGate::SubmissionStage;
+    const auto checkpoint = GENERATE(Stage::BeforeCacheAdmission, Stage::CacheCleanSubmitted, Stage::Background);
+    CAPTURE(checkpoint);
+    const auto check_labels = [](const auto& actual, const auto& expected) {
+        REQUIRE(actual.size() == expected.size());
+        for (std::size_t index = 0U; index != actual.size(); ++index) {
+            CHECK(actual[index].box == expected[index].box);
+            CHECK(actual[index].category == expected[index].category);
+            CHECK(actual[index].compiled_index == expected[index].compiled_index);
+        }
+    };
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-admission"};
+    const auto path = directory.path() / "compiled.bin";
+    // One visible image and one speculative image make the affected cache
+    // identity independent of asynchronous read completion order.
+    write_gallery_artifact(path, 0.25F, 9U, 2U);
+    NativeGallery reference{1U};
+    reference.plan.viewport = {.extent = {8U, 8U}, .row_count = 1U, .columns = 1U};
+    reference.Open(path);
+    reference.Drain();
+    reference.plan.viewport.first_row = 1U;
+    ++reference.plan.generation;
+    reference.demand->store(reference.plan.generation);
+    const auto expected_ready = reference.Begin().ready_slots;
+    const auto expected_clean = reference.Pixels(0U);
+    const auto expected_semantic = reference.Pixels(1U);
+    const auto expected_labels = reference.algorithm->Labels();
+    REQUIRE(expected_ready == std::vector<bool>{true});
+    REQUIRE_FALSE(expected_labels.empty());
+    REQUIRE(std::ranges::any_of(expected_semantic, [](const auto byte) { return byte != 0U; }));
+
+    GalleryGpuPause pause;
+    NativeGallery gallery{1U, false, true};
+    gallery.plan.viewport = reference.plan.viewport;
+    gallery.plan.viewport.first_row = 0U;
+    gallery.Open(path);
+    gallery.WaitForReadyTiles();
+    static_cast<void>(gallery.Step());
+    const auto incumbent_clean = gallery.Pixels(0U);
+    const auto incumbent_semantic = gallery.Pixels(1U);
+    const auto incumbent_labels = gallery.algorithm->Labels();
+    const auto before = gallery.evidence.BackgroundSubmissions();
+    gallery.supersede_at = checkpoint;
+    if (checkpoint == Stage::Background) gallery.pause = &pause;
+    auto submitted = std::async(std::launch::async, [&] {
+        gallery.runtime->BindContext();
+        while (!gallery.superseded.load()) {
+            const auto epoch = gallery.evidence.Epoch();
+            static_cast<void>(gallery.algorithm->AdvanceGallery());
+            if (!gallery.superseded.load()) gallery.evidence.Wait(epoch);
+        }
+    });
+    if (checkpoint == Stage::Background) {
+        const bool entered = pause.Wait();
+        pause.Release();
+        REQUIRE(entered);
+    }
+    submitted.get();
+    gallery.pause = nullptr;
+    gallery.supersede_at.reset();
+    gallery.runtime->BindContext();
+    const bool admitted = checkpoint != Stage::BeforeCacheAdmission;
+    CHECK(gallery.evidence.BackgroundSubmissions() == before + (admitted ? 1U : 0U));
+    CHECK(gallery.Pixels(0U) == incumbent_clean);
+    CHECK(gallery.Pixels(1U) == incumbent_semantic);
+    check_labels(gallery.algorithm->Labels(), incumbent_labels);
+    const auto reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
+    const auto renders = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
+    gallery.plan.viewport.first_row = 1U;
+    ++gallery.plan.generation;
+    gallery.demand->store(gallery.plan.generation);
+    const auto revisited = gallery.Begin();
+    CHECK(revisited.ready_slots == std::vector<bool>{admitted});
+    CHECK(revisited.reused_tiles == (admitted ? 1U : 0U));
+    if (!admitted) {
+        CHECK(revisited.remaining_tiles == 1U);
+        CHECK(gallery.algorithm->Labels().empty());
+    }
+    gallery.Drain();
+    CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
+    CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders + (admitted ? 0U : 1U));
+    CHECK(gallery.algorithm->AdvanceGallery().ready_slots == expected_ready);
+    CHECK(gallery.Pixels(0U) == expected_clean);
+    CHECK(gallery.Pixels(1U) == expected_semantic);
+    check_labels(gallery.algorithm->Labels(), expected_labels);
 }
 
 TEST_CASE("Native submitted GPU work settles after Stop without publication or new reads", "[explore][native][shutdown]") {
