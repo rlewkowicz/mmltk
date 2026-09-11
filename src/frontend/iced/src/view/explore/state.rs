@@ -145,23 +145,6 @@ impl GalleryGeometry {
             card_extent,
         })
     }
-
-    fn compiled_index_at(
-        &self,
-        content_x: u32,
-        content_y: u32,
-        visible_indices: &[u32],
-    ) -> Option<u32> {
-        let column = content_x / self.card_extent;
-        let row = content_y / self.card_extent;
-        if column >= self.viewport.columns || row >= self.viewport.rowcount {
-            return None;
-        }
-        let slot = row
-            .checked_mul(self.viewport.columns)?
-            .checked_add(column)? as usize;
-        visible_indices.get(slot).copied()
-    }
 }
 
 #[derive(Debug, Default)]
@@ -545,7 +528,8 @@ fn selected_at(
         return None;
     }
     let slot = row.checked_mul(layout.columns)?.checked_add(column)? as usize;
-    snapshot.gallery.slots.get(slot).copied().filter(|ready| *ready)?;
+    // A displayed placeholder already identifies its image. Readiness governs
+    // completed pixels and labels, independently of selection and hover focus.
     snapshot.order.visibleindices.get(slot).copied()
 }
 
@@ -562,6 +546,32 @@ mod tests {
 
     fn capacity(width: u32, height: u32) -> VisualExtent {
         VisualExtent { width, height }
+    }
+
+    fn displayed_gallery_snapshot() -> ExploreSnapshot {
+        let mut snapshot = explore_snapshot();
+        snapshot.ready = true;
+        snapshot.mode = crate::generated::ExploreMode::Gallery;
+        snapshot.viewport.extent = capacity(400, 200);
+        snapshot.viewport.columns = 4;
+        snapshot.viewport.rowcount = 2;
+        snapshot.frame.extent = snapshot.viewport.extent.clone();
+        snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
+        snapshot.gallery.slots = vec![true; 8];
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
+        snapshot
+    }
+
+    fn gallery_sample(x: u32, y: u32) -> crate::presentation_surface::SurfaceSample {
+        crate::presentation_surface::SurfaceSample {
+            width: 400,
+            height: 200,
+            x,
+            y,
+            content_x: x,
+            content_y: y,
+            pressed: true,
+        }
     }
 
     fn submit_toggled_labels(state: &mut State, snapshot: &ExploreSnapshot) -> ExploreFilterUpdate {
@@ -1061,46 +1071,46 @@ mod tests {
 
     #[test]
     fn gallery_hit_boundaries_use_half_open_native_square_cells() {
-        let geometry = gallery_geometry(400.0, 200.0, capacity(400, 200), 4, 8, 0).unwrap();
-        let indices = [10, 11, 12, 13, 20, 21, 22, 23];
-        for (x, y, expected) in [
-            (99, 99, Some(10)),
-            (100, 0, Some(11)),
-            (0, 100, Some(20)),
-            (399, 199, Some(23)),
-            (400, 199, None),
-            (399, 200, None),
-        ] {
-            assert_eq!(geometry.compiled_index_at(x, y, &indices), expected);
+        let mut snapshot = displayed_gallery_snapshot();
+        for ready in [true, false] {
+            snapshot.gallery.slots.fill(ready);
+            for (x, y, expected) in [
+                (0, 0, Some(10)),
+                (99, 99, Some(10)),
+                (100, 0, Some(11)),
+                (0, 100, Some(20)),
+                (399, 199, Some(23)),
+                (400, 199, None),
+                (399, 200, None),
+                (u32::MAX, u32::MAX, None),
+            ] {
+                assert_eq!(selected_at(Some(&snapshot), gallery_sample(x, y)), expected);
+            }
+        }
+        assert_eq!(selected_at(None, gallery_sample(0, 0)), None);
+        let mut empty = snapshot.clone();
+        empty.order.visibleindices.clear();
+        empty.gallery.slots.clear();
+        assert_eq!(selected_at(Some(&empty), gallery_sample(0, 0)), None);
+        for invalid in 0..4 {
+            let mut snapshot = snapshot.clone();
+            match invalid {
+                0 => snapshot.mode = crate::generated::ExploreMode::Detail,
+                1 => snapshot.gallery.layout.columns = 0,
+                2 => snapshot.gallery.layout.cardextent = 0,
+                _ => snapshot.gallery.layout.rowcount = 0,
+            }
+            assert_eq!(selected_at(Some(&snapshot), gallery_sample(0, 0)), None);
         }
     }
 
     #[test]
     fn gallery_pointer_resolves_native_visible_identity_and_deduplicates() {
-        let mut snapshot = explore_snapshot();
-        snapshot.ready = true;
-        snapshot.mode = crate::generated::ExploreMode::Gallery;
-        snapshot.viewport.extent = VisualExtent {
-            width: 400,
-            height: 200,
-        };
-        snapshot.viewport.columns = 4;
-        snapshot.viewport.rowcount = 2;
-        snapshot.frame.extent = snapshot.viewport.extent.clone();
-        snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
-        snapshot.gallery.slots = vec![true; 8];
-        crate::view_model::test_support::gallery_layout(&mut snapshot);
+        let mut snapshot = displayed_gallery_snapshot();
+        snapshot.gallery.slots[5] = false;
         let mut gesture = crate::presentation_surface::SurfaceGesture {
             kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
-            sample: crate::presentation_surface::SurfaceSample {
-                width: 400,
-                height: 200,
-                x: 150,
-                y: 150,
-                content_x: 150,
-                content_y: 150,
-                pressed: true,
-            },
+            sample: gallery_sample(150, 150),
         };
         let mut state = State::default();
         assert_eq!(
@@ -1111,18 +1121,30 @@ mod tests {
             state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
             None
         );
-        gesture.kind = crate::presentation_surface::SurfaceGestureKind::Cancel;
-        gesture.sample.pressed = false;
+        for release in [
+            crate::presentation_surface::SurfaceGestureKind::Pointer,
+            crate::presentation_surface::SurfaceGestureKind::End,
+            crate::presentation_surface::SurfaceGestureKind::Cancel,
+        ] {
+            gesture.kind = release;
+            gesture.sample.pressed = false;
+            assert_eq!(
+                state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
+                None
+            );
+            gesture.kind = crate::presentation_surface::SurfaceGestureKind::Pointer;
+            gesture.sample.pressed = true;
+            assert_eq!(
+                state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
+                Some(GalleryGestureOutcome::Selected(21))
+            );
+        }
+        snapshot.gallery.slots[5] = true;
         assert_eq!(
             state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
             None
         );
-        gesture.kind = crate::presentation_surface::SurfaceGestureKind::Pointer;
-        gesture.sample.pressed = true;
-        assert_eq!(
-            state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
-            Some(GalleryGestureOutcome::Selected(21))
-        );
+        snapshot.gallery.slots[5] = false;
         let mut unrelated = snapshot.clone();
         unrelated.frame.source.instance += 1;
         assert_eq!(
@@ -1147,31 +1169,94 @@ mod tests {
             None
         );
         assert_eq!(state.gallery_gesture(Some(&snapshot), None, gesture), None);
+        assert_eq!(state.gallery_gesture(None, Some(&snapshot), gesture), None);
+        gesture.sample.content_x = 400;
+        assert_eq!(
+            state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
+            Some(GalleryGestureOutcome::Focused(None))
+        );
     }
 
     #[test]
-    fn circular_gallery_hits_use_logical_cells_and_completed_identity() {
-        let mut snapshot = explore_snapshot();
-        snapshot.mode = crate::generated::ExploreMode::Gallery;
-        snapshot.viewport.columns = 4;
+    fn circular_gallery_hits_use_displayed_identity_independently_of_readiness() {
+        let mut snapshot = displayed_gallery_snapshot();
         snapshot.viewport.rowcount = 5;
         snapshot.viewport.firstrow = 7;
         snapshot.viewport.extent = VisualExtent { width: 400, height: 500 };
         snapshot.frame.extent = VisualExtent { width: 400, height: 800 };
         snapshot.order.visibleindices = (28..47).collect();
         snapshot.gallery.slots = vec![true; 19];
-        snapshot.gallery.slots[8] = false;
         crate::view_model::test_support::gallery_layout(&mut snapshot);
         snapshot.gallery.layout.roworigin = 7;
-        let sample = |x, y| crate::presentation_surface::SurfaceSample {
-            width: 400, height: 500, x, y, content_x: x, content_y: y, pressed: true,
+        let mut state = State::default();
+        for ready in [true, false] {
+            snapshot.gallery.slots.fill(ready);
+            for (x, y, expected) in [
+                (5, 5, Some(28)),
+                (5, 105, Some(32)),
+                (5, 205, Some(36)),
+                (205, 405, Some(46)),
+                (305, 405, None),
+                (5, 505, None),
+            ] {
+                let sample = crate::presentation_surface::SurfaceSample {
+                    height: 500,
+                    ..gallery_sample(x, y)
+                };
+                assert_eq!(selected_at(Some(&snapshot), sample), expected);
+                for kind in [
+                    crate::presentation_surface::SurfaceGestureKind::Pointer,
+                    crate::presentation_surface::SurfaceGestureKind::Viewport,
+                ] {
+                    let outcome = match kind {
+                        crate::presentation_surface::SurfaceGestureKind::Pointer => {
+                            expected.map(GalleryGestureOutcome::Selected)
+                        }
+                        _ => Some(GalleryGestureOutcome::Focused(expected)),
+                    };
+                    assert_eq!(
+                        state.gallery_gesture(
+                            Some(&snapshot),
+                            Some(&snapshot),
+                            crate::presentation_surface::SurfaceGesture { kind, sample },
+                        ),
+                        outcome
+                    );
+                }
+            }
+        }
+        // Sampling owns the inverse transform: at width 600 and y origin -37.5,
+        // screen (150, 262.5) is logical content (100, 200), past the ring wrap.
+        let gesture = crate::presentation_surface::SurfaceGesture {
+            kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
+            sample: crate::presentation_surface::SurfaceSample {
+                width: 600,
+                height: 700,
+                x: 150,
+                y: 262,
+                ..gallery_sample(100, 200)
+            },
         };
-        assert_eq!(selected_at(Some(&snapshot), sample(5, 5)), Some(28));
-        assert_eq!(selected_at(Some(&snapshot), sample(5, 105)), Some(32));
-        assert_eq!(selected_at(Some(&snapshot), sample(5, 205)), None);
-        assert_eq!(selected_at(Some(&snapshot), sample(205, 405)), Some(46));
-        assert_eq!(selected_at(Some(&snapshot), sample(305, 405)), None);
-        assert_eq!(selected_at(Some(&snapshot), sample(5, 505)), None);
+        state.measure_gallery(600.0, 700.0, capacity(800, 800), 4);
+        state.record_gallery_fraction(0.25);
+        assert_eq!(
+            state.gallery_gesture(Some(&snapshot), Some(&snapshot), gesture),
+            Some(GalleryGestureOutcome::Focused(Some(37)))
+        );
+        // Newer desired geometry/order must not reinterpret the displayed cells.
+        let mut current = snapshot.clone();
+        current.viewport.columns = 5;
+        current.gallery.layout.columns = 5;
+        current.order.visibleindices.reverse();
+        assert_eq!(
+            state.gallery_gesture(Some(&current), Some(&snapshot), gesture),
+            Some(GalleryGestureOutcome::Focused(Some(37)))
+        );
+        current.frame.revision += 1;
+        assert_eq!(
+            state.gallery_gesture(Some(&current), Some(&snapshot), gesture),
+            None
+        );
     }
 
     #[test]
