@@ -232,7 +232,8 @@ class BrowserHostProcess final {
     BrowserHostProcess(const std::filesystem::path& executable, const std::filesystem::path& diagnostics,
                        const std::filesystem::path& runtime_log, const std::filesystem::path& firefox_log,
                        const std::filesystem::path& working_directory, const TerminationMode termination,
-                       const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::string& viewer_scenario,
+                       const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::filesystem::path& compiled_directory,
+                       const std::string& viewer_scenario,
                        const bool logging = true, const bool high_dpi = false, const bool h2d = true, const bool pixel_probes = false,
                        const std::string& probe_failure = {},
                        const mmltk::backend::data::testsupport::FixtureSpec* square_fixture = nullptr) {
@@ -243,7 +244,7 @@ class BrowserHostProcess final {
         const std::string firefox_text = firefox_log.string();
         const std::string mozilla_text = artifact_sibling(diagnostics, "-mozilla%PID.log").string();
         const std::string dataset_source = mmltk::backend::data::testsupport::dataset_dir(fixture);
-        const std::string compiled_directory = mmltk::backend::data::testsupport::compiled_dir(fixture);
+        const std::string compiled_text = compiled_directory.string();
         const std::string resolution = std::to_string(viewer_scenario == "square" ? 384 : kCompiledResolution);
         const std::string square_source = square_fixture ? mmltk::backend::data::testsupport::dataset_dir(*square_fixture) : "";
         const std::string square_compiled = square_fixture ? mmltk::backend::data::testsupport::compiled_dir(*square_fixture) : "";
@@ -287,7 +288,7 @@ class BrowserHostProcess final {
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE", square_source.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED", square_compiled.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 &&
-                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", compiled_directory.c_str(), 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY", compiled_text.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION", resolution.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_descriptor.c_str(), 1) == 0 &&
                 (termination != TerminationMode::WindowClose || ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_WINDOW_CLOSE", "1", 1) == 0);
@@ -928,13 +929,18 @@ struct PixelBoundaryAudit final {
     std::vector<nlohmann::json> probe_failures;
     std::set<std::string> failed_probe_retirements;
 
-    [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
-        if (expected.empty()) return probe_failures.empty();
-        if (!failure.empty() || probe_failures.size() != 1U) return false;
+    struct ProbeFailureEvidence final {
+        bool forwarded = false;
+        bool recovered = false;
+        [[nodiscard]] bool complete() const noexcept { return forwarded && recovered; }
+    };
+
+    [[nodiscard]] ProbeFailureEvidence probe_failure_evidence(std::string_view expected) const {
+        if (expected.empty() || !failure.empty() || probe_failures.size() != 1U) return {};
         const auto& failed = probe_failures.front();
         std::string boundary{expected};
         boundary.front() = static_cast<char>(std::toupper(static_cast<unsigned char>(boundary.front())));
-        if (failed.value("boundary", "") != boundary) return false;
+        if (failed.value("boundary", "") != boundary) return {};
         const auto surface = failed.value("surface", "");
         const bool allocation = expected == "allocation";
         bool forwarded = false, recovered = false;
@@ -944,15 +950,15 @@ struct PixelBoundaryAudit final {
                 for (const auto receiver : {0U, 1U}) {
                     const auto& evidence = publication.receivers[receiver].identity;
                     if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
-                        return false;
+                        return {};
                 }
                 const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
                                           scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
                 if (!publication.forwarded.empty() && (allocation || same_attempt)) {
-                    if (publication.forwarded.value("pixel_probe", true)) return false;
+                    if (publication.forwarded.value("pixel_probe", true)) return {};
                     if (!allocation) {
                         for (const auto* field : {"layer", "slot", "content_session", "content_sequence"})
-                            if (scalar(publication.forwarded, field) != scalar(failed, field)) return false;
+                            if (scalar(publication.forwarded, field) != scalar(failed, field)) return {};
                     }
                     forwarded = true;
                 }
@@ -971,9 +977,12 @@ struct PixelBoundaryAudit final {
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
         }
-        const bool failure_settled =
-            allocation ? (forwarded || failed_probe_retirements.contains(surface)) && recovered : forwarded && recovered;
-        return failure_settled && raw_complete() && viewer_nonblack_complete();
+        return {.forwarded = forwarded || (allocation && failed_probe_retirements.contains(surface)), .recovered = recovered};
+    }
+
+    [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
+        if (expected.empty()) return probe_failures.empty();
+        return probe_failure_evidence(expected).complete() && raw_complete() && viewer_nonblack_complete();
     }
     std::array<std::size_t, 3> joined{};
     struct Composition final {
@@ -1569,6 +1578,11 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         ordinary["pixel_probe"] = false;
         audit.consume(ordinary);
         CHECK(audit.probe_failure_complete(target));
+        CHECK(audit.probe_failure_evidence(target).complete());
+        auto before_viewer = audit;
+        before_viewer.successful_viewer.reset();
+        CHECK(before_viewer.probe_failure_evidence(target).complete());
+        CHECK_FALSE(before_viewer.probe_failure_complete(target));
         if (!allocation) {
             auto unrelated_content = audit;
             auto& publication = unrelated_content.samples.at({surface, 7U});
@@ -1581,6 +1595,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
                 receipt_boundary.identity["content_sequence"] = other_sequence;
             publication.forwarded["content_sequence"] = other_sequence;
             CHECK_FALSE(unrelated_content.probe_failure_complete(target));
+            CHECK_FALSE(unrelated_content.probe_failure_evidence(target).complete());
             CHECK(audit.probe_failure_complete(target));
         }
         auto wrong_slot = audit;
@@ -1595,10 +1610,13 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         successful["sample_y"] = 0U;
         stale_receipt.consume(successful);
         CHECK_FALSE(stale_receipt.probe_failure_complete(target));
+        CHECK_FALSE(stale_receipt.probe_failure_evidence(target).forwarded);
         if (!allocation) {
             auto no_recovery = audit;
             no_recovery.samples.at({surface, 7U}).counted.fill(false);
             CHECK_FALSE(no_recovery.probe_failure_complete(target));
+            CHECK(no_recovery.probe_failure_evidence(target).forwarded);
+            CHECK_FALSE(no_recovery.probe_failure_evidence(target).recovered);
         }
     }
     for (const auto missing_owner : {"import", "mailbox", "iced.surface.pixel"}) {
@@ -4294,6 +4312,18 @@ class ArtifactNotifications final {
     }
 }
 
+void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution) {
+    using namespace mmltk::backend::data;
+    const auto plan = DatasetCompiler::prepare({.source_dir = testsupport::dataset_dir(fixture),
+                                               .output_dir = testsupport::compiled_dir(fixture),
+                                               .split = fixture.split,
+                                               .target_width = resolution,
+                                               .target_height = resolution,
+                                               .worker_cpus = {}},
+                                              {fixture.split});
+    DatasetCompiler::compile(plan, 0U);
+}
+
 class PreparedWaylandInputs final {
    public:
     PreparedWaylandInputs()
@@ -4311,10 +4341,19 @@ class PreparedWaylandInputs final {
                  .height = 384,
                  .num_images = 300,
                  .background_images = 10,
+                 .pixel_evidence = true},
+          probe_{.root_dir = (root_.path() / "probe").string(),
+                 .split = "train",
+                 .width = 768,
+                 .height = 384,
+                 .num_images = 3,
+                 .background_images = 0,
                  .pixel_evidence = true} {
         using namespace mmltk::backend::data::testsupport;
         for (const auto* fixture : {&square_, &mixed_}) {
             create_synthetic_dataset(*fixture);
+            // The top grid edge's image-side sample uses this unpadded background card.
+            replace_synthetic_image(*fixture, 2, 384, 384);
             replace_synthetic_image(*fixture, 8, 192, 384);
             replace_synthetic_image(*fixture, 9, 384, 192);
             replace_synthetic_image(*fixture, 11, 192, 384);
@@ -4329,22 +4368,29 @@ class PreparedWaylandInputs final {
         replace_synthetic_image(square_, 1, 384, 384);
         // This small prerequisite is compiled once. The primary browser owns
         // the one real 512-pixel compile/control/error workflow.
-        const auto plan = mmltk::backend::data::DatasetCompiler::prepare({.source_dir = dataset_dir(square_),
-                                                                          .output_dir = compiled_dir(square_),
-                                                                          .split = "train",
-                                                                          .target_width = 384U,
-                                                                          .target_height = 384U,
-                                                                          .worker_cpus = {}},
-                                                                         {"train"});
-        mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
+        compile_wayland_fixture(square_, 384U);
     }
     [[nodiscard]] const auto& square() const noexcept { return square_; }
     [[nodiscard]] const auto& mixed() const noexcept { return mixed_; }
+    [[nodiscard]] const auto& probe() {
+        using namespace mmltk::backend::data::testsupport;
+        if (!std::filesystem::is_regular_file(compiled_bin_path(probe_))) {
+            create_synthetic_dataset(probe_);
+            // Preserve the selected image's exact annotation and six-class
+            // catalog while keeping every input in the initial measured row.
+            std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl",
+                                       std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
+                                       std::filesystem::copy_options::overwrite_existing);
+            compile_wayland_fixture(probe_, kCompiledResolution);
+        }
+        return probe_;
+    }
 
    private:
     ScopedTempDir root_;
     mmltk::backend::data::testsupport::FixtureSpec square_;
     mmltk::backend::data::testsupport::FixtureSpec mixed_;
+    mmltk::backend::data::testsupport::FixtureSpec probe_;
 };
 
 // One owner retains the process, resources, physical evidence and byte cursors.
@@ -4354,12 +4400,14 @@ class WaylandSession final {
    public:
     WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile,
                    bool diagnostics_enabled = true, bool dpi = false, bool host_to_device = true, std::string fault = {},
-                   bool pixels_enabled = true);
+                   bool pixels_enabled = true,
+                   const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture = nullptr);
     void RunScenario(const std::string& viewer_scenario, bool last, bool dark = false, bool pending_reconstruction = false);
 
    private:
     void AdvanceScenario();
     std::shared_ptr<PreparedWaylandInputs> inputs_;
+    const mmltk::backend::data::testsupport::FixtureSpec& ordinary_fixture_;
     TerminationMode termination;
     std::string profile_;
     bool logging;
@@ -4370,6 +4418,7 @@ class WaylandSession final {
     std::string probe_failure;
     ScopedTempDir quiet_artifacts{"mmltk-wayland-quiet-artifacts"};
     ScopedTempDir working{"mmltk-workspace-wayland-session"};
+    std::filesystem::path ordinary_compiled_;
     std::filesystem::path diagnostics;
     std::filesystem::path runtime_log;
     std::filesystem::path firefox_log;
@@ -4391,8 +4440,9 @@ class WaylandSession final {
 
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
                                const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault,
-                               const bool pixels_enabled)
+                               const bool pixels_enabled, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
     : inputs_(std::move(inputs)),
+      ordinary_fixture_(ordinary_fixture ? *ordinary_fixture : inputs_->mixed()),
       termination(terminal),
       profile_(std::move(profile)),
       logging(diagnostics_enabled),
@@ -4401,6 +4451,8 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
       pixel_probes(logging && pixels_enabled),
       pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
       probe_failure(std::move(fault)),
+      ordinary_compiled_(profile_ == "retained" ? working.path() / "compiled"
+                                              : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
       pixel_audit(pixel_probes) {
     diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl"
                            : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
@@ -4434,8 +4486,9 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     settings_file.close();
     notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
     process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(),
-                                                    termination, inputs_->mixed(), profile_ == "blocked" ? "quiet" : profile_, logging,
-                                                    high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
+                                                    termination, ordinary_fixture_, ordinary_compiled_,
+                                                    profile_ == "blocked" ? "quiet" : profile_, logging, high_dpi, h2d, pixel_probes,
+                                                    probe_failure, &inputs_->square());
     deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
     if (deadline.get() < 0)
         throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
@@ -4445,7 +4498,10 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
 
 void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
     const auto permitted_cpus = permitted_cpu_count();
-    const auto& fixture = viewer_scenario == "square" ? inputs_->square() : inputs_->mixed();
+    const auto& fixture = viewer_scenario == "square" ? inputs_->square() : ordinary_fixture_;
+    const auto compiled_directory = viewer_scenario == "square"
+                                        ? std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(fixture)}
+                                        : ordinary_compiled_;
     auto& process = *process_;
     auto& notifications = *notifications_;
     auto& native_cursor = *native_cursor_;
@@ -4493,7 +4549,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE(entered->generation == scenario_sequence_);
                 using Kind = mmltk::controller::contracts::IntegrationControlKind;
                 const auto kind = static_cast<Kind>(entered->slot);
-                REQUIRE(kind != Kind::Failed);
+                if (kind == Kind::Failed)
+                    FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index
+                                                                    << ", frontend source line " << entered->staging_bytes
+                                                                    << "\nnative runtime output:\n" << read_tail(runtime_log));
                 if (kind == Kind::PressureEntered) {
                     REQUIRE_FALSE(pressure_entered_);
                     pressure_entered_ = true;
@@ -4519,6 +4578,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         CHECK_FALSE(std::filesystem::exists(diagnostics));
         CHECK_FALSE(std::filesystem::exists(firefox_log));
         CHECK_FALSE(std::filesystem::exists(artifact_sibling(diagnostics, "-application.log")));
+        INFO("quiet runtime output: " << read_tail(runtime_log));
         CHECK(std::filesystem::file_size(runtime_log) == 0U);
         return;
     }
@@ -4574,6 +4634,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     bool exited_early = false;
     bool released_one_lane = false;
     bool released_remaining_lanes = false;
+    const bool recover_before_reads = !probe_failure.empty() && probe_failure != "allocation";
+    bool recovery_redraw_requested = false;
     bool released_held_read = false;
     bool held_read_waiting = false;
     bool terminal_failure_observed = false;
@@ -4691,7 +4753,13 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
                 final_generations = *identified;
         }
-        if (!released_one_lane && browser.explore_ready) {
+        const auto recovery = pixel_audit.probe_failure_evidence(probe_failure);
+        if (recover_before_reads && !recovery_redraw_requested && recovery.forwarded) {
+            command_explore(16U, "requested exact-content probe recovery");
+            recovery_redraw_requested = true;
+        }
+        const bool reads_releasable = !recover_before_reads || (recovery_redraw_requested && recovery.complete());
+        if (reads_releasable && !released_one_lane && browser.explore_ready) {
             const auto rendered_placeholder = std::ranges::find_if(native.placeholder_slots, [this](const auto& placeholder) {
                 const auto cardinality = native.placeholder_cardinalities.find(placeholder.first);
                 return cardinality != native.placeholder_cardinalities.end() && cardinality->second == placeholder.second.size() &&
@@ -4703,7 +4771,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 released_one_lane = true;
             }
         }
-        if (!released_remaining_lanes && native.acceptance_first_patch_exact) {
+        if (reads_releasable && !released_remaining_lanes && native.acceptance_first_patch_exact) {
             command_explore(2U, "released remaining Explore lanes");
             if (released_placeholder_generation == 0U) released_placeholder_generation = native.partial_generation;
             // A ready prefetch can satisfy the partial-patch evidence before
@@ -4711,7 +4779,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             released_one_lane = true;
             released_remaining_lanes = true;
         }
-        if (released_one_lane && !released_remaining_lanes && !native.acceptance_first_patch_exact &&
+        if (reads_releasable && released_one_lane && !released_remaining_lanes && !native.acceptance_first_patch_exact &&
             native.explore_generation > released_placeholder_generation &&
             native.placeholder_cardinalities.contains(native.explore_generation)) {
             command_explore(1U, "reissued one Explore lane for superseding generation");
@@ -5043,8 +5111,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(
                 (browser.viewer_import_edits == std::set<std::string>{"box-move-undo-redo", "box-resize-undo-redo", "mask-paint-undo-redo",
                                                                       "mask-erase-undo-redo", "class-undo-redo"}));
-            const auto saved_path =
-                std::filesystem::path(mmltk::backend::data::testsupport::compiled_dir(fixture)) / "viewer-annotations.cbor";
+            const auto saved_path = compiled_directory / "viewer-annotations.cbor";
             REQUIRE(std::filesystem::is_regular_file(saved_path));
             const auto saved_bytes = read_from(saved_path, 0U);
             const auto saved = mmltk::frameworks::serialization::decode<mmltk::controller::contracts::AnnotationUiState>(
@@ -5136,7 +5203,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     constexpr std::size_t maximum_fixture_lane_bytes = source_and_donor_bytes + donor_mask_bytes + fixture_descriptor_allowance;
     CHECK(native.explore_max_pinned <= native.explore_nproc * maximum_fixture_lane_bytes);
 
-    const auto compiled_path = std::filesystem::path{mmltk::backend::data::testsupport::compiled_bin_path(fixture)};
+    const auto compiled_path = compiled_directory / (fixture.split + ".bin");
     REQUIRE(std::filesystem::is_regular_file(compiled_path));
     // CLEANUP-IGNORE: Runtime audit facts and persisted dataset metadata are independent Wayland acceptance evidence.
     const auto compiled = mmltk::backend::data::inspect_compiled_dataset(compiled_path);
@@ -5225,15 +5292,7 @@ void WaylandSession::AdvanceScenario() {
     static const auto inputs = std::make_shared<PreparedWaylandInputs>();
     const auto& fixture = inputs->mixed();
     if (require_compiled && !std::filesystem::is_regular_file(mmltk::backend::data::testsupport::compiled_bin_path(fixture))) {
-        const auto plan =
-            mmltk::backend::data::DatasetCompiler::prepare({.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
-                                                            .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture),
-                                                            .split = "train",
-                                                            .target_width = kCompiledResolution,
-                                                            .target_height = kCompiledResolution,
-                                                            .worker_cpus = {}},
-                                                           {"train"});
-        mmltk::backend::data::DatasetCompiler::compile(plan, 0U);
+        compile_wayland_fixture(fixture, kCompiledResolution);
     }
     return inputs;
 }
@@ -5265,7 +5324,8 @@ void workspace_wayland_terminal() {
 
 void workspace_wayland_probe_recovery() {
     const std::string boundary = GENERATE("allocation", "reset", "begin", "end");
-    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "semantics", true, false, true, boundary};
+    const auto inputs = wayland_inputs(false);
+    WaylandSession session{inputs, TerminationMode::SignalInterrupt, "semantics", true, false, true, boundary, true, &inputs->probe()};
     session.RunScenario("semantics", true);
 }
 

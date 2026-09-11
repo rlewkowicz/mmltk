@@ -194,12 +194,14 @@ TEST_CASE("browser runtime entry redirects Firefox logs and returns startup fail
     REQUIRE(refused_settings.terminal == EntryTerminal::Reaped);
     REQUIRE(refused_settings.exited());
     CHECK(refused_settings.exit_code() != 0);
+    CHECK(std::filesystem::file_size(persistence_refusal.directory() / "native-output.txt") == 0U);
 
     TemporaryFirefoxLog firefox_refusal;
     const EntryResult refused_firefox = run_entry(entry, {}, firefox_refusal.directory(), invalid_firefox);
     REQUIRE(refused_firefox.terminal == EntryTerminal::Reaped);
     REQUIRE(refused_firefox.exited());
     CHECK(refused_firefox.exit_code() != 0);
+    CHECK(std::filesystem::file_size(firefox_refusal.directory() / "native-output.txt") == 0U);
 }
 
 TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing", "[gui][browser-runtime][entry][pixel]") {
@@ -234,6 +236,7 @@ TEST_CASE("integration entry selects explicit complete evidence without forcing 
                                   MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 1, true);
     REQUIRE(result.exited());
     CHECK(result.exit_code() != 0);
+    CHECK(std::filesystem::file_size(refused.directory() / "native-output.txt") == 0U);
     CHECK_FALSE(std::filesystem::exists(refused.path()));
 }
 

@@ -617,6 +617,21 @@ mod tests {
     }
 
     #[test]
+    fn one_row_dataset_preserves_the_measured_open_viewport() {
+        for width in [640.0, 894.0, 1200.0] {
+            let mut state = State::default();
+            assert!(state.measure_gallery(width, 720.0, capacity(2048, 2048), 3));
+            let opening = state.measured_viewport(3, 0, 0).unwrap();
+            assert_eq!(opening.rowcount, 1);
+            assert_eq!(opening.firstrow, 0);
+            assert_eq!(opening.extent.width, opening.extent.height * 3);
+            for images in 1..=3 {
+                assert_eq!(state.measured_viewport(3, 0, images).unwrap(), opening);
+            }
+        }
+    }
+
+    #[test]
     fn viewport_admission_coalesces_and_releases_after_commit() {
         let mut state = State::default();
         assert!(state.measure_gallery(640.0, 480.0, capacity(640, 480), 4));

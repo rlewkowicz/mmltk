@@ -119,6 +119,48 @@ fn explore_message(message: explore::Message) -> Task<RootMessage> {
     ))
 }
 
+fn explore_scenario_preparation(
+    snapshot: &crate::generated::ExploreSnapshot,
+) -> Option<explore::Message> {
+    use explore::{Message, dataset, detail, gallery, overlay};
+    if snapshot.detail.showoriginaldimensions {
+        return Some(Message::Detail(detail::Message::DetailSourceSelected(
+            false,
+        )));
+    }
+    if snapshot.augmentation.enabled {
+        return Some(Message::Gallery(gallery::Message::AugmentationToggled(
+            false,
+        )));
+    }
+    if snapshot.filter.order != crate::generated::ExploreOrder::Sequential {
+        return Some(Message::Dataset(dataset::Message::OrderSelected(
+            crate::generated::ExploreOrder::Sequential,
+        )));
+    }
+    if snapshot.filter.minimumcompiledindex != 0 {
+        return Some(Message::Dataset(
+            dataset::Message::MinimumCompiledIndexChanged(0),
+        ));
+    }
+    if snapshot.filter.classselection.mode != crate::generated::ExploreClassSelectionMode::All {
+        return Some(Message::Dataset(dataset::Message::AllClasses));
+    }
+    if snapshot.overlay.classselection.mode != crate::generated::ExploreClassSelectionMode::All {
+        return Some(Message::Details(explore::details::Message::AllClasses));
+    }
+    let visibility = if !snapshot.overlay.showlabels {
+        overlay::Message::LabelsToggled(true)
+    } else if !snapshot.overlay.showmasks {
+        overlay::Message::MasksToggled(true)
+    } else if !snapshot.overlay.showboxes {
+        overlay::Message::BoxesToggled(true)
+    } else {
+        return None;
+    };
+    Some(Message::Gallery(gallery::Message::Overlay(visibility)))
+}
+
 pub(crate) fn report_viewer_label(
     category: u16,
     color: iced::Color,
@@ -1092,23 +1134,30 @@ fn atlas_composition_samples(draw: &AtlasDraw) -> Option<AtlasCompositionSamples
     // Real canvas samples bound each black/white/black line by adjacent
     // clean fixture pixels. The outer edges have one image-side neighbor;
     // the interior boundary has two. No CPU shader implementation is used.
-    // Pick a visible row interior so horizontal grid lines cannot mask a defect.
+    // Pick visible cell interiors so crossing grid lines cannot mask a defect.
+    // The vertical scrollbar covers the right image edge. Sample the top
+    // horizontal outer edge over the fixture's second, unpadded background
+    // card, using the same three-pixel raster strip.
     let cell = draw.image.width / columns as f32;
     let first_row = ((draw.clip.y - draw.image.y) / cell - 0.5).ceil().max(0.0);
     let y = draw.image.y + (first_row + 0.5) * cell;
     let centers = [
         draw.image.x + 1.5,
         draw.image.x + cell + 0.5,
-        draw.image.x + draw.image.width - 1.5,
+        draw.image.y + 1.5,
     ];
     for (edge, center) in centers.into_iter().enumerate() {
-        let offsets: &[f32] = match edge {
-            0 => &[-1.0, 0.0, 1.0, 2.0],
-            1 => &[-2.0, -1.0, 0.0, 1.0, 2.0],
-            _ => &[-2.0, -1.0, 0.0, 1.0],
+        let offsets: &[f32] = if edge == 1 {
+            &[-2.0, -1.0, 0.0, 1.0, 2.0]
+        } else {
+            &[-1.0, 0.0, 1.0, 2.0]
         };
         for &offset in offsets {
-            let point = iced::Point::new(center + offset, y);
+            let point = if edge == 2 {
+                iced::Point::new(draw.image.x + cell * 1.5, center + offset)
+            } else {
+                iced::Point::new(center + offset, y)
+            };
             if !draw.clip.contains(point) || !draw.image.contains(point) {
                 return None;
             }
@@ -1938,6 +1987,9 @@ enum Phase {
     DatasetStatus,
     ExploreNavigation,
     AwaitExplore,
+    ExploreCloseDetail,
+    AwaitExploreGallery,
+    AwaitExplorePreparation(u64),
     ExploreOpen,
     AwaitExploreReady,
     AwaitExploreInitialPatch {
@@ -2189,6 +2241,8 @@ impl Phase {
             | Self::AwaitNext(_)
             | Self::AwaitPrevious(_)
             | Self::AwaitDetailClose
+            | Self::AwaitExploreGallery
+            | Self::AwaitExplorePreparation(_)
             | Self::AwaitExploreDatasetReopen { .. }
             | Self::AwaitDetailAgain
             | Self::AwaitAnnotation
@@ -2412,6 +2466,7 @@ pub struct Controller {
     control_sequence: u64,
     control_phase: Option<Phase>,
     control_progress: u64,
+    failure_line: u32,
     desired_dark: Option<bool>,
     reuse_compiled: bool,
     bounded_document_revision: u64,
@@ -2573,6 +2628,7 @@ impl Controller {
             control_sequence: 1,
             control_phase: None,
             control_progress: 0,
+            failure_line: 0,
             desired_dark: None,
             reuse_compiled: false,
             bounded_document_revision: 0,
@@ -2711,6 +2767,7 @@ impl Controller {
         receipt: crate::generated::IntegrationControlReceipt,
     ) -> Result<(), &'static str> {
         if receipt.kind != crate::generated::IntegrationControlKind::Advance
+            || receipt.failureline != 0
             || self.control_sequence.checked_add(1) != Some(receipt.sequence)
             || !matches!(self.phase, Phase::Complete)
             || self.control_phase.as_ref() != Some(&Phase::Complete)
@@ -2783,6 +2840,11 @@ impl Controller {
             kind,
             sequence: self.control_sequence,
             progress,
+            failureline: if matches!(self.phase, Phase::Failed) {
+                self.failure_line
+            } else {
+                0
+            },
         }) {
             Ok(_) => {
                 self.control_phase = Some(self.phase.clone());
@@ -2833,11 +2895,16 @@ impl Controller {
         }
     }
 
+    #[track_caller]
     fn fail(&mut self, detail: &str) {
         self.fail_detail(|| std::borrow::Cow::Borrowed(detail));
     }
 
+    #[track_caller]
     fn fail_detail<'a>(&mut self, detail: impl FnOnce() -> std::borrow::Cow<'a, str>) {
+        if self.generation != 0 {
+            self.failure_line = std::panic::Location::caller().line();
+        }
         reporting::emit(|sink| sink.record("integration.failed", "", &detail(), [0.0; 4]));
         self.phase = Phase::Failed;
         self.location_pending = false;
@@ -3414,6 +3481,7 @@ impl Controller {
                 crate::view::navigation::stable_id(FeatureId::Explore).to_owned()
             }
             Phase::ExploreOpen => EXPLORE_OPEN.to_owned(),
+            Phase::ExploreCloseDetail => EXPLORE_DETAIL_CLOSE.to_owned(),
             Phase::ExploreDatasetPane => EXPLORE_DATASET_PANE.to_owned(),
             Phase::ExploreDetailsPane => EXPLORE_DETAILS_PANE.to_owned(),
             Phase::ExplorePolicyOrder(_) => explore::ORDER_SHUFFLED_ID.to_owned(),
@@ -3666,10 +3734,6 @@ impl Controller {
                 if !click(input_bounds) {
                     self.fail("Firefox Settings close dispatch failed");
                 }
-                None
-            }
-            Phase::TrainNavigation => {
-                self.phase = Phase::AwaitTrain;
                 None
             }
             Phase::PageNavigation(page) => {
@@ -4405,6 +4469,7 @@ impl Controller {
                     Phase::TrainNavigation => Phase::AwaitTrain,
                     Phase::Compile => Phase::AwaitCompileProgress,
                     Phase::ExploreNavigation => Phase::AwaitExplore,
+                    Phase::ExploreCloseDetail => Phase::AwaitExploreGallery,
                     Phase::ExploreOpen => {
                         COMPLETION_WITHOUT_INPUT.with(|active| active.set(true));
                         Phase::AwaitExploreReady
@@ -4911,12 +4976,12 @@ impl Controller {
                         ],
                     )
                 });
+                self.reporting
+                    .observe(|reporting| reporting.bootstrap(model, settings));
                 if !self.viewer_scenario.is_empty() {
                     self.phase = Phase::TrainNavigation;
                     return self.arm(crate::view::navigation::stable_id(FeatureId::Train));
                 }
-                self.reporting
-                    .observe(|reporting| reporting.bootstrap(model, settings));
                 self.phase = Phase::SettingsOpen;
                 self.arm("navigation.settings")
             }
@@ -5602,11 +5667,53 @@ impl Controller {
             Phase::AwaitExplore
                 if active == FeatureId::Explore
                     && !settings.has_local_edits()
-                    && model.explore_open_available()
-                    && router.explore_measured_viewport(3, 0, 0).is_some() =>
+                    && model.explore_open_available() =>
             {
+                if model
+                    .explore
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.mode == crate::generated::ExploreMode::Detail)
+                {
+                    self.phase = Phase::ExploreCloseDetail;
+                    return self.arm(EXPLORE_DETAIL_CLOSE);
+                }
+                if let Some(snapshot) = model
+                    .explore
+                    .snapshot
+                    .as_ref()
+                    .filter(|snapshot| snapshot.ready)
+                    && let Some(message) = explore_scenario_preparation(snapshot)
+                {
+                    self.phase = Phase::AwaitExplorePreparation(snapshot.revision);
+                    return explore_message(message);
+                }
+                if router.explore_measured_viewport(3, 0, 0).is_none() {
+                    return Task::none();
+                }
                 self.phase = Phase::ExploreOpen;
                 self.arm(EXPLORE_OPEN)
+            }
+            Phase::ExploreCloseDetail => self.arm(EXPLORE_DETAIL_CLOSE),
+            Phase::AwaitExploreGallery
+                if model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.mode == crate::generated::ExploreMode::Gallery && !snapshot.busy
+                }) && !model.explore.desired_close
+                    && !model.has_explore_pending() =>
+            {
+                self.advance_to(Phase::AwaitExplore)
+            }
+            Phase::AwaitExplorePreparation(revision)
+                if model
+                    .explore
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.revision > revision && !snapshot.busy)
+                    && !model.has_explore_pending()
+                    && !settings.has_local_edits()
+                    && !model.native_settings_unsettled() =>
+            {
+                self.advance_to(Phase::AwaitExplore)
             }
             Phase::ExploreOpen => self.arm(EXPLORE_OPEN),
             Phase::AwaitExploreReady => {
@@ -5818,14 +5925,18 @@ impl Controller {
                 let initial_patch = matches!(self.phase, Phase::AwaitExploreInitialPatch { .. });
                 let revision_pending =
                     snapshot.revision < revision || snapshot.frame.revision < frame_revision;
-                // The two padded fixtures must reach the published snapshot before
-                // resizing can supersede their generation and rendered probes.
-                let initial_overlays_pending = initial_patch
+                // Padding donors are background images. Their published tile
+                // readiness, independent of annotations, must precede resizing.
+                let initial_tiles_pending = initial_patch
                     && [7, 8].iter().any(|index| {
-                        !snapshot
-                            .labels
+                        snapshot
+                            .order
+                            .visibleindices
                             .iter()
-                            .any(|label| label.compiledindex == *index)
+                            .position(|compiled| compiled == index)
+                            .and_then(|slot| snapshot.gallery.slots.get(slot))
+                            .copied()
+                            != Some(true)
                     });
                 let sampleable = sampleable_presentation(
                     model,
@@ -5838,10 +5949,10 @@ impl Controller {
                         sink.record(
                             "integration.explore_patch_wait",
                             EXPLORE_GALLERY,
-                            "revision-labels-busy-publication",
+                            "revision-tiles-busy-publication",
                             [
                                 f64::from(u8::from(revision_pending)),
-                                f64::from(u8::from(initial_overlays_pending)),
+                                f64::from(u8::from(initial_tiles_pending)),
                                 f64::from(u8::from(snapshot.busy)),
                                 f64::from(u8::from(sampleable.is_none())),
                             ],
@@ -5864,7 +5975,7 @@ impl Controller {
                     });
                 }
                 if revision_pending
-                    || initial_overlays_pending
+                    || initial_tiles_pending
                     || snapshot.busy
                     || sampleable.is_none()
                     || sampleable.is_some_and(|sample| {
@@ -6462,6 +6573,11 @@ impl Controller {
                     return Task::none();
                 }
                 if self.viewer_scenario == "quiet" {
+                    if !model.viewed_explore_frame().is_some_and(|source| {
+                        crate::presentation_surface::viewer_copy_matches(model, &source)
+                    }) {
+                        return Task::none();
+                    }
                     self.phase = Phase::OpenAnnotation;
                     return self.arm(EXPLORE_ANNOTATE);
                 }
@@ -7973,7 +8089,8 @@ impl Controller {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if !snapshot.ready
+                if active != FeatureId::Annotate
+                    || !snapshot.ready
                     || snapshot.busy
                     || snapshot.frame.revision == 0
                     || !model.annotation_edit_available()
@@ -8469,6 +8586,7 @@ mod tests {
                         kind: crate::generated::IntegrationControlKind::Advance,
                         sequence: 2,
                         progress: 0,
+                        failureline: 0,
                     })
                     .is_err(),
                 "viewer evidence cannot settle a destructive Annotation workflow"
@@ -8496,6 +8614,7 @@ mod tests {
             kind: crate::generated::IntegrationControlKind::Advance,
             sequence: 2,
             progress: 0,
+            failureline: 0,
         };
         driver.phase = Phase::Complete;
         driver.control_phase = Some(Phase::Complete);
@@ -8507,6 +8626,144 @@ mod tests {
         assert_eq!(driver.resolution, "512");
         assert!(driver.viewer_scenario.is_empty());
         assert!(!driver.reuse_compiled);
+        // A retained native Detail view still covers the Gallery's Open
+        // control after navigation. Close it through its own control and
+        // require native settlement before attempting the next Open.
+        let (mut model, frame) = crate::view_model::test_support::explore_presentation();
+        model.connection = ConnectionState::Connected;
+        model.window_width = 1200;
+        model.window_height = 800;
+        model
+            .settings_snapshot
+            .as_mut()
+            .unwrap()
+            .exploresource
+            .available = true;
+        let settings = crate::view::settings::SettingsModel::default();
+        let router = crate::view::router::Router::default();
+        let drive = |driver: &mut Controller, model: &ApplicationModel| {
+            drop(driver.advance(
+                model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                Some(frame),
+            ));
+        };
+        driver.desired_dark = None;
+        driver.phase = Phase::AwaitExplore;
+        assert!(model.explore_open_available());
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::ExploreCloseDetail);
+        assert!(driver.location_pending);
+        // The packaged Wayland sequence exercises the browser click. This
+        // native fixture starts at its receipt and checks native settlement.
+        driver.phase = Phase::AwaitExploreGallery;
+        driver.location_pending = false;
+        for (mode, busy, expected) in [
+            (
+                crate::generated::ExploreMode::Detail,
+                false,
+                Phase::AwaitExploreGallery,
+            ),
+            (
+                crate::generated::ExploreMode::Gallery,
+                true,
+                Phase::AwaitExploreGallery,
+            ),
+            (
+                crate::generated::ExploreMode::Gallery,
+                false,
+                Phase::AwaitExplore,
+            ),
+        ] {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.mode = mode;
+            snapshot.busy = busy;
+            drive(&mut driver, &model);
+            assert_eq!(driver.phase, expected);
+            assert!(!driver.location_pending);
+            assert!(driver.reporting.state_is_absent());
+        }
+        let revision = model.explore.snapshot.as_ref().unwrap().revision;
+        model
+            .explore
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .detail
+            .showoriginaldimensions = true;
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitExplorePreparation(revision));
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitExplorePreparation(revision));
+        {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.revision += 1;
+            snapshot.detail.showoriginaldimensions = false;
+            assert!(explore_scenario_preparation(snapshot).is_none());
+        }
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitExplore);
+
+        // The shared padding donors have no annotations. Missing or unready
+        // donor slots cannot advance even when the published frame is drawn.
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.labels.clear();
+        let revision = snapshot.revision;
+        let source = snapshot.frame.revision;
+        driver.gallery_drawn = Some((frame.presentation_revision, source));
+        for (indices, slots, timeline, ready) in [
+            (vec![0, 8], vec![true, true], 1, false),
+            (vec![7, 8], vec![true, false], 1, false),
+            (vec![7, 8], vec![true, true], 0, false),
+            (vec![7, 8], vec![true, true], 1, true),
+        ] {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.order.visibleindices = indices;
+            snapshot.gallery.slots = slots;
+            model.presentation.as_mut().unwrap().timelineready = timeline;
+            driver.phase = Phase::AwaitExploreInitialPatch {
+                revision,
+                frame_revision: source,
+            };
+            drive(&mut driver, &model);
+            assert_eq!(
+                driver.phase,
+                if ready {
+                    Phase::AwaitExploreExactGrid(revision)
+                } else {
+                    Phase::AwaitExploreInitialPatch {
+                        revision,
+                        frame_revision: source,
+                    }
+                }
+            );
+            assert!(driver.reporting.state_is_absent());
+        }
+        let annotation = model.annotation.snapshot.as_mut().unwrap();
+        annotation.ready = true;
+        annotation.ui.documentrevision = 1;
+        annotation.frame = crate::view_model::test_support::visual_frame(
+            crate::generated::PresentationSourceKind::Annotation,
+            1,
+        );
+        driver.viewer_scenario = "terminal".into();
+        driver.phase = Phase::AwaitAnnotation;
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitAnnotation);
+        drop(driver.advance(
+            &model,
+            &settings,
+            1.0,
+            &router,
+            FeatureId::Annotate,
+            Some(frame),
+        ));
+        assert!(matches!(driver.phase, Phase::AnnotationTool { .. }));
+        assert!(driver.reporting.state_is_absent());
+        driver.phase = Phase::Complete;
         assert!(driver.receive_control(advance).is_err());
         assert!(matches!(driver.phase, Phase::Failed));
 
@@ -8526,6 +8783,7 @@ mod tests {
                     kind: crate::generated::IntegrationControlKind::Advance,
                     sequence: 2,
                     progress: 0,
+                    failureline: 0,
                 })
                 .is_err(),
             "local completion is insufficient before the typed receipt was admitted"
@@ -8548,7 +8806,7 @@ mod tests {
         assert!(!reporting_enabled());
         assert!(!pixel_fixture_enabled());
         assert!(driver.reporting.state_is_absent());
-        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         // Even a diagnostic-marked surface cannot activate collection in a quiet driver.
@@ -8561,6 +8819,69 @@ mod tests {
             assert!(observer.subscription.is_none());
             assert_eq!(observer.identity, (0, 0));
         });
+        model.presentation.as_mut().unwrap().timelineready = 1;
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.dataset.imagewidth = frame.content_width;
+        snapshot.dataset.imageheight = frame.content_height;
+        snapshot.detail.showoriginaldimensions = false;
+        driver.viewer_scenario = "quiet".into();
+        driver.phase = Phase::AwaitDetail(0);
+        let settings = crate::view::settings::SettingsModel::default();
+        let router = crate::view::router::Router::default();
+        assert!(
+            sampleable_presentation(
+                &model,
+                Some(frame),
+                crate::generated::PresentationSourceKind::Explore,
+                frame.content_sequence,
+            )
+            .is_some()
+        );
+        crate::presentation_surface::clear_drawn_detail();
+        let stale = crate::view_model::test_support::physical_surface(
+            crate::presentation_surface::FrameReady {
+                content_sequence: frame.content_sequence + 1,
+                ..frame
+            },
+        );
+        let crop = surface.content_region();
+        for (draw, expected_ready) in [
+            (None, false),
+            (Some((stale, crop)), false),
+            (
+                Some((
+                    surface,
+                    [1, 0, frame.content_width - 1, frame.content_height],
+                )),
+                false,
+            ),
+            (Some((surface, crop)), true),
+        ] {
+            if let Some((surface, crop)) = draw {
+                crate::presentation_surface::record_drawn_detail(surface, crop);
+            }
+            drop(driver.advance(
+                &model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                Some(frame),
+            ));
+            assert_eq!(driver.location_pending, expected_ready);
+            assert_eq!(
+                driver.phase,
+                if expected_ready {
+                    Phase::OpenAnnotation
+                } else {
+                    Phase::AwaitDetail(0)
+                }
+            );
+            assert!(model.error.is_none());
+            assert!(driver.reporting.state_is_absent());
+            SURFACE_DRAW_OBSERVER.with(|observer| assert!(observer.borrow().receipts.is_empty()));
+        }
+        crate::presentation_surface::clear_drawn_detail();
         driver.phase = Phase::Complete;
         driver
             .reset_scenario(String::new(), String::new(), String::new(), String::new())
@@ -9157,16 +9478,20 @@ mod tests {
                     cell + 0.5,
                     cell + 1.5,
                     cell + 2.5,
-                    width - 3.5,
-                    width - 2.5,
-                    width - 1.5,
-                    width - 0.5,
+                    0.5,
+                    1.5,
+                    2.5,
+                    3.5,
                 ];
-                let clean_indices = [3, 4, 8, 9];
-                let white_indices = [1, 6, 11];
+                let clean_indices = [3, 4, 8, 12];
+                let white_indices = [1, 6, 10];
                 for (index, point) in samples.points[..samples.count].chunks_exact(10).enumerate() {
-                    assert_eq!(point[2], positions[index]);
-                    assert_eq!(point[3], cell / 2.0);
+                    let expected_position = if index < 9 {
+                        [positions[index], cell / 2.0]
+                    } else {
+                        [cell * 1.5, positions[index]]
+                    };
+                    assert_eq!(point[2..4], expected_position);
                     let expected = if clean_indices.contains(&index) {
                         [48.0, 80.0, 112.0]
                     } else if white_indices.contains(&index) {
@@ -9178,6 +9503,17 @@ mod tests {
                     assert_eq!(point[7], 255.0);
                     assert_eq!(point[8], 4.0);
                 }
+                // The real scrollbar can cover the last five logical pixels.
+                // None of the thirteen required samples enters that overlay.
+                assert!(
+                    samples.points[..samples.count]
+                        .chunks_exact(10)
+                        .all(|point| point[2] < width - 5.0 * dpi)
+                );
+                let mut clipped = draw.clone();
+                clipped.clip.y = cell;
+                clipped.clip.height -= cell;
+                assert!(atlas_composition_samples(&clipped).is_none());
             }
         }
         initialize_reporting(false, false);

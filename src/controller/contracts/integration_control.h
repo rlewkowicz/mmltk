@@ -20,6 +20,8 @@ struct IntegrationControlReceipt final {
     IntegrationControlKind kind = IntegrationControlKind::Progress;
     [[= mmltk::frameworks::reflection::Minimum{std::uint64_t{1U}}]] std::uint64_t sequence = 0U;
     std::uint64_t progress = 0U;
+    // Static integration-driver caller line; zero unless kind is Failed.
+    std::uint32_t failureline = 0U;
     bool operator==(const IntegrationControlReceipt&) const = default;
 };
 

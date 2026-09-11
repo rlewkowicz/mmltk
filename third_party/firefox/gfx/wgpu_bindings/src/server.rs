@@ -434,7 +434,8 @@ impl Drop for Global {
 pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr) -> *mut Global {
     mmltk_workspace_channel::initialize_diagnostics();
     MMLTK_WORKSPACE_ACCEPTANCE_TRACE.get_or_init(|| {
-        std::env::var("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION").as_deref() == Ok("1")
+        mmltk_workspace_channel::workspace_diagnostics_enabled()
+            && std::env::var("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION").as_deref() == Ok("1")
     });
     log::info!("Initializing WGPU server");
     let backends = wgt::Backends::VULKAN;

@@ -414,6 +414,14 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
         return owner && owner->admission.load(std::memory_order_acquire) &&
                owner->publish_record(IntegrationControl{.receipt = receipt}, transport::BrowserRecordPriority::Critical);
     });
+    gate->SetRedrawCommand([weak] {
+        const auto owner = weak.lock();
+        if (!owner || !owner->admission.load(std::memory_order_acquire)) return false;
+        const auto installed = owner->systems.load(std::memory_order_acquire);
+        if (!installed || !installed->presentation) return false;
+        installed->presentation->Observe({.redraw_requested = true});
+        return true;
+    });
     impl_->integration = std::move(gate);
 }
 
@@ -435,7 +443,8 @@ void ApplicationBrowserHost::close_admission() noexcept {
     impl_->admission.store(false, std::memory_order_release);
     if (impl_->integration) {
         impl_->integration->SetFrontendCommand({});
-        impl_->integration->Stop();
+        impl_->integration->SetRedrawCommand({});
+        impl_->integration->StopAndJoin();
     }
 }
 

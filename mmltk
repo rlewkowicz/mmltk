@@ -1016,7 +1016,7 @@ ensure_onnxruntime_image() {
     fingerprint="$({
         printf '%s\n' onnxruntime "${ubuntu_identity}" "${gcc16_identity}" "${payload_identity}"
         sha256sum "${repo_root}/docker/Dockerfile.onnxruntime" \
-            "${repo_root}/docker/patches/onnxruntime-1.27.1-cuda-graph-capture-end.patch" \
+            "${repo_root}/docker/patches/onnxruntime-1.27.1-cuda-graph-capture.patch" \
             "${repo_root}/docker/patches/onnxruntime-1.27.1-gcc16.patch"
     } | sha256sum | cut -d' ' -f1)"
     cached_buildx_image default onnxruntime "${onnxruntime_image_name}" \
@@ -2579,6 +2579,7 @@ print_test_suites() {
         '' \
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
+        'For headless-compositor, arguments after -- run a command in the private compositor.' \
         'Test options:' \
         '  --executable <target>       Build and run one executable owned by the suite' \
         '  --config <release|dev>      Select the containerized CMake graph' \
@@ -2833,21 +2834,29 @@ prepare_workspace_wayland_test_mounts() {
 }
 
 ensure_wayland_validation_image() {
-    local runtime_identity runtime_alias fingerprint
+    local runtime_identity runtime_alias build_identity build_alias fingerprint
     runtime_identity="$(docker image inspect "${image_name}" --format '{{.Id}}')" ||
         die "headless compositor requires the packaged runtime image; run ./mmltk --build first"
     runtime_alias="$(content_derived_local_image_alias wayland-runtime "${runtime_identity}")"
+    build_identity="$(docker image inspect "${build_image_name}" --format '{{.Id}}')" ||
+        die "headless compositor requires the GCC 16.2 build image; run ./mmltk --build first"
+    build_alias="$(content_derived_local_image_alias wayland-build "${build_identity}")"
     fingerprint="$({
-        printf '%s\n' wayland-validation "${runtime_identity}"
-        sha256sum "${repo_root}/docker/Dockerfile.wayland-validation"
+        printf '%s\n' wayland-validation "${runtime_identity}" "${build_identity}"
+        sha256sum "${repo_root}/docker/Dockerfile.wayland-validation" \
+            "${repo_root}/tools/headless_weston_seat.cpp"
     } | sha256sum | cut -d' ' -f1)"
     cached_buildx_image default - "${wayland_validation_image_name}" \
         "${repo_root}/docker/Dockerfile.wayland-validation" wayland-validation \
         "${fingerprint}" "${repo_root}" \
         --build-context "mmltk_runtime=docker-image://${runtime_alias}" \
-        --build-arg "MMLTK_RUNTIME_IDENTITY=${runtime_identity}"
+        --build-context "mmltk_build=docker-image://${build_alias}" \
+        --build-arg "MMLTK_RUNTIME_IDENTITY=${runtime_identity}" \
+        --build-arg "MMLTK_BUILD_IDENTITY=${build_identity}"
     verify_content_derived_local_image_alias "${runtime_alias}" "${runtime_identity}"
+    verify_content_derived_local_image_alias "${build_alias}" "${build_identity}"
     verify_image_label "${wayland_validation_image_name}" runtime-identity "${runtime_identity}"
+    verify_image_label "${wayland_validation_image_name}" build-identity "${build_identity}"
 }
 
 run_headless_compositor_tool_tests() {
@@ -2976,12 +2985,12 @@ run_tests() {
             ;;
     esac
     if [[ "${suite}" == "headless-compositor" || "${suite}" == "headless-compositor-tool" ]]; then
-        (($# == 0)) || die "--test ${suite} does not accept additional arguments"
         (( ! test_config_explicit )) || die "--test ${suite} does not accept --config"
         [[ -z "${test_executable}" ]] || die "--test ${suite} does not accept --executable"
         (( ! test_debugger )) || die "--test ${suite} does not accept --gdb or --gdb-command"
         ((${#test_environment[@]} == 0)) || die "--test ${suite} does not accept --env"
         if [[ "${suite}" == "headless-compositor-tool" ]]; then
+            (($# == 0)) || die "--test ${suite} does not accept additional arguments"
             run_headless_compositor_tool_tests
         else
             acquire_mutation_locks
@@ -2990,7 +2999,8 @@ run_tests() {
             ensure_wayland_validation_image
             test_headless_compositor=1
             local compositor_status=0
-            run_workspace_wayland_test_executable /usr/bin/true || compositor_status=$?
+            if (($# == 0)); then set -- /usr/bin/true; fi
+            run_workspace_wayland_test_executable "$@" || compositor_status=$?
             release_mutation_locks
             return "${compositor_status}"
         fi

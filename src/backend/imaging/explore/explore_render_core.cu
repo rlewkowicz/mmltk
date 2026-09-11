@@ -354,22 +354,34 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
     if (in_content && (clean_pixel.x != 0U || clean_pixel.y != 0U || clean_pixel.z != 0U)) atomicAdd(counts, 1ULL);
     const bool content_column = x >= probe.content_x && x < content_right;
     const bool content_row = y >= probe.content_y && y < content_bottom;
-    const std::uint32_t outside_transition_count = (probe.content_y != 0U && content_column && y + 1U == probe.content_y ? 1U : 0U) +
-                                                   (content_bottom < clean.height && content_column && y == content_bottom ? 1U : 0U) +
-                                                   (probe.content_x != 0U && content_row && x + 1U == probe.content_x ? 1U : 0U) +
-                                                   (content_right < clean.width && content_row && x == content_right ? 1U : 0U);
-    if (outside_transition_count != 0U && clean_pixel.x == 0U && clean_pixel.y == 0U && clean_pixel.z == 0U)
-        atomicAdd(counts + 1U, static_cast<unsigned long long>(outside_transition_count));
-    const std::uint32_t inside_transition_count = (probe.content_y != 0U && content_column && y == probe.content_y ? 1U : 0U) +
-                                                  (content_bottom < clean.height && content_column && y + 1U == content_bottom ? 1U : 0U) +
-                                                  (probe.content_x != 0U && content_row && x == probe.content_x ? 1U : 0U) +
-                                                  (content_right < clean.width && content_row && x + 1U == content_right ? 1U : 0U);
-    if (inside_transition_count != 0U) {
-        const auto* reference_row =
-            reinterpret_cast<const uchar4*>(probe.reference.data + static_cast<std::size_t>(y) * probe.reference.pitch_bytes);
-        const uchar4 expected = reference_row[x];
-        if (clean_pixel.x == expected.x && clean_pixel.y == expected.y && clean_pixel.z == expected.z && clean_pixel.w == expected.w)
-            atomicAdd(counts + 4U, static_cast<unsigned long long>(inside_transition_count));
+    // Linear filtering can color the immediate outside edge during enlargement.
+    // Check black padding within each band, and compare both sides of the exact
+    // geometric transition with the retained physical-copy reference.
+    const std::uint32_t padding_count =
+        (probe.content_y != 0U && content_column && y == (probe.content_y - 1U) / 2U ? 1U : 0U) +
+        (content_bottom < clean.height && content_column && y == content_bottom + (clean.height - content_bottom) / 2U ? 1U : 0U) +
+        (probe.content_x != 0U && content_row && x == (probe.content_x - 1U) / 2U ? 1U : 0U) +
+        (content_right < clean.width && content_row && x == content_right + (clean.width - content_right) / 2U ? 1U : 0U);
+    if (padding_count != 0U && clean_pixel.x == 0U && clean_pixel.y == 0U && clean_pixel.z == 0U)
+        atomicAdd(counts + 1U, static_cast<unsigned long long>(padding_count));
+    const bool on_content_edge = x == probe.content_x || y == probe.content_y || x + 1U == content_right || y + 1U == content_bottom;
+    if (in_content && on_content_edge) {
+        const auto matches_reference = [&](const std::uint32_t column, const std::uint32_t row) {
+            const auto* actual_row = reinterpret_cast<const uchar4*>(clean.data + static_cast<std::size_t>(row) * clean.pitch);
+            const auto* reference_row =
+                reinterpret_cast<const uchar4*>(probe.reference.data + static_cast<std::size_t>(row) * probe.reference.pitch_bytes);
+            const auto actual = actual_row[column];
+            const auto expected = reference_row[column];
+            return actual.x == expected.x && actual.y == expected.y && actual.z == expected.z && actual.w == expected.w;
+        };
+        if (matches_reference(x, y)) {
+            const std::uint32_t matching_transitions =
+                (probe.content_y != 0U && y == probe.content_y && matches_reference(x, y - 1U) ? 1U : 0U) +
+                (content_bottom < clean.height && y + 1U == content_bottom && matches_reference(x, y + 1U) ? 1U : 0U) +
+                (probe.content_x != 0U && x == probe.content_x && matches_reference(x - 1U, y) ? 1U : 0U) +
+                (content_right < clean.width && x + 1U == content_right && matches_reference(x + 1U, y) ? 1U : 0U);
+            if (matching_transitions != 0U) atomicAdd(counts + 4U, static_cast<unsigned long long>(matching_transitions));
+        }
     }
     const bool in_box = x >= probe.box_x && y >= probe.box_y && x < probe.box_x + probe.box_width && y < probe.box_y + probe.box_height;
     if (!in_box || semantic_pixel.w == 0U) return;

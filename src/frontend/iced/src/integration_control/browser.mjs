@@ -26,12 +26,11 @@ export function mmltkIntegrationInitialize(enabled) {
     initialAtlasWithoutInput: false,
     initialAtlasInputCount: 0,
     initialAtlasCompleted: false,
-    boundaryScratch: undefined,
     boundaryPending: false,
     boundaryLatest: undefined,
     compositionPending: false,
-    annotationScratch: undefined,
-    annotationContext: undefined,
+    canvasScratch: undefined,
+    canvasContext: undefined,
     integrationRenderKey: 0,
     inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown'],
     onInput: undefined,
@@ -241,15 +240,17 @@ export function mmltkIntegrationAtlasPixels(receipt, rectangles, sourceRevision,
   });
 }
 
-function annotationCanvasSnapshot(canvas) {
-  if (!integrationState.annotationScratch || integrationState.annotationScratch.width !== canvas.width || integrationState.annotationScratch.height !== canvas.height) {
-    integrationState.annotationScratch = new OffscreenCanvas(canvas.width, canvas.height);
-    integrationState.annotationContext = integrationState.annotationScratch.getContext('2d', {willReadFrequently:true});
+function canvasSnapshot(canvas) {
+  if (!integrationState.canvasScratch || integrationState.canvasScratch.width !== canvas.width || integrationState.canvasScratch.height !== canvas.height) {
+    integrationState.canvasScratch = new OffscreenCanvas(canvas.width, canvas.height);
+    integrationState.canvasContext = integrationState.canvasScratch.getContext('2d', {willReadFrequently:true});
   }
-  if (!integrationState.annotationContext) throw new Error('missing annotation canvas pixel reader');
-  integrationState.annotationContext.clearRect(0, 0, canvas.width, canvas.height);
-  integrationState.annotationContext.drawImage(canvas, 0, 0);
-  return integrationState.annotationContext;
+  if (!integrationState.canvasContext) throw new Error('missing diagnostic canvas pixel reader');
+  // Read the WebGPU canvas once per probe. Sampling that retained snapshot
+  // avoids another GPU readback for every individual pixel in the batch.
+  integrationState.canvasContext.clearRect(0, 0, canvas.width, canvas.height);
+  integrationState.canvasContext.drawImage(canvas, 0, 0);
+  return integrationState.canvasContext;
 }
 
 export function mmltkIntegrationAtlasComposition(receipt, points, cards, fields, source, presentation, columns, completed) {
@@ -269,15 +270,11 @@ export function mmltkIntegrationAtlasComposition(receipt, points, cards, fields,
       if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) { completed('invalidated'); return; }
       const canvas = document.querySelector('canvas');
       if (!canvas) throw new Error('missing composition canvas');
-      integrationState.boundaryScratch ??= new OffscreenCanvas(1,1);
-      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
-      if (!context) throw new Error('missing composition pixel reader');
+      const context = canvasSnapshot(canvas);
       const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 10) {
         const [x,y,screenX,screenY,r,g,b,a,kind,card] = points.slice(i,i+10);
-        context.clearRect(0,0,1,1);
-        context.drawImage(canvas,Math.floor(screenX),Math.floor(screenY),1,1,0,0,1,1);
-        const observed = Array.from(context.getImageData(0,0,1,1).data);
+        const observed = Array.from(context.getImageData(Math.floor(screenX),Math.floor(screenY),1,1).data);
         const expected = [r,g,b,a];
         const valid = observed.every((value,index)=>Math.abs(value-expected[index])<=4);
         matched += Number(valid);
@@ -313,15 +310,11 @@ function runBoundaryPixels({points,fields,control,source,presentation,receipt}) 
       if (!drawn || drawn.sourceRevision !== source || drawn.presentationRevision !== presentation) return;
       const canvas = document.querySelector('canvas');
       if (!canvas) return;
-      integrationState.boundaryScratch ??= new OffscreenCanvas(1, 1);
-      const context = integrationState.boundaryScratch.getContext('2d', {willReadFrequently:true});
-      if (!context) return;
+      const context = canvasSnapshot(canvas);
       const identity = JSON.parse(fields);
       for (let i = 0; i < points.length; i += 5) {
         const [x,y,screenX,screenY,sample_index] = points.slice(i,i+5);
-        context.clearRect(0,0,1,1);
-        context.drawImage(canvas,Math.floor(screenX),Math.floor(screenY),1,1,0,0,1,1);
-        const rgba = context.getImageData(0,0,1,1).data;
+        const rgba = context.getImageData(Math.floor(screenX),Math.floor(screenY),1,1).data;
         report({event:'iced.surface.canvas_pixel',...identity,control,sample_index,sample_x:x,sample_y:y,
           canvas_x:screenX,canvas_y:screenY,
           sample_rgba:(rgba[0]|rgba[1]<<8|rgba[2]<<16|rgba[3]<<24)>>>0});
@@ -364,7 +357,7 @@ export function mmltkIntegrationAnnotationSwatch(receipt, cssBounds,color,contro
       const canvas=document.querySelector('canvas');
       if (!canvas) throw new Error('missing annotation canvas');
       const bounds = canvasPixelBounds(canvas, cssBounds, control);
-      const context=annotationCanvasSnapshot(canvas);
+      const context=canvasSnapshot(canvas);
       const pixel=context.getImageData(Math.floor(bounds[0]+bounds[2]*(button?0.9:0.5)),Math.floor(bounds[1]+bounds[3]/2),1,1).data;
       const matched=color.every((channel,index)=>Math.abs(channel-pixel[index])<=3)&&pixel[3]>0;
       report({event:button?'integration.annotation_capability':'integration.annotation_swatch',control,detail,expected:color,observed:Array.from(pixel),matched});
@@ -385,7 +378,7 @@ export function mmltkIntegrationAnnotationPixels(receipt, cssBounds, extent, pro
     const drawn=integrationState.integrationSurfaceDraws.get('workflow.visual.workspace');
     if (!canvas || !drawn || drawn.sourceRevision!==sourceRevision || drawn.presentationRevision!==presentationRevision) { completed('invalidated'); return; }
     const bounds = canvasPixelBounds(canvas, cssBounds, 'annotation.workspace.surface');
-    const context=annotationCanvasSnapshot(canvas);
+    const context=canvasSnapshot(canvas);
     const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
     const ox=bounds[0]+(bounds[2]-extent[0]*scale)/2,oy=bounds[1]+(bounds[3]-extent[1]*scale)/2;
     const colorError = (pixels, offset, expected, filteredPalette) => {

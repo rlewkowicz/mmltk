@@ -17,7 +17,9 @@ namespace mmltk::backend::imaging::upscale::shiftlut {
 // explicitly after provider settlement, before destroying the session.
 class Operators final {
    public:
-    explicit Operators(std::size_t decision_capacity_pixels = 0);
+    // Verification owns an optional counter through this operator's lifetime.
+    // Ordinary runtimes have no allocation-counter state or updates.
+    explicit Operators(std::size_t decision_capacity_pixels = 0, std::uint64_t* allocation_counter = nullptr);
     ~Operators();
     Operators(const Operators&) = delete;
     Operators& operator=(const Operators&) = delete;
@@ -32,7 +34,4 @@ class Operators final {
     std::unique_ptr<Impl> impl_;
 };
 void configure_verification_session(Operators&, Ort::SessionOptions&, int device, bool enable_cuda_graph, cudaStream_t);
-// Effect-only cold allocation evidence; never used to order or select work.
-std::uint64_t allocation_count() noexcept;
-
 }  // namespace mmltk::backend::imaging::upscale::shiftlut

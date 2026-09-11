@@ -1,6 +1,16 @@
 --- a/onnxruntime/core/providers/cuda/cuda_graph.cc
 +++ b/onnxruntime/core/providers/cuda/cuda_graph.cc
-@@ -60,3 +60,12 @@
+@@ -47,6 +47,4 @@
+-  // For now cuda graph can only work with a single thread. In the future, we
+-  // will support multiple threads. For multiple threads with multiple graphs
+-  // and streams, `cudaStreamCaptureModeGlobal` needs to be changed to
+-  // `cudaStreamCaptureModeThreadLocal`
+-  CUDA_CALL_THROW(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal));
++  // Each provider capture belongs to its calling thread and stream.
++  // Independent workers may allocate without invalidating this capture.
++  CUDA_CALL_THROW(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+ }
+@@ -54,3 +52,12 @@
 -  cudaGraph_t graph = NULL;
 -  CUDA_CALL_THROW(cudaStreamEndCapture(stream_, &graph));
 -  if (graph == NULL) {
@@ -16,7 +26,7 @@
 +  } pending;
 +  CUDA_CALL_THROW(cudaStreamEndCapture(stream_, &pending.graph));
 +  if (pending.graph == nullptr) {
-@@ -66,4 +75,3 @@
+@@ -60,4 +67,3 @@
 -  cudaGraphExec_t graph_exec = NULL;
 -  CUDA_CALL_THROW(cudaGraphInstantiate(&graph_exec, graph, NULL, NULL, 0));
 -  CUDA_CALL_THROW(cudaGraphDestroy(graph));
@@ -24,7 +34,7 @@
 +  CUDA_CALL_THROW(cudaGraphInstantiate(&pending.executable, pending.graph, NULL, NULL, 0));
 +  CUDA_CALL_THROW(cudaGraphDestroy(pending.graph));
 +  pending.graph = nullptr;
-@@ -72 +80,2 @@
+@@ -65 +71,2 @@
 -  cuda_graph_set_.Put(cuda_graph_annotation_id, graph_exec);
 +  cuda_graph_set_.Put(cuda_graph_annotation_id, pending.executable);
 +  pending.executable = nullptr;

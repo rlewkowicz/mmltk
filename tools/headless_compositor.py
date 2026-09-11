@@ -41,9 +41,17 @@ def hardware_renderer(log):
 
 
 def require_wayland_protocols(report):
-    for interface in ("wl_compositor", "wl_output", "xdg_wm_base", "zwp_linux_dmabuf_v1"):
+    for interface in ("wl_compositor", "wl_output", "xdg_wm_base", "zwp_linux_dmabuf_v1", "wl_seat"):
         if not re.search(rf"interface:\s*'{interface}'", report):
             raise SessionFailure(f"headless compositor lacks {interface}")
+    # Capabilities must belong to the same seat, not another global or seat.
+    for block in re.split(r"(?=^interface:)", report, flags=re.MULTILINE):
+        if not block.startswith("interface: 'wl_seat'"):
+            continue
+        capabilities = re.search(r"^\s+capabilities:([^\n]*)$", block, re.MULTILINE)
+        if capabilities and {"pointer", "keyboard"} <= set(capabilities.group(1).split()):
+            return
+    raise SessionFailure("headless compositor lacks a wl_seat with pointer and keyboard")
 
 
 def session_environment(runtime):
@@ -168,7 +176,8 @@ class HeadlessSession:
             weston_command = (
                 "/usr/bin/weston", "--backend=headless", "--renderer=gl",
                 "--width=1920", "--height=1080", "--scale=1", "--idle-time=0",
-                "--shell=desktop", "--modules=systemd-notify.so",
+                "--shell=desktop",
+                "--modules=/usr/lib/weston/mmltk-headless-seat.so,systemd-notify.so",
                 f"--config={Path(__file__).with_name('headless-weston.ini')}",
                 f"--socket={self.environment['WAYLAND_DISPLAY']}",
                 f"--log={weston_log}",

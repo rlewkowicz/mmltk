@@ -292,6 +292,15 @@ class PresentationSystem::Impl final {
                                                   }};
         const PresentationNativeOutcome outcome = writer_->Pump(pump_generation);
         pump_span.FinishWith([&](auto& fact) { fact.detail = static_cast<std::uint64_t>(outcome.progress); });
+        bool superseded_source_advanced = false;
+        if (outcome.progress == PresentationNativeProgress::Superseded &&
+            outcome.submitted.selection_generation == pump_generation) {
+            const auto source = Find(outcome.submitted.observation.frame.source);
+            if (source != sources_.end()) {
+                const auto latest = source->observe();
+                superseded_source_advanced = latest.valid() && latest != outcome.submitted.observation;
+            }
+        }
         PresentationSnapshot completed;
         PresentationSnapshot capability_snapshot;
         bool publish_capability = false;
@@ -312,7 +321,10 @@ class PresentationSystem::Impl final {
                     break;
                 case PresentationNativeProgress::Superseded:
                     if (in_flight_ && *in_flight_ == outcome.submitted) {
-                        if (in_flight_->selection_generation == selection_generation_ &&
+                        // Catch up to already-published source progress once.
+                        // An unchanged unavailable borrow waits for its owner's
+                        // notification; repeating it cannot make progress.
+                        if (!pending_ && superseded_source_advanced && in_flight_->selection_generation == selection_generation_ &&
                             state_.selected == in_flight_->observation.frame.source)
                             pending_ = Pending{
                                 .source = state_.selected,

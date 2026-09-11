@@ -169,7 +169,8 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
     for (const bool capture : {false, true}) {
         VerificationStorage storage;
         storage.Allocate();
-        lut::Operators operators{1024};
+        std::uint64_t allocation_count = 0;
+        lut::Operators operators{1024, &allocation_count};
         Ort::SessionOptions options;
         lut::configure_verification_session(operators, options, 0, capture, storage.Stream());
         {
@@ -202,11 +203,11 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
                 Ort::RunOptions run;
                 const auto graph_id = std::to_string(height * 257 + width);
                 run.AddConfigEntry("gpu_graph_id", graph_id.c_str());
-                const auto before = lut::allocation_count();
+                const auto before = allocation_count;
                 for (int replay = 0; replay < 3; ++replay)
                     session.Run(run, binding);
                 cuda_checked(cudaStreamSynchronize(storage.Stream()), "settle verification replay");
-                const auto after = lut::allocation_count();
+                const auto after = allocation_count;
                 if (before != after) throw std::runtime_error("ShiftLUT operator allocated during execution");
                 std::vector<float> actual(expected.size());
                 cuda_checked(cudaMemcpy(actual.data(), storage.Output(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),

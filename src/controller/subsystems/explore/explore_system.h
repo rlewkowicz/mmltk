@@ -349,6 +349,9 @@ class ExploreAcceptanceGate final {
     // Install before admitting reads; invoked outside the lane control mutex.
     void SetReadObserver(void*, void (*)(void*, std::uint64_t, std::uint32_t)) noexcept;
     void ObserveRead(std::uint64_t, std::uint32_t) const;
+    // Construction-only acceptance receipt, invoked before the initial wait
+    // without holding either the physical lane or gate control mutex.
+    void SetInitialWaitObserver(void*, void (*)(void*, std::uint64_t)) noexcept;
     void FailNextPublicationAt(PublicationStage) noexcept;
     void CheckPublication(PublicationStage) const;
     void FailNextProbe() noexcept;
@@ -368,12 +371,16 @@ class ExploreAcceptanceGate final {
     // Installed only by the explicit integration host. The descriptor reader
     // remains the sole receiver of parent commands throughout the session.
     void SetFrontendCommand(FrontendCommand);
+    // One acceptance-only redraw while initial reads remain held.
+    void SetRedrawCommand(std::function<bool()>);
     [[nodiscard]] bool ObserveFrontend(contracts::IntegrationControlReceipt) noexcept;
     struct ControlObservation final {
         ControlEvent event = ControlEvent::InitialWait;
         std::uint64_t generation = 0U;
         std::uint64_t slot = 0U;
         std::uint64_t compiled_index = 0U;
+        // Frontend observations carry the static failure source line here;
+        // worker observations carry physical staging capacity.
         std::uint64_t staging_bytes = 0U;
     };
 
@@ -388,6 +395,9 @@ class ExploreAcceptanceGate final {
     [[nodiscard]] bool ClaimHeldCompletion();
     [[nodiscard]] bool ClaimTerminalReport();
     void Stop() noexcept;
+    // Host teardown only; never call from a descriptor-reader callback.
+    // Settles callbacks before their application systems may be destroyed.
+    void StopAndJoin() noexcept;
 
    private:
     class Impl;

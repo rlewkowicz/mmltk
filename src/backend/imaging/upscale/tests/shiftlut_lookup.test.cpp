@@ -1,25 +1,35 @@
 #include "src/backend/imaging/upscale/detail/image_upscaler_cuda.h"
 #include "src/backend/imaging/upscale/detail/shiftlut_onnx_ops.h"
 #include "shiftlut_reference.h"
+#include "async_test_utils.hpp"
+#include "cuda_test_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <cuda_runtime_api.h>
+#include <onnx/onnx_pb.h>
 #include <onnxruntime_cxx_api.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
+
+namespace onnx = mmltk_onnx;
 
 class DeviceBuffer final {
    public:
@@ -50,6 +60,66 @@ class Stream final {
     cudaStream_t stream_ = nullptr;
 };
 
+struct CaptureObservation final {
+    mmltk::testsupport::TestGate::Receipt gate;
+    std::size_t calls = 0;
+    std::size_t captures = 0;
+};
+
+class CaptureIdentityKernel final {
+   public:
+    explicit CaptureIdentityKernel(CaptureObservation& observation) : observation_(observation) {}
+
+    OrtStatusPtr ComputeV2(OrtKernelContext* raw) noexcept {
+        try {
+            Ort::KernelContext context{raw};
+            const auto stream = static_cast<cudaStream_t>(context.GetGPUComputeStream());
+            cudaStreamCaptureStatus capture{};
+            auto status = cudaStreamIsCapturing(stream, &capture);
+            if (status != cudaSuccess) return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, cudaGetErrorString(status));
+            ++observation_.calls;
+            if (capture == cudaStreamCaptureStatusActive) {
+                ++observation_.captures;
+                observation_.gate.ArriveAndWait();
+            }
+            const auto input = context.GetInput(0);
+            constexpr std::int64_t shape[]{1};
+            auto output = context.GetOutput(0, shape, 1);
+            status = cudaMemcpyAsync(output.GetTensorMutableData<float>(), input.GetTensorData<float>(), sizeof(float),
+                                     cudaMemcpyDeviceToDevice, stream);
+            return status == cudaSuccess ? nullptr : Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, cudaGetErrorString(status));
+        } catch (const std::exception& error) {
+            return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what());
+        } catch (...) {
+            return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, "capture fixture failed");
+        }
+    }
+
+   private:
+    CaptureObservation& observation_;
+};
+
+struct CaptureIdentityOperator final : Ort::CustomOpBase<CaptureIdentityOperator, CaptureIdentityKernel, true> {
+    explicit CaptureIdentityOperator(CaptureObservation& observation) : observation_(observation) {}
+    const char* GetName() const noexcept { return "CaptureIdentity"; }
+    const char* GetExecutionProviderType() const noexcept { return "CUDAExecutionProvider"; }
+    std::size_t GetInputTypeCount() const noexcept { return 1; }
+    std::size_t GetOutputTypeCount() const noexcept { return 1; }
+    ONNXTensorElementDataType GetInputType(std::size_t) const noexcept { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
+    ONNXTensorElementDataType GetOutputType(std::size_t) const noexcept { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
+    OrtStatusPtr CreateKernelV2(const OrtApi& api, const OrtKernelInfo*, void** result) const noexcept {
+        try {
+            *result = new CaptureIdentityKernel(observation_);
+            return nullptr;
+        } catch (const std::exception& error) {
+            return api.CreateStatus(ORT_RUNTIME_EXCEPTION, error.what());
+        }
+    }
+
+   private:
+    CaptureObservation& observation_;
+};
+
 int reflected(int coordinate, int extent) {
     if (extent == 1) return 0;
     const int period = (extent - 1) * 2;
@@ -71,6 +141,82 @@ std::vector<std::uint8_t> oracle(const char* kind, std::uint32_t width, std::uin
 }
 
 }  // namespace
+
+TEST_CASE("ONNX graph capture permits independent worker allocation and retains replay", "[upscale_gpu][capture]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    mmltk::testsupport::TestGate capture{"ONNX CUDA provider capture"};
+    CaptureObservation observation{capture.receipt()};
+    CaptureIdentityOperator operation{observation};
+    Ort::CustomOpDomain domain{"mmltk.test"};
+    domain.Add(&operation);
+    Ort::Env environment{ORT_LOGGING_LEVEL_ERROR, "capture_concurrency"};
+    DeviceBuffer input(sizeof(float));
+    DeviceBuffer output(sizeof(float));
+    Stream stream;
+    const float expected = 1.25F;
+    REQUIRE(cudaMemcpy(input.as<void>(), &expected, sizeof(expected), cudaMemcpyHostToDevice) == cudaSuccess);
+    Ort::SessionOptions options;
+    options.SetIntraOpNumThreads(1);
+    options.SetInterOpNumThreads(1);
+    options.Add(domain);
+    Ort::CUDAProviderOptions cuda_options;
+    cuda_options.Update(std::unordered_map<std::string, std::string>{{"device_id", "0"}, {"enable_cuda_graph", "1"}});
+    cuda_options.UpdateWithValue("user_compute_stream", stream.get());
+    options.AppendExecutionProvider_CUDA_V2(*cuda_options);
+    onnx::ModelProto model;
+    model.set_ir_version(8);
+    auto* opset = model.add_opset_import();
+    opset->set_domain("mmltk.test");
+    opset->set_version(1);
+    auto* graph = model.mutable_graph();
+    graph->set_name("capture_concurrency");
+    for (const auto& [name, value] : {std::pair{"input", graph->add_input()}, std::pair{"output", graph->add_output()}}) {
+        value->set_name(name);
+        auto* tensor = value->mutable_type()->mutable_tensor_type();
+        tensor->set_elem_type(onnx::TensorProto::FLOAT);
+        tensor->mutable_shape()->add_dim()->set_dim_value(1);
+    }
+    auto* node = graph->add_node();
+    node->set_domain("mmltk.test");
+    node->set_op_type("CaptureIdentity");
+    node->add_input("input");
+    node->add_output("output");
+    const auto bytes = model.SerializeAsString();
+    Ort::Session session{environment, bytes.data(), bytes.size(), options};
+    constexpr std::int64_t shape[]{1};
+    Ort::MemoryInfo memory{"Cuda", OrtArenaAllocator, 0, OrtMemTypeDefault};
+    auto input_value = Ort::Value::CreateTensor<float>(memory, input.as<float>(), 1, shape, 1);
+    auto output_value = Ort::Value::CreateTensor<float>(memory, output.as<float>(), 1, shape, 1);
+    Ort::IoBinding binding{session};
+    binding.BindInput("input", input_value);
+    binding.BindOutput("output", output_value);
+    const auto release = [](void* address) { CHECK(cudaFree(address) == cudaSuccess); };
+    std::unique_ptr<void, decltype(release)> independent{nullptr, release};
+    auto inference = std::async(std::launch::async, [&] {
+        const auto selected = cudaSetDevice(0);
+        if (selected != cudaSuccess) throw std::runtime_error(cudaGetErrorString(selected));
+        Ort::RunOptions run;
+        for (int iteration = 0; iteration < 3; ++iteration) session.Run(run, binding);
+        const auto captured_calls = observation.calls;
+        for (int iteration = 0; iteration < 3; ++iteration) session.Run(run, binding);
+        return std::pair{captured_calls, observation.calls};
+    });
+    const mmltk::testsupport::ScopedTestCleanup settle_capture{[&] { capture.Release(); }};
+    REQUIRE(capture.WaitEntered(std::chrono::seconds{10}));
+    void* allocation = nullptr;
+    const auto allocation_status = cudaMalloc(&allocation, 64U);
+    independent.reset(allocation);
+    static_cast<void>(cudaGetLastError());
+    capture.Release();
+    CHECK(allocation_status == cudaSuccess);
+    const auto calls = mmltk::testsupport::await_test_future(inference, "captured ONNX inference", std::chrono::seconds{10});
+    CHECK(observation.captures == 1U);
+    CHECK(calls.first == calls.second);
+    float actual = 0.0F;
+    REQUIRE(cudaMemcpy(&actual, output.as<void>(), sizeof(actual), cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(actual == expected);
+}
 
 TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pitched crop borders", "[upscale_gpu]") {
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
@@ -174,7 +320,8 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
     namespace lut = mmltk::backend::imaging::upscale::shiftlut;
     const bool graph = GENERATE(false, true);
     Stream stream;
-    lut::Operators operators;
+    std::uint64_t allocation_count = 0;
+    lut::Operators operators{0, &allocation_count};
     Ort::Env environment{ORT_LOGGING_LEVEL_ERROR, "shiftlut_equivalence"};
     Ort::SessionOptions options;
     lut::configure_verification_session(operators, options, 0, graph, stream.get());
@@ -196,7 +343,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
         binding.BindInput("image", input_value);
         binding.BindOutput("upscaled", output_value);
         Ort::RunOptions run;
-        const auto allocations = lut::allocation_count();
+        REQUIRE(allocation_count == 1U);
         for (const auto geometry : std::array<std::array<std::uint32_t, 2>, 4>{{{1, 1}, {5, 3}, {197, 193}, {5, 3}}}) {
             const auto width = geometry[0], height = geometry[1];
             const std::size_t source_pitch = width * 4U + 31U, target_pitch = width * 16U + 47U;
@@ -220,7 +367,7 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
                     }
                 }
                 REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
-                CHECK(lut::allocation_count() == allocations);
+                CHECK(allocation_count == 1U);
                 std::vector<std::uint8_t> actual(target_pitch * height * 4U);
                 REQUIRE(cudaMemcpy(actual.data(), target.as<void>(), actual.size(), cudaMemcpyDeviceToHost) == cudaSuccess);
                 for (std::size_t y = 0; y < height * 4U; ++y) {
@@ -235,4 +382,25 @@ TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles acr
         REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
     }
     REQUIRE(operators.Release() == cudaSuccess);
+}
+
+TEST_CASE("ShiftLUT allocation evidence is scoped to an opted-in operator", "[upscale_gpu][probe]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    namespace lut = mmltk::backend::imaging::upscale::shiftlut;
+    Stream stream;
+    Ort::Env environment{ORT_LOGGING_LEVEL_ERROR, "shiftlut_allocation_evidence"};
+    const auto model = std::filesystem::path(MMLTK_TEST_SOURCE_ROOT) / "src/backend/imaging/upscale/assets/ShiftLUT_fp32.onnx";
+    std::uint64_t allocations = 0;
+    lut::Operators observed{0, &allocations};
+    lut::Operators ordinary;
+    for (auto* operators : {&observed, &ordinary, &observed}) {
+        Ort::SessionOptions options;
+        lut::configure_verification_session(*operators, options, 0, false, stream.get());
+        {
+            Ort::Session session{environment, model.c_str(), options};
+            CHECK(allocations == 1U);
+        }
+    }
+    REQUIRE(observed.Release() == cudaSuccess);
+    REQUIRE(ordinary.Release() == cudaSuccess);
 }

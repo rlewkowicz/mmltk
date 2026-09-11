@@ -928,6 +928,59 @@ mod tests {
             if !enabled {
                 assert!(capture.records().is_empty());
             }
+            for dark in [false, true] {
+                driver.phase = Phase::Complete;
+                driver
+                    .reset_scenario(
+                        "source".into(),
+                        "compiled".into(),
+                        "512".into(),
+                        "terminal".into(),
+                    )
+                    .unwrap();
+                let mut settings = crate::view::settings::SettingsModel::default();
+                settings.install(model.settings_snapshot.as_ref().unwrap());
+                settings.draft.as_mut().unwrap().ui.darkmode = dark;
+                drop(driver.advance(
+                    &model,
+                    &settings,
+                    1.0,
+                    &router,
+                    FeatureId::Explore,
+                    Some(frame),
+                ));
+                assert_eq!(driver.phase, Phase::TrainNavigation);
+                STYLES.with(|styles| styles.borrow_mut().as_mut().unwrap().clear());
+                driver.reporting.observe(|state| {
+                    state.style(EXPLORE_OPEN, bounds);
+                    state.style(EXPLORE_OPEN, bounds);
+                    state.style(BENCHMARK_OVERRIDE, bounds);
+                    state.style(BENCHMARK_OVERRIDE, bounds);
+                });
+                STYLES.with(|styles| {
+                    let styles = styles.borrow();
+                    let styles = styles.as_ref().unwrap();
+                    assert_eq!(styles.len(), if enabled { 2 } else { 0 });
+                    if enabled {
+                        let fluent =
+                            crate::fluent_theme::conformance(&crate::fluent_theme::app_theme(dark));
+                        for (record, color) in styles
+                            .iter()
+                            .zip([fluent.primary_color, fluent.benchmark_color])
+                        {
+                            assert_eq!(
+                                record.2,
+                                [color.r, color.g, color.b, color.a].map(f64::from)
+                            );
+                            assert_eq!(record.2[3], 1.0);
+                        }
+                    }
+                });
+                if !enabled {
+                    assert!(capture.records().is_empty());
+                    assert!(driver.reporting.state_is_absent());
+                }
+            }
         }
     }
 
@@ -1100,13 +1153,14 @@ mod tests {
         let (mut connection, _transport_capture) =
             crate::transport_connection::Connection::test_channel();
         connection.observe_integration_pressure(1);
-        let expected = |kind, progress| {
+        let expected = |kind, progress, failureline| {
             crate::generated::IntegrationControl {
                 protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
                 receipt: crate::generated::IntegrationControlReceipt {
                     kind,
                     sequence: 1,
                     progress,
+                    failureline,
                 },
             }
             .encode()
@@ -1120,7 +1174,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(wire, vec![expected(IntegrationControlKind::Progress, 5)]);
+        assert_eq!(wire, vec![expected(IntegrationControlKind::Progress, 5, 0)]);
         wire.clear();
         let sample_count = crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY
             * crate::generated::ANNOTATION_INPUT_ADMISSION_SLOTS
@@ -1166,7 +1220,7 @@ mod tests {
         );
         assert_eq!(
             wire.last().unwrap(),
-            &expected(IntegrationControlKind::PressureEntered, 0)
+            &expected(IntegrationControlKind::PressureEntered, 0, 0)
         );
         driver.phase = Phase::Complete;
         driver.publish_control(&mut connection);
@@ -1200,8 +1254,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(wire, vec![expected(IntegrationControlKind::Settled, 10)]);
+        assert_eq!(wire, vec![expected(IntegrationControlKind::Settled, 10, 0)]);
+        let failure_line = line!() + 1;
         driver.fail_detail(|| panic!("quiet failure formatting ran"));
+        assert_eq!(driver.failure_line, failure_line);
         driver.publish_control(&mut connection);
         wire.clear();
         connection
@@ -1210,7 +1266,13 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(wire, vec![expected(IntegrationControlKind::Failed, 15)]);
+        assert_eq!(
+            wire,
+            vec![expected(IntegrationControlKind::Failed, 15, failure_line)]
+        );
+        let forwarded_line = line!() + 1;
+        driver.fail("static quiet failure");
+        assert_eq!(driver.failure_line, forwarded_line);
         assert!(
             driver
                 .reset_scenario(String::new(), String::new(), String::new(), "quiet".into())
@@ -1221,6 +1283,7 @@ mod tests {
             .reset_scenario(String::new(), String::new(), String::new(), "quiet".into())
             .unwrap();
         assert_eq!(driver.control_progress, 0);
+        assert_eq!(driver.failure_line, 0);
         assert_eq!(driver.control_phase, None);
         assert!(driver.reporting.state_is_absent());
         assert!(capture.records().is_empty());

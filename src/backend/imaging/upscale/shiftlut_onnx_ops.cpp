@@ -4,7 +4,6 @@
 #include <onnxruntime_cxx_api.h>
 
 #include <array>
-#include <atomic>
 #include <exception>
 #include <stdexcept>
 #include <string>
@@ -13,8 +12,6 @@
 
 namespace mmltk::backend::imaging::upscale::shiftlut {
 namespace {
-
-std::atomic<std::uint64_t> allocations{0};
 
 void checked(cudaError_t status, const char* context) {
     if (status != cudaSuccess) throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
@@ -29,7 +26,7 @@ class Storage final {
         checked(cudaGetDevice(&device_), "bind ShiftLUT allocation");
         checked(cudaMalloc(reinterpret_cast<void**>(&data_), resident_bytes(decision_capacity_)),
                 "allocate resident ShiftLUT tables and stages");
-        allocations.fetch_add(1, std::memory_order_relaxed);
+        if (allocation_counter_ != nullptr) ++*allocation_counter_;
         checked(cudaMemcpy(data_, tables, kTableBytes, cudaMemcpyHostToDevice), "install immutable ShiftLUT tables");
     }
     ~Storage() {
@@ -47,7 +44,8 @@ class Storage final {
         const auto restored = cudaSetDevice(previous);
         return released == cudaSuccess ? restored : released;
     }
-    explicit Storage(std::size_t decision_capacity) : decision_capacity_(decision_capacity) {
+    Storage(std::size_t decision_capacity, std::uint64_t* allocation_counter)
+        : decision_capacity_(decision_capacity), allocation_counter_(allocation_counter) {
         if (decision_capacity > kMaximumTilePixels) throw std::invalid_argument("invalid ShiftLUT diagnostic capacity");
     }
     Storage(const Storage&) = delete;
@@ -64,6 +62,7 @@ class Storage final {
 
    private:
     std::size_t decision_capacity_ = 0;
+    std::uint64_t* allocation_counter_ = nullptr;
     int device_ = 0;
     float* data_ = nullptr;
 };
@@ -147,10 +146,13 @@ struct Operators::Impl {
     Storage storage;
     Operator operation{storage};
     Ort::CustomOpDomain domain{kDomain};
-    explicit Impl(std::size_t decision_capacity) : storage(decision_capacity) { domain.Add(&operation); }
+    Impl(std::size_t decision_capacity, std::uint64_t* allocation_counter) : storage(decision_capacity, allocation_counter) {
+        domain.Add(&operation);
+    }
 };
 
-Operators::Operators(std::size_t decision_capacity) : impl_(std::make_unique<Impl>(decision_capacity)) {}
+Operators::Operators(std::size_t decision_capacity, std::uint64_t* allocation_counter)
+    : impl_(std::make_unique<Impl>(decision_capacity, allocation_counter)) {}
 Operators::~Operators() = default;
 void Operators::Register(Ort::SessionOptions& options) { options.Add(impl_->domain); }
 cudaError_t Operators::Release() noexcept { return impl_->storage.Release(); }
@@ -167,6 +169,4 @@ void configure_verification_session(Operators& operators, Ort::SessionOptions& o
     cuda.UpdateWithValue("user_compute_stream", stream);
     options.AppendExecutionProvider_CUDA_V2(*cuda);
 }
-std::uint64_t allocation_count() noexcept { return allocations.load(std::memory_order_relaxed); }
-
 }  // namespace mmltk::backend::imaging::upscale::shiftlut

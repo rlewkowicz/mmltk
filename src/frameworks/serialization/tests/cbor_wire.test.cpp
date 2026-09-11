@@ -95,7 +95,7 @@ void require_decode_error(const Result& result, const wire::ErrorCode code) {
 
 template <std::size_t Size>
 void require_malformed_scalar(const std::array<std::byte, Size>& bytes, const wire::ErrorCode code) {
-    const auto limits = test_limits(Size, 8U, 4U);
+    const auto limits = test_limits(Size, Size, 4U);
     require_decode_error(wire::decode({bytes, {}}, limits), code);
     require_decode_error(wire::Reader({bytes, {}}, limits).read_flat(), code);
     require_decode_error(wire::validate_raw_item({bytes, {}}, limits), code);

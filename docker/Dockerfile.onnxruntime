@@ -31,9 +31,9 @@ RUN curl -fsSL \
     && tar -xzf /tmp/onnxruntime.tar.gz --strip-components=1 -C /src \
     && test "$(cat /src/VERSION_NUMBER)" = "${MMLTK_ONNXRUNTIME_VERSION}" \
     && rm /tmp/onnxruntime.tar.gz
-COPY docker/patches/onnxruntime-1.27.1-cuda-graph-capture-end.patch /tmp/capture-end.patch
+COPY docker/patches/onnxruntime-1.27.1-cuda-graph-capture.patch /tmp/capture.patch
 COPY docker/patches/onnxruntime-1.27.1-gcc16.patch /tmp/gcc16.patch
-RUN patch --batch --fuzz=0 -d /src -p1 </tmp/capture-end.patch \
+RUN patch --batch --fuzz=0 -d /src -p1 </tmp/capture.patch \
     && patch --batch --fuzz=0 -d /src -p1 </tmp/gcc16.patch
 # Keep the dependency's C/C++/CUDA dialects and kernel inventory. Its C++20
 # policy is separate from the application's C++26/CUDA C++23 policy.

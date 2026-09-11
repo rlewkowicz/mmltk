@@ -186,8 +186,9 @@ TEST_CASE("Host render demand samples only the current atomic generation", "[bac
 
 TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha", "[backend][imaging][explore][probe]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
-    constexpr std::size_t pitch = 32U;
-    std::array<std::uint8_t, pitch * 4U> pixels{};
+    std::size_t pitch = 32U;
+    std::uint32_t extent = 4U;
+    std::array<std::uint8_t, 32U * 4U> pixels{};
     for (std::size_t y = 0U; y < 4U; ++y)
         for (std::size_t x = 0U; x < 4U; ++x) {
             pixels[y * pitch + x * 4U + 1U] = 255U;
@@ -203,9 +204,18 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
     semantic.upload<std::uint8_t>(pixels);
     retained.upload<std::uint8_t>(reference);
     CudaStream stream;
-    REQUIRE(cudaMemsetAsync(counts.data(), 0, 5U * sizeof(std::uint64_t), stream.get()) == cudaSuccess);
-    const auto target = [](CudaBuffer& buffer) {
-        return ExploreRenderTargetView{.data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = 4U, .height = 4U};
+    const auto target = [&](CudaBuffer& buffer) {
+        return ExploreRenderTargetView{
+            .data = static_cast<std::uint8_t*>(buffer.data()), .pitch_bytes = pitch, .width = extent, .height = extent};
+    };
+    const auto measure = [&](const ExploreRenderedCardProbe& probe) {
+        std::array<std::uint64_t, 5U> result{};
+        REQUIRE(cudaMemsetAsync(counts.data(), 0, sizeof(result), stream.get()) == cudaSuccess);
+        REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()),
+                                           stream.address()) == kExploreStorageSuccess);
+        REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
+        REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+        return result;
     };
     const ExploreRenderedCardProbe probe{.reference = target(retained),
                                          .content_x = 1U,
@@ -214,15 +224,47 @@ TEST_CASE("Rendered probes compare owned pitched RGBA references including alpha
                                          .content_height = 2U,
                                          .box_width = 4U,
                                          .box_height = 4U};
-    REQUIRE(probe_explore_rendered_card(target(clean), target(semantic), probe, static_cast<std::uint64_t*>(counts.data()),
-                                        stream.address()) == kExploreStorageSuccess);
-    std::array<std::uint64_t, 5U> result{};
-    REQUIRE(cudaMemcpyAsync(result.data(), counts.data(), sizeof(result), cudaMemcpyDeviceToHost, stream.get()) == cudaSuccess);
-    REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
+    const auto result = measure(probe);
     CHECK(result[0U] == 4U);
     CHECK(result[2U] == 12U);
     CHECK(result[3U] == 4U);
     CHECK(result[4U] == 6U);
+
+    pitch = 48U;
+    extent = 8U;
+    std::array<std::uint8_t, 48U * 8U> filtered{};
+    auto overlay = filtered;
+    for (std::size_t y = 0U; y < extent; ++y)
+        for (std::size_t x = 0U; x < extent; ++x) {
+            const auto pixel = y * pitch + x * 4U;
+            const bool content = x >= 2U && x < 6U && y >= 2U && y < 6U;
+            const bool fringe = x >= 1U && x < 7U && y >= 1U && y < 7U;
+            filtered[pixel + 1U] = content ? 255U : fringe ? 26U : 0U;
+            filtered[pixel + 3U] = 255U;
+            overlay[pixel + 1U] = 255U;
+            overlay[pixel + 3U] = 255U;
+        }
+    clean.upload<std::uint8_t>(filtered);
+    retained.upload<std::uint8_t>(filtered);
+    semantic.upload<std::uint8_t>(overlay);
+    const ExploreRenderedCardProbe enlarged{.reference = target(retained),
+                                            .content_x = 2U,
+                                            .content_y = 2U,
+                                            .content_width = 4U,
+                                            .content_height = 4U,
+                                            .box_width = extent,
+                                            .box_height = extent};
+    CHECK(measure(enlarged) == std::array<std::uint64_t, 5U>{16U, 16U, 28U, 36U, 16U});
+    // A filtered fringe is valid only when the exact RGBA copy is preserved.
+    auto mismatched = filtered;
+    mismatched[pitch + 3U * 4U + 3U] = 0U;
+    retained.upload<std::uint8_t>(mismatched);
+    CHECK(measure(enlarged)[4U] == 15U);
+    retained.upload<std::uint8_t>(filtered);
+    mismatched = filtered;
+    mismatched[3U * 4U + 1U] = 26U;
+    clean.upload<std::uint8_t>(mismatched);
+    CHECK(measure(enlarged)[1U] == 15U);
 }
 
 struct SemanticOracleResult final {

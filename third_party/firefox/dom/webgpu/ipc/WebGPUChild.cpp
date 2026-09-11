@@ -53,9 +53,14 @@
 namespace mozilla::webgpu {
 
 static bool WorkspaceAcceptanceTraceEnabled() {
-  const char* const configured =
-      std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
-  return configured && std::strcmp(configured, "1") == 0;
+  static const bool enabled = [] {
+    const char* const destination = std::getenv("MMLTK_GUI_TRACE_FILE");
+    const char* const integration =
+        std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
+    return destination && destination[0] && integration &&
+           std::strcmp(integration, "1") == 0;
+  }();
+  return enabled;
 }
 
 static constexpr auto kWorkspaceFrameReleaseEvent =

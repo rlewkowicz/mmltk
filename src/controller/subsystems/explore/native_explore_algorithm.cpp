@@ -51,16 +51,15 @@ class ExploreAcceptanceGate::Impl final {
     void (*submission_observer)(void*, std::uintptr_t, SubmissionStage) = nullptr;
     void* read_context = nullptr;
     void (*read_observer)(void*, std::uint64_t, std::uint32_t) = nullptr;
+    void* initial_wait_context = nullptr;
+    void (*initial_wait_observer)(void*, std::uint64_t) = nullptr;
     mutable std::atomic<PublicationStage> publication_failure{PublicationStage::None};
     mutable std::atomic_bool probe_failure{false};
     explicit Impl(const int command_descriptor) : command_(command_descriptor), stop_(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)) {
         if (command_.get() < 0 || stop_.get() < 0) throw std::invalid_argument("invalid Explore acceptance gate descriptor");
         reader_ = std::jthread([this] { ReadCommands(); });
     }
-    ~Impl() {
-        Stop();
-        if (reader_.joinable()) reader_.join();
-    }
+    ~Impl() { StopAndJoin(); }
 
     void AdvanceGeneration(const std::uint64_t generation) noexcept {
         std::scoped_lock lock(mutex_);
@@ -129,11 +128,18 @@ class ExploreAcceptanceGate::Impl final {
         frontend_command_ = std::move(retained);
     }
 
+    void SetRedrawCommand(std::function<bool()> callback) {
+        auto retained = callback ? std::make_shared<const std::function<bool()>>(std::move(callback)) : nullptr;
+        std::scoped_lock lock(mutex_);
+        redraw_command_ = std::move(retained);
+    }
+
     [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
         std::scoped_lock lock(mutex_);
         using Kind = contracts::IntegrationControlKind;
         if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ || receipt.kind == Kind::Advance)
             return false;
+        if ((receipt.kind == Kind::Failed) != (receipt.failureline != 0U)) return false;
         if (receipt.kind == Kind::Progress) {
             if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;
             frontend_progress_ = receipt.progress;
@@ -143,7 +149,8 @@ class ExploreAcceptanceGate::Impl final {
         const bool sent = SendControlObservation({.event = ControlEvent::Frontend,
                                                   .generation = receipt.sequence,
                                                   .slot = static_cast<std::uint64_t>(receipt.kind),
-                                                  .compiled_index = receipt.progress});
+                                                  .compiled_index = receipt.progress,
+                                                  .staging_bytes = receipt.failureline});
         if (!sent || receipt.kind == Kind::Failed) {
             terminal_ = true;
             changed_.notify_all();
@@ -155,6 +162,12 @@ class ExploreAcceptanceGate::Impl final {
         const bool wake_requested = mmltk::common::io::signal_event_fd(stop_.get());
         static_cast<void>(wake_requested);
         Terminal();
+    }
+
+    void StopAndJoin() noexcept {
+        Stop();
+        std::scoped_lock lock(join_mutex_);
+        if (reader_.joinable()) reader_.join();
     }
 
    private:
@@ -189,6 +202,7 @@ class ExploreAcceptanceGate::Impl final {
         for (;;) {
             const auto command = ReadCommand();
             std::shared_ptr<const FrontendCommand> callback;
+            std::shared_ptr<const std::function<bool()>> redraw;
             std::uint64_t sequence = 0U;
             {
                 std::scoped_lock lock(mutex_);
@@ -199,6 +213,10 @@ class ExploreAcceptanceGate::Impl final {
                     release_all_ = true;
                 } else if (command == 4U) {
                     release_held_ = true;
+                } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ &&
+                           initial_released_generation_ == 0U && redraw_command_) {
+                    redraw_claimed_ = true;
+                    redraw = redraw_command_;
                 } else if (command == 8U && frontend_settled_ && waiters_ == 0U && !held_pending_ && frontend_command_ &&
                            frontend_sequence_ != std::numeric_limits<std::uint64_t>::max()) {
                     release_all_ = false;
@@ -218,9 +236,11 @@ class ExploreAcceptanceGate::Impl final {
                 changed_.notify_all();
                 if (terminal_) return;
             }
-            if (callback) {
+            if (redraw || callback) {
                 try {
-                    if ((*callback)({.kind = contracts::IntegrationControlKind::Advance, .sequence = sequence})) continue;
+                    const bool accepted =
+                        redraw ? (*redraw)() : (*callback)({.kind = contracts::IntegrationControlKind::Advance, .sequence = sequence});
+                    if (accepted) continue;
                 } catch (...) {}
                 Terminal();
                 return;
@@ -237,6 +257,7 @@ class ExploreAcceptanceGate::Impl final {
     mmltk::common::io::ScopedFd command_;
     mmltk::common::io::ScopedFd stop_;
     std::mutex mutex_;
+    std::mutex join_mutex_;
     std::condition_variable changed_;
     std::size_t waiters_ = 0U;
     bool initial_wait_announced_ = false;
@@ -250,6 +271,8 @@ class ExploreAcceptanceGate::Impl final {
     std::uint64_t current_generation_ = 0U;
     std::uint64_t initial_released_generation_ = 0U;
     std::shared_ptr<const FrontendCommand> frontend_command_;
+    std::shared_ptr<const std::function<bool()>> redraw_command_;
+    bool redraw_claimed_ = false;
     std::uint64_t frontend_sequence_ = 1U;
     bool frontend_settled_ = false;
     bool frontend_pressure_ = false;
@@ -261,7 +284,12 @@ ExploreAcceptanceGate::ExploreAcceptanceGate(const int command_descriptor) : imp
 ExploreAcceptanceGate::~ExploreAcceptanceGate() = default;
 void ExploreAcceptanceGate::AdvanceGeneration(const std::uint64_t generation) noexcept { impl_->AdvanceGeneration(generation); }
 auto ExploreAcceptanceGate::AwaitInitialRelease(const std::uint64_t generation) -> WaitResult {
+    if (impl_->initial_wait_observer) impl_->initial_wait_observer(impl_->initial_wait_context, generation);
     return impl_->AwaitInitialRelease(generation);
+}
+void ExploreAcceptanceGate::SetInitialWaitObserver(void* context, void (*observer)(void*, std::uint64_t)) noexcept {
+    impl_->initial_wait_context = context;
+    impl_->initial_wait_observer = observer;
 }
 auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot,
                                                 const std::uint64_t compiled_index, const std::uint64_t staging_bytes) -> WaitResult {
@@ -270,7 +298,9 @@ auto ExploreAcceptanceGate::AwaitHeldCompletion(const std::uint64_t generation, 
 bool ExploreAcceptanceGate::ClaimHeldCompletion() { return impl_->ClaimHeldCompletion(); }
 bool ExploreAcceptanceGate::ClaimTerminalReport() { return impl_->ClaimTerminalReport(); }
 void ExploreAcceptanceGate::Stop() noexcept { impl_->Stop(); }
+void ExploreAcceptanceGate::StopAndJoin() noexcept { impl_->StopAndJoin(); }
 void ExploreAcceptanceGate::SetFrontendCommand(FrontendCommand callback) { impl_->SetFrontendCommand(std::move(callback)); }
+void ExploreAcceptanceGate::SetRedrawCommand(std::function<bool()> callback) { impl_->SetRedrawCommand(std::move(callback)); }
 bool ExploreAcceptanceGate::ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
     return impl_->ObserveFrontend(receipt);
 }

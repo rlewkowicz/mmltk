@@ -1567,8 +1567,12 @@ mod tests {
 
     #[test]
     fn domain_control_publication_and_capture_reconcile_in_every_causal_order() {
-        for [domain_position, control_position, physical_position, capture_position] in
-            crate::view_model::test_support::presentation_arrival_orders()
+        for [
+            domain_position,
+            control_position,
+            physical_position,
+            capture_position,
+        ] in crate::view_model::test_support::presentation_arrival_orders()
         {
             let (mut app, frame) = viewer_app();
             let next = FrameReady {

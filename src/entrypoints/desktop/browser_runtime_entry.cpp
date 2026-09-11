@@ -15,7 +15,6 @@
 #include <cstdlib>
 #include <cerrno>
 #include <charconv>
-#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -58,17 +57,12 @@ class UwsLoopOwner final {
     return integration != nullptr && std::string_view{integration} == "1";
 }
 
-void report_integration_failure(const bool integration, const std::string_view stage, const std::string_view detail = {}) noexcept {
-    if (!integration) return;
-    std::fprintf(stderr, "workspace-wayland[native-runtime]: %.*s", static_cast<int>(stage.size()), stage.data());
-    if (!detail.empty()) std::fprintf(stderr, ": %.*s", static_cast<int>(detail.size()), detail.data());
-    std::fputc('\n', stderr);
-    std::fflush(stderr);
+void report_runtime_failure(const std::string_view stage, const std::string_view detail = {}) noexcept {
+    mmltk::common::logging::error([&](auto& logger) { logger.error("browser runtime failure: stage={}, detail={}", stage, detail); });
 }
 
-[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const bool integration,
-                              const std::string_view stage) noexcept {
-    report_integration_failure(integration, stage);
+[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage) noexcept {
+    report_runtime_failure(stage);
     shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
     static_cast<void>(shell.shutdown());
     return 1;
@@ -187,7 +181,7 @@ int main(int argc, char** argv) {
         }
         UwsLoopOwner loop_owner;
         if (!mmltk::controller::services::block_browser_runtime_signals()) {
-            report_integration_failure(integration, "signal-mask setup failed");
+            report_runtime_failure("signal-mask setup failed");
             return 1;
         }
         std::vector<std::string_view> arguments;
@@ -207,13 +201,14 @@ int main(int argc, char** argv) {
             std::error_code error;
             integration_file_dialog_root = std::filesystem::current_path(error).string();
             if (error || integration_file_dialog_root.empty()) {
-                report_integration_failure(integration, "integration working-directory discovery failed", error.message());
+                if (mmltk::common::logging::enabled(spdlog::level::err))
+                    report_runtime_failure("integration working-directory discovery failed", error.message());
                 return 1;
             }
             config.file_dialog_launch_directory = integration_file_dialog_root;
             const int explore_control = integration_control_fd();
             if (explore_control < 0) {
-                report_integration_failure(integration, "Explore acceptance control descriptor rejected");
+                report_runtime_failure("Explore acceptance control descriptor rejected");
                 return 1;
             }
             config.explore.acceptance = std::make_shared<mmltk::controller::ExploreAcceptanceGate>(explore_control);
@@ -249,7 +244,7 @@ int main(int argc, char** argv) {
                 const char* const compiled = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPILED_DIRECTORY");
                 const char* const resolution = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_RESOLUTION");
                 if (source == nullptr || compiled == nullptr || resolution == nullptr)
-                    return fail_closed(shell, integration, "integration dataset configuration missing");
+                    return fail_closed(shell, "integration dataset configuration missing");
                 page_query += "&mmltk_integration_dataset_source=" + query_value(source);
                 page_query += "&mmltk_integration_compiled_directory=" + query_value(compiled);
                 page_query += "&mmltk_integration_resolution=" + query_value(resolution);
@@ -263,13 +258,13 @@ int main(int argc, char** argv) {
                 page_query += "mmltk_pixel_trace=1";
             }
             if (!shell.start_browser_host({.asset_root = assets, .session_token = session_token(), .page_query = std::move(page_query)})) {
-                return fail_closed(shell, integration, "browser host start failed");
+                return fail_closed(shell, "browser host start failed");
             }
 
             auto& server = shell.browser_server();
-            if (!server.running()) { return fail_closed(shell, integration, "browser server stopped during startup"); }
+            if (!server.running()) { return fail_closed(shell, "browser server stopped during startup"); }
             auto page = server.page_url();
-            if (!page) return fail_closed(shell, integration, "browser page URL unavailable");
+            if (!page) return fail_closed(shell, "browser page URL unavailable");
 
             const auto process_start = shell.start_firefox(
                 {.executable = configured_root("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", MMLTK_FIREFOX_RUNTIME_ROOT) / "firefox",
@@ -278,20 +273,19 @@ int main(int argc, char** argv) {
                  .integration = integration,
                  .integration_high_dpi = integration_high_dpi});
             if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal)
-                return fail_closed(shell, integration, "Firefox process start failed");
+                return fail_closed(shell, "Firefox process start failed");
             SignalWaiter signal_waiter{shell, diagnostics_terminal};
             shell.run();
             return mmltk::controller::services::browser_runtime_exit_status(shell.firefox_lifecycle(), shell.healthy());
         } catch (const std::exception& error) {
-            report_integration_failure(integration, "browser host runtime exception", error.what());
-            return fail_closed(shell, integration, "browser host fail-closed shutdown");
-        } catch (...) { return fail_closed(shell, integration, "browser host unknown runtime exception"); }
+            report_runtime_failure("browser host runtime exception", error.what());
+            return fail_closed(shell, "browser host fail-closed shutdown");
+        } catch (...) { return fail_closed(shell, "browser host unknown runtime exception"); }
     } catch (const std::exception& error) {
-        report_integration_failure(integration, "browser host construction exception", error.what());
-        if (!integration) std::fprintf(stderr, "mmltk-browser-host: %s\n", error.what());
+        report_runtime_failure("browser host construction exception", error.what());
         return 1;
     } catch (...) {
-        report_integration_failure(integration, "browser host unknown construction exception");
+        report_runtime_failure("browser host unknown construction exception");
         return 1;
     }
 }

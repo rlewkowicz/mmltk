@@ -28,7 +28,7 @@ HARDWARE_LOG = (
 PROTOCOLS = "\n".join(
     f"interface: '{name}', version: 4, name: 1"
     for name in ("wl_compositor", "wl_output", "xdg_wm_base", "zwp_linux_dmabuf_v1")
-)
+) + "\ninterface: 'wl_seat', version: 7, name: 5\n\tname: default\n\tcapabilities: pointer keyboard"
 COMPOSITOR = """
 import os, signal, socket, sys
 from pathlib import Path
@@ -110,8 +110,24 @@ run_owned_docker_command() { printf '%s\\n' "$@"; }
     def test_requires_real_wayland_dmabuf_output_and_shell(self):
         runner.require_wayland_protocols(PROTOCOLS)
         for line in PROTOCOLS.splitlines():
+            if not line.startswith("interface:"):
+                continue
             with self.subTest(line=line), self.assertRaises(runner.SessionFailure):
                 runner.require_wayland_protocols(PROTOCOLS.replace(line, ""))
+
+    def test_requires_pointer_and_keyboard_on_one_seat(self):
+        for replacement in ("pointer", "keyboard", "", "pointer keyboardish"):
+            with self.subTest(replacement=replacement), self.assertRaises(runner.SessionFailure):
+                runner.require_wayland_protocols(PROTOCOLS.replace("pointer keyboard", replacement))
+        separate_seats = PROTOCOLS.replace("pointer keyboard", "pointer")
+        separate_seats += "\ninterface: 'wl_seat', version: 7, name: 6\n\tcapabilities: keyboard"
+        with self.assertRaises(runner.SessionFailure):
+            runner.require_wayland_protocols(separate_seats)
+        wrong_global = PROTOCOLS.replace("pointer keyboard", "pointer")
+        wrong_global += "\ninterface: 'other', version: 1, name: 6\n\tcapabilities: pointer keyboard"
+        with self.assertRaises(runner.SessionFailure):
+            runner.require_wayland_protocols(wrong_global)
+        runner.require_wayland_protocols(PROTOCOLS.replace("pointer keyboard", "keyboard pointer touch"))
 
     def test_private_environment_owns_display_and_renderer(self):
         with patch.dict(os.environ, {
@@ -142,6 +158,10 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
         async def start(*command, **kwargs):
             if command[0] == "/usr/bin/weston":
+                self.assertIn(
+                    "--modules=/usr/lib/weston/mmltk-headless-seat.so,systemd-notify.so",
+                    command,
+                )
                 log_path = next(value[6:] for value in command if value.startswith("--log="))
                 command = (sys.executable, "-c", COMPOSITOR, log_path, self.log, self.mode)
             elif command[0] == "/usr/bin/wayland-info":

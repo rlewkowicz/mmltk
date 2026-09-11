@@ -23,6 +23,7 @@
 #include "catch2_compat.hpp"
 #include <catch2/generators/catch_generators.hpp>
 #include "filesystem_test_utils.hpp"
+#include "async_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
 #include "explore_dataset_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
@@ -101,7 +102,6 @@ class NativeExploreAudit final {
                         audit.reused_tiles_.fetch_add(fact.detail, std::memory_order_acq_rel);
                     } else if (fact.operation == controller::VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) {
                         audit.augmentation_count_.fetch_add(1U, std::memory_order_acq_rel);
-                        audit.last_augmentation_generation_.store(fact.generation, std::memory_order_release);
                         audit.last_augmentation_seed_.store(fact.detail, std::memory_order_release);
                         audit.last_valid_donors_.store(fact.context.capacity_width, std::memory_order_release);
                         audit.last_planned_pastes_.store(fact.context.capacity_height, std::memory_order_release);
@@ -138,6 +138,7 @@ class NativeExploreAudit final {
                     }
                     audit.Wake();
                 },
+            .pixel_probes = true,
         };
     }
 
@@ -191,9 +192,6 @@ class NativeExploreAudit final {
         return augmentation_count_.load(std::memory_order_acquire);
     }
     [[nodiscard]] std::uint64_t last_augmentation_seed() const noexcept { return last_augmentation_seed_.load(std::memory_order_acquire); }
-    [[nodiscard]] std::uint64_t last_augmentation_generation() const noexcept {
-        return last_augmentation_generation_.load(std::memory_order_acquire);
-    }
     [[nodiscard]] std::uint64_t last_valid_donors() const noexcept { return last_valid_donors_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_planned_pastes() const noexcept { return last_planned_pastes_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_render_flags() const noexcept { return last_render_flags_.load(std::memory_order_acquire); }
@@ -267,7 +265,6 @@ class NativeExploreAudit final {
     PublicationObservation tile_;
     std::atomic_uint64_t last_tile_cumulative_{0U};
     std::atomic_uint64_t augmentation_count_{0U};
-    std::atomic_uint64_t last_augmentation_generation_{0U};
     std::atomic_uint64_t last_augmentation_seed_{0U};
     std::atomic_uint64_t last_valid_donors_{0U};
     std::atomic_uint64_t last_planned_pastes_{0U};
@@ -317,7 +314,8 @@ void wait_for_native_gallery(NativeExploreAudit& audit, const controller::Explor
     const bool completed = audit.Wait([&] {
         const auto snapshot = system.snapshot();
         return audit.tile_count() > tile_count && audit.last_tile_generation() == generation &&
-               audit.last_tile_cumulative() == ready_tiles && !snapshot.busy && audit.last_ready_frame() == snapshot.frame.revision;
+               audit.last_tile_cumulative() == ready_tiles && snapshot.mode == controller::ExploreMode::Gallery &&
+               snapshot.gallery.generation == generation && !snapshot.busy && audit.last_ready_frame() == snapshot.frame.revision;
     });
     if (!completed) {
         const auto snapshot = system.snapshot();
@@ -685,8 +683,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(audit.last_descriptor_annotations() > source_annotation_count);
     CHECK(audit.last_descriptor_rle() > source_rle_count);
     check_published_frame(system);
-    const auto retained_labels = system.snapshot().labels;
-    REQUIRE_FALSE(retained_labels.empty());
+    REQUIRE_FALSE(system.snapshot().labels.empty());
     const auto image_pixel_count = audit.image_pixel_count();
     placeholder_count = audit.placeholder_count();
     augmented = system.RerollAugmentation();
@@ -697,10 +694,11 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const auto pending_replacement = audit.pending_snapshot();
     REQUIRE(pending_replacement.has_value());
     CHECK(pending_replacement->gallery.generation == system.snapshot().gallery.generation);
-    CHECK(std::ranges::equal(pending_replacement->labels, retained_labels, [](const auto& left, const auto& right) {
-        return left.box == right.box && left.category == right.category && left.compiled_index == right.compiled_index;
-    }));
+    // A new seed invalidates the old tile meanings. Placeholders must not
+    // advertise labels belonging to the previous generation's image pixels.
+    CHECK(pending_replacement->labels.empty());
     CHECK(system.snapshot().gallery.slots == std::vector<bool>{true, true});
+    CHECK_FALSE(system.snapshot().labels.empty());
     CHECK(system.snapshot().frame.revision > augmented_frame);
     CHECK(system.snapshot().augmentation.seed == 1U);
     CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
@@ -734,7 +732,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         return !system.snapshot().busy && system.snapshot().revision > rerolled.revision && audit.placeholder_count() > placeholder_count &&
                audit.last_tile_generation() == audit.last_placeholder_generation() && audit.last_tile_cumulative() == 2U;
     }));
-    CHECK(audit.last_augmentation_generation() < system.snapshot().gallery.generation);
+    // Reordered indices may miss the position-keyed cache. Their product
+    // identity is proved by the unchanged seed and exact per-image checksums.
     CHECK(system.snapshot().order.shuffle_seed > order_seed);
     CHECK(system.snapshot().order.visible_indices != shuffled_order);
     CHECK(system.snapshot().augmentation.seed == augmentation_seed);
@@ -1151,11 +1150,22 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     mmltk::common::io::ScopedFd commands{sockets[0]};
     auto gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
     NativeExploreAudit audit;
+    mmltk::testsupport::TestGate stale_lane{"third Explore lane before acceptance wait"};
     struct ReadObservation {
         NativeExploreAudit& audit;
+        mmltk::testsupport::TestGate::Receipt stale_lane;
         std::atomic_uint64_t started{0U};
         std::atomic_size_t discarded{0U};
-    } reads{audit};
+        std::atomic_bool hold_third{false};
+        std::atomic_uint64_t held_generation{0U};
+    } reads{audit, stale_lane.receipt()};
+    gate->SetInitialWaitObserver(&reads, [](void* context, const std::uint64_t generation) {
+        auto& observed = *static_cast<ReadObservation*>(context);
+        if (observed.hold_third.exchange(false)) {
+            observed.held_generation.store(generation);
+            observed.stale_lane.ArriveAndWait();
+        }
+    });
     const controller::VisualDiagnosticSink diagnostics{
         .context = &reads, .write = [](void* context, const controller::VisualDiagnosticFact fact) noexcept {
             auto& observed = *static_cast<ReadObservation*>(context);
@@ -1177,8 +1187,12 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     // Stop blocked I/O before system destruction, including assertion unwinding.
     struct StopGate {
         controller::ExploreAcceptanceGate& gate;
-        ~StopGate() { gate.Stop(); }
-    } stop{*gate};
+        mmltk::testsupport::TestGate& lane;
+        ~StopGate() {
+            gate.Stop();
+            lane.Release();
+        }
+    } stop{*gate, stale_lane};
     const auto send = [&](const std::uint8_t command) {
         REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
     };
@@ -1237,7 +1251,9 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     REQUIRE(audit.Wait([&] { return audit.last_tile_cumulative() == 1U && (audit.prefetched_indices() & 2U) != 0U; }));
     // One physical lane renders the retained first tile and the prefetched
     // second tile, then waits before reading the third.
+    reads.hold_third.store(true);
     system.UpdateViewport({.viewport = viewport(3U)});
+    REQUIRE(stale_lane.WaitEntered(std::chrono::seconds{2}));
     REQUIRE(audit.Wait([&] {
         return (reads.started.load(std::memory_order_acquire) & 4U) != 0U &&
                system.snapshot().gallery.slots == std::vector<bool>{true, true, false};
@@ -1246,16 +1262,28 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     const auto discarded = reads.discarded.load(std::memory_order_acquire);
     const auto placeholders = audit.placeholder_count();
     system.UpdateViewport({.viewport = viewport(4U)});
-    REQUIRE(audit.Wait([&] { return audit.placeholder_count() > placeholders; }));
-    // Wake the superseded read. The new generation retains tiles 0 and 1 on
-    // its output candidate boundary, without an input borrower.
-    send(1U);
     REQUIRE(audit.Wait([&] {
+        const auto snapshot = system.snapshot();
+        return audit.placeholder_count() > placeholders && snapshot.gallery.slots.size() == 4U &&
+               snapshot.gallery.generation == audit.last_placeholder_generation();
+    }));
+    CHECK(reads.held_generation.load() != system.snapshot().gallery.generation);
+    // Enter the old generation's wait only after replacement commits. Its stale
+    // completion must pass through the continuation, with tiles 0 and 1 retained.
+    stale_lane.Release();
+    send(1U);
+    const bool replacement_ready = audit.Wait([&] {
         const auto snapshot = system.snapshot();
         return reads.discarded.load(std::memory_order_acquire) > discarded && audit.reused_tiles() >= reused + 2U &&
                snapshot.gallery.slots.size() == 4U && snapshot.gallery.slots[0] && snapshot.gallery.slots[1] &&
                audit.last_tile_generation() == audit.last_placeholder_generation();
-    }));
+    });
+    INFO("discarded=" << reads.discarded.load() << " baseline=" << discarded << " reused=" << audit.reused_tiles()
+                       << " baseline=" << reused << " slots=" << system.snapshot().gallery.slots.size()
+                       << " ready slots=" << std::ranges::count(system.snapshot().gallery.slots, true)
+                       << " tile generation=" << audit.last_tile_generation()
+                       << " placeholder generation=" << audit.last_placeholder_generation());
+    REQUIRE(replacement_ready);
     INFO(audit.failure_detail());
     REQUIRE_FALSE(audit.failed());
     send(2U);
@@ -1312,6 +1340,7 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
 void test_native_explore_transaction_faults_and_inactive_release() {
     enum class Outcome { Commit, Descriptors, CompletedProduct, Cancel };
     const auto outcome = GENERATE(Outcome::Commit, Outcome::Descriptors, Outcome::CompletedProduct, Outcome::Cancel);
+    INFO("outcome=" << static_cast<unsigned>(outcome));
     require_explore_transport(true);
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-native-transaction"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 4);
@@ -1333,6 +1362,8 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     } observation;
     gate->SetProductObserver(&observation, [](void* context, controller::ExploreAcceptanceGate::ProductObservation fact) noexcept {
         auto& observed = *static_cast<Observation*>(context);
+        // Copy-count observations have no artifact and precede dataset preparation.
+        const bool prepared = !fact.released && !fact.artifact.expired();
         {
             std::scoped_lock lock(observed.mutex);
             if (fact.released) {
@@ -1344,7 +1375,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
                 observed.prepared = std::move(fact.artifact);
             }
         }
-        if (!fact.released && observed.block.exchange(false)) {
+        if (prepared && observed.block.exchange(false)) {
             observed.entered.set_value();
             observed.resumed.wait();
         }

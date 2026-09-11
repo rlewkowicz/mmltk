@@ -2846,8 +2846,12 @@ mod tests {
         };
 
         for replacement in [false, true] {
-            for [domain_position, control_position, physical_position, capture_position] in
-                crate::view_model::test_support::presentation_arrival_orders()
+            for [
+                domain_position,
+                control_position,
+                physical_position,
+                capture_position,
+            ] in crate::view_model::test_support::presentation_arrival_orders()
             {
                 reset_test_releases();
                 let (mut model, old) = explore_presentation();

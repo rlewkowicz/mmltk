@@ -111,6 +111,8 @@ install(
 )
 
 function(mmltk_add_backend_imaging_upscale_tests)
+    find_package(ONNX CONFIG REQUIRED PATHS "${MMLTK_ONNX_ROOT}" NO_DEFAULT_PATH)
+    find_package(Protobuf REQUIRED)
     add_executable(mmltk_backend_imaging_upscale_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(mmltk_backend_imaging_upscale_tests PRIVATE_DECLARATIONS)
     mmltk_register_ordinary_sources(mmltk_backend_imaging_upscale_tests
@@ -125,9 +127,9 @@ function(mmltk_add_backend_imaging_upscale_tests)
     target_link_libraries(mmltk_backend_imaging_upscale_tests PRIVATE
         mmltk_acceptance_support mmltk::backend::imaging::upscale
         mmltk_shiftlut_onnx_ops mmltk_shiftlut_model_format
-        mmltk::vendor::onnxruntime CUDA::cudart)
+        mmltk::vendor::onnxruntime CUDA::cudart ONNX::onnx "${Protobuf_LIBRARY}")
     target_compile_definitions(mmltk_backend_imaging_upscale_tests PRIVATE
-        MMLTK_TEST_SOURCE_ROOT="${CMAKE_SOURCE_DIR}")
+        MMLTK_TEST_SOURCE_ROOT="${CMAKE_SOURCE_DIR}" ONNX_ML=1)
     catch_discover_tests(mmltk_backend_imaging_upscale_tests
         TEST_PREFIX "backend::imaging::upscale::"
         DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

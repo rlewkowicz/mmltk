@@ -1010,22 +1010,25 @@ class FileQueryTests(unittest.TestCase):
 
     def test_shared_event_anchors_link_transcript_and_propagate_test_tags(self):
         self.family_fixture()
-        self.write("build/validation/transcript.log",
-            "Filters: [viewer_copy][hardware]\n"
-            "[ RUN ] workspace_wayland_viewer_copy\n"
-            'workspace-wayland[native]: {"event":"browser.server.started","steady_ns":100}\n'
-            '{"event":"firefox.webgpu.blocking_map","buffer":"BufferId(21,1)","detail":"arc_extract"}\n'
-            "native host terminal status: exit 139\n"
-            "[ FAILED ] workspace_wayland_viewer_copy\n")
-        status, rows, _ = self.exported("build/validation/transcript.log", "--family", "session",
-                                       "-q", '@tags:viewer_copy', "--limit", "30")
-        self.assertEqual(status, 0)
-        related = [row for row in rows if row["_log"]["file"].endswith("session.jsonl")]
-        self.assertEqual(len(related), 2)
-        self.assertTrue(all(row["_log"]["test"] == "workspace_wayland_viewer_copy" for row in related))
-        terminal = next(row for row in rows if row["data"].get("event") == "process.terminal")
-        self.assertEqual(terminal["_log"]["run"], "build/validation/session@current")
-        self.assertEqual(terminal["_log"]["run_link"], "shared-event-and-steady-time")
+        for name in ("transcript.log", "session-acceptance.log"):
+            with self.subTest(name=name):
+                path = "build/validation/" + name
+                self.write(path,
+                    "Filters: [viewer_copy][hardware]\n"
+                    "[ RUN ] workspace_wayland_viewer_copy\n"
+                    'workspace-wayland[native]: {"event":"browser.server.started","steady_ns":100}\n'
+                    '{"event":"firefox.webgpu.blocking_map","buffer":"BufferId(21,1)","detail":"arc_extract"}\n'
+                    "native host terminal status: exit 139\n"
+                    "[ FAILED ] workspace_wayland_viewer_copy\n")
+                status, rows, _ = self.exported(path, "--family", "session",
+                                               "-q", '@tags:viewer_copy', "--limit", "30")
+                self.assertEqual(status, 0)
+                related = [row for row in rows if row["_log"]["file"].endswith("session.jsonl")]
+                self.assertEqual(len(related), 2)
+                self.assertTrue(all(row["_log"]["test"] == "workspace_wayland_viewer_copy" for row in related))
+                terminal = next(row for row in rows if row["data"].get("event") == "process.terminal")
+                self.assertEqual(terminal["_log"]["run"], "build/validation/session@current")
+                self.assertEqual(terminal["_log"]["run_link"], "shared-event-and-steady-time")
 
     def test_related_run_includes_terminal_and_never_crosses_reused_buffer_ids(self):
         self.family_fixture()

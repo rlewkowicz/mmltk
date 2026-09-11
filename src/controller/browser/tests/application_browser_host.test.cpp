@@ -1,4 +1,5 @@
 #include "src/acceptance/tests/websocket_test_utils.hpp"
+#include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <meta>
@@ -658,6 +660,43 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     callbacks.closed(callbacks.context.get());
     ready.Flush();
     CHECK(ready.closed() == 1U);
+}
+
+TEST_CASE("browser admission settles acceptance redraw callbacks before releasing systems") {
+    std::array<int, 2U> sockets{};
+    REQUIRE(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets.data()) == 0);
+    mmltk::common::io::ScopedFd commands{sockets[0]};
+    auto gate = std::make_shared<ExploreAcceptanceGate>(sockets[1]);
+    transport::BrowserServer server;
+    ApplicationBrowserHost host{server};
+    host.install_integration(gate);
+    mmltk::testsupport::TestGate callback{"acceptance redraw callback"};
+    std::atomic_bool settled = false;
+    gate->SetRedrawCommand([receipt = callback.receipt(), &settled] {
+        receipt.ArriveAndWait();
+        settled.store(true, std::memory_order_release);
+        return true;
+    });
+    std::future<void> closing;
+    std::future<ExploreAcceptanceGate::WaitResult> initial;
+    mmltk::testsupport::ScopedTestCleanup cleanup{[&] {
+        callback.Release();
+        host.close_admission();
+        if (closing.valid()) closing.wait();
+    }};
+    const std::uint8_t redraw = 16U;
+    REQUIRE(::send(commands.get(), &redraw, sizeof(redraw), MSG_NOSIGNAL) == sizeof(redraw));
+    REQUIRE(callback.WaitEntered(std::chrono::seconds{2}));
+    initial = std::async(std::launch::async, [&] { return gate->AwaitInitialRelease(0U); });
+    closing = std::async(std::launch::async, [&] { host.close_admission(); });
+    CHECK(mmltk::testsupport::await_test_future(initial, "acceptance stopped read") == ExploreAcceptanceGate::WaitResult::Stale);
+    CHECK(closing.wait_for(std::chrono::seconds{0}) != std::future_status::ready);
+    CHECK_FALSE(settled.load(std::memory_order_acquire));
+    callback.Release();
+    mmltk::testsupport::await_test_future(closing, "acceptance reader shutdown");
+    CHECK(settled.load(std::memory_order_acquire));
+    CHECK(gate->AwaitInitialRelease(0U) == ExploreAcceptanceGate::WaitResult::Stale);
+    CHECK_FALSE(host.accepting());
 }
 
 TEST_CASE("direct host drops transient pressure in the real open epoch") {

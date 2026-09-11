@@ -1533,7 +1533,7 @@ void MessageChannel::OnChannelErrorFromLink() {
   }
 
   if (mAbortOnError) {
-    printf_stderr("Exiting due to channel error.\n");
+    MOZ_LOG(sLogModule, LogLevel::Error, ("Exiting due to channel error."));
     ProcessChild::QuickExit();
   }
   mChannelState = ChannelError;

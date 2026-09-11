@@ -2444,8 +2444,9 @@ class PresentationSourceFixture final {
     [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
     [[nodiscard]] PresentationSourceIdentity identity() const noexcept { return identity_; }
     void AdvanceObservation() { snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel); }
+    void PublishUnobserved() { source_->Publish(16U, 16U, [](auto, auto, auto) {}); }
     void Advance() {
-        source_->Publish(16U, 16U, [](auto, auto, auto) {});
+        PublishUnobserved();
         UpdateObservation();
     }
     [[nodiscard]] auto Completed() const { return source_->Completed(); }
@@ -3399,6 +3400,10 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     annotation.SetInputPeer(7U, [&](AnnotationInputProgress progress) {
         if (progress.epoch == 7U) {
             if (progress.consumed_sequence != 0U) credit_records.fetch_add(1U, std::memory_order_release);
+            if (progress.consumed_sequence == 2U) {
+                std::scoped_lock lock(ui_gate_mutex);
+                next_ui_gate = pointer_ui.receipt();
+            }
             consumed.store(progress.consumed_sequence, std::memory_order_release);
         }
         annotation_events.Advance();
@@ -3437,10 +3442,6 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     const auto initial_annotation_frame = annotation.snapshot().frame;
     auto retained_annotation_frame = annotation.BorrowFrame();
     REQUIRE(retained_annotation_frame.valid());
-    {
-        std::scoped_lock lock(ui_gate_mutex);
-        next_ui_gate = pointer_ui.receipt();
-    }
     annotation.Input(first);
     REQUIRE(pointer_entered.wait_for(2s) == std::future_status::ready);
     pointer_entered.get();
@@ -6696,6 +6697,37 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 6U; }));
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 6U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
+
+    // A producer can retire its old storage before newer metadata arrives.
+    // The stale advertised frame must not resubmit itself on every pump.
+    source.PublishUnobserved();
+    const auto before_rejected_borrow = writer_state->PumpCount();
+    presentation.Observe({.redraw_requested = true});
+    REQUIRE(writer_state->WaitForPumpAfter(before_rejected_borrow));
+    const auto rejected_borrow = writer_state->PumpCount();
+    writer_state->SignalReadiness();
+    REQUIRE(writer_state->WaitForPumpAfter(rejected_borrow));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 7U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
+    CHECK(presentation.snapshot().completed.revision == 6U);
+    source.Advance();
+    presentation.SourceChanged(source.identity());
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 8U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 8U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 6U);
+
+    // If the newer observation is already available at rejection, catch up
+    // immediately even before its separate source notification is delivered.
+    writer_state->allow_publication.store(false, std::memory_order_release);
+    source.Advance();
+    presentation.SourceChanged(source.identity());
+    REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
+    source.Advance();
+    writer_state->allow_publication.store(true, std::memory_order_release);
+    writer_state->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 10U; }));
+    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 10U);
+    CHECK(writer_state->timeline.load(std::memory_order_acquire) == 7U);
 
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();

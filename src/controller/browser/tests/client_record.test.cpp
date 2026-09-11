@@ -177,7 +177,8 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     wire::ByteBuffer encoded;
     for (const auto kind : {Kind::Settled, Kind::Failed, Kind::Progress, Kind::PressureEntered}) {
-        const ClientRecord source = IntegrationControl{.receipt = {.kind = kind, .sequence = 3U, .progress = 5U}};
+        const ClientRecord source =
+            IntegrationControl{.receipt = {.kind = kind, .sequence = 3U, .progress = 5U, .failureline = kind == Kind::Failed ? 123U : 0U}};
         REQUIRE(encode_client_record(source, encoded));
         const auto decoded = decode_client_record({.first = encoded, .second = {}});
         REQUIRE(decoded);

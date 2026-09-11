@@ -15,7 +15,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     Object.defineProperty(globalThis, name, {value, configurable: true, writable: true});
   };
   const microtasks = [], frames = [], events = [], reports = [];
-  const allocations = {maps: 0, sets: 0, scratch: 0, reads: 0, listeners: 0, clock: 0};
+  const allocations = {maps: 0, sets: 0, scratch: 0, reads: 0, copies: 0, listeners: 0, clock: 0};
   const css = {x: 0, y: 0, left: 0, top: 0, width: 640, height: 480};
   const canvas = {
     width: 640, height: 480,
@@ -42,7 +42,10 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     getContext() {
       let sourceX = 0, sourceY = 0;
       return {
-        clearRect() {}, drawImage(_canvas, x, y) { sourceX = x; sourceY = y; },
+        clearRect() {}, drawImage(source, x, y) {
+          if (source === canvas) allocations.copies++;
+          sourceX = x; sourceY = y;
+        },
         getImageData(x, y, width, height) {
           allocations.reads++;
           if (sampling.error) throw sampling.error;
@@ -74,7 +77,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
 }
 
 function assertQuiet(fixture) {
-  assert.deepEqual(fixture.allocations, {maps: 0, sets: 0, scratch: 0, reads: 0, listeners: 0, clock: 0});
+  assert.deepEqual(fixture.allocations, {maps: 0, sets: 0, scratch: 0, reads: 0, copies: 0, listeners: 0, clock: 0});
   assert.deepEqual(fixture.reports, []);
 }
 
@@ -328,23 +331,24 @@ for (const columns of [4, 10]) {
       f.canvas.height = width;
       browser.mmltkIntegrationReceipt(gallery, 'grid', 7, 11);
       const clean = [48, 80, 112, 255], black = [0, 0, 0, 255], white = [255, 255, 255, 255];
-      // Independently specified raster strips: outer edges and the first interior
+      // Independently specified raster strips: left/top outer edges and the first interior
       // edge. Rust's actual sample builder is checked against these positions in
       // the existing native browser-app fixtures; this is not a CPU shader model.
       const strips = [
-        [0, [black, white, black, clean]],
-        [cell - 2, [clean, black, white, black, clean]],
-        [width - 4, [clean, black, white, black]],
+        [0, false, [black, white, black, clean]],
+        [cell - 2, false, [clean, black, white, black, clean]],
+        [0, true, [black, white, black, clean]],
       ];
       const raster = new Map(), points = [];
-      for (const [start, colors] of strips) {
+      for (const [start, horizontal, colors] of strips) {
         for (const [offset, color] of colors.entries()) {
-          const x = start + offset;
-          raster.set(x, color);
-          points.push(x + 0.5, y, x + 0.5, y, ...color, 4, 0);
+          const screenX = horizontal ? cell * 1.5 : start + offset + 0.5;
+          const screenY = horizontal ? start + offset + 0.5 : y;
+          raster.set(`${Math.floor(screenX)},${Math.floor(screenY)}`, color);
+          points.push(screenX, screenY, screenX, screenY, ...color, 4, 0);
         }
       }
-      f.sampling.pixel = x => raster.get(x) ?? clean;
+      f.sampling.pixel = (x, y) => raster.get(`${x},${y}`) ?? clean;
       const sample = () => browser.mmltkIntegrationAtlasComposition(browser.mmltkIntegrationProbe(gallery), points, [], '{}', 7, 11, columns,
         (...values) => results.push(values));
       sample();
@@ -356,7 +360,8 @@ for (const columns of [4, 10]) {
       sample();
       f.flushFrames();
       assert.deepEqual(results[1], ['observed', 13, 9]);
-      assert.equal(f.allocations.scratch, 1, 'one reusable single-pixel reader');
+      assert.equal(f.allocations.scratch, 1, 'one reusable canvas snapshot');
+      assert.equal(f.allocations.copies, 2, 'one WebGPU readback per complete probe batch');
     });
   }
 }

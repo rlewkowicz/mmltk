@@ -630,7 +630,7 @@ class TranscriptContext:
             self.last_timestamp = None
             self.context = ""
         anchor = anchors.get((event, record.time_ns)) if record.clock == "steady" and isinstance(event, str) else None
-        if anchor and metadata.get("family") != anchor["family"]:
+        if anchor and (self.capture or metadata.get("family") != anchor["family"]):
             self.active_run = anchor
         record.metadata.update(metadata)
         if self.capture and not self.active_run:
@@ -1009,7 +1009,7 @@ class ArtifactCatalog:
                         "artifact": original.name, "run_link": "artifact-stem"}
             metadata["role"] = (
                 "mozilla" if MOZILLA_ARTIFACT.fullmatch(original.name) else
-                "acceptance" if original.stem.endswith("-acceptance") else
+                "acceptance" if original.name.endswith("-acceptance.jsonl") else
                 "application" if APPLICATION_ARTIFACT.fullmatch(original.name) else
                 "trace" if original.suffix == ".jsonl" else
                 "native" if original.stem.endswith("-native") else
@@ -1061,14 +1061,14 @@ class ArtifactCatalog:
                 self.anchors[key] = source.metadata
                 if len(self.anchors) > MAX_DISTINCT_KEYS:
                     raise QueryError("too many capture anchors; narrow --family/--run")
-        # Only standalone transcripts need this pass. Firefox/native siblings already
-        # belong to a capture; no scan of those verbose logs is needed to infer tests.
+        # Transcripts need this pass even when their stem matches a native family.
+        # Firefox/native siblings need no extra scan to infer test context.
         native_families = {item.metadata["family"] for item in self.files if item.path.suffix == ".jsonl"}
         tests_by_run = {}
         tags_by_run = {}
         runs_by_transcript = {}
         for source in self.files:
-            if source.metadata["family"] in native_families:
+            if source.metadata["family"] in native_families and source.metadata["role"] != "transcript":
                 continue
             for row in source.records(unchanged=True, anchors=self.anchors, line_hint=ANCHOR_HINT.search):
                 test = row.metadata.get("test")

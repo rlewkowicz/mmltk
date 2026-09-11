@@ -848,6 +848,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 kind: generated::IntegrationControlKind::Settled,
                 sequence: 1,
                 progress: 0,
+                failureline: 0,
             },
         }
         .encode()?,

@@ -238,6 +238,7 @@ impl Connection {
                         kind: crate::generated::IntegrationControlKind::PressureEntered,
                         sequence,
                         progress: 0,
+                        failureline: 0,
                     },
                 };
                 send(&record.encode().map_err(|error| error.to_string())?)?;
