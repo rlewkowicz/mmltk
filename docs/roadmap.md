@@ -7,8 +7,8 @@ The project's stated future directions include:
 - YOLO26 model integration.
 - SAM3 support for annotation.
 - libSGM-based disparity and optical-flow work.
-- Binary-classifier integration; the existing experimental direction uses a
-  Python/timm model, with native conversion undecided.
+- Binary-classifier integration; Python/timm and native conversion remain
+  design choices.
 - Keypoint and pose workflows.
 
 These are directions, not supported-feature or delivery-date commitments.

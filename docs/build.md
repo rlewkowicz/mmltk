@@ -38,8 +38,8 @@ native contract change.
 
 Firefox source comes from `third_party/firefox`; the wrapper does not fetch a
 replacement source checkout. Its host toolchain and sysroot have separate
-cached preparation. The owned tree excludes upstream Firefox test
-infrastructure; application browser acceptance belongs to this repository.
+cached preparation. Validation uses the repository's first-party browser
+suites and packaged application acceptance, as described in [validation](validation.md).
 
 ## Toolchain and image inputs
 
@@ -128,14 +128,33 @@ The first builds typed application bindings in its dedicated
 `.cache/cmake/application-bindings-release` graph. The second selects the
 Release protocol-generation target and its cross-language fixtures.
 
-Under the selected graph's `generated/frontend/iced/`, protocol generation writes
-`application_bindings.rs`, `browser_protocol.marker`,
-`protocol_v14_client_records.hex`, and `protocol_v14_server_records.cbor`.
-The marker is `MMLTK_HOST_API_PROTOCOL_14`; generated Rust also carries the
-schema fingerprint and native interaction limits. The current
-[typed boundary](gui-interaction.md#typed-application-boundary) must be
+Under the selected graph's `generated/frontend/iced/`, generation owns:
+
+| Artifact | Purpose |
+| --- | --- |
+| `application_bindings.rs` | Typed native domain projection, codecs, schema fingerprint, and interaction limits |
+| `browser_protocol.marker` | Current application package marker, `MMLTK_HOST_API_PROTOCOL_15` |
+| `protocol_v15_client_records.hex` | Rust-to-native application fixture |
+| `protocol_v15_server_records.cbor` | Native-to-Rust application fixture |
+| `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 10 |
+
+Application-binding generation produces the bindings, marker, and graphics
+artifact; protocol generation also produces the two application fixtures.
+The current [typed boundary](gui-interaction.md#typed-application-boundary) must be
 packaged together with the native host and browser bundle. Generating
 bindings alone does not update the complete runtime package.
+
+The graphics artifact derives records, enum wire values, field offsets, sizes,
+and alignments from the native workspace import and frame-signal declarations.
+Firefox includes it through `MMLTK_WORKSPACE_GRAPHICS_ABI`. CMake makes its
+generation a direct Firefox build dependency. The wrapper's
+`.cache/firefox/build-input.sha256` includes the canonical graphics declarations,
+emitter, generator, and generation build rules as well as the Firefox source
+and toolchain identity. The successful build stamp at
+`.cache/firefox/obj-minimal-opt/.mmltk-build-input.sha256` also includes the
+generated artifact's content hash. A native graphics change therefore
+invalidates Firefox reuse even when `third_party/firefox` itself is unchanged.
+This boundary does not change Firefox's cached Clang/bootstrap-sysroot policy.
 
 Generated Rust stays in build output: change canonical native declarations
 or generators, then regenerate. `--update-gui-lock` performs the containerized

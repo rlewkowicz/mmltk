@@ -62,8 +62,15 @@ Their parent directories must already exist and be writable by the runtime user.
 
 Add `MMLTK_GUI_PIXEL_TRACE=1` for pixel probes; desktop startup enables them
 only when the native trace path is also set. Lifecycle-only traces do not
-prove pixel continuity. Native surface high/low values and the browser's
-32-hex-digit surface identity describe the same surface.
+prove pixel continuity. Native high/low values and browser 32-hex-digit
+identities join the same physical source or arena within their respective
+namespaces; [normalized identity fields](#fields-and-correlation) keep them
+separate.
+
+Enabled Iced pixel probes retain small reusable compute/readback storage and
+the exact sampled slot through completion. They preserve the shared sample's
+shader-read layout and do not introduce a full-image capture texture. Ordinary
+display execution has no pixel-probe owner.
 
 GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
 
@@ -114,6 +121,50 @@ Enabled acceptance requires complete physical and rendered evidence.
 Missing-record exceptions cannot establish a successful handoff or sample.
 Ordinary best-effort captures and the query tool's generic hypotheses have
 different purposes from these strict acceptance assertions.
+
+## Physical presentation evidence
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q '@event=presentation.frame.edge' \
+  --correlate @workspace_source+transfer_sequence --format timeline --limit 80
+./mmltk --logs --family latest-wayland-test \
+  -q '@event=acceptance.physical_inventory' --format jsonl
+```
+
+The packaged harness independently joins native source admission,
+`workspace_allocation`, exact source read and ready/release, Firefox forwarding,
+child dispatch, and physical copy completion. Arena identity does not replace
+producer-source identity. Capacity retry can repeat a logical publication with
+a new `transfer_sequence`; source plus transfer identifies that physical attempt.
+Release-only work requires its positive `firefox.workspace.frame_released`
+receipt and has no copied sample slot.
+
+`acceptance.physical_inventory` reports these observed facts:
+
+| Fields | Interpretation |
+| --- | --- |
+| `live_workspaces`, `workspace_bytes` | Nonretired admitted native source allocations and their allocation bytes |
+| `live_sample_arenas`, `live_sample_slots` | Live browser arenas and their physical sample capacity |
+| `completed_browser_copies`, `release_only_transfers` | Fully joined copy receipts and explicit release-only receipts |
+| `encoded_draws`, `settled_draws`, `abandoned_draws` | Actual Iced encoding and its terminal resource-custody outcomes |
+| `final_reader_releases` | Exact samples returned after their final read hold |
+| `explore_peak_pinned_bytes` | Observed Explore staging high-water footprint |
+
+These are allocation/lifetime and cumulative operation facts for the retained
+session, not frame latency or hardware throughput measurements. They do not
+count every internal algorithm transfer. The harness rejects obsolete
+`presentation.copy.*` and Iced capture events, while source inspection and the
+complete direct-read/draw chain establish the removed passes. Absence of an
+event in a best-effort log alone cannot establish zero copies.
+
+Iced draw settlement proves release of a submitted resource batch; successful
+rendering additionally needs matching drawn-image/pixel evidence. Draw holds,
+displayed fallback holds, source read release, and copy completion are distinct
+facts in the [presentation lifetime rules](gui-interaction.md#browser-draw-eligibility-and-retained-fallback).
+Independent log drains retain incomplete joins across scenario/source retirement
+and require completion at final settlement. Missing evidence is a failed
+acceptance condition, not an inferred successful handoff.
 
 ## Start with a bounded investigation
 
@@ -189,7 +240,8 @@ inside `fields`. Useful metadata includes:
 | `@file`, `@line`, `@text`, `@format` | Physical provenance and input representation |
 | `@clock`, `@time_ns`, `@mtime_ns` | Recorded clock/time and captured file modification time |
 | `@event`, `@owner`, `@level`, `@error` | Normalized event and failure-candidate metadata |
-| `@surface` | Joined native/browser surface identity |
+| `@surface` | Joined native/browser sample-arena identity; source lifecycle records normalize their arena into this field |
+| `@workspace_source` | Joined producer import identity, distinct from the reusable sample arena |
 | `@test`, `@tags`, `@context_copy`, `@part` | Test context, copied INFO, transcript segment |
 | `@run`, `@archive_id`, `@family`, `@artifact` | Capture and artifact grouping |
 | `@terminal`, `@exit_code`, `@signal`, `@signal_number` | Observed terminal status |
@@ -237,6 +289,12 @@ identity indexes; the tool does not build an all-run index. Shared source,
 surface, publication, allocation, or trace identities must agree wherever both
 records provide them. Bare counters and generic numeric report slots do not
 establish identity.
+
+For pixel chains, native and Firefox import/mailbox samples join through the
+observed source-to-arena forwarding record and exact physical transfer. Iced
+samples join the arena publication. The bounded query indexes accept either
+arrival order, report conflicting source facts, and distinguish missing
+evidence from evidence discarded at an index limit.
 
 Phase/control proximity matches are weaker evidence and are labeled as such.
 They use at most 250 ms of comparable time, or eight same-source lines when

@@ -64,6 +64,10 @@ Ninja no-ops. `--config dev` selects the development graph where supported.
 The browser-app suite owns the GUI graph, direct JavaScript-module tests, and
 its Cargo test target.
 
+These are first-party application suites. `browser-runtime` exercises desktop
+startup and process ownership with fixtures; `workspace-wayland` runs the
+packaged application. Neither is a Firefox-specific test runner.
+
 | Suite | Selection |
 | --- | --- |
 | `application-systems` | Browser, service, shell, data/compute, visual, GPU, and Live suites |
@@ -174,7 +178,7 @@ standalone evidence-audit cases.
 
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
-| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls, wide, tall, semantics, light copy, dark copy, rapid changes, then SIGINT |
+| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls, cached and held-miss gallery/detail returns, fractional rows, circular wrap, partial final row, wide/tall layouts, semantics, light/dark copy, rapid changes, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -197,6 +201,22 @@ It resets scenario-local expectations while retaining physical allocations,
 claims, and release history. The primary compile workflow owns a private
 output directory; other lifetimes reuse prepared source and compiled assets.
 
+Explore acceptance follows actual measured N/N+1/N visible-row changes,
+forward/reverse demand, exact cached cells, and an independently held visible
+miss. It checks displayed compiled-image identity and readiness before and
+after the typed release, including selection/hover on known pending cells.
+Native controlled fixtures separately establish disk/GPU admission priority;
+completion order alone cannot establish that priority.
+
+The physical ledger distinguishes native source allocations from retained
+browser arenas and requires each exact source read, transfer, copied or
+release-only receipt, encoded draw, and final sample release. The capacity
+scenario deliberately delivers arena availability before the held native
+completion receipt, then verifies the exact retry. Allocation inventories,
+actual copy receipts, resource settlement, and rendered pixels have independent
+assertions; [logging evidence](logging.md#physical-presentation-evidence)
+describes the fields and their limits.
+
 See [headless details](headless-wayland.md) for compositor readiness,
 shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and-acceptance-ownership)
 owns diagnostic delivery and artifact-family layout. Query one captured run
@@ -207,14 +227,14 @@ at a time.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Ordered reduction, document/history/save behavior, pressure, command barriers, rejection, and cancellation |
-| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema facts, outer-record coverage, bounded compact codecs, owned/borrowed validation, and control receipts |
+| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, bounded compact codecs, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
-| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Native source progression, receiver-owned copies, borrowed-view lifetime, ready/release callbacks, resource failure, and retirement |
-| `mmltk_acceptance` | Compiled-dataset Explore integration, projection, control-reader settlement, and independent prepared/released artifacts |
+| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and priority, allocation-local atlas rollback, late workspace admission, exact raw/workspace reads, receiver copies and device routes, ready/release callbacks, pressure, failure, and retirement |
+| `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `browser-app` | Retained input and credits, typed state reduction, canvas identity, frame/UI arrival order, submitted draws/completed fallback, quiet reporting, and JavaScript probe/callback settlement |
-| `workspace-wayland` | Actual packaged interaction, retained sessions, native/browser physical identity, rendered pixels, recovery, and shutdown |
+| `browser-app` | Retained input and credits, typed state reduction, canvas identity, all model/sample/copy arrival orders, encoded/submitted draw custody, completed fallback, exact displayed gallery interaction, quiet reporting, and JavaScript probe/callback settlement |
+| `workspace-wayland` | Actual packaged interaction, retained sessions, native-source/browser-arena identity, direct sample draws, rendered pixels, recovery, and shutdown |
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable

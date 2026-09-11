@@ -62,7 +62,8 @@ bindings project native facts; mutation remains with the owning system.
 Each domain system also owns its private workers, GPU resources, models,
 reusable staging, and final shareable display workspaces. Producers finalize
 display pixels in their own execution boundary. Presentation coordinates their
-admission and publication; it does not allocate, clear, copy, or compose images.
+admission and publishes those workspaces directly; image storage and
+finalization remain with each producer.
 
 ## Model, presentation model, and views
 
@@ -115,7 +116,8 @@ work. Completion and failure come from typed native results and events.
 
 Images and their annotation meaning share exact source identity, revision, and
 geometry through preview, augmentation, upscale, and editing. Clean pixels and
-native semantic image planes remain separate until producer-owned final display composition.
+native semantic image planes remain separate until producer-owned final display
+composition.
 Iced draws text labels from matching typed annotation facts. Class colors
 remain deterministic and stable across filtering and transformations.
 Visibility controls preserve the underlying objects. Annotation imports are
@@ -136,9 +138,9 @@ Independent producers: raw products + final shared display workspaces
                       │ exact selected workspace read
                       ▼
 PresentationSystem: layout/import coordination + ready/release timeline
-                      │ no native image copy
+                      │ direct producer workspace
                       ▼
-Firefox: imported source → retained two-slot sample arena
+Firefox: imported source → retained sample arena
                       │ queue-ordered sample + matching model
                       ▼
 Iced rendering → Firefox swapchain/compositor → Wayland
@@ -167,13 +169,13 @@ product revision, physical allocation, source admission, and sample-arena
 identity have separate meanings. Selecting a retained gallery may publish an
 older real product revision under a newer domain observation.
 
-Firefox retains one reusable two-slot sample arena across producer and pool-slot
-rotation. One slot can hold a completed fallback while another receives a new
-sample. Source retirement waits for that source's GPU reads; it does not wait
-for future draws of copied browser pixels. Arena retirement independently waits
-for page references and GPU readers. Capacity growth prepares an unpublished
-replacement, retains the old completed arena until replacement is usable, then
-drains its readers. Active, candidate, and retiring storage remain bounded.
+Firefox retains a reusable sample arena across producer and pool-slot rotation,
+with independent storage for a completed fallback and an incoming sample.
+Source retirement waits for that source's GPU reads. Copied browser pixels
+retain their own lifetime for future draws. Arena retirement waits for page
+references and GPU readers. Capacity growth prepares an unpublished replacement,
+retains the old completed arena until replacement is usable, then drains its
+readers. Active, candidate, and retiring storage remain bounded.
 
 Matching native model state authorizes a queue-ordered browser sample immediately
 after submission. Physical native-to-sample completion and page sample release

@@ -56,6 +56,14 @@ typed Rust. Generated definitions are consumed through
 [generated.rs](../src/frontend/iced/src/generated.rs); the generated files
 themselves remain build output.
 
+The separate
+[application_workspace_abi_emitter.h](../src/controller/browser/application_workspace_abi_emitter.h)
+projects the native graphics records into a data-only Rust artifact consumed
+by Firefox. It derives field types, enum values, and size/alignment/offset
+assertions from the canonical native declarations. This graphics ABI is
+independent of the application's CBOR package protocol; [build outputs](build.md#generated-bindings-and-dependency-maintenance)
+locates both artifacts and their invalidation rules.
+
 The physical listener and transport owner is
 [BrowserServer](../src/frameworks/transport/browser_server.h).
 Application-level dispatch and snapshots live under
@@ -76,8 +84,26 @@ the retained annotation input owner lives in
 ## Presentation and browser integration
 
 [src/controller/presentation](../src/controller/presentation) contains native
-source selection, final composition, exported-backbuffer publication, and
-visual diagnostics. Producer products originate in their domain systems.
+source selection, workspace admission/publication, shared visual-worker
+support, and visual diagnostics. Final display products belong to Explore,
+Annotation, Predict, Live, and Upscale. Predict's implementation is in
+[compute_systems.cpp](../src/controller/subsystems/system/compute_systems.cpp).
+
+[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) owns product
+storage and counted reads;
+[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) owns a final
+exportable allocation and its immutable display layout. The controller's
+[finalization policy](../src/controller/presentation/visual_runtime.cpp)
+connects these GPU owners to the raster backend. The GPU framework has no
+reverse dependency on that backend.
+
+Explore's
+[GalleryThumbnailCache](../src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h),
+[GalleryStream](../src/controller/subsystems/explore/detail/gallery_stream.h),
+and [GalleryAtlas](../src/controller/subsystems/explore/detail/gallery_atlas.h)
+own retained thumbnail identity, disk/GPU admission, and allocation-local cell
+meaning respectively. [Dataset loading and Explore residency](datasets.md#explore-thumbnails-and-atlas-residency)
+explains their handoffs.
 
 The Rust browser-image boundary is
 [presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
@@ -85,6 +111,9 @@ and its child modules. Firefox import and WebGPU/Vulkan integration live in
 the owned [third_party/firefox](../third_party/firefox) tree, including
 `gfx/wgpu_bindings/src/server.rs`. Iced owns view transforms and rendering;
 matching metadata authorizes queue-ordered browser-image draws.
+The vendored Iced [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
+retains sampled resources through the actual encoder's submission or
+abandonment; it carries no application schema or selection policy.
 
 For lifetime and synchronization invariants, follow the contract's
 [GPU buffer flow](../CONTRACT.md#gpu-buffer-flow) and

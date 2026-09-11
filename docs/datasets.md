@@ -343,3 +343,70 @@ Measure the real workload before increasing prefetch depth: each slot owns
 capacity for a full batch, so extra overlap also consumes more pinned or device
 memory. See [GPU-local execution](gpu-execution.md) for placement, transport,
 capability inspection, and functional GDR checks.
+
+## Explore thumbnails and atlas residency
+
+Explore uses
+[CompiledImageStream](../src/backend/data/compiled_image_stream.h) for reusable
+disk-read, host-transfer, and device lanes. It has a separate detail lane in
+the same stream owner, so selecting a full-resolution image can progress
+independently of unrelated gallery reads. The default H2D path retains pinned
+host pixels and descriptor storage through asynchronous transfers; GDRCopy
+uses the explicitly selected mapped-device route described above.
+
+The [gallery stream](../src/controller/subsystems/explore/gallery_stream.cpp)
+first places completed cached visible thumbnails. Disk admission and ready
+GPU work then prioritize:
+
+1. Every immediate row, including partially visible rows, with the focused
+   visible image first.
+2. Up to four rows forward in the last nonzero scroll direction, nearest first.
+3. Up to four rows behind, nearest first.
+
+Initial direction is increasing row order. The two neighbor ranges clip
+independently at dataset boundaries; missing rows on one side do not enlarge
+the other side. Priority governs admission, not asynchronous completion.
+In-flight work retains its custody, useful settled inputs can be rebound to
+new demand, and speculative admission preserves foreground lane capacity.
+
+All disk/augmentation/raster misses produce completed individual GPU cache
+tiles before atlas placement. Pixel identity includes the retained dataset
+incarnation, compiled image, augmentation configuration/seed, and card raster
+extent. Filtered position and viewport row count are demand, not pixel identity.
+Overlay validity is separate: box/mask/class changes reuse clean tiles and
+retained annotation meaning; label visibility remains presentation state.
+Per-image augmentation and donor choices remain independent of batch order.
+
+[GalleryThumbnailCache](../src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h)
+retains bounded high-water capacity derived from the admitted maximum viewport
+plus eight neighboring rows, capped by dataset size. Its global ceiling derives
+from `kExploreVisibleItemCapacity`. Demand pins are installed before eviction;
+physical readers/writers and rollback banks separately protect in-flight data.
+Smaller demand does not shrink storage or clear useful cached entries. Cache
+pixels, clean/semantic banks, lanes, descriptors, and retained metadata all
+consume storage; diagnostic byte categories include their existing subsets
+and must not be added twice.
+
+Host-page pinning and device-cache residency describe different resources.
+Host pages remain registered through H2D/D2H completion. Cached GPU pixels stay
+resident by retaining device allocations and read/write custody; GPU storage
+is not registered as host memory.
+
+[GalleryAtlas](../src/controller/subsystems/explore/detail/gallery_atlas.h)
+keeps a separate directory for each physical output owner.
+Each directory records its allocation identity, layout generation, initialized
+cells, and clean/semantic meaning. A logical row maps to the allocation's
+circular row position. A writable candidate reconciles against its own
+contents, which may be older than the preceding publication; it does not copy
+a complete atlas to establish a patch baseline.
+
+First-use or invalid cells are initialized, missing visible tiles get explicit
+placeholders, and removed/unused cells—including padding in the partial final
+row—are cleared. Matching overlapping cells survive. Every touched entry is
+invalidated before a GPU write; new meaning is installed only after successful
+settlement. A failed or cancelled partial write leaves those cells invalid and
+preserves the last committed product. Detail output invalidates the acquired
+owner's atlas directory before any copy, growth, or clearing.
+
+Gallery/detail retention and the exact displayed layout, crop, labels, and hit
+identity are described in [GUI interaction](gui-interaction.md#explore-gallery-and-displayed-geometry).

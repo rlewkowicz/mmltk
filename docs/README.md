@@ -14,15 +14,16 @@
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
   generated boundaries, frontend components, and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): ordered annotation
-  input, retained buffers, command settlement, publication, browser copies,
-  redraws, and physical resource lifetime.
+  input, command settlement, exact displayed gallery geometry, producer
+  workspaces, browser samples, redraws, and physical resource lifetime.
 
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations, the compiled
-  binary format, loading, and batch leases.
+  binary format, loading, batch leases, and retained Explore thumbnails/atlases.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
-  H2D and GDRCopy, provider capture, and capability inspection.
+  H2D and GDRCopy, shared-workspace import, provider capture, and capability
+  inspection.
 
 ## Engineering, validation, and operations
 

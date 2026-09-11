@@ -6,7 +6,7 @@ The architectural resource rules are in
 [CONTRACT.md](../CONTRACT.md#execution-failure-and-shutdown).
 The settings below select concrete devices, placement, and loading transport.
 The [GUI interaction guide](gui-interaction.md#native-gpu-custody-and-completion)
-owns native/browser image-copy, completion, and redraw mechanics.
+owns producer/raw/display inventories, completion, and redraw mechanics.
 
 ## Device and NUMA placement
 
@@ -68,6 +68,55 @@ mapped allocation.
 `MMLTK_GDR_TRACE_FILE` enables mapped-buffer JSONL diagnostics and is forwarded
 with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
+
+## Shared-workspace interoperability
+
+Producer display workspaces use the existing
+[ExportedImageBuffer](../src/frameworks/gpu/exported_image_buffer.cpp) CUDA VMM
+allocation with a POSIX opaque file descriptor, imported by Firefox as memory
+for a linear Vulkan `R8G8B8A8_UNORM` image. Native writers receive a pitched
+linear device view. This route is distinct from CUDA DMA-BUF CPU mapping for
+GDRCopy and from the compositor's DMA-BUF interfaces. It does not import an
+arbitrary CUDA pointer or use a Vulkan-exported optimal image.
+The CUDA VMM `PINNED` allocation property here has a device location; it is
+device backing, separate from [host-page pinning](datasets.md#explore-thumbnails-and-atlas-residency).
+
+Firefox's [workspace integration](../third_party/firefox/gfx/wgpu_bindings/src/server.rs)
+queries the actual device's image format/type/tiling/usage and opaque-FD import
+support. Its result supplies the physical device UUID, device incarnation,
+capacity, row pitch, subresource byte offset, required allocation size,
+alignment, memory-type requirements, and dedicated-allocation requirement.
+The native [ImageWorkspace](../src/frameworks/gpu/image_workspace.h) validates
+the device and allocation layout and creates its exportable allocation on the
+matching CUDA device. Capacity and byte arithmetic must fit both APIs; Firefox
+rechecks the actual image's pitch, offset, alignment, memory-type and dedicated
+requirements before import.
+
+Source admission follows this ownership order:
+
+```text
+Firefox queries layout for the sample arena's device and capacity
+    → producer creates an unpublished exportable workspace
+    → Firefox imports it and completes initial Vulkan ownership
+    → producer fills/finalizes it from authoritative raw data
+    → Presentation borrows and publishes the exact completed workspace
+```
+
+The initial `UNDEFINED` transition occurs before producer filling. It cannot
+preserve an already produced image. First admission, browser/device replacement,
+or capacity growth therefore prepares a new allocation while retaining the
+previous completed product. Subsequent source reads acquire/release the
+external image in `GENERAL`; the browser sample returns to its shared
+shader-read layout after copying. Source and sample storage retain separate
+lifetimes as described in [presentation custody](gui-interaction.md#native-gpu-custody-and-completion).
+
+When the raw producer device differs from the display device, workspace
+finalization owns the existing peer or reusable pinned transfer route and any
+required receiver storage. Matching display UUIDs are required for the imported
+allocation even in this case. A clean-only same-device product can write final
+storage directly; products with semantic planes use the controller-bound fused
+raster finalizer. Late layout readiness completes retained raw work without
+repeating its domain operation.
 
 ## ONNX capture and verification storage
 

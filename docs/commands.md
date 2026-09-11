@@ -14,8 +14,8 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --build` | Build and package the Release runtime |
 | `./mmltk --gui` | Launch the packaged browser host with the canonical bundle |
 | `./mmltk --prepare-gui-container` | Prepare the GUI runtime container without starting the app |
-| `./mmltk --generate-application-bindings` | Generate typed native-to-Rust application bindings |
-| `./mmltk --generate-protocol` | Generate protocol bindings and cross-language fixtures |
+| `./mmltk --generate-application-bindings` | Generate typed application bindings and the data-only graphics ABI |
+| `./mmltk --generate-protocol` | Generate those artifacts and the application cross-language fixtures |
 | `./mmltk --update-gui-lock` | Refresh the Cargo lock inputs for browser tests |
 | `./mmltk --tidy` | Run configured formatting and static analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
