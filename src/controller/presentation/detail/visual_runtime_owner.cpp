@@ -31,6 +31,15 @@ VisualRuntimeOwner::VisualRuntimeOwner(RuntimeFactory factory, FailureSink failu
       worker_([this](const std::stop_token stop) { Run(stop); }, [this](const std::exception_ptr failure) { Failed(failure); },
               [this] { RetireRuntime(); }) {
     if (!factory_) throw std::invalid_argument("visual runtime factory is unavailable");
+    output_wake_ = std::make_shared<OutputWake>();
+    output_wake_->owner = this;
+    retirement_sink_ = std::make_shared<const std::function<void()>>([wake = output_wake_] {
+        std::scoped_lock lock(wake->mutex);
+        if (wake->owner) {
+            wake->owner->retirement_ready_.store(true, std::memory_order_release);
+            wake->owner->worker_.Wake();
+        }
+    });
 }
 VisualRuntimeOwner::~VisualRuntimeOwner() {
     if (output_wake_) {
@@ -157,10 +166,7 @@ void VisualRuntimeOwner::RegisterContinuation(Work work, DispatchObservation dis
     std::scoped_lock lock(mutex_);
     if (continuation_ || stopping_ || terminal_barrier_active_ || runtime_retirement_blocked_ || (wake_on_output_available && runtime_))
         throw std::logic_error("visual continuation registration is unavailable");
-    if (wake_on_output_available) {
-        output_wake_ = std::make_shared<OutputWake>();
-        output_wake_->owner = this;
-    }
+    output_notifications_ = wake_on_output_available;
     continuation_ = std::move(work);
     continuation_dispatched_ = std::move(dispatched);
     continuation_cancellation_ = cancellation;
@@ -173,7 +179,7 @@ bool VisualRuntimeOwner::NotifyContinuation() noexcept {
     return true;
 }
 void VisualRuntimeOwner::SetOutputRetry(const bool armed) noexcept {
-    if (!output_wake_) return;
+    if (!output_notifications_) return;
     std::scoped_lock lock(output_wake_->mutex);
     output_wake_->retry_armed = armed && (continuation_state_.load(std::memory_order_acquire) & kContinuationEnabled) != 0U;
     if (!output_wake_->retry_armed)
@@ -278,7 +284,7 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         if (replacement_active_) RestorePolicy();
         auto created = factory_(product_revision_sequence_);
         if (!created) throw std::runtime_error("visual runtime factory returned no runtime");
-        if (output_wake_)
+        if (output_notifications_)
             created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
                 if (const auto gate = wake.lock()) {
                     std::scoped_lock lock(gate->mutex);
@@ -313,6 +319,7 @@ void VisualRuntimeOwner::Observe(const ActivityStage stage, const std::uint64_t 
 }
 void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     Observe(ActivityStage::CycleEntered);
+    FinishDeferredRetirement();
     std::optional<ScheduledWork> ordered_work;
     std::optional<Work> latest_work;
     bool continuation_work = false;
@@ -322,7 +329,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     std::stop_token operation_stop;
     {
         std::scoped_lock lock(mutex_);
-        if (stopping_) return;
+        if (stopping_ || runtime_retirement_blocked_) return;
         if (!ordered_.empty()) {
             ordered_work.emplace(std::move(ordered_.front()));
             ordered_.pop_front();
@@ -480,6 +487,7 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
         failure = retirement.failure;
         safe = retirement.safe_to_destroy;
         if (!safe) {
+            if (retirement.custody.deferred()) retirement.custody.SetRetirementSink(retirement_sink_);
             std::scoped_lock lock(mutex_);
             retained_.emplace<Runtime::UnsafeCustody>(std::move(retirement.custody));
         }
@@ -494,6 +502,30 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
     }
     Observe(ActivityStage::RetirementCompleted, safe ? 1U : 0U);
     return failure;
+}
+
+void VisualRuntimeOwner::FinishDeferredRetirement() noexcept {
+    if (!retirement_ready_.exchange(false, std::memory_order_acq_rel)) return;
+    Runtime::UnsafeCustody custody;
+    {
+        std::scoped_lock lock(mutex_);
+        auto* retained = std::get_if<Runtime::UnsafeCustody>(&retained_);
+        if (!retained || !retained->deferred()) return;
+        custody = std::move(*retained);
+    }
+    const auto settled = custody.FinishRetirement();
+    {
+        std::scoped_lock lock(mutex_);
+        if (settled.completion_reached) {
+            retained_.emplace<std::monostate>();
+            runtime_retirement_blocked_ = stopping_ || execution_policy_.has_value();
+            if (continuation_ && !runtime_retirement_blocked_)
+                continuation_state_.fetch_or(kContinuationEnabled, std::memory_order_release);
+        } else {
+            retained_.emplace<Runtime::UnsafeCustody>(std::move(custody));
+        }
+    }
+    if (settled.failure) ReportFailure(settled.failure);
 }
 
 VisualRuntimeOwner::StagedReplacement::StagedReplacement(VisualRuntimeOwner& owner) : owner_(&owner) {

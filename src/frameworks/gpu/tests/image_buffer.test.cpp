@@ -27,59 +27,6 @@
 namespace mmltk::frameworks::gpu {
 namespace test_support {
 
-// CLEANUP-IGNORE: This test access probe owns exported-buffer cleanup facts independently from Live receiver probes.
-struct ExportedImageBufferTestAccess final {
-    static inline CUresult unmap_result = CUDA_SUCCESS;
-    static inline CUresult address_result = CUDA_SUCCESS;
-    static inline CUresult allocation_result = CUDA_SUCCESS;
-    static inline std::size_t unmaps = 0U;
-    static inline std::size_t address_frees = 0U;
-    static inline std::size_t allocation_releases = 0U;
-
-    static void Reset() noexcept {
-        unmap_result = CUDA_SUCCESS;
-        address_result = CUDA_SUCCESS;
-        allocation_result = CUDA_SUCCESS;
-        unmaps = 0U;
-        address_frees = 0U;
-        allocation_releases = 0U;
-    }
-
-    static void Adopt(ExportedImageBuffer& buffer) noexcept {
-        buffer.allocation_ = 11U;
-        buffer.address_ = 22U;
-        buffer.device_ptr_ = 22U;
-        buffer.allocation_size_ = 4096U;
-        buffer.reserved_bytes_ = 4096U;
-        buffer.pitch_bytes_ = 64U;
-        buffer.width_ = 16U;
-        buffer.height_ = 16U;
-        buffer.mapping_active_ = true;
-    }
-
-    static cudaError_t Release(ExportedImageBuffer& buffer) noexcept {
-        return buffer.Release({
-            .unmap = &Unmap,
-            .free_address = &FreeAddress,
-            .release_allocation = &ReleaseAllocation,
-        });
-    }
-
-   private:
-    static CUresult Unmap(CUdeviceptr, std::size_t) noexcept {
-        ++unmaps;
-        return unmap_result;
-    }
-    static CUresult FreeAddress(CUdeviceptr, std::size_t) noexcept {
-        ++address_frees;
-        return address_result;
-    }
-    static CUresult ReleaseAllocation(CUmemGenericAllocationHandle) noexcept {
-        ++allocation_releases;
-        return allocation_result;
-    }
-};
-
 struct ExternalGraphicsTimelineTestAccess final {
     static inline std::size_t imports = 0U;
 
@@ -1446,6 +1393,295 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
     }
     CHECK(backend->contexts_destroyed == 2U);
     CHECK(backend->streams_destroyed == 1U);
+}
+
+TEST_CASE("Failed workspace construction closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    using test_support::ExportedImageBufferTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
+    ImageWorkspaceTestAccess::Install(*runtime);
+    const auto initiating = std::make_exception_ptr(std::invalid_argument("rejected workspace initialization"));
+    ImageWorkspaceTestAccess::initialize_failure = initiating;
+    ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    std::exception_ptr failure;
+    try { static_cast<void>(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout())); }
+    catch (...) { failure = std::current_exception(); }
+    REQUIRE(failure);
+    CHECK(test_support::ContainsImageFailure(failure, initiating));
+    CHECK(is_image_execution_failure(failure));
+    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+    ImageWorkspaceTestAccess::initialize_failure = {};
+    CHECK_THROWS(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    CHECK(ImageWorkspaceTestAccess::initialized == 1U);
+    // The independently healthy source context cannot erase the display failure.
+    runtime->BindContext();
+    auto retirement = runtime->Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    REQUIRE(retirement.custody.valid());
+    CHECK_FALSE(retirement.custody.deferred());
+    CHECK(test_support::ContainsImageFailure(retirement.failure, initiating));
+    CHECK(test_support::ContainsImageFailure(retirement.custody.failure(), initiating));
+    CHECK_FALSE(runtime->Retire().safe_to_destroy);
+    runtime.reset();
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+    ImageWorkspaceTestAccess::Reset();
+}
+
+TEST_CASE("Partial workspace stream construction retains display context and both failures", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend});
+    ImageWorkspaceTestAccess::Install(runtime);
+    const auto initiating = std::make_exception_ptr(std::runtime_error("display stream creation failed"));
+    const auto cleanup = std::make_exception_ptr(std::runtime_error("display context unavailable during cleanup"));
+    backend->FailAfter(FakeImageBackend::FailurePoint::CreateStream, 0U, initiating);
+    backend->FailDeviceBinding(1, cleanup);
+    std::exception_ptr failure;
+    try { static_cast<void>(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout())); }
+    catch (...) { failure = std::current_exception(); }
+    CHECK(test_support::ContainsImageFailure(failure, initiating));
+    CHECK(test_support::ContainsImageFailure(failure, cleanup));
+    CHECK(backend->contexts_created == 2U);
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(ImageWorkspaceTestAccess::initialized == 0U);
+    runtime.BindContext();
+    const auto retirement = runtime.Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    CHECK(test_support::ContainsImageFailure(retirement.failure, initiating));
+    CHECK(test_support::ContainsImageFailure(retirement.failure, cleanup));
+    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+}
+
+TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admission", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend});
+    ImageWorkspaceTestAccess::Install(runtime);
+    auto layout = ImageWorkspaceTestAccess::Layout();
+    layout.pitch_bytes = 1U;
+    CHECK_THROWS_AS(runtime.CreateWorkspace(layout), std::invalid_argument);
+    CHECK(backend->contexts_created == 1U);
+    ImageWorkspaceTestAccess::initialize_failure = std::make_exception_ptr(std::invalid_argument("rejected UUID"));
+    CHECK_THROWS_AS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()), std::invalid_argument);
+    CHECK(backend->contexts_destroyed == 1U);
+    CHECK(backend->streams_destroyed == 1U);
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    ImageWorkspaceTestAccess::initialize_failure = {};
+    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    CHECK_THROWS_AS(workspace->Admit(workspace->identity(), 99U), std::invalid_argument);
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    workspace.reset();
+    auto retry = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    retry.reset();
+    CHECK(runtime.Retire().safe_to_destroy);
+}
+
+TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the runtime", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    ImageWorkspaceTestAccess::Install(runtime);
+    auto candidate = runtime.AcquireOutput();
+    auto first = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    first->Admit(first->identity(), first->layout().device_incarnation);
+    runtime.ConfigureWorkspace(candidate, std::move(first));
+    auto replacement = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    replacement->Admit(replacement->identity(), replacement->layout().device_incarnation);
+    auto not_admitted = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    test_support::ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    CHECK_THROWS(runtime.ConfigureWorkspace(candidate, std::move(replacement)));
+    CHECK_THROWS(not_admitted->Admit(not_admitted->identity(), not_admitted->layout().device_incarnation));
+    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    const auto retirement = runtime.Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    CHECK(retirement.failure);
+    CHECK(retirement.custody.valid());
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    ImageWorkspaceTestAccess::Reset();
+}
+
+TEST_CASE("Delayed workspace release reports physical failure through retained runtime custody", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
+    ImageWorkspaceTestAccess::Install(*runtime);
+    auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    auto retirement = runtime->Retire();
+    REQUIRE_FALSE(retirement.safe_to_destroy);
+    REQUIRE(retirement.custody.deferred());
+    CHECK_FALSE(retirement.failure);
+    CHECK_FALSE(retirement.custody.FinishRetirement().completion_reached);
+    runtime.reset();
+    std::atomic<std::size_t> notifications{0U};
+    retirement.custody.SetRetirementSink(std::make_shared<const std::function<void()>>([&] { ++notifications; }));
+    const auto cleanup = std::make_exception_ptr(std::runtime_error("late display context failure"));
+    backend->FailDeviceBinding(1, cleanup);
+    workspace.reset();
+    CHECK(notifications.load() != 0U);
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+    const auto settled = retirement.custody.FinishRetirement();
+    CHECK_FALSE(settled.completion_reached);
+    CHECK(test_support::ContainsImageFailure(settled.failure, cleanup));
+    CHECK_FALSE(retirement.custody.deferred());
+    CHECK(retirement.custody.valid());
+    retirement.custody.SetRetirementSink({});
+}
+
+TEST_CASE("Healthy external workspace products retain exact raw aliases through deferred retirement", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    ImageWorkspaceTestAccess::Install(*runtime);
+    auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto candidate = runtime->AcquireOutput();
+    runtime->ConfigureWorkspace(candidate, workspace);
+    runtime->Publish(candidate, 4U, 3U, [](auto clean, auto, auto) {
+        *reinterpret_cast<std::byte*>(clean.data) = std::byte{73};
+    });
+    auto product = runtime->CommitOutput(std::move(candidate));
+    const auto revision = product.revision();
+    const auto address = product.BorrowWorkspace().plane().data;
+    workspace.reset();
+    auto retirement = runtime->Retire();
+    REQUIRE(retirement.custody.deferred());
+    CHECK_FALSE(retirement.failure);
+    runtime.reset();
+    CHECK(product.revision() == revision);
+    CHECK(product.Borrow().plane(0U).plane().data == address);
+    CHECK(product.BorrowWorkspace().plane().data == address);
+    CHECK(*reinterpret_cast<const std::byte*>(address) == std::byte{73});
+    product = {};
+    const auto settled = retirement.custody.FinishRetirement();
+    CHECK(settled.completion_reached);
+    CHECK_FALSE(settled.failure);
+    CHECK_FALSE(retirement.custody.valid());
+    CHECK(backend->contexts_destroyed == 1U);
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+}
+
+TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA in the callback", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    ImageWorkspaceTestAccess::Install(runtime);
+    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto candidate = runtime.AcquireOutput();
+    runtime.ConfigureWorkspace(candidate, workspace);
+    runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
+    auto product = runtime.CommitOutput(std::move(candidate));
+    auto completion = product.BorrowWorkspace().TakeCompletion();
+    workspace.reset();
+    product = {};
+    auto retirement = runtime.Retire();
+    REQUIRE(retirement.custody.deferred());
+    CHECK_FALSE(retirement.failure);
+    std::atomic<std::size_t> notifications{0U};
+    retirement.custody.SetRetirementSink(std::make_shared<const std::function<void()>>([&] { ++notifications; }));
+    const auto before = notifications.load();
+    completion->Complete();
+    CHECK(notifications.load() == before);
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 0U);
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK_FALSE(retirement.custody.FinishRetirement().completion_reached);
+    completion.reset();
+    CHECK(notifications.load() > before);
+    CHECK(retirement.custody.FinishRetirement().completion_reached);
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+}
+
+TEST_CASE("Failed display finalization closes admission and retains complete transfer custody", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    const auto initiating = std::make_exception_ptr(std::runtime_error("display finalizer failed after transfer"));
+    const auto cleanup = std::make_exception_ptr(std::runtime_error("display completion unavailable"));
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+        .workspace_finalize = [&](auto, auto, auto, auto, auto) {
+            backend->FailDeviceBinding(1, cleanup);
+            std::rethrow_exception(initiating);
+        }});
+    ImageWorkspaceTestAccess::Install(runtime);
+    runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+    auto completed = runtime.Completed();
+    const auto raw = completed.Borrow().plane(0U).plane().data;
+    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    std::exception_ptr failure;
+    try { runtime.PrepareWorkspace(completed, workspace); }
+    catch (...) { failure = std::current_exception(); }
+    CHECK(test_support::ContainsImageFailure(failure, initiating));
+    CHECK(test_support::ContainsImageFailure(failure, cleanup));
+    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    CHECK(completed.Borrow().plane(0U).plane().data == raw);
+    auto retirement = runtime.Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    CHECK_FALSE(retirement.custody.deferred());
+    CHECK(test_support::ContainsImageFailure(retirement.failure, initiating));
+    CHECK(test_support::ContainsImageFailure(retirement.failure, cleanup));
+    CHECK(backend->planes_allocated == 4U);
+    CHECK(backend->planes_freed == 0U);
+    CHECK(backend->pinned_allocated == 2U);
+    CHECK(backend->contexts_destroyed == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 0U);
+}
+
+TEST_CASE("Workspace retirement retains cross-device transfer and raw custody through real finalization", "[gpu][workspace][copy]") {
+    using test_support::ImageWorkspaceTestAccess;
+    for (const bool peer : {false, true}) {
+        ImageWorkspaceTestAccess::Reset();
+        auto backend = std::make_shared<FakeImageBackend>();
+        backend->peer_access = peer;
+        SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+            .workspace_finalize = [](auto clean, auto semantic, auto destination, auto, auto) {
+                CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
+                test_support::CopyImagePlane(destination, clean);
+            }});
+        ImageWorkspaceTestAccess::Install(runtime);
+        runtime.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
+            for (const auto plane : {clean, semantic})
+                std::memset(reinterpret_cast<void*>(plane.data), plane.descriptor.kind == ImagePlaneKind::Clean ? 37 : 91,
+                            plane.descriptor.pitch_bytes * plane.descriptor.height);
+        });
+        auto completed = runtime.Completed();
+        const auto revision = completed.revision();
+        const auto raw = completed.Borrow().plane(0U).plane().data;
+        auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        runtime.PrepareWorkspace(completed, workspace);
+        CHECK(completed.revision() == revision);
+        CHECK(completed.Borrow().plane(0U).plane().data == raw);
+        CHECK(completed.BorrowWorkspace().revision() == revision);
+        CHECK(*reinterpret_cast<const std::byte*>(completed.BorrowWorkspace().plane().data) == std::byte{37});
+        CHECK(backend->peer_copies == (peer ? 2U : 0U));
+        CHECK(backend->staged_uploads == (peer ? 0U : 2U));
+        CHECK(backend->staged_downloads == (peer ? 0U : 2U));
+        workspace.reset();
+        auto retirement = runtime.Retire();
+        REQUIRE(retirement.custody.deferred());
+        CHECK(backend->planes_freed == 0U);
+        completed = {};
+        CHECK(retirement.custody.FinishRetirement().completion_reached);
+        CHECK(backend->planes_freed == 4U);
+        CHECK(backend->contexts_destroyed == 2U);
+    }
 }
 
 TEST_CASE("Workspace transfer routes preserve independent source and receiver pitch guards", "[gpu][workspace][copy]") {

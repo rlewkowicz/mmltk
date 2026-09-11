@@ -257,8 +257,10 @@ class ImageProductBuffer final {
     // Wake-only notification: may run at receiver completion on a GPU callback
     // thread. It must not execute CUDA or synchronously perform product work.
     void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>);
+    void DeferReleaseToReaders() noexcept { deferred_release_ = true; }
     struct State;
     std::shared_ptr<State> state_;
+    bool deferred_release_ = false;
 };
 
 }  // namespace mmltk::frameworks::gpu

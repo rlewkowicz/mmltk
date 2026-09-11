@@ -286,6 +286,10 @@ ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
     }
     return result;
 }
+void ImageProductPool::ReleaseForRetirement() noexcept {
+    for (const auto& slot : slots_) slot->buffer.DeferReleaseToReaders();
+    slots_.clear();
+}
 ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)
         throw std::invalid_argument("image product candidate is incomplete");

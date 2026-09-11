@@ -103,6 +103,7 @@ class VisualRuntimeOwner final {
     void ReportFailure(std::exception_ptr) noexcept;
     [[nodiscard]] std::exception_ptr FinishRuntimeReplacement(bool) noexcept;
     [[nodiscard]] std::exception_ptr RetireOwned(std::unique_ptr<Runtime>) noexcept;
+    void FinishDeferredRetirement() noexcept;
     void RestorePolicy();
     void NotifyReaders() const;
     void RetireRuntime();
@@ -112,6 +113,9 @@ class VisualRuntimeOwner final {
 
     struct OutputWake;
     std::shared_ptr<OutputWake> output_wake_;
+    std::shared_ptr<const std::function<void()>> retirement_sink_;
+    std::atomic_bool retirement_ready_{false};
+    std::atomic_bool output_notifications_{false};
     RuntimeFactory factory_;
     FailureSink failures_;
     ActivityObservation activity_;

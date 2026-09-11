@@ -762,6 +762,7 @@ void ImageProductReadCompletion::Quarantine() noexcept {
 ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout)
     : state_(std::make_shared<State>(std::move(context), layout)) {}
 ImageProductBuffer::~ImageProductBuffer() {
+    if (deferred_release_) return;
     std::unique_lock transaction(state_->transaction_);
     state_->AwaitReceiverReads();
 }
@@ -962,6 +963,9 @@ void ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
     // Retained raw plane custody is unchanged until the next exclusive write.
     state_->workspace_ = std::move(workspace);
     state_->finalize_ = std::move(finalize);
+    // Dropping the replaced owner can reveal failed physical cleanup even
+    // though the new workspace and source execution are healthy.
+    state_->workspace_->CheckOwner();
 }
 void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     {

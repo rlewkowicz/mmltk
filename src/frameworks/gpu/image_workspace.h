@@ -1,14 +1,19 @@
 #pragma once
 
+#include <cuda_runtime_api.h>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <exception>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/device_execution.h"
 
 namespace mmltk::frameworks::gpu {
 
@@ -17,6 +22,11 @@ class ImageStream;
 class ImageProductBuffer;
 class BorrowedImageProductReadView;
 class ImageProductReadCompletion;
+class SystemImageRuntime;
+class ExportedImageBuffer;
+namespace test_support {
+struct ImageWorkspaceTestAccess;
+}
 
 struct ImageWorkspaceLayout final {
     std::uint64_t device_incarnation = 0U;
@@ -54,7 +64,6 @@ using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePla
 // custody. No import registry or scheduling policy lives in this owner.
 class ImageWorkspace final {
    public:
-    ImageWorkspace(DeviceContext, ImageWorkspaceLayout);
     ~ImageWorkspace() noexcept;
     ImageWorkspace(const ImageWorkspace&) = delete;
     ImageWorkspace& operator=(const ImageWorkspace&) = delete;
@@ -70,15 +79,43 @@ class ImageWorkspace final {
     [[nodiscard]] ImageStreamSettlement Settle() noexcept;
 
    private:
+    // Shared by every candidate in one runtime, including candidates that
+    // never reach a product slot and owners released after replacement.
+    class Owner final {
+       public:
+        void Check() const;
+        void Failed(std::exception_ptr) noexcept;
+        [[nodiscard]] std::exception_ptr failure() const noexcept;
+        [[nodiscard]] ImageStreamSettlement Retire() noexcept;
+        [[nodiscard]] bool has_live_workspaces() const noexcept;
+        void SetRetirementSink(std::shared_ptr<const std::function<void()>>) noexcept;
+       private:
+        mutable std::mutex mutex_;
+        std::exception_ptr failure_;
+        std::size_t live_ = 0U;
+        bool closed_ = false;
+        std::shared_ptr<const std::function<void()>> retirement_sink_;
+        void Notify() const noexcept;
+        friend class ImageWorkspace;
+    };
+    struct Operations final {
+        void (*initialize)(ExportedImageBuffer&, const ImageWorkspaceLayout&);
+        cudaError_t (*release)(ExportedImageBuffer&) noexcept;
+    };
     struct State;
     std::shared_ptr<State> state_;
+    ImageWorkspace(std::shared_ptr<Owner>, DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>,
+                   const Operations* = nullptr);
     [[nodiscard]] ImagePlaneView plane(std::uint32_t width, std::uint32_t height) const;
-    void Release() noexcept;
+    [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
+    void CheckOwner(const std::shared_ptr<Owner>& = {}) const;
     void Attach(std::uint64_t product_owner);
     void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
     friend class ImageProductBuffer;
     friend class BorrowedImageWorkspace;
     friend class ImageStream;
+    friend class SystemImageRuntime;
+    friend struct test_support::ImageWorkspaceTestAccess;
 };
 
 class BorrowedImageWorkspace final {

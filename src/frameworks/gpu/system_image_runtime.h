@@ -44,6 +44,11 @@ class SystemImageRuntime final {
         UnsafeCustody& operator=(UnsafeCustody&&) noexcept = default;
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] std::exception_ptr failure() const noexcept;
+        // A healthy external workspace may defer retirement. Consume completion
+        // on the owner thread; the sink only wakes that owner.
+        [[nodiscard]] bool deferred() const noexcept;
+        [[nodiscard]] ImageStreamSettlement FinishRetirement() noexcept;
+        void SetRetirementSink(std::shared_ptr<const std::function<void()>>) noexcept;
 
        private:
         explicit UnsafeCustody(std::shared_ptr<RetentionControl>) noexcept;
@@ -51,6 +56,8 @@ class SystemImageRuntime final {
         friend class SystemImageRuntime;
     };
     struct Retirement final {
+        // False carries either terminal custody or a healthy deferred token.
+        // Keep a deferred token until FinishRetirement reports its final result.
         bool safe_to_destroy = false;
         std::exception_ptr failure{};
         UnsafeCustody custody{};
@@ -100,13 +107,15 @@ class SystemImageRuntime final {
    private:
     struct State;
     [[nodiscard]] static std::shared_ptr<RetentionControl> ReserveRetention();
-    [[nodiscard]] UnsafeCustody Retain(std::exception_ptr) noexcept;
+    [[nodiscard]] UnsafeCustody Retain(std::exception_ptr, bool deferred = false) noexcept;
     [[nodiscard]] State& ActiveState();
     [[nodiscard]] const State& ActiveState() const;
     [[nodiscard]] std::uint64_t TakeProductRevision();
     std::shared_ptr<State> state_;
     std::shared_ptr<RetentionControl> retention_;
     const std::shared_ptr<ImageProductRevisionSequence> product_revision_sequence_;
+    const ImageWorkspace::Operations* workspace_operations_ = nullptr;
+    friend struct test_support::ImageWorkspaceTestAccess;
 };
 
 }  // namespace mmltk::frameworks::gpu

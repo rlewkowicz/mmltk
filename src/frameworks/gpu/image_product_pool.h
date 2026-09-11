@@ -104,6 +104,9 @@ class ImageProductPool final {
     void PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     void FinalizeWorkspace(Candidate&, ImageWorkspaceCoverage);
     [[nodiscard]] ImageStreamSettlement SettleWorkspaces() noexcept;
+    // Existing shared product/plane leases own delayed release. Counted
+    // completion objects retain those leases beyond their GPU callback.
+    void ReleaseForRetirement() noexcept;
     void Select(const Product&);
     [[nodiscard]] Product Selected() const;
     [[nodiscard]] Availability ObserveAvailability() const noexcept;

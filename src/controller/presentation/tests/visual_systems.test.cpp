@@ -5055,6 +5055,105 @@ TEST_CASE("Explore selection and detail navigation publish complete bounded snap
     CHECK(explore.snapshot().order.visible_indices.size() <= kExploreVisibleItemCapacity);
 }
 
+TEST_CASE("Visual workspace retirement resumes queued work only after its delayed physical outcome", "[workspace]") {
+    using mmltk::frameworks::gpu::SystemImageRuntime;
+    using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
+    const bool fail_release = GENERATE(false, true);
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::atomic<std::size_t> constructions{0U};
+    std::promise<std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace>> created_workspace;
+    auto workspace_result = created_workspace.get_future();
+    std::promise<void> staged_completed;
+    auto staged_result = staged_completed.get_future();
+    std::promise<void> queued_completed;
+    auto queued_result = queued_completed.get_future();
+    std::promise<std::exception_ptr> failed;
+    auto failure_result = failed.get_future();
+    std::atomic<std::size_t> failures{0U};
+    mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
+    detail::VisualRuntimeOwner owner{
+        [&](auto revisions) {
+            ++constructions;
+            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+            ImageWorkspaceTestAccess::Install(*runtime);
+            return runtime;
+        },
+        [&](std::exception_ptr failure) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+        }};
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+        return detail::VisualRuntimeOwner::Notification{[&, workspace = std::move(workspace)]() mutable {
+            created_workspace.set_value(std::move(workspace));
+        }};
+    }));
+    auto workspace = mmltk::testsupport::await_test_future(workspace_result, "external workspace creation");
+    REQUIRE(owner.SubmitDiscrete([&](auto& runtime, std::stop_token) {
+        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+        staged_gate.receipt().ArriveAndWait();
+        return detail::VisualRuntimeOwner::Notification{[&] { staged_completed.set_value(); }};
+    }, {}, true));
+    mmltk::testsupport::ScopedTestCleanup release_stage{[&] { staged_gate.Release(); }};
+    REQUIRE(staged_gate.WaitEntered(2s));
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
+        return detail::VisualRuntimeOwner::Notification{[&] { queued_completed.set_value(); }};
+    }));
+    staged_gate.Release();
+    mmltk::testsupport::await_test_future(staged_result, "staged workspace retirement handoff");
+    CHECK(failures.load() == 0U);
+    CHECK(queued_result.wait_for(0s) == std::future_status::timeout);
+    CHECK(constructions.load() == 2U);
+    const auto cleanup = std::make_exception_ptr(std::runtime_error("delayed visual display release failure"));
+    if (fail_release) backend->FailDeviceBinding(1, cleanup);
+    workspace.reset();
+    if (fail_release) {
+        const auto failure = mmltk::testsupport::await_test_future(failure_result, "delayed workspace terminal result");
+        CHECK(mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, cleanup));
+        CHECK_FALSE(owner.SubmitLatest([](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{}; }));
+        CHECK(queued_result.wait_for(0s) == std::future_status::timeout);
+    } else {
+        mmltk::testsupport::await_test_future(queued_result, "queued work after healthy workspace release");
+        CHECK(failures.load() == 0U);
+        std::promise<void> resumed;
+        auto resumed_result = resumed.get_future();
+        submit_visual_completion(owner, resumed);
+        mmltk::testsupport::await_test_future(resumed_result, "restored visual admission");
+    }
+    owner.StopAndWait();
+    CHECK(constructions.load() == 2U);
+}
+
+TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake", "[workspace]") {
+    using mmltk::frameworks::gpu::SystemImageRuntime;
+    using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::promise<std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace>> created;
+    auto ready = created.get_future();
+    auto owner = std::make_unique<detail::VisualRuntimeOwner>(
+        [&](auto revisions) {
+            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+            ImageWorkspaceTestAccess::Install(*runtime);
+            return runtime;
+        }, [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
+    REQUIRE(owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        return detail::VisualRuntimeOwner::Notification{[&, workspace = std::move(workspace)]() mutable {
+            created.set_value(std::move(workspace));
+        }};
+    }));
+    auto workspace = mmltk::testsupport::await_test_future(ready, "workspace before visual owner destruction");
+    owner.reset();
+    CHECK(backend->contexts_destroyed == 1U);
+    workspace.reset();
+    CHECK(backend->contexts_destroyed == 2U);
+    CHECK(mmltk::frameworks::gpu::test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+}
+
 TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto constructions = std::make_shared<std::atomic<std::uint64_t>>(0U);
