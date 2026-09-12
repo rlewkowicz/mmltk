@@ -137,9 +137,8 @@ class ExploreAcceptanceGate::Impl final {
         }
         std::unique_lock lock(mutex_);
         ++waiters_;
-        changed_.wait(lock, [this, generation] {
-            return terminal_ || held_superseded_ || generation != current_generation_ || release_held_;
-        });
+        changed_.wait(lock,
+                      [this, generation] { return terminal_ || held_superseded_ || generation != current_generation_ || release_held_; });
         --waiters_;
         held_pending_ = false;
         return finish(terminal_ || held_superseded_ || generation != current_generation_ ? WaitResult::Stale : WaitResult::Proceed);

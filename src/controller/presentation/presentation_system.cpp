@@ -467,8 +467,9 @@ class PresentationSystem::Impl final {
             // Capacity and shared custody are reserved before the worker starts.
             // A terminal receiver retains its borrowed source and CUDA resources.
             auto* retained_writer = retired.get();
-            std::move(retirement_).Install(gpu::TerminalCudaCustody::Share(std::move(retired)),
-                                           result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
+            std::move(retirement_)
+                .Install(gpu::TerminalCudaCustody::Share(std::move(retired)),
+                         result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
             if (result == Retirement::RetainedBrowserRead) retained_writer->TerminalCustodyInstalled();
         }
         if (result == Retirement::UnsafeFailure || result == Retirement::ReleasedWithFailure) Failed({});

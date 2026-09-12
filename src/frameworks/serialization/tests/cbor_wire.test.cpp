@@ -172,11 +172,11 @@ static_assert(
 using CborObjectLayout = mmltk::frameworks::serialization::implementation::detail::ObjectLayout;
 
 template <class Owner, CborObjectLayout Layout>
-concept PublicRawCborAppend = requires(const Owner& source,
-                                     std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>& object,
-                                     std::optional<wire::EncodeError>& failure) {
-    mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure);
-};
+concept PublicRawCborAppend =
+    requires(const Owner& source, std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>& object,
+             std::optional<wire::EncodeError>& failure) {
+        mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure);
+    };
 
 template <class Owner>
 concept PublicRawCborValueDecode =
@@ -463,9 +463,8 @@ TEST_CASE("schema agreed transport preserves reflected fields and named persiste
     const auto positional = cbor::reflected_transport_value(leaf);
     REQUIRE(named);
     REQUIRE(positional);
-    const wire::Value expected(wire::Value::Array{
-        wire::Value(std::uint64_t{65535U}), wire::Value(leaf.text),
-        wire::Value(wire::ByteBuffer(3U, std::byte{0xff})), wire::Value{}});
+    const wire::Value expected(wire::Value::Array{wire::Value(std::uint64_t{65535U}), wire::Value(leaf.text),
+                                                  wire::Value(wire::ByteBuffer(3U, std::byte{0xff})), wire::Value{}});
     CHECK(*positional == expected);
     REQUIRE(std::holds_alternative<wire::Value::Object>(named->storage));
     CHECK(std::get<wire::Value::Object>(named->storage).size() == 3U);

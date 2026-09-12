@@ -83,8 +83,8 @@ int main(const int argument_count, char* const* const arguments) {
                 .skeleton_nodes = std::vector<contracts::AnnotationSkeletonNode>(
                     contracts::kAnnotationGeometryCapacity,
                     {.key = contracts::AnnotationText::From(std::string(contracts::kAnnotationNameCapacity, 'k')), .point = point}),
-                .skeleton_edges = std::vector<contracts::AnnotationEdge>(contracts::kAnnotationGeometryCapacity,
-                                                                        {.source = 6U, .target = 7U}),
+                .skeleton_edges =
+                    std::vector<contracts::AnnotationEdge>(contracts::kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
             };
             scene.objects = {object};
             snapshot.ui.editor.selected_object = 0U;

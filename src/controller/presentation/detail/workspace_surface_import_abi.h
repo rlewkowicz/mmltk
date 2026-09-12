@@ -189,9 +189,10 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
     const bool empty_layout =
         record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
         (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
-         record.opcode == Opcode::ReleaseSubmitted) && record.alignment == 0U &&
-        !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
-    if (record.opcode != Opcode::Allocate && record.opcode != Opcode::Ready && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
+         record.opcode == Opcode::ReleaseSubmitted) &&
+        record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
+    if (record.opcode != Opcode::Allocate && record.opcode != Opcode::Ready && record.opcode != Opcode::ArenaReady && !empty_layout)
+        return false;
     const bool layout_valid =
         record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
         record.offset <= record.size && record.stride != 0U && record.height <= (record.size - record.offset) / record.stride &&

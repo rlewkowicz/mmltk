@@ -1898,9 +1898,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         state_->browser_terminals.fetch_add(1U, std::memory_order_acq_rel);
         return state_->terminal_retirement.load(std::memory_order_acquire);
     }
-    void TerminalCustodyInstalled() noexcept override {
-        state_->terminal_custody_notifications.fetch_add(1U, std::memory_order_acq_rel);
-    }
+    void TerminalCustodyInstalled() noexcept override { state_->terminal_custody_notifications.fetch_add(1U, std::memory_order_acq_rel); }
 
    private:
     struct Allocation final {
@@ -7425,18 +7423,30 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
         REQUIRE(fixture.channel.take_source_transition().has_value());
     }
     switch (invalid) {
-        case 0U: break; // Release before any acquisition.
+        case 0U:
+            break;  // Release before any acquisition.
         case 1U:
             REQUIRE(send_workspace_record(fixture.peer.get(), release));
             fixture.channel.pump();
             REQUIRE(fixture.channel.take_source_transition().has_value());
-            break; // Duplicate release.
-        case 2U: ++release.offset; break;
-        case 3U: ++release.presentation_revision; break;
-        case 4U: ++release.stride; break;
-        case 5U: ++release.size; break;
-        case 6U: ++release.id_low; break;
-        default: FAIL("unknown invalid source release case");
+            break;  // Duplicate release.
+        case 2U:
+            ++release.offset;
+            break;
+        case 3U:
+            ++release.presentation_revision;
+            break;
+        case 4U:
+            ++release.stride;
+            break;
+        case 5U:
+            ++release.size;
+            break;
+        case 6U:
+            ++release.id_low;
+            break;
+        default:
+            FAIL("unknown invalid source release case");
     }
     REQUIRE(send_workspace_record(fixture.peer.get(), release));
     fixture.channel.pump();
@@ -7602,8 +7612,7 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                     layout.arena_high = iteration;
                     layout.arena_low = 9U;
                     layout.allocation_identity = iteration;
-                    REQUIRE(channel.admit_source(layout, iteration, edge.get(),
-                                                 signal.descriptor(), edge.get()));
+                    REQUIRE(channel.admit_source(layout, iteration, edge.get(), signal.descriptor(), edge.get()));
                 } else {
                     REQUIRE(channel.admit_arena(id, iteration, 4U, 3U));
                 }

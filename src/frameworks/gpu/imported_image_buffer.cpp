@@ -32,11 +32,11 @@ void trace_loaded_libraries() noexcept {
     bool discard_line = false;
     int read_errno = 0;
     FILE* const maps = std::fopen("/proc/self/maps", "re");
-    if (!maps) read_errno = errno;
+    if (!maps)
+        read_errno = errno;
     else {
         char line[8192];
-        while (read_bytes < kMapsBytes &&
-               std::fgets(line, static_cast<int>(std::min(sizeof(line), kMapsBytes - read_bytes + 1U)), maps)) {
+        while (read_bytes < kMapsBytes && std::fgets(line, static_cast<int>(std::min(sizeof(line), kMapsBytes - read_bytes + 1U)), maps)) {
             const std::size_t length = std::strlen(line);
             read_bytes += length;
             const bool complete = length != 0U && line[length - 1U] == '\n';
@@ -62,9 +62,8 @@ void trace_loaded_libraries() noexcept {
             }
             // A non-ASCII or JSON-sensitive mapping path is explicitly omitted,
             // never emitted as malformed JSON or a guessed resolved pathname.
-            if (!std::ranges::all_of(path_view, [](const unsigned char byte) {
-                    return byte >= 32U && byte < 127U && byte != '"' && byte != '\\';
-                })) {
+            if (!std::ranges::all_of(path_view,
+                                     [](const unsigned char byte) { return byte >= 32U && byte < 127U && byte != '"' && byte != '\\'; })) {
                 encoding_unavailable = true;
                 continue;
             }
@@ -76,27 +75,29 @@ void trace_loaded_libraries() noexcept {
     }
     char output[1536];
     for (std::size_t index = 0U; index != path_count; ++index) {
-        const int length = std::snprintf(
-            output, sizeof(output),
-            "{\"event\":\"cuda.workspace.loaded_library\",\"native_process_id\":%ld,\"library_path\":\"%s\","
-            "\"library_provenance\":\"proc_self_maps_at_first_memory_import\"}\n",
-            static_cast<long>(process), paths[index].data());
+        const int length = std::snprintf(output, sizeof(output),
+                                         "{\"event\":\"cuda.workspace.loaded_library\",\"native_process_id\":%ld,\"library_path\":\"%s\","
+                                         "\"library_provenance\":\"proc_self_maps_at_first_memory_import\"}\n",
+                                         static_cast<long>(process), paths[index].data());
         if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))
             mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(length)});
     }
-    const int length = std::snprintf(
-        output, sizeof(output),
-        "{\"event\":\"cuda.workspace.library_inventory\",\"native_process_id\":%ld,\"inventory_status\":\"%s\","
-        "\"inventory_errno\":%d,\"library_count\":%zu,\"maps_bytes\":%zu,\"maps_byte_limit\":%zu,"
-        "\"inventory_bounded\":%s,\"path_encoding_unavailable\":%s}\n",
-        static_cast<long>(process), read_errno != 0 ? "unavailable" : bounded || encoding_unavailable ? "partial" : "complete",
-        read_errno, path_count, read_bytes, kMapsBytes, bounded ? "true" : "false", encoding_unavailable ? "true" : "false");
+    const int length =
+        std::snprintf(output, sizeof(output),
+                      "{\"event\":\"cuda.workspace.library_inventory\",\"native_process_id\":%ld,\"inventory_status\":\"%s\","
+                      "\"inventory_errno\":%d,\"library_count\":%zu,\"maps_bytes\":%zu,\"maps_byte_limit\":%zu,"
+                      "\"inventory_bounded\":%s,\"path_encoding_unavailable\":%s}\n",
+                      static_cast<long>(process),
+                      read_errno != 0                   ? "unavailable"
+                      : bounded || encoding_unavailable ? "partial"
+                                                        : "complete",
+                      read_errno, path_count, read_bytes, kMapsBytes, bounded ? "true" : "false", encoding_unavailable ? "true" : "false");
     if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))
         mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(length)});
 }
 
-void observe(const char* operation, std::uint64_t identity, int retained_fd, CUexternalMemory memory,
-             CUdeviceptr base, const ImageWorkspaceLayout& layout, CUresult status, int importing_fd = -1) noexcept {
+void observe(const char* operation, std::uint64_t identity, int retained_fd, CUexternalMemory memory, CUdeviceptr base,
+             const ImageWorkspaceLayout& layout, CUresult status, int importing_fd = -1) noexcept {
     const auto* trace = std::getenv("MMLTK_GUI_TRACE_FILE");
     if (!trace || !*trace) return;
     const int saved_errno = errno;
@@ -108,22 +109,22 @@ void observe(const char* operation, std::uint64_t identity, int retained_fd, CUe
         device_uuid[index * 2U + 1U] = hex[layout.device_uuid[index] & 15U];
     }
     char output[1024];
-    const int length = std::snprintf(output, sizeof(output),
+    const int length = std::snprintf(
+        output, sizeof(output),
         "{\"event\":\"cuda.workspace.%s\",\"native_process_id\":%ld,\"workspace_allocation\":%llu,"
         "\"retained_memory_descriptor\":%d,\"import_descriptor\":%d,\"cuda_external_memory\":%llu,\"cuda_mapped_base\":%llu,"
         "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,"
         "\"fd_consumed\":%s,\"memory_size\":%zu,\"image_offset\":%zu,\"row_pitch\":%zu,\"dedicated\":%s,\"cuda_status\":%d}\n",
         operation, static_cast<long>(::getpid()), static_cast<unsigned long long>(identity), retained_fd, importing_fd,
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory)), static_cast<unsigned long long>(base),
-        device_uuid, static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
-        std::strcmp(operation, "memory_import") == 0 && status == CUDA_SUCCESS ? "true" : "false",
-        layout.required_allocation_bytes, layout.offset_bytes, layout.pitch_bytes, layout.dedicated ? "true" : "false",
-        static_cast<int>(status));
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory)), static_cast<unsigned long long>(base), device_uuid,
+        static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
+        std::strcmp(operation, "memory_import") == 0 && status == CUDA_SUCCESS ? "true" : "false", layout.required_allocation_bytes,
+        layout.offset_bytes, layout.pitch_bytes, layout.dedicated ? "true" : "false", static_cast<int>(status));
     if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))
         mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(length)});
     errno = saved_errno;
 }
-}
+}  // namespace
 ImportedImageBuffer::ImportedImageBuffer() : resources_(std::make_shared<Resources>()) {}
 ImportedImageBuffer::~ImportedImageBuffer() noexcept { static_cast<void>(Release()); }
 CUdeviceptr ImportedImageBuffer::data() const noexcept { return resources_ ? resources_->data : 0U; }
@@ -132,8 +133,8 @@ std::size_t ImportedImageBuffer::allocation_size() const noexcept { return resou
 bool ImportedImageBuffer::owns_resources() const noexcept {
     return resources_ && (resources_->memory || resources_->mapped_base || resources_->backing.get() >= 0);
 }
-bool ImportedImageBuffer::Import(DeviceContext context, mmltk::common::io::ScopedFd backing,
-                                 const ImageWorkspaceLayout& layout, std::uint64_t identity, std::string* error) {
+bool ImportedImageBuffer::Import(DeviceContext context, mmltk::common::io::ScopedFd backing, const ImageWorkspaceLayout& layout,
+                                 std::uint64_t identity, std::string* error) {
     const auto fail = [&](const char* operation, CUresult status) {
         observe("memory_import_rejected", identity,
                 resources_ && resources_->backing.get() >= 0 ? resources_->backing.get() : backing.get(),
@@ -154,7 +155,9 @@ bool ImportedImageBuffer::Import(DeviceContext context, mmltk::common::io::Scope
         return fail("workspace physical device UUID", CUDA_ERROR_INVALID_DEVICE);
     mmltk::common::io::ScopedFd consumed;
     int duplicate;
-    do { duplicate = ::fcntl(backing.get(), F_DUPFD_CLOEXEC, 0); } while (duplicate < 0 && errno == EINTR);
+    do {
+        duplicate = ::fcntl(backing.get(), F_DUPFD_CLOEXEC, 0);
+    } while (duplicate < 0 && errno == EINTR);
     consumed.reset(duplicate);
     if (duplicate < 0) return fail("workspace memory descriptor duplication", CUDA_ERROR_OPERATING_SYSTEM);
     auto& resource = *resources_;
@@ -191,7 +194,8 @@ cudaError_t ImportedImageBuffer::Release(const ReleaseOperations& operations) no
     }
     auto& resource = *resources_;
     CUresult status = CUDA_SUCCESS;
-    observe("memory_retirement_started", resource.identity, resource.backing.get(), resource.memory, resource.mapped_base, resource.layout, status);
+    observe("memory_retirement_started", resource.identity, resource.backing.get(), resource.memory, resource.mapped_base, resource.layout,
+            status);
     try {
         if (resource.context) resource.context->Bind();
         if (resource.mapped_base) {
@@ -203,8 +207,7 @@ cudaError_t ImportedImageBuffer::Release(const ReleaseOperations& operations) no
             if (status == CUDA_SUCCESS) resource.memory = nullptr;
         }
     } catch (...) { status = CUDA_ERROR_UNKNOWN; }
-    observe("memory_retirement", resource.identity, resource.backing.get(), resource.memory, resource.mapped_base,
-            resource.layout, status);
+    observe("memory_retirement", resource.identity, resource.backing.get(), resource.memory, resource.mapped_base, resource.layout, status);
     if (status != CUDA_SUCCESS) {
         release_failure_ = cudaErrorUnknown;
         std::move(retention_).Install(TerminalCudaCustody::Share(std::move(resources_)), release_failure_);

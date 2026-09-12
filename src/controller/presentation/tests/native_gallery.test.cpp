@@ -1620,18 +1620,19 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
                         << " frame_revision=" << snapshot.frame.revision << " gallery_generation=" << snapshot.gallery.generation
                         << " first_row=" << snapshot.viewport.first_row << " rows=" << snapshot.viewport.row_count
                         << " columns=" << snapshot.viewport.columns << " matching=" << snapshot.order.matching_count << "\nslots=";
-                for (const bool ready_slot : snapshot.gallery.slots) context << (ready_slot ? '1' : '0');
-                context << "\nheld=" << std::ranges::count(facts, VisualDiagnosticOperation::AcceptanceCompletionHeld,
-                                                         &VisualDiagnosticFact::operation)
-                        << " gpu_completed=" << std::ranges::count(facts, VisualDiagnosticOperation::GalleryGpuCompleted,
-                                                                  &VisualDiagnosticFact::operation)
+                for (const bool ready_slot : snapshot.gallery.slots)
+                    context << (ready_slot ? '1' : '0');
+                context << "\nheld="
+                        << std::ranges::count(facts, VisualDiagnosticOperation::AcceptanceCompletionHeld, &VisualDiagnosticFact::operation)
+                        << " gpu_completed="
+                        << std::ranges::count(facts, VisualDiagnosticOperation::GalleryGpuCompleted, &VisualDiagnosticFact::operation)
                         << " facts=" << facts.size();
                 const auto first = facts.size() > 128U ? facts.size() - 128U : 0U;
                 for (auto index = first; index < facts.size(); ++index) {
                     const auto& fact = facts[index];
-                    context << "\n" << index << " " << visual_diagnostic_event_name(fact.operation)
-                            << " generation=" << fact.generation << " value=" << fact.value << " detail=" << fact.detail
-                            << " condition=" << fact.context.condition;
+                    context << "\n"
+                            << index << " " << visual_diagnostic_event_name(fact.operation) << " generation=" << fact.generation
+                            << " value=" << fact.value << " detail=" << fact.detail << " condition=" << fact.context.condition;
                 }
                 throw std::runtime_error(context.str());
             }

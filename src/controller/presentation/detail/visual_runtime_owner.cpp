@@ -300,8 +300,10 @@ void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::stri
     if (!request.diagnostics) return;
     request.diagnostics->sink.Emit([&] {
         VisualDiagnosticFact fact{.system = contracts::DiagnosticOwner::Presentation,
-                                 .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
-                                 .device = request.layout.device, .context = request.diagnostics->context, .failure_detail = reason};
+                                  .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
+                                  .device = request.layout.device,
+                                  .context = request.diagnostics->context,
+                                  .failure_detail = reason};
         auto& progress = fact.context.workspace_progress;
         progress.requested_product_owner = request.product_owner;
         progress.requested_product_revision = request.product_revision;
@@ -343,8 +345,8 @@ void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
             diagnose_workspace_service(request, "request_rejected_stopping");
             return;
         }
-        if (workspace_request_ && workspace_request_->diagnostics &&
-            workspace_request_->diagnostics->sink.valid() && workspace_pending_.load(std::memory_order_acquire))
+        if (workspace_request_ && workspace_request_->diagnostics && workspace_request_->diagnostics->sink.valid() &&
+            workspace_pending_.load(std::memory_order_acquire))
             diagnose_workspace_service(*workspace_request_, "pending_request_replaced");
         diagnose_workspace_service(request, "request_enqueued");
         workspace_request_ = std::move(request);

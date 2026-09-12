@@ -1355,8 +1355,8 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
     CHECK(generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
                          std::to_string(static_cast<std::uint32_t>(
-                             mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) + ";") !=
-          std::string::npos);
+                             mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) +
+                         ";") != std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
     CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);
     CHECK(generated.find("offset_of!(Record, presentation_revision) == 64") != std::string::npos);
@@ -1444,9 +1444,7 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     auto value = browser::application_materializer_detail::reflected_value(snapshot);
     REQUIRE(value.has_value());
     browser::wire::CountingEncoder measure{
-        {.max_bytes = browser::kMaxRecordWireBytes,
-         .max_items = browser::kMaxRecordWireBytes,
-         .max_depth = browser::kMaxIntentValueDepth}};
+        {.max_bytes = browser::kMaxRecordWireBytes, .max_items = browser::kMaxRecordWireBytes, .max_depth = browser::kMaxIntentValueDepth}};
     const auto snapshot_size = measure.measure(*value);
     REQUIRE(snapshot_size.has_value());
     INFO("Complete Annotation snapshot bytes: " << *snapshot_size);
@@ -1465,8 +1463,7 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
         const auto failed = browser::encode_system_event<&ApplicationSystems::annotation>(
             AnnotationFailed{.snapshot = snapshot, .detail = std::string(kVisualFailureByteCapacity, 'e')});
         REQUIRE(browser::encode_server_record(browser::ServerRecord{failed}, encoded));
-        const browser::IntentReply reply{
-            .correlation = 1U, .result = browser::application_materializer_detail::encode_result(snapshot)};
+        const browser::IntentReply reply{.correlation = 1U, .result = browser::application_materializer_detail::encode_result(snapshot)};
         REQUIRE(browser::encode_server_record(browser::ServerRecord{reply}, encoded));
     }
     browser::Bootstrap bootstrap{

@@ -246,7 +246,8 @@ ImageStorageFootprint ImageWorkspace::StorageFootprint() const noexcept {
     std::scoped_lock lock(state_->access);
     auto result = state_->transfer ? state_->transfer->StorageFootprint() : ImageStorageFootprint{};
     // Clean cross-device transfer already owns the final allocation directly.
-    if (!state_->transfer || state_->transfer->layout() != ImageProductLayout::Clean) result.device_bytes += state_->allocation->allocation_size();
+    if (!state_->transfer || state_->transfer->layout() != ImageProductLayout::Clean)
+        result.device_bytes += state_->allocation->allocation_size();
     return result;
 }
 void ImageWorkspace::Attach(std::uint64_t product_owner) {

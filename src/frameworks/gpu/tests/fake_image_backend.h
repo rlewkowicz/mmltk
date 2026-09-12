@@ -47,9 +47,7 @@ struct ImportedImageBufferTestAccess final {
         resource.layout.required_allocation_bytes = 4096U;
         resource.layout.pitch_bytes = 64U;
     }
-    static cudaError_t Release(ImportedImageBuffer& buffer) noexcept {
-        return buffer.Release({&FreeMapping, &DestroyMemory});
-    }
+    static cudaError_t Release(ImportedImageBuffer& buffer) noexcept { return buffer.Release({&FreeMapping, &DestroyMemory}); }
     static void AdoptWorkspace(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout) {
         auto* storage = new std::byte[layout.required_allocation_bytes]{};
         Adopt(buffer);
@@ -65,6 +63,7 @@ struct ImportedImageBufferTestAccess final {
         if (released == cudaSuccess) delete[] storage;
         return released;
     }
+
    private:
     static CUresult FreeMapping(CUdeviceptr base) noexcept {
         ++unmaps;

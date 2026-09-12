@@ -1441,8 +1441,8 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
 }
 
 TEST_CASE("Failed workspace import closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
-    using test_support::ImportedImageBufferTestAccess;
     using test_support::ImageWorkspaceTestAccess;
+    using test_support::ImportedImageBufferTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
     auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
@@ -2133,7 +2133,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK(descriptor.get() == -1);
     REQUIRE(workspace->QueueAllocation(std::move(transferred)));
     workspace->Admit(workspace->identity(), layout.device_incarnation);
-    allocation.reset(); // Native backing remains valid after all Vulkan owners retire.
+    allocation.reset();  // Native backing remains valid after all Vulkan owners retire.
     const auto check_pixels = [](ImagePlaneView plane) {
         std::vector<std::byte> pixels(plane.descriptor.row_bytes() * plane.descriptor.height);
         CUDA_MEMCPY2D copy{};

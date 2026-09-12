@@ -14,8 +14,9 @@ class VulkanWorkspaceFixture final {
     VulkanWorkspaceFixture& operator=(const VulkanWorkspaceFixture&) = delete;
     [[nodiscard]] const ImageWorkspaceLayout& layout() const noexcept;
     [[nodiscard]] mmltk::common::io::ScopedFd Export() const;
+
    private:
     struct State;
     std::unique_ptr<State> state_;
 };
-}
+}  // namespace mmltk::frameworks::gpu::test_support

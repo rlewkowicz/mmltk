@@ -165,9 +165,8 @@ class WorkspaceSurfaceImportChannel final {
     // completing initial Vulkan ownership. Per-frame work uses the existing edge.
     [[nodiscard]] bool admit_arena(WorkspaceSurfaceImportId, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
                                    std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
-    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, int frame_edge,
-                                    int frame_signal, int access_signal, std::uint64_t selection_generation = 0U,
-                                    std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, int frame_edge, int frame_signal,
+                                    int access_signal, std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
     [[nodiscard]] bool read_settled(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
                                     std::uint64_t transfer_sequence);
     // Transfers one exact withdrawal ticket. Capacity retains the ticket in the

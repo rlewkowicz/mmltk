@@ -98,26 +98,26 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
     }
     char output[2048];
     const int bytes = std::snprintf(output, sizeof(output),
-        "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
-        "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
-        "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
-        "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
-        "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"memory_size\":%llu,\"row_pitch\":%llu,"
-        "\"image_offset\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,\"dedicated\":%u,"
-        "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
-        "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
-        "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
-        event, static_cast<unsigned long long>(record.id_high), static_cast<unsigned long long>(record.id_low),
-        static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
-        static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()),
-        peer_known ? static_cast<long>(credentials.pid) : 0L, peer_known ? "true" : "false", peer, descriptor,
-        record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, uuid,
-        static_cast<unsigned long long>(record.device_incarnation), static_cast<unsigned long long>(record.size),
-        static_cast<unsigned long long>(record.stride), static_cast<unsigned long long>(record.offset),
-        record.width, record.height, record.dedicated, sizeof(record), stat_status, stat_errno,
-        static_cast<unsigned long long>(metadata.st_dev), static_cast<unsigned long long>(metadata.st_ino),
-        static_cast<unsigned long long>(metadata.st_rdev), static_cast<unsigned int>(metadata.st_mode),
-        static_cast<long long>(metadata.st_size));
+                                    "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
+                                    "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
+                                    "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
+                                    "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
+                                    "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"memory_size\":%llu,\"row_pitch\":%llu,"
+                                    "\"image_offset\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,\"dedicated\":%u,"
+                                    "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
+                                    "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
+                                    "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
+                                    event, static_cast<unsigned long long>(record.id_high), static_cast<unsigned long long>(record.id_low),
+                                    static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
+                                    static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()),
+                                    peer_known ? static_cast<long>(credentials.pid) : 0L, peer_known ? "true" : "false", peer, descriptor,
+                                    record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, uuid,
+                                    static_cast<unsigned long long>(record.device_incarnation),
+                                    static_cast<unsigned long long>(record.size), static_cast<unsigned long long>(record.stride),
+                                    static_cast<unsigned long long>(record.offset), record.width, record.height, record.dedicated,
+                                    sizeof(record), stat_status, stat_errno, static_cast<unsigned long long>(metadata.st_dev),
+                                    static_cast<unsigned long long>(metadata.st_ino), static_cast<unsigned long long>(metadata.st_rdev),
+                                    static_cast<unsigned int>(metadata.st_mode), static_cast<long long>(metadata.st_size));
     if (bytes > 0 && static_cast<std::size_t>(bytes) < sizeof(output))
         mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(bytes)});
     errno = saved_errno;
@@ -685,7 +685,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().imported = true;
                     outcomes.back().layout = record;
                     if (record.opcode == Opcode::Ready)
-                        trace_memory_descriptor("descriptor_received", record, peer.get(), descriptors[workspace_surface_import::kReadyMemoryDescriptor].get());
+                        trace_memory_descriptor("descriptor_received", record, peer.get(),
+                                                descriptors[workspace_surface_import::kReadyMemoryDescriptor].get());
                     outcomes.back().memory_descriptor = std::move(descriptors[workspace_surface_import::kReadyMemoryDescriptor]);
                     outcomes.back().timeline_descriptor = std::move(descriptors[workspace_surface_import::kReadyTimelineDescriptor]);
                     break;
@@ -808,8 +809,7 @@ bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId 
         acquired.offset != transfer_sequence)
         return false;
     for (std::size_t index = 0U; index != impl_->source_transition_count; ++index) {
-        const auto& pending =
-            impl_->source_transitions[(impl_->next_source_transition + index) % impl_->source_transitions.size()];
+        const auto& pending = impl_->source_transitions[(impl_->next_source_transition + index) % impl_->source_transitions.size()];
         if (pending.id_high == id.high && pending.id_low == id.low) return false;
     }
     if (!impl_->send(Record{.opcode = Opcode::ReadSettled,

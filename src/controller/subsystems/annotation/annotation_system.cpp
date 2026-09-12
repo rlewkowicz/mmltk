@@ -506,15 +506,20 @@ class AnnotationSystem::Impl final {
     void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description,
                         const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
         diagnostics_.Emit([&] {
-            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
-                                        .operation = operation, .device = settings_.device,
-                                        .generation = description.generation, .value = description.scene_revision,
-                                        .detail = description.document_epoch,
-                                        .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
-                                                    .capacity_height = description.scene ? description.scene->frame_height : 0U,
-                                                    .frame_revision = revision, .condition = baseline && baseline->valid() ? 1U : 0U,
-                                                    .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation),
-                                                               .source_instance = 1U, .source_revision = revision}}};
+            return VisualDiagnosticFact{
+                .system = contracts::DiagnosticOwner::Annotation,
+                .operation = operation,
+                .device = settings_.device,
+                .generation = description.generation,
+                .value = description.scene_revision,
+                .detail = description.document_epoch,
+                .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
+                            .capacity_height = description.scene ? description.scene->frame_height : 0U,
+                            .frame_revision = revision,
+                            .condition = baseline && baseline->valid() ? 1U : 0U,
+                            .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation),
+                                       .source_instance = 1U,
+                                       .source_revision = revision}}};
         });
     }
     void QueueRender() {

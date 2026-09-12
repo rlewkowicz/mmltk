@@ -520,8 +520,7 @@ class BindingEmitter final {
                 const auto method = transport ? "from_application_transport_value" : "from_application_value";
                 output_ << "fn " << method << "(value: Value) -> Result<Self, String> { ";
                 if (transport)
-                    output_ << "let mut fields = crate::application_codec::transport_fields(value, "
-                            << output_field_count << ")?;\n";
+                    output_ << "let mut fields = crate::application_codec::transport_fields(value, " << output_field_count << ")?;\n";
                 else
                     output_ << "let mut fields = object(value)?;\n";
                 VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
@@ -606,8 +605,8 @@ class BindingEmitter final {
                        "match name.as_str() {\n";
             schema::Variant<Variant>::Visit([&]<class Alternative>() {
                 const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
-                output_ << "    \"" << source << "\" => Ok(Self::" << rust_identifier(source, true)
-                        << "(FromApplicationValue::" << method << "(value)?)),\n";
+                output_ << "    \"" << source << "\" => Ok(Self::" << rust_identifier(source, true) << "(FromApplicationValue::" << method
+                        << "(value)?)),\n";
             });
             output_ << "    _ => Err(\"unknown variant\".into()), } }\n";
         }

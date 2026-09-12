@@ -321,7 +321,6 @@ pub struct Admission {
     pub height: u32,
     pub stride: u64,
     pub size: u64,
-    pub modifier: u64,
     pub layout: Record,
     frame_edge: Option<OwnedFd>,
     frame_signal: Option<OwnedFd>,
@@ -743,7 +742,6 @@ impl Channel {
                             height: record.height,
                             stride: record.stride,
                             size: record.size,
-                            modifier: record.modifier,
                             frame_edge: Some(frame_edge),
                             frame_signal: Some(frame_signal),
                             access_signal: Some(access_signal),
@@ -764,7 +762,7 @@ impl Channel {
                         self.fail(); return;
                     }
                     self.admitted.insert(id, Admission { width: record.width, height: record.height,
-                        stride: 0, size: 0, modifier: MODIFIER_LINEAR, layout: record,
+                        stride: 0, size: 0, layout: record,
                         frame_edge: None, frame_signal: None, access_signal: None });
                     write_diagnostic(|line| write!(line,
                         "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{}}}",

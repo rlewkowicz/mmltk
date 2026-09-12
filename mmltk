@@ -2550,7 +2550,7 @@ print_test_suites() {
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
         'For headless-compositor, arguments after -- run a command in the private compositor.' \
-        'For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner; use -- --help.' \
+        'For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner process-mode; use -- --help.' \
         'Test options:' \
         '  --executable <target>       Build and run one executable owned by the suite' \
         '  --config <release|dev>      Select the containerized CMake graph' \
