@@ -88,6 +88,7 @@ mmltk_register_retained_module_importers(
     tests/profile_runner_common.cpp)
 mmltk_register_private_headers(
     mmltk_acceptance_support
+    tests/annotation_test_utils.hpp
     tests/async_test_utils.hpp
     tests/catch2_compat.hpp
     tests/cuda_test_utils.hpp

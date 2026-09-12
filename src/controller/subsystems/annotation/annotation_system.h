@@ -242,6 +242,7 @@ MMLTK_REFLECT_FIELDS(AnnotationObjectEdit)
 MMLTK_REFLECT_FIELDS(AnnotationCategoryEdit)
 MMLTK_REFLECT_FIELDS(AnnotationClassEdit)  // CLEANUP-IGNORE: Distinct canonical Annotation types require distinct reflection registrations.
 MMLTK_REFLECT_FIELDS(AnnotationSelectedObjectEdit)
+// CLEANUP-IGNORE: Annotation edit and publication types have their own schema identities, independent of Explore's registered types.
 MMLTK_REFLECT_FIELDS(AnnotationSplineEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSplineHandleEdit)
 MMLTK_REFLECT_FIELDS(AnnotationSkeletonEdit)

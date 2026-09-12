@@ -329,6 +329,7 @@ struct AnnotationSplineBody final {
 
 struct AnnotationObjectGeometry final {
     decltype(AnnotationObject::shape) shape{};
+    // CLEANUP-IGNORE: Full preview geometry and selected-handle geometry are distinct reflected projections of canonical object fields.
     decltype(AnnotationObject::box) box{};
     decltype(AnnotationObject::point) point{};
     decltype(AnnotationObject::mask) mask{};
@@ -467,6 +468,7 @@ struct AnnotationUiState final {
     auto operator<=>(const AnnotationUiState&) const = default;
 };
 
+// CLEANUP-IGNORE: These registrations materialize distinct canonical Annotation types; structural projection is already shared.
 MMLTK_REFLECT_FIELDS(AnnotationText)
 MMLTK_REFLECT_FIELDS(AnnotationPoint)
 MMLTK_REFLECT_FIELDS(AnnotationBox)

@@ -1759,13 +1759,8 @@ pub(crate) fn drawable_detail(requested: Surface) -> Option<(Surface, DetailCont
         .with(|renderer| {
             let renderer = renderer.borrow();
             let renderer = renderer.as_ref()?;
-            [&renderer.pending, &renderer.imported]
-                .into_iter()
-                .flatten()
-                .find_map(|imported| {
-                    let pending = imported.image.submitted_draw(requested)?;
-                    Some((requested, pending.detail.clone()?))
-                })
+            SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
+                .find_map(|(_, pending)| Some((requested, pending.detail.clone()?)))
         })
         .or_else(|| {
             retained_detail().map(|(retained, detail)| {
@@ -1782,13 +1777,8 @@ pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, Annota
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
-        [&renderer.pending, &renderer.imported]
-            .into_iter()
-            .flatten()
-            .find_map(|imported| {
-                let pending = imported.image.submitted_draw(requested)?;
-                Some((requested, pending.annotation.clone()?))
-            })
+        SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
+            .find_map(|(_, pending)| Some((requested, pending.annotation.clone()?)))
             .or_else(|| {
                 let image = &renderer.imported.as_ref()?.image;
                 Some((image.retained()?, image.annotation.clone()?))
@@ -2351,6 +2341,16 @@ fn retained_draw_admitted(retained: Surface, requested: Surface, placement: Plac
 }
 
 impl SurfaceRenderer {
+    fn submitted_draws<'a>(
+        pending: &'a Option<Imported>,
+        imported: &'a Option<Imported>,
+        requested: Surface,
+    ) -> impl Iterator<Item = (&'a Imported, &'a PendingImage)> {
+        [pending, imported].into_iter().flatten().filter_map(move |imported| {
+            imported.image.submitted_draw(requested).map(|image| (imported, image))
+        })
+    }
+
     fn matching_import<'a>(
         imported: &'a mut Option<Imported>,
         pending: &'a mut Option<Imported>,
@@ -2395,15 +2395,7 @@ impl SurfaceRenderer {
         transform: ViewTransform,
     ) {
         let requested = self.requested.expect("prepared surface request");
-        let submitted = [&self.pending, &self.imported]
-            .into_iter()
-            .flatten()
-            .find_map(|imported| {
-                imported
-                    .image
-                    .submitted_draw(requested)
-                    .map(|pending| (imported, pending))
-            });
+        let submitted = Self::submitted_draws(&self.pending, &self.imported, requested).next();
         let Some(imported) = submitted.map(|(imported, _)| imported).or_else(|| {
             self.imported
                 .as_ref()

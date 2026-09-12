@@ -15,6 +15,7 @@ namespace mmltk::controller::presentation::detail {
 struct alignas(64) WorkspaceFrameSignal final {
     // CLEANUP-IGNORE: Signal timeline fields have atomic ABI offsets unrelated to image-layout dimension sequences.
     std::uint64_t sequence_lock = 0U;
+    // CLEANUP-IGNORE: Shared publication ABI fields and acceptance-control observations have independent meanings and layouts.
     std::uint64_t timeline_ready = 0U;
     std::uint64_t transfer_sequence = 0U;
     std::uint64_t layer = 0U;

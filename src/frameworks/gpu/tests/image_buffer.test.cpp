@@ -1533,6 +1533,15 @@ struct WorkspaceRuntimeFixture final {
         test_support::ImageWorkspaceTestAccess::Reset();
         test_support::ImageWorkspaceTestAccess::Install(runtime);
     }
+
+    auto PublishWorkspace(const int device) {
+        auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout(device));
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        auto output = runtime.AcquireOutput();
+        REQUIRE(runtime.ConfigureWorkspace(output, workspace));
+        runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
+        return std::pair{std::move(workspace), runtime.CommitOutput(std::move(output))};
+    }
 };
 
 class WorkspaceAccessPeer final {
@@ -1672,13 +1681,7 @@ TEST_CASE("Workspace withdrawal linearizes against an external thread holding an
     for (const bool withdrawal_first : {false, true}) {
         CAPTURE(withdrawal_first);
         WorkspaceRuntimeFixture fixture;
-        auto& runtime = fixture.runtime;
-        auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout());
-        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        auto output = runtime.AcquireOutput();
-        REQUIRE(runtime.ConfigureWorkspace(output, workspace));
-        runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
-        auto baseline = runtime.CommitOutput(std::move(output));
+        auto [workspace, baseline] = fixture.PublishWorkspace(1);
         WorkspaceAccessPeer peer(workspace);
         const auto offer = peer.Access();
         const auto revision = workspace->revision();
@@ -1714,13 +1717,7 @@ TEST_CASE("Workspace withdrawal linearizes against an external thread holding an
 TEST_CASE("Lost acquisition notification requires the exact terminal completion receipt before source reuse",
           "[gpu][workspace][acquisition]") {
     WorkspaceRuntimeFixture fixture;
-    auto& runtime = fixture.runtime;
-    auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout());
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-    auto output = runtime.AcquireOutput();
-    REQUIRE(runtime.ConfigureWorkspace(output, workspace));
-    runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
-    auto baseline = runtime.CommitOutput(std::move(output));
+    auto [workspace, baseline] = fixture.PublishWorkspace(1);
     WorkspaceAccessPeer peer(workspace);
     const auto revision = workspace->revision();
     REQUIRE(peer.Acquire(peer.Access(), revision));
@@ -1899,15 +1896,9 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
 }
 
 TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA in the callback", "[gpu][workspace]") {
-    using test_support::ImageWorkspaceTestAccess;
     WorkspaceRuntimeFixture fixture;
     auto& runtime = fixture.runtime;
-    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-    auto candidate = runtime.AcquireOutput();
-    REQUIRE(runtime.ConfigureWorkspace(candidate, workspace));
-    runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
-    auto product = runtime.CommitOutput(std::move(candidate));
+    auto [workspace, product] = fixture.PublishWorkspace(0);
     auto completion = product.BorrowWorkspace().TakeCompletion();
     workspace.reset();
     product = {};

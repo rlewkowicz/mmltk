@@ -709,6 +709,16 @@ mod tests {
         snapshot
     }
 
+    fn measured_unfocused_gallery() -> (State, ExploreSnapshot) {
+        let mut snapshot = displayed_gallery_snapshot();
+        snapshot.order.matchingcount = 100;
+        snapshot.focusedimage = None;
+        let mut state = State::default();
+        state.rebase(Some(&snapshot), false);
+        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+        (state, snapshot)
+    }
+
     fn gallery_sample(x: u32, y: u32) -> crate::presentation_surface::SurfaceSample {
         crate::presentation_surface::SurfaceSample {
             width: 400,
@@ -809,12 +819,7 @@ mod tests {
 
     #[test]
     fn row_return_and_failed_admission_recover_local_same_cell_focus() {
-        let mut snapshot = displayed_gallery_snapshot();
-        snapshot.order.matchingcount = 100;
-        snapshot.focusedimage = None;
-        let mut state = State::default();
-        state.rebase(Some(&snapshot), false);
-        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+        let (mut state, mut snapshot) = measured_unfocused_gallery();
         let input = local_focus(&state, &snapshot).unwrap();
         let focused = accept_local_focus(&mut state, &snapshot, input);
         state.viewport_queued(focused.clone());
@@ -858,12 +863,7 @@ mod tests {
 
     #[test]
     fn captured_hits_keep_source_identity_and_bootstrap_invalidates_old_callbacks() {
-        let mut snapshot = displayed_gallery_snapshot();
-        snapshot.order.matchingcount = 100;
-        snapshot.focusedimage = None;
-        let mut state = State::default();
-        state.rebase(Some(&snapshot), false);
-        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
+        let (mut state, snapshot) = measured_unfocused_gallery();
         let input = local_focus(&state, &snapshot).unwrap();
         let old_callback = state.gallery_hover.clone();
         state.rebase(Some(&snapshot), true);

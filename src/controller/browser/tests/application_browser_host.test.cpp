@@ -1,5 +1,6 @@
 #include "src/acceptance/tests/websocket_test_utils.hpp"
 #include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/acceptance/tests/annotation_test_utils.hpp"
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -622,8 +623,8 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
 
     auto& annotation = ready.system();
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
-    REQUIRE(ready.Wait([&] { return !annotation.snapshot().busy && annotation.snapshot().revision > edit.revision; }));
-    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.scene_revision == annotation.snapshot().ui.scene_revision; }));
+    mmltk::testsupport::await_annotation_command(annotation, ready, edit.revision);
+    mmltk::testsupport::await_annotation_render(annotation, ready);
     const auto epoch = annotation.snapshot().input_document_epoch;
     annotation.SetInputPeer(1U, {});
     const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t batch, std::uint64_t sequence) {

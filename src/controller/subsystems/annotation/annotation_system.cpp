@@ -709,6 +709,7 @@ AnnotationSnapshot AnnotationSystem::Stop() noexcept { return impl_->Stop(); }
 void AnnotationSystem::PeerClosed() noexcept { impl_->PeerClosed(); }
 void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
+// CLEANUP-IGNORE: These direct methods expose Annotation's sealed owner; Live and Upscale retain independent system ownership.
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

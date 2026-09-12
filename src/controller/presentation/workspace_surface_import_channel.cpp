@@ -49,6 +49,7 @@ namespace mmltk::controller::presentation {
 using mmltk::common::io::ScopedFd;
 
 contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surface_import::Record& record) noexcept {
+    // CLEANUP-IGNORE: Workspace diagnostic projection has no shared fields or behavior with RF-DETR model preset construction.
     return {.workspace_source_high = record.id_high,
             .workspace_source_low = record.id_low,
             .workspace_allocation = record.allocation_identity,
