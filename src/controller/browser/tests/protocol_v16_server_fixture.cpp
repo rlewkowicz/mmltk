@@ -1,6 +1,7 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_materializer.h"
+#include "src/controller/browser/tests/annotation_wire_fixture.h"
 
 #include <algorithm>
 #include <array>
@@ -68,24 +69,8 @@ int main(const int argument_count, char* const* const arguments) {
             scene.categories = {{.value = "fixture"}};
             scene.palette = {{.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F}};
             const contracts::AnnotationPoint point{1.234567F, 2.345678F};
-            contracts::AnnotationObject object{
-                .name = contracts::AnnotationText::From(std::string(contracts::kAnnotationNameCapacity, 'n')),
-                .shape = contracts::AnnotationShape::Box,
-                .box = {point, point},
-                .point = point,
-                .mask = {.runs = {{1U, 2U, 3U}}, .cleanup_radius = 17U, .present = true},
-                .sup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
-                .nosup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
-                .mask_points = std::vector<contracts::AnnotationPoint>(contracts::kAnnotationGeometryCapacity, point),
-                .spline_knots = std::vector<contracts::AnnotationSplineKnot>(
-                    contracts::kAnnotationGeometryCapacity,
-                    {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
-                .skeleton_nodes = std::vector<contracts::AnnotationSkeletonNode>(
-                    contracts::kAnnotationGeometryCapacity,
-                    {.key = contracts::AnnotationText::From(std::string(contracts::kAnnotationNameCapacity, 'k')), .point = point}),
-                .skeleton_edges =
-                    std::vector<contracts::AnnotationEdge>(contracts::kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
-            };
+            auto object = test_support::make_annotation_wire_object(point, scene.palette.front());
+            object.mask = {.runs = {{1U, 2U, 3U}}, .cleanup_radius = 17U, .present = true};
             scene.objects = {object};
             snapshot.ui.editor.selected_object = 0U;
             auto displayed = scene;

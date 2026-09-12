@@ -20,6 +20,10 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 
+namespace mmltk::frameworks::gpu {
+class ImageWorkspace;
+}
+
 namespace mmltk::controller {
 namespace detail {
 
@@ -265,6 +269,7 @@ struct VisualDiagnosticSink final {
     }
 };
 [[nodiscard]] contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation&) noexcept;
+void observe_workspace_storage(contracts::DiagnosticContext&, const mmltk::frameworks::gpu::ImageWorkspace&) noexcept;
 [[nodiscard]] services::RuntimeDiagnosticFact visual_runtime_diagnostic(VisualDiagnosticFact) noexcept;
 
 struct VisualWorkspaceDiagnostics final {

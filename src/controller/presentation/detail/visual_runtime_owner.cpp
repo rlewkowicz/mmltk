@@ -321,15 +321,8 @@ void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::stri
         progress.expected_device_incarnation = request.layout.device_incarnation;
         if (observed.workspace) {
             const auto& workspace = *observed.workspace;
-            fact.context.workspace.workspace_allocation = workspace.identity();
-            fact.context.workspace.workspace_width = workspace.layout().width;
-            fact.context.workspace.workspace_height = workspace.layout().height;
-            fact.context.workspace.workspace_pitch = workspace.layout().pitch_bytes;
-            fact.context.workspace.workspace_bytes = workspace.allocation_bytes();
-            fact.context.workspace.direct_sampling = workspace.layout().direct_sampling;
+            observe_workspace_storage(fact.context, workspace);
             progress.workspace_layout_matches = workspace.layout() == request.layout;
-            progress.workspace_admitted = workspace.admitted();
-            progress.workspace_write_available = workspace.WriteAvailable();
         }
         return fact;
     });

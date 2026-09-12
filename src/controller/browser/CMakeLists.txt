@@ -120,6 +120,9 @@ mmltk_register_ordinary_sources(
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_v16_server_fixture.cpp)
 mmltk_configure_component(
     mmltk_controller_browser_protocol_v16_fixture PRIVATE_DECLARATIONS)
+mmltk_register_private_headers(
+    mmltk_controller_browser_protocol_v16_fixture
+    tests/annotation_wire_fixture.h)
 target_link_libraries(
     mmltk_controller_browser_protocol_v16_fixture
     PRIVATE
@@ -151,6 +154,7 @@ function(mmltk_add_controller_browser_tests)
     )
     mmltk_register_private_headers(
         mmltk_controller_browser_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_wire_fixture.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_outer_routing_emitter.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_visual_projection_emitter.h
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/application_workspace_abi_emitter.h)

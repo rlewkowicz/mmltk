@@ -50,10 +50,13 @@ struct DiagnosticAllocation final {
     // CLEANUP-IGNORE: Allocation identity and the following workspace schema are independent reflected records, not a repeated
     // implementation.
     std::uint64_t allocation_generation = 0U;
+    // CLEANUP-IGNORE: Adjacent allocation and workspace schemas are not a repeated progress record.
 };
+// CLEANUP-IGNORE: Workspace storage fields differ from requested and observed admission progress.
 struct DiagnosticWorkspace final {
     // CLEANUP-IGNORE: Workspace provenance is its canonical reflected schema; ABI and acceptance inventories retain separate ownership.
     std::uint64_t workspace_source_high = 0U;
+    // CLEANUP-IGNORE: Source and allocation identities are not requested or observed product state.
     std::uint64_t workspace_source_low = 0U;
     std::uint64_t workspace_allocation = 0U;
     std::uint64_t workspace_arena_high = 0U;
@@ -71,11 +74,13 @@ struct DiagnosticWorkspace final {
     bool direct_sampling = false;
 };
 struct DiagnosticWorkspaceProgress final {
+    // CLEANUP-IGNORE: Progress observations are independent of graphics ABI fields and trace capacities.
     std::uint64_t requested_product_owner = 0U;
     std::uint64_t requested_product_revision = 0U;
     std::uint64_t observed_product_owner = 0U;
     std::uint64_t observed_product_revision = 0U;
     std::uint64_t suppressed_request_owner = 0U;
+    // CLEANUP-IGNORE: Admission state differs from the acceptance viewer's rendered-grid evidence.
     std::uint64_t admitted_allocation = 0U;
     std::uint64_t candidate_allocation = 0U;
     std::uint64_t candidate_product_owner = 0U;
@@ -124,6 +129,7 @@ struct DiagnosticPixel final {
     std::uint32_t sample_index = 0U;
     std::uint32_t sample_x = 0U;
     std::uint32_t sample_y = 0U;
+    // CLEANUP-IGNORE: Pixel color followed by the trace envelope is not workspace admission state.
     std::uint32_t sample_rgba = 0U;
     // CLEANUP-IGNORE: Closing the pixel evidence record before the trace envelope is a reflected schema boundary.
 };

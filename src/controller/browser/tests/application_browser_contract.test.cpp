@@ -4,6 +4,7 @@
 #include "src/controller/browser/application_outer_routing_emitter.h"
 #include "src/controller/browser/application_visual_projection_emitter.h"
 #include "src/controller/browser/application_event_publisher.h"
+#include "src/controller/browser/tests/annotation_wire_fixture.h"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1380,23 +1381,9 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     scene.categories.resize(c::kAnnotationCategoryCapacity, {.value = std::string(c::kArtifactClassNameCapacity, 'c')});
     scene.palette.resize(c::kAnnotationCategoryCapacity, {.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F});
     const c::AnnotationPoint point{1234.5678F, 2345.6789F};
-    c::AnnotationObject object{
-        .name = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'n')),
-        .shape = c::AnnotationShape::Box,
-        .box = {point, point},
-        .point = point,
-        .mask = {.cleanup_radius = std::numeric_limits<std::uint16_t>::max()},
-        .sup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
-        .nosup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
-        .mask_points = std::vector<c::AnnotationPoint>(c::kAnnotationGeometryCapacity, point),
-        .spline_knots = std::vector<c::AnnotationSplineKnot>(
-            c::kAnnotationGeometryCapacity,
-            {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
-        .skeleton_nodes = std::vector<c::AnnotationSkeletonNode>(
-            c::kAnnotationGeometryCapacity, {.key = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'k')), .point = point}),
-        .skeleton_edges = std::vector<c::AnnotationEdge>(c::kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
-        .category = static_cast<std::uint16_t>(c::kAnnotationCategoryCapacity - 1U),
-    };
+    auto object = browser::test_support::make_annotation_wire_object(point, scene.palette.front());
+    object.mask.cleanup_radius = std::numeric_limits<std::uint16_t>::max();
+    object.category = static_cast<std::uint16_t>(c::kAnnotationCategoryCapacity - 1U);
     scene.objects.resize(c::kAnnotationObjectCapacity, object);
     scene.objects.front().mask = {
         .runs = std::vector<c::AnnotationMaskRun>(c::kAnnotationMaskRunCapacity, {65534U, 65532U, 65534U}),

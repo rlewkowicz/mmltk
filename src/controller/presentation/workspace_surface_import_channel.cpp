@@ -302,6 +302,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         source_transitions[(next_source_transition + source_transition_count) % source_transitions.size()] = record;
         ++source_transition_count;
     }
+    // CLEANUP-IGNORE: Transport queues track protocol custody, unlike the shell's independently typed system owners.
     std::optional<WorkspaceSurfaceImportId> capacity_wake;
     std::vector<WorkspaceSurfaceRetired> retirements;
     std::vector<WorkspaceRendererPresentation> renderer_presentations;

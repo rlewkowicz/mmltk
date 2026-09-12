@@ -6738,6 +6738,21 @@ void record_source_transfer(SurfaceAudit& audit, const bool acquired = true) {
         audit.browser(browser_surface_record(browser_surface_events[stage]));
 }
 
+void record_unsettled_source_read(SurfaceAudit& audit, const bool direct, const bool dispatched) {
+    for (std::size_t stage = 0U; stage < 13U; ++stage) {
+        auto record = native_surface_record(native_surface_events[stage]);
+        record["direct_sampling"] = direct;
+        audit.native(record);
+    }
+    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) {
+        const std::string_view event{browser_surface_events[stage]};
+        if (event == "firefox.workspace.copy_completed" || (!dispatched && event == "firefox.workspace.frame_dispatched")) continue;
+        auto record = browser_surface_record(browser_surface_events[stage]);
+        record["direct_sampling"] = direct;
+        audit.browser(record);
+    }
+}
+
 void record_receiver_withdrawal(SurfaceAudit& audit) {
     for (std::size_t index = 0U; index < 6U; ++index)
         audit.browser(browser_surface_record(browser_surface_events[index]));
@@ -6794,15 +6809,7 @@ TEST_CASE("terminal reads require exact positive completion or installed custody
         record["direct_sampling"] = direct;
         audit.native(record);
     };
-    for (std::size_t stage = 0U; stage < 13U; ++stage)
-        native(native_surface_events[stage]);
-    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) {
-        const std::string_view event{browser_surface_events[stage]};
-        if (event == "firefox.workspace.copy_completed" || (fault == "dispatch" && event == "firefox.workspace.frame_dispatched")) continue;
-        auto record = browser_surface_record(browser_surface_events[stage]);
-        record["direct_sampling"] = direct;
-        audit.browser(record);
-    }
+    record_unsettled_source_read(audit, direct, fault != "dispatch");
     if (fault != "before_terminal") {
         native("shutdown.requested");
         native("shutdown.firefox_terminal");
@@ -6847,15 +6854,7 @@ TEST_CASE("terminal source retirement proves native completion whose receiver no
         if (fault == "transfer" && std::string_view{event} == "presentation.release_wait.completed") record["transfer_sequence"] = 999999U;
         audit.native(record);
     };
-    for (std::size_t stage = 0U; stage < 13U; ++stage)
-        native(native_surface_events[stage]);
-    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) {
-        const std::string_view event{browser_surface_events[stage]};
-        if (event == "firefox.workspace.copy_completed" || (fault == "dispatch" && event == "firefox.workspace.frame_dispatched")) continue;
-        auto record = browser_surface_record(browser_surface_events[stage]);
-        record["direct_sampling"] = direct;
-        audit.browser(record);
-    }
+    record_unsettled_source_read(audit, direct, fault != "dispatch");
     native("presentation.release_wait.started");
     if (fault != "release") native("presentation.release_wait.completed");
     if (fault != "shutdown") native("shutdown.requested");

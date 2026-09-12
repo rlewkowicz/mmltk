@@ -94,10 +94,8 @@ struct Record {
     std::uint64_t size = 0U;
     std::uint64_t modifier = kModifierLinear;
     std::uint32_t code = 0U;
-    // How many descriptors accompany this record. The receiving side rejects a
-    // record whose ancillary data does not carry exactly this many, which is
-    // what keeps the two independent declarations of this ABI honest about the
-    // one message that carries more than a payload.
+    // Receivers require the ancillary descriptor count to match this field
+    // and the canonical inventory for the record's opcode.
     std::uint32_t descriptors = 0U;
     // Exact generation-scoped arena publication copied into a private mailbox
     // slot. Meaningful only for Available, Presented, and Completed.

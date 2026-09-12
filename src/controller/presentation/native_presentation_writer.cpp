@@ -638,17 +638,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     progress.requested_product_owner = observed->product_owner;
                     progress.observed_product_owner = observed->product_owner;
                     progress.observed_product_revision = observed->product_revision;
-                    if (observed->workspace) {
-                        const auto& workspace = *observed->workspace;
-                        fact.context.workspace.workspace_allocation = workspace.identity();
-                        fact.context.workspace.workspace_width = workspace.layout().width;
-                        fact.context.workspace.workspace_height = workspace.layout().height;
-                        fact.context.workspace.workspace_pitch = workspace.layout().pitch_bytes;
-                        fact.context.workspace.workspace_bytes = workspace.allocation_bytes();
-                        fact.context.workspace.direct_sampling = workspace.layout().direct_sampling;
-                        progress.workspace_admitted = workspace.admitted();
-                        progress.workspace_write_available = workspace.WriteAvailable();
-                    }
+                    if (observed->workspace) { observe_workspace_storage(fact.context, *observed->workspace); }
                 }
                 return fact;
             });

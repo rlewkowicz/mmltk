@@ -1,4 +1,5 @@
 #include "src/controller/presentation/visual_diagnostics.h"
+#include "src/frameworks/gpu/image_workspace.h"
 
 #include <array>
 #include <cstddef>
@@ -8,6 +9,17 @@
 #include <string_view>
 
 namespace mmltk::controller {
+
+void observe_workspace_storage(contracts::DiagnosticContext& context, const mmltk::frameworks::gpu::ImageWorkspace& workspace) noexcept {
+    context.workspace.workspace_allocation = workspace.identity();
+    context.workspace.workspace_width = workspace.layout().width;
+    context.workspace.workspace_height = workspace.layout().height;
+    context.workspace.workspace_pitch = workspace.layout().pitch_bytes;
+    context.workspace.workspace_bytes = workspace.allocation_bytes();
+    context.workspace.direct_sampling = workspace.layout().direct_sampling;
+    context.workspace_progress.workspace_admitted = workspace.admitted();
+    context.workspace_progress.workspace_write_available = workspace.WriteAvailable();
+}
 
 contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation& observation) noexcept {
     const auto& frame = observation.frame;
