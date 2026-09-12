@@ -391,23 +391,28 @@ void VisualRuntimeOwner::ServiceWorkspace() {
     if (!candidate.workspace && observed.workspace && observed.workspace->layout() == request->layout &&
         observed.workspace->identity() == request->admitted_allocation)
         candidate = observed;
-    if (!candidate.workspace || candidate.product_owner != observed.product_owner || candidate.workspace->layout() != request->layout) {
+    if (!candidate.workspace || candidate.workspace->retired() || candidate.product_owner != observed.product_owner ||
+        candidate.workspace->layout() != request->layout) {
         if (request->admitted_allocation != 0U) {
             diagnose_workspace_service(*request, "admitted_candidate_mismatch", observed, candidate);
             return;
         }
         if (candidate.workspace) candidate.workspace->Withdraw();
         candidate = observed;
-        diagnose_workspace_service(*request, "allocation_started", observed, candidate);
+        diagnose_workspace_service(*request, "allocation_request_started", observed, candidate);
         candidate.workspace = runtime_->CreateWorkspace(request->layout, request->display_execution);
-        diagnose_workspace_service(*request, "allocation_completed", observed, candidate);
+        diagnose_workspace_service(*request, "allocation_request_completed", observed, candidate);
         {
             std::scoped_lock lock(mutex_);
             workspace_candidate_ = candidate;
         }
     }
     if (request->admitted_allocation == candidate.workspace->identity()) {
-        if (!candidate.workspace->admitted()) candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
+        if (!candidate.workspace->admitted()) {
+            diagnose_workspace_service(*request, "memory_import_started", observed, candidate);
+            candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
+            diagnose_workspace_service(*request, "memory_import_completed", observed, candidate);
+        }
         workspace_retry_.store(true, std::memory_order_release);
         diagnose_workspace_service(*request, "prepare_started", observed, candidate);
         if (!runtime_->PrepareWorkspace(observed, candidate.workspace)) {

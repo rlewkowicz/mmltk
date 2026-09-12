@@ -1348,6 +1348,10 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("pub const ABI_VERSION: u32 = " +
                          std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") !=
           std::string::npos);
+    CHECK(generated.find("pub const OPCODE_ALLOCATE: u32 = 1;") != std::string::npos);
+    CHECK(generated.find("pub const ALLOCATE_DESCRIPTOR_COUNT: usize = 3;") != std::string::npos);
+    CHECK(generated.find("pub const READY_MEMORY_DESCRIPTOR: usize = 0;") != std::string::npos);
+    CHECK(generated.find("pub const READY_TIMELINE_DESCRIPTOR: usize = 1;") != std::string::npos);
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
     CHECK(generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
                          std::to_string(static_cast<std::uint32_t>(

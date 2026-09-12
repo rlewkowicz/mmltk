@@ -20,77 +20,58 @@
 
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/exported_image_buffer.h"
+#include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 namespace mmltk::frameworks::gpu::test_support {
 
-// CLEANUP-IGNORE: This test access probe owns exported-buffer cleanup facts independently from Live receiver probes.
-struct ExportedImageBufferTestAccess final {
+// The fixture records the physical mapped-base release before external-memory
+// destruction. A failed mapping release must retain backing and context.
+struct ImportedImageBufferTestAccess final {
     static inline CUresult unmap_result = CUDA_SUCCESS;
-    static inline CUresult address_result = CUDA_SUCCESS;
     static inline CUresult allocation_result = CUDA_SUCCESS;
     static inline std::size_t unmaps = 0U;
-    static inline std::size_t address_frees = 0U;
     static inline std::size_t allocation_releases = 0U;
-
+    static inline CUdeviceptr last_freed_base = 0U;
     static void Reset() noexcept {
-        unmap_result = CUDA_SUCCESS;
-        address_result = CUDA_SUCCESS;
-        allocation_result = CUDA_SUCCESS;
-        unmaps = 0U;
-        address_frees = 0U;
-        allocation_releases = 0U;
+        unmap_result = allocation_result = CUDA_SUCCESS;
+        unmaps = allocation_releases = 0U;
+        last_freed_base = 0U;
     }
-
-    static void Adopt(ExportedImageBuffer& buffer) noexcept {
-        buffer.allocation_ = 11U;
-        buffer.address_ = 22U;
-        buffer.device_ptr_ = 22U;
-        buffer.allocation_size_ = 4096U;
-        buffer.reserved_bytes_ = 4096U;
-        buffer.pitch_bytes_ = 64U;
-        buffer.width_ = 16U;
-        buffer.height_ = 16U;
-        buffer.mapping_active_ = true;
+    static void Adopt(ImportedImageBuffer& buffer, mmltk::common::io::ScopedFd backing = {}) noexcept {
+        auto& resource = *buffer.resources_;
+        resource.backing = std::move(backing);
+        resource.memory = reinterpret_cast<CUexternalMemory>(11U);
+        resource.mapped_base = 22U;
+        resource.data = 150U;
+        resource.layout.required_allocation_bytes = 4096U;
+        resource.layout.pitch_bytes = 64U;
     }
-
-    static cudaError_t Release(ExportedImageBuffer& buffer) noexcept {
-        return buffer.Release({
-            .unmap = &Unmap,
-            .free_address = &FreeAddress,
-            .release_allocation = &ReleaseAllocation,
-        });
+    static cudaError_t Release(ImportedImageBuffer& buffer) noexcept {
+        return buffer.Release({&FreeMapping, &DestroyMemory});
     }
-
-    static void AdoptWorkspace(ExportedImageBuffer& buffer, const ImageWorkspaceLayout& layout) {
+    static void AdoptWorkspace(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout) {
         auto* storage = new std::byte[layout.required_allocation_bytes]{};
         Adopt(buffer);
-        buffer.address_ = reinterpret_cast<CUdeviceptr>(storage);
-        buffer.device_ptr_ = buffer.address_ + layout.offset_bytes;
-        buffer.allocation_size_ = layout.required_allocation_bytes;
-        buffer.reserved_bytes_ = layout.required_allocation_bytes;
-        buffer.pitch_bytes_ = layout.pitch_bytes;
-        buffer.width_ = layout.width;
-        buffer.height_ = layout.height;
+        auto& resource = *buffer.resources_;
+        resource.context.emplace(std::move(context));
+        resource.mapped_base = reinterpret_cast<CUdeviceptr>(storage);
+        resource.data = resource.mapped_base + layout.offset_bytes;
+        resource.layout = layout;
     }
-    static cudaError_t ReleaseWorkspace(ExportedImageBuffer& buffer) noexcept {
-        auto* storage = reinterpret_cast<std::byte*>(buffer.address_);
+    static cudaError_t ReleaseWorkspace(ImportedImageBuffer& buffer) noexcept {
+        auto* storage = buffer.resources_ ? reinterpret_cast<std::byte*>(buffer.resources_->mapped_base) : nullptr;
         const auto released = Release(buffer);
         if (released == cudaSuccess) delete[] storage;
         return released;
     }
-
    private:
-    static CUresult Unmap(CUdeviceptr, std::size_t) noexcept {
+    static CUresult FreeMapping(CUdeviceptr base) noexcept {
         ++unmaps;
+        last_freed_base = base;
         return unmap_result;
     }
-    static CUresult FreeAddress(CUdeviceptr, std::size_t) noexcept {
-        ++address_frees;
-        return address_result;
-    }
-    static CUresult ReleaseAllocation(CUmemGenericAllocationHandle) noexcept {
+    static CUresult DestroyMemory(CUexternalMemory) noexcept {
         ++allocation_releases;
         return allocation_result;
     }
@@ -104,7 +85,7 @@ struct ImageWorkspaceTestAccess final {
     static void Reset() noexcept {
         initialize_failure = {};
         initialized = 0U;
-        ExportedImageBufferTestAccess::Reset();
+        ImportedImageBufferTestAccess::Reset();
     }
     [[nodiscard]] static ImageWorkspaceLayout Layout(const int device = 1) noexcept {
         return {.device_incarnation = 7U,
@@ -118,12 +99,13 @@ struct ImageWorkspaceTestAccess final {
     }
 
    private:
-    static void Initialize(ExportedImageBuffer& buffer, const ImageWorkspaceLayout& layout) {
+    static void Initialize(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout,
+                           mmltk::common::io::ScopedFd, std::uint64_t) {
         ++initialized;
-        ExportedImageBufferTestAccess::AdoptWorkspace(buffer, layout);
+        ImportedImageBufferTestAccess::AdoptWorkspace(buffer, std::move(context), layout);
         if (initialize_failure) std::rethrow_exception(initialize_failure);
     }
-    static inline const ImageWorkspace::Operations operations{&Initialize, &ExportedImageBufferTestAccess::ReleaseWorkspace};
+    static inline const ImageWorkspace::Operations operations{&Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace};
 };
 
 inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {

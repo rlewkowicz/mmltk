@@ -52,14 +52,15 @@ struct WorkspaceSurfaceImportOutcome {
     WorkspaceSurfaceImportId id{};
     bool imported = false;
     workspace_surface_import::FailureCode failure = workspace_surface_import::FailureCode::Import;
-    // Meaningful only for FailureCode::Layout: the row pitch and size the
-    // browser's device requires for the same extent. The importing driver owns
-    // that number, so this is the one thing the shell ever tells the host that
-    // the host could not have computed for itself.
+    // Meaningful only for FailureCode::Layout: the row pitch and allocation size
+    // required by the browser's Vulkan device for the same extent.
     std::uint64_t required_stride = 0U;
     std::uint64_t required_size = 0U;
-    // Present exactly for a successful Ready response. CUDA consumes ownership
-    // when the timeline semaphore import succeeds.
+    // Present exactly for Ready. Producer admission retains this memory FD and
+    // gives CUDA ownership only of a duplicate after successful memory import.
+    mmltk::common::io::ScopedFd memory_descriptor;
+    // Present exactly for Ready. Presentation imports the timeline separately;
+    // CUDA consumes this descriptor when that semaphore import succeeds.
     mmltk::common::io::ScopedFd timeline_descriptor;
     workspace_surface_import::Record layout{};
 };
@@ -135,16 +136,8 @@ class WorkspaceSurfaceFrameSignal {
     detail::WorkspaceFrameSignal* mapping_ = nullptr;
 };
 
-// The host end of the import channel: an AF_UNIX socket that carries the opaque-FD source allocation
-// descriptor, frame edge, and shared frame identity over SCM_RIGHTS.
-//
-// The host drives. It admits an allocation under an identifier and hands over
-// the descriptor backing it; the shell answers imported or failed; the host
-// later withdraws the identifier. The shell treats the surface capability,
-// typed layer, and logical content identity as opaque transport data;
-// application interpretation and retirement stay in Presentation.
-//
-// This owns only the socket and its bounded ABI-correlation ledger.
+// Native endpoint for bounded Vulkan allocation requests, allocation/timeline
+// replies, and exact physical-read receipts. Domain interpretation stays native.
 class WorkspaceSurfaceImportChannel final {
    public:
     explicit WorkspaceSurfaceImportChannel(const std::filesystem::path& socket_path, VisualDiagnosticSink diagnostics = {});
@@ -167,22 +160,12 @@ class WorkspaceSurfaceImportChannel final {
     void set_expected_process_group(pid_t process_group);
     void reset_peer() noexcept;
 
-    // Admits `id` and transfers `descriptor` to the shell. Ownership of the
-    // descriptor moves; the kernel keeps the allocation alive for as long as
-    // the shell's import holds it, so the caller may release its own mapping
-    // independently.
-    //
-    // `frame_edge` is the eventfd the shell watches for the one signal the host
-    // raises per producer workspace publication. It is borrowed rather than moved,
-    // because the host keeps the signalling end. The channel takes a private
-    // duplicate while a nonblocking record is queued; SCM_RIGHTS then installs
-    // the shell's descriptor for the same open file. The eventfd is the only
-    // per-frame wakeup that crosses the boundary, and the host never reads or
-    // waits on it. `frame_signal` is the shared snapshot, read only by the shell, identifying
-    // the exact timeline copy authorized by that edge.
+    // Setup transfers duplicated native eventfd/frame/access descriptors. Firefox
+    // replies with independently owned memory and timeline descriptors after
+    // completing initial Vulkan ownership. Per-frame work uses the existing edge.
     [[nodiscard]] bool admit_arena(WorkspaceSurfaceImportId, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
                                    std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
-    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, mmltk::common::io::ScopedFd, int frame_edge,
+    [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, int frame_edge,
                                     int frame_signal, int access_signal, std::uint64_t selection_generation = 0U,
                                     std::uint64_t frame_revision = 0U);
     [[nodiscard]] bool read_settled(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,

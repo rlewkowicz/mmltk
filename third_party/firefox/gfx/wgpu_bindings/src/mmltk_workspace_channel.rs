@@ -4,9 +4,9 @@
 
 //! Semantics-free import channel between the host application and this shell.
 //!
-//! The host owns the allocation. It describes one over this socket together
-//! with the descriptor backing it and the frame edge that says when it changed,
-//! and later withdraws that description. Nothing here knows what a workspace,
+//! The host requests independent Vulkan storage and supplies its frame edge and
+//! shared physical access records. Firefox returns initialized memory and timeline
+//! descriptors, then honors exact reads and withdrawal. Nothing here knows what a workspace,
 //! workflow, generation, lease, activation, or retirement is: those are host
 //! concepts and travel on the host's own transports.
 //!
@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fmt::{self, Write};
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::{Mutex, OnceLock};
 
@@ -141,7 +141,7 @@ pub(super) fn trace_loaded_libraries() {
         write_diagnostic(|line| {
             let path = serde_json::to_string(path).map_err(|_| fmt::Error)?;
             write!(line,
-                "{{\"event\":\"firefox.workspace.loaded_library\",\"browser_process_id\":{process},\"library_path\":{path},\"library_provenance\":\"proc_self_maps_at_first_memory_import\"}}")
+                "{{\"event\":\"firefox.workspace.loaded_library\",\"browser_process_id\":{process},\"library_path\":{path},\"library_provenance\":\"proc_self_maps_at_first_memory_export\"}}")
         });
     }
     write_diagnostic(|line| {
@@ -153,9 +153,10 @@ pub(super) fn trace_loaded_libraries() {
     unsafe { *libc::__errno_location() = saved_errno };
 }
 
-/// Called only inside an enabled diagnostic formatter, before Vulkan consumes
-/// the descriptor. F_GETFD and fstat observe liveness/metadata, never GPU payload
-/// identity. No diagnostic descriptor or persistent admission state is created.
+/// Called only inside an enabled diagnostic formatter for a Firefox-exported
+/// descriptor before SCM_RIGHTS transfer. F_GETFD and fstat observe liveness and
+/// metadata, never GPU payload identity. No diagnostic descriptor or persistent
+/// admission state is created.
 pub(super) fn write_descriptor_facts(
     line: &mut String,
     descriptor: RawFd,
@@ -196,7 +197,7 @@ pub(super) fn write_descriptor_facts(
 fn trace_memory_descriptor(event: &str, record: &Record, descriptor: RawFd, socket: RawFd) {
     write_diagnostic(|line| {
         write!(line,
-            "{{\"event\":\"firefox.workspace.{event}\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"channel_descriptor\":{socket},\"workspace_descriptor\":{descriptor},\"descriptor_count\":{},\"memory_descriptor_index\":{IMPORT_MEMORY_DESCRIPTOR},\"record_bytes\":{RECORD_BYTES},\"descriptor_transport\":\"SCM_RIGHTS\"",
+            "{{\"event\":\"firefox.workspace.{event}\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"channel_descriptor\":{socket},\"workspace_descriptor\":{descriptor},\"descriptor_count\":{},\"memory_descriptor_index\":{READY_MEMORY_DESCRIPTOR},\"record_bytes\":{RECORD_BYTES},\"descriptor_transport\":\"SCM_RIGHTS\"",
             record.id_high, record.id_low, record.arena_high, record.arena_low,
             record.allocation_identity, std::process::id(), record.descriptors)?;
         write_descriptor_facts(line, descriptor, Some(socket))?;
@@ -210,7 +211,7 @@ pub(super) mod graphics_abi {
 }
 pub use graphics_abi::*;
 
-/// An `Import`'s descriptors are the most any record carries.
+/// An `Allocate`'s descriptors are the most any record carries.
 const CONTROL_BYTES: usize = 32;
 const PENDING_RECORD_CAPACITY: usize = 256;
 
@@ -254,13 +255,13 @@ impl fmt::Display for SurfaceId {
 /// How many descriptors an opcode carries.
 fn descriptor_count(opcode: u32) -> usize {
     match opcode {
-        OPCODE_IMPORT => IMPORT_DESCRIPTOR_COUNT,
+        OPCODE_ALLOCATE => ALLOCATE_DESCRIPTOR_COUNT,
         OPCODE_READY => READY_DESCRIPTOR_COUNT,
         _ => 0,
     }
 }
 
-fn valid_import_shape(record: &Record) -> bool {
+fn valid_allocation_shape(record: &Record) -> bool {
     let row_bytes = u64::from(record.width).checked_mul(4);
     let described = record.stride.checked_mul(u64::from(record.height));
     record.width != 0
@@ -274,16 +275,16 @@ fn valid_import_shape(record: &Record) -> bool {
         && record.allocation_identity != 0
         && record.device_incarnation != 0
         && record.alignment.is_power_of_two()
-        && record.size % record.alignment == 0
         && record.device_uuid.iter().any(|byte| *byte != 0)
         && record.dedicated <= 1
         && record.direct_sampling <= 1
         && record.memory_type_bits != 0
+        && record.size <= isize::MAX as u64
 }
 
 struct PendingRecord {
     record: Record,
-    descriptor: Option<OwnedFd>,
+    descriptors: [Option<OwnedFd>; READY_DESCRIPTOR_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -301,7 +302,13 @@ enum ChannelCloseObservation {
     Protocol,
 }
 
-/// An allocation the host has described but the page has not yet claimed.
+/// An initialized source allocation, retained until its complete reply is sent.
+pub struct Allocation {
+    pub layout: Record,
+    pub memory: OwnedFd,
+}
+
+/// A native capacity request awaiting the exact arena device.
 pub struct Admission {
     pub width: u32,
     pub height: u32,
@@ -309,27 +316,12 @@ pub struct Admission {
     pub size: u64,
     pub modifier: u64,
     pub layout: Record,
-    memory: Option<OwnedFd>,
     frame_edge: Option<OwnedFd>,
     frame_signal: Option<OwnedFd>,
     access_signal: Option<OwnedFd>,
 }
 
 impl Admission {
-    /// The descriptor backing this allocation, still owned here.
-    pub fn descriptor(&self) -> RawFd {
-        self.memory.as_ref().map_or(-1, AsRawFd::as_raw_fd)
-    }
-
-    /// Gives up ownership once an import has consumed the descriptor. Calling
-    /// this without a consuming import leaks it, which is why the only caller
-    /// is the success arm of that import.
-    pub fn release_descriptor(&mut self) {
-        if let Some(memory) = self.memory.take() {
-            let _ = memory.into_raw_fd();
-        }
-    }
-
     /// Takes the frame edge. The caller owns it afterwards and is the only
     /// thing that ever reads it; dropping this admission without taking it
     /// closes it, which is what an import that produced no texture wants.
@@ -603,9 +595,6 @@ impl Channel {
         }
         let admission = self.admitted.remove(&id)?;
         self.claimed.insert(id);
-        if admission.layout.opcode == OPCODE_IMPORT {
-            trace_memory_descriptor("descriptor_claimed", &admission.layout, admission.descriptor(), self.fd);
-        }
         write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
             if self.sources.contains_key(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
@@ -706,7 +695,7 @@ impl Channel {
                 self.fail();
                 return;
             }
-            if record.opcode != OPCODE_IMPORT && (record.arena_high != 0 || record.arena_low != 0
+            if record.opcode != OPCODE_ALLOCATE && (record.arena_high != 0 || record.arena_low != 0
                 || record.allocation_identity != 0 || record.device_incarnation != 0
                 || (record.offset != 0 && record.opcode != OPCODE_READ_SETTLED)
                 || record.alignment != 0 || record.device_uuid.iter().any(|byte| *byte != 0)
@@ -714,30 +703,24 @@ impl Channel {
                 self.fail(); return;
             }
             match record.opcode {
-                OPCODE_IMPORT => {
-                    if !valid_import_shape(&record) {
+                OPCODE_ALLOCATE => {
+                    if !valid_allocation_shape(&record) {
                         self.fail();
                         return;
                     }
-                    // This is the exact, framing-checked SCM_RIGHTS slot, before
-                    // the descriptor is moved into Admission's existing owner.
-                    trace_memory_descriptor("descriptor_received", &record,
-                        descriptors[IMPORT_MEMORY_DESCRIPTOR].as_raw_fd(), self.fd);
-                    let mut memory = None;
                     let mut frame_edge = None;
                     let mut frame_signal = None;
                     let mut access_signal = None;
                     for (index, descriptor) in descriptors.into_iter().enumerate() {
                         match index {
-                            IMPORT_MEMORY_DESCRIPTOR => memory = Some(descriptor),
-                            IMPORT_FRAME_EDGE_DESCRIPTOR => frame_edge = Some(descriptor),
-                            IMPORT_FRAME_SIGNAL_DESCRIPTOR => frame_signal = Some(descriptor),
-                            IMPORT_ACCESS_DESCRIPTOR => access_signal = Some(descriptor),
+                            ALLOCATE_FRAME_EDGE_DESCRIPTOR => frame_edge = Some(descriptor),
+                            ALLOCATE_FRAME_SIGNAL_DESCRIPTOR => frame_signal = Some(descriptor),
+                            ALLOCATE_ACCESS_DESCRIPTOR => access_signal = Some(descriptor),
                             _ => {}
                         }
                     }
-                    let (Some(memory), Some(frame_edge), Some(frame_signal), Some(access_signal)) =
-                        (memory, frame_edge, frame_signal, access_signal)
+                    let (Some(frame_edge), Some(frame_signal), Some(access_signal)) =
+                        (frame_edge, frame_signal, access_signal)
                     else {
                         self.fail();
                         return;
@@ -754,7 +737,6 @@ impl Channel {
                             stride: record.stride,
                             size: record.size,
                             modifier: record.modifier,
-                            memory: Some(memory),
                             frame_edge: Some(frame_edge),
                             frame_signal: Some(frame_signal),
                             access_signal: Some(access_signal),
@@ -776,7 +758,7 @@ impl Channel {
                     }
                     self.admitted.insert(id, Admission { width: record.width, height: record.height,
                         stride: 0, size: 0, modifier: MODIFIER_LINEAR, layout: record,
-                        memory: None, frame_edge: None, frame_signal: None, access_signal: None });
+                        frame_edge: None, frame_signal: None, access_signal: None });
                     write_diagnostic(|line| write!(line,
                         "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{}}}",
                         record.width, record.height));
@@ -863,13 +845,12 @@ impl Channel {
             descriptors: descriptors as u32,
             ..Record::default()
         };
-        self.pending.push_back(PendingRecord { record, descriptor });
+        self.pending.push_back(PendingRecord { record, descriptors: [descriptor, None] });
         if opcode == OPCODE_FAILED {
             write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.{}import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}",
                 if self.sources.contains_key(&id) { "source." } else { "" }));
-        } else if opcode == OPCODE_READY {
-            trace_state("ready", id, "vulkan_import_complete", self.sources.contains_key(&id));
+
         }
         self.flush();
         if !self.pending.is_empty() {
@@ -905,12 +886,7 @@ impl Channel {
             }
             return;
         }
-        if opcode == OPCODE_READY {
-            if !was_claimed || was_admitted || !self.live.insert(id) {
-                self.fail();
-                return;
-            }
-        } else if opcode != OPCODE_FAILED {
+        if opcode != OPCODE_FAILED {
             self.fail();
             return;
         }
@@ -991,10 +967,10 @@ impl Channel {
         while self.terminal == ChannelTerminal::Open {
             let source_transition = self.sources.iter().find_map(|(id, acquisition)| acquisition.as_ref().and_then(|acquisition|
                 acquisition.pending_record().map(|record| (*id, record))));
-            let (record, descriptor) = if let Some((_, record)) = source_transition {
-                (record, None)
+            let (record, descriptors) = if let Some((_, record)) = source_transition {
+                (record, [None, None])
             } else if let Some(pending) = self.pending.front() {
-                (pending.record, pending.descriptor.as_ref())
+                (pending.record, pending.descriptors.each_ref().map(|fd| fd.as_ref()))
             } else {
                 return;
             };
@@ -1006,20 +982,26 @@ impl Channel {
             let mut message: libc::msghdr = unsafe { mem::zeroed() };
             message.msg_iov = &mut payload;
             message.msg_iovlen = 1;
-            if let Some(descriptor) = descriptor {
+            let count = descriptors.iter().flatten().count();
+            if count != descriptor_count(record.opcode) { self.fail(); return; }
+            if count != 0 {
                 message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-                message.msg_controllen =
-                    unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as _) } as usize;
+                let bytes = count * mem::size_of::<RawFd>();
+                message.msg_controllen = unsafe { libc::CMSG_SPACE(bytes as _) } as usize;
                 let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-                if header.is_null() {
-                    self.fail();
-                    return;
-                }
+                if header.is_null() { self.fail(); return; }
                 unsafe {
                     (*header).cmsg_level = libc::SOL_SOCKET;
                     (*header).cmsg_type = libc::SCM_RIGHTS;
-                    (*header).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as _) as usize;
-                    (libc::CMSG_DATA(header) as *mut RawFd).write_unaligned(descriptor.as_raw_fd());
+                    (*header).cmsg_len = libc::CMSG_LEN(bytes as _) as usize;
+                    for (index, descriptor) in descriptors.iter().flatten().enumerate() {
+                        (libc::CMSG_DATA(header) as *mut RawFd).add(index).write_unaligned(descriptor.as_raw_fd());
+                    }
+                }
+            }
+            if record.opcode == OPCODE_READY {
+                if let Some(memory) = descriptors[READY_MEMORY_DESCRIPTOR] {
+                    trace_memory_descriptor("descriptor_send", &record, memory.as_raw_fd(), self.fd);
                 }
             }
             let sent = unsafe { libc::sendmsg(self.fd, &message, libc::MSG_NOSIGNAL) };
@@ -1199,15 +1181,28 @@ pub fn withdrawn_arenas() -> Vec<SurfaceId> {
             .copied().collect())).unwrap_or_default()
 }
 
-pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
-    if let Some(channel) = channel() {
-        if let Ok(mut channel) = channel.lock() {
-            channel.send_outcome(OPCODE_READY, id, 0, 0, 0, Some(timeline));
-            if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
-                channel.settled_releases.push_back(id);
-                channel.wake_dispatcher();
-            }
-        }
+pub fn send_ready(id: SurfaceId, allocation: Allocation, timeline: OwnedFd) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    if channel.terminal != ChannelTerminal::Open { return; }
+    if !channel.claimed.remove(&id) || !channel.live.insert(id)
+        || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
+    if !channel.withdrawn.contains(&id) { channel.replied.insert(id); }
+    let mut record = allocation.layout;
+    record.abi_version = ABI_VERSION;
+    record.opcode = OPCODE_READY;
+    record.descriptors = READY_DESCRIPTOR_COUNT as u32;
+    record.id_high = id.high;
+    record.id_low = id.low;
+    let mut descriptors = std::array::from_fn(|_| None);
+    descriptors[READY_MEMORY_DESCRIPTOR] = Some(allocation.memory);
+    descriptors[READY_TIMELINE_DESCRIPTOR] = Some(timeline);
+    channel.pending.push_back(PendingRecord { record, descriptors });
+    trace_state("ready", id, "vulkan_allocation_initialized", true);
+    channel.flush();
+    channel.wake_dispatcher();
+    if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
+        channel.settled_releases.push_back(id);
     }
 }
 
@@ -1447,7 +1442,7 @@ pub fn take_read_settlements() -> Vec<(SurfaceId, u64, u64, u64, u64)> {
 pub fn take_source_admission(id: SurfaceId) -> Option<Admission> {
     let mut channel = channel()?.lock().ok()?;
     let admission = channel.admitted.get(&id)?;
-    if admission.layout.opcode != OPCODE_IMPORT { return None; }
+    if admission.layout.opcode != OPCODE_ALLOCATE { return None; }
     let (width, height) = (admission.width, admission.height);
     channel.claim(id, width, height)
 }
@@ -1462,7 +1457,7 @@ pub fn send_arena_ready(id: SurfaceId, mut record: Record) {
     record.opcode = OPCODE_ARENA_READY;
     record.id_high = id.high;
     record.id_low = id.low;
-    channel.pending.push_back(PendingRecord { record, descriptor: None });
+    channel.pending.push_back(PendingRecord { record, descriptors: std::array::from_fn(|_| None) });
     channel.flush();
     channel.wake_dispatcher();
 }

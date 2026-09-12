@@ -1,13 +1,15 @@
+#include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
-#include "src/frameworks/gpu/exported_image_buffer.h"
+#include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
 #include "src/acceptance/tests/cuda_test_utils.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
@@ -1038,43 +1040,46 @@ TEST_CASE("completed stream execution failure retires once and remains reportabl
     CHECK(backend->contexts_bound >= 2U);
 }
 
-TEST_CASE("exported image release is ordered and leaves an inert wrapper") {
-    using test_support::ExportedImageBufferTestAccess;
-    ExportedImageBufferTestAccess::Reset();
-    ExportedImageBuffer buffer;
-    ExportedImageBufferTestAccess::Adopt(buffer);
+TEST_CASE("imported image release is ordered and leaves an inert wrapper") {
+    using test_support::ImportedImageBufferTestAccess;
+    ImportedImageBufferTestAccess::Reset();
+    ImportedImageBuffer buffer;
+    mmltk::common::io::ScopedFd backing(::memfd_create("import-backing", MFD_CLOEXEC));
+    const int retained = backing.get();
+    REQUIRE(retained >= 0);
+    ImportedImageBufferTestAccess::Adopt(buffer, std::move(backing));
 
-    CHECK(ExportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
-    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
-    CHECK(ExportedImageBufferTestAccess::address_frees == 1U);
-    CHECK(ExportedImageBufferTestAccess::allocation_releases == 1U);
+    CHECK(ImportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
+    CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(ImportedImageBufferTestAccess::allocation_releases == 1U);
     CHECK(buffer.empty());
     CHECK_FALSE(buffer.owns_resources());
+    CHECK(ImportedImageBufferTestAccess::last_freed_base == 22U);
+    CHECK(::fcntl(retained, F_GETFD) == -1);
+    CHECK(errno == EBADF);
 
-    CHECK(ExportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
-    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
-    CHECK(ExportedImageBufferTestAccess::address_frees == 1U);
-    CHECK(ExportedImageBufferTestAccess::allocation_releases == 1U);
+    CHECK(ImportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
+    CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(ImportedImageBufferTestAccess::allocation_releases == 1U);
 }
 
-TEST_CASE("failed exported image release remains finite and inert") {
-    using test_support::ExportedImageBufferTestAccess;
-    ExportedImageBufferTestAccess::Reset();
-    ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
-    ExportedImageBuffer buffer;
-    ExportedImageBufferTestAccess::Adopt(buffer);
+TEST_CASE("failed imported image release remains finite and inert") {
+    using test_support::ImportedImageBufferTestAccess;
+    ImportedImageBufferTestAccess::Reset();
+    ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    ImportedImageBuffer buffer;
+    ImportedImageBufferTestAccess::Adopt(buffer);
 
-    CHECK(ExportedImageBufferTestAccess::Release(buffer) == cudaErrorUnknown);
+    CHECK(ImportedImageBufferTestAccess::Release(buffer) == cudaErrorUnknown);
     CHECK(buffer.release_failure() == cudaErrorUnknown);
-    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
-    CHECK(ExportedImageBufferTestAccess::address_frees == 0U);
-    CHECK(ExportedImageBufferTestAccess::allocation_releases == 1U);
+    CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(ImportedImageBufferTestAccess::allocation_releases == 0U);
     CHECK(buffer.empty());
     CHECK_FALSE(buffer.owns_resources());
 
-    CHECK(ExportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
-    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
-    CHECK(ExportedImageBufferTestAccess::allocation_releases == 1U);
+    CHECK(ImportedImageBufferTestAccess::Release(buffer) == cudaSuccess);
+    CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(ImportedImageBufferTestAccess::allocation_releases == 0U);
 }
 
 TEST_CASE("partial layered receiver copies settle before failure releases source custody") {
@@ -1435,8 +1440,8 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
     CHECK(backend->streams_destroyed == 1U);
 }
 
-TEST_CASE("Failed workspace construction closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
-    using test_support::ExportedImageBufferTestAccess;
+TEST_CASE("Failed workspace import closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
+    using test_support::ImportedImageBufferTestAccess;
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
@@ -1444,15 +1449,16 @@ TEST_CASE("Failed workspace construction closes its runtime family only when cle
     ImageWorkspaceTestAccess::Install(*runtime);
     const auto initiating = std::make_exception_ptr(std::invalid_argument("rejected workspace initialization"));
     ImageWorkspaceTestAccess::initialize_failure = initiating;
-    ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
     std::exception_ptr failure;
     try {
-        static_cast<void>(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+        auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     } catch (...) { failure = std::current_exception(); }
     REQUIRE(failure);
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(is_image_execution_failure(failure));
-    CHECK(ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
     CHECK(backend->contexts_destroyed == 0U);
     CHECK(backend->streams_destroyed == 0U);
     ImageWorkspaceTestAccess::initialize_failure = {};
@@ -1511,16 +1517,29 @@ TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admi
     CHECK_THROWS_AS(runtime.CreateWorkspace(layout), std::invalid_argument);
     CHECK(backend->contexts_created == 1U);
     ImageWorkspaceTestAccess::initialize_failure = std::make_exception_ptr(std::invalid_argument("rejected UUID"));
-    CHECK_THROWS_AS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()), std::invalid_argument);
+    {
+        auto rejected = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        CHECK_THROWS_AS(rejected->Admit(rejected->identity(), rejected->layout().device_incarnation), std::invalid_argument);
+    }
     CHECK(backend->contexts_destroyed == 1U);
     CHECK(backend->streams_destroyed == 1U);
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
     ImageWorkspaceTestAccess::initialize_failure = {};
     auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     CHECK_THROWS_AS(workspace->Admit(workspace->identity(), 99U), std::invalid_argument);
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     workspace.reset();
     auto retry = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    mmltk::common::io::ScopedFd queued(::memfd_create("pending-backing", MFD_CLOEXEC));
+    const int descriptor = queued.get();
+    REQUIRE(descriptor >= 0);
+    REQUIRE(retry->QueueAllocation(std::move(queued)));
+    CHECK_FALSE(retry->WriteAvailable());
+    CHECK_FALSE(retry->ReserveWrite());
+    CHECK(retry->StorageFootprint().device_bytes == 0U);
+    retry->Withdraw();
+    CHECK(::fcntl(descriptor, F_GETFD) == -1);
+    CHECK(errno == EBADF);
     retry.reset();
     CHECK(runtime.Retire().safe_to_destroy);
 }
@@ -1776,7 +1795,7 @@ TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the 
     auto replacement = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
     replacement->Admit(replacement->identity(), replacement->layout().device_incarnation);
     auto not_admitted = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-    test_support::ExportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    test_support::ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
     CHECK_THROWS(runtime.ConfigureWorkspace(candidate, std::move(replacement)));
     CHECK_THROWS(not_admitted->Admit(not_admitted->identity(), not_admitted->layout().device_incarnation));
     CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
@@ -1784,7 +1803,7 @@ TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the 
     CHECK_FALSE(retirement.safe_to_destroy);
     CHECK(retirement.failure);
     CHECK(retirement.custody.valid());
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
     ImageWorkspaceTestAccess::Reset();
 }
 
@@ -1892,7 +1911,7 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
     CHECK_FALSE(settled.failure);
     CHECK_FALSE(retirement.custody.valid());
     CHECK(backend->contexts_destroyed == 1U);
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
 }
 
 TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA in the callback", "[gpu][workspace]") {
@@ -1910,13 +1929,13 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
     const auto before = notifications.load();
     completion->Complete();
     CHECK(notifications.load() == before);
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 0U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 0U);
     CHECK(fixture.backend->contexts_destroyed == 0U);
     CHECK_FALSE(retirement.custody.FinishRetirement().completion_reached);
     completion.reset();
     CHECK(notifications.load() > before);
     CHECK(retirement.custody.FinishRetirement().completion_reached);
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
 }
 
 TEST_CASE("Failed display finalization closes admission and retains complete transfer custody", "[gpu][workspace]") {
@@ -1956,7 +1975,7 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
     CHECK(backend->pinned_allocated == 2U);
     CHECK(backend->contexts_destroyed == 0U);
     CHECK(backend->streams_destroyed == 0U);
-    CHECK(test_support::ExportedImageBufferTestAccess::unmaps == 0U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 0U);
 }
 
 TEST_CASE("Workspace retirement retains cross-device transfer and raw custody through real finalization", "[gpu][workspace][copy]") {
@@ -2064,29 +2083,21 @@ TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds
     invalid = layout;
     invalid.alignment_bytes = 3U;
     CHECK_FALSE(invalid.valid());
-    ExportedImageBuffer allocation;
+    ImportedImageBuffer allocation;
     std::string error;
-    CHECK_FALSE(allocation.allocate(0, 4U, 3U, 32U, 256U, &error, std::numeric_limits<std::size_t>::max()));
+    auto backend = std::make_shared<FakeImageBackend>();
+    DeviceContext context(0, backend);
+    invalid = layout;
+    invalid.offset_bytes = std::numeric_limits<std::size_t>::max();
+    CHECK_FALSE(allocation.Import(context, {}, invalid, 1U, &error));
     CHECK_FALSE(allocation.owns_resources());
 }
 
 TEST_CASE("Late workspace admission preserves raw storage then aliases the next clean publication", "[gpu][workspace][hardware]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     REQUIRE(cuInit(0U) == CUDA_SUCCESS);
-    int supported = 0;
-    REQUIRE(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, 0) == CUDA_SUCCESS);
-    if (!supported) SKIP("CUDA opaque-FD allocation is unavailable");
-    CUuuid uuid{};
-    REQUIRE(cuDeviceGetUuid(&uuid, 0) == CUDA_SUCCESS);
-    ImageWorkspaceLayout layout{.device_incarnation = 7U,
-                                .device = 0,
-                                .width = 4U,
-                                .height = 3U,
-                                .pitch_bytes = 64U,
-                                .offset_bytes = 128U,
-                                .required_allocation_bytes = 4096U,
-                                .alignment_bytes = 256U};
-    std::memcpy(layout.device_uuid.data(), uuid.bytes, layout.device_uuid.size());
+    auto allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(0, 4U, 3U);
+    auto layout = allocation->layout();
     std::size_t finalizations = 0U;
     bool fail_finalization = false;
     SystemImageRuntimeConfig config{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop};
@@ -2116,22 +2127,40 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     const auto raw = runtime.Borrow().plane(0U).plane().data;
     auto workspace = runtime.CreateWorkspace(layout);
     CHECK_THROWS(workspace->Admit(workspace->identity(), 8U));
-    workspace->Admit(workspace->identity(), layout.device_incarnation);
-    auto descriptor = workspace->ExportDescriptor();
+    auto descriptor = allocation->Export();
     REQUIRE(descriptor.get() >= 0);
     mmltk::common::io::ScopedFd transferred(descriptor.release());
     CHECK(descriptor.get() == -1);
+    REQUIRE(workspace->QueueAllocation(std::move(transferred)));
+    workspace->Admit(workspace->identity(), layout.device_incarnation);
+    allocation.reset(); // Native backing remains valid after all Vulkan owners retire.
+    const auto check_pixels = [](ImagePlaneView plane) {
+        std::vector<std::byte> pixels(plane.descriptor.row_bytes() * plane.descriptor.height);
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = plane.data;
+        copy.srcPitch = plane.descriptor.pitch_bytes;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = pixels.data();
+        copy.dstPitch = plane.descriptor.row_bytes();
+        copy.WidthInBytes = plane.descriptor.row_bytes();
+        copy.Height = plane.descriptor.height;
+        REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
+        CHECK(std::ranges::all_of(pixels, [](auto byte) { return byte == std::byte{37U}; }));
+    };
     REQUIRE(runtime.PrepareWorkspace(completed, workspace));
     CHECK(runtime.Borrow().plane(0U).plane().data == raw);
     CHECK(runtime.BorrowWorkspace().plane().data != raw);
     CHECK(finalizations == 1U);
+    check_pixels(runtime.BorrowWorkspace().plane());
     completed = {};
     runtime.Publish(4U, 3U, fill);
     CHECK(runtime.Borrow().plane(0U).plane().data == runtime.BorrowWorkspace().plane().data);
     CHECK(finalizations == 1U);
+    check_pixels(runtime.Borrow().plane(0U).plane());
     auto borrowed = runtime.BorrowWorkspace();
     REQUIRE(borrowed.valid());
-    CHECK(borrowed.layout().offset_bytes == 128U);
+    CHECK(borrowed.layout().offset_bytes == layout.offset_bytes);
     auto completion = std::move(borrowed).TakeCompletion();
     SystemImageRuntime::CompletedOutput baseline;
     CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
@@ -2143,12 +2172,17 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK_FALSE(runtime.BorrowWorkspace().valid());
     const auto grown_raw = runtime.Borrow().plane(0U).plane().data;
     const auto grown_revision = runtime.OutputFacts().revision;
-    layout.width = 8U;
+    allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(0, 8U, 3U);
+    layout = allocation->layout();
     auto wrong_device = layout;
     wrong_device.device_uuid[0U] ^= 1U;
-    CHECK_THROWS(runtime.CreateWorkspace(wrong_device));
+    auto rejected = runtime.CreateWorkspace(wrong_device);
+    REQUIRE(rejected->QueueAllocation(allocation->Export()));
+    CHECK_THROWS(rejected->Admit(rejected->identity(), wrong_device.device_incarnation));
+    rejected.reset();
     auto replacement = runtime.CreateWorkspace(layout);
     CHECK(replacement->identity() != workspace->identity());
+    REQUIRE(replacement->QueueAllocation(allocation->Export()));
     replacement->Admit(replacement->identity(), layout.device_incarnation);
     fail_finalization = true;
     CHECK_THROWS(runtime.PrepareWorkspace(runtime.Completed(), replacement));
@@ -2161,12 +2195,10 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     CHECK(finalizations == 3U);
     if (mmltk::testsupport::checked_cuda_device_count() > 1) {
-        auto remote_layout = layout;
-        remote_layout.device = 1;
-        remote_layout.device_incarnation = 8U;
-        REQUIRE(cuDeviceGetUuid(&uuid, 1) == CUDA_SUCCESS);
-        std::memcpy(remote_layout.device_uuid.data(), uuid.bytes, remote_layout.device_uuid.size());
+        test_support::VulkanWorkspaceFixture remote_allocation(1, 8U, 3U);
+        const auto remote_layout = remote_allocation.layout();
         auto remote = runtime.CreateWorkspace(remote_layout);
+        REQUIRE(remote->QueueAllocation(remote_allocation.Export()));
         remote->Admit(remote->identity(), remote_layout.device_incarnation);
         REQUIRE(runtime.PrepareWorkspace(runtime.Completed(), remote));
         CHECK(runtime.BorrowWorkspace().layout().device == 1);

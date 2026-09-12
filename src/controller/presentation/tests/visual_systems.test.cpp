@@ -4929,6 +4929,7 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
                                      }};
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
         return detail::VisualRuntimeOwner::Notification{
             [&, workspace = std::move(workspace)]() mutable { created_workspace.set_value(std::move(workspace)); }};
@@ -4987,6 +4988,7 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
         [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
     REQUIRE(owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
         return detail::VisualRuntimeOwner::Notification{
             [&, workspace = std::move(workspace)]() mutable { created.set_value(std::move(workspace)); }};
     }));
@@ -4995,7 +4997,7 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
     CHECK(backend->contexts_destroyed == 1U);
     workspace.reset();
     CHECK(backend->contexts_destroyed == 2U);
-    CHECK(mmltk::frameworks::gpu::test_support::ExportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(mmltk::frameworks::gpu::test_support::ImportedImageBufferTestAccess::unmaps == 1U);
 }
 
 TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
@@ -7010,7 +7012,6 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
         REQUIRE(queued_fillers > 0U);
         REQUIRE(queued_fillers < 256U);
     }
-    auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
     auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     const presentation::WorkspaceSurfaceImportId id{11U, 12U};
@@ -7020,7 +7021,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
                        .height = 32U,
                        .stride = 512U,
                        .size = 32768U,
-                       .descriptors = abi::kImportDescriptorCount,
+                       .descriptors = abi::kAllocateDescriptorCount,
                        .arena_high = 1U,
                        .arena_low = 2U,
                        .allocation_identity = 3U,
@@ -7030,7 +7031,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
                        .device_uuid = {1U},
                        .memory_type_bits = 1U};
     const auto admitted = record;
-    REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), edge.get(), 19U, 23U));
+    REQUIRE(channel.admit_source(record, 7U, edge.get(), signal.descriptor(), edge.get(), 19U, 23U));
     CHECK(channel.claimable(id) == !deferred);
     CHECK(channel.wants_write() == deferred);
     REQUIRE(capture.count == (capture.enabled ? (deferred ? 1U : 2U) : 0U));
@@ -7050,11 +7051,11 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
     CHECK_FALSE(channel.terminal_error());
     abi::Record sent{};
     const auto descriptors = receive_workspace_record(peer.get(), sent);
-    REQUIRE(descriptors.descriptor_count == abi::kImportDescriptorCount);
+    REQUIRE(descriptors.descriptor_count == abi::kAllocateDescriptorCount);
     for (std::size_t index = 0U; index < descriptors.descriptor_count; ++index)
         CHECK(::fcntl(descriptors.descriptors[index].get(), F_GETFD) >= 0);
     CHECK(abi::valid(sent));
-    // Record is the canonical ABI11 wire layout.
+    // Record is the canonical allocation-request wire layout.
     CHECK(std::memcmp(&sent, &admitted, sizeof(sent)) == 0);
     REQUIRE(capture.count == (capture.enabled ? 2U : 0U));
     if (!capture.enabled) return;
@@ -7155,19 +7156,15 @@ class WorkspaceChannelFixture final {
         imported.arena_high = arena.high;
         imported.arena_low = arena.low;
         imported.allocation_identity = 6U;
-        REQUIRE(channel.admit_source(imported, generation, std::move(memory), edge.get(), signal.descriptor(), edge.get()));
+        REQUIRE(channel.admit_source(imported, generation, edge.get(), signal.descriptor(), edge.get()));
         Record received{};
         CHECK(mmltk::testsupport::receive_workspace_record(peer.get(), received).descriptor_count ==
-              presentation::detail::workspace_surface_import::kImportDescriptorCount);
+              presentation::detail::workspace_surface_import::kAllocateDescriptorCount);
         auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
-        const std::array descriptors{timeline.get()};
-        REQUIRE(mmltk::testsupport::send_workspace_record(
-            peer.get(),
-            {.opcode = Opcode::Ready,
-             .id_high = id.high,
-             .id_low = id.low,
-             .descriptors = presentation::detail::workspace_surface_import::kReadyDescriptorCount},
-            descriptors));
+        const std::array descriptors{memory.get(), timeline.get()};
+        received.opcode = Opcode::Ready;
+        received.descriptors = presentation::detail::workspace_surface_import::kReadyDescriptorCount;
+        REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), received, descriptors));
         channel.pump();
         const auto outcome = channel.take_outcome();
         REQUIRE(outcome.has_value());
@@ -7594,7 +7591,8 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
     auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
     auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
     auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
-    const std::array descriptors{timeline.get()};
+    auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
+    const std::array descriptors{memory.get(), timeline.get()};
     for (std::uint64_t iteration = 1U; iteration <= 300U; ++iteration) {
         for (const bool source : {false, true}) {
             for (const bool ready : {false, true}) {
@@ -7604,7 +7602,7 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                     layout.arena_high = iteration;
                     layout.arena_low = 9U;
                     layout.allocation_identity = iteration;
-                    REQUIRE(channel.admit_source(layout, iteration, mmltk::testsupport::workspace_surface_event_descriptor(), edge.get(),
+                    REQUIRE(channel.admit_source(layout, iteration, edge.get(),
                                                  signal.descriptor(), edge.get()));
                 } else {
                     REQUIRE(channel.admit_arena(id, iteration, 4U, 3U));
@@ -7613,10 +7611,9 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                 static_cast<void>(receive_workspace_record(peer.get(), received));
                 if (ready) {
                     if (source) {
-                        REQUIRE(send_workspace_record(
-                            peer.get(),
-                            {.opcode = abi::Opcode::Ready, .id_high = id.high, .id_low = id.low, .descriptors = abi::kReadyDescriptorCount},
-                            descriptors));
+                        received.opcode = abi::Opcode::Ready;
+                        received.descriptors = abi::kReadyDescriptorCount;
+                        REQUIRE(send_workspace_record(peer.get(), received, descriptors));
                     } else {
                         REQUIRE(send_workspace_record(peer.get(), layout));
                     }

@@ -57,13 +57,14 @@ bindings project native facts; mutation remains with the owning system.
 | Navigation, drafts, modal visibility, scroll, selection, and typed event reduction | Rust presentation model and the component owning each UI fact |
 | Widgets, view transforms, styling, rendering, and retained redraw images | Owning Rust/Iced components |
 | Firefox process lifetime and Linux process registrations | `FirefoxProcessOwner` |
-| Native texture import, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
+| Vulkan source images, independent backing allocations, views, external timelines, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
 
 Each domain system also owns its private workers, GPU resources, models,
-reusable staging, and final shareable display workspaces. Producers finalize
-display pixels in their own execution boundary. Presentation coordinates their
-admission and publishes those workspaces directly; image storage and
-finalization remain with each producer.
+reusable staging, and final display workspace demand and reuse. Producers finalize
+display pixels in their own execution boundary. Firefox allocates each physical
+Vulkan workspace and exports its independent memory and timeline resources.
+Presentation coordinates admission; native CUDA imports retain backing and
+context custody through all native writes and raw readers.
 
 Annotation owns an independent input executor and its sole mutable document,
 editing history, and gesture reduction. Its renderer receives bounded immutable
@@ -144,7 +145,7 @@ updates.
 Independent producers: raw products + final shared display workspaces
                       │ completed workspace and exact model facts
                       ▼
-PresentationSystem: layout/import coordination + completed offers
+PresentationSystem: allocation/import coordination + completed offers
                       │ nonblocking exact read acquisition
                       ▼
 Firefox: directly sampled source, or capability-selected single copy
@@ -162,9 +163,12 @@ remain independent of display preparation.
 
 Layout negotiation belongs to the exact browser device incarnation and physical
 capacity. Firefox validates external-image support, UUID, memory requirements,
-pitch, offset, and ownership. The producer creates its exportable allocation
-from those immutable facts. Firefox completes initial source ownership before
-the producer fills the final workspace. Late admission uses retained raw data
+pitch, offset, and ownership. Firefox creates and binds each independent Vulkan
+allocation and completes initial external ownership before exporting memory and
+timeline descriptors. Native CUDA imports the full allocation on the producer
+execution owner and exposes its pitched image view. It retains its CUDA context
+and an independent backing descriptor through every native alias, including
+browser replacement and process exit. The producer then fills the final workspace. Late admission uses retained raw data
 without rerunning inference, reapplying edits, or requiring another camera frame.
 Logical completion and ordered input consumption never wait for the browser.
 
@@ -181,7 +185,7 @@ older real product revision under a newer domain observation.
 Each selected producer has reusable current and overflow capacity. Promotion
 exchanges roles without copying pixels. Raw consumers and externally acquired
 readers independently prevent reuse; unacquired overflow remains replaceable.
-Firefox directly samples exported storage when the actual requesting device
+Firefox directly samples its shared source storage when the actual requesting device
 supports the exact linear image, sampled usage, external handle, and legal image
 layout. Otherwise, it uses one copy into a reusable two-slot sample arena.
 Direct mode allocates no sample arena and performs no presentation copy.
@@ -239,8 +243,8 @@ Stop browser ingress → request system stops → return from browser loop
 ```
 
 The shell initiates shutdown; systems finish their own work and reverse-order
-RAII releases physical resources. Firefox's imported allocations outlive its
-use of them. Failures leave resources safe to destroy and shutdown outcomes
+RAII releases physical resources. Vulkan images and native CUDA imports each
+retain physical backing through their own completed uses. Failures leave resources safe to destroy and shutdown outcomes
 observable.
 
 ## Performance and observability

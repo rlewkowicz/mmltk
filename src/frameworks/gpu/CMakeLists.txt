@@ -17,7 +17,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         image_product_pool.h
         image_types.h
         image_workspace.h
-        exported_image_buffer.h
+        imported_image_buffer.h
         external_graphics_timeline.h
         system_image_worker.h
         system_image_runtime.h
@@ -40,7 +40,7 @@ mmltk_register_ordinary_sources(
     pinned_host_buffer.cpp
     gdr_mapped_buffer.cpp
     detail/gdr_buffer_backend.cpp
-    exported_image_buffer.cpp
+    imported_image_buffer.cpp
     external_graphics_timeline.cpp
     image_buffer.cpp
     image_workspace.cpp
@@ -83,15 +83,18 @@ target_link_libraries(
     mmltk::frameworks::gpu)
 
 function(mmltk_add_frameworks_gpu_tests)
+    find_package(Vulkan REQUIRED)
     add_executable(mmltk_frameworks_gpu_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_frameworks_gpu_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_buffer.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/vulkan_workspace_fixture.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/device_execution.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/pinned_host_buffer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/gdr_mapped_buffer.test.cpp)
     mmltk_register_private_headers(mmltk_frameworks_gpu_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/device_execution_fixture.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/device_execution_fixture.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/vulkan_workspace_fixture.h)
     mmltk_configure_component(
         mmltk_frameworks_gpu_tests PRIVATE_DECLARATIONS)
     target_link_libraries(
@@ -99,7 +102,8 @@ function(mmltk_add_frameworks_gpu_tests)
         mmltk_acceptance_support
         mmltk::frameworks::gpu
         mmltk_frameworks_gpu_test_support
-        CUDA::cuda_driver)
+        CUDA::cuda_driver
+        Vulkan::Vulkan)
     catch_discover_tests(
         mmltk_frameworks_gpu_tests
         TEST_PREFIX "frameworks::gpu::"

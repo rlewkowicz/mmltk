@@ -71,71 +71,44 @@ using workspace_surface_import::FailureCode;
 using workspace_surface_import::Opcode;
 using workspace_surface_import::Record;
 
-// Import's DMA-BUF, frame edge, and frame-identity descriptors fit the shell's
+// Allocation request eventfd, frame, and access descriptors fit the shell's
 // frozen control-message budget.
 constexpr std::size_t kControlBytes = 32U;
-static_assert(CMSG_SPACE(sizeof(int) * workspace_surface_import::kImportDescriptorCount) <= kControlBytes);
+static_assert(CMSG_SPACE(sizeof(int) * workspace_surface_import::kAllocateDescriptorCount) <= kControlBytes);
 
-// These records use the existing native stderr capture, as do the CUDA export
+// These records use the existing native stderr capture, as do the CUDA import
 // records. Observe descriptors only while their existing owners retain them.
 // No diagnostic descriptor, protocol field, or lifetime extension is needed.
-void trace_memory_descriptor(const char* event, const Record& record, const int peer, const int descriptor,
-                             const int export_descriptor = -1, const ssize_t sent = 0, const int send_errno = 0) noexcept {
-    if (record.opcode != Opcode::Import) return;
+void trace_memory_descriptor(const char* event, const Record& record, int peer, int descriptor) noexcept {
     const auto* trace = std::getenv("MMLTK_GUI_TRACE_FILE");
     if (!trace || !*trace) return;
     const int saved_errno = errno;
     ucred credentials{};
-    socklen_t credentials_length = sizeof(credentials);
-    const int peer_status = ::getsockopt(peer, SOL_SOCKET, SO_PEERCRED, &credentials, &credentials_length);
-    const int peer_errno = peer_status == 0 ? 0 : errno;
-    const bool peer_known = peer_status == 0 && credentials_length == sizeof(credentials);
-    const int flags = ::fcntl(descriptor, F_GETFD);
-    const int flags_errno = flags < 0 ? errno : 0;
+    socklen_t length = sizeof(credentials);
+    const int peer_status = ::getsockopt(peer, SOL_SOCKET, SO_PEERCRED, &credentials, &length);
+    const bool peer_known = peer_status == 0 && length == sizeof(credentials);
     struct stat metadata{};
     const int stat_status = ::fstat(descriptor, &metadata);
     const int stat_errno = stat_status == 0 ? 0 : errno;
-    // Linux UAPI F_LINUX_SPECIFIC_BASE + 3. The Ubuntu build headers may
-    // predate F_DUPFD_QUERY. It is a read-only struct-file comparison: 1
-    // means the same open file description, 0 means different, EINVAL means
-    // this kernel does not implement the command. Never substitute fstat.
-    constexpr int kDuplicateQuery = 1027;
-    const int ofd_result = export_descriptor >= 0 && descriptor >= 0
-                               ? ::fcntl(export_descriptor, kDuplicateQuery, descriptor)
-                               : -1;
-    const int ofd_errno = export_descriptor >= 0 && descriptor >= 0 && ofd_result < 0 ? errno : 0;
-    const char* ofd_status = export_descriptor < 0 || descriptor < 0 ? "not_requested"
-                             : ofd_result == 1 ? "same"
-                             : ofd_result == 0 ? "different"
-                             : ofd_errno == EINVAL || ofd_errno == ENOSYS || ofd_errno == EOPNOTSUPP ? "unsupported"
-                             : ofd_errno == EPERM || ofd_errno == EACCES ? "denied"
-                             : ofd_errno == EBADF ? "invalid_descriptor"
-                             : "unavailable";
-    char output[2048];
-    const int length = std::snprintf(
-        output, sizeof(output),
+    char output[1536];
+    const int bytes = std::snprintf(output, sizeof(output),
         "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
         "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
-        "\"peer_credentials_status\":%d,\"peer_credentials_errno\":%d,\"peer_credentials_known\":%s,"
-        "\"channel_descriptor\":%d,\"workspace_descriptor\":%d,\"export_descriptor\":%d,"
+        "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
         "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
-        "\"record_bytes\":%zu,\"send_bytes\":%lld,\"send_errno\":%d,\"fd_dup_errno\":%d,"
-        "\"fd_getfd_result\":%d,\"fd_getfd_errno\":%d,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
+        "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
         "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
-        "\"fd_ofd_query\":\"F_DUPFD_QUERY\",\"fd_ofd_result\":%d,\"fd_ofd_errno\":%d,\"fd_ofd_status\":\"%s\","
-        "\"fd_identity_scope\":\"ofd_comparison_only_at_duplication_metadata_elsewhere\"}\n",
+        "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
         event, static_cast<unsigned long long>(record.id_high), static_cast<unsigned long long>(record.id_low),
         static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
         static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()),
-        peer_known ? static_cast<long>(credentials.pid) : 0L, peer_status, peer_errno, peer_known ? "true" : "false", peer,
-        descriptor, export_descriptor, record.descriptors, workspace_surface_import::kImportMemoryDescriptor, sizeof(record),
-        static_cast<long long>(sent), export_descriptor < 0 ? send_errno : 0, export_descriptor >= 0 ? send_errno : 0,
-        flags, flags_errno, stat_status, stat_errno,
+        peer_known ? static_cast<long>(credentials.pid) : 0L, peer_known ? "true" : "false", peer, descriptor,
+        record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, sizeof(record), stat_status, stat_errno,
         static_cast<unsigned long long>(metadata.st_dev), static_cast<unsigned long long>(metadata.st_ino),
         static_cast<unsigned long long>(metadata.st_rdev), static_cast<unsigned int>(metadata.st_mode),
-        static_cast<long long>(metadata.st_size), ofd_result, ofd_errno, ofd_status);
-    if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))
-        mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(length)});
+        static_cast<long long>(metadata.st_size));
+    if (bytes > 0 && static_cast<std::size_t>(bytes) < sizeof(output))
+        mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(bytes)});
     errno = saved_errno;
 }
 
@@ -245,6 +218,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         ClosedObserved,
     };
     struct Admission {
+        Record request{};
         std::uint64_t generation = 0U;
         std::uint64_t selection_generation = 0U;
         std::uint64_t frame_revision = 0U;
@@ -258,7 +232,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
 
     struct PendingRecord {
         Record record{};
-        std::array<ScopedFd, workspace_surface_import::kImportDescriptorCount> descriptors{};
+        std::array<ScopedFd, workspace_surface_import::kAllocateDescriptorCount> descriptors{};
         std::size_t descriptor_count = 0U;
     };
 
@@ -368,7 +342,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
             return false;
         }
         seen.push_back(id);
-        admitted.emplace_back(id, Admission{.generation = generation,
+        admitted.emplace_back(id, Admission{.request = record,
+                                            .generation = generation,
                                             .selection_generation = selection_generation,
                                             .frame_revision = frame_revision,
                                             .width = record.width,
@@ -392,14 +367,10 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 duplicate = ::fcntl(descriptors[index], F_DUPFD_CLOEXEC, 0);
             } while (duplicate < 0 && errno == EINTR);
             if (duplicate < 0) {
-                if (index == workspace_surface_import::kImportMemoryDescriptor)
-                    trace_memory_descriptor("descriptor_duplicate_failed", record, peer.get(), duplicate, descriptors[index], 0, errno);
                 fail("workspace import descriptor duplication failed");
                 return false;
             }
             outbound.descriptors[index] = ScopedFd{duplicate};
-            if (index == workspace_surface_import::kImportMemoryDescriptor)
-                trace_memory_descriptor("descriptor_duplicated", record, peer.get(), duplicate, descriptors[index]);
         }
         pending.push_back(std::move(outbound));
         flush();
@@ -435,7 +406,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         while (peer.get() >= 0 && !pending.empty()) {
             PendingRecord& outbound = pending.front();
             iovec buffer{.iov_base = &outbound.record, .iov_len = sizeof(outbound.record)};
-            std::array<int, workspace_surface_import::kImportDescriptorCount> descriptor_values{};
+            std::array<int, workspace_surface_import::kAllocateDescriptorCount> descriptor_values{};
             for (std::size_t index = 0U; index < outbound.descriptor_count; ++index) {
                 descriptor_values[index] = outbound.descriptors[index].get();
             }
@@ -460,10 +431,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
             const ssize_t sent = ::sendmsg(peer.get(), &message, MSG_NOSIGNAL);
             if (sent < 0 && errno == EINTR) { continue; }
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return; }
-            trace_memory_descriptor(sent == static_cast<ssize_t>(sizeof(outbound.record))
-                                        ? "descriptor_sent" : "descriptor_send_failed",
-                                    outbound.record, peer.get(), descriptor_values[workspace_surface_import::kImportMemoryDescriptor],
-                                    -1, sent, sent < 0 ? errno : 0);
             if (sent < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN || errno == ESHUTDOWN || errno == ECONNABORTED)) {
                 lose_peer();
                 return;
@@ -472,7 +439,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 fail("workspace import channel write failed");
                 return;
             }
-            if (outbound.record.opcode == Opcode::Import || outbound.record.opcode == Opcode::Arena) {
+            if (outbound.record.opcode == Opcode::Allocate || outbound.record.opcode == Opcode::Arena) {
                 const WorkspaceSurfaceImportId id{
                     .high = outbound.record.id_high,
                     .low = outbound.record.id_low,
@@ -525,7 +492,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 lose_peer();
                 return;
             }
-            std::array<ScopedFd, workspace_surface_import::kImportDescriptorCount> descriptors{};
+            std::array<ScopedFd, workspace_surface_import::kAllocateDescriptorCount> descriptors{};
             std::size_t descriptor_count = 0U;
             bool ancillary_valid = true;
             for (cmsghdr* header = CMSG_FIRSTHDR(&message); header != nullptr; header = CMSG_NXTHDR(&message, header)) {
@@ -653,6 +620,15 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 fail("workspace import channel received an outcome for the wrong capability role");
                 return;
             }
+            if (record.opcode == Opcode::Ready) {
+                auto expected = admission->second.request;
+                expected.opcode = Opcode::Ready;
+                expected.descriptors = workspace_surface_import::kReadyDescriptorCount;
+                if (record != expected) {
+                    fail("workspace allocation reply changed its immutable request layout");
+                    return;
+                }
+            }
             if (record.opcode == Opcode::Failed && static_cast<FailureCode>(record.code) == FailureCode::Layout) {
                 const std::uint64_t row_bytes = static_cast<std::uint64_t>(admission->second.width) * 4U;
                 constexpr std::uint64_t kMaximumObjectBytes = static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max());
@@ -697,6 +673,9 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().id = id;
                     outcomes.back().imported = true;
                     outcomes.back().layout = record;
+                    if (record.opcode == Opcode::Ready)
+                        trace_memory_descriptor("descriptor_received", record, peer.get(), descriptors[workspace_surface_import::kReadyMemoryDescriptor].get());
+                    outcomes.back().memory_descriptor = std::move(descriptors[workspace_surface_import::kReadyMemoryDescriptor]);
                     outcomes.back().timeline_descriptor = std::move(descriptors[workspace_surface_import::kReadyTimelineDescriptor]);
                     break;
                 case Opcode::Failed:
@@ -714,7 +693,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 case Opcode::Acquired:
                 case Opcode::ReleaseSubmitted:
                 case Opcode::ReadSettled:
-                case Opcode::Import:
+                case Opcode::Allocate:
                 case Opcode::Drop:
                 case Opcode::Available:
                 case Opcode::Presented:
@@ -798,12 +777,12 @@ bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId i
            impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low, .width = width, .height = height}, generation,
                         {}, selection_generation, frame_revision);
 }
-bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, ScopedFd descriptor, const int frame_edge,
+bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, const int frame_edge,
                                                  const int frame_signal, const int access_signal, const std::uint64_t selection_generation,
                                                  const std::uint64_t frame_revision) {
-    if (!connected() || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0 || access_signal < 0) return false;
-    record.opcode = Opcode::Import;
-    const std::array descriptors{descriptor.get(), frame_edge, frame_signal, access_signal};
+    if (!connected() || frame_edge < 0 || frame_signal < 0 || access_signal < 0) return false;
+    record.opcode = Opcode::Allocate;
+    const std::array descriptors{frame_edge, frame_signal, access_signal};
     return impl_->admit(record, generation, descriptors, selection_generation, frame_revision);
 }
 bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,

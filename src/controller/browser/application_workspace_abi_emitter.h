@@ -27,11 +27,11 @@ class ApplicationWorkspaceAbiEmitter final {
         output_ << "// Generated from native graphics declarations. Do not edit.\n";
         Constant("ABI_VERSION", "u32", abi::kAbiVersion);
         Constant("MODIFIER_LINEAR", "u64", abi::kModifierLinear);
-        Constant("IMPORT_MEMORY_DESCRIPTOR", "usize", abi::kImportMemoryDescriptor);
-        Constant("IMPORT_FRAME_EDGE_DESCRIPTOR", "usize", abi::kImportFrameEdgeDescriptor);
-        Constant("IMPORT_FRAME_SIGNAL_DESCRIPTOR", "usize", abi::kImportFrameSignalDescriptor);
-        Constant("IMPORT_ACCESS_DESCRIPTOR", "usize", abi::kImportAccessDescriptor);
-        Constant("IMPORT_DESCRIPTOR_COUNT", "usize", abi::kImportDescriptorCount);
+        Constant("READY_MEMORY_DESCRIPTOR", "usize", abi::kReadyMemoryDescriptor);
+        Constant("ALLOCATE_FRAME_EDGE_DESCRIPTOR", "usize", abi::kAllocateFrameEdgeDescriptor);
+        Constant("ALLOCATE_FRAME_SIGNAL_DESCRIPTOR", "usize", abi::kAllocateFrameSignalDescriptor);
+        Constant("ALLOCATE_ACCESS_DESCRIPTOR", "usize", abi::kAllocateAccessDescriptor);
+        Constant("ALLOCATE_DESCRIPTOR_COUNT", "usize", abi::kAllocateDescriptorCount);
         Constant("READY_TIMELINE_DESCRIPTOR", "usize", abi::kReadyTimelineDescriptor);
         Constant("READY_DESCRIPTOR_COUNT", "usize", abi::kReadyDescriptorCount);
         Enum<abi::Opcode>("OPCODE_");

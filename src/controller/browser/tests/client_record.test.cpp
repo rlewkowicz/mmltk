@@ -665,7 +665,7 @@ TEST_CASE("Native graphics records reject unknown raw opcodes and malformed desc
                        .height = 3U,
                        .stride = 32U,
                        .size = 96U,
-                       .descriptors = abi::kImportDescriptorCount,
+                       .descriptors = abi::kAllocateDescriptorCount,
                        .arena_high = 2U,
                        .allocation_identity = 3U,
                        .device_incarnation = 4U,
@@ -675,10 +675,10 @@ TEST_CASE("Native graphics records reject unknown raw opcodes and malformed desc
     REQUIRE(abi::valid(record));
     record.opcode = static_cast<abi::Opcode>(0xffff'ffffU);
     CHECK_FALSE(abi::valid(record));
-    record.opcode = abi::Opcode::Import;
+    record.opcode = abi::Opcode::Allocate;
     --record.descriptors;
     CHECK_FALSE(abi::valid(record));
-    record.descriptors = abi::kImportDescriptorCount;
+    record.descriptors = abi::kAllocateDescriptorCount;
     record.size = 95U;
     CHECK_FALSE(abi::valid(record));
     auto packet = abi::layout_packet();

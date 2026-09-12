@@ -132,7 +132,7 @@ pub struct Global {
     global: Arc<wgc::global::Global>,
     device_poll_workers: DevicePollWorkers,
     swap_chain_configs: Mutex<HashMap<SwapChainId, SwapChainConfig>>,
-    /// One registration per imported allocation, keyed by the private texture
+    /// One registration per browser sample texture, keyed by the private texture
     /// the page samples. One dispatcher owns every frame edge and raw blit.
     mmltk_workspace_mirrors: Mutex<HashMap<id::TextureId, MmltkWorkspaceMirror>>,
     mmltk_workspace_dispatcher: MmltkWorkspaceDispatcher,
@@ -618,9 +618,9 @@ unsafe fn adapter_request_device(
         }
     }
 
-    // The reserved-label import path binds a host-owned allocation to a sampled
-    // texture, which needs the external-memory descriptor feature whenever the
-    // adapter offers it.
+    // The reserved-label import path exposes Firefox-owned workspace storage as
+    // a sampled texture. Source backing is exported to native CUDA, which needs
+    // the external-memory descriptor feature whenever the adapter offers it.
     if global
         .adapter_features(self_id)
         .contains(wgt::Features::VULKAN_EXTERNAL_MEMORY_FD)
@@ -1800,8 +1800,8 @@ impl Drop for MmltkWorkspaceImage {
     }
 }
 
-// Opt-in facts of the exact import. A buffer alias cannot provide defined
-// content after this image's external ownership acquire, even in GENERAL.
+// Opt-in facts of the exact source allocation. A buffer alias cannot provide
+// defined content after this image's external ownership acquire, even in GENERAL.
 // Keep the reason and allocation context without creating or reading an alias.
 struct MmltkWorkspaceDirectMemoryFacts {
     layout: mmltk_workspace_channel::Record,
@@ -1943,6 +1943,7 @@ enum MmltkWorkspaceDispatcherCommand {
         frame: OwnedFd,
         frame_signal: MmltkWorkspaceFrameSignal,
         blit: MmltkWorkspaceBlit,
+        allocation: mmltk_workspace_channel::Allocation,
         timeline_descriptor: OwnedFd,
     },
     DetachDestination { surface_id: mmltk_workspace_channel::SurfaceId },
@@ -2613,11 +2614,12 @@ impl MmltkWorkspaceDispatcherShared {
     fn register(
         self: &Arc<Self>, arena: Arc<MmltkWorkspaceArena>, surface_id: mmltk_workspace_channel::SurfaceId,
         frame: OwnedFd, frame_signal: MmltkWorkspaceFrameSignal, blit: MmltkWorkspaceBlit,
+        allocation: mmltk_workspace_channel::Allocation,
         timeline_descriptor: OwnedFd,
     ) {
         self.enqueue(MmltkWorkspaceDispatcherCommand::Register {
             device_id: arena.device_id, arena,
-            surface_id, frame, frame_signal, blit, timeline_descriptor,
+            surface_id, frame, frame_signal, blit, allocation, timeline_descriptor,
         });
     }
 
@@ -2903,6 +2905,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             frame,
                             frame_signal,
                             blit,
+                            allocation,
                             timeline_descriptor,
                         } => {
                             let frame_fd = frame.as_raw_fd();
@@ -2960,7 +2963,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                         physical_read: None,
                                     },
                                 );
-                                mmltk_workspace_channel::send_ready(surface_id, timeline_descriptor);
+                                mmltk_workspace_channel::send_ready(surface_id, allocation, timeline_descriptor);
                             }
                         }
                         MmltkWorkspaceDispatcherCommand::DetachDestination { surface_id } => {
@@ -3139,8 +3142,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
     unsafe { libc::close(epoll) };
 }
 
-/// Everything one imported allocation needs to reach the page's texture, owned
-/// by the shell dispatcher for as long as the mirror is active.
+/// Everything one shared source allocation needs to reach the page's texture,
+/// owned by the shell dispatcher for as long as the mirror is active.
 ///
 /// This is raw Vulkan rather than `wgpu`: `wgpu-core` identifiers are allocated
 /// by the host process and mixing in internally allocated ones is a hard error,
@@ -3579,9 +3582,9 @@ mod mmltk_workspace_transition_tests {
     }
 }
 
-// Fixed receiver-owned evidence for the imported source and completed mailbox.
+// Fixed browser-owned evidence for the shared source and completed mailbox.
 // Direct sampling reads 25 image pixels without a mailbox image.
-// Commands and coherent mappings are reused for the lifetime of the import.
+// Commands and coherent mappings are reused for the lifetime of the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MmltkWorkspaceProbeFailure { Allocation, Reset, Begin, End }
 
@@ -4116,9 +4119,10 @@ impl Global {
     /// Gives the page its own texture for the allocation the host described
     /// under `id`, and starts the watch that keeps it current.
     ///
-    /// The page owns one two-slot destination independently of imported producer
-    /// allocations. Source attachment initializes external ownership before the
-    /// producer fills its workspace; only the queued source blit reads it here.
+    /// The page owns one two-slot destination independently of Firefox-allocated
+    /// source backing shared with native CUDA. Source attachment initializes
+    /// external ownership before the producer fills its workspace; only the
+    /// queued source blit reads it here.
     fn request_mmltk_workspace(
         &self, device_id: id::DeviceId, id: mmltk_workspace_channel::SurfaceId, width: u32, height: u32,
     ) -> Result<(), MmltkWorkspaceImportError> {
@@ -4258,7 +4262,7 @@ impl Global {
             }
             let format = properties.image_format_properties;
             let external_memory = external_properties.external_memory_properties;
-            if external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+            if external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::EXPORTABLE)
                 && external_memory.compatible_handle_types.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
                 && format.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
                 && format.max_mip_levels >= 1 && format.max_array_layers >= 1
@@ -4363,13 +4367,13 @@ impl Global {
             || described.direct_sampling != actual.direct_sampling
             || described.memory_type_bits != actual.memory_type_bits || described.device_uuid != actual.device_uuid
             || described.device_incarnation != actual.device_incarnation || described.size < actual.size
-            || described.size % actual.alignment != 0 || described.allocation_identity == 0 {
+            || described.allocation_identity == 0 {
             unsafe { hal.raw_device().destroy_image(source, None) }; return Err(invalid());
         }
         let properties = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
-        let storage = match self.import_mmltk_workspace_memory(&hal, &properties, source, &mut admission) {
+        let (storage, allocation) = match self.allocate_mmltk_workspace_memory(&hal, &properties, source, &admission) {
             Ok(storage) => storage,
-            Err(error) => { unsafe { hal.raw_device().destroy_image(source, None) }; return Err(error); }
+            Err(error) => return Err(error),
         };
         let edge = admission.take_frame_edge();
         let signal = admission.take_frame_signal().zip(admission.take_access_signal())
@@ -4380,7 +4384,7 @@ impl Global {
         if !valid_mmltk_workspace_eventfd(edge.as_raw_fd()) {
             return Err(invalid());
         }
-        self.start_mmltk_workspace_mirror(&hal, arena, id, storage, edge, signal)
+        self.start_mmltk_workspace_mirror(&hal, arena, id, storage, allocation, edge, signal)
             .ok_or_else(|| MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT))
     }
 
@@ -4435,7 +4439,7 @@ impl Global {
 
     /// Records one reusable copy per mailbox slot and registers them with the
     /// shell dispatcher, which selects one on frame edges. Ownership of the
-    /// source image and its imported memory transfers in on every path: a
+    /// source image and its Firefox-allocated memory transfers in on every path: a
     /// failure before the blit exists releases them here, and once the blit
     /// exists its Drop does. The caller keeps owning only the destination.
     #[allow(clippy::too_many_arguments)]
@@ -4445,6 +4449,7 @@ impl Global {
         arena: Arc<MmltkWorkspaceArena>,
         surface_id: mmltk_workspace_channel::SurfaceId,
         storage: MmltkWorkspaceImage,
+        allocation: mmltk_workspace_channel::Allocation,
         frame_edge: OwnedFd,
         frame_signal: MmltkWorkspaceFrameSignal,
     ) -> Option<()> {
@@ -4553,7 +4558,7 @@ impl Global {
             }
             return None;
         };
-        self.mmltk_workspace_dispatcher.shared.register(arena, surface_id, frame_edge, frame_signal, blit, timeline_descriptor);
+        self.mmltk_workspace_dispatcher.shared.register(arena, surface_id, frame_edge, frame_signal, blit, allocation, timeline_descriptor);
         Some(())
     }
 
@@ -4602,161 +4607,75 @@ impl Global {
         drop(retired);
     }
 
-    /// Imports the descriptor backing `admission` into the image's resource
-    /// owner. Dedicated allocation follows the negotiated image requirement.
-    /// The descriptor is consumed by a successful allocation and closed by the
-    /// caller's `Admission` otherwise.
-    fn import_mmltk_workspace_memory(
+    /// One independent Vulkan allocation per physical native slot. Exporting an
+    /// opaque FD gives native retention its own backing reference after retirement.
+    fn allocate_mmltk_workspace_memory(
         &self,
         hal_device: &wgh::vulkan::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         image: vk::Image,
-        admission: &mut mmltk_workspace_channel::Admission,
-    ) -> Result<MmltkWorkspaceImage, MmltkWorkspaceImportError> {
-        if admission.modifier != mmltk_workspace_channel::MODIFIER_LINEAR {
-            return Err(MmltkWorkspaceImportError::code(
-                mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR,
-            ));
-        }
-        let unimportable =
-            || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT);
+        admission: &mmltk_workspace_channel::Admission,
+    ) -> Result<(MmltkWorkspaceImage, mmltk_workspace_channel::Allocation), MmltkWorkspaceImportError> {
+        let unavailable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT);
+        let invalid = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR);
         let device = hal_device.raw_device();
-
-        let layout = unsafe {
-            device.get_image_subresource_layout(
-                image,
-                vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR),
-            )
-        };
-        let requirements = unsafe { device.get_image_memory_requirements(image) };
-        if layout.row_pitch != admission.stride || layout.offset != admission.layout.offset || requirements.size > admission.size {
-            // One exchange of the layout this device requires, which is how the
-            // exporting side learns a pitch it has no way to compute. It is
-            // logged as the negotiation step it is, so a genuine import failure
-            // stays the only thing reported at error level.
-            log::debug!(
-                "mmltk workspace import is renegotiating the host layout; step=layout, \
-                 driver_row_pitch={}, admission_stride={}, requirements_size={}, \
-                 admission_size={}, width={}, height={}",
-                layout.row_pitch,
-                admission.stride,
-                requirements.size,
-                admission.size,
-                admission.width,
-                admission.height
-            );
-            // The required pitch is a property of the importing driver that the
-            // exporting side cannot compute, so report the one that fits and let
-            // the host describe a fresh allocation with it.
-            return Err(MmltkWorkspaceImportError {
-                code: mmltk_workspace_channel::FAILED_LAYOUT,
-                stride: layout.row_pitch,
-                size: requirements.size,
-            });
-        }
-
-        // `vkGetMemoryFdPropertiesKHR` is not defined for an opaque descriptor,
-        // so the memory type comes from the image's own requirements. The host
-        // allocation is device-local CUDA memory, which is what that filter
-        // selects.
-        let memory_type = select_memory_type(
-            memory_properties,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            Some(requirements.memory_type_bits),
-        )
-        .ok_or_else(|| {
-            log::error!(
-                "mmltk workspace import found no device-local memory type; step=memory_type, \
-                 memory_type_bits={:#x}, requirements_size={}, admission_size={}",
-                requirements.memory_type_bits,
-                requirements.size,
-                admission.size
-            );
-            unimportable()
-        })?;
-
-        // Capture the transported descriptor while Admission still owns it.
-        // OPAQUE_FD forbids vkGetMemoryFdPropertiesKHR; fstat is only file
-        // metadata and matching anonymous inodes do not identify a GPU payload.
-        mmltk_workspace_channel::trace_loaded_libraries();
-        mmltk_workspace_channel::write_diagnostic(|line| {
-            let source = mmltk_workspace_channel::SurfaceId {
-                high: admission.layout.id_high, low: admission.layout.id_low };
-            let surface = mmltk_workspace_channel::SurfaceId {
-                high: admission.layout.arena_high, low: admission.layout.arena_low };
-            let descriptor = admission.descriptor();
-            write!(line,
-                "{{\"event\":\"firefox.workspace.memory_import\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"workspace_descriptor\":{descriptor},\"vk_device\":\"{:?}\",\"vk_physical_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"memory_size\":{},\"memory_type_index\":{memory_type},\"memory_property_flags\":{},\"memory_heap_index\":{},\"dedicated\":{},\"capacity_width\":{},\"capacity_height\":{},\"row_pitch\":{},\"image_offset\":{},\"subresource_size\":{},\"requirements_size\":{},\"requirements_alignment\":{},\"requirements_memory_type_bits\":{},\"described_row_pitch\":{},\"described_image_offset\":{}",
-                admission.layout.allocation_identity, std::process::id(), device.handle(), hal_device.raw_physical_device(),
-                admission.size, memory_properties.memory_types[memory_type as usize].property_flags.as_raw(),
-                memory_properties.memory_types[memory_type as usize].heap_index, admission.layout.dedicated,
-                admission.width, admission.height, layout.row_pitch, layout.offset, layout.size,
-                requirements.size, requirements.alignment, requirements.memory_type_bits,
-                admission.stride, admission.layout.offset)?;
-            mmltk_workspace_channel::write_descriptor_facts(line, descriptor, None)?;
-            write!(line, ",\"import_handle_type\":\"OPAQUE_FD\",\"fd_properties_query\":\"not_permitted_for_opaque_fd\"}}")
-        });
-
-        // A successful `vkAllocateMemory` consumes the descriptor; the
-        // `Admission` still owns it on every failure arm below.
-        //
-        // The allocation size is the exporter's, not this image's requirement:
-        // an imported opaque payload is bound at the size it was created with.
-        let descriptor = admission.descriptor();
-        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
-            .fd(descriptor);
-        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
-        let mut allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(admission.size).memory_type_index(memory_type).push_next(&mut import_info);
-        if admission.layout.dedicated != 0 { allocate_info = allocate_info.push_next(&mut dedicated); }
-        let allocation = unsafe { device.allocate_memory(&allocate_info, None) };
-        // Record the actual allocation argument and return before binding can
-        // fail. A consumed FD must never be queried here: its integer may
-        // already have been reused by another thread.
-        mmltk_workspace_channel::write_diagnostic(|line| {
-            let (memory, status) = match &allocation {
-                Ok(memory) => (*memory, 0),
-                Err(error) => (vk::DeviceMemory::null(), error.as_raw()),
-            };
-            write!(line,
-                "{{\"event\":\"firefox.workspace.memory_allocation\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"workspace_descriptor\":{descriptor},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"vk_allocate_status\":{status},\"fd_consumed\":{},\"fd_observation\":\"allocate_argument_not_post_consumption_query\"}}",
-                admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
-                admission.layout.allocation_identity, std::process::id(), device.handle(), allocation.is_ok())
-        });
-        let memory = allocation.map_err(|error| {
-            log::error!(
-                "mmltk workspace import could not allocate imported memory; step=allocate_memory, \
-                 handle_type=opaque_fd, allocation_size={}, memory_type_index={memory_type}, \
-                 requirements_size={}, error={error:?}",
-                admission.size,
-                requirements.size
-            );
-            unimportable()
-        })?;
-        admission.release_descriptor();
-        if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
-            log::error!(
-                "mmltk workspace import could not bind imported memory; step=bind_image_memory, \
-                 allocation_size={}, memory_type_index={memory_type}, error={error:?}",
-                admission.size
-            );
-            unsafe { device.free_memory(memory, None) };
-            return Err(unimportable());
-        }
-        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.workspace.memory_bound\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"image_binding_offset\":0,\"memory_size\":{},\"memory_type_index\":{memory_type},\"dedicated\":{},\"fd_consumed\":true}}",
-            admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
-            admission.layout.allocation_identity, std::process::id(), device.handle(), admission.size, admission.layout.dedicated));
         let mut storage = MmltkWorkspaceImage {
-            device: device.clone(), image, memory, direct_memory: None,
+            device: device.clone(), image, memory: vk::DeviceMemory::null(), direct_memory: None,
             _device_custody: hal_device.external_image_custody(),
         };
-        if admission.layout.direct_sampling != 0 && mmltk_workspace_channel::workspace_pixel_probes_enabled() {
-            storage.direct_memory = Some(Box::new(MmltkWorkspaceDirectMemoryFacts::new(
-                image, memory, memory_type, admission.layout)));
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        // Dedicated allocation still permits a larger native minimum (VUID
+        // VkMemoryDedicatedAllocateInfo-image-02964). Report the allocated size,
+        // and bind only this image to its independent backing.
+        if admission.size < requirements.size {
+            return Err(invalid());
         }
-        Ok(storage)
+        let memory_type = select_memory_type(memory_properties, vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            Some(requirements.memory_type_bits)).ok_or_else(unavailable)?;
+        let mut export = vk::ExportMemoryAllocateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let mut info = vk::MemoryAllocateInfo::default().allocation_size(admission.size)
+            .memory_type_index(memory_type).push_next(&mut export);
+        if admission.layout.dedicated != 0 { info = info.push_next(&mut dedicated); }
+        let observe = |operation: &str, memory: vk::DeviceMemory, status: vk::Result| {
+            mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+                "{{\"event\":\"firefox.workspace.{operation}\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"memory_size\":{},\"dedicated\":{},\"vk_status\":{}}}",
+                admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
+                admission.layout.allocation_identity, std::process::id(), device.handle(), admission.size,
+                admission.layout.dedicated, status.as_raw()));
+        };
+        let allocation = unsafe { device.allocate_memory(&info, None) };
+        let (memory, status) = match &allocation {
+            Ok(memory) => (*memory, vk::Result::SUCCESS),
+            Err(status) => (vk::DeviceMemory::null(), *status),
+        };
+        observe("memory_allocation", memory, status);
+        storage.memory = allocation.map_err(|_| unavailable())?;
+        let bound = unsafe { device.bind_image_memory(image, memory, 0) };
+        observe("memory_bound", memory, bound.as_ref().err().copied().unwrap_or(vk::Result::SUCCESS));
+        bound.map_err(|_| unavailable())?;
+        let external = khr::external_memory_fd::Device::new(hal_device.shared_instance().raw_instance(), device);
+        let get_fd = vk::MemoryGetFdInfoKHR::default().memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let descriptor = match unsafe { external.get_memory_fd(&get_fd) } {
+            Ok(fd) => unsafe { OwnedFd::from_raw_fd(fd) },
+            Err(status) => { observe("memory_export_failed", memory, status); return Err(unavailable()); },
+        };
+        mmltk_workspace_channel::trace_loaded_libraries();
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            write!(line,
+                "{{\"event\":\"firefox.workspace.memory_export\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"workspace_descriptor\":{},\"memory_size\":{},\"row_pitch\":{},\"image_offset\":{},\"dedicated\":{},\"memory_type_index\":{memory_type},\"external_handle_type\":\"OPAQUE_FD\"",
+                admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
+                admission.layout.allocation_identity, std::process::id(), device.handle(), descriptor.as_raw_fd(),
+                admission.size, admission.stride, admission.layout.offset, admission.layout.dedicated)?;
+            mmltk_workspace_channel::write_descriptor_facts(line, descriptor.as_raw_fd(), None)?;
+            write!(line, "}}")
+        });
+        if admission.layout.direct_sampling != 0 && mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+            storage.direct_memory = Some(Box::new(MmltkWorkspaceDirectMemoryFacts::new(image, memory, memory_type, admission.layout)));
+        }
+        Ok((storage, mmltk_workspace_channel::Allocation { layout: admission.layout, memory: descriptor }))
     }
 
     fn drop_device_after_completion_shutdown(&self, device_id: id::DeviceId) {

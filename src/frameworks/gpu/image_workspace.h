@@ -24,7 +24,7 @@ class ImageProductBuffer;
 class BorrowedImageProductReadView;
 class ImageProductReadCompletion;
 class SystemImageRuntime;
-class ExportedImageBuffer;
+class ImportedImageBuffer;
 namespace test_support {
 struct ImageWorkspaceTestAccess;
 }
@@ -36,7 +36,7 @@ inline constexpr std::uint64_t kWorkspaceAccessReading = 3U;
 inline constexpr std::uint64_t kWorkspaceAccessMask = 3U;
 inline constexpr std::uint64_t kWorkspaceAccessRevoked = std::uint64_t{1U} << 63U;
 
-// The exporter owns this shared, generation-scoped physical access gate.
+// The native producer owns this shared, generation-scoped physical access gate.
 // Availability advertises completed pixels; it grants no reader custody.
 struct alignas(64) ImageWorkspaceAccessSignal final {
     std::uint64_t access = kWorkspaceAccessEmpty;
@@ -82,7 +82,7 @@ struct ImageWorkspaceCoverage final {
 using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
                                                   ImageWorkspaceCoverage, std::uintptr_t stream)>;
 
-// One physical CUDA opaque-FD allocation and its display-device execution.
+// One physical Vulkan opaque-FD allocation imported into CUDA and its display-device execution.
 // Admission precedes writes; raw products and browser imports have their own
 // custody. No import registry or scheduling policy lives in this owner.
 class ImageWorkspace final {
@@ -94,7 +94,6 @@ class ImageWorkspace final {
     [[nodiscard]] std::uint64_t identity() const noexcept;
     [[nodiscard]] std::size_t allocation_bytes() const noexcept;
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
-    [[nodiscard]] mmltk::common::io::ScopedFd ExportDescriptor() const;
     [[nodiscard]] mmltk::common::io::ScopedFd ExportAccessDescriptor() const;
     [[nodiscard]] bool WriteAvailable() const noexcept;
     [[nodiscard]] bool ReserveWrite();
@@ -103,7 +102,9 @@ class ImageWorkspace final {
     [[nodiscard]] bool Acquired(std::uint64_t generation) const noexcept;
     [[nodiscard]] bool TerminalReadComplete(std::uint64_t generation) const noexcept;
     void CompleteRead(std::uint64_t generation);
-    // Called only after the importing device completed initial ownership setup.
+    // Queue initialized backing without running GPU work. Withdrawal closes an
+    // unconsumed descriptor; only the producer execution owner admits its mapping.
+    [[nodiscard]] bool QueueAllocation(mmltk::common::io::ScopedFd);
     void Admit(std::uint64_t allocation_identity, std::uint64_t device_incarnation);
     [[nodiscard]] bool admitted() const noexcept;
     [[nodiscard]] bool retired() const noexcept;
@@ -133,8 +134,8 @@ class ImageWorkspace final {
         friend class ImageWorkspace;
     };
     struct Operations final {
-        void (*initialize)(ExportedImageBuffer&, const ImageWorkspaceLayout&);
-        cudaError_t (*release)(ExportedImageBuffer&) noexcept;
+        void (*initialize)(ImportedImageBuffer&, DeviceContext, const ImageWorkspaceLayout&, mmltk::common::io::ScopedFd, std::uint64_t);
+        cudaError_t (*release)(ImportedImageBuffer&) noexcept;
     };
     struct State;
     std::shared_ptr<State> state_;
@@ -167,7 +168,6 @@ class BorrowedImageWorkspace final {
     [[nodiscard]] std::uint64_t identity() const noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] std::size_t allocation_bytes() const noexcept;
-    [[nodiscard]] mmltk::common::io::ScopedFd ExportDescriptor() const;
     // Retains allocation and contexts with the existing completion owner. The
     // GPU callback drops only counted access; destroy after callback settlement.
     [[nodiscard]] std::unique_ptr<ImageProductReadCompletion> TakeCompletion() &&;

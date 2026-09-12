@@ -568,10 +568,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (source->id() != outcome.id) continue;
             if (!outcome.imported) throw std::runtime_error("Firefox source admission failed");
             if (source->withdrawing) return;
+            if (outcome.memory_descriptor.get() < 0) throw std::runtime_error("Firefox source memory is unavailable");
             if (outcome.timeline_descriptor.get() < 0) throw std::runtime_error("Firefox source timeline is unavailable");
             source->context.Bind();
             DiagnoseSource(VisualDiagnosticOperation::PresentationSourceTimelineImportStarted, *source, 0U);
             source->timeline.emplace(std::move(outcome.timeline_descriptor));
+            if (!source->workspace->QueueAllocation(std::move(outcome.memory_descriptor))) return;
             DiagnoseSource(VisualDiagnosticOperation::PresentationSourceReady, *source, 1U);
             const auto* arena = candidate_ && candidate_->id == source->arena() ? candidate_.get() : active_.get();
             if (!arena || arena->id != source->arena()) throw std::runtime_error("Firefox source belongs to a retired arena");
@@ -658,8 +660,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         const auto observed = pending_->reader->observe_workspace();
         if (observed.product_owner == 0U) return wait("product_unavailable", arena, &observed);
         if (observed.product_revision != frame.revision) return Supersede();
-        if (!observed.workspace || observed.workspace->layout() != Layout(*arena)) {
-            if (pending_->requested_owner != observed.product_owner) {
+        const bool retired_workspace = observed.workspace && observed.workspace->retired();
+        if (!observed.workspace || retired_workspace || observed.workspace->layout() != Layout(*arena)) {
+            if (retired_workspace || pending_->requested_owner != observed.product_owner) {
                 Request(*pending_->reader, observed, *arena);
                 pending_->requested_owner = observed.product_owner;
                 return wait("workspace_requested", arena, &observed);
@@ -681,8 +684,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (sources_.size() == kSourceCapacity) return wait("source_capacity", arena, &observed);
             const auto id = native::WorkspaceSurfaceImportId::generate();
             auto packet = arena->layout;
-            packet.opcode = abi::Opcode::Import;
-            packet.descriptors = abi::kImportDescriptorCount;
+            packet.opcode = abi::Opcode::Allocate;
+            packet.descriptors = abi::kAllocateDescriptorCount;
             packet.id_high = id.high;
             packet.id_low = id.low;
             packet.arena_high = arena->id.high;
@@ -696,7 +699,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (source->edge.get() < 0) throw std::runtime_error("native source eventfd creation failed");
             source->signal = native::WorkspaceSurfaceFrameSignal::create();
             auto access = source->workspace->ExportAccessDescriptor();
-            if (!channel_.admit_source(source->description, source->generation, source->workspace->ExportDescriptor(), source->edge.get(),
+            if (!channel_.admit_source(source->description, source->generation, source->edge.get(),
                                        source->signal.descriptor(), access.get(), pending_->submitted.selection_generation, frame.revision))
                 return wait("source_admission_backpressure", arena, &observed);
             sources_.push_back(std::move(source));

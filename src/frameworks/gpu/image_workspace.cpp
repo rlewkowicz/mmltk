@@ -16,7 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "src/frameworks/gpu/exported_image_buffer.h"
+#include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/common/io/noexcept_io.h"
@@ -30,7 +30,8 @@ bool ImageWorkspaceLayout::valid() const noexcept {
            height <= static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) &&
            std::ranges::any_of(device_uuid, [](auto byte) { return byte != 0U; }) && pitch_bytes >= static_cast<std::size_t>(width) * 4U &&
            alignment_bytes != 0U && (alignment_bytes & (alignment_bytes - 1U)) == 0U && height <= (maximum - offset_bytes) / pitch_bytes &&
-           required_allocation_bytes >= offset_bytes + pitch_bytes * height;
+           required_allocation_bytes >= offset_bytes + pitch_bytes * height &&
+           required_allocation_bytes <= static_cast<std::size_t>(std::numeric_limits<std::ptrdiff_t>::max());
 }
 
 namespace {
@@ -40,15 +41,10 @@ namespace {
     } catch (...) { return std::current_exception(); }
 }
 
-void initialize_workspace_allocation(ExportedImageBuffer& allocation, const ImageWorkspaceLayout& layout) {
-    CUuuid uuid{};
-    if (cuDeviceGetUuid(&uuid, layout.device) != CUDA_SUCCESS ||
-        std::memcmp(uuid.bytes, layout.device_uuid.data(), layout.device_uuid.size()) != 0)
-        throw std::invalid_argument("workspace physical device UUID mismatch");
+void initialize_workspace_allocation(ImportedImageBuffer& allocation, DeviceContext context, const ImageWorkspaceLayout& layout,
+                                     mmltk::common::io::ScopedFd memory, std::uint64_t identity) {
     std::string error;
-    if (!allocation.allocate(layout.device, layout.width, layout.height, layout.pitch_bytes, layout.required_allocation_bytes, &error,
-                             layout.offset_bytes))
-        throw std::runtime_error(error);
+    if (!allocation.Import(std::move(context), std::move(memory), layout, identity, &error)) throw std::runtime_error(error);
 }
 }  // namespace
 
@@ -103,7 +99,7 @@ struct ImageWorkspace::State final {
     State(std::shared_ptr<Owner> family, ImageWorkspaceLayout requested, const Operations* injected)
         : owner(std::move(family)),
           layout(std::move(requested)),
-          operations(injected ? *injected : Operations{&initialize_workspace_allocation, [](ExportedImageBuffer& buffer) noexcept {
+          operations(injected ? *injected : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept {
                                                            return buffer.Release();
                                                        }}) {}
     void Initialize(DeviceContext source, std::optional<DeviceExecution> execution) {
@@ -122,9 +118,6 @@ struct ImageWorkspace::State final {
         context.emplace(source.OnDevice(layout.device, std::move(execution)));
         stream.emplace(*context);
         context->Bind();
-        operations.initialize(*allocation, layout);
-        if (allocation->allocation_size() % layout.alignment_bytes != 0U)
-            throw std::invalid_argument("workspace allocation alignment mismatch");
         completion = context->CreateEvent();
     }
     ~State() {
@@ -160,6 +153,7 @@ struct ImageWorkspace::State final {
             // A winning external reader retains custody through settlement.
             static_cast<void>(gate.compare_exchange_strong(expected, (expected & ~kWorkspaceAccessMask) | kWorkspaceAccessEmpty,
                                                            std::memory_order_acq_rel));
+        pending_memory.reset();
         withdrawn.store(true, std::memory_order_release);
     }
     std::shared_ptr<Owner> owner;
@@ -167,12 +161,13 @@ struct ImageWorkspace::State final {
     const ImageWorkspaceLayout layout;
     const Operations operations;
     std::optional<ImageStream> stream;
-    std::shared_ptr<ExportedImageBuffer> allocation = std::make_shared<ExportedImageBuffer>();
+    std::shared_ptr<ImportedImageBuffer> allocation = std::make_shared<ImportedImageBuffer>();
     std::unique_ptr<ImageProductBuffer> transfer;
     std::optional<BorrowedImageProductReadView> unsettled_source;
     std::uintptr_t completion = 0U;
     std::uint64_t identity = 0U;
     mmltk::common::io::ScopedFd access_descriptor;
+    mmltk::common::io::ScopedFd pending_memory;
     ImageWorkspaceAccessSignal* access_signal = nullptr;
     bool write_reserved = false;
     bool write_invalidated = false;
@@ -213,7 +208,8 @@ std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexce
     if (safe) {
         try {
             if (state_->context) state_->context->Bind();
-            const auto released = state_->operations.release(*state_->allocation);
+            state_->transfer.reset();
+            const auto released = state_->allocation.use_count() == 1U ? state_->operations.release(*state_->allocation) : cudaSuccess;
             safe = released == cudaSuccess && state_->allocation->release_failure() == cudaSuccess;
             if (!safe) failure = combine_image_failures(failure, workspace_release_failure("workspace allocation release failed"));
         } catch (...) {
@@ -245,12 +241,12 @@ void ImageWorkspace::CheckOwner(const std::shared_ptr<Owner>& owner) const {
 }
 const ImageWorkspaceLayout& ImageWorkspace::layout() const noexcept { return state_->layout; }
 std::uint64_t ImageWorkspace::identity() const noexcept { return state_->identity; }
-std::size_t ImageWorkspace::allocation_bytes() const noexcept { return state_->allocation->allocation_size(); }
+std::size_t ImageWorkspace::allocation_bytes() const noexcept { return layout().required_allocation_bytes; }
 ImageStorageFootprint ImageWorkspace::StorageFootprint() const noexcept {
     std::scoped_lock lock(state_->access);
     auto result = state_->transfer ? state_->transfer->StorageFootprint() : ImageStorageFootprint{};
     // Clean cross-device transfer already owns the final allocation directly.
-    if (!state_->transfer || state_->transfer->layout() != ImageProductLayout::Clean) result.device_bytes += allocation_bytes();
+    if (!state_->transfer || state_->transfer->layout() != ImageProductLayout::Clean) result.device_bytes += state_->allocation->allocation_size();
     return result;
 }
 void ImageWorkspace::Attach(std::uint64_t product_owner) {
@@ -275,32 +271,11 @@ bool ImageWorkspace::retired() const noexcept {
 void ImageWorkspace::Withdraw() noexcept { state_->Withdraw(); }
 std::uint64_t ImageWorkspace::revision() const noexcept { return state_->revision.load(std::memory_order_acquire); }
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
-    if (width == 0U || height == 0U || width > layout().width || height > layout().height)
+    if (!admitted() || state_->allocation->empty() || width == 0U || height == 0U || width > layout().width || height > layout().height)
         throw std::invalid_argument("workspace logical extent exceeds capacity");
     return {state_->allocation->data(),
             {ImagePlaneKind::Clean, ImageFormat::Rgba8, width, height, layout().pitch_bytes},
             {identity(), layout().width, layout().height, identity()}};
-}
-mmltk::common::io::ScopedFd ImageWorkspace::ExportDescriptor() const {
-    std::string error;
-    mmltk::common::io::ScopedFd descriptor(state_->allocation->export_descriptor(&error));
-    if (descriptor.get() < 0) throw std::runtime_error(error);
-    if (const auto* trace = std::getenv("MMLTK_GUI_TRACE_FILE"); trace && *trace) {
-        const int saved_errno = errno;
-        char record[512];
-        const int length = std::snprintf(
-            record, sizeof(record),
-            "{\"event\":\"gpu.workspace.memory_export\",\"native_process_id\":%ld,\"workspace_allocation\":%llu,"
-            "\"workspace_descriptor\":%d,\"workspace_plane\":%llu,\"memory_size\":%zu,\"row_pitch\":%zu,"
-            "\"image_offset\":%zu,\"capacity_width\":%u,\"capacity_height\":%u}\n",
-            static_cast<long>(::getpid()), static_cast<unsigned long long>(identity()), descriptor.get(),
-            static_cast<unsigned long long>(state_->allocation->data()), allocation_bytes(), layout().pitch_bytes,
-            layout().offset_bytes, layout().width, layout().height);
-        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record))
-            mmltk::common::io::write_all_noexcept(STDERR_FILENO, {record, static_cast<std::size_t>(length)});
-        errno = saved_errno;
-    }
-    return descriptor;
 }
 mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {
     mmltk::common::io::ScopedFd descriptor(::fcntl(state_->access_descriptor.get(), F_DUPFD_CLOEXEC, 0));
@@ -308,10 +283,12 @@ mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {
     return descriptor;
 }
 bool ImageWorkspace::WriteAvailable() const noexcept {
+    if (!admitted()) return false;
     const auto access = std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
     return (access & kWorkspaceAccessMask) == kWorkspaceAccessEmpty || (access & kWorkspaceAccessMask) == kWorkspaceAccessAvailable;
 }
 bool ImageWorkspace::ReserveWrite() {
+    if (!admitted()) return false;
     std::unique_lock lock(state_->access, std::try_to_lock);
     if (!lock.owns_lock()) return false;
     return state_->ReservePhysicalWrite();
@@ -367,14 +344,38 @@ void ImageWorkspace::CompleteRead(std::uint64_t generation) {
 void ImageWorkspace::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
     state_->availability_sink.store(std::move(sink), std::memory_order_release);
 }
-void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t device_incarnation) {
+bool ImageWorkspace::QueueAllocation(mmltk::common::io::ScopedFd memory) {
     std::scoped_lock lock(state_->access);
     std::scoped_lock owner_lock(state_->owner->mutex_);
+    if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire)) return false;
+    if (memory.get() < 0 || state_->pending_memory.get() >= 0 || admitted())
+        throw std::invalid_argument("workspace allocation descriptor is unavailable or duplicated");
+    state_->pending_memory = std::move(memory);
+    return true;
+}
+void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t device_incarnation) {
+    std::unique_lock lock(state_->access);
+    std::unique_lock owner_lock(state_->owner->mutex_);
     if (state_->owner->failure_) std::rethrow_exception(state_->owner->failure_);
     if (state_->owner->closed_ || state_->withdrawn.load(std::memory_order_acquire)) throw std::runtime_error("workspace owner is retired");
     if (allocation_identity != identity() || device_incarnation != layout().device_incarnation || state_->admitted)
         throw std::invalid_argument("workspace admission identity mismatch or duplicate");
-    state_->admitted = true;
+    try {
+        state_->context->Bind();
+        state_->operations.initialize(*state_->allocation, *state_->context, layout(), std::move(state_->pending_memory), identity());
+        state_->admitted = true;
+    } catch (...) {
+        auto failure = std::current_exception();
+        const auto released = state_->operations.release(*state_->allocation);
+        state_->withdrawn.store(true, std::memory_order_release);
+        owner_lock.unlock();
+        lock.unlock();
+        if (released != cudaSuccess || state_->allocation->release_failure() != cudaSuccess) {
+            failure = combine_image_failures(failure, workspace_release_failure("workspace import cleanup failed"));
+            state_->owner->Failed(failure);
+        }
+        std::rethrow_exception(failure);
+    }
 }
 ImageStreamSettlement ImageWorkspace::Settle() noexcept {
     if (!state_) return {.completion_reached = true};
@@ -479,10 +480,6 @@ const ImageWorkspaceLayout& BorrowedImageWorkspace::layout() const {
 std::uint64_t BorrowedImageWorkspace::identity() const noexcept { return valid() ? lease_->workspace->identity() : 0U; }
 std::uint64_t BorrowedImageWorkspace::revision() const noexcept { return valid() ? lease_->revision : 0U; }
 std::size_t BorrowedImageWorkspace::allocation_bytes() const noexcept { return valid() ? lease_->workspace->allocation_bytes() : 0U; }
-mmltk::common::io::ScopedFd BorrowedImageWorkspace::ExportDescriptor() const {
-    if (!valid()) throw std::invalid_argument("workspace borrow is unavailable");
-    return lease_->workspace->ExportDescriptor();
-}
 std::unique_ptr<ImageProductReadCompletion> BorrowedImageWorkspace::TakeCompletion() && {
     if (!valid()) throw std::invalid_argument("workspace borrow is unavailable");
     return std::make_unique<ImageProductReadCompletion>(std::move(lease_->source));
