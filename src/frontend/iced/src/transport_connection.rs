@@ -876,7 +876,7 @@ mod tests {
                     let reply =
                         crate::protocol::ServerRecord::IntentReply(crate::protocol::IntentReply {
                             correlation: 17,
-                            result: Ok(snapshot.clone().into_application_value()),
+                            result: Ok(snapshot.clone().into_application_transport_value()),
                         });
                     let settled = |revision| {
                         let mut snapshot = snapshot.clone();
@@ -973,7 +973,9 @@ mod tests {
                             .observe(&crate::protocol::ServerRecord::IntentReply(
                                 crate::protocol::IntentReply {
                                     correlation: 18,
-                                    result: Ok(annotation_snapshot().into_application_value()),
+                                    result: Ok(
+                                        annotation_snapshot().into_application_transport_value()
+                                    ),
                                 },
                             ))
                             .unwrap();
@@ -1021,7 +1023,7 @@ mod tests {
                     crate::protocol::IntentReply {
                         correlation: 1,
                         result: if successful {
-                            Ok(annotation_snapshot().into_application_value())
+                            Ok(annotation_snapshot().into_application_transport_value())
                         } else {
                             Err(crate::protocol::ApplicationError {
                                 category: crate::generated::ApplicationErrorCategory::Unavailable,

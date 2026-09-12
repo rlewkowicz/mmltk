@@ -25,12 +25,19 @@ pub(super) enum Step {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Settlement {
+    NativeUi,
+    RenderedFrame,
+}
+
 pub(super) struct Action {
     pub messages: Vec<Message>,
     // Source-space coordinates; transformation belongs to the observed shader bounds.
     pub gesture: Option<[f64; 4]>,
     pub cancel: bool,
     pub tool: Option<Tool>,
+    pub settlement: Settlement,
 }
 
 #[derive(Default)]
@@ -121,6 +128,7 @@ impl Pass {
             gesture: None,
             cancel: false,
             tool: None,
+            settlement: step.settlement(),
         };
         let mut sidebar_message = |message| action.messages.push(Message::Sidebar(message));
         match step {
@@ -170,9 +178,20 @@ impl Pass {
                 action.gesture = Some([x, y, x, y]);
             }
             Step::Paint | Step::Erase => {
-                let b = &self.before.as_ref()?.box_;
-                let x = (f64::from(b.second.x) + 2.0).min(f64::from(ui.scene.framewidth) - 1.0);
-                let y = f64::from((b.first.y + b.second.y) / 2.0);
+                let object = self.before.as_ref()?;
+                let center = super::annotation_checks::sample_pixel(ui);
+                let [x, y] = if matches!(step, Step::Erase)
+                    && super::annotation_checks::mask_contains(&object.mask, center)
+                {
+                    // Repeated passes must leave a real hole for the later Fill.
+                    center.map(|value| f64::from(value) + 0.5)
+                } else {
+                    let b = &object.box_;
+                    [
+                        (f64::from(b.second.x) + 2.0).min(f64::from(ui.scene.framewidth) - 1.0),
+                        f64::from((b.first.y + b.second.y) / 2.0),
+                    ]
+                };
                 action.gesture = Some([x, y, x, y]);
             }
             Step::ResizeMask => {
@@ -271,14 +290,14 @@ impl Pass {
                 selected.is_some_and(|object| object.shape == Shape::Mask && object.sup.sampling)
             }
             Step::Fill => {
-                let [x, y] = super::annotation_checks::sample_pixel(ui);
-                selected.is_some_and(|object| {
-                    object
-                        .mask
-                        .runs
-                        .iter()
-                        .any(|run| run.row == y && run.first <= x && run.last >= x)
-                })
+                let center = super::annotation_checks::sample_pixel(ui);
+                selected
+                    .zip(self.before.as_ref())
+                    .is_some_and(|(after, before)| {
+                        !super::annotation_checks::mask_contains(&before.mask, center)
+                            && super::annotation_checks::mask_contains(&after.mask, center)
+                            && after.mask.runs != before.mask.runs
+                    })
             }
             Step::Cleanup(operation) => selected.is_some_and(|object| {
                 object.mask.cleanup == operation
@@ -357,6 +376,28 @@ impl Pass {
 }
 
 impl Step {
+    fn settlement(self) -> Settlement {
+        match self {
+            Self::Select(_)
+            | Self::Tool(_)
+            | Self::Sample
+            | Self::Cleanup(_)
+            | Self::Reclass
+            | Self::Undo
+            | Self::Redo
+            | Self::Segment
+            | Self::Handle => Settlement::NativeUi,
+            Self::Fill
+            | Self::Move(_)
+            | Self::ResizeMask
+            | Self::Paint
+            | Self::Erase
+            | Self::Singleton
+            | Self::Create(_, _)
+            | Self::Cancel => Settlement::RenderedFrame,
+        }
+    }
+
     pub(super) fn detail(self) -> String {
         match self {
             Step::Select(_) => "selection".into(),

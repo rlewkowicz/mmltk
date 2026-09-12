@@ -446,6 +446,56 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             _ => {}
         }
     }
+    let Some(ServerRecord::IntentReply(reference)) = records.iter().find(
+        |record| matches!(record, ServerRecord::IntentReply(reply) if reply.correlation == 19),
+    ) else {
+        return Err(io::Error::other("native named Annotation reference is missing").into());
+    };
+    use mmltk_browser_app::application_codec::{
+        FromApplicationValue as _, IntoApplicationValue as _,
+    };
+    let expected = mmltk_browser_app::generated::AnnotationSnapshot::from_application_value(
+        reference
+            .result
+            .clone()
+            .map_err(|_| io::Error::other("native reference is an error"))?,
+    )
+    .map_err(io::Error::other)?;
+    require(
+        visual.annotation == Some(&expected),
+        "positional Annotation transport changed a logical, displayed or inactive field",
+    )?;
+    let transported = expected.clone().into_application_transport_value();
+    if let mmltk_browser_app::application_codec::Value::Array(fields) = &transported {
+        for count in [fields.len() - 1, fields.len() + 1] {
+            let mut invalid = fields.clone();
+            invalid.resize(count, mmltk_browser_app::application_codec::Value::Null);
+            require(
+                mmltk_browser_app::generated::AnnotationSnapshot::from_application_transport_value(
+                    mmltk_browser_app::application_codec::Value::Array(invalid),
+                )
+                .is_err(),
+                "positional Annotation decoder accepted an incorrect field count",
+            )?;
+        }
+    } else {
+        return Err(io::Error::other("generated Annotation output is not positional").into());
+    }
+    require(
+        mmltk_browser_app::generated::AnnotationSnapshot::from_application_transport_value(
+            transported,
+        )
+        .map_err(io::Error::other)?
+            == expected,
+        "generated positional Annotation codec does not round trip",
+    )?;
+    require(
+        mmltk_browser_app::generated::AnnotationSnapshot::from_application_transport_value(
+            expected.into_application_value(),
+        )
+        .is_err(),
+        "positional output decoder accepted named persistence data",
+    )?;
     use mmltk_browser_app::generated;
     for (kind, session) in [
         (generated::PresentationSourceKind::None, 0),

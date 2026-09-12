@@ -128,12 +128,20 @@ impl Value {
     }
 }
 
-pub trait IntoApplicationValue {
+pub trait IntoApplicationValue: Sized {
     fn into_application_value(self) -> Value;
+
+    fn into_application_transport_value(self) -> Value {
+        self.into_application_value()
+    }
 }
 
 pub trait FromApplicationValue: Sized {
     fn from_application_value(value: Value) -> Result<Self, String>;
+
+    fn from_application_transport_value(value: Value) -> Result<Self, String> {
+        Self::from_application_value(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +160,21 @@ pub(crate) fn object(value: Value) -> Result<Vec<(String, Value)>, String> {
         }
     }
     Ok(fields)
+}
+
+/// A schema-agreed reflected object has exactly one slot per declared field,
+/// including null optionals. Consume slots without name allocation or searches.
+pub(crate) fn transport_fields(
+    value: Value,
+    count: usize,
+) -> Result<std::vec::IntoIter<Value>, String> {
+    let Value::Array(fields) = value else {
+        return Err("positional object expected".into());
+    };
+    if fields.len() != count {
+        return Err("positional object field count mismatch".into());
+    }
+    Ok(fields.into_iter())
 }
 
 pub(crate) fn take_field(fields: &mut Vec<(String, Value)>, name: &str) -> Result<Value, String> {
@@ -368,44 +391,66 @@ impl FromApplicationValue for Cow<'static, str> {
     }
 }
 
+fn encode_sequence<T>(values: impl IntoIterator<Item = T>, encode: fn(T) -> Value) -> Value {
+    Value::Array(values.into_iter().map(encode).collect())
+}
+
+fn decode_sequence<T>(
+    value: Value,
+    decode: fn(Value) -> Result<T, String>,
+) -> Result<Vec<T>, String> {
+    let Value::Array(values) = value else {
+        return Err("array expected".into());
+    };
+    values.into_iter().map(decode).collect()
+}
+
 impl<T: IntoApplicationValue> IntoApplicationValue for Vec<T> {
     fn into_application_value(self) -> Value {
-        Value::Array(
-            self.into_iter()
-                .map(IntoApplicationValue::into_application_value)
-                .collect(),
-        )
+        encode_sequence(self, T::into_application_value)
+    }
+
+    fn into_application_transport_value(self) -> Value {
+        encode_sequence(self, T::into_application_transport_value)
     }
 }
 
 impl<T: FromApplicationValue> FromApplicationValue for Vec<T> {
     fn from_application_value(value: Value) -> Result<Self, String> {
-        let Value::Array(values) = value else {
-            return Err("array expected".into());
-        };
-        values
-            .into_iter()
-            .map(FromApplicationValue::from_application_value)
-            .collect()
+        decode_sequence(value, T::from_application_value)
+    }
+
+    fn from_application_transport_value(value: Value) -> Result<Self, String> {
+        decode_sequence(value, T::from_application_transport_value)
     }
 }
 
 impl<T: IntoApplicationValue, const N: usize> IntoApplicationValue for [T; N] {
     fn into_application_value(self) -> Value {
-        Value::Array(
-            self.into_iter()
-                .map(IntoApplicationValue::into_application_value)
-                .collect(),
-        )
+        encode_sequence(self, T::into_application_value)
     }
+
+    fn into_application_transport_value(self) -> Value {
+        encode_sequence(self, T::into_application_transport_value)
+    }
+}
+
+fn decode_array<T, const N: usize>(
+    value: Value,
+    decode: fn(Value) -> Result<T, String>,
+) -> Result<[T; N], String> {
+    decode_sequence(value, decode)?
+        .try_into()
+        .map_err(|_| format!("array must contain {N} items"))
 }
 
 impl<T: FromApplicationValue, const N: usize> FromApplicationValue for [T; N] {
     fn from_application_value(value: Value) -> Result<Self, String> {
-        let values: Vec<T> = FromApplicationValue::from_application_value(value)?;
-        values
-            .try_into()
-            .map_err(|_| format!("array must contain {N} items"))
+        decode_array(value, T::from_application_value)
+    }
+
+    fn from_application_transport_value(value: Value) -> Result<Self, String> {
+        decode_array(value, T::from_application_transport_value)
     }
 }
 
@@ -444,17 +489,32 @@ impl FromApplicationValue for ByteBuffer {
 
 impl<T: IntoApplicationValue> IntoApplicationValue for Option<T> {
     fn into_application_value(self) -> Value {
-        self.map_or(Value::Null, IntoApplicationValue::into_application_value)
+        self.map_or(Value::Null, T::into_application_value)
+    }
+
+    fn into_application_transport_value(self) -> Value {
+        self.map_or(Value::Null, T::into_application_transport_value)
+    }
+}
+
+fn decode_optional<T>(
+    value: Value,
+    decode: fn(Value) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    if matches!(value, Value::Null) {
+        Ok(None)
+    } else {
+        decode(value).map(Some)
     }
 }
 
 impl<T: FromApplicationValue> FromApplicationValue for Option<T> {
     fn from_application_value(value: Value) -> Result<Self, String> {
-        if matches!(value, Value::Null) {
-            Ok(None)
-        } else {
-            T::from_application_value(value).map(Some)
-        }
+        decode_optional(value, T::from_application_value)
+    }
+
+    fn from_application_transport_value(value: Value) -> Result<Self, String> {
+        decode_optional(value, T::from_application_transport_value)
     }
 }
 

@@ -443,7 +443,7 @@ mod tests {
             saturation: 1.0,
             value: 1.0,
         }];
-        let value = snapshot.clone().into_application_value();
+        let value = snapshot.clone().into_application_transport_value();
         let bootstrap = bootstrap_payload(
             1,
             crate::generated::SCHEMA_FINGERPRINT,
@@ -472,7 +472,7 @@ mod tests {
             ("state_revision", Value::Unsigned(snapshot.revision)),
             (
                 "value",
-                crate::generated::ExploreChanged { snapshot }.into_application_value(),
+                crate::generated::ExploreChanged { snapshot }.into_application_transport_value(),
             ),
         ]);
         assert!(matches!(
@@ -548,15 +548,28 @@ mod tests {
         let crate::generated::ApplicationSnapshot::Settings(settings) = default.value else {
             panic!("settings default has wrong generated variant");
         };
-        let mut invalid_settings = settings.into_application_value();
-        *invalid_settings
-            .field_mut("settings_state")
-            .and_then(|value| value.field_mut("workflows"))
-            .and_then(|value| value.field_mut("train"))
-            .and_then(|value| value.field_mut("request"))
-            .and_then(|value| value.field_mut("recipe_overrides"))
-            .and_then(|value| value.field_mut("mask"))
-            .unwrap() = Value::Unsigned(0x0800);
+        let mut invalid_settings = settings.into_application_transport_value();
+        // Opaque native storage deliberately retains its named scalar envelope
+        // inside positional transport. Corrupt its value without depending on
+        // generated member positions or bypassing its private typed API.
+        fn invalidate_opaque_mask(value: &mut Value) -> bool {
+            match value {
+                Value::Object(fields) => {
+                    if let [(name, Value::Unsigned(storage))] = fields.as_mut_slice()
+                        && name.as_str() == "mask"
+                    {
+                        *storage = 0x0800;
+                        return true;
+                    }
+                    fields
+                        .iter_mut()
+                        .any(|(_, value)| invalidate_opaque_mask(value))
+                }
+                Value::Array(fields) => fields.iter_mut().any(invalidate_opaque_mask),
+                _ => false,
+            }
+        }
+        assert!(invalidate_opaque_mask(&mut invalid_settings));
         let encoded = |fingerprint: [u64; 2]| {
             encode_envelope(
                 "Bootstrap",
@@ -689,10 +702,14 @@ mod tests {
                         && record.encode().is_err()
                 )
         );
-        assert!(controls.iter().any(|record| record.receipt.kind
-            == crate::generated::IntegrationControlKind::VisibleReadHeld
-            && record.receipt.readgeneration == 7
-            && record.receipt.compiledindex == 0));
+        for kind in [
+            crate::generated::IntegrationControlKind::VisibleReadHeld,
+            crate::generated::IntegrationControlKind::GalleryReadCompletionHeld,
+        ] {
+            assert!(controls.iter().any(|record| record.receipt.kind == kind
+                && record.receipt.readgeneration == 7
+                && record.receipt.compiledindex == 0));
+        }
         assert!(
             matches!(decode_server(native[7]).unwrap(), ServerRecord::IntegrationControl(record)
             if record.receipt.kind == crate::generated::IntegrationControlKind::Advance && record.receipt.sequence == 2)

@@ -1728,8 +1728,8 @@ struct TestPresentationWriterState final {
     std::atomic_bool fail_pump{false};
     std::atomic_bool block_pump{false};
     std::atomic_bool pump_block_reported{false};
-    std::atomic_bool terminal_release_succeeds{true};
-    std::atomic_bool terminal_source_settled{true};
+    std::atomic<PresentationNativeWriter::Retirement> terminal_retirement{PresentationNativeWriter::Retirement::Released};
+    std::atomic_uint terminal_custody_notifications{0U};
     std::promise<void> first_submission;
     std::promise<void> second_submission;
     std::promise<void> third_submission;
@@ -1894,10 +1894,12 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         try {
             context_.Bind();
             state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
-        } catch (...) { return {.all_released = false}; }
+        } catch (...) { return Retirement::ReleasedWithFailure; }
         state_->browser_terminals.fetch_add(1U, std::memory_order_acq_rel);
-        return {.all_released = state_->terminal_release_succeeds.load(std::memory_order_acquire),
-                .safe_to_destroy = state_->terminal_source_settled.load(std::memory_order_acquire)};
+        return state_->terminal_retirement.load(std::memory_order_acquire);
+    }
+    void TerminalCustodyInstalled() noexcept override {
+        state_->terminal_custody_notifications.fetch_add(1U, std::memory_order_acq_rel);
     }
 
    private:
@@ -5176,7 +5178,7 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
                                 },
                                 [&events](AnnotationSystem::event_type) { events.Advance(); }};
     mmltk::testsupport::open_annotation(annotation, events, source.frame());
-    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationHoldEdit{true}}}));
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("kept category")}}}));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
@@ -5196,6 +5198,8 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}}));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     CHECK(annotation.snapshot().ui.document_revision == prior.ui.document_revision + 1U);
+    REQUIRE(annotation.snapshot().ui.scene.categories.size() == prior.ui.scene.categories.size() + 1U);
+    CHECK(annotation.snapshot().ui.scene.categories.back().value == "kept category");
 }
 
 TEST_CASE("Annotation reduces input and settles commands while rendering is held") {
@@ -5272,6 +5276,7 @@ TEST_CASE("Annotation admission reuses both credits without consuming rejected b
     auto entered = pause->committed.get_future();
     std::atomic_uint64_t consumed{0U};
     std::atomic_bool ordered{true};
+    std::atomic_bool peer_ready{false};
     auto annotation = make_test_annotation(backend, source.system(), events);
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(pause->release);
@@ -5282,7 +5287,11 @@ TEST_CASE("Annotation admission reuses both credits without consuming rejected b
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     const auto epoch = annotation.snapshot().input_document_epoch;
     annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
-        if (!progress.consumed_sequence) return;
+        if (!progress.consumed_sequence) {
+            peer_ready = true;
+            events.Advance();
+            return;
+        }
         if (progress.consumed_sequence != consumed.load() + 1U) ordered = false;
         consumed = progress.consumed_sequence;
         if (progress.consumed_sequence == 1U) {
@@ -5291,6 +5300,7 @@ TEST_CASE("Annotation admission reuses both credits without consuming rejected b
         }
         events.Advance();
     });
+    REQUIRE(events.Wait([&] { return peer_ready.load(); }));
     const auto batch = [epoch](std::uint64_t sequence, contracts::AnnotationPointerPhase phase) {
         return AnnotationInputBatch{
             .document_epoch = epoch,
@@ -7198,7 +7208,7 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
     const presentation::WorkspaceSurfaceImportId source{3U, 4U};
     abi::Record received{};
-    const auto layout = fixture.AdmitArena(arena, 1U);
+    const auto layout = fixture.AdmitArena(arena, 1U, GENERATE(false, true));
     fixture.AdmitSource(source, arena, layout, 2U);
     // A capacity retry may repeat content and presentation while representing
     // a new physical source transfer. The wire must preserve that distinction.
@@ -7211,10 +7221,21 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
                                                    .presentation_revision = 9U,
                                                    .offset = transfer}));
         channel.pump();
-        const auto acquisition = channel.take_acquisition();
+        const auto acquisition = channel.take_source_transition();
         REQUIRE(acquisition.has_value());
         CHECK(acquisition->offset == transfer);
-        CHECK_FALSE(channel.take_acquisition().has_value());
+        CHECK(acquisition->opcode == abi::Opcode::Acquired);
+        CHECK_FALSE(channel.take_source_transition().has_value());
+        CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
+        auto release = *acquisition;
+        release.opcode = abi::Opcode::ReleaseSubmitted;
+        REQUIRE(send_workspace_record(peer.get(), release));
+        channel.pump();
+        CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
+        const auto submitted = channel.take_source_transition();
+        REQUIRE(submitted.has_value());
+        CHECK(submitted->opcode == abi::Opcode::ReleaseSubmitted);
+        CHECK(submitted->offset == transfer);
         REQUIRE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
         static_cast<void>(receive_workspace_record(peer.get(), received));
         CHECK(received.opcode == abi::Opcode::ReadSettled);
@@ -7251,7 +7272,7 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
     using mmltk::testsupport::receive_workspace_record;
     using mmltk::testsupport::send_workspace_record;
     const bool direct = GENERATE(false, true);
-    const bool terminal = GENERATE(false, true);
+    const unsigned terminal = GENERATE(0U, 1U, 2U);
     CAPTURE(direct, terminal);
     WorkspaceChannelFixture fixture;
     auto& channel = fixture.channel;
@@ -7269,16 +7290,20 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
     REQUIRE(fillers > 0U);
     REQUIRE(fillers < 256U);
     const auto acquired = WorkspaceChannelFixture::Acquisition(source);
+    auto submitted_release = acquired;
+    submitted_release.opcode = abi::Opcode::ReleaseSubmitted;
     std::barrier blocked{2};
     std::barrier drop_seen{2};
     std::barrier writable{2};
     bool backpressured = false;
+    bool release_backpressured = false;
     bool dropped = false;
     bool notified = false;
     std::exception_ptr failure;
     std::jthread browser([&] {
         try {
             backpressured = !send_workspace_record(peer.get(), acquired);
+            release_backpressured = !send_workspace_record(peer.get(), submitted_release);
         } catch (...) { failure = std::current_exception(); }
         blocked.arrive_and_wait();
         try {
@@ -7289,17 +7314,25 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
         drop_seen.arrive_and_wait();
         writable.arrive_and_wait();
         try {
-            if (terminal)
+            if (terminal == 1U)
                 peer.reset();
-            else
+            else {
                 notified = send_workspace_record(peer.get(), acquired);
+                if (terminal == 2U) {
+                    peer.reset();
+                } else {
+                    notified = notified && send_workspace_record(peer.get(), submitted_release);
+                }
+            }
         } catch (...) { failure = std::current_exception(); }
     });
     blocked.arrive_and_wait();
     const auto withdrawal = channel.withdraw(source);
     CHECK(withdrawal.progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+    CHECK_FALSE(channel.claimable(source));
     drop_seen.arrive_and_wait();
     CHECK(backpressured);
+    CHECK(release_backpressured);
     CHECK(dropped);
     // Remove transport fillers directly; they are deliberately not protocol
     // messages delivered to the native channel. Drop already crossed in the
@@ -7315,13 +7348,25 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
     channel.pump();
     if (terminal) {
         CHECK_FALSE(channel.connected());
-        CHECK_FALSE(channel.take_acquisition());
+        if (const auto observed = channel.take_source_transition()) {
+            CHECK(terminal == 2U);
+            CHECK(observed->opcode == abi::Opcode::Acquired);
+        }
+        CHECK_FALSE(channel.take_source_transition());
         CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
         CHECK_FALSE(channel.take_retirement());
         return;
     }
     REQUIRE(notified);
-    REQUIRE(channel.take_acquisition().has_value());
+    const auto acquisition = channel.take_source_transition();
+    REQUIRE(acquisition.has_value());
+    CHECK(acquisition->opcode == abi::Opcode::Acquired);
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    const auto release = channel.take_source_transition();
+    REQUIRE(release.has_value());
+    CHECK(release->opcode == abi::Opcode::ReleaseSubmitted);
+    CHECK(release->offset == acquired.offset);
+    CHECK_FALSE(channel.take_source_transition());
     CHECK_FALSE(channel.claimable(source));
     CHECK_FALSE(channel.take_retirement());
     CHECK_FALSE(channel.read_settled(source, {7U, 99U}, 9U, 1U));
@@ -7353,7 +7398,7 @@ TEST_CASE("Source admission rejects duplicate acquisition and retirement before 
     const auto acquired = WorkspaceChannelFixture::Acquisition(source);
     REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
     fixture.channel.pump();
-    REQUIRE(fixture.channel.take_acquisition().has_value());
+    REQUIRE(fixture.channel.take_source_transition().has_value());
     if (premature_retirement) {
         fixture.Withdraw(source);
         REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::Retired, .id_high = source.high, .id_low = source.low}));
@@ -7363,6 +7408,77 @@ TEST_CASE("Source admission rejects duplicate acquisition and retirement before 
     fixture.channel.pump();
     CHECK(fixture.channel.terminal_error().has_value());
     CHECK_FALSE(fixture.channel.take_retirement());
+}
+
+TEST_CASE("Source release submission requires one exact acquired transfer", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::send_workspace_record;
+    const unsigned invalid = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U);
+    CAPTURE(invalid);
+    WorkspaceChannelFixture fixture;
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    const presentation::WorkspaceSurfaceImportId source{3U, 4U};
+    fixture.AdmitSource(source, arena, fixture.AdmitArena(arena, 1U), 2U);
+    const auto acquired = WorkspaceChannelFixture::Acquisition(source);
+    auto release = acquired;
+    release.opcode = abi::Opcode::ReleaseSubmitted;
+    if (invalid != 0U) {
+        REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+        fixture.channel.pump();
+        REQUIRE(fixture.channel.take_source_transition().has_value());
+    }
+    switch (invalid) {
+        case 0U: break; // Release before any acquisition.
+        case 1U:
+            REQUIRE(send_workspace_record(fixture.peer.get(), release));
+            fixture.channel.pump();
+            REQUIRE(fixture.channel.take_source_transition().has_value());
+            break; // Duplicate release.
+        case 2U: ++release.offset; break;
+        case 3U: ++release.presentation_revision; break;
+        case 4U: ++release.stride; break;
+        case 5U: ++release.size; break;
+        case 6U: ++release.id_low; break;
+        default: FAIL("unknown invalid source release case");
+    }
+    REQUIRE(send_workspace_record(fixture.peer.get(), release));
+    fixture.channel.pump();
+    CHECK(fixture.channel.terminal_error().has_value());
+    CHECK_FALSE(fixture.channel.take_source_transition());
+    CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    CHECK_FALSE(fixture.channel.take_retirement());
+}
+
+TEST_CASE("A release receipt from an earlier transfer cannot settle the next acquisition", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::send_workspace_record;
+    WorkspaceChannelFixture fixture;
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    const presentation::WorkspaceSurfaceImportId source{3U, 4U};
+    fixture.AdmitSource(source, arena, fixture.AdmitArena(arena, 1U), 2U);
+    auto acquired = WorkspaceChannelFixture::Acquisition(source);
+    auto release = acquired;
+    release.opcode = abi::Opcode::ReleaseSubmitted;
+    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    REQUIRE(send_workspace_record(fixture.peer.get(), release));
+    fixture.channel.pump();
+    const auto first = fixture.channel.take_source_transition();
+    const auto second = fixture.channel.take_source_transition();
+    REQUIRE(first.has_value());
+    REQUIRE(second.has_value());
+    CHECK(first->opcode == abi::Opcode::Acquired);
+    CHECK(second->opcode == abi::Opcode::ReleaseSubmitted);
+    REQUIRE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    abi::Record settled{};
+    static_cast<void>(mmltk::testsupport::receive_workspace_record(fixture.peer.get(), settled));
+    ++acquired.offset;
+    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    fixture.channel.pump();
+    REQUIRE(fixture.channel.take_source_transition().has_value());
+    REQUIRE(send_workspace_record(fixture.peer.get(), release));
+    fixture.channel.pump();
+    CHECK(fixture.channel.terminal_error().has_value());
+    CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 2U));
 }
 
 TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[workspace][protocol]") {
@@ -7669,10 +7785,14 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
-    source.Advance();
+    // A pending refresh can outlive its wake while the submitted frame waits.
+    // The next producer notification must wake that submitted work as well.
+    const auto before_coalesced_refresh = writer_state->PumpCount();
     presentation.SourceChanged(source.identity());
+    REQUIRE(writer_state->WaitForPumpAfter(before_coalesced_refresh));
+    source.Advance();
     writer_state->allow_publication.store(true, std::memory_order_release);
-    writer_state->SignalReadiness();
+    presentation.SourceChanged(source.identity());
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 4U; }));
     CHECK(presentation.snapshot().completed_source_revision == 4U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
@@ -9014,7 +9134,7 @@ TEST_CASE("Presentation control remains available during a native wait") {
 TEST_CASE("Presentation release failure publishes once and still stops") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    writer_state->terminal_release_succeeds.store(false, std::memory_order_release);
+    writer_state->terminal_retirement.store(PresentationNativeWriter::Retirement::ReleasedWithFailure, std::memory_order_release);
     PresentationFailureProbe failures;
     auto presentation = make_failure_presentation(source, writer_state, failures);
     PresentationScenario scenario{presentation, writer_state};
@@ -9035,8 +9155,9 @@ TEST_CASE("Presentation release failure publishes once and still stops") {
 TEST_CASE("Presentation retains an unprovable native source read through terminal shutdown") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    writer_state->terminal_release_succeeds.store(false, std::memory_order_release);
-    writer_state->terminal_source_settled.store(false, std::memory_order_release);
+    using Retirement = PresentationNativeWriter::Retirement;
+    const auto outcome = GENERATE(Retirement::RetainedBrowserRead, Retirement::UnsafeFailure);
+    writer_state->terminal_retirement.store(outcome, std::memory_order_release);
     PresentationFailureProbe failures;
     {
         auto presentation = make_failure_presentation(source, writer_state, failures);
@@ -9044,7 +9165,9 @@ TEST_CASE("Presentation retains an unprovable native source read through termina
         presentation.CloseAdmission();
         presentation.BrowserPeerLost();
         CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
-        CHECK(failures.failures() == 1U);
+        CHECK(failures.failures() == (outcome == Retirement::UnsafeFailure ? 1U : 0U));
+        CHECK(writer_state->terminal_custody_notifications.load(std::memory_order_acquire) ==
+              (outcome == Retirement::RetainedBrowserRead ? 1U : 0U));
         CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
         CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
     }

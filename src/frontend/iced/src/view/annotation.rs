@@ -73,6 +73,13 @@ pub struct Component {
 }
 
 impl Component {
+    #[cfg(test)]
+    pub(crate) fn test_install_displayed(&self, snapshot: &crate::generated::AnnotationSnapshot) {
+        self.canvas.test_install_displayed(
+            crate::presentation_surface::AnnotationContent::test_displayed(snapshot),
+        );
+    }
+
     pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
         self.canvas.set_connection(connection);
     }
@@ -618,11 +625,7 @@ mod tests {
         model: &mut ApplicationModel,
         settings: &mut crate::view::settings::SettingsModel,
     ) -> crate::generated::AnnotationPointer {
-        component.canvas.test_install_displayed(
-            crate::presentation_surface::AnnotationContent::test_displayed(
-                model.annotation.snapshot.as_ref().unwrap(),
-            ),
-        );
+        component.test_install_displayed(model.annotation.snapshot.as_ref().unwrap());
         let Some(Outcome::Pointer(pointer)) = component
             .update(
                 model,

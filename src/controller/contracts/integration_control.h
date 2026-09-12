@@ -31,6 +31,7 @@ enum class IntegrationControlKind : std::uint8_t {
     VisibleReadArmed[[= IntegrationCommandDirection{true}]],
     VisibleReadHeld[[= IntegrationCommandDirection{true, true, true}]],
     VisibleReadReleaseRequested[[= IntegrationCommandDirection{false, true, true}]],
+    GalleryReadCompletionHeld[[= IntegrationCommandDirection{true, true, true}]],
 };
 
 template <auto Kind>

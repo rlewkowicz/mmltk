@@ -107,9 +107,11 @@ enum class PresentationShutdownResult : std::uint8_t {
 };
 class PresentationNativeWriter {
    public:
-    struct Retirement final {
-        bool all_released = true;
-        bool safe_to_destroy = true;
+    enum class Retirement : std::uint8_t {
+        Released,
+        RetainedBrowserRead,
+        UnsafeFailure,
+        ReleasedWithFailure,
     };
     virtual ~PresentationNativeWriter() = default;
     virtual void Submit(PresentationSubmittedSource, const VisualSourceReader&) = 0;
@@ -120,6 +122,7 @@ class PresentationNativeWriter {
     virtual void SetApplicationPeerConnected(bool) noexcept = 0;
     virtual void SetExpectedBrowserProcessGroup(pid_t) = 0;
     [[nodiscard]] virtual Retirement BrowserPeerLost() noexcept = 0;
+    virtual void TerminalCustodyInstalled() noexcept {}
 };
 using PresentationNativeWriterFactory = std::function<std::unique_ptr<PresentationNativeWriter>()>;
 // Acceptance-only custody of a completion notification. Physical GPU work and

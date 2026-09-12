@@ -557,6 +557,7 @@ class ExploreSystem::Impl final {
             }
             if (desired_) {
                 desired_.reset();
+                state_.render_pending = false;
                 AdvanceRevision();
             }
             if (state_.busy && !state_.cancellation_requested) {
@@ -589,6 +590,10 @@ class ExploreSystem::Impl final {
         latest_generation_->store(generation, std::memory_order_release);
         active_gallery_generation_ = 0U;
         desired_.reset();
+        if (state_.render_pending) {
+            state_.render_pending = false;
+            AdvanceRevision();
+        }
         pending_discrete_.reset();
         reserved_output_ = {};
         retained_gallery_ = {};
@@ -696,10 +701,15 @@ class ExploreSystem::Impl final {
         desired_ = std::move(request);
         if (!worker_.SubmitLatest([this](auto& runtime, auto stop) { return RunDesired(runtime, stop); })) {
             desired_.reset();
+            if (state_.render_pending) {
+                state_.render_pending = false;
+                AdvanceRevision();
+            }
             throw contracts::UnavailableError("Explore desired-product ingress is stopped");
         }
-        if (viewport_update) {
-            state_.viewport_result = desired_->snapshot.viewport_result;
+        if (viewport_update) state_.viewport_result = desired_->snapshot.viewport_result;
+        if (viewport_update || !state_.render_pending) {
+            state_.render_pending = true;
             AdvanceRevision();
         }
         return state_;
@@ -859,6 +869,7 @@ class ExploreSystem::Impl final {
                 const bool discrete_pending = state_.busy;
                 CompleteProduct(settled, *rendered);
                 settled.busy = discrete_pending;
+                settled.render_pending = false;
             }
             const ExploreFilterUpdate policy{.filter = settled.filter, .overlay = settled.overlay};
             const auto augmentation = settled.augmentation.enabled;
@@ -1584,6 +1595,7 @@ class ExploreSystem::Impl final {
         configured_algorithm_ = nullptr;
         if (!desired_) latest_generation_->store(active_gallery_generation_, std::memory_order_release);
         auto restored = state_;
+        restored.render_pending = desired_ != nullptr;
         const bool was_busy = restored.busy;
         Complete(restored);
         if (preserve_busy) restored.busy = was_busy;
@@ -1628,6 +1640,7 @@ class ExploreSystem::Impl final {
                 failed = UnavailableSnapshotLocked();
             }
             failed.failure = detail;
+            failed.render_pending = false;
             failed.failure_kind =
                 kind == ExploreFailureKind::Operation && !runtime_initialized_ ? ExploreFailureKind::RuntimeInitialization : kind;
             state_ = failed;

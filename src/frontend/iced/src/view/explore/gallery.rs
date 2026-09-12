@@ -53,7 +53,17 @@ pub(super) fn update(
     message: Message,
 ) -> Result<Option<Outcome>, String> {
     Ok(Some(match message {
-        Message::ScrollRequested(offset) => Outcome::ScrollRequested(offset),
+        Message::ScrollRequested(offset) => {
+            crate::integration_control::report_gallery_scroll("requested", || {
+                [
+                    f64::from(offset),
+                    f64::from(state.gallery_first_row(0)),
+                    f64::from(state.gallery_row_fraction()),
+                    f64::from(snapshot.map_or(0, |value| value.viewport.firstrow)),
+                ]
+            });
+            Outcome::ScrollRequested(offset)
+        }
         Message::Overlay(message) => {
             Outcome::OverlayUpdated(super::overlay::update(state, snapshot, message)?)
         }
@@ -442,6 +452,14 @@ fn gallery_viewport<'a>(
             let offset = viewport.absolute_offset().y;
             let first_row = logical_geometry.first_row_for_offset(offset);
             let row_fraction = (offset / logical_geometry.row_extent()).fract();
+            crate::integration_control::report_gallery_scroll("observed", || {
+                [
+                    f64::from(offset),
+                    f64::from(logical_geometry.row_extent()),
+                    f64::from(first_row),
+                    f64::from(matching),
+                ]
+            });
             let request = super::state::gallery_geometry_at_fraction(
                 width,
                 height,

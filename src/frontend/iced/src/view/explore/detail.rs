@@ -68,32 +68,53 @@ pub(super) fn view<'a>(
     let original = state
         .desired_original
         .unwrap_or(snapshot.detail.showoriginaldimensions);
-    let surface = surface.map(|mut surface| {
-        if !shown.as_ref().is_some_and(|shown| {
-            surface.frame.is_some_and(|frame| {
-                model
-                    .presentation
+    let retained = shown
+        .as_ref()
+        .and_then(|shown| crate::presentation_surface::retained_detail_for(model, shown));
+    let surface = surface
+        .map(|surface| {
+            if surface.frame.is_some_and(|frame| {
+                shown
                     .as_ref()
-                    .is_some_and(|presentation| frame.matches_completed(presentation))
-                    && frame.matches_content(shown)
-            })
-        }) {
-            surface.frame = None;
-        }
-        surface.viewer_identity = snapshot
-            .selectedimage
-            .map(|image| (snapshot.dataset.identity, image));
-        surface.fit_revision = state.fit_revision;
-        surface.crop = shown.as_ref().filter(|_| original).map(|frame| {
-            [
-                frame.content.x,
-                frame.content.y,
-                frame.content.width,
-                frame.content.height,
-            ]
+                    .is_some_and(|shown| frame.matches_content(shown))
+                    && model
+                        .presentation
+                        .as_ref()
+                        .is_some_and(|snapshot| frame.matches_completed(snapshot))
+            }) {
+                surface
+            } else {
+                retained.unwrap_or(surface)
+            }
+        })
+        .or(retained)
+        .map(|mut surface| {
+            if !shown.as_ref().is_some_and(|shown| {
+                surface.frame.is_some_and(|frame| {
+                    (model
+                        .presentation
+                        .as_ref()
+                        .is_some_and(|presentation| frame.matches_completed(presentation))
+                        || retained.is_some_and(|retained| retained.frame == Some(frame)))
+                        && frame.matches_content(shown)
+                })
+            }) {
+                surface.frame = None;
+            }
+            surface.viewer_identity = snapshot
+                .selectedimage
+                .map(|image| (snapshot.dataset.identity, image));
+            surface.fit_revision = state.fit_revision;
+            surface.crop = shown.as_ref().filter(|_| original).map(|frame| {
+                [
+                    frame.content.x,
+                    frame.content.y,
+                    frame.content.width,
+                    frame.content.height,
+                ]
+            });
+            surface
         });
-        surface
-    });
     let image: Element<'a, Message> = surface.map_or_else(
         || {
             container(text("Preparing selected GPU detail"))

@@ -237,7 +237,7 @@ mod route_tests {
     ) {
         app.reduce_reply(IntentReply {
             correlation,
-            result: Ok(snapshot.into_application_value()),
+            result: Ok(snapshot.into_application_transport_value()),
         });
     }
 
@@ -451,6 +451,7 @@ mod tests {
         annotation.frame =
             crate::view_model::test_support::visual_frame(PresentationSourceKind::Annotation, 1);
         app.workspace.rebase_annotation(&app.model);
+        app.workspace.test_install_annotation_displayed(&app.model);
     }
 
     fn local_annotation_press(app: &mut App) -> crate::generated::AnnotationPointer {

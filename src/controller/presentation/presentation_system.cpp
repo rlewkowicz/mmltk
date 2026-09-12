@@ -97,9 +97,11 @@ class PresentationSystem::Impl final {
         bool wake = false;
         {
             std::scoped_lock lock(mutex_);
-            if (!stopping_ && application_peer_connected_ && state_.selected == source && !pending_) {
+            if (!stopping_ && application_peer_connected_ && state_.selected == source) {
                 wake = true;
-                pending_ = Pending{.source = source, .generation = selection_generation_, .force = false};
+                // Coalesce demand without suppressing the producer's readiness
+                // edge: an in-flight publication may still await an older frame.
+                if (!pending_) pending_ = Pending{.source = source, .generation = selection_generation_, .force = false};
             }
         }
         if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation source notification failed")));
@@ -457,15 +459,19 @@ class PresentationSystem::Impl final {
             pending_.reset();
             in_flight_.reset();
         }
-        const auto result = retired ? retired->BrowserPeerLost() : PresentationNativeWriter::Retirement{};
-        if (result.safe_to_destroy) {
+        using Retirement = PresentationNativeWriter::Retirement;
+        const auto result = retired ? retired->BrowserPeerLost() : Retirement::Released;
+        if (result == Retirement::Released || result == Retirement::ReleasedWithFailure) {
             retired.reset();
         } else {
             // Capacity and shared custody are reserved before the worker starts.
             // A terminal receiver retains its borrowed source and CUDA resources.
-            std::move(retirement_).Install(gpu::TerminalCudaCustody::Share(std::move(retired)), cudaErrorUnknown);
+            auto* retained_writer = retired.get();
+            std::move(retirement_).Install(gpu::TerminalCudaCustody::Share(std::move(retired)),
+                                           result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
+            if (result == Retirement::RetainedBrowserRead) retained_writer->TerminalCustodyInstalled();
         }
-        if (!result.all_released) Failed({});
+        if (result == Retirement::UnsafeFailure || result == Retirement::ReleasedWithFailure) Failed({});
     }
 
     void Publish(event_type event) noexcept { publish_visual_event_noexcept(events_, std::move(event)); }

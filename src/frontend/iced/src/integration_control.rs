@@ -231,6 +231,34 @@ fn upscale_acceptance_label(kernel: crate::generated::UpscaleKernel) -> &'static
     }
 }
 
+// Fixture demand windows are disjoint and separated beyond the native four
+// neighbour rows. This does not change the producer's admission/cache policy.
+const COLD_GALLERY_ROW_GAP: u32 = 5;
+
+fn cold_gallery_scroll_offset(
+    row: u32,
+    viewport: &crate::generated::ExploreViewport,
+    matching: u32,
+    row_extent: f32,
+) -> Option<f32> {
+    if !row_extent.is_finite() || row_extent <= 0.0 || row == 0 || viewport.columns == 0 {
+        return None;
+    }
+    let total_rows = matching.div_ceil(viewport.columns);
+    let sweep_rows = (768.0 / row_extent).ceil() as u32;
+    if row
+        .saturating_add(viewport.rowcount)
+        .saturating_add(sweep_rows)
+        .saturating_add(2)
+        >= total_rows
+    {
+        return None;
+    }
+    // A fractional row avoids floating rounding selecting the preceding row.
+    let offset = row_extent * (row as f32 + 0.25);
+    offset.is_finite().then_some(offset)
+}
+
 fn explore_order_signature(indices: &[u32]) -> u64 {
     indices
         .iter()
@@ -1773,6 +1801,17 @@ pub(crate) fn report_annotation_gesture(detail: &str, values: [f64; 4]) {
     });
 }
 
+pub(crate) fn report_gallery_scroll(detail: &str, values: impl FnOnce() -> [f64; 4]) {
+    reporting::emit(|sink| {
+        sink.record(
+            "integration.gallery_scroll",
+            EXPLORE_GALLERY,
+            detail,
+            values(),
+        )
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SampleablePresentation {
     source_revision: u64,
@@ -1799,8 +1838,23 @@ fn sampleable_presentation(
     let (source, source_revision) = viewed.as_ref().map_or((source, source_revision), |viewed| {
         (viewed.source.kind, viewed.revision)
     });
-    let presentation = model.presentation.as_ref()?;
     let frame = frame?;
+    if let Some(viewed) = model
+        .viewed_explore_frame()
+        .filter(|viewed| viewed.source.kind == source && viewed.revision == source_revision)
+        && let Some(retained) = crate::presentation_surface::retained_detail_for(model, &viewed)
+        && retained.frame == Some(frame)
+    {
+        return Some(SampleablePresentation {
+            source_revision,
+            presentation_revision: frame.presentation_revision,
+            content_width: frame.content_width,
+            content_height: frame.content_height,
+            capability_width: retained.width,
+            capability_height: retained.height,
+        });
+    }
+    let presentation = model.presentation.as_ref()?;
     (presentation.completed.source.kind == source
         && presentation.completed.revision == source_revision
         && frame.content_sequence == source_revision
@@ -2109,6 +2163,8 @@ enum Phase {
         revision: u64,
         frame_revision: u64,
     },
+    GalleryColdRead(u32),
+    AwaitGalleryColdRead(u32, u64),
     GallerySweep,
     AwaitGallerySweep,
     GalleryLaterReady,
@@ -2297,6 +2353,8 @@ impl Phase {
             | Self::AwaitExploreAugmentationReroll { .. }
             | Self::AwaitExploreReshuffle { .. }
             | Self::AwaitGalleryPatch { .. }
+            | Self::GalleryColdRead(_)
+            | Self::AwaitGalleryColdRead(_, _)
             | Self::GallerySweep
             | Self::AwaitGallerySweep
             | Self::GalleryLaterReady
@@ -2576,6 +2634,8 @@ pub struct Controller {
     copy_product_cancel: bool,
     copy_product_cancelled: bool,
     copy_product_frame: u64,
+    copy_product_ui_revision: u64,
+    copy_product_settlement: annotation_product::Settlement,
     copy_compact: bool,
     copy_original_scale: f32,
     copy_requested_scale: f32,
@@ -2591,6 +2651,7 @@ pub struct Controller {
     copy_after: Option<crate::generated::AnnotationObject>,
     copy_objects: usize,
     copy_categories: Vec<crate::generated::ArtifactClassName>,
+    gallery_completion_held: Option<(u64, u32)>,
     sweep_baseline: Option<(u64, crate::generated::ExploreViewport, Option<u32>)>,
     explore_dataset_pane: Option<Rectangle>,
     explore_details_pane: Option<Rectangle>,
@@ -2637,7 +2698,7 @@ pub struct Controller {
     ui_scale_baseline: f32,
     ui_scale_first: Option<f32>,
     input_scale: f32,
-    oversized_capacity: Option<crate::generated::VisualExtent>,
+    oversized_gallery: Option<(iced::Size, crate::generated::VisualExtent)>,
     selection_grid: Option<(u32, u32, u32, u64, u64)>,
 }
 
@@ -2740,6 +2801,8 @@ impl Controller {
             copy_product_cancel: false,
             copy_product_cancelled: false,
             copy_product_frame: 0,
+            copy_product_ui_revision: 0,
+            copy_product_settlement: annotation_product::Settlement::RenderedFrame,
             copy_compact: false,
             copy_original_scale: 1.0,
             copy_requested_scale: 1.0,
@@ -2755,6 +2818,7 @@ impl Controller {
             copy_after: None,
             copy_objects: 0,
             copy_categories: Vec::new(),
+            gallery_completion_held: None,
             sweep_baseline: None,
             explore_dataset_pane: None,
             explore_details_pane: None,
@@ -2801,7 +2865,7 @@ impl Controller {
             ui_scale_baseline: 1.0,
             ui_scale_first: None,
             input_scale: 1.0,
-            oversized_capacity: None,
+            oversized_gallery: None,
             selection_grid: None,
         }
     }
@@ -2876,6 +2940,17 @@ impl Controller {
             {
                 self.fail("invalid capacity control identity");
                 return Err("invalid capacity control identity");
+            }
+            if receipt.kind == Kind::GalleryReadCompletionHeld {
+                if self.gallery_completion_held.is_some()
+                    || matches!(self.phase, Phase::Disabled | Phase::Failed)
+                {
+                    self.fail("duplicate or inactive gallery completion hold");
+                    return Err("duplicate or inactive gallery completion hold");
+                }
+                self.gallery_completion_held =
+                    Some((receipt.readgeneration, receipt.compiledindex));
+                return Ok(());
             }
             self.phase = match (receipt.kind, &self.phase) {
                 (Kind::VisibleReadArmed, Phase::AwaitVisibleReadArm(index)) => {
@@ -3241,6 +3316,17 @@ impl Controller {
         true
     }
 
+    fn copy_product_settled(&self, snapshot: &crate::generated::AnnotationSnapshot) -> bool {
+        match self.copy_product_settlement {
+            annotation_product::Settlement::NativeUi => {
+                snapshot.uirevision > self.copy_product_ui_revision
+            }
+            annotation_product::Settlement::RenderedFrame => {
+                snapshot.frame.revision > self.copy_product_frame
+            }
+        }
+    }
+
     fn prepare_annotation_probe(
         &mut self,
         source: u64,
@@ -3254,6 +3340,19 @@ impl Controller {
         let Some(output) = probe_output("workflow.visual.workspace") else {
             return false;
         };
+        let Some(frame) = output
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.surface.frame)
+        else {
+            return false;
+        };
+        if frame.content_sequence != source
+            || frame.presentation_revision != presentation
+            || [frame.content_width, frame.content_height] != extent
+        {
+            return false;
+        }
         if self.annotation_pixels_pending == output.receipt {
             return false;
         }
@@ -6188,8 +6287,22 @@ impl Controller {
                     return Task::none();
                 }
                 if matches!(self.phase, Phase::AwaitExploreExactGridPatch { .. }) {
+                    let Some((size, maximum_extent)) = self.oversized_gallery.take() else {
+                        self.fail("oversized Explore measurement lacks its original geometry");
+                        return Task::none();
+                    };
                     self.phase = Phase::ExploreDatasetPane;
-                    return self.arm(EXPLORE_DATASET_PANE);
+                    // The capacity probe overrides the component's measurement,
+                    // not the sensor's physical layout. No resize event is owed
+                    // when the real bounds remain unchanged.
+                    return explore_message(explore::Message::Gallery(
+                        explore::gallery::Message::Measured {
+                            size,
+                            maximum_extent,
+                            columns: snapshot.viewport.columns.max(1),
+                        },
+                    ))
+                    .chain(self.arm(EXPLORE_DATASET_PANE));
                 }
                 reporting::emit(|sink| {
                     sink.record(
@@ -6204,9 +6317,12 @@ impl Controller {
                         ],
                     )
                 });
+                let Some(size) = router.explore_gallery_size() else {
+                    return Task::none();
+                };
                 let columns = snapshot.viewport.columns.max(1);
                 let capacity = snapshot.maximumatlasextent.clone();
-                self.oversized_capacity = Some(capacity.clone());
+                self.oversized_gallery = Some((size, capacity.clone()));
                 self.phase = Phase::AwaitExploreExactGrid(snapshot.revision);
                 Task::done(RootMessage::Workspace(
                     crate::view::router::Message::Explore(explore::Message::Gallery(
@@ -6222,7 +6338,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let Some(capacity) = self.oversized_capacity.as_ref() else {
+                let Some((_, capacity)) = self.oversized_gallery.as_ref() else {
                     self.fail("oversized Explore capacity was not retained");
                     return Task::none();
                 };
@@ -6598,8 +6714,100 @@ impl Controller {
                     snapshot.viewport.clone(),
                     snapshot.focusedimage,
                 ));
-                self.phase = Phase::GallerySweep;
-                self.arm(EXPLORE_GALLERY)
+                if self.viewer_scenario.is_empty() {
+                    self.phase = Phase::GalleryColdRead(
+                        snapshot
+                            .viewport
+                            .firstrow
+                            .saturating_add(snapshot.viewport.rowcount)
+                            .saturating_add(COLD_GALLERY_ROW_GAP),
+                    );
+                    Task::none()
+                } else {
+                    self.phase = Phase::GallerySweep;
+                    self.arm(EXPLORE_GALLERY)
+                }
+            }
+            Phase::GalleryColdRead(row) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if model.has_explore_pending() || !model.explore_viewport_available() {
+                    return Task::none();
+                }
+                // Leave space for the existing eight 96px wheels, the Later
+                // row and the complete viewport. The five-row separation is
+                // beyond the native four-neighbour prefetch window.
+                let Some(offset) = cold_gallery_scroll_offset(
+                    row,
+                    &snapshot.viewport,
+                    snapshot.order.matchingcount,
+                    self.atlas_row_extent,
+                ) else {
+                    self.fail("Explore fixture has no cold interior viewport with sweep room");
+                    return Task::none();
+                };
+                // A disjoint jump hides the incumbent atlas. First draw its
+                // completed publication so the retained fallback can advance
+                // and release the previous physical slot.
+                if fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none() {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitGalleryColdRead(row, snapshot.gallery.generation);
+                iced::widget::operation::scroll_to(
+                    EXPLORE_GALLERY,
+                    AbsoluteOffset { x: 0.0, y: offset },
+                )
+            }
+            Phase::AwaitGalleryColdRead(row, prior_generation) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery
+                    || snapshot.viewport.firstrow != row
+                    || snapshot.gallery.generation <= prior_generation
+                    || snapshot.gallery.layout.firstrow != row
+                    || snapshot.gallery.layout.columns != snapshot.viewport.columns
+                    || snapshot.gallery.layout.rowcount != snapshot.viewport.rowcount
+                    || model.has_explore_pending()
+                    || !model.explore_viewport_available()
+                {
+                    return Task::none();
+                }
+                if let Some((generation, index)) = self.gallery_completion_held {
+                    if snapshot.gallery.generation < generation {
+                        return Task::none();
+                    }
+                    if snapshot.gallery.generation != generation
+                        || !snapshot.order.visibleindices.contains(&index)
+                    {
+                        self.fail(
+                            "held gallery completion does not match the accepted cold viewport",
+                        );
+                        return Task::none();
+                    }
+                    self.sweep_baseline = Some((
+                        snapshot.revision,
+                        snapshot.viewport.clone(),
+                        snapshot.focusedimage,
+                    ));
+                    self.phase = Phase::GallerySweep;
+                    return self.arm(EXPLORE_GALLERY);
+                }
+                // Reshuffle retains pixel identities. A previously unseen
+                // order range can therefore already be cached. Only a fully
+                // ready accepted range permits moving to the next disjoint
+                // range; unfinished reads wait for their actual completion.
+                if !snapshot.gallery.slots.is_empty()
+                    && snapshot.gallery.slots.len() == snapshot.order.visibleindices.len()
+                    && snapshot.gallery.slots.iter().all(|ready| *ready)
+                {
+                    self.phase = Phase::GalleryColdRead(
+                        row.saturating_add(snapshot.viewport.rowcount)
+                            .saturating_add(COLD_GALLERY_ROW_GAP),
+                    );
+                }
+                Task::none()
             }
             Phase::GallerySweep => self.arm(EXPLORE_GALLERY),
             Phase::AwaitGallerySweep => {
@@ -7856,9 +8064,11 @@ impl Controller {
                 presentation_revision,
             } => {
                 let Some(upscale) = model.current_upscale() else {
+                    reporting::upscale_settlement(self, model, frame, "current_upscale_missing");
                     return Task::none();
                 };
                 if upscale.kernel != crate::generated::UPSCALE_KERNEL_VALUES[kernel] {
+                    reporting::upscale_settlement(self, model, frame, "requested_kernel_mismatch");
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
@@ -7867,14 +8077,27 @@ impl Controller {
                     crate::generated::PresentationSourceKind::Upscale,
                     upscale.frame.revision,
                 ) else {
+                    reporting::upscale_settlement(
+                        self,
+                        model,
+                        frame,
+                        "sampleable_presentation_mismatch",
+                    );
                     return Task::none();
                 };
                 if upscale.busy || !upscale.ready {
+                    reporting::upscale_settlement(self, model, frame, "native_work_pending");
                     return Task::none();
                 }
                 if upscale.frame.revision != upscale_frame_revision
                     && sampleable.presentation_revision <= presentation_revision
                 {
+                    reporting::upscale_settlement(
+                        self,
+                        model,
+                        frame,
+                        "presentation_not_newer_than_baseline",
+                    );
                     return Task::none();
                 }
                 let Some(expected_width) = source_width.checked_mul(4) else {
@@ -7926,6 +8149,7 @@ impl Controller {
                     )
                 });
                 if model.displayed_upscale_kernel() != Some(upscale.kernel) {
+                    reporting::upscale_settlement(self, model, frame, "displayed_kernel_mismatch");
                     return Task::none();
                 }
                 let Some((drawn, source, viewer)) =
@@ -7934,15 +8158,24 @@ impl Controller {
                             && *source == upscale.frame.revision
                     })
                 else {
+                    reporting::upscale_settlement(
+                        self,
+                        model,
+                        frame,
+                        "matching_viewer_draw_missing",
+                    );
                     return Task::none();
                 };
                 let Some(button) = self.upscale_button else {
+                    reporting::upscale_settlement(self, model, frame, "method_button_missing");
                     return Task::none();
                 };
                 let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else {
+                    reporting::upscale_settlement(self, model, frame, "draw_probe_receipt_missing");
                     return Task::none();
                 };
                 if self.upscale_pixel_pending.as_ref() != Some(&receipt) {
+                    reporting::upscale_settlement(self, model, frame, "probe_receipt_not_current");
                     if let Some(output) = self.prepare_upscale_probe(viewer.image, source, drawn) {
                         sample_upscale_pixels(output, viewer.image, button, source, drawn);
                     }
@@ -7950,9 +8183,16 @@ impl Controller {
                 }
                 let Some((pixel_source, pixel_presentation, checksum, blue)) = self.upscale_pixels
                 else {
+                    reporting::upscale_settlement(self, model, frame, "probe_pixels_pending");
                     return Task::none();
                 };
                 if pixel_source != source || pixel_presentation != drawn {
+                    reporting::upscale_settlement(
+                        self,
+                        model,
+                        frame,
+                        "probe_pixels_frontier_mismatch",
+                    );
                     if let Some(output) = self.prepare_upscale_probe(viewer.image, source, drawn) {
                         sample_upscale_pixels(output, viewer.image, button, source, drawn);
                     }
@@ -7972,6 +8212,12 @@ impl Controller {
                 });
                 if let Some(revision) = self.upscale_repeat_revision {
                     if !self.upscale_repeat_observed {
+                        reporting::upscale_settlement(
+                            self,
+                            model,
+                            frame,
+                            "repeat_request_not_observed",
+                        );
                         return Task::none();
                     }
                     if upscale.revision != revision {
@@ -7993,6 +8239,7 @@ impl Controller {
                     if !click(button) {
                         self.fail("Upscale completed method re-click failed");
                     }
+                    reporting::upscale_settlement(self, model, frame, "repeat_request_dispatched");
                     return Task::none();
                 }
                 if self.upscale_cache_pass {
@@ -8017,9 +8264,21 @@ impl Controller {
                         && self.viewer_continuity_request.is_none()
                     {
                         let Some(snapshot) = model.settings_snapshot.as_ref() else {
+                            reporting::upscale_settlement(
+                                self,
+                                model,
+                                frame,
+                                "continuity_settings_missing",
+                            );
                             return Task::none();
                         };
                         if !route_edit_available(model, settings) {
+                            reporting::upscale_settlement(
+                                self,
+                                model,
+                                frame,
+                                "continuity_route_unavailable",
+                            );
                             return Task::none();
                         }
                         self.viewer_continuity_request = model.explore.requested_upscale.clone();
@@ -8060,6 +8319,12 @@ impl Controller {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
+                        reporting::upscale_settlement(
+                            self,
+                            model,
+                            frame,
+                            "annotation_handoff_draw_missing",
+                        );
                         return Task::none();
                     }
                     self.phase = Phase::OpenAnnotation;
@@ -8072,6 +8337,12 @@ impl Controller {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
+                        reporting::upscale_settlement(
+                            self,
+                            model,
+                            frame,
+                            "semantic_handoff_draw_missing",
+                        );
                         return Task::none();
                     }
                     self.phase = Phase::ViewerNoAspect;
@@ -8082,6 +8353,12 @@ impl Controller {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
+                        reporting::upscale_settlement(
+                            self,
+                            model,
+                            frame,
+                            "rapid_completion_draw_missing",
+                        );
                         return Task::none();
                     }
                     reporting::emit(|sink| {
@@ -8654,6 +8931,10 @@ impl Controller {
                     )));
                 };
                 self.copy_product_frame = snapshot.frame.revision;
+                // Commands and completed reads can leave pixels unchanged.
+                // Scene/editor matching and exact draw evidence remain required.
+                self.copy_product_ui_revision = snapshot.uirevision;
+                self.copy_product_settlement = action.settlement;
                 self.copy_product_gesture = action.gesture;
                 self.copy_product_cancel = action.cancel;
                 self.copy_product_cancelled = false;
@@ -8831,10 +9112,32 @@ impl Controller {
                 };
                 if snapshot.busy
                     || (self.copy_step != 8 && snapshot.ui.interactionrevision <= revision)
-                    || (self.copy_step == 8 && snapshot.frame.revision <= self.copy_product_frame)
+                    || (self.copy_step == 8 && !self.copy_product_settled(snapshot))
                     || snapshot.ui.editor.tool != tool
                     || !model.annotation_edit_available()
                 {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.annotation_tool_wait",
+                            &annotation::tool_id(tool),
+                            &format!(
+                                "observed={:?}; busy={}; editable={}; copy_step={}; ui_revision={}; settlement={:?}; ui_baseline={}",
+                                snapshot.ui.editor.tool,
+                                snapshot.busy,
+                                model.annotation_edit_available(),
+                                self.copy_step,
+                                snapshot.uirevision,
+                                self.copy_product_settlement,
+                                self.copy_product_ui_revision,
+                            ),
+                            [
+                                revision as f64,
+                                snapshot.ui.interactionrevision as f64,
+                                self.copy_product_frame as f64,
+                                snapshot.frame.revision as f64,
+                            ],
+                        )
+                    });
                     return Task::none();
                 }
                 reporting::emit(|sink| {
@@ -8905,6 +9208,44 @@ impl Controller {
                         return Task::none();
                     }
                 }
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_settlement",
+                        ANNOTATION_SURFACE,
+                        &format!(
+                            "phase={:?}; editable={}; busy={}; ui_revision={}; interaction={}; settlement={:?}; ui_baseline={}; epoch={}/{}; scene={}/{}; editor_match={}; sampleable={:?}; presentation={:?}; drawn={:?}; location_pending={}; probe_pending={}",
+                            self.phase,
+                            model.annotation_edit_available(),
+                            snapshot.busy,
+                            snapshot.uirevision,
+                            snapshot.ui.interactionrevision,
+                            self.copy_product_settlement,
+                            self.copy_product_ui_revision,
+                            snapshot.inputdocumentepoch,
+                            snapshot.rendered.documentepoch,
+                            snapshot.ui.scenerevision,
+                            snapshot.rendered.scenerevision,
+                            snapshot.ui.editor == snapshot.rendered.editor,
+                            self.annotation_frame_ready,
+                            model.presentation.as_ref().map(|state| (
+                                state.completed.source.kind,
+                                state.completed.revision,
+                                state.presentationrevision,
+                                state.browsercompletedsample,
+                                state.timelineready,
+                            )),
+                            self.annotation_drawn,
+                            self.location_pending,
+                            self.annotation_pixels_pending.is_some(),
+                        ),
+                        [
+                            self.copy_product_frame as f64,
+                            snapshot.frame.revision as f64,
+                            revision as f64,
+                            self.copy_step as f64,
+                        ],
+                    )
+                });
                 let Some(presentation) = model.presentation.as_ref() else {
                     return Task::none();
                 };
@@ -8914,7 +9255,7 @@ impl Controller {
                 let presentation_revision = sampleable.presentation_revision;
                 if !model.annotation_edit_available()
                     || (self.copy_step != 8 && snapshot.ui.interactionrevision <= revision)
-                    || (self.copy_step == 8 && snapshot.frame.revision <= self.copy_product_frame)
+                    || (self.copy_step == 8 && !self.copy_product_settled(snapshot))
                     || sampleable.source_revision != snapshot.frame.revision
                     || presentation.completed.source.kind
                         != crate::generated::PresentationSourceKind::Annotation
@@ -8925,6 +9266,25 @@ impl Controller {
                     || self.annotation_drawn
                         != Some((presentation_revision, snapshot.frame.revision))
                 {
+                    return Task::none();
+                }
+                if snapshot.rendered.documentepoch != snapshot.inputdocumentepoch
+                    || snapshot.rendered.scenerevision != snapshot.ui.scenerevision
+                    || snapshot.rendered.editor != snapshot.ui.editor
+                {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.annotation_render_wait",
+                            ANNOTATION_SURFACE,
+                            "logical-scene-and-rendered-scene",
+                            [
+                                snapshot.inputdocumentepoch as f64,
+                                snapshot.rendered.documentepoch as f64,
+                                snapshot.ui.scenerevision as f64,
+                                snapshot.rendered.scenerevision as f64,
+                            ],
+                        )
+                    });
                     return Task::none();
                 }
                 if self.copy_step == 8 && self.copy_product_cancel && !self.copy_product_cancelled {
@@ -9208,6 +9568,194 @@ mod tests {
     }
 
     #[test]
+    fn cold_gallery_walk_waits_for_new_complete_viewports_and_exact_held_receipts() {
+        use crate::generated::{IntegrationControlKind as Kind, IntegrationControlReceipt};
+        initialize_reporting(false, false);
+        let mut driver = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            String::new(),
+        );
+        let (mut model, frame) = crate::view_model::test_support::explore_presentation();
+        model.connection = ConnectionState::Connected;
+        model.presentation.as_mut().unwrap().timelineready = 1;
+        let settings = crate::view::settings::SettingsModel::default();
+        let router = crate::view::router::Router::default();
+        let drive = |driver: &mut Controller, model: &ApplicationModel| {
+            drop(driver.advance(
+                model,
+                &settings,
+                1.0,
+                &router,
+                FeatureId::Explore,
+                Some(frame),
+            ));
+        };
+        {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.mode = crate::generated::ExploreMode::Gallery;
+            snapshot.ready = true;
+            snapshot.busy = false;
+            snapshot.viewport.firstrow = 10;
+            snapshot.viewport.rowcount = 2;
+            snapshot.viewport.columns = 3;
+            snapshot.gallery.layout.firstrow = 10;
+            snapshot.gallery.layout.columns = 3;
+            snapshot.gallery.layout.rowcount = 2;
+            snapshot.gallery.generation = 4;
+            snapshot.gallery.slots = vec![true; 6];
+            snapshot.order.visibleindices = vec![17, 18, 19, 20, 21, 22];
+            snapshot.order.matchingcount = 300;
+        }
+        driver.atlas_row_extent = 160.0;
+        driver.phase = Phase::AwaitGalleryColdRead(10, 4);
+        drive(&mut driver, &model);
+        assert!(
+            matches!(driver.phase, Phase::AwaitGalleryColdRead(10, 4)),
+            "unchanged demand cannot advance"
+        );
+        model.explore.snapshot.as_mut().unwrap().gallery.generation = 5;
+        model.explore.snapshot.as_mut().unwrap().gallery.slots[0] = false;
+        drive(&mut driver, &model);
+        assert!(
+            matches!(driver.phase, Phase::AwaitGalleryColdRead(10, 4)),
+            "pending read cannot advance"
+        );
+        model.explore.snapshot.as_mut().unwrap().gallery.slots[0] = true;
+        drive(&mut driver, &model);
+        assert!(matches!(driver.phase, Phase::GalleryColdRead(17)));
+        drive(&mut driver, &model);
+        assert!(
+            matches!(driver.phase, Phase::GalleryColdRead(17)),
+            "a sampleable publication must actually draw before a disjoint jump"
+        );
+        driver.gallery_drawn = Some((frame.presentation_revision, frame.content_sequence - 1));
+        drive(&mut driver, &model);
+        assert!(matches!(driver.phase, Phase::GalleryColdRead(17)));
+        driver.gallery_drawn = Some((frame.presentation_revision, frame.content_sequence));
+        drive(&mut driver, &model);
+        assert!(matches!(driver.phase, Phase::AwaitGalleryColdRead(17, 5)));
+        let receipt = IntegrationControlReceipt {
+            kind: Kind::GalleryReadCompletionHeld,
+            sequence: 1,
+            progress: 0,
+            failureline: 0,
+            readgeneration: 6,
+            compiledindex: 47,
+        };
+        driver.receive_control(receipt.clone()).unwrap();
+        drive(&mut driver, &model);
+        assert!(
+            matches!(driver.phase, Phase::AwaitGalleryColdRead(17, 5)),
+            "early receipt must retain its identity"
+        );
+        {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.viewport.firstrow = 17;
+            snapshot.gallery.layout.firstrow = 17;
+            snapshot.gallery.generation = 6;
+            snapshot.gallery.slots[0] = false;
+            snapshot.order.visibleindices[0] = 47;
+        }
+        drive(&mut driver, &model);
+        assert!(matches!(driver.phase, Phase::GallerySweep));
+        assert_eq!(driver.gallery_completion_held, Some((6, 47)));
+        assert!(driver.receive_control(receipt).is_err());
+        assert!(matches!(driver.phase, Phase::Failed));
+
+        for held in [(5, 47), (6, 99)] {
+            let mut mismatch = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                "512".into(),
+                String::new(),
+            );
+            mismatch.phase = Phase::AwaitGalleryColdRead(17, 5);
+            mismatch.gallery_completion_held = Some(held);
+            drive(&mut mismatch, &model);
+            assert!(
+                matches!(mismatch.phase, Phase::Failed),
+                "stale generation or absent image cannot authorize the sweep"
+            );
+        }
+
+        let viewport = &model.explore.snapshot.as_ref().unwrap().viewport;
+        assert_eq!(
+            cold_gallery_scroll_offset(17, viewport, 300, 160.0),
+            Some(2760.0)
+        );
+        for extent in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(cold_gallery_scroll_offset(17, viewport, 300, extent).is_none());
+        }
+        assert!(cold_gallery_scroll_offset(0, viewport, 300, 160.0).is_none());
+        assert!(cold_gallery_scroll_offset(93, viewport, 300, 160.0).is_none());
+        driver.phase = Phase::GalleryColdRead(93);
+        drive(&mut driver, &model);
+        assert!(
+            matches!(driver.phase, Phase::Failed),
+            "exhausted fixture is an explicit failure"
+        );
+    }
+
+    #[test]
+    fn gallery_completion_controls_reject_stale_scenarios_and_reset_with_the_driver() {
+        use crate::generated::{IntegrationControlKind as Kind, IntegrationControlReceipt};
+        for sequence in [0, 2] {
+            let mut driver = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                "512".into(),
+                String::new(),
+            );
+            assert!(
+                driver
+                    .receive_control(IntegrationControlReceipt {
+                        kind: Kind::GalleryReadCompletionHeld,
+                        sequence,
+                        progress: 0,
+                        failureline: 0,
+                        readgeneration: 7,
+                        compiledindex: 47,
+                    })
+                    .is_err()
+            );
+        }
+        let mut driver = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            String::new(),
+        );
+        driver.phase = Phase::Complete;
+        // A current physical read can settle after the UI's last step; it
+        // belongs to this scenario until the native owner permits Advance.
+        driver
+            .receive_control(IntegrationControlReceipt {
+                kind: Kind::GalleryReadCompletionHeld,
+                sequence: 1,
+                progress: 0,
+                failureline: 0,
+                readgeneration: 7,
+                compiledindex: 47,
+            })
+            .unwrap();
+        assert!(matches!(driver.phase, Phase::Complete));
+        driver
+            .reset_scenario(String::new(), String::new(), "512".into(), String::new())
+            .unwrap();
+        assert!(driver.gallery_completion_held.is_none());
+    }
+
+    #[test]
     fn destructive_profile_continues_viewer_completion_into_annotation() {
         initialize_reporting(false, false);
         for window_close in [false, true] {
@@ -9304,7 +9852,16 @@ mod tests {
             .exploresource
             .available = true;
         let settings = crate::view::settings::SettingsModel::default();
-        let router = crate::view::router::Router::default();
+        let mut router = crate::view::router::Router::default();
+        router.explore_measure_gallery(
+            896.0,
+            896.0,
+            crate::generated::VisualExtent {
+                width: 1920,
+                height: 1080,
+            },
+            3,
+        );
         let drive = |driver: &mut Controller, model: &ApplicationModel| {
             drop(driver.advance(
                 model,
@@ -9419,10 +9976,13 @@ mod tests {
             columns: 3,
         };
         snapshot.busy = false;
-        driver.oversized_capacity = Some(crate::generated::VisualExtent {
-            width: 1920,
-            height: 1080,
-        });
+        driver.oversized_gallery = Some((
+            iced::Size::new(896.0, 896.0),
+            crate::generated::VisualExtent {
+                width: 1920,
+                height: 1080,
+            },
+        ));
         driver.phase = Phase::AwaitExploreExactGrid(revision);
         drive(&mut driver, &model);
         assert_eq!(
@@ -10129,6 +10689,32 @@ mod tests {
                 assert_eq!(prepared.color, controller.copy_swatch_color);
                 assert!(prepared.available);
             } else {
+                for (source, presentation, extent) in [
+                    (
+                        frame.content_sequence + 1,
+                        frame.presentation_revision,
+                        [frame.content_width, frame.content_height],
+                    ),
+                    (
+                        frame.content_sequence,
+                        frame.presentation_revision + 1,
+                        [frame.content_width, frame.content_height],
+                    ),
+                    (
+                        frame.content_sequence,
+                        frame.presentation_revision,
+                        [frame.content_width + 1, frame.content_height],
+                    ),
+                ] {
+                    assert!(!controller.prepare_annotation_probe(
+                        source,
+                        presentation,
+                        extent,
+                        vec![1.0; 7],
+                    ));
+                    assert!(controller.annotation_probe.is_none());
+                    assert!(controller.annotation_pixels_pending.is_none());
+                }
                 assert!(controller.prepare_annotation_probe(
                     frame.content_sequence,
                     frame.presentation_revision,

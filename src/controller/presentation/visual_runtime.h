@@ -16,6 +16,8 @@ struct SystemImageRuntimeConfig;
 
 namespace mmltk::controller {
 
+struct VisualWorkspaceDiagnostics;
+
 struct VisualDeviceSettings final {
     int device = -1;
     std::uint32_t maximum_width = 0U;
@@ -37,6 +39,7 @@ struct VisualWorkspaceRequest final {
     std::uint64_t admitted_allocation = 0U;
     // Wake-only response; no producer or graphics work executes in the sink.
     std::function<void()> ready;
+    std::shared_ptr<const VisualWorkspaceDiagnostics> diagnostics{};
 };
 
 void configure_visual_workspace_finalization(mmltk::frameworks::gpu::SystemImageRuntimeConfig&);

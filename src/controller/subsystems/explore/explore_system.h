@@ -147,6 +147,9 @@ struct ExploreGalleryReadiness final {
 struct ExploreSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
+    // Replaceable display work remains admissible while its current product
+    // is retained. Consumers must distinguish that retention from settlement.
+    bool render_pending = false;
     bool cancellation_requested = false;
     bool ready = false;
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string failure{};

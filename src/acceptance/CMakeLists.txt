@@ -56,6 +56,19 @@ if(NOT MMLTK_HAVE_ATOMIC_PIDFD_TEST_SUPPORT)
 endif()
 
 enable_testing()
+
+# An opt-in hardware diagnostic with no product, Firefox, or Catch2 dependency.
+find_package(Vulkan REQUIRED)
+add_executable(mmltk_cuda_vulkan_interop EXCLUDE_FROM_ALL)
+mmltk_configure_component(mmltk_cuda_vulkan_interop PRIVATE_DECLARATIONS)
+mmltk_register_ordinary_sources(
+    mmltk_cuda_vulkan_interop
+    diagnostics/cuda_vulkan_interop.cpp
+    diagnostics/cuda_vulkan_fill.cu)
+mmltk_register_private_headers(mmltk_cuda_vulkan_interop diagnostics/cuda_vulkan_fill.h)
+mmltk_target_cuda_architectures(mmltk_cuda_vulkan_interop)
+target_link_libraries(mmltk_cuda_vulkan_interop PRIVATE CUDA::cuda_driver CUDA::cudart Vulkan::Vulkan)
+
 set(CATCH_INSTALL_DOCS OFF CACHE BOOL "Install Catch2 documentation" FORCE)
 set(CATCH_INSTALL_EXTRAS OFF CACHE BOOL "Install Catch2 extras" FORCE)
 set(CATCH_DEVELOPMENT_BUILD OFF CACHE BOOL "Build Catch2 development extras" FORCE)

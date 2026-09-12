@@ -169,9 +169,13 @@ static_assert(
 static_assert(
     !mmltk::frameworks::reflection::opaque_relation_storage_shape_is_valid<mmltk::frameworks::serialization::test::OpaqueFixture>(0x0800U));
 
-template <class Owner>
-concept PublicRawCborAppend = requires(const Owner& source, wire::Value::Object& object, std::optional<wire::EncodeError>& failure) {
-    mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields(source, object, failure);
+using CborObjectLayout = mmltk::frameworks::serialization::implementation::detail::ObjectLayout;
+
+template <class Owner, CborObjectLayout Layout>
+concept PublicRawCborAppend = requires(const Owner& source,
+                                     std::conditional_t<Layout == CborObjectLayout::Named, wire::Value::Object, wire::Value::Array>& object,
+                                     std::optional<wire::EncodeError>& failure) {
+    mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure);
 };
 
 template <class Owner>
@@ -192,11 +196,13 @@ concept PublicRawCborFixedEncode = requires(const Owner& source, mmltk::framewor
 
 using OpaqueFixture = mmltk::frameworks::serialization::test::OpaqueFixture;
 using OpaqueFixtureOwner = mmltk::frameworks::serialization::test::OpaqueFixtureOwner;
-static_assert(PublicRawCborAppend<OpaqueFixtureOwner>);
+static_assert(PublicRawCborAppend<OpaqueFixtureOwner, CborObjectLayout::Named>);
+static_assert(PublicRawCborAppend<OpaqueFixtureOwner, CborObjectLayout::Positional>);
 static_assert(PublicRawCborValueDecode<OpaqueFixtureOwner>);
 static_assert(PublicRawCborProjectedDecode<OpaqueFixtureOwner>);
 static_assert(PublicRawCborFixedEncode<OpaqueFixtureOwner>);
-static_assert(!PublicRawCborAppend<OpaqueFixture>);
+static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Named>);
+static_assert(!PublicRawCborAppend<OpaqueFixture, CborObjectLayout::Positional>);
 static_assert(!PublicRawCborValueDecode<OpaqueFixture>);
 static_assert(!PublicRawCborProjectedDecode<OpaqueFixture>);
 static_assert(!PublicRawCborFixedEncode<OpaqueFixture>);
@@ -444,6 +450,61 @@ TEST_CASE("structural accounting propagates through optional containers and vari
     containers.rows->push_back(leaf);
     wire::ByteBuffer rejected;
     CHECK_FALSE(cbor::encode(containers, rejected, test_limits(1024U)));
+}
+
+TEST_CASE("schema agreed transport preserves reflected fields and named persistence", "[frameworks][serialization][reflection]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    using namespace cbor::test;
+    BoundLeaf leaf;
+    leaf.id = 65535U;
+    leaf.text.assign(24U, 'x');
+    leaf.bytes.fill(std::byte{0xff});
+    const auto named = cbor::reflected_value(leaf);
+    const auto positional = cbor::reflected_transport_value(leaf);
+    REQUIRE(named);
+    REQUIRE(positional);
+    const wire::Value expected(wire::Value::Array{
+        wire::Value(std::uint64_t{65535U}), wire::Value(leaf.text),
+        wire::Value(wire::ByteBuffer(3U, std::byte{0xff})), wire::Value{}});
+    CHECK(*positional == expected);
+    REQUIRE(std::holds_alternative<wire::Value::Object>(named->storage));
+    CHECK(std::get<wire::Value::Object>(named->storage).size() == 3U);
+    BoundLeaf restored;
+    REQUIRE(cbor::decode_into(restored, *named));
+    CHECK(restored.id == leaf.id);
+    CHECK(restored.text == leaf.text);
+    CHECK(restored.bytes == leaf.bytes);
+    CHECK_FALSE(restored.payload);
+
+    const std::array<BoundLeaf, 1U> borrowed{leaf};
+    BoundContainers containers;
+    containers.rows = std::vector<BoundLeaf>{leaf};
+    containers.fixed = {leaf, std::nullopt};
+    containers.local.push_back(leaf);
+    containers.borrowed = borrowed;
+    containers.values[0] = wire::Value(wire::Value::Object{{"kept", wire::Value(true)}});
+    const auto nested = cbor::reflected_transport_value(containers);
+    REQUIRE(nested);
+    const auto& fields = std::get<wire::Value::Array>(nested->storage);
+    REQUIRE(fields.size() == 5U);
+    for (const auto index : {0U, 1U, 2U, 3U}) {
+        const auto& rows = std::get<wire::Value::Array>(fields[index].storage);
+        REQUIRE_FALSE(rows.empty());
+        CHECK(rows.front() == expected);
+    }
+    CHECK(std::get<wire::Value::Array>(fields.back().storage).front() == containers.values.front());
+    const auto variant = cbor::reflected_transport_value(BoundVariant{leaf});
+    REQUIRE(variant);
+    const auto& envelope = std::get<wire::Value::Object>(variant->storage);
+    REQUIRE(envelope.size() == 2U);
+    CHECK(envelope[1].second == expected);
+    leaf.text.push_back('x');
+    CHECK_FALSE(cbor::reflected_transport_value(leaf));
+    containers.rows->resize(3U);
+    CHECK_FALSE(cbor::reflected_transport_value(containers));
+    const auto opaque = cbor::reflected_transport_value(OpaqueFixture{});
+    REQUIRE(opaque);
+    CHECK(*opaque == *cbor::reflected_value(OpaqueFixture{}));
 }
 
 TEST_CASE("reflected aggregate budgets reject arithmetic overflow", "[frameworks][serialization][reflection][bounds]") {

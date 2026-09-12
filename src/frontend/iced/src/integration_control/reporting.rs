@@ -46,6 +46,75 @@ pub(super) fn emit(payload: impl FnOnce(&Sink)) {
     }
 }
 
+pub(super) fn upscale_settlement(
+    controller: &Controller,
+    model: &ApplicationModel,
+    frame: Option<crate::presentation_surface::FrameReady>,
+    blocker: &'static str,
+) {
+    emit(|sink| {
+        let Phase::AwaitUpscale { kernel, .. } = controller.phase else {
+            return;
+        };
+        let native = model.upscale_snapshot.as_ref();
+        // Read only real frontiers here. The controller reports the branch that
+        // blocked; reporting neither repeats its predicates nor settles work.
+        sink.record(
+            "integration.upscale_settlement",
+            EXPLORE_UPSCALE_ACTIONS[kernel],
+            &format!(
+                "blocked={blocker}; phase={:?}; foreground={:?}; viewed_frame={:?}; native(revision,busy,ready,kernel,frame)={:?}; presentation(completed,publication,ready,browser_sample)={:?}; received={frame:?}; displayed_kernel={:?}; drawn={:?}; probe_current={:?}; probe_pending={:?}; probe_pixels={:?}; button={:?}; repeat(revision,observed)={:?}; requested={:?}; native_input={:?}; native_pending={:?}; native_method={:?}; explore(mode,selected,requested_selection,frame,document)={:?}",
+                controller.phase,
+                model.foreground_visual(),
+                model.viewed_explore_frame(),
+                native.map(|state| (
+                    state.revision,
+                    state.busy,
+                    state.ready,
+                    state.kernel,
+                    &state.frame,
+                )),
+                model.presentation.as_ref().map(|state| (
+                    &state.completed,
+                    state.presentationrevision,
+                    state.timelineready,
+                    state.browsercompletedsample,
+                )),
+                model.displayed_upscale_kernel(),
+                controller.viewer_drawn,
+                current_receipt(explore::DETAIL_WORKSPACE_ID),
+                controller.upscale_pixel_pending,
+                controller.upscale_pixels,
+                controller.upscale_button,
+                (
+                    controller.upscale_repeat_revision,
+                    controller.upscale_repeat_observed,
+                ),
+                model.explore.requested_upscale,
+                native.map(|state| &state.input),
+                native.and_then(|state| state.pending.as_ref()),
+                native.and_then(|state| state.methods.get(kernel)),
+                model.explore.snapshot.as_ref().map(|state| (
+                    state.mode,
+                    state.selectedimage,
+                    model.explore.requested_selection,
+                    &state.frame,
+                    &state.document,
+                )),
+            ),
+            [
+                native.map_or(0.0, |state| state.revision as f64),
+                native.map_or(0.0, |state| state.frame.revision as f64),
+                model
+                    .presentation
+                    .as_ref()
+                    .map_or(0.0, |state| state.presentationrevision as f64),
+                frame.map_or(0.0, |value| value.presentation_revision as f64),
+            ],
+        );
+    });
+}
+
 pub(super) struct Sink {
     _private: (),
 }

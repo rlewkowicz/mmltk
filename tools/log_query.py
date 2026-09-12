@@ -8,8 +8,10 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+import errno
 import glob
 import heapq
+from itertools import islice
 import json
 import math
 import os
@@ -24,6 +26,8 @@ MAX_QUERY_LENGTH = 8192
 MAX_QUERY_TOKENS = 512
 MAX_QUERY_DEPTH = 32
 MAX_LINE_BYTES = 1024 * 1024
+MAX_MESSAGE_LINES = 128
+MAX_VULKAN_OBJECTS = 64
 MAX_DISTINCT_KEYS = 10000
 ROTATION_WINDOW_NS = 10000000
 ROTATION_NAME = re.compile(r"(\d+)-(\d+)\Z")
@@ -41,14 +45,37 @@ KEY_VALUE = re.compile(
 NATIVE = re.compile(
     r"^(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?"
     r"(?:Z|[+-]\d\d:\d\d)?) \[(?P<pid>\d+):(?P<tid>\d+)\] "
-    r"\[(?P<logger>[^]]*)\] \[(?P<level>[^]]*)\] (?P<message>.*)$"
+    r"\[(?P<logger>[^]]*)\] \[(?P<level>[^]]*)\] (?P<message>.*)$",
+    re.DOTALL,
 )
 FIREFOX = re.compile(
     r"^(?:(?P<timestamp>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d+)?"
     r"(?: UTC|Z|[+-]\d\d:\d\d)?)\s+)?"
     r"\[(?P<process>.*?) (?P<pid>\d+): (?P<thread>[^]]+)\]: "
-    r"(?P<level>[VDIWE])/(?P<module>\S+) (?P<message>.*)$"
+    r"(?P<level>[VDIWE])/(?P<module>\S+) (?P<message>.*)$",
+    re.DOTALL,
 )
+RUST = re.compile(
+    r"^\[(?:(?P<timestamp>\d{4}-\d\d-\d\dT\S+)\s+)?"
+    r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+(?P<module>[^\s\]]+)\]\s?(?P<message>.*)$",
+    re.DOTALL,
+)
+VULKAN_HEADER = re.compile(r"^VALIDATION\s+\[(?P<id>[A-Za-z0-9_-]+)(?:\s+\((?P<message_id>0x[0-9a-fA-F]+)\))?\]")
+VULKAN_BODY = re.compile(
+    r"^\s*Validation\s+(?P<level>Error|Warning|Info):\s*\[\s*(?P<id>[A-Za-z0-9_-]+)\s*\]",
+    re.IGNORECASE,
+)
+VULKAN_OBJECT = re.compile(
+    r"Object\s+\d+:\s*handle\s*=\s*(?P<handle>0x[0-9a-fA-F]+),\s*"
+    r"type\s*=\s*VK_OBJECT_TYPE_(?P<type>[A-Z0-9_]+)"
+)
+VULKAN_RUST_OBJECT = re.compile(
+    r"\(type:\s*(?P<type>[A-Z0-9_]+),\s*hndl:\s*(?P<handle>0x[0-9a-fA-F]+)"
+    r"(?:,\s*name:\s*(?P<name>[^)\r\n]*))?\)"
+)
+# Project only physical workspace resource types into the existing native fields.
+# Device/queue/command-buffer handles remain message facts, never broad join keys.
+VULKAN_RESOURCE_FIELDS = {"IMAGE": "vk_image", "DEVICE_MEMORY": "vk_memory"}
 FAILURE_WORD = re.compile(
     r"(?<![a-z])(?:error|fatal|panic|failed|failure|exception|crash|timeout|timed out"
     r"|segmentation fault|sigsegv|sigabrt|sigbus|aborted)(?![a-z])",
@@ -82,17 +109,83 @@ START_STAGES = frozenset(("start", "started", "begin", "begun", "requested", "su
 INCOMPLETE_STAGES = frozenset(("missing", "unavailable", "blocked", "stalled", "pending", "discarded"))
 FAILED_STAGES = frozenset(("failed", "failure", "error", "aborted", "rejected"))
 AMBIENT_IDS = frozenset(("pid", "tid", "process_id", "thread_id", "device_id", "host_id",
-                         "user_id", "test_id", "run_id", "session_id", "parent_process_id"))
+                         "user_id", "test_id", "run_id", "session_id", "parent_process_id",
+                         "native_process_id", "browser_process_id"))
 REFINEMENT_FIELDS = ("sequence", "generation", "slot")
 MAX_TRIAGE_STATES = 256
 MAX_TRIAGE_EVENTS = 64
 MAX_TRIAGE_TEXT = 2048
 MAX_TRIAGE_PIXEL_SAMPLES = 16384
+NATIVE_PIXEL_STAGES = {
+    "presentation.pixel": "native",
+    "presentation.pixel_after_release": "native_after_release",
+    "presentation.pixel_source_copy_before_ready": "source_copy_before_ready",
+    "presentation.pixel_source_copy_after_release": "source_copy_after_release",
+}
+DIRECT_PIXEL_STAGES = {
+    "firefox.workspace.direct_pixel": "direct_image",
+}
+DIRECT_ALLOCATION_FIELDS = (
+    "workspace_allocation", "vk_image", "vk_memory", "memory_type_index", "dedicated", "memory_size",
+    "image_offset", "row_pitch", "capacity_width", "capacity_height",
+)
+MEMORY_PROVENANCE_EVENTS = frozenset((
+    "cuda.workspace.memory_export", "gpu.workspace.memory_export",
+    "firefox.workspace.image_created", "firefox.workspace.memory_import", "firefox.workspace.memory_bound",
+    "presentation.workspace.descriptor_duplicated", "presentation.workspace.descriptor_sent",
+    "presentation.workspace.descriptor_duplicate_failed", "presentation.workspace.descriptor_send_failed",
+    "firefox.workspace.descriptor_received", "firefox.workspace.descriptor_claimed",
+    "firefox.workspace.memory_allocation",
+))
+VULKAN_PROVENANCE_EVENTS = frozenset((
+    "firefox.workspace.image_created", "firefox.workspace.memory_import",
+    "firefox.workspace.memory_bound", "firefox.workspace.direct_binding",
+))
+MEMORY_PROVENANCE_FIELDS = (
+    "native_process_id", "browser_process_id", "workspace_descriptor", "cuda_address",
+    "cuda_export_allocation", "cuda_mapped_allocation", "cuda_mapping_matches_export",
+    "cuda_retain_status", "cuda_release_status", "cuda_property_status", "cuda_allocation_type",
+    "cuda_location_type", "cuda_location_id", "cuda_requested_handle_types", "cuda_compression_type",
+    "cuda_gpu_direct_rdma", "cuda_allocation_usage", "cuda_uuid_status", "device_uuid",
+    "vk_device", "vk_physical_device", "vk_image", "vk_memory", "memory_type_index",
+    "memory_property_flags", "memory_heap_index", "memory_size", "reserved_bytes",
+    "row_pitch", "image_offset", "capacity_width", "capacity_height", "cuda_mapping_offset",
+    "dedicated", "image_binding_offset", "image_tiling", "image_format", "image_usage", "image_flags",
+    "image_depth", "image_type", "image_mip_levels", "image_array_layers", "image_samples",
+    "image_sharing_mode", "image_initial_layout", "requirements_size", "requirements_alignment",
+    "requirements_memory_type_bits", "requires_dedicated", "prefers_dedicated", "external_memory_features",
+    "subresource_size", "array_pitch", "depth_pitch", "described_row_pitch", "described_image_offset",
+    "export_handle_type", "import_handle_type", "external_handle_type",
+    "fd_stat_status", "fd_stat_errno", "fd_dev", "fd_ino", "fd_rdev", "fd_mode", "fd_size",
+    "fd_consumed", "fd_identity_scope", "fd_properties_query",
+    "export_descriptor", "channel_descriptor", "descriptor_count", "memory_descriptor_index",
+    "descriptor_transport", "record_bytes", "send_bytes", "send_errno", "fd_dup_errno", "peer_credentials_status",
+    "peer_credentials_errno", "peer_credentials_known", "fd_getfd_result", "fd_getfd_errno",
+    "fd_ofd_query", "fd_ofd_result", "fd_ofd_errno", "fd_ofd_status", "fd_observation", "vk_allocate_status",
+)
+DESCRIPTOR_LINEAGE_STAGES = {
+    "cuda.workspace.memory_export": "cuda_export",
+    "gpu.workspace.memory_export": "workspace_export",
+    "presentation.workspace.descriptor_duplicated": "duplicated",
+    "presentation.workspace.descriptor_sent": "sent",
+    "presentation.workspace.descriptor_duplicate_failed": "duplicate_failed",
+    "presentation.workspace.descriptor_send_failed": "send_failed",
+    "firefox.workspace.descriptor_received": "received",
+    "firefox.workspace.descriptor_claimed": "claimed",
+    "firefox.workspace.memory_import": "import",
+    "firefox.workspace.memory_allocation": "allocation",
+    "firefox.workspace.memory_bound": "bound",
+}
+LIBRARY_PROVENANCE_EVENTS = frozenset((
+    "cuda.workspace.loaded_library", "cuda.workspace.library_inventory",
+    "firefox.workspace.loaded_library", "firefox.workspace.library_inventory",
+))
 MAX_AUTO_ANCHORS = 128
 MAX_AUTO_RELATED = 48
 MAX_AUTO_WEAK = 8
 MAX_AUTO_PER_ANCHOR = 3
 MAX_AUTO_PER_IDENTITY = 2
+MAX_AUTO_VULKAN_RELATED = 4
 AUTO_SOURCE_DOMAINS = frozenset(("explore", "annotation", "upscale", "live"))
 AUTO_FIELDS = (
     "source_session", "source_instance", "source_revision", "frame_revision",
@@ -110,6 +203,9 @@ AUTO_INTEGRATION_FIELDS = {
     "integration.explore_state": ("explore", {"a": "snapshot_revision"}),
     "integration.explore_frame": ("explore", {"a": "source_revision"}),
     "integration.annotation_ready": ("annotation", {"a": "source_revision"}),
+    # c/d are distinct presentation and received-frame frontiers, not an
+    # asserted matching publication of the native Upscale frame in b.
+    "integration.upscale_settlement": ("upscale", {"a": "snapshot_revision", "b": "source_revision"}),
 }
 AUTO_NOISE = re.compile(r"(?:^|[._])(?:pixel|probe|slot|sample|tick|heartbeat|metric|poll)(?:[._]|$)")
 AUTO_LIFECYCLE_STAGES = START_STAGES | FAILED_STAGES | INCOMPLETE_STAGES
@@ -408,6 +504,41 @@ def workspace_source_identity(data):
     return physical_identity(data, "source", "workspace_source_high", "workspace_source_low")
 
 
+def vulkan_handle(value, *, allow_null=False):
+    if isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]{1,16}", value):
+        number = int(value, 16)
+        if number or allow_null:
+            return hex(number)
+    return None
+
+
+def vulkan_resources(data):
+    """One typed projection for diagnostic objects and existing workspace records."""
+    objects = data.get("objects", ())
+    result = {}
+    if isinstance(objects, list):
+        for item in objects[:MAX_VULKAN_OBJECTS]:
+            if (isinstance(item, dict) and isinstance(item.get("type"), str)
+                    and (name := VULKAN_RESOURCE_FIELDS.get(item["type"]))):
+                if handle := vulkan_handle(item.get("handle")):
+                    result[name, handle] = None
+    for name in VULKAN_RESOURCE_FIELDS.values():
+        if handle := vulkan_handle(value_from(data, name, "fields." + name)):
+            result[name, handle] = None
+    return tuple(result)
+
+
+def vulkan_process(record):
+    """Missing process facts remain missing; contradictory facts cannot join."""
+    values = [record.get(name) for name in ("browser_process_id", "pid")]
+    values = [value for value in values if value is not MISSING]
+    if not values:
+        return None
+    if any(type(value) is not int or value <= 0 for value in values) or len(set(values)) != 1:
+        return MISSING
+    return values[0]
+
+
 @dataclass
 class Record:
     source: str
@@ -428,6 +559,8 @@ class Record:
             return self.source
         if name == "@line":
             return self.line
+        if name == "@line_end":
+            return self.metadata.get("line_end", self.line)
         if name == "@text":
             return self.raw
         if name == "@format":
@@ -484,7 +617,13 @@ class Record:
         if name.startswith("@"):
             return self.metadata.get(name[1:], MISSING)
         value = lookup(self.data, name)
-        return lookup(self.data, "fields." + name) if value is MISSING and "." not in name else value
+        if value is MISSING and "." not in name:
+            value = lookup(self.data, "fields." + name)
+        if value is MISSING and name in VULKAN_RESOURCE_FIELDS.values():
+            handles = [handle for field_name, handle in vulkan_resources(self.data) if field_name == name]
+            if len(handles) == 1:
+                return handles[0]
+        return value
 
 
 def reject_json_constant(token):
@@ -559,6 +698,44 @@ def transcript_data(text):
     return None
 
 
+def vulkan_diagnostic(message, data):
+    """Keep the layer's assertion as text; extract only explicitly reported facts."""
+    header = VULKAN_HEADER.match(message)
+    if header is None and "\n" not in message and not VULKAN_BODY.match(message):
+        return None
+    body = next((match for line in message.splitlines() if (match := VULKAN_BODY.match(line))), None)
+    if header is None and body is None:
+        return None
+    identifier = (header or body)["id"]
+    data.update({"event": "vulkan.validation", "validation_id": identifier, "message": message})
+    if body:
+        data.setdefault("level", body["level"])
+    message_id = re.search(r"\bMessageID\s*=\s*(0x[0-9a-fA-F]+)", message)
+    if message_id or header and header["message_id"]:
+        data["message_id"] = message_id[1] if message_id else header["message_id"]
+    api = re.search(r"\b(vk[A-Z][A-Za-z0-9]+)\s*\(", message)
+    if api:
+        data["api"] = api[1]
+    objects = {}
+    overflow = False
+    for pattern in (VULKAN_OBJECT, VULKAN_RUST_OBJECT):
+        for match in pattern.finditer(message):
+            handle = vulkan_handle(match["handle"], allow_null=True)
+            if handle is None:
+                continue
+            key = match["type"], handle
+            if key not in objects:
+                if len(objects) == MAX_VULKAN_OBJECTS:
+                    overflow = True
+                    continue
+                objects[key] = {"type": match["type"], "handle": handle}
+            name = match.groupdict().get("name")
+            if name is not None:
+                objects[key]["name"] = name
+    data["objects"] = list(objects.values())
+    return "Vulkan object facts exceed bounded capacity; original text retained" if overflow else ""
+
+
 def parse_record(source, line, raw, truncated=False):
     clean = ANSI.sub("", raw.rstrip("\r\n"))
     data = {}
@@ -566,15 +743,17 @@ def parse_record(source, line, raw, truncated=False):
     message = clean
     context = CONTEXT_LABEL.search(clean)
     payload = clean[context.end():] if context else clean
-    match = NATIVE.match(payload) or FIREFOX.match(payload)
+    match = NATIVE.match(payload) or FIREFOX.match(payload) or RUST.match(payload)
     if match:
-        log_format = "native" if "logger" in match.groupdict() else "firefox"
+        log_format = "native" if "logger" in match.groupdict() else "firefox" if "pid" in match.groupdict() else "rust"
         data = {key: value for key, value in match.groupdict().items() if value is not None}
         for key in ("pid", "tid"):
             if key in data:
                 data[key] = int(data[key])
         message = data["message"]
     error = "line exceeds byte limit; text is truncated" if truncated else ""
+    if (vulkan_error := vulkan_diagnostic(message, data)) is not None:
+        return Record(source, line, raw.rstrip("\r\n"), data, log_format, error or vulkan_error)
     transcript = transcript_data(clean)
     if transcript:
         data.update(transcript)
@@ -617,6 +796,67 @@ def parse_record(source, line, raw, truncated=False):
             except (ValueError, SyntaxError):
                 data[key] = value
     return Record(source, line, clean, data, log_format, error)
+
+
+class VulkanMessages:
+    """Assemble adjacent Rust callback lines before filtering, with bounded storage."""
+
+    def __init__(self):
+        self.pending = []
+        self.bytes = 0
+        self.module = None
+        self.process = None
+        self.identifier = None
+        self.body_seen = False
+
+    def take(self, error=""):
+        first, last = self.pending[0], self.pending[-1]
+        text = "\n".join(part[1].rstrip("\r\n") for part in self.pending)
+        errors = [part[2] for part in self.pending if part[2]]
+        self.pending = []
+        self.bytes = 0
+        self.body_seen = False
+        return first[0], last[0], text, error or next(iter(errors), "")
+
+    def push(self, line, text, error):
+        clean = ANSI.sub("", text.rstrip("\r\n"))
+        prefix = RUST.match(clean) or FIREFOX.match(clean) or NATIVE.match(clean)
+        fields = prefix.groupdict() if prefix else {}
+        message = fields.get("message", clean)
+        header = VULKAN_HEADER.match(message)
+        body = VULKAN_BODY.match(message)
+        continuation = bool(
+            self.pending and not header and (
+                prefix and fields.get("module", fields.get("logger")) == self.module
+                and fields.get("pid") == self.process and message.lstrip().startswith("objects:")
+                or not prefix and (not clean or clean[:1].isspace() or body)
+                and not clean.lstrip().startswith(("{", "["))
+            )
+        )
+        # A callback has one body. A second body is an independent orphaned
+        # diagnostic, not a continuation of a possibly interleaved callback.
+        if body and self.pending and (self.body_seen or body["id"] != self.identifier):
+            continuation = False
+        size = len(text.encode("utf-8")) if header or body or continuation else 0
+        if continuation and (len(self.pending) == MAX_MESSAGE_LINES or self.bytes + size > MAX_LINE_BYTES):
+            yield self.take("Vulkan message exceeds byte/line limit; continuation retained separately")
+            continuation = False
+        if self.pending and not continuation:
+            yield self.take()
+        if header or body or continuation:
+            if not self.pending:
+                self.module = fields.get("module", fields.get("logger"))
+                self.process = fields.get("pid")
+                self.identifier = (header or body)["id"]
+            self.pending.append((line, text, error))
+            self.body_seen = self.body_seen or bool(body)
+            self.bytes += size
+        elif text.strip():
+            yield line, line, text, error
+
+    def finish(self):
+        if self.pending:
+            yield self.take()
 
 
 class TranscriptContext:
@@ -709,9 +949,23 @@ class LogFile:
 
     def records(self, unchanged=False, anchors=None, line_hint=None):
         context = TranscriptContext()
+        messages = VulkanMessages()
         metadata = {"mtime_ns": self.modified_ns, "run": self.source, "artifact": Path(self.source).stem,
                     **self.metadata}
         anchors = anchors or {}
+
+        def parse_message(first, last, text, error):
+            if line_hint is not None and not line_hint(text) and not (
+                ANCHOR_HINT.search(text) or TEST_STATUS.match(text)
+                or text.startswith(("Filters:", "workspace-wayland:"))
+            ):
+                return
+            for row in context.parse_line(self.source, first, text, metadata, anchors):
+                row.parse_error = error or row.parse_error
+                if last != first:
+                    row.metadata["line_end"] = last
+                yield row
+
         with self.path.open("rb") as stream:
             info = os.fstat(stream.fileno())
             if (info.st_dev, info.st_ino) != (self.device, self.inode) or info.st_size < self.size:
@@ -733,21 +987,16 @@ class LogFile:
                     remaining -= len(part)
                     if not part:
                         raise QueryError(f"log was truncated during query: {self.source}")
-                if raw.strip():
-                    decoding_error = ""
-                    try:
-                        text = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        text = raw.decode("utf-8", errors="replace")
-                        decoding_error = "invalid UTF-8 bytes replaced"
-                    if line_hint is not None and not line_hint(text) and not (
-                        ANCHOR_HINT.search(text) or TEST_STATUS.match(text)
-                        or text.startswith(("Filters:", "workspace-wayland:"))
-                    ):
-                        continue
-                    for row in context.parse_line(self.source, line, text, metadata, anchors, truncated):
-                        row.parse_error = row.parse_error or decoding_error
-                        yield row
+                error = "line exceeds byte limit; text is truncated" if truncated else ""
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    text = raw.decode("utf-8", errors="replace")
+                    error = error or "invalid UTF-8 bytes replaced"
+                for message in messages.push(line, text, error):
+                    yield from parse_message(*message)
+            for message in messages.finish():
+                yield from parse_message(*message)
             if unchanged:
                 final = os.fstat(stream.fileno())
                 if (final.st_size, final.st_mtime_ns) != (self.size, self.modified_ns):
@@ -1315,6 +1564,7 @@ class QueryResult:
         self.native_tail = []
         self.automatic = None
         self.recent_query = ([], []) if auto_correlate_enabled(options) else None
+        self.representatives = TriagePool(options.limit, retain_full=True) if options.representatives else None
 
     def inspect(self, record, permitted=True):
         self.scanned += 1
@@ -1345,6 +1595,7 @@ class QueryResult:
 
     def include(self, record, reason):
         if (reason == "query" and self.recent_query is not None
+                and not self.options.representatives
                 and not record.metadata.get("context_copy") and not record.parse_error):
             recent = self.recent_query[int(auto_specific_query(record))]
             key = order_key(record, "capture")
@@ -1356,6 +1607,7 @@ class QueryResult:
                     heapq.heapreplace(recent, item)
         if reason == "context":
             self.context += 1
+            group = ("context", *physical_position(record))
         else:
             self.matches += reason == "query"
             self.related += reason in ("correlated", "run")
@@ -1371,6 +1623,10 @@ class QueryResult:
             if record.time_ns is not None:
                 bounds[0] = min(bounds[0], record.time_ns)
                 bounds[1] = max(bounds[1], record.time_ns)
+        if self.representatives is not None:
+            rank = (bool(record.metadata.get("context_copy")), order_key(record, self.options.order))
+            self.representatives.add(record, rank, reason, group)
+            return
         item = Retained(order_key(record, self.options.order), record, reason, self.options.tail)
         if self.lookup:
             event = record.get("@event")
@@ -1464,6 +1720,15 @@ def execute(files, query, where, options, anchors=None, lookup=None):
                     last_included = record.line, record.metadata.get("part", 0)
                 remaining_context -= 1
             before.append(record)
+    # Representative selection precedes enrichment, so repeated diagnostics
+    # do not consume the space reserved for their direct provenance.
+    if result.representatives is not None:
+        for _, record, reason in result.representatives.rows():
+            if reason != "context":
+                group = tuple(encoded(None if (value := record.get(name)) is MISSING else value)
+                              for name in options.group_by)
+                record.metadata["representative_count"] = result.groups[group]
+            result.retained.append(Retained(order_key(record, options.order), record, reason, False))
     if automatic:
         result.automatic = AutoCorrelation(result)
         result.automatic.collect(files, query, where, anchors)
@@ -1489,7 +1754,14 @@ def triage_snapshot(record):
             if depth >= 4 or budget[0] <= 0:
                 shortened[0] = True
                 return "<triage payload omitted>"
-            items = value.items() if isinstance(value, dict) else enumerate(value)
+            if isinstance(value, dict):
+                # A large earlier array/context must not consume the budget
+                # before the same record's event, reason and exact identities.
+                # Inspect at most the remaining budget plus one dictionary key.
+                items = list(islice(value.items(), budget[0] + 1))
+                items.sort(key=lambda item: isinstance(item[1], (dict, list)))
+            else:
+                items = enumerate(value)
             result = {}
             for name, child in items:
                 if budget[0] <= 0:
@@ -1549,6 +1821,10 @@ def strong_identities(record, explicit=()):
         if len(name) > 128 or not FIELD_NAME.fullmatch(name):
             continue
         if name in AMBIENT_IDS or name in ("surface_high", "surface_low"):
+            continue
+        if record.get("@event") == "vulkan.validation" and name in ("validation_id", "message_id"):
+            # A validation rule/message hash classifies reports; it does not
+            # identify an operation, process, or physical Vulkan object.
             continue
         if isinstance(value, str) and len(value) > 128:
             continue
@@ -1634,8 +1910,9 @@ class PoolRank:
 class TriagePool:
     """Small, diverse deterministic reservoir; cardinality never follows the input."""
 
-    def __init__(self, limit):
+    def __init__(self, limit, retain_full=False):
         self.limit = limit
+        self.retain_full = retain_full
         self.entries = {}
         self.discarded = 0
         self._ranks = {}
@@ -1668,7 +1945,7 @@ class TriagePool:
         if len(self._heap) > 2 * self.limit:
             self._heap = list(self._ranks.values())
             heapq.heapify(self._heap)
-        self.entries[key] = rank, triage_snapshot(record), why
+        self.entries[key] = rank, record if self.retain_full else triage_snapshot(record), why
 
     def rows(self):
         return sorted(self.entries.values(), key=lambda item: item[0])
@@ -1699,7 +1976,11 @@ def auto_facts(record):
         domain, fields = AUTO_INTEGRATION_FIELDS[event]
         for external, native in fields.items():
             value = record.get(external)
-            # The external report uses f64; ambiguous large values are not identities.
+            # The external f64 reporter writes String(value). Only these known
+            # slots accept its integer spelling; generic string IDs stay typed.
+            if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,15}", value):
+                value = int(value)
+            # Ambiguous large values are not identities.
             if type(value) in (int, float) and 0 < value <= 2**53 and int(value) == value:
                 facts.setdefault(native, encoded(int(value)))
     if event in ("integration.phase_progress", "integration.phase_advanced"):
@@ -1719,6 +2000,19 @@ def auto_facts(record):
         if all(value is not None for value in values):
             identities.append((priority, Identity(run, names, values)))
 
+    if isinstance(event, str) and (event == "vulkan.validation" or event in VULKAN_PROVENANCE_EVENTS):
+        process = vulkan_process(record)
+        if process is not MISSING:
+            if process is not None:
+                facts["browser_process_id"] = encoded(process)
+            if device := vulkan_handle(record.get("vk_device")):
+                facts["vk_device"] = encoded(device)
+            for name, handle in vulkan_resources(record.data):
+                if process is not None:
+                    add(0, ("browser_process_id", name), (encoded(process), encoded(handle)))
+                # Rust stderr has no PID. These file-scoped keys are only
+                # candidates; collect rejects conflicting observed owners.
+                add(1, ("@file", name), (encoded(record.source), encoded(handle)))
     for field in ("frame", "snapshot"):
         add(0, ("source_session", "source_instance", field))
         if domain and field in facts:
@@ -1748,6 +2042,8 @@ def auto_event_rank(record):
     event = record.get("@event")
     if not isinstance(event, str) or AUTO_NOISE.search(event):
         return None
+    if event in VULKAN_PROVENANCE_EVENTS:
+        return 2
     if event in AUTO_INTEGRATION_FIELDS or event == "iced.gallery.source":
         return 1
     parts = event.split(".")
@@ -1816,15 +2112,17 @@ class AutoCorrelation:
             ))
         recent = result.recent_query
         self.recent = sorted(recent[1] or recent[0], key=lambda item: item.key)
-        self.highlight_recent = result.matches > 20 or result.matches > len(matches)
+        self.highlight_recent = not self.options.representatives and (result.matches > 20 or result.matches > len(matches))
         self.omitted_anchors = max(0, len(matches) - len(preferred))
         self.seeds = sorted(preferred, key=lambda item: item.key)
         self.facts = []
         self.groups = {}
-        self.pools = [TriagePool(MAX_AUTO_PER_ANCHOR) for _ in self.seeds]
+        self.pools = [TriagePool(MAX_AUTO_VULKAN_RELATED if item.record.get("@event") == "vulkan.validation"
+                                 else MAX_AUTO_PER_ANCHOR) for item in self.seeds]
         self.related = {}
         self.count = 0
         self.bridge_sources = {}
+        self.object_owners = {}
         self.ambiguous = set()
         self.existing = {physical_position(item.record) for item in result.retained}
         if not self.limit:
@@ -1841,6 +2139,13 @@ class AutoCorrelation:
             group.finish()
 
     def observe_bridge(self, priority, identity, facts):
+        if self.object_identity(identity):
+            previous = self.object_owners.setdefault(identity, {})
+            for name in ("browser_process_id", "vk_device", "@workspace_source", "workspace_allocation"):
+                if name in facts and previous.setdefault(name, facts[name]) != facts[name]:
+                    # Reused handles or multiple processes/devices are ambiguous
+                    # without a recorded lifetime on the diagnostic itself.
+                    self.ambiguous.add(identity)
         if priority == 1 and len(identity.names) == 1 and "domain" in facts:
             source_identity = facts.get("source_session"), facts.get("source_instance")
             if all(source_identity):
@@ -1848,13 +2153,19 @@ class AutoCorrelation:
                 if previous != source_identity:
                     self.ambiguous.add(identity)
 
+    @staticmethod
+    def object_identity(identity):
+        return (len(identity.names) == 2 and identity.names[0] in ("@file", "browser_process_id")
+                and identity.names[1] in VULKAN_RESOURCE_FIELDS.values())
+
     def link(self, row, facts, priority, identity, index):
         seed = self.seeds[index].record
         original = self.facts[index]
         # A coarse surface/trace/dataset match must not override contradictory
         # recorded source, frame, publication, allocation, or dataset identities.
         for name in ("domain", "@surface", "@workspace_source", "workspace_allocation", "transfer_sequence", "source_session", "source_instance", "frame",
-                     "presentation_revision", "allocation_generation", "dataset_identity", "gallery_identity"):
+                     "presentation_revision", "allocation_generation", "dataset_identity", "gallery_identity",
+                     "browser_process_id", "vk_device"):
             if name in facts and name in original and facts[name] != original[name]:
                 return None
         comparable = row.clock == seed.clock and row.time_ns is not None and seed.time_ns is not None
@@ -1872,6 +2183,14 @@ class AutoCorrelation:
                 return None
         else:
             why = identity.label()
+            if self.object_identity(identity):
+                if row.source == seed.source and not comparable:
+                    distance = abs(row.line - seed.line)
+                if identity.names[0] == "@file":
+                    why = ("same-file handle candidate; process unrecorded: "
+                           + identity.names[1] + "=" + json.loads(identity.values[1]))
+                else:
+                    why += " (exact typed handle and recorded process)"
         return (weak, priority, distance, index), why
 
     def collect(self, files, query, where, anchors):
@@ -1913,7 +2232,8 @@ class AutoCorrelation:
         for rank, index, row, identity, why in candidates:
             if self.count == self.limit:
                 break
-            if identity in self.ambiguous or identities[identity] == MAX_AUTO_PER_IDENTITY:
+            identity_limit = MAX_AUTO_VULKAN_RELATED if self.object_identity(identity) else MAX_AUTO_PER_IDENTITY
+            if identity in self.ambiguous or identities[identity] == identity_limit:
                 continue
             if rank[0] and weak_count == MAX_AUTO_WEAK:
                 continue
@@ -1948,7 +2268,8 @@ class AutoCorrelation:
         for item in self.recent:
             row = item.record
             facts = [f"{name}={compact(value, 70)}" for name in
-                     ("control", "a", "b", "c", "d", "source_revision", "presentation_revision", "detail", "message")
+                     ("reason", "observed_event", "control", "a", "b", "c", "d",
+                      "source_revision", "presentation_revision", "detail", "message")
                      if (value := row.get(name)) is not MISSING and value not in ("", None)]
             event = row.get("@event")
             print("  " + compact("(text)" if event is MISSING else event, 80) + " " + compact(" ".join(facts), 240) +
@@ -2159,7 +2480,7 @@ class Triage:
                 if (not apply_where or self.where.matches(row)) and (not self.run or row.metadata["run"] == self.run):
                     yield row
 
-    def finding(self, kind, score, message, record, identity=None, other=None):
+    def finding(self, kind, score, message, record, identity=None, other=None, *, discriminator=None):
         if identity is not None:
             score -= min(15, self.identities[identity].hop * 5)
         if self.lookup and self.nearby(record) is None:
@@ -2173,6 +2494,8 @@ class Triage:
         repeated_kind = kind in ("incomplete-state", "explicit-failure", "unmatched-end", "duplicate-terminal",
                                  "owner-handoff", "clock-regression")
         key = (kind, record.source, str(record.get("@event")), identity) if repeated_kind else (kind, position)
+        if discriminator is not None:
+            key = (*key, discriminator)
         rank = lambda item: (-item.score, *physical_position(item.record), item.kind)
         new_rank = (-score, *position, kind)
         count = 1
@@ -2196,8 +2519,10 @@ class Triage:
     def pixel_sample(record, source=None):
         event = record.get("@event")
         boundary = record.get("boundary")
-        if event == "presentation.pixel":
-            stage = ("native", (record.get("@workspace_source"), record.get("transfer_sequence")))
+        if event in NATIVE_PIXEL_STAGES:
+            stage = (NATIVE_PIXEL_STAGES[event], (record.get("@workspace_source"), record.get("transfer_sequence")))
+        elif event in DIRECT_PIXEL_STAGES:
+            stage = (DIRECT_PIXEL_STAGES[event], (source, record.get("transfer_sequence")))
         elif event == "firefox.workspace.pixel" and boundary in ("import", "mailbox"):
             stage = (boundary, (source, record.get("transfer_sequence")))
         elif event == "iced.surface.pixel":
@@ -2216,22 +2541,48 @@ class Triage:
         run = str(record.metadata.get("run", record.source))
         return (run, surface, revision, index), stage, sample
 
-    def pixel_divergence(self, kind, message, record, other, publication, emit):
-        if publication in self.pixel_divergences:
+    def pixel_divergence(self, kind, message, record, other, publication, emit, optional_edge=None):
+        # Optional diagnostic boundaries cannot suppress the existing physical
+        # mode comparisons, including when their records arrive later.
+        identity = publication if optional_edge is None else (*publication, optional_edge)
+        if identity in self.pixel_divergences:
             return
-        self.pixel_divergences.add(publication)
+        self.pixel_divergences.add(identity)
         if emit:
-            self.finding(kind, 115, message, record, other=other)
+            self.finding(kind, 115, message, record, other=other, discriminator=optional_edge)
         else:
             self.seed_pool.add(
                 record, (-120, False, -record.metadata["mtime_ns"], *physical_position(record)),
-                "deterministic pixel-chain divergence", ("pixel-chain", *publication),
+                "deterministic pixel-chain divergence", ("pixel-chain", *identity),
             )
 
     def observe_pixel_chain(self, record, emit, bridge=None):
         event = record.get("@event")
+        if event == "firefox.workspace.direct_memory_pixel":
+            # This retired diagnostic read a buffer alias after the image's
+            # queue-family acquire. Vulkan makes that alias's contents undefined;
+            # completion and markers establish execution, not defined bytes.
+            self.notes.add("Historical direct_memory_pixel used an alias invalidated by the image ownership acquire; excluded from pixel comparisons.")
+            return
         source = None
-        if event in ("firefox.workspace.frame_forwarded", "firefox.workspace.pixel"):
+        direct_stage = DIRECT_PIXEL_STAGES.get(event)
+        direct_probe = direct_stage is not None
+        native_stage = NATIVE_PIXEL_STAGES.get(event)
+        source_probe = native_stage is not None and native_stage != "native"
+        optional_stage = direct_stage if direct_probe else native_stage if source_probe else None
+        optional_kind = "direct" if direct_probe else "source-copy" if source_probe else None
+        if (event in ("firefox.workspace.direct_memory_alias", "firefox.workspace.direct_memory_status") and
+                (record.get("memory_alias_supported") is False or record.get("completion") not in (MISSING, "Ok(true)"))):
+            self.notes.add("Optional direct-memory probe reports unsupported or unsettled evidence; inspect its structured reason.")
+        if direct_probe and (record.get("completion") != "Ok(true)" or
+                             record.get("readback_marker") != 0x4d4d4c54 or
+                             record.get("expected_marker") != 0x4d4d4c54):
+            self.notes.add(f"Optional {direct_stage} probe lacks successful completion or its readback marker; bytes were not compared.")
+            return
+        if source_probe and not isinstance(record.get("@workspace_source"), str):
+            self.notes.add("Optional native probe lacks an exact source identity; bytes were not compared.")
+            return
+        if direct_probe or source_probe or event in ("firefox.workspace.frame_forwarded", "firefox.workspace.pixel"):
             run = str(record.metadata.get("run", record.source))
             key = (run, record.get("@surface"), record.get("presentation_revision"), record.get("transfer_sequence"))
             if (not isinstance(key[1], str) or type(key[2]) is not int or key[2] <= 0 or
@@ -2274,9 +2625,11 @@ class Triage:
                         if any(stage[0] in ("import", "mailbox") for stage in chain.stages):
                             self.pixel_divergence("pixel-mode-conflict", "direct sampling contains a forbidden sample-arena copy receipt",
                                                   record, None, key[:3], emit)
-                        sample = chain.stages.get(("sample", None))
-                        if sample is not None:
-                            self.observe_pixel_chain(sample[1], emit)
+                        for name in ("sample", *DIRECT_PIXEL_STAGES.values(), *NATIVE_PIXEL_STAGES.values()):
+                            stage = (name, None if name == "sample" else transfer)
+                            sample = chain.stages.get(stage)
+                            if sample is not None:
+                                self.observe_pixel_chain(sample[1], emit, bridge=previous)
                 return
             if bridge is None:
                 bridge = self.pixel_sources.get(key)
@@ -2289,13 +2642,25 @@ class Triage:
                 return
             source, forwarded = bridge
             declared = record.get("@workspace_source")
-            corroborating = ("generation", "slot", "frame_id", "session_epoch", "layer_generation", "content_width", "content_height")
-            conflict = declared is not MISSING and declared != source
-            conflict |= any(record.get(field) is not MISSING and forwarded.get(field) is not MISSING and
-                            record.get(field) != forwarded.get(field) for field in corroborating)
+            corroborating = ("workspace_allocation", "timeline_ready") if source_probe else (
+                "generation", "slot", "frame_id", "session_epoch", "layer_generation", "content_width", "content_height")
+            if direct_probe:
+                corroborating += ("layer", "content_session", "content_sequence", "timeline_ready", "timeline_release") + DIRECT_ALLOCATION_FIELDS
+            conflict = "@workspace_source" if declared is not MISSING and declared != source else None
+            for field in corroborating:
+                stated, acquired = record.get(field), forwarded.get(field)
+                if stated is not MISSING and acquired is not MISSING and (
+                        stated != acquired or source_probe and type(stated) is not type(acquired)):
+                    conflict = field
+                    break
             if conflict:
-                self.pixel_divergence("pixel-transfer-conflict", "pixel sample conflicts with its exact forwarded transfer",
-                                      record, forwarded, key[:3], emit)
+                self.pixel_divergence(f"pixel-{optional_kind}-transfer-conflict" if optional_kind else "pixel-transfer-conflict",
+                                      f"pixel sample conflicts with its exact forwarded transfer ({conflict})",
+                                      record, forwarded, key[:3], emit,
+                                      optional_edge=f"{optional_stage}-bridge" if optional_stage else None)
+                return
+            if direct_probe and forwarded.get("direct_sampling") is not True:
+                self.notes.add(f"Optional {direct_stage} probe has no exact direct-mode acquisition; bytes were not compared.")
                 return
         parsed = self.pixel_sample(record, source)
         if parsed is None:
@@ -2317,10 +2682,11 @@ class Triage:
             self.pixel_stage_count += 1
         if previous is not None and previous[0] != sample:
             self.pixel_divergence(
-                "pixel-owner-mutation",
+                f"pixel-{optional_kind}-owner-mutation" if optional_kind else "pixel-owner-mutation",
                 f"{stage[0]} sample changed within surface={key[1]} presentation_revision={key[2]} "
                 f"sample_index={key[3]}: {previous[0]} != {sample}",
                 record, previous[1], publication, emit,
+                optional_edge=f"{optional_stage}-mutation" if optional_stage else None,
             )
         else:
             if previous is None and stage[0] == "mailbox":
@@ -2328,26 +2694,62 @@ class Triage:
                 chain.mailbox = stage
             stages[stage] = sample, triage_snapshot(record)
 
-        def compare(left, right):
+        def compare(left, right, optional=None):
             before, after = stages.get(left), stages.get(right)
-            if before is None or after is None or before[0] == after[0]:
+            if before is None or after is None:
+                return
+            if optional == "source-copy":
+                if any(not isinstance(item[1].get("@workspace_source"), str) for item in (before, after)):
+                    self.notes.add("Optional source-copy comparison lacks an exact source identity; bytes were not compared.")
+                    return
+                conflict = "sample_x/sample_y" if before[0][:2] != after[0][:2] else None
+                for field in ("@workspace_source", "transfer_sequence", "workspace_allocation", "timeline_ready"):
+                    before_fact, after_fact = before[1].get(field), after[1].get(field)
+                    if before_fact is not MISSING and after_fact is not MISSING and (
+                            type(before_fact) is not type(after_fact) or before_fact != after_fact):
+                        conflict = field
+                        break
+                if conflict:
+                    self.pixel_divergence(
+                        "pixel-source-copy-transfer-conflict",
+                        f"{left[0]} -> {right[0]} identities or coordinates conflict ({conflict}) for surface={key[1]} "
+                        f"presentation_revision={key[2]} sample_index={key[3]}; bytes were not compared",
+                        after[1], before[1], publication, emit, optional_edge=(left[0], right[0]),
+                    )
+                    return
+            if before[0] == after[0]:
                 return
             self.pixel_divergence(
-                "pixel-chain-divergence",
+                f"pixel-{optional}-boundary-divergence" if optional else "pixel-chain-divergence",
                 f"{left[0]} -> {right[0]} sample differs for surface={key[1]} "
                 f"presentation_revision={key[2]} sample_index={key[3]}: {before[0]} != {after[0]}",
                 after[1], before[1], publication, emit,
+                optional_edge=(left[0], right[0]) if optional else None,
             )
 
         # Only edges adjacent to this stage can have changed. Rechecking every
         # transfer makes repeated transfers of one publication quadratic.
         name, transfer = stage
+        for copied, kernel in (("source_copy_before_ready", "native"), ("source_copy_after_release", "native_after_release")):
+            if name in (copied, kernel):
+                compare((kernel, transfer), (copied, transfer), optional="source-copy")
+            if chain.direct_transfer is not None:
+                if name in (copied, "direct_image"):
+                    compare((copied, chain.direct_transfer), ("direct_image", chain.direct_transfer), optional="source-copy")
+                if name in (copied, "sample"):
+                    compare((copied, chain.direct_transfer), ("sample", None), optional="source-copy")
+        if name in ("source_copy_before_ready", "source_copy_after_release"):
+            compare(("source_copy_before_ready", transfer), ("source_copy_after_release", transfer), optional="source-copy")
         if chain.direct_transfer is not None:
             if name in ("import", "mailbox"):
                 self.pixel_divergence("pixel-mode-conflict", "direct sampling contains a forbidden sample-arena copy receipt",
                                       record, None, publication, emit)
             elif name in ("native", "sample"):
                 compare(("native", chain.direct_transfer), ("sample", None))
+            if name in ("native", "direct_image"):
+                compare(("native", chain.direct_transfer), ("direct_image", chain.direct_transfer), optional="direct")
+            if name in ("direct_image", "sample"):
+                compare(("direct_image", chain.direct_transfer), ("sample", None), optional="direct")
             return
         if name in ("native", "import"):
             compare(("native", transfer), ("import", transfer))
@@ -2362,6 +2764,11 @@ class Triage:
         reason = ("exact frame_forwarded correlation incomplete because bridge index was truncated"
                   if self.pixel_sources_truncated else "no exact frame_forwarded bridge in scanned scope")
         for key, pending in self.pixel_pending.items():
+            pending = [row for row in pending if row.get("@event") not in DIRECT_PIXEL_STAGES and
+                       NATIVE_PIXEL_STAGES.get(row.get("@event")) in (None, "native")]
+            if not pending:
+                self.notes.add("Optional pixel probe has no exact frame_forwarded bridge; bytes were not compared.")
+                continue
             run, surface, revision, transfer = key
             representative = min(pending, key=physical_position)
             message = (f"{reason}: surface={surface} "
@@ -2776,11 +3183,15 @@ def compact(value, width=180):
     text = value if isinstance(value, str) else encoded(value)
     text = text.replace("\t", "\\t").replace("\r", "\\r").replace("\n", "\\n")
     text = "".join(character if character.isprintable() else f"\\x{ord(character):02x}" for character in text)
-    return text if len(text) <= width else text[:width - 1] + "…"
+    return text if width is None or len(text) <= width else text[:width - 1] + "…"
 
 
 def projected(record, names):
     output = {"@file": record.source, "@line": record.line}
+    if "line_end" in record.metadata:
+        output["@line_end"] = record.metadata["line_end"]
+    if "representative_count" in record.metadata:
+        output["@representative_count"] = record.metadata["representative_count"]
     if record.metadata.get("part"):
         output["@part"] = record.metadata["part"]
     output.update({name: None if (value := record.get(name)) is MISSING else value for name in names})
@@ -2810,7 +3221,8 @@ def render_record(item, options):
     reason = "auto: " + record.metadata["auto_reason"] if item.reason == "auto" else item.reason
     if options.fields:
         cells = projected(record, options.fields)
-        return " ".join(f"{name}={compact(value)}" for name, value in cells.items()) + f" [{reason}]"
+        return " ".join(f"{name}={compact(value, None if record.get('@event') == 'vulkan.validation' else 180)}"
+                        for name, value in cells.items()) + f" [{reason}]"
     clock = "elapsed" if record.clock.startswith("elapsed:") else record.clock
     timestamp = (
         f"{record.time_ns / 1000000:.3f}ms" if clock == "elapsed" else
@@ -2824,10 +3236,45 @@ def render_record(item, options):
     if detail is MISSING and event is MISSING:
         detail = record.raw
     facts = []
-    for name in ("trace_id", "span_id", "@surface", "source_session", "source_instance",
-                 "source_revision", "frame_revision", "presentation_revision", "allocation_generation"):
+    if "representative_count" in record.metadata:
+        facts.append(f"occurrences={record.metadata['representative_count']}")
+    if event == "vulkan.validation":
+        for name in ("validation_id", "message_id", "api", "objects"):
+            if (value := record.get(name)) is not MISSING:
+                facts.append(f"{name}={compact(value, None)}")
+    for name in ("trace_id", "span_id", "@surface", "@workspace_source", "source_session", "source_instance",
+                 "source_revision", "frame_revision", "presentation_revision", "allocation_generation",
+                 "workspace_allocation", "workspace_plane"):
         if correlation_key(record, (name,)) is not None:
             facts.append(f"{name}={compact(record.get(name), 70)}")
+    for name in ("reason", "observed_event", "observed_file", "observed_line", "audit_context.field"):
+        value = record.get(name)
+        if value is not MISSING:
+            facts.append(f"{name}={compact(value, 150)}")
+    if event in NATIVE_PIXEL_STAGES or event in DIRECT_PIXEL_STAGES or event in (
+            "firefox.workspace.direct_memory_alias", "firefox.workspace.direct_memory_status", "firefox.workspace.direct_memory_pixel"):
+        for name in ("transfer_sequence", "timeline_ready", "memory_alias_supported", "sample_index",
+                     "sample_x", "sample_y", "sample_byte_offset", "sample_rgba", "completion", "readback_marker"):
+            value = record.get(name)
+            if value is not MISSING:
+                facts.append(f"{name}={compact(value, 70)}")
+        if event == "firefox.workspace.direct_memory_pixel":
+            facts.append("pixel_evidence=undefined_alias_after_image_acquire")
+    if event in MEMORY_PROVENANCE_EVENTS or event == "firefox.workspace.direct_binding":
+        for name in MEMORY_PROVENANCE_FIELDS:
+            value = record.get(name)
+            if value is not MISSING:
+                facts.append(f"{name}={compact(value, 100)}")
+        if event == "firefox.workspace.direct_binding":
+            for name in ("phase", "storage_image", "chosen_layout", "transfer_sequence", "texture_id"):
+                if (value := record.get(name)) is not MISSING:
+                    facts.append(f"{name}={compact(value, 100)}")
+    if event in LIBRARY_PROVENANCE_EVENTS:
+        for name in ("native_process_id", "browser_process_id", "library_path", "library_provenance",
+                     "inventory_status", "inventory_errno", "library_count", "maps_bytes", "maps_byte_limit",
+                     "inventory_bounded", "path_encoding_unavailable"):
+            if (value := record.get(name)) is not MISSING:
+                facts.append(f"{name}={compact(value, None if name == 'library_path' else 100)}")
     for name in ("@signal", "@exit_code", "@test", "buffer"):
         if name == "@test" and options.error is not None:
             continue
@@ -2866,10 +3313,166 @@ def render_record(item, options):
         facts.append("context-copy")
     if "proximity_ns" in record.metadata:
         facts.append(f"delta_ms={record.metadata['proximity_ns'] / 1000000:+.3f} ({record.metadata['time_link']})")
-    suffix = (" " + compact(detail)) if detail is not MISSING and detail != "" else ""
+    suffix = (" " + compact(detail)) if detail is not MISSING and detail != "" and event != "vulkan.validation" else ""
     if facts:
         suffix += " " + " ".join(facts)
-    return f"{compact(clock, 70)}:{timestamp} {compact(record.source, 150)}:{record.line} [{reason}] {compact(label)}{suffix}"
+    location = str(record.line)
+    if "line_end" in record.metadata:
+        location += "-" + str(record.metadata["line_end"])
+    rendered = f"{compact(clock, 70)}:{timestamp} {compact(record.source, 150)}:{location} [{reason}] {compact(label)}{suffix}"
+    if event == "vulkan.validation":
+        rendered += "\n" + "\n".join("    " + compact(line, None) for line in record.raw.splitlines())
+    return rendered
+
+
+def render_descriptor_lineage(result, options, output):
+    """Summarize only retained physical records; never turn FD numbers into OFD identities."""
+    groups, exports, cuda = {}, {}, {}
+
+    def index_row(index, key, row):
+        # Two examples suffice to reject an ambiguous/reused export association.
+        bucket = index.setdefault(key, [])
+        if len(bucket) < 2:
+            bucket.append(row)
+
+    for item in result.retained:
+        row = item.record
+        event = row.get("@event")
+        if not isinstance(event, str) or event not in DESCRIPTOR_LINEAGE_STAGES or row.metadata.get("context_copy"):
+            continue
+        run = str(row.metadata.get("run", row.source))
+        if event == "gpu.workspace.memory_export":
+            key = correlation_key(row, ("native_process_id", "workspace_allocation"))
+            if key:
+                index_row(exports, (run, key), row)
+        elif event == "cuda.workspace.memory_export":
+            key = correlation_key(row, ("native_process_id", "workspace_descriptor", "workspace_plane"))
+            if key:
+                index_row(cuda, (run, key), row)
+        elif isinstance(source := row.get("@workspace_source"), str):
+            groups.setdefault((run, source), []).append(row)
+    print("Descriptor lineage: retained physical rows only; missing/ambiguous stages are not proof of a failed handoff.", file=output)
+    print("  Equal FD integers or fstat metadata never prove payload identity. Cross-process links below are "
+          "SCM_RIGHTS record associations, not independent OFD/payload comparisons.", file=output)
+    if not groups:
+        print("  No exact source chain retained; query workspace_allocation and include the native/browser artifact family.", file=output)
+        return
+    required = ("cuda_export", "workspace_export", "duplicated", "sent", "received", "claimed", "import", "allocation", "bound")
+    for (run, source), rows in sorted(groups.items())[:options.top]:
+        issues, unavailable = [], []
+
+        def values(selected, name):
+            found = set()
+            for row in selected:
+                value = row.get(name)
+                if value is MISSING or value is None:
+                    continue
+                if name in ("native_process_id", "browser_process_id") and (type(value) is not int or value <= 0):
+                    continue
+                found.add(encoded(value))
+                if len(found) == 3:
+                    break
+            return found
+
+        def shown(row, name):
+            value = row.get(name)
+            return "not_recorded" if value is MISSING else compact(value, 100)
+
+        def compare(selected, names):
+            for name in names:
+                observed = values(selected, name)
+                if len(observed) > 1:
+                    issues.append(f"{name} differs: {compact(','.join(sorted(observed)), 200)}")
+
+        compare(rows, ("workspace_allocation", "@surface", "native_process_id", "browser_process_id"))
+        native = values(rows, "native_process_id")
+        allocations = values(rows, "workspace_allocation")
+        if len(native) == 1 and len(allocations) == 1:
+            matches = exports.get((run, (next(iter(native)), next(iter(allocations)))), [])
+            if len(matches) == 1:
+                exported = matches[0]
+                rows = [*rows, exported]
+                key = correlation_key(exported, ("native_process_id", "workspace_descriptor", "workspace_plane"))
+                mapped = cuda.get((run, key), []) if key else []
+                if len(mapped) == 1:
+                    rows.append(mapped[0])
+                elif mapped:
+                    unavailable.append("ambiguous CUDA export association; process/FD/address may have been reused")
+            elif matches:
+                unavailable.append("ambiguous workspace export association; no export selected")
+        stages = {}
+        for row in rows:
+            stages.setdefault(DESCRIPTOR_LINEAGE_STAGES[row.get("@event")], []).append(row)
+        for stage, entries in stages.items():
+            if len(entries) > 1:
+                unavailable.append(f"{stage} has {len(entries)} retained records; no unique stage selected")
+        single = {stage: entries[0] for stage, entries in stages.items() if len(entries) == 1}
+        for stage, row in single.items():
+            if stage.endswith("_failed"):
+                issues.append(f"{stage} reported by its owner")
+            if row.get("cuda_mapping_matches_export") is False:
+                issues.append("CUDA mapping differs from the exported allocation handle")
+            for status, error in (("fd_getfd_result", "fd_getfd_errno"), ("fd_stat_status", "fd_stat_errno")):
+                if type(row.get(status)) is int and row.get(status) < 0:
+                    target = issues if exact(row.get(error), errno.EBADF) else unavailable
+                    target.append(f"{stage} {status}={shown(row, status)} errno={shown(row, error)}")
+            if row.get("peer_credentials_known") is False:
+                unavailable.append(f"{stage} peer credentials unavailable (errno={shown(row, 'peer_credentials_errno')})")
+        duplicated = single.get("duplicated")
+        if duplicated:
+            status = duplicated.get("fd_ofd_status")
+            if status == "same":
+                if duplicated.get("fd_ofd_query") != "F_DUPFD_QUERY" \
+                        or not exact(duplicated.get("fd_ofd_result"), 1) or not exact(duplicated.get("fd_ofd_errno"), 0):
+                    issues.append("inconsistent F_DUPFD_QUERY same-OFD result")
+            elif status in ("different", "invalid_descriptor"):
+                issues.append(f"native duplicate OFD comparison: {status}")
+            else:
+                unavailable.append(f"native duplicate OFD comparison: {shown(duplicated, 'fd_ofd_status')}"
+                                   f" (errno={shown(duplicated, 'fd_ofd_errno')})")
+            exported = single.get("workspace_export")
+            if exported and exported.get("workspace_descriptor") is not MISSING and duplicated.get("export_descriptor") is not MISSING \
+                    and not exact(exported.get("workspace_descriptor"), duplicated.get("export_descriptor")):
+                issues.append("workspace export FD differs from the native duplication argument")
+        compare([single[stage] for stage in ("duplicated", "sent") if stage in single], ("workspace_descriptor",))
+        compare([single[stage] for stage in ("received", "claimed", "import", "allocation") if stage in single],
+                ("workspace_descriptor",))
+        compare([single[stage] for stage in ("import", "allocation", "bound") if stage in single], ("vk_device", "vk_image"))
+        compare([single[stage] for stage in ("allocation", "bound") if stage in single], ("vk_memory",))
+        compare([row for row in rows if exact(row.get("fd_stat_status"), 0)],
+                ("fd_dev", "fd_ino", "fd_rdev", "fd_mode", "fd_size"))
+        compare([single[stage] for stage in ("sent", "received", "claimed") if stage in single],
+                ("descriptor_count", "memory_descriptor_index", "record_bytes"))
+        sent = single.get("sent")
+        if sent and (not exact(sent.get("send_bytes"), sent.get("record_bytes")) or not exact(sent.get("send_errno"), 0)):
+            issues.append("SCM_RIGHTS send lacks an exact successful record-length result")
+        allocated = single.get("allocation")
+        if allocated and (not exact(allocated.get("vk_allocate_status"), 0) or allocated.get("fd_consumed") is not True):
+            issues.append(f"vkAllocateMemory status={shown(allocated, 'vk_allocate_status')} "
+                          f"fd_consumed={shown(allocated, 'fd_consumed')}")
+        allocation = compact(",".join(sorted(allocations)), 100) or "unknown"
+        browser = ",".join(sorted(values(rows, "browser_process_id"))) or "unknown"
+        print(f"  source={source} allocation={allocation} native_pid={','.join(sorted(native)) or 'unknown'} "
+              f"browser_pid={browser} run={run}", file=output)
+        chain = []
+        for stage in required:
+            row = single.get(stage)
+            if row is None:
+                chain.append(stage + "(missing)" if stage not in stages else stage + "(ambiguous)")
+                continue
+            descriptor = row.get("workspace_descriptor")
+            label = stage + (f"(fd={shown(row, 'workspace_descriptor')})" if descriptor is not MISSING else "")
+            if stage == "duplicated":
+                label += f"[export_fd={shown(row, 'export_descriptor')},ofd={shown(row, 'fd_ofd_status')}]"
+            if stage == "allocation":
+                label += f"[status={shown(row, 'vk_allocate_status')},consumed={shown(row, 'fd_consumed')}]"
+            chain.append(label)
+        print("    " + " -> ".join(chain), file=output)
+        print("    conflicts: " + ("; ".join(dict.fromkeys(issues)) or "none observed in retained evidence"), file=output)
+        if unavailable:
+            print("    unavailable: " + "; ".join(dict.fromkeys(unavailable)), file=output)
+    if len(groups) > options.top:
+        print(f"  {len(groups) - options.top} additional source chains omitted by --top.", file=output)
 
 
 def render(result, options, output, diagnostics):
@@ -2881,6 +3484,8 @@ def render(result, options, output, diagnostics):
         f"{result.proximity} proximity, {result.context} context; {result.errors} failure candidates; "
         f"{str(automatic) + ' automatic; ' if automatic else ''}showing {len(rows)}/{total}."
     )
+    if options.representatives:
+        status += " One representative per --group-by value; occurrences count all selected records."
     if result.lookup:
         lookup = result.lookup
         report = output if options.format == "summary" else diagnostics
@@ -2913,13 +3518,20 @@ def render(result, options, output, diagnostics):
         if automatic or result.automatic.omitted_anchors:
             print(f"Auto correlation: {automatic} related rows; at most {MAX_AUTO_PER_ANCHOR}/anchor, "
                   f"{MAX_AUTO_PER_IDENTITY}/identity, {MAX_AUTO_RELATED} total, within --limit. "
+                  f"Vulkan object provenance allows {MAX_AUTO_VULKAN_RELATED}/anchor and identity. "
                   "Rows are grouped beside exact query anchors; cross-clock times remain unaligned. "
                   "Use --no-auto-correlate for the original query timeline.", file=diagnostics)
         if result.automatic.omitted_anchors:
             print(f"Auto correlation: {result.automatic.omitted_anchors} query anchors outside the "
                   f"{MAX_AUTO_ANCHORS}-anchor budget; recent specific matches take priority.", file=diagnostics)
+        object_conflicts = sum(result.automatic.object_identity(identity) for identity in result.automatic.ambiguous)
+        if object_conflicts:
+            print(f"Auto correlation: {object_conflicts} Vulkan handle keys have conflicting recorded "
+                  "process/device/source/allocation facts; their candidate joins were omitted.", file=diagnostics)
     for item in rows:
         print(render_record(item, options), file=output)
+    if options.descriptor_lineage:
+        render_descriptor_lineage(result, options, output if options.format == "summary" else diagnostics)
     if options.format == "summary":
         terminals = heapq.nlargest(
             options.top, (row for key, row in result.terminals.items() if key[0] in result.selected_runs),
@@ -2952,9 +3564,21 @@ Examples:
   ./mmltk --logs build/validation/final-wayland-acceptance.log \\
       --family latest-wayland-test --triage -q 'probe_failed OR "rendered probe"'
   ./mmltk --logs --errors
+  ./mmltk --logs --family latest-wayland-test -q '@event=vulkan.validation' \\
+      --group-by validation_id --representatives --format timeline --limit 40 --top 20
+  ./mmltk --logs --family latest-wayland-test -q 'validation_id:SYNC-HAZARD' \\
+      --group-by validation_id --representatives --format jsonl --auto-correlate
   ./mmltk --logs -q 'onnx OR "CUDA error"'
   ./mmltk --logs -q '@event:shutdown AND NOT @event:started' --format timeline
   ./mmltk --logs -q 'trace_id=42' --correlate trace_id --tail --limit 80
+  ./mmltk --logs --family latest-wayland-test -q 'workspace_allocation=34' \\
+      --where '@event:memory_export OR @event:memory_import OR @event:memory_bound OR @event:image_created' \\
+      --correlate native_process_id+workspace_descriptor+workspace_plane \\
+      --correlate browser_process_id+vk_device+vk_image --format timeline --limit 16
+  ./mmltk --logs --family latest-wayland-test -q 'workspace_allocation=34' \\
+      --descriptor-lineage --format timeline --limit 32
+  ./mmltk --logs --family latest-wayland-test \\
+      -q '@event:loaded_library OR @event:library_inventory' --format timeline --limit 70
   ./mmltk --logs -q '@event=firefox.workspace.ready' --correlate @surface
   ./mmltk --logs -q 'duration_ns>=1000000' --fields @event,duration_ns,trace_id
   ./mmltk --logs --where '@file:"latest-wayland-test"' --group-by @event
@@ -2980,7 +3604,7 @@ presence including null/zero. Quote strings containing spaces or punctuation.
 
 Fields:
   JSON paths (fields.name), event/trace_id/etc. (unqualified names also look
-  inside fields), plus @file, @line, @text, @format, @clock, @time_ns,
+  inside fields), plus @file, @line, @line_end, @text, @format, @clock, @time_ns,
   @event, @owner, @level, @error, @surface, @parse_error, @test, @tags,
   @run, @archive_id, @family, @artifact, @mtime_ns, @context_copy, @part,
   @terminal, @exit_code, @signal, @signal_number, @proximity_ns, @time_link,
@@ -2993,6 +3617,74 @@ Fields:
   Signals describe the observed termination, not whether shutdown was intended.
   Bare terms search test/tag/run/signal metadata as well as original text.
   Catch INFO copies retain their original timestamps and are labeled context-copy.
+  Memory provenance explicitly separates native CUDA handles/pointers, transported
+  FD metadata, and browser Vulkan handles. cuda_mapping_matches_export compares the
+  actual exported handle with CUDA's retained handle for the native mapping; null
+  means that query failed. Driver property fields require their successful status.
+  native_process_id+workspace_descriptor+workspace_plane links the immediate
+  framework export records; browser_process_id+vk_device+vk_image links image
+  creation, import and binding. These are explicit, process-local observations:
+  scope to one capture/allocation lifetime because FDs, addresses and handles can
+  be reused. Neither equal numeric FDs across processes nor matching fstat metadata
+  (especially anonymous inodes) proves the same GPU backing. No OPAQUE_FD memory
+  properties query or buffer-alias probe is used. Native export records live in
+  the existing native stderr artifact, enabled by nonempty MMLTK_GUI_TRACE_FILE.
+  --descriptor-lineage restricts an explicit query to memory provenance and adds
+  the two process-local correlations above. Query an exact workspace_allocation
+  in one capture; a source-only query may not retain its framework export.
+  Its bounded report uses only retained physical rows (--limit and --where still
+  apply), reports at most --top sources, rejects ambiguous export associations,
+  and exposes conflicting source/allocation/process/descriptor/binding facts.
+  Missing stages may mean disabled logging or omitted evidence. Raw stage rows
+  retain physical file/line provenance. JSONL summaries go only to stderr.
+  Native F_DUPFD_QUERY compares the live export FD with its ordinary queued
+  duplicate at duplication time. same/different are kernel OFD observations;
+  unsupported, denied, invalid_descriptor and unavailable remain distinct.
+  No diagnostic FD is retained, no cross-process kcmp reference is available,
+  and no independent payload identity is asserted across SCM_RIGHTS. Socket
+  peer credentials and exact source/allocation/role identify the transport
+  record. Receive, claim and pre-import FD snapshots observe current liveness;
+  they cannot exclude a close/reuse between snapshots. memory_allocation records
+  the actual vkAllocateMemory FD argument and return before binding, without
+  querying an FD after Vulkan consumes it.
+  loaded_library/library_inventory record existing /proc/self/maps paths once
+  per enabled native exporter/browser importer process at its first memory
+  handoff. They load no DSO and create no GPU work. Inventories inspect at most
+  1 MiB, retain 32 distinct paths of less than 1024 bytes, and report unavailable
+  reads, bounded/partial results and unencodable paths explicitly. Absence does
+  not exclude static linkage or a library loaded after the snapshot. Query these
+  events separately with the chain's process IDs; --descriptor-lineage keeps
+  its row budget for the allocation chain.
+
+Vulkan layer diagnostics:
+  Adjacent Rust VALIDATION headers, indented message bodies, and matching
+  logger objects lines form one searchable record. The original physical lines
+  and complete message remain available in text/message; @line..@line_end
+  identifies their span. Assembly is bounded to 128 lines and 1 MiB; overflow is
+  reported as a parse error and remaining lines stay searchable separately.
+  @event=vulkan.validation exposes validation_id (VUID or SYNC-HAZARD), message_id,
+  api, level, and typed objects with normalized hexadecimal handles and reported
+  names. A sole IMAGE or DEVICE_MEMORY is also queryable as vk_image/vk_memory.
+  Human timelines print the complete diagnostic, including its stated conditions.
+  It remains a layer allegation; a handle match does not establish its cause.
+  --group-by validation_id --representatives selects one first record per group,
+  preferring physical records over context copies, with @representative_count.
+  All selected occurrences still contribute to counts. --order controls selection
+  and ordering; --limit bounds retained groups/context plus automatic evidence.
+  Add api or message to --group-by when different messages use the same VUID.
+  --representatives cannot combine with --tail, --error, or --triage.
+  Automatic correlation joins the representative's exact typed image/memory
+  handles to image_created, memory_import, memory_bound, and direct_binding.
+  It retains at most four diverse provenance events per Vulkan anchor/handle,
+  within the normal 48-row and --limit budgets, using the existing streaming pass.
+  Explicit equal process IDs may join files in the same run; conflicting process,
+  device, source, or allocation facts reject the join. PID-free Rust stderr can
+  only produce labeled same-file handle candidates, never a cross-process join
+  or an asserted process identity. Observed handle reuse/multiple owners suppress
+  ambiguous candidates. Missing provenance is not proof that an object is unrelated.
+  Narrow a capture/allocation lifetime because handle numbers may be reused.
+  Correlated rows do not seed further expansion. JSONL requires --auto-correlate;
+  --no-auto-correlate disables the automatic joins in human timelines.
 
 Inputs and ordering:
   Paths/globs are repository-relative or absolute within the repository.
@@ -3076,6 +3768,21 @@ Automatic triage:
   never identifies source storage. Direct GPU read_settled receipts prove
   released source custody; copy_completed proves the Copy-mode transfer.
   Offered publications need no read settlement until actually acquired.
+  Optional firefox.workspace.direct_pixel adds native -> direct_image -> sample
+  comparisons only for that exact direct acquisition after completion=Ok(true)
+  and matching 0x4d4d4c54 readback markers. Missing or invalid optional probes
+  never replace native -> sample or require another evidence stage.
+  Optional presentation.pixel_source_copy_before_ready and
+  presentation.pixel_source_copy_after_release report direct CUDA source-to-host
+  samples separately from the native kernel probes (presentation.pixel and
+  presentation.pixel_after_release). Exact source+transfer+publication and
+  coordinates join these observations to their kernel, each other, and the
+  acquired direct_image/Iced samples. Contradictory source/allocation facts
+  prevent byte comparison; missing optional observations never imply failure.
+  Raw buffer-alias observation is unavailable across the image's external
+  ownership acquire; direct_memory_alias/status report the exact reason.
+  Historical direct_memory_pixel records read undefined alias contents and
+  remain inspectable, but never participate in pixel comparisons.
   --triage selects a run using ranked failure/assertion/error/terminal/parse
   anchors, or an unmatched start when no explicit failure is available. --query
   narrows anchors; --where constrains every pass. --error keeps its first-physical
@@ -3154,6 +3861,8 @@ def argument_parser():
                         help="pasted-error neighborhood radius in milliseconds (default: 1000)")
     parser.add_argument("--correlate", action="append", default=[], metavar="FIELD[+FIELD...]",
                         help="include records sharing a seed identity; repeat for OR, + for composite identities")
+    parser.add_argument("--descriptor-lineage", action="store_true",
+                        help="follow memory provenance for an explicit allocation query and report bounded descriptor-chain conflicts")
     automatic = parser.add_mutually_exclusive_group()
     automatic.add_argument("--auto-correlate", action="store_true", dest="auto_correlate",
                            help="opt in to bounded automatic related evidence, including for JSONL")
@@ -3165,6 +3874,8 @@ def argument_parser():
     parser.add_argument("--format", choices=("summary", "timeline", "jsonl"), default="summary")
     parser.add_argument("--fields", help="comma-separated output field projection; provenance is always retained")
     parser.add_argument("--group-by", default="@owner,@event", help="comma-separated summary grouping fields")
+    parser.add_argument("--representatives", action="store_true",
+                        help="retain one first record per --group-by value, with full occurrence counts")
     parser.add_argument("--top", type=bounded_integer(1, 100),
                         help="maximum summary entries per section (default: 5 for triage, 10 otherwise)")
     parser.add_argument("--limit", type=bounded_integer(1, 10000), default=20,
@@ -3192,8 +3903,20 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
         where = QueryParser(options.where).parse()
         if options.errors:
             query = Expression("and", (query, Expression("=", ("@error", True))))
+        if options.descriptor_lineage:
+            if not options.query.strip() or options.triage or options.related_run or options.error is not None \
+                    or options.list_runs or options.representatives:
+                raise QueryError("--descriptor-lineage requires --query and cannot combine with "
+                                 "--triage, --related-run, --error, --list-runs, or --representatives")
+            where = Expression("and", (where, Expression("or", tuple(
+                Expression("=", ("@event", event)) for event in sorted(MEMORY_PROVENANCE_EVENTS)))))
+            for names in ("native_process_id+workspace_descriptor+workspace_plane", "browser_process_id+vk_device+vk_image"):
+                if names not in options.correlate:
+                    options.correlate.append(names)
         if options.triage and (options.related_run or options.tail or options.list_runs):
             raise QueryError("--triage cannot combine with --related-run, --tail, or --list-runs; its evidence is bounded automatically")
+        if options.representatives and (options.triage or options.tail or options.error is not None):
+            raise QueryError("--representatives cannot combine with --triage, --tail, or --error")
         if options.correlate and not (options.query.strip() or options.errors or options.triage):
             raise QueryError("--correlate requires an explicit --query or --errors seed")
         if options.auto_correlate is True and not auto_correlate_enabled(options):

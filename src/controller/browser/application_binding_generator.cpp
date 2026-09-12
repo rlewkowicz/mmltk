@@ -484,9 +484,11 @@ class BindingEmitter final {
                 return;
             }
             output_ << "#[derive(Debug, Clone, PartialEq)]\npub struct " << name << " {\n";
+            std::size_t output_field_count = 0U;
             VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
                 symbols_.Reserve("struct " + name, member, NativeSource<Type>() + "." + std::string(fact.member_name));
                 output_ << "    pub " << member << ": " << rust_type<Field>() << ",\n";
+                ++output_field_count;
             });
             output_ << "}\n";
             if constexpr (mmltk::frameworks::reflection::fixed_text_annotation_count<Type>() == 1U) {
@@ -503,38 +505,54 @@ class BindingEmitter final {
                            "let size = value.len().try_into().map_err(|_| \"fixed text size overflow\".to_owned())?;\n"
                            "Ok(Self { bytes: crate::application_codec::ByteArray(bytes), size }) } }\n";
             }
-            output_ << "impl IntoApplicationValue for " << name << " { fn into_application_value(self) -> Value { Value::Object(vec![\n";
-            VisitRustFields<Type>([&]<class, class>(const auto& fact, const std::string& member) {
-                output_ << "    (\"" << fact.member_name << "\".into(), self." << member << ".into_application_value()),\n";
-            });
-            output_ << "]) } }\nimpl FromApplicationValue for " << name
-                    << " { fn from_application_value(value: Value) -> Result<Self, String> { "
-                       "let mut fields = object(value)?;\n";
-            VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
-                output_ << "let " << member << ": " << rust_type<Field>() << " = FromApplicationValue::from_application_value(";
-                if constexpr (schema::Optional<Field>::value)
-                    output_ << "take_optional_field(&mut fields, \"" << fact.member_name << "\")";
-                else
-                    output_ << "take_field(&mut fields, \"" << fact.member_name << "\")?";
-                output_ << ")?;\n";
-                EmitConstraint<Field>(member, fact.constraint);
-            });
-            output_ << "if !fields.is_empty() { return Err(\"unknown object field\".into()) }\n";
-            if constexpr (mmltk::frameworks::reflection::fixed_text_annotation_count<Type>() == 1U) {
-                constexpr auto policy = mmltk::frameworks::reflection::fixed_text_policy_of<Type>();
-                output_ << "let fixed_size: usize = size.try_into().map_err(|_| \"fixed text size overflow\")?;\n"
-                           "if fixed_size == 0 || fixed_size > "
-                        << policy.capacity
-                        << " { return Err(\"invalid fixed text size\".into()) }\n"
-                           "if bytes.0[fixed_size..].iter().any(|byte| *byte != 0) "
-                           "{ return Err(\"fixed text tail is not canonical\".into()) }\n";
-                if constexpr (policy.characters == mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii)
-                    output_ << "if bytes.0[..fixed_size].iter().any(|byte| !(0x20..0x7f).contains(byte)) "
-                               "{ return Err(\"invalid fixed text character\".into()) }\n";
+            output_ << "impl IntoApplicationValue for " << name << " {\n";
+            for (const bool transport : {false, true}) {
+                const auto method = transport ? "into_application_transport_value" : "into_application_value";
+                output_ << "fn " << method << "(self) -> Value { Value::" << (transport ? "Array" : "Object") << "(vec![\n";
+                VisitRustFields<Type>([&]<class, class>(const auto& fact, const std::string& member) {
+                    if (!transport) output_ << "(\"" << fact.member_name << "\".into(), ";
+                    output_ << "self." << member << '.' << method << "()" << (transport ? "" : ")") << ",\n";
+                });
+                output_ << "]) }\n";
             }
-            output_ << "Ok(Self {\n";
-            VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) { output_ << "    " << member << ",\n"; });
-            output_ << "}) } }\n\n";
+            output_ << "}\nimpl FromApplicationValue for " << name << " {\n";
+            for (const bool transport : {false, true}) {
+                const auto method = transport ? "from_application_transport_value" : "from_application_value";
+                output_ << "fn " << method << "(value: Value) -> Result<Self, String> { ";
+                if (transport)
+                    output_ << "let mut fields = crate::application_codec::transport_fields(value, "
+                            << output_field_count << ")?;\n";
+                else
+                    output_ << "let mut fields = object(value)?;\n";
+                VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
+                    output_ << "let " << member << ": " << rust_type<Field>() << " = FromApplicationValue::" << method << "(";
+                    if (transport)
+                        output_ << "fields.next().ok_or(\"missing positional field\")?";
+                    else if constexpr (schema::Optional<Field>::value)
+                        output_ << "take_optional_field(&mut fields, \"" << fact.member_name << "\")";
+                    else
+                        output_ << "take_field(&mut fields, \"" << fact.member_name << "\")?";
+                    output_ << ")?;\n";
+                    EmitConstraint<Field>(member, fact.constraint);
+                });
+                if (!transport) output_ << "if !fields.is_empty() { return Err(\"unknown object field\".into()) }\n";
+                if constexpr (mmltk::frameworks::reflection::fixed_text_annotation_count<Type>() == 1U) {
+                    constexpr auto policy = mmltk::frameworks::reflection::fixed_text_policy_of<Type>();
+                    output_ << "let fixed_size: usize = size.try_into().map_err(|_| \"fixed text size overflow\")?;\n"
+                               "if fixed_size == 0 || fixed_size > "
+                            << policy.capacity
+                            << " { return Err(\"invalid fixed text size\".into()) }\n"
+                               "if bytes.0[fixed_size..].iter().any(|byte| *byte != 0) "
+                               "{ return Err(\"fixed text tail is not canonical\".into()) }\n";
+                    if constexpr (policy.characters == mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii)
+                        output_ << "if bytes.0[..fixed_size].iter().any(|byte| !(0x20..0x7f).contains(byte)) "
+                                   "{ return Err(\"invalid fixed text character\".into()) }\n";
+                }
+                output_ << "Ok(Self {\n";
+                VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) { output_ << "    " << member << ",\n"; });
+                output_ << "}) }\n";
+            }
+            output_ << "}\n\n";
             CollectMetadata<Type>(name);
         } else if constexpr (!Builtin<Type>) {
             throw std::logic_error("unsupported reachable application boundary type at `" + NativeSource<Type>() + "`");
@@ -553,35 +571,47 @@ class BindingEmitter final {
             symbols_.Reserve("enum " + name, variant, NativeSource<Alternative>());
             output_ << "    " << variant << '(' << rust_type<Alternative>() << "),\n";
         });
-        output_ << "}\nimpl IntoApplicationValue for " << name << " { fn into_application_value(self) -> Value { ";
-        if (wrapped) output_ << "let value = ";
-        output_ << "match self {\n";
-        schema::Variant<Variant>::Visit([&]<class Alternative>() {
-            const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
-            output_ << "    Self::" << rust_identifier(source, true) << "(value) => Value::Object(vec![(\"kind\".into(), Value::Text(\""
-                    << source << "\".into())), (\"payload\".into(), value.into_application_value())]),\n";
-        });
-        output_ << '}';
-        if (wrapped) output_ << "; Value::Object(vec![(\"value\".into(), value)])";
-        output_ << " } }\nimpl FromApplicationValue for " << name
-                << " { fn from_application_value(value: Value) -> Result<Self, String> { ";
-        if (wrapped)
-            output_ << "let mut wrapper = object(value)?; "
-                       "let mut fields = object(take_field(&mut wrapper, \"value\")?)?; "
-                       "if !wrapper.is_empty() { return Err(\"unknown named variant field\".into()) } ";
-        else
-            output_ << "let mut fields = object(value)?; ";
-        output_ << "let kind = take_field(&mut fields, \"kind\")?; "
-                   "let Value::Text(name) = kind else { return Err(\"variant kind must be text\".into()) }; "
-                   "let value = take_field(&mut fields, \"payload\")?; "
-                   "if !fields.is_empty() { return Err(\"unknown variant field\".into()) } "
-                   "match name.as_str() {\n";
-        schema::Variant<Variant>::Visit([&]<class Alternative>() {
-            const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
-            output_ << "    \"" << source << "\" => Ok(Self::" << rust_identifier(source, true)
-                    << "(FromApplicationValue::from_application_value(value)?)),\n";
-        });
-        output_ << "    _ => Err(\"unknown variant\".into()), } } }\n\n";
+        output_ << "}\nimpl IntoApplicationValue for " << name << " {\n";
+        for (const bool transport : {false, true}) {
+            const auto method = transport ? "into_application_transport_value" : "into_application_value";
+            output_ << "fn " << method << "(self) -> Value { ";
+            if (wrapped) output_ << "let value = ";
+            output_ << "match self {\n";
+            schema::Variant<Variant>::Visit([&]<class Alternative>() {
+                const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
+                output_ << "    Self::" << rust_identifier(source, true) << "(value) => Value::Object(vec![(\"kind\".into(), Value::Text(\""
+                        << source << "\".into())), (\"payload\".into(), value." << method << "())]),\n";
+            });
+            output_ << '}';
+            if (wrapped) output_ << (transport ? "; Value::Array(vec![value])" : "; Value::Object(vec![(\"value\".into(), value)])");
+            output_ << " }\n";
+        }
+        output_ << "}\nimpl FromApplicationValue for " << name << " {\n";
+        for (const bool transport : {false, true}) {
+            const auto method = transport ? "from_application_transport_value" : "from_application_value";
+            output_ << "fn " << method << "(value: Value) -> Result<Self, String> { ";
+            if (wrapped && transport)
+                output_ << "let mut wrapper = crate::application_codec::transport_fields(value, 1)?; "
+                           "let mut fields = object(wrapper.next().ok_or(\"missing variant field\")?)?; ";
+            else if (wrapped)
+                output_ << "let mut wrapper = object(value)?; "
+                           "let mut fields = object(take_field(&mut wrapper, \"value\")?)?; "
+                           "if !wrapper.is_empty() { return Err(\"unknown named variant field\".into()) } ";
+            else
+                output_ << "let mut fields = object(value)?; ";
+            output_ << "let kind = take_field(&mut fields, \"kind\")?; "
+                       "let Value::Text(name) = kind else { return Err(\"variant kind must be text\".into()) }; "
+                       "let value = take_field(&mut fields, \"payload\")?; "
+                       "if !fields.is_empty() { return Err(\"unknown variant field\".into()) } "
+                       "match name.as_str() {\n";
+            schema::Variant<Variant>::Visit([&]<class Alternative>() {
+                const auto source = mmltk::frameworks::serialization::reflected_schema_type_name<Alternative>();
+                output_ << "    \"" << source << "\" => Ok(Self::" << rust_identifier(source, true)
+                        << "(FromApplicationValue::" << method << "(value)?)),\n";
+            });
+            output_ << "    _ => Err(\"unknown variant\".into()), } }\n";
+        }
+        output_ << "}\n\n";
     }
 
     template <class Type>

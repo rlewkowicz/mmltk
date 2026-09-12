@@ -74,6 +74,7 @@ impl<T> Requests<T> {
 }
 
 struct Probe {
+    bound: Surface,
     device: wgpu::Device,
     queue: wgpu::Queue,
     buffer: wgpu::Buffer,
@@ -89,10 +90,12 @@ impl PixelTrace {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
+        bound: Surface,
     ) -> Option<Self> {
         if !enabled() {
             return None;
         }
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mmltk sample pixel evidence"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(PROBE)),
@@ -145,22 +148,23 @@ impl PixelTrace {
                 },
             ],
         });
-        Some(Self {
-            state: Arc::new(Probe {
-                device: device.clone(),
-                queue: queue.clone(),
-                pipeline,
-                bindings,
-                parameters,
-                pixels,
-                buffer: buffer(
-                    "mmltk bounded pixel evidence",
-                    25 * 256,
-                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                ),
-                requests: Mutex::new(Requests::default()),
-            }),
-        })
+        let state = Arc::new(Probe {
+            bound,
+            device: device.clone(),
+            queue: queue.clone(),
+            pipeline,
+            bindings,
+            parameters,
+            pixels,
+            buffer: buffer(
+                "mmltk bounded pixel evidence",
+                25 * 256,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            ),
+            requests: Mutex::new(Requests::default()),
+        });
+        state.report_validation(bound, "create", validation);
+        Some(Self { state })
     }
 
     pub(super) fn sample(&self, surface: Surface, read: Arc<SampleRead>) {
@@ -194,6 +198,67 @@ impl Drop for PixelTrace {
 }
 
 impl Probe {
+    fn trace(bound: Surface, surface: Surface, phase: &str, outcome: bool, error: Option<&str>) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let error = error
+                .and_then(|error| {
+                    js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(error))
+                        .ok()
+                        .and_then(|value| value.as_string())
+                })
+                .unwrap_or_else(|| "null".to_owned());
+            super::emit_surface_trace(&format!(
+                "{{\"event\":\"iced.surface.pixel_probe\",\"phase\":\"{phase}\",{}, {},\"outcome\":{outcome},\"error\":{error}}}",
+                super::surface_trace_fields(surface, surface),
+                Self::bound_fields(bound),
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (bound, surface, phase, outcome, error);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn bound_fields(bound: Surface) -> String {
+        let frame = bound.frame.expect("probe texture has an exact source");
+        format!(
+            "\"bound_surface\":\"{:016x}{:016x}\",\"bound_source\":\"{:016x}{:016x}\",\"bound_slot\":{},\"bound_direct_sampling\":{},\"bound_width\":{},\"bound_height\":{},\"bound_publication\":{}",
+            bound.high,
+            bound.low,
+            frame.source_high,
+            frame.source_low,
+            frame.slot,
+            frame.direct_sampling,
+            bound.width,
+            bound.height,
+            frame.presentation_revision,
+        )
+    }
+
+    fn report_validation(
+        &self,
+        surface: Surface,
+        phase: &'static str,
+        scope: wgpu::ErrorScopeGuard,
+    ) {
+        // Pop now, before any unrelated work can run. Awaiting only reports
+        // the result; it must never extend the device's error scope.
+        let result = scope.pop();
+        #[cfg(target_arch = "wasm32")]
+        {
+            use iced::Executor as _;
+            let bound = self.bound;
+            iced::executor::Default::new()
+                .expect("browser executor")
+                .spawn(async move {
+                    let error = result.await.map(|error| error.to_string());
+                    Self::trace(bound, surface, phase, error.is_none(), error.as_deref());
+                });
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (surface, phase, result);
+    }
+
     fn start(self: Arc<Self>, request: Request) {
         let surface = request.surface;
         let frame = surface.frame.expect("validated sample probe frame");
@@ -212,6 +277,7 @@ impl Probe {
                 coordinate(index / 5, frame.content_height),
             )
         });
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -222,7 +288,9 @@ impl Probe {
             frame.content_width,
             frame.content_height,
             if frame.direct_sampling { 0 } else { frame.slot },
-            0,
+            // An echoed diagnostic word identifies stale probe output without
+            // participating in publication or resource ownership decisions.
+            frame.presentation_revision as u32,
         ]
         .into_iter()
         .enumerate()
@@ -244,21 +312,39 @@ impl Probe {
         encoder.copy_buffer_to_buffer(&self.pixels, 0, &self.buffer, 0, 25 * 256);
         // The read's physical custody follows the copy's encoder separately
         // from optional mapping success, request coalescing and owner disposal.
-        encoder.on_submitted_work_done(move || drop(request.read));
+        let bound = self.bound;
+        encoder.on_submitted_work_done(move || {
+            drop(request.read);
+            // This callback has no GPU status parameter. Record its arrival,
+            // independently from validation and the map's explicit result.
+            Self::trace(bound, surface, "submit_callback", true, None);
+        });
         self.queue.submit([encoder.finish()]);
+        self.report_validation(surface, "submit_validation", validation);
+        Self::trace(bound, surface, "submit_returned", true, None);
         let buffer = self.buffer.clone();
         let callback_buffer = buffer.clone();
+        let mapping = self.clone();
+        let validation = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let error = result.as_ref().err().map(|error| error.to_string());
+            Self::trace(bound, surface, "map_completed", result.is_ok(), error.as_deref());
             if result.is_ok() {
                 {
                     let bytes = callback_buffer.slice(..).get_mapped_range();
                     for (index, &(x, y)) in coordinates.iter().enumerate() {
                         let offset = index * 256;
-                        let rgba = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("four-byte pixel"));
+                        let word = |index: usize| {
+                            let start = offset + index * 4;
+                            u32::from_le_bytes(bytes[start..start + 4].try_into().expect("four-byte probe word"))
+                        };
+                        let rgba = word(0);
                         #[cfg(target_arch = "wasm32")]
                         super::emit_surface_trace(&format!(
-                            "{{\"event\":\"iced.surface.pixel\",{},\"sample_index\":{index},\"sample_x\":{x},\"sample_y\":{y},\"sample_rgba\":{rgba}}}",
+                            "{{\"event\":\"iced.surface.pixel\",{}, {},\"sample_index\":{index},\"sample_x\":{x},\"sample_y\":{y},\"sample_rgba\":{rgba},\"probe_stamp\":{},\"probe_width\":{},\"probe_height\":{},\"probe_layer\":{},\"texture_width\":{},\"texture_height\":{},\"texture_layers\":{},\"probe_request_word\":{}}}",
                             super::surface_trace_fields(surface, surface),
+                            Self::bound_fields(bound), word(1), word(2), word(3), word(4),
+                            word(5), word(6), word(7), word(8),
                         ));
                         #[cfg(not(target_arch = "wasm32"))]
                         let _ = (x, y, rgba);
@@ -271,6 +357,7 @@ impl Probe {
             let next = self.requests.lock().unwrap_or_else(|error| error.into_inner()).finish(result.is_ok());
             if let Some(next) = next { self.start(next); }
         });
+        mapping.report_validation(surface, "map_validation", validation);
     }
 }
 
@@ -323,5 +410,15 @@ fn coordinate(index: u32, size: u32) -> u32 {
 fn probe(@builtin(local_invocation_index) index: u32) {
     let xy = vec2<i32>(i32(coordinate(index % 5u, parameters.x)), i32(coordinate(index / 5u, parameters.y)));
     pixels[index * 64u] = pack4x8unorm(textureLoad(sample, xy, i32(parameters.z), 0));
+    // Existing per-sample padding carries effect-only execution evidence.
+    let dimensions = textureDimensions(sample, 0);
+    pixels[index * 64u + 1u] = 0x4d4d4c54u;
+    pixels[index * 64u + 2u] = parameters.x;
+    pixels[index * 64u + 3u] = parameters.y;
+    pixels[index * 64u + 4u] = parameters.z;
+    pixels[index * 64u + 5u] = dimensions.x;
+    pixels[index * 64u + 6u] = dimensions.y;
+    pixels[index * 64u + 7u] = textureNumLayers(sample);
+    pixels[index * 64u + 8u] = parameters.w;
 }
 "#;

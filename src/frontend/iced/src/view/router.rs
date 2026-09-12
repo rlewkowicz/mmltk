@@ -56,6 +56,12 @@ impl Default for Router {
 }
 
 impl Router {
+    #[cfg(test)]
+    pub(crate) fn test_install_annotation_displayed(&self, model: &ApplicationModel) {
+        self.annotation
+            .test_install_displayed(model.annotation.snapshot.as_ref().unwrap());
+    }
+
     pub const fn active(&self) -> FeatureId {
         self.active
     }

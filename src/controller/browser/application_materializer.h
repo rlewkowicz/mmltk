@@ -22,7 +22,7 @@ namespace application_materializer_detail {
 
 template <class Value>
 [[nodiscard]] std::expected<wire::Value, wire::ErrorCode> reflected_value(const Value& value) {
-    auto result = mmltk::frameworks::serialization::reflected_value(value);
+    auto result = mmltk::frameworks::serialization::reflected_transport_value(value);
     if (!result) return std::unexpected(result.error().code);
     return std::move(*result);
 }

@@ -1,4 +1,10 @@
-use crate::generated::{AnnotationShape, AnnotationUiState};
+use crate::generated::{AnnotationMask, AnnotationShape, AnnotationUiState};
+
+pub(super) fn mask_contains(mask: &AnnotationMask, [x, y]: [u16; 2]) -> bool {
+    mask.runs
+        .iter()
+        .any(|run| run.row == y && run.first <= x && run.last >= x)
+}
 
 pub(super) fn sample_pixel(ui: &AnnotationUiState) -> [u16; 2] {
     // Keep the clean-image sample inside the image. A corner sample can land
@@ -54,12 +60,7 @@ pub(super) fn probes(ui: &AnnotationUiState) -> Vec<f64> {
                     let [x, y] = sample_pixel(ui);
                     let clean =
                         crate::presentation_surface::labels::class_color(&object.sup.center);
-                    let alpha = if object
-                        .mask
-                        .runs
-                        .iter()
-                        .any(|run| run.row == y && run.first <= x && run.last >= x)
-                    {
+                    let alpha = if mask_contains(&object.mask, [x, y]) {
                         92.0 / 255.0
                     } else {
                         0.0

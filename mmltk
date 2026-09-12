@@ -2533,6 +2533,7 @@ print_test_suites() {
         '  transport  Isolated browser physical transport and attachment suite' \
         '  browser-runtime  Isolated Firefox process-owner and shell shutdown suite' \
         '  workspace-wayland  Opt-in packaged Wayland/NVIDIA browser hardware suite' \
+        '  cuda-vulkan     Standalone CUDA/Vulkan FD, timeline, and pixel diagnostic (no browser)' \
         '  headless-compositor  Verify the NVIDIA headless Wayland compositor and protocols' \
         '  headless-compositor-tool  Headless session ownership and failure-handling fixture suite' \
         '  browser-app  Iced client protocol, state, and transport unit suite' \
@@ -2549,6 +2550,7 @@ print_test_suites() {
         'Use: ./mmltk --test <suite> [test options] [-- <Catch2 args...>]' \
         'For browser-app, arguments after -- are Cargo test arguments.' \
         'For headless-compositor, arguments after -- run a command in the private compositor.' \
+        'For cuda-vulkan, arguments after -- are width height allocation-pairs transfers validation context-mode memory-owner; use -- --help.' \
         'Test options:' \
         '  --executable <target>       Build and run one executable owned by the suite' \
         '  --config <release|dev>      Select the containerized CMake graph' \
@@ -2587,6 +2589,118 @@ run_log_tool() {
         diagnostic_args+=("${diagnostic_image_id}" /workspace/tools/log_query.py "$@")
     fi
     run_owned_docker_command "${log_container_name}" "${diagnostic_args[@]}"
+}
+
+run_gpu_environment_diagnostic() {
+    local diagnostic_image diagnostic_image_id
+    case "$1" in
+        runtime) diagnostic_image="${image_name}" ;;
+        wayland-validation) diagnostic_image="${wayland_validation_image_name}" ;;
+        development) diagnostic_image="${build_image_name}" ;;
+        -h|--help)
+            printf '%s\n' \
+                'Usage: ./mmltk --diagnose-gpu-environment [runtime|wayland-validation|development]' \
+                'Default: runtime (MMLTK_IMAGE). Other selections reuse existing wrapper images.' \
+                'Print bounded JSON for the container, kernel, NVIDIA driver/GPU identities,' \
+                'CUDA/Vulkan libraries and ICD manifests, and explicit virtualization evidence.' \
+                'Read-only, no network, no image builds/pulls, no application or GPU workload.'
+            return 0
+            ;;
+        *) die "--diagnose-gpu-environment accepts runtime, wayland-validation, or development" ;;
+    esac
+    [[ "${repo_root}" != *:* ]] || die "--diagnose-gpu-environment repository path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; GPU environment diagnostic did not start"
+    diagnostic_image_id="$(docker image inspect "${diagnostic_image}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${diagnostic_image}'; no image was built or pulled"
+    local diagnostic_container="${container_name}-gpu-environment"
+    local -a diagnostic_args=(
+        run --rm --init --pull never --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges
+        --network none --gpus all --user "${uid}:${gid}"
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --env "MMLTK_DIAGNOSTIC_IMAGE=${diagnostic_image}"
+        --env "MMLTK_DIAGNOSTIC_IMAGE_ID=${diagnostic_image_id}"
+        --volume "${repo_root}/tools/diagnose_gpu_environment.py:/diagnostic/report.py:ro"
+        --entrypoint /usr/bin/python3
+    )
+    build_common_group_args
+    append_wrapper_labels diagnostic_args "diagnose-gpu-environment"
+    diagnostic_args+=("${common_group_args[@]}" "${diagnostic_image_id}" -I -B /diagnostic/report.py)
+    run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
+}
+
+run_gpu_program_diagnostic() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        printf '%s\n' \
+            'Usage: ./mmltk --diagnose-gpu-program SOURCE.cpp [PROGRAM_ARGS...]' \
+            'Build one standalone C++26 CUDA-driver/Vulkan diagnostic in the existing development image.' \
+            'Run it in the existing Wayland validation image, without starting the application or compositor.' \
+            'Artifacts go under build/diagnostics; no image builds, pulls, or network.' \
+            'Compilation and execution each have a 120-second deadline.'
+        return 0
+    fi
+    (( $# >= 1 )) || die "--diagnose-gpu-program requires a C++ source path"
+    local program_source program_directory artifact_directory build_id
+    program_source="$(realpath -e -- "$1")" || die "diagnostic source does not exist: $1"
+    shift
+    [[ -f "${program_source}" && -r "${program_source}" && "${program_source}" == *.cpp ]] ||
+        die "--diagnose-gpu-program requires a readable .cpp file"
+    [[ "${program_source}" != *:* ]] || die "diagnostic source path cannot contain ':'"
+    program_directory="$(dirname -- "${program_source}")"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; diagnostic did not start"
+    build_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${build_image_name}'"
+    docker image inspect "${wayland_validation_image_name}" >/dev/null 2>&1 ||
+        die "diagnostic requires existing image '${wayland_validation_image_name}'"
+    prepare_owned_dirs "${repo_root}/build/diagnostics"
+    artifact_directory="$(mktemp -d "${repo_root}/build/diagnostics/gpu-program.XXXXXX")"
+    chown "${uid}:${gid}" "${artifact_directory}"
+    local diagnostic_container="${container_name}-gpu-program"
+    local -a compile_args=(
+        run --rm --init --pull never --name "${diagnostic_container}-build"
+        --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --user "${uid}:${gid}" --tmpfs /tmp:rw,nosuid,nodev,size=256m
+        --volume "${program_directory}:/diagnostic/source:ro"
+        --volume "${artifact_directory}:/diagnostic/output:rw"
+        --env "MMLTK_DIAGNOSTIC_SOURCE=$(basename -- "${program_source}")"
+        --entrypoint /usr/bin/timeout
+    )
+    append_wrapper_labels compile_args "diagnose-gpu-program"
+    log "standalone diagnostic artifacts: ${artifact_directory}"
+    run_owned_docker_command "${diagnostic_container}-build" "${compile_args[@]}" \
+        "${build_id}" --signal=KILL 120s /bin/bash -c '
+            exec /opt/gcc-16.2/bin/g++ -std=c++26 -O2 -g -Wall -Wextra \
+                -Wno-missing-field-initializers \
+                -I"${CUDA_HOME}/include" "/diagnostic/source/${MMLTK_DIAGNOSTIC_SOURCE}" \
+                -L"${CUDA_HOME}/lib64/stubs" -lcuda -lvulkan \
+                -o /diagnostic/output/probe
+        '
+    run_gpu_diagnostic_executable "${artifact_directory}/probe" "$@"
+}
+
+run_gpu_diagnostic_executable() {
+    local executable="$1"
+    shift
+    local runtime_id diagnostic_container="${container_name}-gpu-program"
+    runtime_id="$(docker image inspect "${wayland_validation_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${wayland_validation_image_name}'; run ./mmltk --build first"
+    [[ "${executable}" != *:* ]] || die "diagnostic executable path cannot contain ':'"
+    local -a runtime_args=(
+        run --rm --init --pull never --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --gpus all --user "${uid}:${gid}" --env NVIDIA_DRIVER_CAPABILITIES=all
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m
+        --volume "${executable}:/diagnostic/probe:ro"
+        --entrypoint /usr/bin/timeout
+    )
+    build_common_group_args
+    append_wrapper_labels runtime_args "diagnose-gpu-program"
+    runtime_args+=("${common_group_args[@]}")
+    log "standalone diagnostic runtime: ${runtime_id}"
+    run_owned_docker_command "${diagnostic_container}" "${runtime_args[@]}" \
+        "${runtime_id}" --signal=KILL 120s /diagnostic/probe "$@"
 }
 
 run_io_diagnostic() {
@@ -3054,6 +3168,7 @@ run_tests() {
     local configure_preset="${test_config}"
     local build_directory="${test_config}"
     local workspace_wayland_suite=0
+    local cuda_vulkan_suite=0
     local -a suite_args=("$@")
     local -a all_native_test_targets=(
         mmltk_acceptance
@@ -3128,6 +3243,11 @@ run_tests() {
             targets=(mmltk_workspace_wayland_integration)
             executables=(mmltk_workspace_wayland_integration)
             workspace_wayland_suite=1
+            ;;
+        cuda-vulkan)
+            targets=(mmltk_cuda_vulkan_interop)
+            executables=("${targets[@]}")
+            cuda_vulkan_suite=1
             ;;
         core)
             targets=(
@@ -3204,6 +3324,11 @@ run_tests() {
         (( ! test_debugger )) ||
             die "workspace-wayland does not run through the build-image debugger"
     fi
+    if (( cuda_vulkan_suite )); then
+        [[ "${test_config}" == "release" ]] || die "cuda-vulkan requires the release graph"
+        (( ! test_debugger )) || die "cuda-vulkan runs in the existing validation image without a debugger"
+        ((${#test_environment[@]} == 0)) || die "cuda-vulkan accepts positional program arguments, not --env"
+    fi
     if (( test_debugger )) && ((${#executables[@]} != 1)); then
         die "--gdb requires a suite with one executable or an explicit --executable"
     fi
@@ -3240,6 +3365,14 @@ run_tests() {
          python3 /workspace/tools/check_toolchain_invariants.py \
              --repo-root /workspace --build-dir \"\${MMLTK_CONTAINER_CACHE_ROOT}/cmake/${build_directory}\""
 
+    if (( cuda_vulkan_suite )); then
+        ensure_wayland_validation_image
+        local diagnostic_status=0
+        run_gpu_diagnostic_executable "${cmake_cache_root}/${build_directory}/${executables[0]}" \
+            "${suite_args[@]}" || diagnostic_status=$?
+        release_mutation_locks
+        return "${diagnostic_status}"
+    fi
     if (( workspace_wayland_suite )); then
         if (( test_headless_compositor )); then
             ensure_wayland_validation_image
@@ -3416,6 +3549,12 @@ if [[ "${1:-}" == "--logs" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == "--diagnose-gpu-program" ]]; then
+    invocation_mode="diagnose-gpu-program"
+    run_gpu_program_diagnostic "${@:2}"
+    exit $?
+fi
+
 gui_mode=0
 build_mode=0
 build_gui_mode=0
@@ -3436,6 +3575,8 @@ diagnose_io_mode=0
 diagnose_io_path=""
 diagnose_nvidia_mode=0
 diagnose_nvidia_args=()
+diagnose_gpu_mode=0
+diagnose_gpu_image="runtime"
 test_suite=""
 test_args=()
 test_config="release"
@@ -3510,6 +3651,12 @@ if ((${#passthrough_args[@]} > 0)); then
         test_suite="${passthrough_args[0]#--test=}"
         [[ -n "${test_suite}" ]] || die "--test requires a suite name; use './mmltk --test list'"
         test_args=("${passthrough_args[@]:1}")
+    elif [[ "${passthrough_args[0]}" == "--diagnose-gpu-environment" ]]; then
+        diagnose_gpu_mode=1
+        ((${#passthrough_args[@]} <= 2)) ||
+            die "--diagnose-gpu-environment accepts at most one existing image selection"
+        diagnose_gpu_image="${passthrough_args[1]:-runtime}"
+        passthrough_args=()
     elif [[ "${passthrough_args[0]}" == "--diagnose-nvidia-payload" ]]; then
         diagnose_nvidia_mode=1
         ((${#passthrough_args[@]} >= 3)) ||
@@ -3564,6 +3711,10 @@ fi
 for arg in "${passthrough_args[@]}"; do
     [[ "${arg}" != "--logs" ]] ||
         die "--logs must be the standalone operation; use './mmltk --logs --help'"
+    [[ "${arg}" != "--diagnose-gpu-environment" ]] ||
+        die "--diagnose-gpu-environment must be the standalone operation; use './mmltk --diagnose-gpu-environment --help'"
+    [[ "${arg}" != "--diagnose-gpu-program" ]] ||
+        die "--diagnose-gpu-program must be the standalone operation; use './mmltk --diagnose-gpu-program --help'"
 done
 
 parse_test_invocation_args() {
@@ -3639,9 +3790,9 @@ if (( test_mode )) && [[ "${test_suite}" == "tsan" ]] && (( build_jobs > 8 )); t
 fi
 
 if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode + export_shiftlut_mode +
-      update_gui_lock_mode + update_firefox_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode > 1 ||
-      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || export_shiftlut_mode || update_firefox_lock_mode) && gui_mode )); then
-    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
+      update_gui_lock_mode + update_firefox_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode + diagnose_gpu_mode > 1 ||
+      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || diagnose_gpu_mode || export_shiftlut_mode || update_firefox_lock_mode) && gui_mode )); then
+    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, --diagnose-nvidia-payload, and --diagnose-gpu-environment are standalone"
 fi
 
 if (( export_shiftlut_mode )); then
@@ -3655,6 +3806,12 @@ if (( export_shiftlut_mode )); then
         die "ShiftLUT requires --export-only or --verify-only"
     invocation_mode="export-shiftlut"
     run_shiftlut_export
+    exit $?
+fi
+
+if (( diagnose_gpu_mode )); then
+    invocation_mode="diagnose-gpu-environment"
+    run_gpu_environment_diagnostic "${diagnose_gpu_image}"
     exit $?
 fi
 

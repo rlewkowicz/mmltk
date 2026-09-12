@@ -503,6 +503,20 @@ class AnnotationSystem::Impl final {
         }
         Publish(AnnotationChanged{std::move(installed)});
     }
+    void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description,
+                        const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
+        diagnostics_.Emit([&] {
+            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
+                                        .operation = operation, .device = settings_.device,
+                                        .generation = description.generation, .value = description.scene_revision,
+                                        .detail = description.document_epoch,
+                                        .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
+                                                    .capacity_height = description.scene ? description.scene->frame_height : 0U,
+                                                    .frame_revision = revision, .condition = baseline && baseline->valid() ? 1U : 0U,
+                                                    .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation),
+                                                               .source_instance = 1U, .source_revision = revision}}};
+        });
+    }
     void QueueRender() {
         document_.CaptureRender(scratch_render_);
         scratch_render_.generation = render_generation_ = mmltk::common::types::advance_monotonic_identity(render_generation_);
@@ -514,6 +528,7 @@ class AnnotationSystem::Impl final {
             std::scoped_lock lock(render_mutex_);
             std::swap(scratch_render_, pending_description_);
             pending_render_ = true;
+            DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderQueued, pending_description_);
         }
         if (!renderer_.NotifyContinuation()) throw contracts::UnavailableError("Annotation renderer is unavailable");
     }
@@ -528,8 +543,18 @@ class AnnotationSystem::Impl final {
         }
         if (!pending_baseline_.valid()) pending_baseline_ = runtime.Completed();
         renderer_.SetOutputRetry(true);
+        if (diagnostics_.valid()) {
+            std::scoped_lock lock(render_mutex_);
+            DiagnoseRender(VisualDiagnosticOperation::AnnotationOutputAcquireStarted, pending_description_, &pending_baseline_);
+        }
         auto output = runtime.TryAcquireOutput(pending_baseline_, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
-        if (!output.valid()) return;
+        if (!output.valid()) {
+            if (diagnostics_.valid()) {
+                std::scoped_lock lock(render_mutex_);
+                DiagnoseRender(VisualDiagnosticOperation::AnnotationOutputUnavailable, pending_description_, &pending_baseline_);
+            }
+            return;
+        }
         renderer_.SetOutputRetry(false);
         {
             std::scoped_lock lock(render_mutex_);
@@ -538,6 +563,7 @@ class AnnotationSystem::Impl final {
             pending_render_ = false;
         }
         const auto& description = active_description_;
+        DiagnoseRender(VisualDiagnosticOperation::AnnotationOutputAcquired, description, &pending_baseline_);
         const VisualExtent extent{description.scene->frame_width, description.scene->frame_height};
         const bool fresh_source = clean_epoch_ != description.document_epoch;
         const auto input = fresh_source ? runtime.BorrowInput() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
@@ -604,6 +630,7 @@ class AnnotationSystem::Impl final {
         }
         if (changed) Publish(AnnotationChanged{std::move(*changed)});
         Publish(AnnotationFrameChanged{rendered});
+        DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, description, &pending_baseline_, frame.revision);
     }
     void Reject(std::string detail, bool settle) {
         AnnotationSnapshot failed;

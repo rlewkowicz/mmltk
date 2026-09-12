@@ -71,22 +71,44 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     PresentationSourceReadSubmitted[[= detail::VisualDiagnosticName{"presentation.source.read_submitted"}]],
     PresentationSourceAdmissionEnqueued[[= detail::VisualDiagnosticName{"presentation.source.admission.enqueued"}]],
     PresentationSourceAdmissionWritten[[= detail::VisualDiagnosticName{"presentation.source.admission.written"}]],
+    PresentationSourceTimelineImportStarted[[= detail::VisualDiagnosticName{"presentation.source.timeline_import.started"}]],
     PresentationSourceReady[[= detail::VisualDiagnosticName{"presentation.source.ready"}]],
     PresentationSourceWithdrawal[[= detail::VisualDiagnosticName{"presentation.source.withdrawal"}]],
+    PresentationSourceRetirementStarted[[= detail::VisualDiagnosticName{"presentation.source.retirement.started"}]],
     PresentationSourceRetirement[[= detail::VisualDiagnosticName{"presentation.source.retirement"}]],
+    PresentationSourceStreamSettlementStarted[[= detail::VisualDiagnosticName{"presentation.source.stream_settlement.started"}]],
+    PresentationSourceStreamSettlementCompleted[[= detail::VisualDiagnosticName{"presentation.source.stream_settlement.completed"}]],
+    PresentationSourceProbeDeviceReleaseStarted[[= detail::VisualDiagnosticName{"presentation.source.probe_device_release.started"}]],
+    PresentationSourceProbeDeviceReleaseCompleted[[= detail::VisualDiagnosticName{"presentation.source.probe_device_release.completed"}]],
+    PresentationSourceProbeHostReleaseStarted[[= detail::VisualDiagnosticName{"presentation.source.probe_host_release.started"}]],
+    PresentationSourceProbeHostReleaseCompleted[[= detail::VisualDiagnosticName{"presentation.source.probe_host_release.completed"}]],
+    PresentationSourceStreamDestructionStarted[[= detail::VisualDiagnosticName{"presentation.source.stream_destruction.started"}]],
+    PresentationSourceStreamDestructionCompleted[[= detail::VisualDiagnosticName{"presentation.source.stream_destruction.completed"}]],
+    PresentationSourceSignalReleaseStarted[[= detail::VisualDiagnosticName{"presentation.source.signal_release.started"}]],
+    PresentationSourceSignalReleaseCompleted[[= detail::VisualDiagnosticName{"presentation.source.signal_release.completed"}]],
+    PresentationSourceTimelineDestructionStarted[[= detail::VisualDiagnosticName{"presentation.source.timeline_destruction.started"}]],
+    PresentationSourceTimelineDestructionCompleted[[= detail::VisualDiagnosticName{"presentation.source.timeline_destruction.completed"}]],
+    PresentationSourceWorkspaceReleaseStarted[[= detail::VisualDiagnosticName{"presentation.source.workspace_release.started"}]],
+    PresentationSourceWorkspaceReleaseCompleted[[= detail::VisualDiagnosticName{"presentation.source.workspace_release.completed"}]],
     PresentationFrameEdge[[= detail::VisualDiagnosticName{"presentation.frame.edge"}]],
     PresentationPixel[[= detail::VisualDiagnosticName{"presentation.pixel"}]],
     PresentationPixelProbeStarted[[= detail::VisualDiagnosticName{"presentation.pixel_probe.started"}]],
     PresentationPixelProbeSubmitted[[= detail::VisualDiagnosticName{"presentation.pixel_probe.submitted"}]],
     PresentationPixelAfterRelease[[= detail::VisualDiagnosticName{"presentation.pixel_after_release"}]],
+    PresentationPixelSourceCopyBeforeReady[[= detail::VisualDiagnosticName{"presentation.pixel_source_copy_before_ready"}]],
+    PresentationPixelSourceCopyAfterRelease[[= detail::VisualDiagnosticName{"presentation.pixel_source_copy_after_release"}]],
     UpscaleStopRequested[[= detail::VisualDiagnosticName{"upscale.stop.requested"}]],
     PresentationReplacement[[= detail::VisualDiagnosticName{"presentation.replacement"}]],
     PresentationRetirement[[= detail::VisualDiagnosticName{"presentation.retirement"}]],
     PresentationPumpStarted[[= detail::VisualDiagnosticName{"presentation.pump.started"}]],
     PresentationPumpCompleted[[= detail::VisualDiagnosticName{"presentation.pump.completed"}]],
+    PresentationChannelPumpStarted[[= detail::VisualDiagnosticName{"presentation.channel.pump.started"}]],
+    PresentationChannelPumpCompleted[[= detail::VisualDiagnosticName{"presentation.channel.pump.completed"}]],
     PresentationCapabilityPublished[[= detail::VisualDiagnosticName{"presentation.capability.published"}]],
     PresentationReleaseWaitStarted[[= detail::VisualDiagnosticName{"presentation.release_wait.started"}]],
     PresentationReleaseWaitCompleted[[= detail::VisualDiagnosticName{"presentation.release_wait.completed"}]],
+    PresentationTerminalReadCompleted[[= detail::VisualDiagnosticName{"presentation.terminal_read.completed"}]],
+    PresentationTerminalReadRetained[[= detail::VisualDiagnosticName{"presentation.terminal_read.retained"}]],
     PresentationSourceBorrowStarted[[= detail::VisualDiagnosticName{"presentation.source_borrow.started"}]],
     PresentationSourceBorrowCompleted[[= detail::VisualDiagnosticName{"presentation.source_borrow.completed"}]],
     PresentationReadySyncStarted[[= detail::VisualDiagnosticName{"presentation.ready_sync.started"}]],
@@ -141,6 +163,13 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     UpscaleOutputAdmissionStarted[[= detail::VisualDiagnosticName{"upscale.output.admission.started"}]],
     UpscaleOutputAdmissionCompleted[[= detail::VisualDiagnosticName{"upscale.output.admission.completed"}]],
     PresentationSourceWaitSubmitted[[= detail::VisualDiagnosticName{"presentation.source.wait_submitted"}]],
+    PresentationWorkspaceWait[[= detail::VisualDiagnosticName{"presentation.workspace.wait"}]],
+    PresentationWorkspaceService[[= detail::VisualDiagnosticName{"presentation.workspace.service"}]],
+    AnnotationRenderQueued[[= detail::VisualDiagnosticName{"annotation.render.queued"}]],
+    AnnotationOutputAcquireStarted[[= detail::VisualDiagnosticName{"annotation.output.acquire.started"}]],
+    AnnotationOutputUnavailable[[= detail::VisualDiagnosticName{"annotation.output.unavailable"}]],
+    AnnotationOutputAcquired[[= detail::VisualDiagnosticName{"annotation.output.acquired"}]],
+    AnnotationRenderPublished[[= detail::VisualDiagnosticName{"annotation.render.published"}]],
 };
 
 namespace detail {
@@ -237,6 +266,11 @@ struct VisualDiagnosticSink final {
 };
 [[nodiscard]] contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation&) noexcept;
 [[nodiscard]] services::RuntimeDiagnosticFact visual_runtime_diagnostic(VisualDiagnosticFact) noexcept;
+
+struct VisualWorkspaceDiagnostics final {
+    VisualDiagnosticSink sink{};
+    contracts::DiagnosticContext context{};
+};
 
 // The shell owns the target until after every visual worker is joined. Test
 // sinks retain their direct typed injection, including dynamic disablement.

@@ -63,6 +63,7 @@ class ExploreAcceptanceGate::Impl final {
 
     void AdvanceGeneration(const std::uint64_t generation) noexcept {
         std::scoped_lock lock(mutex_);
+        if (held_pending_ && generation != current_generation_) held_superseded_ = true;
         current_generation_ = generation;
         changed_.notify_all();
     }
@@ -90,6 +91,7 @@ class ExploreAcceptanceGate::Impl final {
         if (terminal_ || held_claimed_) return false;
         held_claimed_ = true;
         held_pending_ = true;
+        held_superseded_ = false;
         return true;
     }
 
@@ -100,6 +102,13 @@ class ExploreAcceptanceGate::Impl final {
 
     [[nodiscard]] WaitResult AwaitHeldCompletion(const std::uint64_t generation, const std::uint64_t slot,
                                                  const std::uint64_t compiled_index, const std::uint64_t staging_bytes) {
+        std::shared_ptr<const FrontendCommand> frontend;
+        std::uint64_t sequence = 0U;
+        {
+            std::scoped_lock lock(mutex_);
+            frontend = frontend_command_;
+            sequence = frontend_sequence_;
+        }
         ControlObservation observation{.event = ControlEvent::HeldWait,
                                        .generation = generation,
                                        .slot = slot,
@@ -114,12 +123,26 @@ class ExploreAcceptanceGate::Impl final {
             static_cast<void>(SendControlObservation(observation));
             return result;
         };
+        // Publish the same physical hold to the installed UI fixture before
+        // waiting. Reentrant callbacks may inspect or supersede demand.
+        if (frontend && generation != 0U) {
+            try {
+                if (compiled_index > std::numeric_limits<std::uint32_t>::max() ||
+                    !(*frontend)({.kind = contracts::IntegrationControlKind::GalleryReadCompletionHeld,
+                                  .sequence = sequence,
+                                  .read_generation = generation,
+                                  .compiled_index = static_cast<std::uint32_t>(compiled_index)}))
+                    Terminal();
+            } catch (...) { Terminal(); }
+        }
         std::unique_lock lock(mutex_);
         ++waiters_;
-        changed_.wait(lock, [this, generation] { return terminal_ || generation != current_generation_ || release_held_; });
+        changed_.wait(lock, [this, generation] {
+            return terminal_ || held_superseded_ || generation != current_generation_ || release_held_;
+        });
         --waiters_;
         held_pending_ = false;
-        return finish(terminal_ || generation != current_generation_ ? WaitResult::Stale : WaitResult::Proceed);
+        return finish(terminal_ || held_superseded_ || generation != current_generation_ ? WaitResult::Stale : WaitResult::Proceed);
     }
 
     void SetFrontendCommand(FrontendCommand callback) {
@@ -344,6 +367,8 @@ class ExploreAcceptanceGate::Impl final {
     bool release_held_ = false;
     bool held_claimed_ = false;
     bool held_pending_ = false;
+    // Supersession survives restoration before the physical waiter resumes.
+    bool held_superseded_ = false;
     bool terminal_reported_ = false;
     std::uint64_t current_generation_ = 0U;
     std::uint64_t initial_released_generation_ = 0U;

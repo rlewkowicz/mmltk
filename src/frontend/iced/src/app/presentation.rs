@@ -111,7 +111,9 @@ impl Controller {
             }
             if self.viewer.is_some() {
                 let abandoned = self.abandon_viewer();
-                if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
+                if let Some(snapshot) = source
+                    .filter(|snapshot| snapshot.ready && !snapshot.busy && !snapshot.renderpending)
+                {
                     self.viewer = identity;
                     return Some(ViewerOutcome::Replaced(crate::generated::UpscaleRequest {
                         source: snapshot.frame.clone(),
@@ -125,7 +127,9 @@ impl Controller {
         if identity == self.viewer {
             return None;
         }
-        if let Some(snapshot) = source.filter(|snapshot| snapshot.ready && !snapshot.busy) {
+        if let Some(snapshot) =
+            source.filter(|snapshot| snapshot.ready && !snapshot.busy && !snapshot.renderpending)
+        {
             let replacing = self.viewer.is_some();
             self.viewer = identity;
             let request = crate::generated::UpscaleRequest {
@@ -224,9 +228,55 @@ impl Controller {
         update
     }
 
+    fn trace_redraw_decision(&self, previous: Option<Surface>, outcome: &str) {
+        #[cfg(target_arch = "wasm32")]
+        if crate::presentation_surface::surface_trace_enabled() {
+            // Surface contains only numeric identities, geometry and flags.
+            // Project those fields only when the existing surface trace is enabled.
+            let identity = |surface: Option<Surface>| {
+                surface.map_or_else(
+                    || "null".to_owned(),
+                    |surface| {
+                        let crop = surface.crop.map_or_else(
+                            || "null".to_owned(),
+                            |crop| format!("{crop:?}"),
+                        );
+                        let viewer = surface.viewer_identity.map_or_else(
+                            || "null".to_owned(),
+                            |(dataset, image)| format!("[{dataset},{image}]"),
+                        );
+                        format!(
+                            "{{{},\"integration\":{},\"crop\":{crop},\"viewer_identity\":{viewer},\"fit_revision\":{}}}",
+                            crate::presentation_surface::surface_trace_fields(surface, surface),
+                            surface.integration,
+                            surface.fit_revision,
+                        )
+                    },
+                )
+            };
+            let current = self.surface();
+            let gallery_awaiting_display = current
+                .and_then(|surface| surface.frame)
+                .is_some_and(crate::presentation_surface::gallery::awaiting_display);
+            crate::presentation_surface::emit_surface_trace(&format!(
+                "{{\"event\":\"iced.presentation.redraw_decision\",\"outcome\":\"{outcome}\",\"changed\":{},\"gallery_awaiting_display\":{gallery_awaiting_display},\"pending_rejected\":{},\"previous\":{},\"current\":{},\"pending\":{},\"retained\":{},\"renderer_retained\":{}}}",
+                current != previous,
+                self.pending_rejected,
+                identity(previous),
+                identity(current),
+                identity(self.pending),
+                identity(self.retained),
+                identity(crate::presentation_surface::retained_surface()),
+            ));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (previous, outcome);
+    }
+
     pub(super) fn redraw(&self, previous: Option<Surface>) -> Task<Message> {
         match self.surface() {
             Some(surface) if self.surface() != previous && surface.frame.is_none() => {
+                self.trace_redraw_decision(previous, "queued");
                 queued_redraw(surface)
             }
             _ if self.surface() != previous
@@ -235,9 +285,13 @@ impl Controller {
                     .and_then(|surface| surface.frame)
                     .is_some_and(crate::presentation_surface::gallery::awaiting_display) =>
             {
+                self.trace_redraw_decision(previous, "requested");
                 iced::window::request_redraw()
             }
-            _ => Task::none(),
+            _ => {
+                self.trace_redraw_decision(previous, "none");
+                Task::none()
+            }
         }
     }
 }
@@ -289,7 +343,17 @@ impl App {
         self.on_viewer(outcome);
     }
 
-    fn on_viewer(&mut self, outcome: Option<ViewerOutcome>) {
+    fn on_viewer(&mut self, mut outcome: Option<ViewerOutcome>) {
+        // A method can be selected while this viewer's initial render is
+        // pending. Keep that exact request when applying the automatic open.
+        if let Some(ViewerOutcome::Opened(request) | ViewerOutcome::Replaced(request)) =
+            &mut outcome
+            && let Some(selected) = self.model.explore.requested_upscale.as_ref()
+            && selected.source == request.source
+            && selected.document == request.document
+        {
+            request.kernel = selected.kernel;
+        }
         match outcome {
             Some(ViewerOutcome::Opened(request)) => self.model.request_upscale(request),
             Some(ViewerOutcome::Replaced(request)) => {
@@ -585,6 +649,34 @@ impl Controller {
         recovery: bool,
     ) -> Result<(), UiError> {
         crate::presentation_surface::authorize_draw(None);
+        if feature == FeatureId::Explore
+            && model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.ready
+                    && snapshot.mode == crate::generated::ExploreMode::Gallery
+                    && snapshot.order.matchingcount == 0
+            })
+        {
+            // The gallery replaces the image with its local empty outcome.
+            // No replacement image draw will release the previous sample.
+            #[cfg(target_arch = "wasm32")]
+            let retirement_trace = if crate::presentation_surface::surface_trace_enabled() {
+                model
+                    .explore
+                    .snapshot
+                    .as_ref()
+                    .map(crate::presentation_surface::empty_gallery_retirement_trace)
+            } else {
+                None
+            };
+            crate::presentation_surface::retire_samples();
+            self.retire_frame();
+            self.incumbent = None;
+            #[cfg(target_arch = "wasm32")]
+            if let Some(record) = retirement_trace {
+                crate::presentation_surface::emit_surface_trace(&record);
+            }
+            return Ok(());
+        }
         crate::presentation_surface::authorize_acquisition(
             (!matches!(
                 feature,
@@ -718,9 +810,6 @@ impl Controller {
                 if !self.surface.zip(surface).is_some_and(|(current, updated)| {
                     crate::presentation_surface::same_allocation(current, updated)
                 }) {
-                    if let Some(previous) = self.surface {
-                        crate::presentation_surface::trace_surface("capability_replaced", previous);
-                    }
                     if let Some(updated) = surface {
                         crate::presentation_surface::trace_surface("capability_selected", updated);
                     }
@@ -979,7 +1068,7 @@ mod tests {
         app.reduce_reply(IntentReply {
             correlation: start_correlation,
             result: Ok(
-                crate::application_codec::IntoApplicationValue::into_application_value(
+                crate::application_codec::IntoApplicationValue::into_application_transport_value(
                     busy.clone(),
                 ),
             ),
@@ -1016,7 +1105,9 @@ mod tests {
         app.reduce_reply(IntentReply {
             correlation: shift_start.correlation,
             result: Ok(
-                crate::application_codec::IntoApplicationValue::into_application_value(busy),
+                crate::application_codec::IntoApplicationValue::into_application_transport_value(
+                    busy,
+                ),
             ),
         });
         let crate::transport_connection::CapturedRecord::Intent(start) =
@@ -1048,7 +1139,7 @@ mod tests {
         app.reduce_reply(IntentReply {
             correlation: start_correlation,
             result: Ok(
-                crate::application_codec::IntoApplicationValue::into_application_value(
+                crate::application_codec::IntoApplicationValue::into_application_transport_value(
                     busy.clone(),
                 ),
             ),
@@ -1323,6 +1414,78 @@ mod tests {
             crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
         );
         (app, basic, start.correlation, receiver)
+    }
+
+    #[test]
+    fn empty_gallery_retires_samples_without_waiting_for_presentation_completion() {
+        for direct_sampling in [false, true] {
+            let (mut app, mut frame) = viewer_app();
+            frame.direct_sampling = direct_sampling;
+            app.present_native_frame(frame);
+            let surface = app.presentation.surface().unwrap();
+            app.presentation.retained = Some(surface);
+            let explore = app.model.explore.snapshot.as_mut().unwrap();
+            explore.ready = true;
+            explore.busy = true;
+            explore.mode = crate::generated::ExploreMode::Gallery;
+            explore.order.matchingcount = 0;
+            explore.frame.revision += 1;
+            let read = crate::presentation_surface::test_sample_read(frame);
+            app.reconcile_surface_frame();
+            assert!(app.presentation.pending.is_none());
+            assert!(app.presentation.retained.is_none());
+            assert!(app.presentation.incumbent.is_none());
+            assert!(app.presentation.surface.is_some());
+            assert!(test_releases().is_empty());
+            drop(read);
+            assert_eq!(test_releases(), vec![frame]);
+
+            let late = FrameReady {
+                presentation_revision: frame.presentation_revision + 1,
+                content_sequence: frame.content_sequence + 1,
+                slot: 1,
+                ..frame
+            };
+            app.present_native_frame(late);
+            drop(app.on_presentation(Message::Surface(
+                crate::presentation_surface::Notification::Copied(late),
+            )));
+            app.reconcile_surface_frame();
+            assert!(app.presentation.pending.is_none());
+            assert!(app.presentation.retained.is_none());
+            assert_eq!(test_releases(), vec![frame, late]);
+        }
+    }
+
+    #[test]
+    fn only_active_ready_empty_gallery_removes_the_retained_fallback() {
+        for condition in 0..5 {
+            let (mut app, frame) = viewer_app();
+            app.present_native_frame(frame);
+            let retained = app.presentation.surface().unwrap();
+            app.presentation.retained = Some(retained);
+            let explore = app.model.explore.snapshot.as_mut().unwrap();
+            explore.ready = true;
+            explore.busy = true;
+            explore.mode = crate::generated::ExploreMode::Gallery;
+            explore.order.matchingcount = 0;
+            let mut feature = FeatureId::Explore;
+            match condition {
+                0 => explore.ready = false,
+                1 => explore.mode = crate::generated::ExploreMode::Detail,
+                2 => explore.order.matchingcount = 1,
+                3 => feature = FeatureId::Annotate,
+                _ => app.model.explore.snapshot = None,
+            }
+            // Domain/control unavailability must retain ordinary fallback.
+            app.model.presentation = None;
+            app.presentation
+                .reconcile(&app.model, feature, false)
+                .unwrap();
+            assert_eq!(app.presentation.retained, Some(retained));
+            assert!(test_releases().is_empty());
+            app.presentation.discard();
+        }
     }
 
     #[test]
@@ -1861,7 +2024,7 @@ mod tests {
     fn settle_upscale_stop(app: &mut App, correlation: u64) {
         app.reduce_reply(IntentReply {
             correlation,
-            result: Ok(crate::application_codec::IntoApplicationValue::into_application_value(())),
+            result: Ok(crate::application_codec::IntoApplicationValue::into_application_transport_value(())),
         });
     }
 

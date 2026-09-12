@@ -606,8 +606,10 @@ TEST_CASE("direct host closes a real peer when an interaction endpoint is unknow
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
     wire::ByteBuffer interaction;
-    REQUIRE(encode_client_record(ClientRecord{Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}}},
-                                 interaction));
+    REQUIRE(encode_client_record(ClientRecord{explore_viewport_interaction()}, interaction));
+    // The canonical encoder rejects unknown endpoints. Send an invalid compact
+    // opcode directly to exercise the untrusted peer's ingress path.
+    interaction[1] = std::byte{0x17};
     peer.send_binary(interaction);
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));

@@ -11,7 +11,7 @@
 // kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
 
-inline constexpr std::uint32_t kAbiVersion = 11U;
+inline constexpr std::uint32_t kAbiVersion = 12U;
 
 // The underlying type is the wire type: the Rust half of this record declares
 // `u32` fields, and the static assertions below are what keep the two frozen
@@ -54,6 +54,9 @@ enum class Opcode : std::uint32_t {
     ReadSettled = 11U,
     // Shell won the physical generation gate for this exact completed offer.
     Acquired = 12U,
+    // Shell submitted the exact read's final Vulkan ownership release and
+    // matching even timeline signal. This grants no completion or reuse.
+    ReleaseSubmitted = 13U,
 };
 
 // Why the shell produced no texture. These describe what happened in the shell,
@@ -119,7 +122,7 @@ struct Record {
     std::uint64_t arena_low = 0U;
     std::uint64_t allocation_identity = 0U;
     std::uint64_t device_incarnation = 0U;
-    // Import/ArenaReady: image byte offset. ReadSettled: exact source transfer sequence.
+    // Import/ArenaReady: image byte offset. Source-read receipts: exact transfer sequence.
     std::uint64_t offset = 0U;
     std::uint64_t alignment = 0U;
     std::uint8_t device_uuid[16]{};
@@ -192,7 +195,8 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
     const bool known = record.opcode == Opcode::Import || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready ||
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
                        record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
-                       record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired;
+                       record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
+                       record.opcode == Opcode::ReleaseSubmitted;
     if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
         record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
         return false;
@@ -203,7 +207,8 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
         uuid_valid = uuid_valid || byte != 0U;
     const bool empty_layout =
         record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
-        (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired) && record.alignment == 0U &&
+        (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
+         record.opcode == Opcode::ReleaseSubmitted) && record.alignment == 0U &&
         !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
     if (record.opcode != Opcode::Import && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
     const bool layout_valid =
@@ -225,6 +230,7 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
                    record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
         case Opcode::ReadSettled:
         case Opcode::Acquired:
+        case Opcode::ReleaseSubmitted:
             return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U &&
                    (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Drop:

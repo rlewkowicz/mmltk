@@ -233,9 +233,13 @@ impl ApplicationModel {
             PresentationSourceKind::Upscale => &self.current_upscale()?.frame,
             _ => return None,
         };
-        let completed = &self.presentation.as_ref()?.completed;
-        (completed == expected && Self::valid_visual_source(completed).is_some())
-            .then(|| completed.clone())
+        (Self::valid_visual_source(expected).is_some()
+            && (self
+                .presentation
+                .as_ref()
+                .is_some_and(|snapshot| &snapshot.completed == expected)
+                || crate::presentation_surface::retained_detail_for(self, expected).is_some()))
+        .then(|| expected.clone())
     }
     pub fn valid_visual_source(frame: &VisualFrame) -> Option<PresentationSourceIdentity> {
         (frame.source.kind != PresentationSourceKind::None

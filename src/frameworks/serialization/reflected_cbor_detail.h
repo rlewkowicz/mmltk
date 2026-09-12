@@ -473,7 +473,12 @@ template <class T>
     return std::string(static_variant_name<T>());
 }
 
+enum class ObjectLayout { Named, Positional };
+
 template <class T>
+[[nodiscard]] consteval std::size_t flattened_member_count();
+
+template <ObjectLayout Layout = ObjectLayout::Named, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value);
 
 template <class T>
@@ -647,11 +652,11 @@ template <class T>
     return present_count;
 }
 
-template <class T>
+template <ObjectLayout Layout, class T, class Fields>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
-void append_reflected_object_fields(const T& value, wire::Value::Object& object, std::optional<wire::EncodeError>& failure) {
+void append_reflected_object_fields(const T& value, Fields& object, std::optional<wire::EncodeError>& failure) {
     visit_bases<T>([&]<class Base>() {
-        if (!failure) { append_reflected_object_fields(static_cast<const Base&>(value), object, failure); }
+        if (!failure) { append_reflected_object_fields<Layout>(static_cast<const Base&>(value), object, failure); }
     });
     visit_members<T>([&]<class Declaration>(const auto& fact) {
         if constexpr (requires { Declaration::pointer; }) {
@@ -659,18 +664,21 @@ void append_reflected_object_fields(const T& value, wire::Value::Object& object,
                 constexpr auto member = Declaration::pointer;
                 bool present = true;
                 using MemberType = RemoveCvRef<decltype(value.*member)>;
-                if constexpr (kIsOptional<MemberType>) { present = (value.*member).has_value(); }
+                if constexpr (Layout == ObjectLayout::Named && kIsOptional<MemberType>) { present = (value.*member).has_value(); }
                 if (present) {
                     if (!member_constraints_accept<Declaration>(value.*member)) {
                         failure = encode_error(wire::ErrorCode::LimitExceeded);
                         prepend_path(*failure, fact.member_name);
                     } else {
-                        auto encoded = to_value(value.*member);
+                        auto encoded = to_value<Layout>(value.*member);
                         if (!encoded) {
                             failure = encoded.error();
                             prepend_path(*failure, fact.member_name);
                         } else {
-                            object.emplace_back(std::string(fact.member_name), std::move(*encoded));
+                            if constexpr (Layout == ObjectLayout::Named)
+                                object.emplace_back(std::string(fact.member_name), std::move(*encoded));
+                            else
+                                object.push_back(std::move(*encoded));
                         }
                     }
                 }
@@ -679,16 +687,19 @@ void append_reflected_object_fields(const T& value, wire::Value::Object& object,
     });
 }
 
-template <class T>
+template <ObjectLayout Layout, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_object(const T& value) {
     audit_object<T>();
     if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<T>) {
         return OpaqueCborFacade::EncodeObject(value);
     } else {
-        wire::Value::Object object;
-        object.reserve(reflected_object_present_count(value));
+        std::conditional_t<Layout == ObjectLayout::Named, wire::Value::Object, wire::Value::Array> object;
+        if constexpr (Layout == ObjectLayout::Named)
+            object.reserve(reflected_object_present_count(value));
+        else
+            object.reserve(flattened_member_count<T>());
         std::optional<wire::EncodeError> failure;
-        append_reflected_object_fields(value, object, failure);
+        append_reflected_object_fields<Layout>(value, object, failure);
         if (failure) return std::unexpected(std::move(*failure));
         return wire::Value(std::move(object));
     }
@@ -841,7 +852,7 @@ template <class T>
     return finish_decoded_object(std::move(result), *object, source_index, std::move(failure));
 }
 
-template <class Variant>
+template <ObjectLayout Layout, class Variant>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_variant(const Variant& value) {
     wire::Value::Object object;
     object.reserve(VariantEnvelope::field_count);
@@ -849,7 +860,7 @@ template <class Variant>
     std::visit(
         [&object, &failure](const auto& alternative) {
             using Alternative = RemoveCvRef<decltype(alternative)>;
-            auto encoded = to_value(alternative);
+            auto encoded = to_value<Layout>(alternative);
             if (!encoded) {
                 failure = encoded.error();
                 prepend_path(*failure, VariantEnvelope::payload_key);
@@ -906,7 +917,7 @@ template <class Variant>
     return std::move(*decoded);
 }
 
-template <class T>
+template <ObjectLayout Layout, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value) {
     using U = RemoveCvRef<T>;
     static_assert(supported_type<U>(), "Attempted to encode an unsupported reflected CBOR type.");
@@ -958,21 +969,21 @@ template <class T>
         std::transform(value.begin(), value.end(), std::back_inserter(bytes), [](const auto byte) { return to_wire_byte(byte); });
         return wire::Value(std::move(bytes));
     } else if constexpr (kIsOptional<U>) {
-        return value ? to_value(*value) : std::expected<wire::Value, wire::EncodeError>(wire::Value());
+        return value ? to_value<Layout>(*value) : std::expected<wire::Value, wire::EncodeError>(wire::Value());
     } else if constexpr (kIsVariant<U>) {
         static_assert(kUniqueVariantAlternatives<U>, "Reflected CBOR variant alternatives require unique type identifiers.");
-        return encode_variant(value);
+        return encode_variant<Layout>(value);
     } else if constexpr (kIsArray<U> || kIsVector<U> || kIsSpan<U> || kIsInplaceVector<U>) {
         wire::Value::Array array;
         array.reserve(value.size());
         for (const auto& element : value) {
-            auto encoded = to_value(element);
+            auto encoded = to_value<Layout>(element);
             if (!encoded) { return std::unexpected(encoded.error()); }
             array.push_back(std::move(*encoded));
         }
         return wire::Value(std::move(array));
     } else {
-        return encode_object(value);
+        return encode_object<Layout>(value);
     }
 }
 

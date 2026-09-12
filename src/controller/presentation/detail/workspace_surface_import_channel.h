@@ -195,7 +195,8 @@ class WorkspaceSurfaceImportChannel final {
     // readiness.
     void pump();
     [[nodiscard]] std::optional<WorkspaceSurfaceImportOutcome> take_outcome();
-    [[nodiscard]] std::optional<workspace_surface_import::Record> take_acquisition();
+    // FIFO Acquired/ReleaseSubmitted receipts preserve each exact read's order.
+    [[nodiscard]] std::optional<workspace_surface_import::Record> take_source_transition();
     [[nodiscard]] std::optional<WorkspaceSurfaceImportId> take_capacity_wake();
     [[nodiscard]] std::optional<WorkspaceSurfaceRetired> take_retirement();
     // Set once the active protocol session fails.

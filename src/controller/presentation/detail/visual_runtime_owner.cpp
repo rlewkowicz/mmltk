@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image_failure.h"
 
 namespace mmltk::controller {
@@ -292,12 +293,60 @@ mmltk::frameworks::gpu::ImageWorkspaceObservation VisualRuntimeOwner::ObserveWor
         observed.workspace = workspace_candidate_.workspace;
     return observed;
 }
+namespace {
+void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::string_view reason,
+                                const mmltk::frameworks::gpu::ImageWorkspaceObservation& observed = {},
+                                const mmltk::frameworks::gpu::ImageWorkspaceObservation& candidate = {}) noexcept {
+    if (!request.diagnostics) return;
+    request.diagnostics->sink.Emit([&] {
+        VisualDiagnosticFact fact{.system = contracts::DiagnosticOwner::Presentation,
+                                 .operation = VisualDiagnosticOperation::PresentationWorkspaceService,
+                                 .device = request.layout.device, .context = request.diagnostics->context, .failure_detail = reason};
+        auto& progress = fact.context.workspace_progress;
+        progress.requested_product_owner = request.product_owner;
+        progress.requested_product_revision = request.product_revision;
+        progress.observed_product_owner = observed.product_owner;
+        progress.observed_product_revision = observed.product_revision;
+        progress.admitted_allocation = request.admitted_allocation;
+        progress.candidate_allocation = candidate.workspace ? candidate.workspace->identity() : 0U;
+        progress.candidate_product_owner = candidate.product_owner;
+        if (candidate.workspace) {
+            progress.candidate_admitted = candidate.workspace->admitted();
+            progress.candidate_write_available = candidate.workspace->WriteAvailable();
+        }
+        progress.expected_workspace_pitch = request.layout.pitch_bytes;
+        progress.expected_workspace_bytes = request.layout.required_allocation_bytes;
+        progress.expected_device_incarnation = request.layout.device_incarnation;
+        if (observed.workspace) {
+            const auto& workspace = *observed.workspace;
+            fact.context.workspace.workspace_allocation = workspace.identity();
+            fact.context.workspace.workspace_width = workspace.layout().width;
+            fact.context.workspace.workspace_height = workspace.layout().height;
+            fact.context.workspace.workspace_pitch = workspace.layout().pitch_bytes;
+            fact.context.workspace.workspace_bytes = workspace.allocation_bytes();
+            fact.context.workspace.direct_sampling = workspace.layout().direct_sampling;
+            progress.workspace_layout_matches = workspace.layout() == request.layout;
+            progress.workspace_admitted = workspace.admitted();
+            progress.workspace_write_available = workspace.WriteAvailable();
+        }
+        return fact;
+    });
+}
+}  // namespace
+
 void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
     if (!request.layout.valid() || request.product_owner == 0U || request.product_revision == 0U || !request.ready)
         throw std::invalid_argument("visual workspace request is incomplete");
     {
         std::scoped_lock lock(mutex_);
-        if (stopping_ || runtime_retirement_blocked_) return;
+        if (stopping_ || runtime_retirement_blocked_) {
+            diagnose_workspace_service(request, "request_rejected_stopping");
+            return;
+        }
+        if (workspace_request_ && workspace_request_->diagnostics &&
+            workspace_request_->diagnostics->sink.valid() && workspace_pending_.load(std::memory_order_acquire))
+            diagnose_workspace_service(*workspace_request_, "pending_request_replaced");
+        diagnose_workspace_service(request, "request_enqueued");
         workspace_request_ = std::move(request);
         workspace_pending_.store(true, std::memory_order_release);
     }
@@ -309,16 +358,22 @@ void VisualRuntimeOwner::ServiceWorkspace() {
     mmltk::frameworks::gpu::ImageWorkspaceObservation candidate;
     {
         std::scoped_lock lock(mutex_);
-        if (stopping_ || runtime_retirement_blocked_ || !runtime_ || !workspace_request_) return;
+        if (stopping_ || runtime_retirement_blocked_ || !runtime_ || !workspace_request_) {
+            if (workspace_request_) diagnose_workspace_service(*workspace_request_, "service_unavailable");
+            return;
+        }
         request = workspace_request_;
         candidate = workspace_candidate_;
     }
     const auto observed = runtime_->ObserveWorkspace();
+    diagnose_workspace_service(*request, "observed", observed, candidate);
     if (observed.product_owner == 0U) {
+        diagnose_workspace_service(*request, "product_unavailable_retry", observed, candidate);
         workspace_retry_.store(true, std::memory_order_release);
         return;
     }
     if (observed.product_owner != request->product_owner) {
+        diagnose_workspace_service(*request, "product_owner_changed", observed, candidate);
         if (candidate.workspace && candidate.product_owner == request->product_owner) {
             candidate.workspace->Withdraw();
             std::scoped_lock lock(mutex_);
@@ -328,6 +383,7 @@ void VisualRuntimeOwner::ServiceWorkspace() {
         return;
     }
     if (observed.product_revision != request->product_revision) {
+        diagnose_workspace_service(*request, "product_revision_changed", observed, candidate);
         request->ready();
         return;
     }
@@ -336,10 +392,15 @@ void VisualRuntimeOwner::ServiceWorkspace() {
         observed.workspace->identity() == request->admitted_allocation)
         candidate = observed;
     if (!candidate.workspace || candidate.product_owner != observed.product_owner || candidate.workspace->layout() != request->layout) {
-        if (request->admitted_allocation != 0U) return;
+        if (request->admitted_allocation != 0U) {
+            diagnose_workspace_service(*request, "admitted_candidate_mismatch", observed, candidate);
+            return;
+        }
         if (candidate.workspace) candidate.workspace->Withdraw();
         candidate = observed;
+        diagnose_workspace_service(*request, "allocation_started", observed, candidate);
         candidate.workspace = runtime_->CreateWorkspace(request->layout, request->display_execution);
+        diagnose_workspace_service(*request, "allocation_completed", observed, candidate);
         {
             std::scoped_lock lock(mutex_);
             workspace_candidate_ = candidate;
@@ -348,13 +409,19 @@ void VisualRuntimeOwner::ServiceWorkspace() {
     if (request->admitted_allocation == candidate.workspace->identity()) {
         if (!candidate.workspace->admitted()) candidate.workspace->Admit(request->admitted_allocation, request->layout.device_incarnation);
         workspace_retry_.store(true, std::memory_order_release);
-        if (!runtime_->PrepareWorkspace(observed, candidate.workspace)) return;
+        diagnose_workspace_service(*request, "prepare_started", observed, candidate);
+        if (!runtime_->PrepareWorkspace(observed, candidate.workspace)) {
+            diagnose_workspace_service(*request, "prepare_unavailable_retry", observed, candidate);
+            return;
+        }
+        diagnose_workspace_service(*request, "prepare_completed", observed, candidate);
         workspace_retry_.store(false, std::memory_order_release);
         {
             std::scoped_lock lock(mutex_);
             workspace_candidate_ = {};
         }
     }
+    diagnose_workspace_service(*request, "ready_notification", observed, candidate);
     request->ready();
 }
 void VisualRuntimeOwner::NotifyReaders() const {

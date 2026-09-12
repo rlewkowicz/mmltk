@@ -547,6 +547,12 @@ impl App {
             return;
         }
         if !self.model.has_upscale_pending()
+            && self
+                .model
+                .explore
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| !snapshot.renderpending)
             && let Some(request) = self.model.explore.requested_upscale.clone()
             && self.model.explore.sent_upscale.as_ref() != Some(&request)
         {

@@ -189,7 +189,7 @@ void emit_application_outer_routing(Writer& writer) {
               "-> Result<ApplicationSnapshot, String> { match system_id {\n";
     Schema::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
         output << "    " << SystemCell::stable_id << " => Ok(ApplicationSnapshot::" << variant(SystemCell::name)
-               << "(FromApplicationValue::from_application_value(value)?)),\n";
+               << "(FromApplicationValue::from_application_transport_value(value)?)),\n";
     });
     output << "    _ => Err(\"unknown application snapshot\".into()), } }\n"
               "pub fn decode_application_event(system_id: u64, event_id: u64, value: Value) "
@@ -197,7 +197,7 @@ void emit_application_outer_routing(Writer& writer) {
     Schema::VisitEvents([&]<class Identity, class Event>(const auto&) {
         output << "    (" << Identity::system_id << ", " << Identity::event_id << ") => Ok(ApplicationEvent::"
                << variant(Identity::system_cell::name, mmltk::frameworks::serialization::reflected_schema_type_name<Event>())
-               << "(FromApplicationValue::from_application_value(value)?)),\n";
+               << "(FromApplicationValue::from_application_transport_value(value)?)),\n";
     });
     output << "    _ => Err(\"unknown application event\".into()), } }\n"
               "pub fn application_event_delivery(system_id: u64, event_id: u64) -> Option<EventDelivery> { "
@@ -211,7 +211,7 @@ void emit_application_outer_routing(Writer& writer) {
     Schema::VisitEndpoints([&]<class Endpoint>() {
         if constexpr (!Endpoint::interaction)
             output << "    " << Endpoint::stable_id << " => Ok(ApplicationReply::" << variant(Endpoint::system_cell::name, Endpoint::name)
-                   << "(FromApplicationValue::from_application_value(value)?)),\n";
+                   << "(FromApplicationValue::from_application_transport_value(value)?)),\n";
     });
     output << "    _ => Err(\"unknown application reply\".into()), } }\n\n";
 

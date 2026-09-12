@@ -64,7 +64,34 @@ struct DiagnosticWorkspace final {
     std::uint64_t workspace_pitch = 0U;
     std::uint64_t workspace_width = 0U;
     std::uint64_t workspace_height = 0U;
+    // Process-local pointer provenance; neither field is a cross-process GPU
+    // allocation identity or participates in workspace ownership.
+    std::uint64_t native_process_id = 0U;
+    std::uint64_t workspace_plane = 0U;
     bool direct_sampling = false;
+};
+struct DiagnosticWorkspaceProgress final {
+    std::uint64_t requested_product_owner = 0U;
+    std::uint64_t requested_product_revision = 0U;
+    std::uint64_t observed_product_owner = 0U;
+    std::uint64_t observed_product_revision = 0U;
+    std::uint64_t suppressed_request_owner = 0U;
+    std::uint64_t admitted_allocation = 0U;
+    std::uint64_t candidate_allocation = 0U;
+    std::uint64_t candidate_product_owner = 0U;
+    std::uint64_t expected_workspace_pitch = 0U;
+    std::uint64_t expected_workspace_bytes = 0U;
+    std::uint64_t expected_device_incarnation = 0U;
+    std::uint64_t live_source_count = 0U;
+    bool candidate_admitted = false;
+    bool candidate_write_available = false;
+    bool workspace_layout_matches = false;
+    bool workspace_admitted = false;
+    bool workspace_write_available = false;
+    bool source_timeline_imported = false;
+    bool source_acquired = false;
+    bool source_release_submitted = false;
+    bool source_withdrawing = false;
 };
 struct DiagnosticExploreAdmission final {
     std::uint64_t admission_position = 0U;
@@ -129,6 +156,7 @@ struct DiagnosticContext final {
     DiagnosticAllocation allocation{};
     DiagnosticTransfer transfer{};
     DiagnosticWorkspace workspace{};
+    DiagnosticWorkspaceProgress workspace_progress{};
     DiagnosticExploreAdmission admission{};
     DiagnosticLink link{};
     DiagnosticSpanTiming span{};
@@ -142,6 +170,7 @@ MMLTK_REFLECT_FIELDS(DiagnosticDemand)
 MMLTK_REFLECT_FIELDS(DiagnosticPublication)
 MMLTK_REFLECT_FIELDS(DiagnosticAllocation)
 MMLTK_REFLECT_FIELDS(DiagnosticWorkspace)
+MMLTK_REFLECT_FIELDS(DiagnosticWorkspaceProgress)
 MMLTK_REFLECT_FIELDS(DiagnosticExploreAdmission)
 MMLTK_REFLECT_FIELDS(DiagnosticTransfer)
 MMLTK_REFLECT_FIELDS(DiagnosticLink)

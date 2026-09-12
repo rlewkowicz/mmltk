@@ -1349,6 +1349,10 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
                          std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") !=
           std::string::npos);
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
+    CHECK(generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
+                         std::to_string(static_cast<std::uint32_t>(
+                             mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) + ";") !=
+          std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
     CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);
     CHECK(generated.find("offset_of!(Record, presentation_revision) == 64") != std::string::npos);
@@ -1435,12 +1439,32 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
 
     auto value = browser::application_materializer_detail::reflected_value(snapshot);
     REQUIRE(value.has_value());
+    browser::wire::CountingEncoder measure{
+        {.max_bytes = browser::kMaxRecordWireBytes,
+         .max_items = browser::kMaxRecordWireBytes,
+         .max_depth = browser::kMaxIntentValueDepth}};
+    const auto snapshot_size = measure.measure(*value);
+    REQUIRE(snapshot_size.has_value());
+    INFO("Complete Annotation snapshot bytes: " << *snapshot_size);
+    const auto logical_value = browser::application_materializer_detail::reflected_value(ui);
+    REQUIRE(logical_value.has_value());
+    const auto logical_size = measure.measure(*logical_value);
+    REQUIRE(logical_size.has_value());
+    INFO("Editable Annotation state bytes: " << *logical_size);
     browser::wire::ByteBuffer encoded;
     REQUIRE(browser::wire::encode(*value, encoded,
                                   {.max_bytes = browser::kMaxOutputValueBytes,
                                    .max_items = browser::kMaxOutputValueItems,
                                    .max_depth = browser::kMaxIntentValueDepth}));
     CHECK(encoded.size() <= c::kAnnotationUiStateByteBudget);
+    {
+        const auto failed = browser::encode_system_event<&ApplicationSystems::annotation>(
+            AnnotationFailed{.snapshot = snapshot, .detail = std::string(kVisualFailureByteCapacity, 'e')});
+        REQUIRE(browser::encode_server_record(browser::ServerRecord{failed}, encoded));
+        const browser::IntentReply reply{
+            .correlation = 1U, .result = browser::application_materializer_detail::encode_result(snapshot)};
+        REQUIRE(browser::encode_server_record(browser::ServerRecord{reply}, encoded));
+    }
     browser::Bootstrap bootstrap{
         .schema_fingerprint = browser::application_schema_fingerprint<ApplicationSystems>().words,
         .input_epoch = 1U,

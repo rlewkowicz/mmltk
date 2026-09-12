@@ -83,6 +83,127 @@ pub fn trace_state(event: &str, id: SurfaceId, detail: &str, source: bool) {
     ));
 }
 
+pub(super) fn trace_loaded_libraries() {
+    use std::io::{BufRead, Read};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    if !workspace_diagnostics_enabled() {
+        return;
+    }
+    static OBSERVED_PROCESS: AtomicU32 = AtomicU32::new(0);
+    let process = std::process::id();
+    if OBSERVED_PROCESS.swap(process, Ordering::Relaxed) == process {
+        return;
+    }
+    let saved_errno = unsafe { *libc::__errno_location() };
+    const MAPS_BYTES: u64 = 1024 * 1024;
+    let mut paths = Vec::<String>::with_capacity(32);
+    let mut read_bytes = 0;
+    let mut bounded = false;
+    let mut encoding_unavailable = false;
+    let result = (|| -> std::io::Result<()> {
+        // This reads existing mappings only. File and bounded scratch storage
+        // are released here; no loader, Vulkan, CUDA, or product state changes.
+        let file = std::fs::File::open("/proc/self/maps")?;
+        let mut reader = std::io::BufReader::new(file.take(MAPS_BYTES));
+        let mut line = Vec::with_capacity(1024);
+        loop {
+            line.clear();
+            let count = reader.read_until(b'\n', &mut line)?;
+            if count == 0 { break; }
+            read_bytes += count;
+            if !line.ends_with(b"\n") || line.len() > 8192 {
+                bounded = true;
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&line[..line.len() - 1]) else {
+                encoding_unavailable = true;
+                continue;
+            };
+            let Some(start) = text.find('/') else { continue; };
+            let path = &text[start..];
+            let name = path.rsplit('/').next().unwrap_or("");
+            if !["libcuda.so", "libcudart.so", "libvulkan", "libGLX_nvidia.so", "libnvidia-"]
+                .iter().any(|prefix| name.starts_with(*prefix)) || paths.iter().any(|previous| previous == path) {
+                continue;
+            }
+            if paths.len() == 32 || path.len() >= 1024 {
+                bounded = true;
+                continue;
+            }
+            paths.push(path.to_owned());
+        }
+        Ok(())
+    })();
+    bounded |= read_bytes as u64 == MAPS_BYTES;
+    let error = result.as_ref().err().map_or(0, |error| error.raw_os_error().unwrap_or(-1));
+    for path in &paths {
+        write_diagnostic(|line| {
+            let path = serde_json::to_string(path).map_err(|_| fmt::Error)?;
+            write!(line,
+                "{{\"event\":\"firefox.workspace.loaded_library\",\"browser_process_id\":{process},\"library_path\":{path},\"library_provenance\":\"proc_self_maps_at_first_memory_import\"}}")
+        });
+    }
+    write_diagnostic(|line| {
+        let status = if result.is_err() { "unavailable" } else if bounded || encoding_unavailable { "partial" } else { "complete" };
+        write!(line,
+            "{{\"event\":\"firefox.workspace.library_inventory\",\"browser_process_id\":{process},\"inventory_status\":\"{status}\",\"inventory_errno\":{error},\"library_count\":{},\"maps_bytes\":{read_bytes},\"maps_byte_limit\":{MAPS_BYTES},\"inventory_bounded\":{bounded},\"path_encoding_unavailable\":{encoding_unavailable}}}",
+            paths.len())
+    });
+    unsafe { *libc::__errno_location() = saved_errno };
+}
+
+/// Called only inside an enabled diagnostic formatter, before Vulkan consumes
+/// the descriptor. F_GETFD and fstat observe liveness/metadata, never GPU payload
+/// identity. No diagnostic descriptor or persistent admission state is created.
+pub(super) fn write_descriptor_facts(
+    line: &mut String,
+    descriptor: RawFd,
+    socket: Option<RawFd>,
+) -> fmt::Result {
+    let saved_errno = unsafe { *libc::__errno_location() };
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    let flags_errno = if flags < 0 { unsafe { *libc::__errno_location() } } else { 0 };
+    let mut metadata = mem::MaybeUninit::<libc::stat>::uninit();
+    let stat_status = unsafe { libc::fstat(descriptor, metadata.as_mut_ptr()) };
+    let stat_errno = if stat_status == 0 { 0 } else { unsafe { *libc::__errno_location() } };
+    let peer = socket.map(|socket| {
+        let mut credentials: libc::ucred = unsafe { mem::zeroed() };
+        let mut length = mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let status = unsafe {
+            libc::getsockopt(socket, libc::SOL_SOCKET, libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(), &mut length)
+        };
+        let error = if status == 0 { 0 } else { unsafe { *libc::__errno_location() } };
+        (credentials.pid, status, error, status == 0 && length as usize == mem::size_of::<libc::ucred>())
+    });
+    unsafe { *libc::__errno_location() = saved_errno };
+    write!(line,
+        ",\"fd_getfd_result\":{flags},\"fd_getfd_errno\":{flags_errno},\"fd_stat_status\":{stat_status},\"fd_stat_errno\":{stat_errno}")?;
+    if stat_status == 0 {
+        let metadata = unsafe { metadata.assume_init() };
+        write!(line, ",\"fd_dev\":{},\"fd_ino\":{},\"fd_rdev\":{},\"fd_mode\":{},\"fd_size\":{}",
+            metadata.st_dev, metadata.st_ino, metadata.st_rdev, metadata.st_mode, metadata.st_size)?;
+    }
+    if let Some((pid, status, error, known)) = peer {
+        write!(line,
+            ",\"native_process_id\":{},\"peer_credentials_status\":{status},\"peer_credentials_errno\":{error},\"peer_credentials_known\":{known}",
+            if known { pid } else { 0 })?;
+    }
+    write!(line, ",\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"")
+}
+
+fn trace_memory_descriptor(event: &str, record: &Record, descriptor: RawFd, socket: RawFd) {
+    write_diagnostic(|line| {
+        write!(line,
+            "{{\"event\":\"firefox.workspace.{event}\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"channel_descriptor\":{socket},\"workspace_descriptor\":{descriptor},\"descriptor_count\":{},\"memory_descriptor_index\":{IMPORT_MEMORY_DESCRIPTOR},\"record_bytes\":{RECORD_BYTES},\"descriptor_transport\":\"SCM_RIGHTS\"",
+            record.id_high, record.id_low, record.arena_high, record.arena_low,
+            record.allocation_identity, std::process::id(), record.descriptors)?;
+        write_descriptor_facts(line, descriptor, Some(socket))?;
+        write!(line, "}}")
+    });
+}
+
 pub(super) mod graphics_abi {
     #![allow(dead_code)]
     include!(env!("MMLTK_WORKSPACE_GRAPHICS_ABI"));
@@ -232,9 +353,29 @@ enum AcquisitionState {
     Settling,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseState {
+    Unsubmitted,
+    Submitted,
+    Notified,
+}
+
 struct SourceAcquisition {
     record: Record,
     state: AcquisitionState,
+    release: ReleaseState,
+}
+
+impl SourceAcquisition {
+    fn pending_record(&self) -> Option<Record> {
+        if self.state == AcquisitionState::Submitted {
+            return Some(self.record);
+        }
+        if self.state == AcquisitionState::Notified && self.release == ReleaseState::Submitted {
+            return Some(Record { opcode: OPCODE_RELEASE_SUBMITTED, ..self.record });
+        }
+        None
+    }
 }
 
 struct Channel {
@@ -462,6 +603,9 @@ impl Channel {
         }
         let admission = self.admitted.remove(&id)?;
         self.claimed.insert(id);
+        if admission.layout.opcode == OPCODE_IMPORT {
+            trace_memory_descriptor("descriptor_claimed", &admission.layout, admission.descriptor(), self.fd);
+        }
         write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
             if self.sources.contains_key(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
@@ -575,6 +719,10 @@ impl Channel {
                         self.fail();
                         return;
                     }
+                    // This is the exact, framing-checked SCM_RIGHTS slot, before
+                    // the descriptor is moved into Admission's existing owner.
+                    trace_memory_descriptor("descriptor_received", &record,
+                        descriptors[IMPORT_MEMORY_DESCRIPTOR].as_raw_fd(), self.fd);
                     let mut memory = None;
                     let mut frame_edge = None;
                     let mut frame_signal = None;
@@ -645,6 +793,7 @@ impl Channel {
                         self.fail(); return;
                     };
                     if acquisition.state != AcquisitionState::Notified
+                        || acquisition.release != ReleaseState::Notified
                         || acquisition.record.stride != record.stride
                         || acquisition.record.size != record.size
                         || acquisition.record.presentation_revision != record.presentation_revision
@@ -840,9 +989,9 @@ impl Channel {
 
     fn flush(&mut self) {
         while self.terminal == ChannelTerminal::Open {
-            let acquired = self.sources.iter().find_map(|(id, acquisition)| acquisition.as_ref().and_then(|acquisition|
-                (acquisition.state == AcquisitionState::Submitted).then_some((*id, acquisition.record))));
-            let (record, descriptor) = if let Some((_, record)) = acquired {
+            let source_transition = self.sources.iter().find_map(|(id, acquisition)| acquisition.as_ref().and_then(|acquisition|
+                acquisition.pending_record().map(|record| (*id, record))));
+            let (record, descriptor) = if let Some((_, record)) = source_transition {
                 (record, None)
             } else if let Some(pending) = self.pending.front() {
                 (pending.record, pending.descriptor.as_ref())
@@ -888,8 +1037,13 @@ impl Channel {
                 self.fail();
                 return;
             }
-            if let Some((id, _)) = acquired {
-                self.sources.get_mut(&id).unwrap().as_mut().unwrap().state = AcquisitionState::Notified;
+            if let Some((id, record)) = source_transition {
+                let acquisition = self.sources.get_mut(&id).unwrap().as_mut().unwrap();
+                if record.opcode == OPCODE_ACQUIRED {
+                    acquisition.state = AcquisitionState::Notified;
+                } else {
+                    acquisition.release = ReleaseState::Notified;
+                }
                 continue;
             }
             let record = self.pending.pop_front().unwrap().record;
@@ -980,7 +1134,7 @@ pub fn poll_state() -> Option<(RawFd, u32)> {
     }
     let mut events = libc::EPOLLIN as u32;
     if !channel.pending.is_empty()
-        || channel.sources.values().flatten().any(|acquisition| acquisition.state == AcquisitionState::Submitted) {
+        || channel.sources.values().flatten().any(|acquisition| acquisition.pending_record().is_some()) {
         events |= libc::EPOLLOUT as u32;
     }
     Some((channel.fd, events))
@@ -1221,6 +1375,7 @@ pub fn reserve_acquisition(id: SurfaceId, session: u64, sequence: u64, publicati
             id_high: id.high, id_low: id.low, stride: session, size: sequence,
             presentation_revision: publication, offset: transfer, ..Default::default() },
         state: AcquisitionState::Reserved,
+        release: ReleaseState::Unsubmitted,
     });
     true
 }
@@ -1231,6 +1386,22 @@ pub fn submit_acquisition(id: SurfaceId) -> bool {
     let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
     if acquisition.state != AcquisitionState::Reserved { channel.fail(); return false; }
     acquisition.state = AcquisitionState::Submitted;
+    channel.flush();
+    channel.wake_dispatcher();
+    channel.terminal == ChannelTerminal::Open
+}
+
+// Physical release submission can precede delivery of Acquired. Keep both
+// obligations on the exact source owner; flush always sends Acquired first.
+pub fn submit_release(id: SurfaceId) -> bool {
+    let Some(channel) = channel() else { return false; };
+    let Ok(mut channel) = channel.lock() else { return false; };
+    let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
+    if !matches!(acquisition.state, AcquisitionState::Submitted | AcquisitionState::Notified)
+        || acquisition.release != ReleaseState::Unsubmitted {
+        channel.fail(); return false;
+    }
+    acquisition.release = ReleaseState::Submitted;
     channel.flush();
     channel.wake_dispatcher();
     channel.terminal == ChannelTerminal::Open

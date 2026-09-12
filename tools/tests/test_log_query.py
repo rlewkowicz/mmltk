@@ -20,6 +20,21 @@ def record(data, source="runtime.jsonl", line=1):
     return logs.parse_record(source, line, json.dumps(data))
 
 
+def vulkan_message(identifier="VUID-vkCmdCopyImageToBuffer-srcImage-00186", *,
+                   handle="0x001AbC", object_type="IMAGE", pid=None, level="ERROR",
+                   detail="The Vulkan spec states: srcImage must have transfer source usage."):
+    module = "wgpu_hal::vulkan::instance"
+    prefix = f"[{level} {module}]" if pid is None else f"[Child {pid}: Renderer]: E/{module}"
+    severity = "Warning" if level == "WARN" else "Error"
+    return (
+        f"{prefix} VALIDATION [{identifier} (0x30009145)]\n"
+        f"    \tValidation {severity}: [ {identifier} ] Object 0: handle = {handle}, "
+        f"type = VK_OBJECT_TYPE_{object_type}; | MessageID = 0x30009145 | "
+        f"vkCmdCopyImageToBuffer(): {detail}\n"
+        f"{prefix} \tobjects: (type: {object_type}, hndl: {handle}, name: ?)\n"
+    )
+
+
 class ParserTests(unittest.TestCase):
     def matches(self, expression, data):
         return logs.QueryParser(expression).parse().matches(record(data))
@@ -124,6 +139,14 @@ class LogFormatTests(unittest.TestCase):
         self.assertEqual(first, {identity for _, identity in identities(10, arena=21)
                                  if "transfer_sequence" in identity.names})
 
+    def test_memory_provenance_process_ids_never_expand_as_resource_identities(self):
+        row = record({"event": "gpu.workspace.memory_export", "native_process_id": 101,
+                      "browser_process_id": 202, "workspace_descriptor": 9, "workspace_plane": 4096})
+        self.assertFalse(logs.strong_identities(row))
+        fields = ("native_process_id", "workspace_descriptor", "workspace_plane")
+        identities = logs.strong_identities(row, explicit=(fields,))
+        self.assertEqual([identity.names for identity in identities], [fields])
+
     def test_native_header_and_key_value_messages(self):
         row = logs.parse_record("native.log", 4,
             "1970-01-01 00:00:01.123456789 [694:836] [mmltk-browser-host] [debug] "
@@ -136,6 +159,45 @@ class LogFormatTests(unittest.TestCase):
         self.assertEqual(row.get("device"), 0)
         self.assertEqual(row.get("failed"), False)
         self.assertEqual((row.clock, row.time_ns), ("wall-local", 1123456789))
+
+    def test_vulkan_report_conditions_do_not_become_allocation_or_fd_identity_facts(self):
+        message = (
+            "[ERROR wgpu_hal::vulkan::instance] VALIDATION "
+            "[VUID-VkMemoryAllocateInfo-allocationSize-01742 (0xc093a791)]\n"
+            "    \tValidation Error: [ VUID-VkMemoryAllocateInfo-allocationSize-01742 ] "
+            "| MessageID = 0xc093a791 | vkAllocateMemory(): allocationSize (2097152) "
+            "does not match fd (122) allocationSize (0). The Vulkan spec states: "
+            "If the external handle specified was created by the Vulkan API, "
+            "then the values of allocationSize and memoryTypeIndex must match."
+        )
+        row = logs.parse_record("firefox.log", 10, message)
+        self.assertEqual(row.get("api"), "vkAllocateMemory")
+        self.assertIn("If the external handle specified was created by the Vulkan API", row.get("message"))
+        self.assertEqual(row.raw, message)
+        self.assertEqual(row.get("objects"), [])
+        self.assertIs(row.get("workspace_descriptor"), logs.MISSING)
+        self.assertIs(row.get("memory_size"), logs.MISSING)
+        self.assertFalse(logs.vulkan_resources(row.data))
+        self.assertFalse(logs.strong_identities(row))
+
+    def test_vulkan_object_projection_keeps_types_and_multiple_images_separate(self):
+        message = vulkan_message().rstrip("\n") + (
+            "\n    Object 1: handle = 0x20, type = VK_OBJECT_TYPE_IMAGE;"
+            " Object 2: handle = 0x1abc, type = VK_OBJECT_TYPE_DEVICE_MEMORY;"
+            " Object 3: handle = 0x0, type = VK_OBJECT_TYPE_IMAGE;"
+        )
+        row = logs.parse_record("firefox.log", 1, message)
+        self.assertIs(row.get("vk_image"), logs.MISSING)
+        self.assertEqual(row.get("vk_memory"), "0x1abc")
+        self.assertEqual(set(logs.vulkan_resources(row.data)),
+                         {("vk_image", "0x1abc"), ("vk_image", "0x20"), ("vk_memory", "0x1abc")})
+        self.assertIn({"type": "IMAGE", "handle": "0x0"}, row.get("objects"))
+        with patch.object(logs, "MAX_VULKAN_OBJECTS", 1):
+            bounded = logs.parse_record("firefox.log", 1, message)
+        self.assertEqual(len(bounded.get("objects")), 1)
+        self.assertIn("bounded capacity", bounded.parse_error)
+        self.assertEqual(bounded.raw, message)
+        self.assertIs(record({"objects": [{"type": [], "handle": "0x20"}]}).get("vk_image"), logs.MISSING)
 
     def test_firefox_moz_log_including_optional_timestamp(self):
         message = "[Child 780: IPC I/O Child]: E/ipc OnChannelErrorFromLink"
@@ -320,16 +382,21 @@ class TriageSelectionTests(unittest.TestCase):
         self.assertLessEqual(times.reads, logs.MAX_AUTO_ANCHORS.bit_length() + 2)
         self.assertEqual(group.nearest(self.row({}, source="another.log")), (0,))
 
-    def pixel_row(self, boundary, transfer=1, rgba=10, line=1):
+    def pixel_row(self, boundary, transfer=1, rgba=10, line=1, *, index=0):
         data = {
             "surface": "00000000000000010000000000000002", "presentation_revision": 1,
             "source": "00000000000000030000000000000004",
-            "sample_index": 0, "sample_x": 4, "sample_y": 5, "sample_rgba": rgba,
+            "sample_index": index, "sample_x": 4 + index % 5, "sample_y": 5 + index // 5, "sample_rgba": rgba,
             "transfer_sequence": transfer, "boundary": boundary,
             "event": "firefox.workspace.frame_forwarded" if boundary == "forwarded" else
                      "presentation.pixel" if boundary == "native" else
+                     "presentation.pixel_after_release" if boundary == "native_after_release" else
+                     f"presentation.pixel_{boundary}" if boundary.startswith("source_copy_") else
+                     "firefox.workspace.direct_pixel" if boundary == "direct_image" else
                      "iced.surface.pixel" if boundary == "sample" else "firefox.workspace.pixel",
         }
+        if boundary == "direct_image":
+            data.update(completion="Ok(true)", readback_marker=0x4d4d4c54, expected_marker=0x4d4d4c54)
         if boundary in ("import", "mailbox"):
             del data["source"]
         return self.row(data, line)
@@ -382,6 +449,276 @@ class TriageSelectionTests(unittest.TestCase):
                     triage.observe_pixel_chain(record, emit=True)
                 finding, = triage.findings.values()
                 self.assertEqual(finding.kind, "pixel-mode-conflict")
+
+    def test_optional_direct_image_edges_preserve_native_comparison_in_every_arrival_order(self):
+        for order in permutations(("native", "forwarded", "direct_image", "sample")):
+            for image_rgba, sampled_rgba in ((10, 10), (10, 11), (11, 11), (11, 10)):
+                with self.subTest(order=order, image=image_rgba, sample=sampled_rgba):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    for line, boundary in enumerate(order, 1):
+                        rgba = image_rgba if boundary == "direct_image" else sampled_rgba if boundary == "sample" else 10
+                        row = self.pixel_row(boundary, rgba=rgba, line=line)
+                        row.data["direct_sampling"] = True
+                        triage.observe_pixel_chain(row, emit=True)
+                    triage.finalize_pixel_chain(emit=True)
+                    findings = list(triage.findings.values())
+                    native = [item for item in findings if item.kind == "pixel-chain-divergence"]
+                    self.assertEqual(len(native), int(sampled_rgba != 10))
+                    if native:
+                        self.assertIn("native -> sample", native[0].message)
+                    optional = [item for item in findings if item.kind == "pixel-direct-boundary-divergence"]
+                    self.assertEqual(len(optional), int(image_rgba != 10) + int(image_rgba != sampled_rgba))
+                    if image_rgba != 10:
+                        self.assertTrue(any("native -> direct_image" in item.message for item in optional))
+                    if image_rgba != sampled_rgba:
+                        self.assertTrue(any("direct_image -> sample" in item.message for item in optional))
+                    self.assertEqual(len(findings), len(native) + len(optional))
+
+    def test_optional_direct_image_requires_completion_marker_and_exact_direct_bridge(self):
+        for defect in ({"completion": "Ok(false)"}, {"readback_marker": 0},
+                       {"expected_marker": 0}, {"readback_marker": 0, "expected_marker": 0},
+                       {"completion": None}, {"expected_marker": None}):
+            with self.subTest(defect=defect):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for line, boundary in enumerate(("native", "forwarded", "direct_image", "sample"), 1):
+                    row = self.pixel_row(boundary, rgba=10 if boundary == "native" else 11, line=line)
+                    row.data["direct_sampling"] = True
+                    if boundary == "direct_image":
+                        row.data.update(defect)
+                    triage.observe_pixel_chain(row, emit=True)
+                triage.finalize_pixel_chain(emit=True)
+                finding, = triage.findings.values()
+                self.assertEqual(finding.kind, "pixel-chain-divergence")
+                self.assertIn("native -> sample", finding.message)
+                self.assertTrue(any("readback marker" in note for note in triage.notes))
+        for bridge_mode in (None, False):
+            with self.subTest(bridge_mode=bridge_mode):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                triage.observe_pixel_chain(self.pixel_row("direct_image", rgba=11), emit=True)
+                if bridge_mode is not None:
+                    bridge = self.pixel_row("forwarded", line=2)
+                    bridge.data["direct_sampling"] = bridge_mode
+                    triage.observe_pixel_chain(bridge, emit=True)
+                triage.finalize_pixel_chain(emit=True)
+                self.assertFalse(triage.findings)
+                self.assertFalse(triage.pixel_pending)
+                self.assertTrue(any("bytes were not compared" in note for note in triage.notes))
+
+    def test_complete_source_copy_pixels_compare_exact_edges_in_every_group_order(self):
+        groups = {
+            "native": ("native", "native_after_release"),
+            "source_copies": ("source_copy_before_ready", "source_copy_after_release"),
+            "browser": ("direct_image", "sample"),
+            "forwarded": ("forwarded",),
+        }
+        source_edges = (
+            ("native", "source_copy_before_ready"),
+            ("native_after_release", "source_copy_after_release"),
+            ("source_copy_before_ready", "source_copy_after_release"),
+            ("source_copy_before_ready", "direct_image"),
+            ("source_copy_after_release", "direct_image"),
+            ("source_copy_before_ready", "sample"),
+            ("source_copy_after_release", "sample"),
+        )
+        direct_edges = (("native", "direct_image"), ("direct_image", "sample"))
+        for order in permutations(groups):
+            for changed in ((), ("source_copy_before_ready", "source_copy_after_release"),
+                            ("source_copy_after_release",), ("direct_image", "sample"),
+                            ("direct_image",), ("native_after_release",)):
+                with self.subTest(order=order, changed=changed):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    values = {name: 11 if name in changed else 10 for names in groups.values() for name in names}
+                    line = 0
+                    for group in order:
+                        for boundary in groups[group]:
+                            for index in range(1 if boundary == "forwarded" else 25):
+                                line += 1
+                                row = self.pixel_row(boundary, rgba=values[boundary], line=line, index=index)
+                                row.data.update(direct_sampling=True, workspace_allocation=57, timeline_ready=1)
+                                triage.observe_pixel_chain(row, emit=True)
+                    triage.finalize_pixel_chain(emit=True)
+                    findings = list(triage.findings.values())
+                    for kind, edges in (
+                        ("pixel-chain-divergence", (("native", "sample"),)),
+                        ("pixel-direct-boundary-divergence", direct_edges),
+                        ("pixel-source-copy-boundary-divergence", source_edges),
+                    ):
+                        observed = {item.message.split(" sample differs", 1)[0] for item in findings if item.kind == kind}
+                        expected = {f"{left} -> {right}" for left, right in edges if values[left] != values[right]}
+                        self.assertEqual(observed, expected, kind)
+                    self.assertTrue(all(item.kind.endswith("divergence") for item in findings))
+                    self.assertEqual(len(findings), len(triage.pixel_divergences))
+                    self.assertEqual(len(triage.pixel_samples), 25)
+                    self.assertTrue(all(len(chain.stages) == 6 for chain in triage.pixel_samples.values()))
+                    self.assertEqual(triage.pixel_pending_count, 0)
+
+    def test_optional_source_copy_absence_and_retired_alias_keep_required_native_evidence(self):
+        for optional in ((), ("source_copy_before_ready",), ("source_copy_after_release",),
+                         ("source_copy_before_ready", "source_copy_after_release")):
+            for rgba in (10, 11):
+                with self.subTest(optional=optional, rgba=rgba):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    for line, boundary in enumerate((*optional, "native", "forwarded", "sample"), 1):
+                        row = self.pixel_row(boundary, rgba=10 if boundary == "native" else rgba, line=line)
+                        row.data["direct_sampling"] = True
+                        triage.observe_pixel_chain(row, emit=True)
+                    alias = self.pixel_row("direct_image", rgba=99, line=10)
+                    alias.data["event"] = "firefox.workspace.direct_memory_pixel"
+                    triage.observe_pixel_chain(alias, emit=True)
+                    triage.finalize_pixel_chain(emit=True)
+                    required = [item for item in triage.findings.values() if item.kind == "pixel-chain-divergence"]
+                    self.assertEqual(len(required), int(rgba != 10))
+                    if required:
+                        self.assertIn("native -> sample", required[0].message)
+                    if rgba == 10:
+                        self.assertFalse(triage.findings)
+                    self.assertFalse(any("direct_image" in item.message for item in triage.findings.values()))
+                    self.assertTrue(any("excluded from pixel comparisons" in note for note in triage.notes))
+
+    def test_optional_native_pixels_without_a_bridge_never_create_missing_required_evidence(self):
+        for boundary in ("source_copy_before_ready", "source_copy_after_release", "native_after_release"):
+            for emit in (False, True):
+                with self.subTest(boundary=boundary, emit=emit):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    triage.observe_pixel_chain(self.pixel_row(boundary), emit=emit)
+                    triage.finalize_pixel_chain(emit=emit)
+                    self.assertFalse(triage.findings)
+                    self.assertFalse(triage.seed_pool.entries)
+                    self.assertFalse(triage.pixel_samples)
+                    self.assertEqual(triage.pixel_pending_count, 0)
+                    self.assertTrue(any("bytes were not compared" in note for note in triage.notes))
+                    triage.observe_pixel_chain(self.pixel_row("forwarded", line=2), emit=emit)
+                    triage.observe_pixel_chain(self.pixel_row(boundary, line=3), emit=emit)
+                    chain, = triage.pixel_samples.values()
+                    self.assertEqual({stage[0] for stage in chain.stages}, {boundary})
+                    self.assertFalse(triage.findings)
+
+    def test_source_copy_pixels_reject_conflicting_bridge_facts_in_either_order(self):
+        for boundary in ("source_copy_before_ready", "source_copy_after_release"):
+            for defect in ({"source": "00000000000000050000000000000006"},
+                           {"workspace_allocation": 58}, {"timeline_ready": 3}, {"timeline_ready": True}):
+                for order in (("forwarded", boundary), (boundary, "forwarded")):
+                    with self.subTest(boundary=boundary, defect=defect, order=order):
+                        triage = logs.Triage(self.triage.options, self.triage.where, {})
+                        for line, stage in enumerate(("native", "sample", *order), 1):
+                            row = self.pixel_row(stage, rgba=99 if stage == boundary else 10, line=line)
+                            row.data.update(direct_sampling=True, workspace_allocation=57, timeline_ready=1)
+                            if stage == boundary:
+                                row.data.update(defect)
+                            triage.observe_pixel_chain(row, emit=True)
+                        triage.finalize_pixel_chain(emit=True)
+                        finding, = triage.findings.values()
+                        self.assertEqual(finding.kind, "pixel-source-copy-transfer-conflict")
+                        self.assertIn("exact forwarded transfer", finding.message)
+                        self.assertFalse(any(stage[0] == boundary for chain in triage.pixel_samples.values() for stage in chain.stages))
+
+    def test_source_copy_pixels_never_join_another_transfer_publication_surface_or_run(self):
+        for boundary in ("source_copy_before_ready", "source_copy_after_release"):
+            for field, value in (("transfer_sequence", 2), ("presentation_revision", 2),
+                                 ("surface", "00000000000000070000000000000008"), ("@run", "another")):
+                with self.subTest(boundary=boundary, field=field):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    for line, stage in enumerate((boundary, "native", "forwarded", "sample"), 1):
+                        row = self.pixel_row(stage, rgba=99 if stage == boundary else 10, line=line)
+                        row.data["direct_sampling"] = True
+                        if stage == boundary:
+                            if field == "@run":
+                                row.metadata["run"] = value
+                            else:
+                                row.data[field] = value
+                        triage.observe_pixel_chain(row, emit=True)
+                    triage.finalize_pixel_chain(emit=True)
+                    self.assertFalse(triage.findings)
+                    self.assertEqual(triage.pixel_pending_count, 0)
+                    self.assertFalse(any(stage[0] == boundary for chain in triage.pixel_samples.values() for stage in chain.stages))
+
+    def test_source_copy_edges_reject_contradictory_coordinates_and_iced_source_facts(self):
+        for defect in ({"sample_x": 9}, {"sample_y": 9},
+                       {"source": "00000000000000050000000000000006"},
+                       {"transfer_sequence": 2}, {"transfer_sequence": True},
+                       {"workspace_allocation": 58}, {"workspace_allocation": 57.0}):
+            with self.subTest(defect=defect):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for line, stage in enumerate(("source_copy_before_ready", "source_copy_after_release",
+                                               "native", "forwarded", "sample"), 1):
+                    row = self.pixel_row(stage, line=line)
+                    row.data.update(direct_sampling=True, workspace_allocation=57)
+                    if stage == "sample":
+                        row.data.update(defect)
+                    triage.observe_pixel_chain(row, emit=True)
+                triage.finalize_pixel_chain(emit=True)
+                optional = [item for item in triage.findings.values() if item.kind.startswith("pixel-source-copy")]
+                self.assertEqual(len(optional), 2)
+                self.assertTrue(all(item.kind == "pixel-source-copy-transfer-conflict" for item in optional))
+                self.assertTrue(all("bytes were not compared" in item.message for item in optional))
+
+    def test_source_copy_pixels_with_ambiguous_native_source_spelling_are_not_compared(self):
+        for source in ("invalid", "00000000000000050000000000000006"):
+            with self.subTest(source=source):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for line, stage in enumerate(("native", "forwarded", "source_copy_before_ready", "sample"), 1):
+                    row = self.pixel_row(stage, rgba=99 if stage == "source_copy_before_ready" else 10, line=line)
+                    row.data["direct_sampling"] = True
+                    if stage == "source_copy_before_ready":
+                        row.data.update(source=source, workspace_source_high=3, workspace_source_low=4)
+                    triage.observe_pixel_chain(row, emit=True)
+                triage.finalize_pixel_chain(emit=True)
+                self.assertFalse(triage.findings)
+                self.assertTrue(any("lacks an exact source identity" in note for note in triage.notes))
+
+    def test_source_copy_pixels_preserve_the_required_copy_mode_chain(self):
+        for line, boundary in enumerate(("native", "native_after_release", "source_copy_before_ready",
+                                         "source_copy_after_release", "sample", "mailbox", "import", "forwarded"), 1):
+            row = self.pixel_row(boundary, rgba=10 if boundary.startswith("native") else 11, line=line)
+            row.data["direct_sampling"] = False
+            self.triage.observe_pixel_chain(row, emit=True)
+        self.triage.finalize_pixel_chain(emit=True)
+        required = [item for item in self.triage.findings.values() if item.kind == "pixel-chain-divergence"]
+        self.assertEqual(len(required), 1)
+        self.assertIn("native -> import", required[0].message)
+        optional = [item for item in self.triage.findings.values() if item.kind == "pixel-source-copy-boundary-divergence"]
+        self.assertEqual({item.message.split(" sample differs", 1)[0] for item in optional},
+                         {"native -> source_copy_before_ready", "native_after_release -> source_copy_after_release"})
+        self.assertEqual(len(self.triage.findings), 3)
+        self.assertEqual(self.triage.pixel_pending_count, 0)
+
+    def test_source_copy_owner_mutation_keeps_the_first_complete_observation(self):
+        self.triage.observe_pixel_chain(self.pixel_row("forwarded"), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("source_copy_before_ready", line=2), emit=True)
+        self.triage.observe_pixel_chain(self.pixel_row("source_copy_before_ready", rgba=11, line=3), emit=True)
+        self.triage.finalize_pixel_chain(emit=True)
+        finding, = self.triage.findings.values()
+        self.assertEqual(finding.kind, "pixel-source-copy-owner-mutation")
+        self.assertEqual((finding.other.line, finding.record.line), (2, 3))
+        chain, = self.triage.pixel_samples.values()
+        observation, = chain.stages.values()
+        self.assertEqual(observation[0], (4, 5, 10))
+
+    def test_native_pixel_timeline_retains_exact_source_copy_facts(self):
+        options = logs.argument_parser().parse_args(["--format", "timeline"])
+        for boundary in ("native", "native_after_release", "source_copy_before_ready", "source_copy_after_release"):
+            with self.subTest(boundary=boundary):
+                row = self.pixel_row(boundary, transfer=7, rgba=0xff332211, index=24)
+                row.data["workspace_allocation"] = 57
+                output = logs.render_record(logs.Retained((), row, "query", False), options)
+                for text in (f"{row.get('@event')}", "@workspace_source=00000000000000030000000000000004",
+                             "workspace_allocation=57", "presentation_revision=1", "transfer_sequence=7",
+                             "sample_index=24", "sample_x=8", "sample_y=9", "sample_rgba=4281541137"):
+                    self.assertIn(text, output)
+
+    def test_bounded_failure_payload_preserves_reason_and_identities_before_large_context(self):
+        row = self.row({
+            "audit_context": {"prior": {"visible_indices": list(range(200))}, "field": "rows", "expected": 4},
+            "event": "acceptance.atlas_draw.failed", "observed_event": "iced.surface.draw_encoded",
+            "reason": "draw_source_facts_mismatch", "source_revision": 30, "presentation_revision": 337,
+            "surface": "00000000000000010000000000000002",
+            "source": "00000000000000030000000000000004",
+        })
+        retained = logs.triage_snapshot(row)
+        for field in ("@event", "reason", "observed_event", "source_revision", "presentation_revision",
+                      "@surface", "@workspace_source", "audit_context.field", "audit_context.expected"):
+            self.assertEqual(retained.get(field), row.get(field), field)
+        self.assertTrue(retained.metadata["triage_payload_truncated"])
 
     def test_absent_pixel_bridges_finalize_each_exact_transfer_once(self):
         for boundary, transfer, line in (("import", 7, 9), ("mailbox", 7, 3), ("import", 8, 4)):
@@ -602,6 +939,161 @@ class FileQueryTests(unittest.TestCase):
         status, output, diagnostics = self.run_query(*arguments, "--format", "jsonl")
         return status, [json.loads(line) for line in output.splitlines()], diagnostics
 
+    def test_vulkan_callback_preserves_complete_text_objects_and_physical_lines(self):
+        message = vulkan_message()
+        path = self.write("vulkan.log", "\n" + message + '{"event":"after"}\n')
+        rows = list(logs.LogFile.capture(path, self.root).records())
+        self.assertEqual(len(rows), 2)
+        row = rows[0]
+        self.assertEqual((row.line, row.get("@line_end")), (2, 4))
+        self.assertEqual(row.raw, message.rstrip("\n"))
+        self.assertEqual(row.format, "rust")
+        self.assertEqual(row.get("@event"), "vulkan.validation")
+        self.assertEqual(row.get("@level"), "error")
+        self.assertEqual(row.get("api"), "vkCmdCopyImageToBuffer")
+        self.assertEqual(row.get("message_id"), "0x30009145")
+        self.assertEqual(row.get("vk_image"), "0x1abc")
+        self.assertEqual(row.get("objects"), [{"type": "IMAGE", "handle": "0x1abc", "name": "?"}])
+        self.assertIs(row.get("browser_process_id"), logs.MISSING)
+        self.assertEqual(rows[1].line, 5)
+        self.assertFalse(row.parse_error)
+        status, projected, diagnostics = self.exported(
+            "vulkan.log", "-q", "has(validation_id)", "--fields", "validation_id,message,vk_image")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(projected[0]["@line_end"], 4)
+        self.assertIn("srcImage must have transfer source usage.", projected[0]["message"])
+        # Pasted-error prefiltering must see the entire callback, including words
+        # on different physical lines and the header's validation identifier.
+        phrase = "Validation Error: [ VUID-vkCmdCopyImageToBuffer-srcImage-00186 ] Object 0"
+        status, found, diagnostics = self.exported("vulkan.log", "--error", phrase)
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(found[0]["_log"]["line"], 2)
+        self.assertEqual(found[0]["text"], row.raw)
+
+    def test_vulkan_representatives_count_distinct_ids_without_shortening_messages(self):
+        detail = ("complete diagnostic condition " * 100
+                  + "If the external handle specified was created by the Vulkan API, then apply this condition.")
+        first = vulkan_message(detail=detail)
+        hazard = vulkan_message("SYNC-HAZARD-WRITE-AFTER-READ", level="WARN")
+        self.write("vulkan.log", first * 50 + hazard * 3)
+        arguments = ("vulkan.log", "-q", "@event=vulkan.validation", "--group-by", "validation_id",
+                     "--representatives", "--limit", "8")
+        status, rows, diagnostics = self.exported(*arguments)
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["_log"]["representative_count"] for row in rows], [50, 3])
+        self.assertEqual(rows[0]["text"], first.rstrip("\n"))
+        self.assertIn(detail, rows[0]["data"]["message"])
+        self.assertEqual(rows[1]["data"]["validation_id"], "SYNC-HAZARD-WRITE-AFTER-READ")
+        self.assertEqual(rows[1]["data"]["level"], "WARN")
+        self.assertIn("53 matched", diagnostics)
+        status, output, diagnostics = self.run_query(*arguments, "--format", "timeline", "--no-auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn(detail, output)
+        self.assertIn("occurrences=50", output)
+        for incompatible in ("--tail", "--triage"):
+            self.assertEqual(self.run_query(*arguments, incompatible)[0], 2)
+
+    def test_vulkan_assembly_preserves_interruptions_and_reports_bounded_fragments(self):
+        lines = vulkan_message().splitlines(keepends=True)
+        interrupted = self.write("interrupted.log", lines[0] + '{"event":"interleaved"}\n' + "".join(lines[1:]))
+        rows = list(logs.LogFile.capture(interrupted, self.root).records())
+        self.assertNotIn("transfer source usage", rows[0].raw)
+        self.assertEqual(rows[1].get("@event"), "interleaved")
+        self.assertIn("transfer source usage", rows[2].raw)
+        self.assertEqual(rows[2].line, 3)
+        path = self.write("bounded.log", vulkan_message() + '{"event":"after"}\n')
+        with patch.object(logs, "MAX_MESSAGE_LINES", 2):
+            status, output, diagnostics = self.run_query("bounded.log", "--strict")
+        self.assertEqual(status, 2)
+        self.assertIn("continuation retained separately", diagnostics)
+        with patch.object(logs, "MAX_MESSAGE_LINES", 2):
+            rows = list(logs.LogFile.capture(path, self.root).records())
+        self.assertEqual([row.line for row in rows], [1, 3, 4])
+        self.assertIn("objects:", rows[1].raw)
+        byte_limit = max(len(line.encode("utf-8")) for line in lines) + 1
+        with patch.object(logs, "MAX_LINE_BYTES", byte_limit):
+            rows = list(logs.LogFile.capture(path, self.root).records())
+        self.assertTrue(any(row.parse_error for row in rows))
+        self.assertEqual("\n".join(row.raw for row in rows) + "\n", path.read_text(encoding="utf-8"))
+        other = vulkan_message("SYNC-HAZARD-WRITE-AFTER-WRITE").splitlines(keepends=True)[1]
+        self.write("mismatched.log", lines[0] + other)
+        _, rows, _ = self.exported("mismatched.log", "-q", "@event=vulkan.validation")
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["data"]["validation_id"], rows[1]["data"]["validation_id"])
+
+    def test_vulkan_exact_handles_add_bounded_same_file_provenance_candidates(self):
+        source = "00000000000000010000000000000002"
+        common = {"browser_process_id": 202, "vk_device": "0x10", "vk_image": "0x1abc"}
+        records = [
+            {"event": "firefox.workspace.image_created", **common},
+            {"event": "firefox.workspace.memory_import", **common, "source": source, "workspace_allocation": 34},
+            {"event": "firefox.workspace.memory_bound", **common, "source": source,
+             "workspace_allocation": 34, "vk_memory": "0x30"},
+            {"event": "firefox.workspace.direct_binding", "vk_device": "0x10", "vk_image": "0x1abc",
+             "vk_memory": "0x30", "source": source, "workspace_allocation": 34, "phase": "attached"},
+            {"event": "firefox.workspace.memory_bound", "browser_process_id": 202,
+             "vk_memory": "0x1abc"},  # A different object type cannot match the same number.
+        ]
+        self.write("build/validation/vulkan-firefox.log",
+                   "".join(json.dumps(row) + "\n" for row in records) + vulkan_message() * 100)
+        self.write("build/validation/vulkan-native.log", [
+            {"event": "firefox.workspace.image_created", **common, "browser_process_id": 303}])
+        arguments = ("--family", "vulkan", "-q", "@event=vulkan.validation",
+                     "--group-by", "validation_id", "--representatives", "--auto-correlate", "--limit", "10")
+        status, rows, diagnostics = self.exported(*arguments)
+        self.assertEqual(status, 0, diagnostics)
+        related = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertEqual(len(related), logs.MAX_AUTO_VULKAN_RELATED)
+        self.assertEqual({row["data"]["event"] for row in related}, logs.VULKAN_PROVENANCE_EVENTS)
+        self.assertTrue(all("same-file handle candidate; process unrecorded" in row["_log"]["auto_reason"]
+                            for row in related))
+        self.assertTrue(all(row["_log"]["file"].endswith("-firefox.log") for row in related))
+        self.assertEqual(sum(row["data"].get("source") == source for row in related), 3)
+        diagnostic, = [row for row in rows if row["_log"]["match"] == "query"]
+        self.assertNotIn("browser_process_id", diagnostic["data"])
+        self.assertEqual(diagnostic["_log"]["representative_count"], 100)
+        _, limited, _ = self.exported(*arguments[:-1], "2")
+        self.assertEqual(len(limited), 2)
+        _, filtered, _ = self.exported(*arguments, "--where", "NOT @event=firefox.workspace.memory_bound")
+        self.assertFalse(any(row["data"]["event"] == "firefox.workspace.memory_bound" for row in filtered))
+
+    def test_vulkan_recorded_process_joins_files_in_one_run_and_rejects_other_processes(self):
+        common = {"vk_image": "0x1abc", "vk_device": "0x10"}
+        self.write("build/validation/vulkan-firefox.log", vulkan_message(pid=202))
+        self.write("build/validation/vulkan-native.log", [
+            {"event": "firefox.workspace.image_created", **common, "browser_process_id": 202},
+            {"event": "firefox.workspace.memory_import", **common, "browser_process_id": 303},
+        ])
+        self.write("build/validation/vulkan-native.log.history/57-1000000000.log", [
+            {"event": "firefox.workspace.memory_bound", **common, "browser_process_id": 202}])
+        status, rows, diagnostics = self.exported(
+            "--family", "vulkan", "--history", "-q", "@event=vulkan.validation", "--auto-correlate")
+        self.assertEqual(status, 0, diagnostics)
+        related = [row for row in rows if row["_log"]["match"] == "auto"]
+        self.assertEqual(len(related), 1)
+        self.assertEqual(related[0]["data"]["browser_process_id"], 202)
+        self.assertIn("recorded process", related[0]["_log"]["auto_reason"])
+        self.assertTrue(related[0]["_log"]["run"].endswith("@current"))
+
+    def test_vulkan_ambiguous_handle_owners_are_reported_without_asserted_provenance(self):
+        common = {"event": "firefox.workspace.memory_import", "browser_process_id": 202,
+                  "vk_device": "0x10", "vk_image": "0x1abc", "workspace_allocation": 34,
+                  "source": "00000000000000010000000000000002"}
+        conflicts = (
+            {"browser_process_id": 303}, {"vk_device": "0x11"}, {"workspace_allocation": 35},
+            {"source": "00000000000000010000000000000003"},
+        )
+        for conflict in conflicts:
+            with self.subTest(conflict=conflict):
+                self.write("vulkan.log", json.dumps(common) + "\n" + vulkan_message()
+                           + json.dumps({**common, **conflict}) + "\n")
+                status, rows, diagnostics = self.exported(
+                    "vulkan.log", "-q", "@event=vulkan.validation", "--auto-correlate")
+                self.assertEqual(status, 0, diagnostics)
+                self.assertEqual(len(rows), 1)
+                self.assertIn("conflicting recorded process/device/source/allocation", diagnostics)
+
     def automatic_fixture(self, progress=0):
         self.write("build/validation/auto.jsonl", [
             {"event": "explore.frame.published", "owner": "explore", "source_session": 1,
@@ -638,6 +1130,30 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("presentation_revision=11", output)
         self.assertNotIn("presentation.pixel", output)
         self.assertIn("cross-clock times remain unaligned", diagnostics)
+
+    def test_upscale_settlement_joins_native_frontier_without_inventing_presentation_match(self):
+        self.write("input.jsonl", [
+            {"event": "upscale.frame.published", "owner": "upscale", "source_revision": 30},
+            {"event": "presentation.frame.edge", "presentation_revision": 336, "source_revision": 28},
+            {"event": "integration.upscale_settlement", "control": "explore.detail.upscale.basic",
+             "detail": "blocked=sampleable_presentation_mismatch", "a": "104", "b": "30", "c": "336", "d": "337"},
+        ])
+        _, rows, _ = self.exported("input.jsonl", "-q", "@event=integration.upscale_settlement", "--auto-correlate")
+        self.assertEqual({row["data"]["event"] for row in rows},
+                         {"integration.upscale_settlement", "upscale.frame.published"})
+
+    def test_timeline_failure_highlights_show_reason_original_event_and_provenance(self):
+        self.write("input.jsonl", [{
+            "event": "acceptance.atlas_draw.failed", "reason": "draw_source_facts_mismatch",
+            "observed_event": "iced.surface.draw_encoded", "observed_file": "firefox.log", "observed_line": 82,
+            "audit_context": {"field": "rows", "expected": 4}, "rows": 3,
+        }])
+        status, output, diagnostics = self.run_query(
+            "input.jsonl", "-q", "@event=acceptance.atlas_draw.failed", "--format", "timeline")
+        self.assertEqual(status, 0, diagnostics)
+        for fact in ("draw_source_facts_mismatch", "iced.surface.draw_encoded", "firefox.log", "observed_line=82",
+                     "audit_context.field=rows"):
+            self.assertIn(fact, output)
 
     def test_automatic_machine_formats_require_opt_in_and_preserve_query_rows(self):
         arguments = self.automatic_fixture()
@@ -932,6 +1448,179 @@ class FileQueryTests(unittest.TestCase):
         _, rows, _ = self.exported("input.jsonl", "-q", "event=seed",
                                    "--correlate", "source_session+source_instance")
         self.assertEqual({item["data"]["event"] for item in rows}, {"seed", "same"})
+
+    def test_memory_provenance_query_exposes_export_mapping_and_import_without_fd_identity_claim(self):
+        native = {"native_process_id": 101, "workspace_descriptor": 9, "workspace_plane": 4096}
+        browser = {"browser_process_id": 202, "vk_device": "0x10", "vk_image": "0x20"}
+        metadata = {"fd_stat_status": 0, "fd_dev": 1, "fd_ino": 2,
+                    "fd_identity_scope": "metadata_only_not_gpu_allocation_identity"}
+        self.write("build/validation/memory-native.log", [
+            {"event": "cuda.workspace.memory_export", **native, **metadata,
+             "cuda_export_allocation": 55, "cuda_mapped_allocation": 56,
+             "cuda_mapping_matches_export": False, "memory_size": 2097152, "row_pitch": 3584},
+            {"event": "gpu.workspace.memory_export", **native, "workspace_allocation": 34},
+            {"event": "cuda.workspace.memory_export", **native, **metadata, "native_process_id": 303},
+            {"event": "cuda.workspace.memory_export", **native, **metadata, "workspace_plane": 8192},
+        ])
+        self.write("build/validation/memory-firefox.log", [
+            {"event": "firefox.workspace.image_created", **browser, "image_tiling": "LINEAR",
+             "image_usage": 5, "requirements_alignment": 256},
+            {"event": "firefox.workspace.memory_import", **browser, **metadata,
+             "workspace_allocation": 34, "workspace_descriptor": 77, "row_pitch": 3584},
+            {"event": "firefox.workspace.memory_bound", **browser, "workspace_allocation": 34,
+             "vk_memory": "0x30", "image_binding_offset": 0, "fd_consumed": True},
+            {"event": "firefox.workspace.image_created", **browser, "browser_process_id": 303},
+        ])
+        arguments = ("--family", "memory", "-q", "workspace_allocation=34",
+                     "--correlate", "native_process_id+workspace_descriptor+workspace_plane",
+                     "--correlate", "browser_process_id+vk_device+vk_image", "--limit", "8")
+        status, rows, diagnostics = self.exported(*arguments)
+        self.assertEqual(status, 0, diagnostics)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual(sum(item["_log"]["match"] == "correlated" for item in rows), 2)
+        self.assertEqual({item["data"]["event"] for item in rows}, {
+            "cuda.workspace.memory_export", "gpu.workspace.memory_export",
+            "firefox.workspace.image_created", "firefox.workspace.memory_import", "firefox.workspace.memory_bound",
+        })
+        status, output, diagnostics = self.run_query(*arguments, "--format", "timeline")
+        self.assertEqual(status, 0, diagnostics)
+        for fact in ("cuda_export_allocation=55", "cuda_mapped_allocation=56",
+                     "cuda_mapping_matches_export=false", "fd_ino=2", "image_tiling=LINEAR",
+                     "image_binding_offset=0", "metadata_only_not_gpu_allocation_identity"):
+            self.assertIn(fact, output)
+
+    def descriptor_lineage_fixture(self, mutate=None):
+        source = "00000000000000010000000000000002"
+        arena = "00000000000000030000000000000004"
+        metadata = {"fd_getfd_result": 1, "fd_getfd_errno": 0, "fd_stat_status": 0,
+                    "fd_dev": 1, "fd_ino": 2, "fd_rdev": 3, "fd_mode": 8630, "fd_size": 0}
+        exported = {"native_process_id": 101, "workspace_descriptor": 9, "workspace_plane": 4096}
+        transport = {"source": source, "surface": arena, "workspace_allocation": 34,
+                     "native_process_id": 101, "browser_process_id": 202, "peer_credentials_known": True,
+                     "descriptor_count": 4, "memory_descriptor_index": 0, "record_bytes": 256}
+        imported = {"source": source, "surface": arena, "workspace_allocation": 34,
+                    "browser_process_id": 202, "vk_device": "0x10", "vk_image": "0x20"}
+        native = [
+            {"event": "cuda.workspace.memory_export", **exported, **metadata, "cuda_mapping_matches_export": True},
+            {"event": "gpu.workspace.memory_export", **exported, "workspace_allocation": 34},
+            {"event": "presentation.workspace.descriptor_duplicated", **transport, **metadata,
+             "workspace_descriptor": 19, "export_descriptor": 9,
+             "fd_ofd_status": "same", "fd_ofd_query": "F_DUPFD_QUERY", "fd_ofd_result": 1, "fd_ofd_errno": 0},
+            {"event": "presentation.workspace.descriptor_sent", **transport, **metadata,
+             "workspace_descriptor": 19, "send_bytes": 256, "send_errno": 0},
+        ]
+        browser = [
+            {"event": "firefox.workspace.descriptor_received", **transport, **metadata, "workspace_descriptor": 77},
+            {"event": "firefox.workspace.descriptor_claimed", **transport, **metadata, "workspace_descriptor": 77},
+            {"event": "firefox.workspace.memory_import", **imported, **metadata, "workspace_descriptor": 77},
+            {"event": "firefox.workspace.memory_allocation", **imported, "workspace_descriptor": 77,
+             "vk_memory": "0x30", "vk_allocate_status": 0, "fd_consumed": True,
+             "fd_observation": "allocate_argument_not_post_consumption_query"},
+            {"event": "firefox.workspace.memory_bound", **imported, "vk_memory": "0x30", "fd_consumed": True},
+        ]
+        if mutate:
+            mutate(native, browser)
+        self.write("build/validation/lineage-native.log", native)
+        self.write("build/validation/lineage-firefox.log", browser)
+        return ("--family", "lineage", "-q", "workspace_allocation=34", "--descriptor-lineage", "--limit", "32")
+
+    def test_descriptor_lineage_joins_exact_source_and_process_scoped_exports(self):
+        def unrelated(native, browser):
+            native.append({**native[0], "native_process_id": 303})
+            native.append({**native[0], "workspace_plane": 8192})
+            browser.append({**browser[-1], "workspace_allocation": 99, "vk_image": "0x99"})
+        arguments = self.descriptor_lineage_fixture(unrelated)
+        status, rows, report = self.exported(*arguments)
+        self.assertEqual(status, 0, report)
+        self.assertEqual(len(rows), 9)
+        self.assertIn("native_pid=101 browser_pid=202", report)
+        self.assertIn("duplicated(fd=19)[export_fd=9,ofd=same]", report)
+        self.assertIn("received(fd=77)", report)
+        self.assertIn("allocation(fd=77)[status=0,consumed=true]", report)
+        self.assertIn("conflicts: none observed in retained evidence", report)
+        self.assertNotIn("(missing)", report)
+        self.assertIn("not independent OFD/payload comparisons", report)
+        status, output, _ = self.run_query(*arguments, "--format", "timeline")
+        self.assertEqual(status, 0)
+        for value in ("export_descriptor=9", "fd_ofd_query=F_DUPFD_QUERY", "fd_ofd_result=1", "vk_allocate_status=0"):
+            self.assertIn(value, output)
+
+    def test_descriptor_lineage_distinguishes_ofd_mismatch_unsupported_denied_and_unavailable(self):
+        for status, result, error in (("different", 0, 0), ("unsupported", -1, 22),
+                                      ("denied", -1, 1), ("invalid_descriptor", -1, 9), ("unavailable", -1, 4)):
+            with self.subTest(status=status):
+                def change(native, browser):
+                    native[2].update(fd_ofd_status=status, fd_ofd_result=result, fd_ofd_errno=error)
+                _, _, report = self.exported(*self.descriptor_lineage_fixture(change))
+                self.assertIn(f"native duplicate OFD comparison: {status}", report)
+                if status in ("different", "invalid_descriptor"):
+                    self.assertNotIn("conflicts: none observed", report)
+                else:
+                    self.assertIn("conflicts: none observed in retained evidence", report)
+                    self.assertIn("unavailable: native duplicate OFD comparison:", report)
+
+    def test_descriptor_lineage_reports_fd_reuse_closed_fd_process_and_binding_conflicts(self):
+        def change(native, browser):
+            native[2]["export_descriptor"] = 10
+            native[3]["workspace_descriptor"] = 20
+            browser[1]["workspace_descriptor"] = 78
+            browser[2].update(fd_getfd_result=-1, fd_getfd_errno=9)
+            browser[3].update(vk_allocate_status=-2, fd_consumed=False)
+            browser[4].update(browser_process_id=303, vk_memory="0x40", workspace_allocation=35)
+        _, _, report = self.exported(*self.descriptor_lineage_fixture(change),
+                                     "-q", 'source="00000000000000010000000000000002" OR workspace_allocation=34')
+        for text in ("workspace_descriptor differs", "browser_process_id differs", "workspace_allocation differs",
+                     "import fd_getfd_result=-1 errno=9", "vkAllocateMemory status=-2 fd_consumed=false", "vk_memory differs"):
+            self.assertIn(text, report)
+        # Contradictory allocation ownership prevents selecting any CUDA export.
+        self.assertIn("cuda_export(missing)", report)
+
+    def test_descriptor_lineage_checks_native_export_argument_without_metadata_identity_inference(self):
+        def change(native, browser):
+            native[2]["export_descriptor"] = 10
+        _, _, report = self.exported(*self.descriptor_lineage_fixture(change))
+        self.assertIn("workspace export FD differs from the native duplication argument", report)
+        self.assertIn("Equal FD integers or fstat metadata never prove payload identity", report)
+
+    def test_descriptor_lineage_rejects_ambiguous_reused_export_reference(self):
+        def change(native, browser):
+            native.append({**native[0], "cuda_mapping_matches_export": False})
+        _, _, report = self.exported(*self.descriptor_lineage_fixture(change))
+        self.assertIn("ambiguous CUDA export association", report)
+        self.assertIn("cuda_export(missing)", report)
+        self.assertNotIn("CUDA mapping differs", report)
+
+    def test_descriptor_lineage_limits_and_where_remain_evidence_limits(self):
+        arguments = self.descriptor_lineage_fixture()
+        _, rows, report = self.exported(*arguments, "--where", "NOT @event=presentation.workspace.descriptor_sent")
+        self.assertEqual(len(rows), 8)
+        self.assertIn("sent(missing)", report)
+        self.assertIn("conflicts: none observed in retained evidence", report)
+        _, rows, report = self.exported(*arguments, "--limit", "1")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("retained physical rows only", report)
+        self.assertIn("(missing)", report)
+        status, _, report = self.run_query("--descriptor-lineage")
+        self.assertEqual(status, 2)
+        self.assertIn("requires --query", report)
+
+    def test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits(self):
+        path = "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.580.42.09"
+        self.write("libraries.log", [
+            {"event": "firefox.workspace.loaded_library", "browser_process_id": 202,
+             "library_path": path, "library_provenance": "proc_self_maps_at_first_memory_import"},
+            {"event": "firefox.workspace.library_inventory", "browser_process_id": 202,
+             "inventory_status": "partial", "inventory_errno": 0, "inventory_bounded": True,
+             "library_count": 1, "maps_bytes": 1048576, "maps_byte_limit": 1048576},
+            {"event": "cuda.workspace.library_inventory", "native_process_id": 101,
+             "inventory_status": "unavailable", "inventory_errno": 13, "library_count": 0},
+        ])
+        status, output, diagnostics = self.run_query("libraries.log", "-q",
+            "@event:loaded_library OR @event:library_inventory", "--format", "timeline")
+        self.assertEqual(status, 0, diagnostics)
+        for fact in (path, "browser_process_id=202", "native_process_id=101", "inventory_status=partial",
+                     "inventory_errno=13", "maps_byte_limit=1048576"):
+            self.assertIn(fact, output)
 
     def test_surface_correlates_native_and_firefox_and_where_scopes_all_rows(self):
         self.write("native.jsonl", [{"event": "native.ready", "surface_high": 1, "surface_low": 2}])

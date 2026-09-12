@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <concepts>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -44,6 +46,7 @@ int main(const int argument_count, char* const* const arguments) {
     using SettingsEvent = ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::settings, SettingsChanged>;
     Bootstrap bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words, .snapshots = {}};
     bool snapshots_valid = true;
+    std::optional<wire::Value> named_annotation_reference;
     ApplicationSchema<ApplicationSystems>::VisitSnapshotDefaults([&]<class Cell, class Snapshot>(Snapshot snapshot) {
         if constexpr (requires { typename Cell::type::visual_source; }) {
             using Projection = typename Cell::type::visual_source;
@@ -56,14 +59,67 @@ int main(const int argument_count, char* const* const arguments) {
                 std::numeric_limits<std::uint64_t>::max() - session;
             snapshots_valid = snapshots_valid && visual_clean_content_identity(frame).revision == 43U;
         }
-        auto encoded = mmltk::frameworks::serialization::reflected_value(snapshot);
+        if constexpr (std::same_as<Snapshot, AnnotationSnapshot>) {
+            auto& scene = snapshot.ui.scene;
+            scene.document = contracts::WorkspaceResource::From("annotation-codec-fixture", 1U);
+            scene.frame_width = 32U;
+            scene.frame_height = 24U;
+            scene.frame_ready = true;
+            scene.categories = {{.value = "fixture"}};
+            scene.palette = {{.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F}};
+            const contracts::AnnotationPoint point{1.234567F, 2.345678F};
+            contracts::AnnotationObject object{
+                .name = contracts::AnnotationText::From(std::string(contracts::kAnnotationNameCapacity, 'n')),
+                .shape = contracts::AnnotationShape::Box,
+                .box = {point, point},
+                .point = point,
+                .mask = {.runs = {{1U, 2U, 3U}}, .cleanup_radius = 17U, .present = true},
+                .sup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
+                .nosup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
+                .mask_points = std::vector<contracts::AnnotationPoint>(contracts::kAnnotationGeometryCapacity, point),
+                .spline_knots = std::vector<contracts::AnnotationSplineKnot>(
+                    contracts::kAnnotationGeometryCapacity,
+                    {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
+                .skeleton_nodes = std::vector<contracts::AnnotationSkeletonNode>(
+                    contracts::kAnnotationGeometryCapacity,
+                    {.key = contracts::AnnotationText::From(std::string(contracts::kAnnotationNameCapacity, 'k')), .point = point}),
+                .skeleton_edges = std::vector<contracts::AnnotationEdge>(contracts::kAnnotationGeometryCapacity,
+                                                                        {.source = 6U, .target = 7U}),
+            };
+            scene.objects = {object};
+            snapshot.ui.editor.selected_object = 0U;
+            auto displayed = scene;
+            displayed.objects.front().shape = contracts::AnnotationShape::Skeleton;
+            displayed.objects.front().skeleton_nodes.back().point.x += 0.12345F;
+            snapshot.rendered_scene.document_epoch = 2U;
+            snapshot.rendered_scene.scene_revision = 3U;
+            contracts::project_annotation_geometry(snapshot.rendered_scene.geometry, displayed);
+            snapshot.rendered_scene.identities = {47U};
+            snapshot.rendered.document_epoch = 2U;
+            snapshot.rendered.scene_revision = 3U;
+            snapshot.rendered.editor = snapshot.ui.editor;
+            snapshot.rendered.selected_identity = contracts::AnnotationObjectIdentity{
+                .object = 47U, .elements = std::vector<std::uint64_t>(contracts::kAnnotationGeometryCapacity, 59U)};
+            snapshot.rendered.selected.emplace();
+            contracts::project_annotation_geometry(*snapshot.rendered.selected, displayed.objects.front());
+            snapshot.rendered.preview.emplace();
+            contracts::project_annotation_geometry(*snapshot.rendered.preview, object);
+            snapshot.rendered.preview_object = 0U;
+            auto reference = mmltk::frameworks::serialization::reflected_value(snapshot);
+            if (!reference) {
+                snapshots_valid = false;
+                return;
+            }
+            named_annotation_reference = std::move(*reference);
+        }
+        auto encoded = mmltk::frameworks::serialization::reflected_transport_value(snapshot);
         if (!encoded) {
             snapshots_valid = false;
             return;
         }
         bootstrap.snapshots.push_back({.system_id = Cell::stable_id, .value = std::move(*encoded)});
     });
-    if (!snapshots_valid) return EXIT_FAILURE;
+    if (!snapshots_valid || !named_annotation_reference) return EXIT_FAILURE;
     std::uint64_t dialog_id = 0U;
     ApplicationSchema<ApplicationSystems>::VisitApplicationSettingsLeaves(
         [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) {
@@ -81,15 +137,15 @@ int main(const int argument_count, char* const* const arguments) {
                 .path = "/tmp/protocol-v16-fixture",
             },
     };
-    auto cancelled_reply = mmltk::frameworks::serialization::reflected_value(FileDialogSnapshot{
+    auto cancelled_reply = mmltk::frameworks::serialization::reflected_transport_value(FileDialogSnapshot{
         .target = services::FileDialogTarget{services::SettingsFieldTarget{dialog_id}},
         .selection = cancelled,
     });
-    auto selected_reply = mmltk::frameworks::serialization::reflected_value(FileDialogSnapshot{
+    auto selected_reply = mmltk::frameworks::serialization::reflected_transport_value(FileDialogSnapshot{
         .target = services::FileDialogTarget{services::SettingsFieldTarget{dialog_id}},
         .selection = selected,
     });
-    auto event = mmltk::frameworks::serialization::reflected_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
+    auto event = mmltk::frameworks::serialization::reflected_transport_value(SettingsChanged{.snapshot = contracts::SettingsUiState{}});
     if (!cancelled_reply || !selected_reply || !event) return EXIT_FAILURE;
     bootstrap.input_epoch = 1U;
     std::vector<ServerRecord> records{
@@ -117,6 +173,10 @@ int main(const int argument_count, char* const* const arguments) {
                       .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
+    // An independent named persistence projection is test data, carried as a
+    // dynamic value. The client compares every decoded transport field against
+    // it through the separate named codec, without a handwritten field mirror.
+    records.emplace_back(IntentReply{.correlation = 19U, .result = std::move(*named_annotation_reference)});
     using ControlKind = contracts::IntegrationControlKind;
     contracts::visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
         if constexpr (Policy.server && Kind != ControlKind::Advance) {

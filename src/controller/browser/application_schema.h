@@ -1567,6 +1567,7 @@ template <class Composition>
         if (!inserted) throw std::logic_error("application stable identity collision between " + prior->second + " and " + source);
     };
     sink.append_number(kBrowserProtocolVersion);
+    sink.append("positional-output-objects-v1");
     sink.append("compact-numeric-interactions");
     application_schema_detail::append_type<CompactInteraction>(sink);
     visit_interaction_opcodes<Composition>([&]<class Endpoint>(const auto opcode) {

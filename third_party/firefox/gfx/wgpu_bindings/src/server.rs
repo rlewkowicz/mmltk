@@ -1166,6 +1166,15 @@ pub struct VkImageHandle {
     pub layouts: Vec<vk::SubresourceLayout>,
 }
 
+// Shared canvas textures support rendering and the copies used by WebGPU
+// initialization and canvas readback. The exported allocation and its imported
+// image must negotiate the same usages.
+const SHARED_CANVAS_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from_raw(
+    vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
+);
+
 impl VkImageHandle {
     fn destroy(&self, global: &Global, device_id: id::DeviceId) {
         unsafe {
@@ -1234,8 +1243,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             &mut format_properties_2,
         );
 
-        let mut usage_flags = vk::ImageUsageFlags::empty();
-        usage_flags |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        let usage_flags = SHARED_CANVAS_IMAGE_USAGE;
 
         modifier_props.retain(|modifier_prop| {
             is_dmabuf_supported(
@@ -1777,6 +1785,7 @@ struct MmltkWorkspaceImage {
     device: ash::Device,
     image: vk::Image,
     memory: vk::DeviceMemory,
+    direct_memory: Option<Box<MmltkWorkspaceDirectMemoryFacts>>,
     _device_custody: Arc<dyn std::any::Any + Send + Sync>,
 }
 
@@ -1788,6 +1797,45 @@ impl Drop for MmltkWorkspaceImage {
                 self.device.free_memory(self.memory, None);
             }
         }
+    }
+}
+
+// Opt-in facts of the exact import. A buffer alias cannot provide defined
+// content after this image's external ownership acquire, even in GENERAL.
+// Keep the reason and allocation context without creating or reading an alias.
+struct MmltkWorkspaceDirectMemoryFacts {
+    layout: mmltk_workspace_channel::Record,
+    memory_type_index: u32,
+}
+
+impl MmltkWorkspaceDirectMemoryFacts {
+    fn new(image: vk::Image, memory: vk::DeviceMemory, memory_type_index: u32,
+           layout: mmltk_workspace_channel::Record) -> Self {
+        let facts = Self { layout, memory_type_index };
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            let source = mmltk_workspace_channel::SurfaceId { high: layout.id_high, low: layout.id_low };
+            let surface = mmltk_workspace_channel::SurfaceId { high: layout.arena_high, low: layout.arena_low };
+            write!(line, "{{\"event\":\"firefox.workspace.direct_memory_alias\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"reason\":\"{}\"",
+                facts.reason())?;
+            facts.write_fields(line, image, memory)?;
+            write!(line, "}}")
+        });
+        facts
+    }
+
+    fn reason(&self) -> &'static str {
+        if self.layout.dedicated != 0 {
+            "dedicated_image_allocation"
+        } else {
+            "image_ownership_transfer_invalidates_buffer_alias"
+        }
+    }
+
+    fn write_fields(&self, line: &mut String, image: vk::Image, memory: vk::DeviceMemory) -> std::fmt::Result {
+        write!(line, ",\"workspace_allocation\":{},\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"memory_alias_supported\":false,\"memory_type_index\":{},\"dedicated\":{},\"memory_size\":{},\"image_offset\":{},\"row_pitch\":{},\"capacity_width\":{},\"capacity_height\":{}",
+            self.layout.allocation_identity, self.memory_type_index,
+            self.layout.dedicated, self.layout.size, self.layout.offset, self.layout.stride,
+            self.layout.width, self.layout.height)
     }
 }
 
@@ -2355,7 +2403,24 @@ fn submit_mmltk_workspace_transfer(
     let release = snapshot.timeline_ready.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
     let copy_slot = identity.copy_index(slot);
     let direct = arena.layout.direct_sampling != 0;
-    let mut pixels = if !direct && entry.blit.pixels.is_some() {
+    let mut pixels = if direct && entry.blit.pixels.is_some()
+        && snapshot.content_width != 0 && snapshot.content_height != 0
+        && snapshot.content_width <= entry.blit.extent.width && snapshot.content_height <= entry.blit.extent.height {
+        let receipt = MmltkWorkspacePixelReceipt {
+            snapshot,
+            coordinates: std::array::from_fn(|index| (
+                MmltkWorkspacePixels::coordinate(index % 5, snapshot.content_width),
+                MmltkWorkspacePixels::coordinate(index / 5, snapshot.content_height),
+            )),
+            copy_index: 0,
+            release: 0,
+        };
+        match entry.blit.record_direct_probe(&receipt.coordinates) {
+            Ok(()) => Some(receipt),
+            Err(vk::Result::ERROR_DEVICE_LOST) => return Err(vk::Result::ERROR_DEVICE_LOST),
+            Err(_) => None,
+        }
+    } else if !direct && entry.blit.pixels.is_some() {
         if let Some(slot) = copy_slot {
             let extent = entry.blit.extent;
             if snapshot.content_width == 0 || snapshot.content_height == 0
@@ -2394,7 +2459,9 @@ fn submit_mmltk_workspace_transfer(
             }
         } else { None }
     } else { None };
-    let command = if direct { entry.blit.copy_commands[0] } else {
+    let command = if direct {
+        pixels.as_ref().map_or(entry.blit.copy_commands[0], |_| entry.blit.pixels.as_ref().unwrap().commands[0])
+    } else {
         pixels.as_ref().map(|_| entry.blit.pixels.as_ref().unwrap().commands[slot as usize])
             .unwrap_or(entry.blit.copy_commands[slot as usize])
     };
@@ -2406,30 +2473,38 @@ fn submit_mmltk_workspace_transfer(
         mmltk_workspace_channel::cancel_acquisition(entry.surface_id);
         return Ok(false);
     };
+    entry.blit.trace_binding("acquire_submit_started", &arena, entry.surface_id, &entry.frame_signal,
+        Some(snapshot), None, true);
     let submitted = match entry.blit.submission().acquire_completed(snapshot.timeline_ready, command,
         (!direct).then_some(slot as usize)) {
         Ok(submitted) => submitted,
         Err(error) => {
+            entry.blit.trace_binding("acquire_submit_failed", &arena, entry.surface_id, &entry.frame_signal,
+                Some(snapshot), None, false);
             entry.frame_signal.abandon_acquisition();
             mmltk_workspace_channel::cancel_acquisition(entry.surface_id);
             return Err(error);
         }
     };
+    entry.blit.trace_binding("acquire_submitted", &arena, entry.surface_id, &entry.frame_signal,
+        Some(snapshot), None, true);
     entry.next_transfer_sequence = next_transfer;
     if let Some(receipt) = pixels.as_mut() {
         receipt.release = release;
     }
-    if let (Some(probe), Some(slot)) = (entry.blit.pixels.as_mut(), copy_slot) {
+    if let (false, Some(probe), Some(slot)) = (direct, entry.blit.pixels.as_mut(), copy_slot) {
         // Track every use, including a copy whose diagnostic receipt was
         // dropped. A later free-slot admission can recover without polling.
         probe.submitted_release[slot] = release;
     }
     let receipt = MmltkWorkspaceMailboxReceipt { identity, pixels };
     entry.physical_read = Some(MmltkWorkspacePhysicalReceipt { access, slot, snapshot, frame: receipt });
-    // Native release waiting is armed only after a real GPU read submission.
-    // Failed command preparation or a lost acquisition never creates a wait
-    // for an even timeline value that no queue can signal.
+    // Acquisition retains CPU custody. Copy submission also contains the
+    // final release; direct sampling retains the read until ReleaseSlot.
     if !mmltk_workspace_channel::submit_acquisition(entry.surface_id) {
+        return Err(vk::Result::ERROR_UNKNOWN);
+    }
+    if !direct && !mmltk_workspace_channel::submit_release(entry.surface_id) {
         return Err(vk::Result::ERROR_UNKNOWN);
     }
     if !mailboxes.occupy(receipt, slot) {
@@ -2444,8 +2519,9 @@ fn submit_mmltk_workspace_transfer(
         identity.presentation_revision,
     );
     if mmltk_workspace_acceptance_trace_enabled() {
-        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"source\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{},\"direct_sampling\":{}}}",
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            write!(line,
+            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"source\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{},\"direct_sampling\":{}",
             entry.surface_id,
             arena.surface_id,
             identity.layer,
@@ -2458,8 +2534,12 @@ fn submit_mmltk_workspace_transfer(
             snapshot.transfer_sequence,
             submitted.ready(),
             submitted.ready() + 1,
-            pixels.is_some(), direct
-        ));
+            pixels.is_some(), direct)?;
+            if let Some(facts) = &entry.blit.storage.direct_memory {
+                facts.write_fields(line, entry.blit.storage.image, entry.blit.storage.memory)?;
+            }
+            write!(line, "}}")
+        });
     }
     unsafe {
         wgpu_parent_external_texture_frame_ready(
@@ -2686,7 +2766,11 @@ fn service_mmltk_workspace_admissions(
         let frame = receipt.frame;
         if let (Some(pixels), Some(probe)) = (frame.pixels, &entry.blit.pixels) {
             let completed = entry.blit.submission().submitted_release_complete(pixels.release);
-            probe.report(source, arena.surface_id, frame.identity, slot, pixels, completed);
+            if entry.blit.direct {
+                probe.report_direct(source, arena.surface_id, frame.identity, slot, pixels, completed, &entry.blit.storage);
+            } else {
+                probe.report(source, arena.surface_id, frame.identity, slot, pixels, completed);
+            }
         }
         unsafe { wgpu_parent_external_texture_frame_ready(shared.owner, arena.device_id,
             arena.surface_id.high, arena.surface_id.low, 0, slot, session, sequence, revision,
@@ -2829,9 +2913,16 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             let duplicate = !arenas.contains_key(&arena.surface_id)
                                 || surface_frames.contains_key(&surface_id)
                                 || entries.contains_key(&frame_fd);
+                            let cancelled = arena.closed.load(Ordering::Acquire);
                             drop(entries);
                             drop(arenas);
-                            let failed = duplicate || blit.initialize().is_err()
+                            blit.trace_binding("attached", &arena, surface_id, &frame_signal, None, None, !cancelled && !duplicate);
+                            let failed = cancelled || duplicate || {
+                                    blit.trace_binding("initialization_started", &arena, surface_id, &frame_signal, None, None, true);
+                                    let result = blit.initialize();
+                                    blit.trace_binding("initialization_completed", &arena, surface_id, &frame_signal, None, None, result.is_ok());
+                                    result.is_err()
+                                }
                                 || (if blit.direct {
                                     blit.record_acquire().is_err()
                                 } else {
@@ -2851,7 +2942,9 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             entries = shared.entries.lock().unwrap();
                             if failed {
                                 retired_blits.push(blit);
-                                mmltk_workspace_channel::send_failed(surface_id, mmltk_workspace_channel::FAILED_IMPORT, 0, 0);
+                                mmltk_workspace_channel::send_failed(surface_id,
+                                    if cancelled { mmltk_workspace_channel::FAILED_NOT_ADMITTED }
+                                    else { mmltk_workspace_channel::FAILED_IMPORT }, 0, 0);
                             } else {
                                 surface_frames.insert(surface_id, frame_fd);
                                 entries.insert(
@@ -2893,6 +2986,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                             receipt.slot == slot && receipt.frame.identity == identity) {
                                             let ready = receipt.snapshot.timeline_ready;
                                             if entry.blit.submission().release_acquired(ready).is_err() {
+                                                mmltk_workspace_channel::fail();
+                                            } else if !mmltk_workspace_channel::submit_release(entry.surface_id) {
                                                 mmltk_workspace_channel::fail();
                                             }
                                         }
@@ -3152,9 +3247,9 @@ fn mmltk_workspace_initial_transitions(
     (
         [
             MmltkWorkspaceImageTransition {
-                src_access: vk::AccessFlags::empty(),
+                src_access: vk::AccessFlags::MEMORY_WRITE,
                 dst_access: vk::AccessFlags::empty(),
-                old_layout: vk::ImageLayout::UNDEFINED,
+                old_layout: vk::ImageLayout::GENERAL,
                 new_layout: vk::ImageLayout::GENERAL,
                 src_queue_family: queue_family,
                 dst_queue_family: vk::QUEUE_FAMILY_EXTERNAL,
@@ -3485,6 +3580,7 @@ mod mmltk_workspace_transition_tests {
 }
 
 // Fixed receiver-owned evidence for the imported source and completed mailbox.
+// Direct sampling reads 25 image pixels without a mailbox image.
 // Commands and coherent mappings are reused for the lifetime of the import.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MmltkWorkspaceProbeFailure { Allocation, Reset, Begin, End }
@@ -3502,6 +3598,7 @@ struct MmltkWorkspacePixels {
 impl MmltkWorkspacePixels {
     const SAMPLES: usize = 25;
     const SLOT_BYTES: usize = (Self::SAMPLES * 2 + 1) * 4;
+    const DIRECT_BYTES: usize = (Self::SAMPLES + 1) * 4;
     const COMPLETED_MARKER: u32 = 0x4d4d4c54;
 
     fn check_failure(boundary: MmltkWorkspaceProbeFailure) -> Result<(), vk::Result> {
@@ -3544,6 +3641,10 @@ impl MmltkWorkspacePixels {
 
     fn new(hal: &wgh::vulkan::Device) -> Result<Self, vk::Result> {
         Self::check_failure(MmltkWorkspaceProbeFailure::Allocation)?;
+        Self::allocate(hal, MMLTK_WORKSPACE_MAILBOX_COUNT, Self::SLOT_BYTES)
+    }
+
+    fn allocate(hal: &wgh::vulkan::Device, slots: usize, slot_bytes: usize) -> Result<Self, vk::Result> {
         let device = hal.raw_device();
         let mut probe = Self {
             device: device.clone(), buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(),
@@ -3555,9 +3656,9 @@ impl MmltkWorkspacePixels {
             .queue_family_index(hal.queue_family_index()), None) }?;
         probe.commands = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
             .command_pool(probe.pool).level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(MMLTK_WORKSPACE_MAILBOX_COUNT as u32)) }?;
+            .command_buffer_count(slots as u32)) }?;
         probe.buffer = unsafe { device.create_buffer(&vk::BufferCreateInfo::default()
-            .size((Self::SLOT_BYTES * MMLTK_WORKSPACE_MAILBOX_COUNT) as u64)
+            .size((slot_bytes * slots) as u64)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE), None) }?;
         let requirements = unsafe { device.get_buffer_memory_requirements(probe.buffer) };
@@ -3619,6 +3720,36 @@ impl MmltkWorkspacePixels {
             ));
         }
     }
+
+    fn report_direct(&self, source: mmltk_workspace_channel::SurfaceId,
+                     surface: mmltk_workspace_channel::SurfaceId, identity: MmltkWorkspaceFrameIdentity,
+                     slot: u32, receipt: MmltkWorkspacePixelReceipt, completed: Result<bool, vk::Result>,
+                     storage: &MmltkWorkspaceImage) {
+        let samples = unsafe { std::slice::from_raw_parts(self.mapped as *const u32, Self::SAMPLES + 1) };
+        for (index, rgba) in samples[..Self::SAMPLES].iter().enumerate() {
+            mmltk_workspace_channel::write_diagnostic(|line| {
+                write!(line,
+                    "{{\"event\":\"firefox.workspace.direct_pixel\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"sample_index\":{index},\"sample_x\":{},\"sample_y\":{},\"sample_rgba\":{rgba},\"completion\":\"{completed:?}\",\"readback_marker\":{},\"expected_marker\":{}",
+                    identity.layer, slot, identity.session, identity.sequence, identity.presentation_revision,
+                    receipt.snapshot.content_width, receipt.snapshot.content_height, receipt.snapshot.transfer_sequence,
+                    receipt.snapshot.timeline_ready, receipt.release, receipt.coordinates[index].0, receipt.coordinates[index].1,
+                    samples[Self::SAMPLES], Self::COMPLETED_MARKER)?;
+                if let Some(facts) = &storage.direct_memory {
+                    facts.write_fields(line, storage.image, storage.memory)?;
+                }
+                write!(line, "}}")
+            });
+        }
+        if let Some(facts) = &storage.direct_memory {
+            mmltk_workspace_channel::write_diagnostic(|line| {
+                write!(line, "{{\"event\":\"firefox.workspace.direct_memory_status\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"completion\":\"{completed:?}\",\"reason\":\"{}\"",
+                    identity.layer, slot, identity.session, identity.sequence, identity.presentation_revision,
+                    receipt.snapshot.transfer_sequence, receipt.snapshot.timeline_ready, receipt.release, facts.reason())?;
+                facts.write_fields(line, storage.image, storage.memory)?;
+                write!(line, "}}")
+            });
+        }
+    }
 }
 
 impl Drop for MmltkWorkspacePixels {
@@ -3655,6 +3786,21 @@ struct MmltkWorkspaceBlit {
 }
 
 impl MmltkWorkspaceBlit {
+    fn trace_binding(&self, phase: &str, arena: &MmltkWorkspaceArena,
+        source: mmltk_workspace_channel::SurfaceId, signal: &MmltkWorkspaceFrameSignal,
+        snapshot: Option<MmltkWorkspaceFrameSnapshot>, texture: Option<id::TextureId>, outcome: bool) {
+        if !self.direct || !mmltk_workspace_acceptance_trace_enabled() { return; }
+        // Allocation identity is immutable for the lifetime of this mapping.
+        let allocation = unsafe { (*signal.access).allocation_identity };
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.workspace.direct_binding\",\"phase\":\"{}\",\"source\":\"{}\",\"surface\":\"{}\",\"workspace_allocation\":{},\"device_id\":\"{:?}\",\"vk_device\":\"{:?}\",\"vk_queue\":\"{:?}\",\"queue_family\":{},\"vk_image\":\"{:?}\",\"storage_image\":\"{:?}\",\"vk_memory\":\"{:?}\",\"vk_semaphore\":\"{:?}\",\"texture_id\":\"{:?}\",\"chosen_layout\":\"GENERAL\",\"width\":{},\"height\":{},\"pitch\":{},\"offset\":{},\"timeline_ready\":{},\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"outcome\":{}}}",
+            phase, source, arena.surface_id, allocation, arena.device_id, self.device.handle(), self.queue,
+            self.queue_family_index, self.source, self.storage.image, self.storage.memory, self.timeline, texture,
+            self.extent.width, self.extent.height, arena.layout.stride, arena.layout.offset,
+            snapshot.map_or(0, |frame| frame.timeline_ready), snapshot.map_or(0, |frame| frame.transfer_sequence),
+            snapshot.map_or(0, |frame| frame.content_session), snapshot.map_or(0, |frame| frame.content_sequence),
+            snapshot.map_or(0, |frame| frame.presentation_revision), outcome));
+    }
     fn record_acquire(&self) -> Result<(), vk::Result> {
         let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1).layer_count(1);
@@ -3666,6 +3812,32 @@ impl MmltkWorkspaceBlit {
             self.device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
             self.device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+            self.device.end_command_buffer(command)
+        }
+    }
+
+    fn record_direct_probe(&self, coordinates: &[(u32, u32); MmltkWorkspacePixels::SAMPLES]) -> Result<(), vk::Result> {
+        let probe = self.pixels.as_ref().expect("enabled direct source probe");
+        let command = probe.commands[0];
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1).layer_count(1);
+        let mut transition = mmltk_workspace_release_transitions(self.queue_family_index)[0];
+        transition.dst_access = vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ;
+        let acquire = mmltk_workspace_image_barrier(transition, self.source, range);
+        // The sole prior source read has physically settled before this command
+        // is reset. The ordinary pre-recorded acquire remains the failure fallback.
+        unsafe {
+            self.device.reset_command_buffer(command, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
+            self.device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[acquire]);
+            probe.record(command, self.source, vk::ImageLayout::GENERAL, 0, 0, 0, coordinates);
+            self.device.cmd_fill_buffer(command, probe.buffer, (MmltkWorkspacePixels::SAMPLES * 4) as u64,
+                4, MmltkWorkspacePixels::COMPLETED_MARKER);
+            self.device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)], &[], &[]);
             self.device.end_command_buffer(command)
         }
     }
@@ -3850,12 +4022,26 @@ impl MmltkWorkspaceBlit {
     /// independently owned Copy destination was initialized with its arena.
     fn initialize(&self) -> Result<(), vk::Result> {
         let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
+        // Finish the potentially discarding layout transition locally before
+        // handing memory to CUDA. A layout transition attached to an ownership
+        // transfer spans its release/acquire pair; all external handoffs must
+        // instead preserve the producer's GENERAL-layout contents.
+        let layout = mmltk_workspace_image_barrier(MmltkWorkspaceImageTransition {
+            src_access: vk::AccessFlags::empty(),
+            dst_access: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: vk::ImageLayout::GENERAL,
+            src_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family: vk::QUEUE_FAMILY_IGNORED,
+        }, self.source, range);
         let (initial, _) = mmltk_workspace_initial_transitions(self.queue_family_index);
         let barrier = mmltk_workspace_image_barrier(initial[0], self.source, range);
         unsafe {
             self.device.begin_command_buffer(self.copy_commands[0], &vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             self.device.cmd_pipeline_barrier(self.copy_commands[0], vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[layout]);
+            self.device.cmd_pipeline_barrier(self.copy_commands[0], vk::PipelineStageFlags::ALL_COMMANDS,
                 vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
             self.device.end_command_buffer(self.copy_commands[0])?;
         }
@@ -3961,13 +4147,13 @@ impl Global {
         let (image, layout) = self.create_mmltk_workspace_source(&hal, device_id, extent, None)?;
         // This is the first physical producer image, retained unbound until its
         // allocation arrives. Negotiation creates no dummy WebGPU resource.
-        let initial_source = MmltkWorkspaceImage { device: device.clone(), image, memory: vk::DeviceMemory::null(),
+        let initial_source = MmltkWorkspaceImage { device: device.clone(), image, memory: vk::DeviceMemory::null(), direct_memory: None,
             _device_custody: hal.external_image_custody() };
         let storage = if layout.direct_sampling == 0 {
             let properties = unsafe { hal.shared_instance().raw_instance()
                 .get_physical_device_memory_properties(hal.raw_physical_device()) };
             let (image, memory) = self.create_mmltk_workspace_destination(device, &properties, extent).ok_or_else(unimportable)?;
-            Some(Arc::new(MmltkWorkspaceImage { device: device.clone(), image, memory,
+            Some(Arc::new(MmltkWorkspaceImage { device: device.clone(), image, memory, direct_memory: None,
                 _device_custody: hal.external_image_custody() }))
         } else { None };
         let arena = Arc::new(MmltkWorkspaceArena {
@@ -3996,7 +4182,13 @@ impl Global {
         let Some(arena) = arena else {
             let source = self.mmltk_workspace_dispatcher.shared.entries.lock().unwrap().values().find(|entry|
                     entry.surface_id == id && entry.device_id == device_id && entry.blit.direct)
-                    .map(|entry| (entry.blit.storage.clone(), entry.arena.extent)).ok_or_else(unavailable)?;
+                    .map(|entry| {
+                        if mmltk_workspace_acceptance_trace_enabled() {
+                            entry.blit.trace_binding("page_texture_binding", &entry.arena, entry.surface_id,
+                                &entry.frame_signal, entry.physical_read.as_ref().map(|read| read.snapshot), Some(texture_id), true);
+                        }
+                        (entry.blit.storage.clone(), entry.arena.extent)
+                    }).ok_or_else(unavailable)?;
             if desc.size.width != source.1.width || desc.size.height != source.1.height ||
                 desc.size.depth_or_array_layers != 1 { return Err(unsupported()); }
             let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(device_id) }.ok_or_else(unavailable)?;
@@ -4009,6 +4201,11 @@ impl Global {
             unsafe { texture.use_external_general_layout(); }
             let (_, error) = unsafe { self.create_texture_from_hal(Box::new(texture), device_id, desc,
                 wgt::TextureUses::RESOURCE, Some(texture_id)) };
+            if mmltk_workspace_acceptance_trace_enabled() {
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+                    "{{\"event\":\"firefox.workspace.direct_texture_import\",\"source\":\"{}\",\"texture_id\":\"{:?}\",\"view_layers\":1,\"chosen_layout\":\"GENERAL\",\"outcome\":{}}}",
+                    id, texture_id, error.is_none()));
+            }
             return if error.is_none() { Ok(()) } else { Err(unavailable()) };
         };
         if arena.device_id != device_id || !arena.ready.load(Ordering::Acquire)
@@ -4100,6 +4297,20 @@ impl Global {
                 external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)),
             direct_sampling: u64::from(direct),
             ..Default::default() };
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            write!(line,
+                "{{\"event\":\"firefox.workspace.image_created\",\"browser_process_id\":{},\"vk_device\":\"{:?}\",\"vk_physical_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"device_incarnation\":{},\"device_uuid\":\"",
+                std::process::id(), device.handle(), hal.raw_physical_device(), packet.device_incarnation)?;
+            for byte in packet.device_uuid { write!(line, "{byte:02x}")?; }
+            write!(line,
+                "\",\"capacity_width\":{},\"capacity_height\":{},\"image_depth\":{},\"image_type\":\"{:?}\",\"image_format\":\"{:?}\",\"image_tiling\":\"{:?}\",\"image_usage\":{},\"image_flags\":{},\"image_mip_levels\":{},\"image_array_layers\":{},\"image_samples\":{},\"image_sharing_mode\":\"{:?}\",\"image_initial_layout\":\"{:?}\",\"external_handle_type\":\"OPAQUE_FD\",\"requirements_size\":{},\"requirements_alignment\":{},\"requirements_memory_type_bits\":{},\"requires_dedicated\":{},\"prefers_dedicated\":{},\"external_memory_features\":{},\"row_pitch\":{},\"image_offset\":{},\"subresource_size\":{},\"array_pitch\":{},\"depth_pitch\":{},\"direct_sampling\":{}}}",
+                info.extent.width, info.extent.height, info.extent.depth, info.image_type, info.format, info.tiling,
+                info.usage.as_raw(), info.flags.as_raw(), info.mip_levels, info.array_layers, info.samples.as_raw(),
+                info.sharing_mode, info.initial_layout, memory.size, memory.alignment, memory.memory_type_bits,
+                dedicated.requires_dedicated_allocation != 0, dedicated.prefers_dedicated_allocation != 0,
+                external_memory.external_memory_features.as_raw(), layout.row_pitch, layout.offset, layout.size,
+                layout.array_pitch, layout.depth_pitch, direct)
+        });
         Ok((image, packet))
     }
 
@@ -4156,22 +4367,20 @@ impl Global {
             unsafe { hal.raw_device().destroy_image(source, None) }; return Err(invalid());
         }
         let properties = unsafe { hal.shared_instance().raw_instance().get_physical_device_memory_properties(hal.raw_physical_device()) };
-        let memory = match self.import_mmltk_workspace_memory(&hal, &properties, source, &mut admission) {
-            Ok(memory) => memory,
+        let storage = match self.import_mmltk_workspace_memory(&hal, &properties, source, &mut admission) {
+            Ok(storage) => storage,
             Err(error) => { unsafe { hal.raw_device().destroy_image(source, None) }; return Err(error); }
         };
         let edge = admission.take_frame_edge();
         let signal = admission.take_frame_signal().zip(admission.take_access_signal())
             .and_then(|(signal, access)| MmltkWorkspaceFrameSignal::map(signal, access, described.allocation_identity));
         let (Some(edge), Some(signal)) = (edge, signal) else {
-            unsafe { hal.raw_device().destroy_image(source, None); hal.raw_device().free_memory(memory, None); }
             return Err(invalid());
         };
         if !valid_mmltk_workspace_eventfd(edge.as_raw_fd()) {
-            unsafe { hal.raw_device().destroy_image(source, None); hal.raw_device().free_memory(memory, None); }
             return Err(invalid());
         }
-        self.start_mmltk_workspace_mirror(&hal, arena, id, source, memory, edge, signal)
+        self.start_mmltk_workspace_mirror(&hal, arena, id, storage, edge, signal)
             .ok_or_else(|| MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT))
     }
 
@@ -4235,25 +4444,20 @@ impl Global {
         hal_device: &wgh::vulkan::Device,
         arena: Arc<MmltkWorkspaceArena>,
         surface_id: mmltk_workspace_channel::SurfaceId,
-        source: vk::Image,
-        source_memory: vk::DeviceMemory,
+        storage: MmltkWorkspaceImage,
         frame_edge: OwnedFd,
         frame_signal: MmltkWorkspaceFrameSignal,
     ) -> Option<()> {
         let destination = arena.destination;
         let extent = arena.extent;
         let device = hal_device.raw_device();
-        let release_source = || unsafe {
-            device.destroy_image(source, None);
-            device.free_memory(source_memory, None);
-        };
+        let source = storage.image;
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(hal_device.queue_family_index());
         let pool = match unsafe { device.create_command_pool(&pool_info, None) } {
             Ok(pool) => pool,
             Err(_) => {
-                release_source();
                 return None;
             }
         };
@@ -4269,7 +4473,6 @@ impl Global {
             Ok(semaphore) => semaphore,
             Err(_) => {
                 unsafe { device.destroy_command_pool(pool, None) };
-                release_source();
                 return None;
             }
         };
@@ -4287,7 +4490,6 @@ impl Global {
                     device.destroy_semaphore(timeline, None);
                     device.destroy_command_pool(pool, None);
                 }
-                release_source();
                 return None;
             }
         };
@@ -4305,12 +4507,19 @@ impl Global {
                 .to_vec()
                 .into_boxed_slice();
             let release_commands = allocated[read_commands];
-            let pixels = if arena.layout.direct_sampling == 0 && mmltk_workspace_channel::workspace_pixel_probes_enabled() {
-                match MmltkWorkspacePixels::new(hal_device) {
+            let pixels = if mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+                let allocation = if arena.layout.direct_sampling != 0 {
+                    MmltkWorkspacePixels::allocate(hal_device, 1, MmltkWorkspacePixels::DIRECT_BYTES)
+                } else {
+                    MmltkWorkspacePixels::new(hal_device)
+                };
+                match allocation {
                     Ok(probe) => Some(probe),
                     Err(vk::Result::ERROR_DEVICE_LOST) => return None,
                     Err(_) => {
-                        MmltkWorkspacePixels::report_failure(arena.surface_id, surface_id, MmltkWorkspaceProbeFailure::Allocation, None);
+                        if arena.layout.direct_sampling == 0 {
+                            MmltkWorkspacePixels::report_failure(arena.surface_id, surface_id, MmltkWorkspaceProbeFailure::Allocation, None);
+                        }
                         None
                     }
                 }
@@ -4330,8 +4539,7 @@ impl Global {
                     timeline,
                 )),
                 source,
-                storage: Arc::new(MmltkWorkspaceImage { device: device.clone(), image: source, memory: source_memory,
-                    _device_custody: hal_device.external_image_custody() }),
+                storage: Arc::new(storage),
                 direct: arena.layout.direct_sampling != 0,
                 pixels,
                 destination,
@@ -4343,7 +4551,6 @@ impl Global {
                 device.destroy_semaphore(timeline, None);
                 device.destroy_command_pool(pool, None);
             }
-            release_source();
             return None;
         };
         self.mmltk_workspace_dispatcher.shared.register(arena, surface_id, frame_edge, frame_signal, blit, timeline_descriptor);
@@ -4395,16 +4602,17 @@ impl Global {
         drop(retired);
     }
 
-    /// Imports the descriptor backing `admission` as dedicated memory for
-    /// `image`. The descriptor is consumed by a successful allocation and
-    /// closed by the caller's `Admission` otherwise.
+    /// Imports the descriptor backing `admission` into the image's resource
+    /// owner. Dedicated allocation follows the negotiated image requirement.
+    /// The descriptor is consumed by a successful allocation and closed by the
+    /// caller's `Admission` otherwise.
     fn import_mmltk_workspace_memory(
         &self,
         hal_device: &wgh::vulkan::Device,
         memory_properties: &vk::PhysicalDeviceMemoryProperties,
         image: vk::Image,
         admission: &mut mmltk_workspace_channel::Admission,
-    ) -> Result<vk::DeviceMemory, MmltkWorkspaceImportError> {
+    ) -> Result<MmltkWorkspaceImage, MmltkWorkspaceImportError> {
         if admission.modifier != mmltk_workspace_channel::MODIFIER_LINEAR {
             return Err(MmltkWorkspaceImportError::code(
                 mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR,
@@ -4467,19 +4675,56 @@ impl Global {
             unimportable()
         })?;
 
+        // Capture the transported descriptor while Admission still owns it.
+        // OPAQUE_FD forbids vkGetMemoryFdPropertiesKHR; fstat is only file
+        // metadata and matching anonymous inodes do not identify a GPU payload.
+        mmltk_workspace_channel::trace_loaded_libraries();
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            let source = mmltk_workspace_channel::SurfaceId {
+                high: admission.layout.id_high, low: admission.layout.id_low };
+            let surface = mmltk_workspace_channel::SurfaceId {
+                high: admission.layout.arena_high, low: admission.layout.arena_low };
+            let descriptor = admission.descriptor();
+            write!(line,
+                "{{\"event\":\"firefox.workspace.memory_import\",\"source\":\"{source}\",\"surface\":\"{surface}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"workspace_descriptor\":{descriptor},\"vk_device\":\"{:?}\",\"vk_physical_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"memory_size\":{},\"memory_type_index\":{memory_type},\"memory_property_flags\":{},\"memory_heap_index\":{},\"dedicated\":{},\"capacity_width\":{},\"capacity_height\":{},\"row_pitch\":{},\"image_offset\":{},\"subresource_size\":{},\"requirements_size\":{},\"requirements_alignment\":{},\"requirements_memory_type_bits\":{},\"described_row_pitch\":{},\"described_image_offset\":{}",
+                admission.layout.allocation_identity, std::process::id(), device.handle(), hal_device.raw_physical_device(),
+                admission.size, memory_properties.memory_types[memory_type as usize].property_flags.as_raw(),
+                memory_properties.memory_types[memory_type as usize].heap_index, admission.layout.dedicated,
+                admission.width, admission.height, layout.row_pitch, layout.offset, layout.size,
+                requirements.size, requirements.alignment, requirements.memory_type_bits,
+                admission.stride, admission.layout.offset)?;
+            mmltk_workspace_channel::write_descriptor_facts(line, descriptor, None)?;
+            write!(line, ",\"import_handle_type\":\"OPAQUE_FD\",\"fd_properties_query\":\"not_permitted_for_opaque_fd\"}}")
+        });
+
         // A successful `vkAllocateMemory` consumes the descriptor; the
         // `Admission` still owns it on every failure arm below.
         //
         // The allocation size is the exporter's, not this image's requirement:
         // an imported opaque payload is bound at the size it was created with.
+        let descriptor = admission.descriptor();
         let mut import_info = vk::ImportMemoryFdInfoKHR::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
-            .fd(admission.descriptor());
+            .fd(descriptor);
         let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let mut allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(admission.size).memory_type_index(memory_type).push_next(&mut import_info);
         if admission.layout.dedicated != 0 { allocate_info = allocate_info.push_next(&mut dedicated); }
-        let memory = unsafe { device.allocate_memory(&allocate_info, None) }.map_err(|error| {
+        let allocation = unsafe { device.allocate_memory(&allocate_info, None) };
+        // Record the actual allocation argument and return before binding can
+        // fail. A consumed FD must never be queried here: its integer may
+        // already have been reused by another thread.
+        mmltk_workspace_channel::write_diagnostic(|line| {
+            let (memory, status) = match &allocation {
+                Ok(memory) => (*memory, 0),
+                Err(error) => (vk::DeviceMemory::null(), error.as_raw()),
+            };
+            write!(line,
+                "{{\"event\":\"firefox.workspace.memory_allocation\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"workspace_descriptor\":{descriptor},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"vk_allocate_status\":{status},\"fd_consumed\":{},\"fd_observation\":\"allocate_argument_not_post_consumption_query\"}}",
+                admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
+                admission.layout.allocation_identity, std::process::id(), device.handle(), allocation.is_ok())
+        });
+        let memory = allocation.map_err(|error| {
             log::error!(
                 "mmltk workspace import could not allocate imported memory; step=allocate_memory, \
                  handle_type=opaque_fd, allocation_size={}, memory_type_index={memory_type}, \
@@ -4499,7 +4744,19 @@ impl Global {
             unsafe { device.free_memory(memory, None) };
             return Err(unimportable());
         }
-        Ok(memory)
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.workspace.memory_bound\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"vk_device\":\"{:?}\",\"vk_image\":\"{image:?}\",\"vk_memory\":\"{memory:?}\",\"image_binding_offset\":0,\"memory_size\":{},\"memory_type_index\":{memory_type},\"dedicated\":{},\"fd_consumed\":true}}",
+            admission.layout.id_high, admission.layout.id_low, admission.layout.arena_high, admission.layout.arena_low,
+            admission.layout.allocation_identity, std::process::id(), device.handle(), admission.size, admission.layout.dedicated));
+        let mut storage = MmltkWorkspaceImage {
+            device: device.clone(), image, memory, direct_memory: None,
+            _device_custody: hal_device.external_image_custody(),
+        };
+        if admission.layout.direct_sampling != 0 && mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+            storage.direct_memory = Some(Box::new(MmltkWorkspaceDirectMemoryFacts::new(
+                image, memory, memory_type, admission.layout)));
+        }
+        Ok(storage)
     }
 
     fn drop_device_after_completion_shutdown(&self, device_id: id::DeviceId) {
@@ -4562,8 +4819,7 @@ impl Global {
                 height: desc.size.height,
                 depth: 1,
             };
-            let mut usage_flags = vk::ImageUsageFlags::empty();
-            usage_flags |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            let usage_flags = SHARED_CANVAS_IMAGE_USAGE;
 
             let mut external_image_create_info = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -4571,7 +4827,13 @@ impl Global {
             let memory_plane_layouts: Vec<_> = vk_image_wrapper
                 .layouts
                 .iter()
-                .map(|layout| vk::SubresourceLayout { size: 0, ..*layout })
+                .map(|layout| vk::SubresourceLayout {
+                    offset: layout.offset,
+                    row_pitch: layout.row_pitch,
+                    size: 0,
+                    array_pitch: 0,
+                    depth_pitch: 0,
+                })
                 .collect();
 
             let mut modifier_list = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
@@ -4658,7 +4920,7 @@ impl Global {
                 sample_count: desc.sample_count,
                 dimension: desc.dimension,
                 format: desc.format,
-                usage: wgt::TextureUses::COPY_DST | wgt::TextureUses::COLOR_TARGET,
+                usage: wgt::TextureUses::COPY_SRC | wgt::TextureUses::COPY_DST | wgt::TextureUses::COLOR_TARGET,
                 memory_flags: wgh::MemoryFlags::empty(),
                 view_formats: vec![],
             };

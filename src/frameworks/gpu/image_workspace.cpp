@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <cstring>
 #include <limits>
@@ -16,6 +19,7 @@
 #include "src/frameworks/gpu/exported_image_buffer.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "src/common/io/noexcept_io.h"
 
 namespace mmltk::frameworks::gpu {
 
@@ -281,6 +285,21 @@ mmltk::common::io::ScopedFd ImageWorkspace::ExportDescriptor() const {
     std::string error;
     mmltk::common::io::ScopedFd descriptor(state_->allocation->export_descriptor(&error));
     if (descriptor.get() < 0) throw std::runtime_error(error);
+    if (const auto* trace = std::getenv("MMLTK_GUI_TRACE_FILE"); trace && *trace) {
+        const int saved_errno = errno;
+        char record[512];
+        const int length = std::snprintf(
+            record, sizeof(record),
+            "{\"event\":\"gpu.workspace.memory_export\",\"native_process_id\":%ld,\"workspace_allocation\":%llu,"
+            "\"workspace_descriptor\":%d,\"workspace_plane\":%llu,\"memory_size\":%zu,\"row_pitch\":%zu,"
+            "\"image_offset\":%zu,\"capacity_width\":%u,\"capacity_height\":%u}\n",
+            static_cast<long>(::getpid()), static_cast<unsigned long long>(identity()), descriptor.get(),
+            static_cast<unsigned long long>(state_->allocation->data()), allocation_bytes(), layout().pitch_bytes,
+            layout().offset_bytes, layout().width, layout().height);
+        if (length > 0 && static_cast<std::size_t>(length) < sizeof(record))
+            mmltk::common::io::write_all_noexcept(STDERR_FILENO, {record, static_cast<std::size_t>(length)});
+        errno = saved_errno;
+    }
     return descriptor;
 }
 mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {

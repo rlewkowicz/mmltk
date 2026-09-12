@@ -55,6 +55,14 @@ template <class T>
     return implementation::reflected_value(value);
 }
 
+// Schema-agreed output transport removes repeated member names. Persistence and
+// ordinary named request values retain reflected_value's named representation.
+// Scalars, byte strings, variants and opaque storage preserve canonical policy.
+template <class T>
+[[nodiscard]] std::expected<wire::Value, wire::EncodeError> reflected_transport_value(const T& value) {
+    return implementation::detail::to_value<implementation::detail::ObjectLayout::Positional>(value);
+}
+
 using CompactShape = implementation::compact_detail::Shape;
 template <class T>
 inline constexpr CompactShape compact_shape = implementation::compact_detail::shape<T>;

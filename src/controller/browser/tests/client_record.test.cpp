@@ -11,6 +11,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <array>
@@ -725,9 +726,22 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
     abi::Record completed{
         .opcode = abi::Opcode::ReadSettled, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
     REQUIRE(abi::valid(completed));
-    SECTION("exact acquisition uses the same physical identity") {
-        completed.opcode = abi::Opcode::Acquired;
+    SECTION("exact acquisition and submitted release use the same physical identity") {
+        completed.opcode = GENERATE(abi::Opcode::Acquired, abi::Opcode::ReleaseSubmitted);
         REQUIRE(abi::valid(completed));
+        CHECK(abi::descriptor_count(completed.opcode) == 0U);
+        auto malformed = completed;
+        malformed.descriptors = 1U;
+        CHECK_FALSE(abi::valid(malformed));
+        malformed = completed;
+        malformed.presentation_revision = 0U;
+        CHECK_FALSE(abi::valid(malformed));
+        malformed = completed;
+        malformed.stride = malformed.size = 0U;
+        CHECK_FALSE(abi::valid(malformed));
+        malformed = completed;
+        malformed.abi_version = abi::kAbiVersion - 1U;
+        CHECK_FALSE(abi::valid(malformed));
         completed.offset = 0U;
         CHECK_FALSE(abi::valid(completed));
     }

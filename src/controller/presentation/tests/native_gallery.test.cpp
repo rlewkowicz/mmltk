@@ -26,6 +26,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1124,12 +1125,18 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     CHECK(gallery.Begin().remaining_tiles == 4U);
-    static_cast<void>(gallery.algorithm->AdvanceGallery());
-    {
+    for (;;) {
+        const auto observed = gallery.evidence.Epoch();
+        static_cast<void>(gallery.algorithm->AdvanceGallery());
         const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
-        REQUIRE_FALSE(admitted.empty());
-        CHECK(admitted.front() == 40U);
-        CHECK(std::ranges::all_of(admitted, [](const auto image) { return image >= 40U && image < 44U; }));
+        if (!admitted.empty()) {
+            CHECK(admitted.front() == 40U);
+            CHECK(std::ranges::all_of(admitted, [](const auto image) { return image >= 40U && image < 44U; }));
+            break;
+        }
+        // The other physical lane may still be finishing its incumbent read.
+        // Its completion must admit current visible work while image 4 stays held.
+        gallery.evidence.Wait(observed);
     }
     held.Release();
     gallery.Drain();
@@ -1590,16 +1597,49 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
                          },
                          [&evidence](ExploreSystem::event_type) { evidence.Wake(); },
                          diagnostics};
-    const auto wait = [&](auto&& ready) {
+    const auto wait = [&](const char* stage, auto&& ready) {
         for (;;) {
             const auto observed = evidence.Epoch();
             if (ready()) return;
-            evidence.Wait(observed);
+            try {
+                evidence.Wait(observed);
+            } catch (const std::runtime_error& failure) {
+                // Collect context only after the existing completion deadline fails.
+                const auto snapshot = system.snapshot();
+                std::vector<VisualDiagnosticFact> facts;
+                std::uint64_t epoch = 0U;
+                {
+                    std::scoped_lock lock(evidence.mutex);
+                    facts = evidence.facts;
+                    epoch = evidence.epoch;
+                }
+                std::ostringstream context;
+                context << failure.what() << "\nrollback stage=" << stage << " empty_candidate=" << empty_candidate
+                        << " observed_epoch=" << observed << " current_epoch=" << epoch << " ready=" << snapshot.ready
+                        << " busy=" << snapshot.busy << " failure=" << snapshot.failure << " revision=" << snapshot.revision
+                        << " frame_revision=" << snapshot.frame.revision << " gallery_generation=" << snapshot.gallery.generation
+                        << " first_row=" << snapshot.viewport.first_row << " rows=" << snapshot.viewport.row_count
+                        << " columns=" << snapshot.viewport.columns << " matching=" << snapshot.order.matching_count << "\nslots=";
+                for (const bool ready_slot : snapshot.gallery.slots) context << (ready_slot ? '1' : '0');
+                context << "\nheld=" << std::ranges::count(facts, VisualDiagnosticOperation::AcceptanceCompletionHeld,
+                                                         &VisualDiagnosticFact::operation)
+                        << " gpu_completed=" << std::ranges::count(facts, VisualDiagnosticOperation::GalleryGpuCompleted,
+                                                                  &VisualDiagnosticFact::operation)
+                        << " facts=" << facts.size();
+                const auto first = facts.size() > 128U ? facts.size() - 128U : 0U;
+                for (auto index = first; index < facts.size(); ++index) {
+                    const auto& fact = facts[index];
+                    context << "\n" << index << " " << visual_diagnostic_event_name(fact.operation)
+                            << " generation=" << fact.generation << " value=" << fact.value << " detail=" << fact.detail
+                            << " condition=" << fact.context.condition;
+                }
+                throw std::runtime_error(context.str());
+            }
         }
     };
     const ExploreViewport viewport{.extent = {32U, 32U}, .first_row = 17U, .row_count = 4U, .columns = 4U};
     static_cast<void>(system.Open({.viewport = viewport, .compiled_source = path.string()}));
-    wait([&] {
+    wait("incumbent held input", [&] {
         const auto snapshot = system.snapshot();
         return snapshot.ready && snapshot.gallery.slots.size() == 16U && std::ranges::count(snapshot.gallery.slots, true) == 15 &&
                evidence.Count(VisualDiagnosticOperation::AcceptanceCompletionHeld) == 1U;
@@ -1624,7 +1664,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
         static_cast<void>(system.UpdateFilter({.filter = {.minimum_instances = 2U}, .overlay = incumbent.overlay}));
     else
         system.UpdateViewport({.viewport = {.extent = {32U, 8U}, .first_row = 17U, .row_count = 1U, .columns = 4U}});
-    wait([&] {
+    wait("failed candidate rollback and held input continuation", [&] {
         const auto snapshot = system.snapshot();
         return !snapshot.failure.empty() && snapshot.viewport == viewport && snapshot.gallery.slots.size() == 16U &&
                std::ranges::all_of(snapshot.gallery.slots, [](bool ready) { return ready; });
@@ -1646,7 +1686,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
         }
     }
     const auto cached_tiles = explore_detail::GalleryThumbnailCache::WindowCount(incumbent.order.matching_count, viewport);
-    wait([&] { return evidence.Count(VisualDiagnosticOperation::GalleryGpuCompleted) == cached_tiles; });
+    wait("restored cache completion", [&] { return evidence.Count(VisualDiagnosticOperation::GalleryGpuCompleted) == cached_tiles; });
     const auto reads_of_held = [&] {
         std::scoped_lock lock(evidence.mutex);
         return std::ranges::count_if(evidence.facts, [&](const auto& fact) {
@@ -1658,13 +1698,13 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     overlay.show_masks = !overlay.show_masks;
     const auto first_revision = system.snapshot().frame.revision;
     static_cast<void>(system.UpdateOverlay(overlay));
-    wait([&] { return system.snapshot().frame.revision > first_revision; });
+    wait("changed semantic overlay", [&] { return system.snapshot().frame.revision > first_revision; });
     CHECK(pixels(0U) == clean);
     // Semantic updates continue using the restored demand's cached tiles after
     // the smaller or empty candidate rolls back.
     const auto semantic_revision = system.snapshot().frame.revision;
     static_cast<void>(system.UpdateOverlay(restored.overlay));
-    wait([&] { return system.snapshot().frame.revision > semantic_revision; });
+    wait("restored semantic overlay", [&] { return system.snapshot().frame.revision > semantic_revision; });
     CHECK(pixels(0U) == clean);
     CHECK(pixels(1U) == semantic);
     CHECK(reads_of_held() == 1);
@@ -2002,6 +2042,7 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
     auto initial = std::async(std::launch::async, [&] { return gate.AwaitInitialRelease(7U); });
     CHECK(fixture.Await(initial) == ExploreAcceptanceGate::WaitResult::Proceed);
     REQUIRE(gate.ClaimHeldCompletion());
+    gate.AdvanceGeneration(7U);
     auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 4U, 8U, 64U); });
     CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Proceed);
     CHECK_FALSE(gate.ClaimHeldCompletion());
@@ -2111,6 +2152,51 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
 
 namespace mmltk::controller {
 namespace {
+
+TEST_CASE("completed gallery read receipts retain identity through reentrant supersession and terminal callbacks",
+          "[explore][acceptance][control]") {
+    using Kind = contracts::IntegrationControlKind;
+    const auto outcome = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U);
+    AcceptanceGateFixture fixture{SOCK_SEQPACKET};
+    auto& gate = fixture.gate();
+    std::optional<contracts::IntegrationControlReceipt> received;
+    gate.SetFrontendCommand([&](const auto receipt) {
+        CHECK(gate.FrontendSequence() == 1U);
+        REQUIRE_FALSE(received.has_value());
+        received = receipt;
+        if (outcome == 0U) gate.AdvanceGeneration(8U);
+        if (outcome == 4U || outcome == 5U) {
+            gate.AdvanceGeneration(outcome == 4U ? 8U : 0U);
+            gate.AdvanceGeneration(7U);
+        }
+        if (outcome == 2U) throw std::runtime_error("fixture callback failed");
+        if (outcome == 3U) gate.Stop();
+        return outcome != 1U;
+    });
+    gate.AdvanceGeneration(7U);
+    REQUIRE(gate.ClaimHeldCompletion());
+    CHECK_FALSE(gate.ClaimHeldCompletion());
+    if (outcome == 6U || outcome == 7U) {
+        gate.AdvanceGeneration(outcome == 6U ? 8U : 0U);
+        gate.AdvanceGeneration(7U);
+    }
+    auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 3U, 47U, 1024U); });
+    CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Stale);
+    REQUIRE(received.has_value());
+    CHECK((*received == contracts::IntegrationControlReceipt{
+                            .kind = Kind::GalleryReadCompletionHeld, .sequence = 1U, .read_generation = 7U, .compiled_index = 47U}));
+    for (const auto expected : {ExploreAcceptanceGate::ControlEvent::HeldWait, ExploreAcceptanceGate::ControlEvent::HeldStale}) {
+        ExploreAcceptanceGate::ControlObservation observation{};
+        REQUIRE(::recv(fixture.commands().get(), &observation, sizeof(observation), MSG_DONTWAIT) == sizeof(observation));
+        CHECK(observation.event == expected);
+        CHECK(observation.generation == 7U);
+        CHECK(observation.slot == 3U);
+        CHECK(observation.compiled_index == 47U);
+        CHECK(observation.staging_bytes == 1024U);
+    }
+    CHECK(gate.ClaimTerminalReport() == (outcome >= 1U && outcome <= 3U));
+    gate.StopAndJoin();
+}
 
 TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts",
           "[explore][acceptance][control]") {
