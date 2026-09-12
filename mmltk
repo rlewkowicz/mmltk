@@ -2533,7 +2533,7 @@ print_test_suites() {
         '  transport  Isolated browser physical transport and attachment suite' \
         '  browser-runtime  Isolated Firefox process-owner and shell shutdown suite' \
         '  workspace-wayland  Opt-in packaged Wayland/NVIDIA browser hardware suite' \
-        '  cuda-vulkan     Standalone CUDA/Vulkan FD, timeline, and pixel diagnostic (no browser)' \
+        '  cuda-vulkan     Standalone CUDA/Vulkan FD, timeline, pixel and process-exit diagnostic (no browser)' \
         '  headless-compositor  Verify the NVIDIA headless Wayland compositor and protocols' \
         '  headless-compositor-tool  Headless session ownership and failure-handling fixture suite' \
         '  browser-app  Iced client protocol, state, and transport unit suite' \

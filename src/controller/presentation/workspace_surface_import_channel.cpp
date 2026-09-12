@@ -90,12 +90,20 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
     struct stat metadata{};
     const int stat_status = ::fstat(descriptor, &metadata);
     const int stat_errno = stat_status == 0 ? 0 : errno;
-    char output[1536];
+    char uuid[33]{};
+    constexpr char hex[] = "0123456789abcdef";
+    for (std::size_t index = 0; index < sizeof(record.device_uuid); ++index) {
+        uuid[index * 2] = hex[record.device_uuid[index] >> 4];
+        uuid[index * 2 + 1] = hex[record.device_uuid[index] & 15];
+    }
+    char output[2048];
     const int bytes = std::snprintf(output, sizeof(output),
         "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
         "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
         "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
         "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
+        "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"memory_size\":%llu,\"row_pitch\":%llu,"
+        "\"image_offset\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,\"dedicated\":%u,"
         "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
         "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
         "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
@@ -103,7 +111,10 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
         static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
         static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()),
         peer_known ? static_cast<long>(credentials.pid) : 0L, peer_known ? "true" : "false", peer, descriptor,
-        record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, sizeof(record), stat_status, stat_errno,
+        record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, uuid,
+        static_cast<unsigned long long>(record.device_incarnation), static_cast<unsigned long long>(record.size),
+        static_cast<unsigned long long>(record.stride), static_cast<unsigned long long>(record.offset),
+        record.width, record.height, record.dedicated, sizeof(record), stat_status, stat_errno,
         static_cast<unsigned long long>(metadata.st_dev), static_cast<unsigned long long>(metadata.st_ino),
         static_cast<unsigned long long>(metadata.st_rdev), static_cast<unsigned int>(metadata.st_mode),
         static_cast<long long>(metadata.st_size));

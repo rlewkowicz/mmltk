@@ -112,10 +112,11 @@ void observe(const char* operation, std::uint64_t identity, int retained_fd, CUe
         "{\"event\":\"cuda.workspace.%s\",\"native_process_id\":%ld,\"workspace_allocation\":%llu,"
         "\"retained_memory_descriptor\":%d,\"import_descriptor\":%d,\"cuda_external_memory\":%llu,\"cuda_mapped_base\":%llu,"
         "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,"
-        "\"memory_size\":%zu,\"image_offset\":%zu,\"row_pitch\":%zu,\"dedicated\":%s,\"cuda_status\":%d}\n",
+        "\"fd_consumed\":%s,\"memory_size\":%zu,\"image_offset\":%zu,\"row_pitch\":%zu,\"dedicated\":%s,\"cuda_status\":%d}\n",
         operation, static_cast<long>(::getpid()), static_cast<unsigned long long>(identity), retained_fd, importing_fd,
         static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory)), static_cast<unsigned long long>(base),
         device_uuid, static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
+        std::strcmp(operation, "memory_import") == 0 && status == CUDA_SUCCESS ? "true" : "false",
         layout.required_allocation_bytes, layout.offset_bytes, layout.pitch_bytes, layout.dedicated ? "true" : "false",
         static_cast<int>(status));
     if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))

@@ -135,14 +135,21 @@ MEMORY_PROVENANCE_EVENTS = frozenset((
     "presentation.workspace.descriptor_duplicated", "presentation.workspace.descriptor_sent",
     "presentation.workspace.descriptor_duplicate_failed", "presentation.workspace.descriptor_send_failed",
     "firefox.workspace.descriptor_received", "firefox.workspace.descriptor_claimed",
-    "firefox.workspace.memory_allocation",
+    "firefox.workspace.memory_allocation", "firefox.workspace.memory_export", "firefox.workspace.memory_export_failed",
+    "firefox.workspace.descriptor_send", "firefox.workspace.descriptor_send_result",
+    "presentation.workspace.descriptor_received", "cuda.workspace.memory_import_started",
+    "cuda.workspace.memory_import", "cuda.workspace.memory_map", "cuda.workspace.memory_import_rejected",
+    "cuda.workspace.memory_retirement_started", "cuda.workspace.memory_retirement",
 ))
 VULKAN_PROVENANCE_EVENTS = frozenset((
     "firefox.workspace.image_created", "firefox.workspace.memory_import",
     "firefox.workspace.memory_bound", "firefox.workspace.direct_binding",
+    "firefox.workspace.memory_allocation", "firefox.workspace.memory_export", "firefox.workspace.memory_export_failed",
 ))
 MEMORY_PROVENANCE_FIELDS = (
     "native_process_id", "browser_process_id", "workspace_descriptor", "cuda_address",
+    "retained_memory_descriptor", "import_descriptor", "cuda_external_memory", "cuda_mapped_base",
+    "cuda_status", "vk_status", "device_incarnation", "initialization",
     "cuda_export_allocation", "cuda_mapped_allocation", "cuda_mapping_matches_export",
     "cuda_retain_status", "cuda_release_status", "cuda_property_status", "cuda_allocation_type",
     "cuda_location_type", "cuda_location_id", "cuda_requested_handle_types", "cuda_compression_type",
@@ -175,6 +182,17 @@ DESCRIPTOR_LINEAGE_STAGES = {
     "firefox.workspace.memory_import": "import",
     "firefox.workspace.memory_allocation": "allocation",
     "firefox.workspace.memory_bound": "bound",
+    "firefox.workspace.memory_export": "vulkan_export",
+    "firefox.workspace.memory_export_failed": "export_failed",
+    "firefox.workspace.descriptor_send": "send_attempt",
+    "firefox.workspace.descriptor_send_result": "send_result",
+    "presentation.workspace.descriptor_received": "native_received",
+    "cuda.workspace.memory_import_started": "cuda_import_started",
+    "cuda.workspace.memory_import": "cuda_import",
+    "cuda.workspace.memory_map": "cuda_map",
+    "cuda.workspace.memory_import_rejected": "import_rejected",
+    "cuda.workspace.memory_retirement_started": "retirement_started",
+    "cuda.workspace.memory_retirement": "retirement",
 }
 LIBRARY_PROVENANCE_EVENTS = frozenset((
     "cuda.workspace.loaded_library", "cuda.workspace.library_inventory",
@@ -192,7 +210,7 @@ AUTO_FIELDS = (
     "source_observation_revision", "snapshot_revision", "observation_revision",
     "presentation_revision", "allocation_generation", "transfer_sequence", "timeline_ready",
     "trace_id", "span_id", "parent_span_id", "request_id", "operation_id",
-    "workspace_allocation", "dataset_identity", "gallery_identity", "gallery_generation", "phase", "phase_id", "control",
+    "native_process_id", "browser_process_id", "workspace_allocation", "dataset_identity", "gallery_identity", "gallery_generation", "phase", "phase_id", "control",
 )
 # The integration reporter is a distinct external format: these event-specific
 # f64 slots are translated once, never treated as generic numeric identities.
@@ -2013,6 +2031,9 @@ def auto_facts(record):
                 # Rust stderr has no PID. These file-scoped keys are only
                 # candidates; collect rejects conflicting observed owners.
                 add(1, ("@file", name), (encoded(record.source), encoded(handle)))
+    if event in MEMORY_PROVENANCE_EVENTS:
+        add(0, ("native_process_id", "workspace_allocation"))
+        add(0, ("browser_process_id", "@workspace_source", "workspace_allocation"))
     for field in ("frame", "snapshot"):
         add(0, ("source_session", "source_instance", field))
         if domain and field in facts:
@@ -2042,7 +2063,7 @@ def auto_event_rank(record):
     event = record.get("@event")
     if not isinstance(event, str) or AUTO_NOISE.search(event):
         return None
-    if event in VULKAN_PROVENANCE_EVENTS:
+    if event in MEMORY_PROVENANCE_EVENTS or event in VULKAN_PROVENANCE_EVENTS:
         return 2
     if event in AUTO_INTEGRATION_FIELDS or event == "iced.gallery.source":
         return 1
@@ -3327,7 +3348,7 @@ def render_record(item, options):
 
 def render_descriptor_lineage(result, options, output):
     """Summarize only retained physical records; never turn FD numbers into OFD identities."""
-    groups, exports, cuda = {}, {}, {}
+    groups, exports, cuda, imports, sources = {}, {}, {}, {}, {}
 
     def index_row(index, key, row):
         # Two examples suffice to reject an ambiguous/reused export association.
@@ -3341,7 +3362,11 @@ def render_descriptor_lineage(result, options, output):
         if not isinstance(event, str) or event not in DESCRIPTOR_LINEAGE_STAGES or row.metadata.get("context_copy"):
             continue
         run = str(row.metadata.get("run", row.source))
-        if event == "gpu.workspace.memory_export":
+        if event.startswith("cuda.workspace.") and event != "cuda.workspace.memory_export":
+            key = correlation_key(row, ("native_process_id", "workspace_allocation"))
+            if key:
+                imports.setdefault((run, key), []).append(row)
+        elif event == "gpu.workspace.memory_export":
             key = correlation_key(row, ("native_process_id", "workspace_allocation"))
             if key:
                 index_row(exports, (run, key), row)
@@ -3351,13 +3376,18 @@ def render_descriptor_lineage(result, options, output):
                 index_row(cuda, (run, key), row)
         elif isinstance(source := row.get("@workspace_source"), str):
             groups.setdefault((run, source), []).append(row)
+            key = correlation_key(row, ("native_process_id", "workspace_allocation"))
+            if key:
+                sources.setdefault((run, key), set()).add(source)
     print("Descriptor lineage: retained physical rows only; missing/ambiguous stages are not proof of a failed handoff.", file=output)
     print("  Equal FD integers or fstat metadata never prove payload identity. Cross-process links below are "
           "SCM_RIGHTS record associations, not independent OFD/payload comparisons.", file=output)
     if not groups:
+        if imports:
+            print("  Missing native process/allocation source association; no CUDA import selected.", file=output)
         print("  No exact source chain retained; query workspace_allocation and include the native/browser artifact family.", file=output)
         return
-    required = ("cuda_export", "workspace_export", "duplicated", "sent", "received", "claimed", "import", "allocation", "bound")
+    historical_required = ("cuda_export", "workspace_export", "duplicated", "sent", "received", "claimed", "import", "allocation", "bound")
     for (run, source), rows in sorted(groups.items())[:options.top]:
         issues, unavailable = [], []
 
@@ -3369,6 +3399,8 @@ def render_descriptor_lineage(result, options, output):
                     continue
                 if name in ("native_process_id", "browser_process_id") and (type(value) is not int or value <= 0):
                     continue
+                if name == "dedicated" and type(value) in (bool, int):
+                    value = bool(value)
                 found.add(encoded(value))
                 if len(found) == 3:
                     break
@@ -3385,10 +3417,24 @@ def render_descriptor_lineage(result, options, output):
                     issues.append(f"{name} differs: {compact(','.join(sorted(observed)), 200)}")
 
         compare(rows, ("workspace_allocation", "@surface", "native_process_id", "browser_process_id"))
+        modern = any(row.get("@event") in (
+            "firefox.workspace.memory_export", "firefox.workspace.memory_export_failed",
+            "firefox.workspace.descriptor_send", "firefox.workspace.descriptor_send_result",
+            "presentation.workspace.descriptor_received") or row.get("vk_status") is not MISSING for row in rows)
+        required = ("allocation", "bound", "vulkan_export", "send_attempt", "send_result", "native_received",
+                    "cuda_import_started", "cuda_import", "cuda_map", "retirement_started", "retirement") if modern else historical_required
         native = values(rows, "native_process_id")
         allocations = values(rows, "workspace_allocation")
         if len(native) == 1 and len(allocations) == 1:
-            matches = exports.get((run, (next(iter(native)), next(iter(allocations)))), [])
+            owner_key = (next(iter(native)), next(iter(allocations)))
+            if modern:
+                source_count = len(sources.get((run, owner_key), ()))
+                if source_count == 1:
+                    rows = [*rows, *imports.get((run, owner_key), [])]
+                else:
+                    association = "missing" if source_count == 0 else "ambiguous"
+                    unavailable.append(f"{association} native process/allocation source association; no CUDA import selected")
+            matches = [] if modern else exports.get((run, owner_key), [])
             if len(matches) == 1:
                 exported = matches[0]
                 rows = [*rows, exported]
@@ -3400,15 +3446,43 @@ def render_descriptor_lineage(result, options, output):
                     unavailable.append("ambiguous CUDA export association; process/FD/address may have been reused")
             elif matches:
                 unavailable.append("ambiguous workspace export association; no export selected")
+        elif modern:
+            association = "ambiguous" if len(native) > 1 or len(allocations) > 1 else "missing"
+            unavailable.append(f"{association} native process/allocation source association; no CUDA import selected")
         stages = {}
         for row in rows:
             stages.setdefault(DESCRIPTOR_LINEAGE_STAGES[row.get("@event")], []).append(row)
+        if modern:
+            required += tuple(stage for stage in ("import_rejected", "export_failed")
+                              if stage in stages)
         for stage, entries in stages.items():
-            if len(entries) > 1:
+            if len(entries) > 1 and stage not in ("send_attempt", "send_result"):
                 unavailable.append(f"{stage} has {len(entries)} retained records; no unique stage selected")
         single = {stage: entries[0] for stage, entries in stages.items() if len(entries) == 1}
+        if modern:
+            results = stages.get("send_result", [])
+            compare([*stages.get("send_attempt", []), *results],
+                    ("workspace_descriptor", "native_process_id", "browser_process_id", "@workspace_source",
+                     "@surface", "workspace_allocation", "channel_descriptor", "descriptor_count",
+                     "memory_descriptor_index", "record_bytes", "descriptor_transport", "device_uuid",
+                     "device_incarnation", "memory_size", "image_offset", "row_pitch", "capacity_width",
+                     "capacity_height", "dedicated", "initialization"))
+            successful = [row for row in results if type(row.get("send_bytes")) is int
+                          and exact(row.get("send_bytes"), row.get("record_bytes")) and exact(row.get("send_errno"), 0)]
+            if len(successful) == 1:
+                single["send_result"] = successful[0]
+            elif len(successful) > 1:
+                unavailable.append("ambiguous successful SCM_RIGHTS sends")
+                single.pop("send_result", None)
+            else:
+                single.pop("send_result", None)
+                unavailable.append("SCM_RIGHTS send lacks an exact successful record-length result")
+            for row in results:
+                if not (type(row.get("send_bytes")) is int and exact(row.get("send_bytes"), row.get("record_bytes"))
+                        and exact(row.get("send_errno"), 0)) and row.get("send_errno") not in (errno.EINTR, errno.EAGAIN):
+                    issues.append("SCM_RIGHTS send failed or returned a short record")
         for stage, row in single.items():
-            if stage.endswith("_failed"):
+            if stage.endswith("_failed") or stage == "import_rejected":
                 issues.append(f"{stage} reported by its owner")
             if row.get("cuda_mapping_matches_export") is False:
                 issues.append("CUDA mapping differs from the exported allocation handle")
@@ -3439,17 +3513,59 @@ def render_descriptor_lineage(result, options, output):
                 ("workspace_descriptor",))
         compare([single[stage] for stage in ("import", "allocation", "bound") if stage in single], ("vk_device", "vk_image"))
         compare([single[stage] for stage in ("allocation", "bound") if stage in single], ("vk_memory",))
-        compare([row for row in rows if exact(row.get("fd_stat_status"), 0)],
-                ("fd_dev", "fd_ino", "fd_rdev", "fd_mode", "fd_size"))
         compare([single[stage] for stage in ("sent", "received", "claimed") if stage in single],
                 ("descriptor_count", "memory_descriptor_index", "record_bytes"))
         sent = single.get("sent")
         if sent and (not exact(sent.get("send_bytes"), sent.get("record_bytes")) or not exact(sent.get("send_errno"), 0)):
             issues.append("SCM_RIGHTS send lacks an exact successful record-length result")
         allocated = single.get("allocation")
-        if allocated and (not exact(allocated.get("vk_allocate_status"), 0) or allocated.get("fd_consumed") is not True):
+        if not modern and allocated and (not exact(allocated.get("vk_allocate_status"), 0) or allocated.get("fd_consumed") is not True):
             issues.append(f"vkAllocateMemory status={shown(allocated, 'vk_allocate_status')} "
                           f"fd_consumed={shown(allocated, 'fd_consumed')}")
+        if modern:
+            compare([single[stage] for stage in ("allocation", "bound", "vulkan_export") if stage in single],
+                    ("vk_device", "vk_image", "vk_memory"))
+            compare(rows, ("device_uuid", "device_incarnation", "memory_size", "image_offset", "row_pitch",
+                           "capacity_width", "capacity_height", "dedicated"))
+            compare([single[stage] for stage in ("vulkan_export", "send_result") if stage in single],
+                    ("workspace_descriptor",))
+            compare([single[stage] for stage in ("send_result", "native_received") if stage in single],
+                    ("descriptor_count", "memory_descriptor_index", "record_bytes"))
+            compare([single[stage] for stage in ("cuda_import_started", "cuda_import", "cuda_map", "retirement_started", "retirement")
+                     if stage in single], ("retained_memory_descriptor",))
+            received, started = single.get("native_received"), single.get("cuda_import_started")
+            if received and started and not exact(received.get("workspace_descriptor"), started.get("retained_memory_descriptor")):
+                issues.append("native received FD differs from retained backing FD")
+            if started and exact(started.get("retained_memory_descriptor"), started.get("import_descriptor")):
+                issues.append("CUDA consuming import descriptor is not an independent duplicate")
+            compare([single[stage] for stage in ("cuda_import", "cuda_map") if stage in single], ("cuda_external_memory",))
+            for stage, row in single.items():
+                for status in ("cuda_status", "vk_status"):
+                    if type(row.get(status)) is int and row.get(status) != 0:
+                        issues.append(f"{stage} {status}={shown(row, status)}")
+            for stage, names in (("allocation", ("vk_status",)), ("bound", ("vk_status",)),
+                                 ("send_result", ("initialization",)),
+                                 ("cuda_import_started", ("retained_memory_descriptor", "import_descriptor")),
+                                 ("cuda_import", ("cuda_status", "cuda_external_memory")),
+                                 ("cuda_map", ("cuda_status", "cuda_mapped_base")),
+                                 ("retirement", ("cuda_status", "cuda_mapped_base", "cuda_external_memory"))):
+                if stage in single:
+                    for name in names:
+                        if single[stage].get(name) is MISSING:
+                            unavailable.append(f"{stage} {name} not recorded")
+            for stage, handle in (("cuda_import", "cuda_external_memory"), ("cuda_map", "cuda_mapped_base")):
+                row = single.get(stage)
+                if row and exact(row.get("cuda_status"), 0) and exact(row.get(handle), 0):
+                    issues.append(f"{stage} reports success with null {handle}")
+            retired = single.get("retirement")
+            if retired and exact(retired.get("cuda_status"), 0):
+                for handle in ("cuda_mapped_base", "cuda_external_memory"):
+                    value = retired.get(handle)
+                    if value is not MISSING and not exact(value, 0):
+                        issues.append(f"retirement reports success with unreleased {handle}={shown(retired, handle)}")
+            imported = single.get("cuda_import")
+            if imported and exact(imported.get("cuda_status"), 0) and imported.get("fd_consumed") is not True:
+                unavailable.append("successful CUDA import lacks consumed-duplicate observation")
         allocation = compact(",".join(sorted(allocations)), 100) or "unknown"
         browser = ",".join(sorted(values(rows, "browser_process_id"))) or "unknown"
         print(f"  source={source} allocation={allocation} native_pid={','.join(sorted(native)) or 'unknown'} "
@@ -3457,6 +3573,12 @@ def render_descriptor_lineage(result, options, output):
         chain = []
         for stage in required:
             row = single.get(stage)
+            if stage == "send_attempt" and stage in stages:
+                chain.append(f"send_attempt(count={len(stages[stage])})")
+                continue
+            if modern and stage == "send_result" and not row and stage in stages:
+                chain.append("send_result(no_unique_success)")
+                continue
             if row is None:
                 chain.append(stage + "(missing)" if stage not in stages else stage + "(ambiguous)")
                 continue
@@ -3464,9 +3586,12 @@ def render_descriptor_lineage(result, options, output):
             label = stage + (f"(fd={shown(row, 'workspace_descriptor')})" if descriptor is not MISSING else "")
             if stage == "duplicated":
                 label += f"[export_fd={shown(row, 'export_descriptor')},ofd={shown(row, 'fd_ofd_status')}]"
-            if stage == "allocation":
+            if stage == "allocation" and not modern:
                 label += f"[status={shown(row, 'vk_allocate_status')},consumed={shown(row, 'fd_consumed')}]"
+            if stage in ("cuda_import_started", "cuda_import", "cuda_map"):
+                label += f"[retained_fd={shown(row, 'retained_memory_descriptor')},import_fd={shown(row, 'import_descriptor')},status={shown(row, 'cuda_status')}]"
             chain.append(label)
+        print("    direction=" + ("Vulkan_export_to_CUDA_import" if modern else "historical_CUDA_export_to_Vulkan_import"), file=output)
         print("    " + " -> ".join(chain), file=output)
         print("    conflicts: " + ("; ".join(dict.fromkeys(issues)) or "none observed in retained evidence"), file=output)
         if unavailable:
@@ -3617,44 +3742,29 @@ Fields:
   Signals describe the observed termination, not whether shutdown was intended.
   Bare terms search test/tag/run/signal metadata as well as original text.
   Catch INFO copies retain their original timestamps and are labeled context-copy.
-  Memory provenance explicitly separates native CUDA handles/pointers, transported
-  FD metadata, and browser Vulkan handles. cuda_mapping_matches_export compares the
-  actual exported handle with CUDA's retained handle for the native mapping; null
-  means that query failed. Driver property fields require their successful status.
-  native_process_id+workspace_descriptor+workspace_plane links the immediate
-  framework export records; browser_process_id+vk_device+vk_image links image
-  creation, import and binding. These are explicit, process-local observations:
-  scope to one capture/allocation lifetime because FDs, addresses and handles can
-  be reused. Neither equal numeric FDs across processes nor matching fstat metadata
-  (especially anonymous inodes) proves the same GPU backing. No OPAQUE_FD memory
-  properties query or buffer-alias probe is used. Native export records live in
-  the existing native stderr artifact, enabled by nonempty MMLTK_GUI_TRACE_FILE.
-  --descriptor-lineage restricts an explicit query to memory provenance and adds
-  the two process-local correlations above. Query an exact workspace_allocation
-  in one capture; a source-only query may not retain its framework export.
-  Its bounded report uses only retained physical rows (--limit and --where still
-  apply), reports at most --top sources, rejects ambiguous export associations,
-  and exposes conflicting source/allocation/process/descriptor/binding facts.
-  Missing stages may mean disabled logging or omitted evidence. Raw stage rows
-  retain physical file/line provenance. JSONL summaries go only to stderr.
-  Native F_DUPFD_QUERY compares the live export FD with its ordinary queued
-  duplicate at duplication time. same/different are kernel OFD observations;
-  unsupported, denied, invalid_descriptor and unavailable remain distinct.
-  No diagnostic FD is retained, no cross-process kcmp reference is available,
-  and no independent payload identity is asserted across SCM_RIGHTS. Socket
-  peer credentials and exact source/allocation/role identify the transport
-  record. Receive, claim and pre-import FD snapshots observe current liveness;
-  they cannot exclude a close/reuse between snapshots. memory_allocation records
-  the actual vkAllocateMemory FD argument and return before binding, without
-  querying an FD after Vulkan consumes it.
-  loaded_library/library_inventory record existing /proc/self/maps paths once
-  per enabled native exporter/browser importer process at its first memory
-  handoff. They load no DSO and create no GPU work. Inventories inspect at most
-  1 MiB, retain 32 distinct paths of less than 1024 bytes, and report unavailable
-  reads, bounded/partial results and unencodable paths explicitly. Absence does
-  not exclude static linkage or a library loaded after the snapshot. Query these
-  events separately with the chain's process IDs; --descriptor-lineage keeps
-  its row budget for the allocation chain.
+  Memory provenance follows Firefox Vulkan allocation/binding/export, SCM_RIGHTS
+  send attempts and exact send results, native receipt, CUDA import and mapping,
+  and retirement. --descriptor-lineage restricts a query to these physical facts
+  and retained historical CUDA-export captures. Query workspace_allocation in one
+  capture and use --family to include native and Firefox artifacts. Correlations
+  use native_process_id+workspace_allocation, browser_process_id+source+workspace_allocation,
+  and process-local image or historical export identities. FD numbers never join
+  different processes; fstat metadata does not establish backing payload identity.
+  The bounded report uses retained rows only (--limit/--where still apply), with
+  at most --top source chains. Missing and ambiguous observations remain explicit.
+  A descriptor_send is only an attempt, including EINTR/EAGAIN retries. Only an
+  exact record-length descriptor_send_result with send_errno=0 proves send success.
+  Native received storage remains in retained_memory_descriptor. import_descriptor
+  is its consuming duplicate, observed before CUDA; successful import does not
+  query that consumed FD. Historical F_DUPFD_QUERY observations retain their
+  original same/different/unsupported/denied meaning without asserting identity
+  across processes. Diagnostics never retain extra descriptors or GPU resources.
+  loaded_library/library_inventory capture existing /proc/self/maps once at the
+  native first_memory_import or Firefox first_memory_export. They load no DSO.
+  Inventories bound reads to 1 MiB and 32 paths shorter than 1024 bytes, reporting
+  incomplete/unavailable facts. Query these separately by process ID so they do
+  not consume the allocation chain's retained-row budget. Disabled diagnostics
+  collect nothing. Raw rows retain their original file/line provenance.
 
 Vulkan layer diagnostics:
   Adjacent Rust VALIDATION headers, indented message bodies, and matching
@@ -3862,7 +3972,7 @@ def argument_parser():
     parser.add_argument("--correlate", action="append", default=[], metavar="FIELD[+FIELD...]",
                         help="include records sharing a seed identity; repeat for OR, + for composite identities")
     parser.add_argument("--descriptor-lineage", action="store_true",
-                        help="follow memory provenance for an explicit allocation query and report bounded descriptor-chain conflicts")
+                        help="follow Vulkan export/CUDA import (or historical captures), distinguishing send attempts, success and retained/consumed FDs")
     automatic = parser.add_mutually_exclusive_group()
     automatic.add_argument("--auto-correlate", action="store_true", dest="auto_correlate",
                            help="opt in to bounded automatic related evidence, including for JSONL")
@@ -3910,7 +4020,8 @@ def main(argv=None, *, root=None, output=None, diagnostics=None):
                                  "--triage, --related-run, --error, --list-runs, or --representatives")
             where = Expression("and", (where, Expression("or", tuple(
                 Expression("=", ("@event", event)) for event in sorted(MEMORY_PROVENANCE_EVENTS)))))
-            for names in ("native_process_id+workspace_descriptor+workspace_plane", "browser_process_id+vk_device+vk_image"):
+            for names in ("native_process_id+workspace_allocation", "browser_process_id+source+workspace_allocation",
+                          "native_process_id+workspace_descriptor+workspace_plane", "browser_process_id+vk_device+vk_image"):
                 if names not in options.correlate:
                     options.correlate.append(names)
         if options.triage and (options.related_run or options.tail or options.list_runs):

@@ -7,7 +7,7 @@ __global__ void fill_image(void* destination, std::size_t pitch,
     const auto y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x < width && y < height) {
         auto* row = reinterpret_cast<std::uint32_t*>(static_cast<char*>(destination) + y * pitch);
-        row[x] = value;
+        row[x] = cuda_vulkan_pixel(value, x, y);
     }
 }
 }  // namespace

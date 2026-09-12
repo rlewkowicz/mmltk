@@ -194,12 +194,19 @@ pub(super) fn write_descriptor_facts(
     write!(line, ",\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"")
 }
 
-fn trace_memory_descriptor(event: &str, record: &Record, descriptor: RawFd, socket: RawFd) {
+fn trace_memory_descriptor(event: &str, record: &Record, descriptor: RawFd, socket: RawFd, result: Option<(isize, i32)>) {
     write_diagnostic(|line| {
         write!(line,
             "{{\"event\":\"firefox.workspace.{event}\",\"source\":\"{:016x}{:016x}\",\"surface\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"browser_process_id\":{},\"channel_descriptor\":{socket},\"workspace_descriptor\":{descriptor},\"descriptor_count\":{},\"memory_descriptor_index\":{READY_MEMORY_DESCRIPTOR},\"record_bytes\":{RECORD_BYTES},\"descriptor_transport\":\"SCM_RIGHTS\"",
             record.id_high, record.id_low, record.arena_high, record.arena_low,
             record.allocation_identity, std::process::id(), record.descriptors)?;
+        write!(line, ",\"device_incarnation\":{},\"memory_size\":{},\"row_pitch\":{},\"image_offset\":{},\"capacity_width\":{},\"capacity_height\":{},\"dedicated\":{},\"initialization\":\"vulkan_external_ownership_settled\",\"device_uuid\":\"",
+            record.device_incarnation, record.size, record.stride, record.offset, record.width, record.height, record.dedicated)?;
+        for byte in record.device_uuid { write!(line, "{byte:02x}")?; }
+        write!(line, "\"")?;
+        if let Some((sent, error)) = result {
+            write!(line, ",\"send_bytes\":{sent},\"send_errno\":{error}")?;
+        }
         write_descriptor_facts(line, descriptor, Some(socket))?;
         write!(line, "}}")
     });
@@ -1001,12 +1008,18 @@ impl Channel {
             }
             if record.opcode == OPCODE_READY {
                 if let Some(memory) = descriptors[READY_MEMORY_DESCRIPTOR] {
-                    trace_memory_descriptor("descriptor_send", &record, memory.as_raw_fd(), self.fd);
+                    trace_memory_descriptor("descriptor_send", &record, memory.as_raw_fd(), self.fd, None);
                 }
             }
             let sent = unsafe { libc::sendmsg(self.fd, &message, libc::MSG_NOSIGNAL) };
+            let send_error = if sent < 0 { std::io::Error::last_os_error().raw_os_error().unwrap_or(0) } else { 0 };
+            if record.opcode == OPCODE_READY {
+                if let Some(memory) = descriptors[READY_MEMORY_DESCRIPTOR] {
+                    trace_memory_descriptor("descriptor_send_result", &record, memory.as_raw_fd(), self.fd, Some((sent, send_error)));
+                }
+            }
             if sent < 0 {
-                match std::io::Error::last_os_error().raw_os_error() {
+                match Some(send_error) {
                     Some(libc::EINTR) => continue,
                     Some(libc::EAGAIN) => return,
                     _ => {

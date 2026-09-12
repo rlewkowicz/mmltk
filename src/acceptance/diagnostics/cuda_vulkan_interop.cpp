@@ -1,10 +1,20 @@
 // Standalone CUDA/Vulkan linear-image external-memory comparison.
 // No application, Firefox, window system, or graphics shader dependencies.
-// argv: width height allocation-pairs transfers-per-image validation-layer context-mode memory-owner
+// argv: width height allocation-pairs transfers-per-image validation-layer context-mode memory-owner process-mode
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <cuda.h>
 #include <vulkan/vulkan.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <cerrno>
+#include <csignal>
+#include <memory>
+extern char** environ;
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -135,7 +145,8 @@ struct Device {
             else cuDevicePrimaryCtxRelease(cuda_device);
         }
     }
-    void initialize(bool validation, unsigned mode) {
+    CUuuid uuid{};
+    void initialize_cuda(unsigned mode) {
         CHECK(cuInit(0));
         CHECK(cuDeviceGet(&cuda_device, 0));
         isolated_context = mode != 0;
@@ -143,7 +154,6 @@ struct Device {
         else CHECK(cuDevicePrimaryCtxRetain(&context, cuda_device));
         CHECK(cuCtxSetCurrent(context));
         CHECK(cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING));
-        CUuuid uuid{};
         CHECK(cuDeviceGetUuid(&uuid, cuda_device));
         if (mode == 2) {
             CHECK(cuCtxCreate(&producer_context, nullptr, CU_CTX_SCHED_AUTO, cuda_device));
@@ -151,8 +161,10 @@ struct Device {
             CHECK(cuEventCreate(&producer_complete, CU_EVENT_DISABLE_TIMING));
             CHECK(cuCtxSetCurrent(context));
         }
-        std::printf("cuda_context=%s\n", mode == 2 ? "separate_producer_and_semaphore" :
+        std::printf("cuda_pid=%ld cuda_context=%s\n", static_cast<long>(getpid()), mode == 2 ? "separate_producer_and_semaphore" :
                     isolated_context ? "isolated" : "primary");
+    }
+    void initialize_vulkan(bool validation) {
         auto app = vk_structure<VkApplicationInfo>(VK_STRUCTURE_TYPE_APPLICATION_INFO);
         app.pApplicationName = "standalone-cuda-vulkan";
         app.apiVersion = VK_API_VERSION_1_2;
@@ -197,7 +209,7 @@ struct Device {
             vkGetPhysicalDeviceProperties2(candidate, &properties);
             if (std::memcmp(uuid.bytes, ids.deviceUUID, VK_UUID_SIZE) == 0) {
                 physical = candidate;
-                std::printf("device=%s driver=%u uuid=", properties.properties.deviceName,
+                std::printf("vulkan_pid=%ld device=%s driver=%u uuid=", static_cast<long>(getpid()), properties.properties.deviceName,
                             properties.properties.driverVersion);
                 for (unsigned char value : ids.deviceUUID) std::printf("%02x", value);
                 std::puts("");
@@ -313,6 +325,8 @@ struct Image {
     uint32_t width, height;
     uint64_t sequence = 0;
     MemoryOwner memory_owner;
+    bool needs_dedicated = false;
+    Fd backing, exported_semaphore;
     Image(Device& owner, uint32_t w, uint32_t h, MemoryOwner memory)
         : device(owner), width(w), height(h), memory_owner(memory) {}
     Image(const Image&) = delete;
@@ -322,12 +336,12 @@ struct Image {
             cuCtxSetCurrent(device.producer_context);
             cuStreamSynchronize(device.producer_stream);
         }
-        cuCtxSetCurrent(device.context);
-        cuStreamSynchronize(device.stream);
-        vkDeviceWaitIdle(device.vk);
+        if (device.context) cuCtxSetCurrent(device.context);
+        if (device.stream) cuStreamSynchronize(device.stream);
+        if (device.vk) vkDeviceWaitIdle(device.vk);
         if (cuda_semaphore) cudaDestroyExternalSemaphore(cuda_semaphore);
         if (semaphore) vkDestroySemaphore(device.vk, semaphore, nullptr);
-        cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context);
+        if (device.context) cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context);
         if (external_memory) {
             if (address) cuMemFree(address);
             cuDestroyExternalMemory(external_memory);
@@ -341,8 +355,23 @@ struct Image {
         if (host) vkUnmapMemory(device.vk, host_memory);
         if (readback) vkDestroyBuffer(device.vk, readback, nullptr);
         if (host_memory) vkFreeMemory(device.vk, host_memory, nullptr);
-        cuCtxSetCurrent(device.context);
+        if (device.context) cuCtxSetCurrent(device.context);
         if (native) cuMemFreeHost(native);
+    }
+    void release_native() {
+        CHECK(cuCtxSetCurrent(device.context));
+        CHECK(cuStreamSynchronize(device.stream));
+        if (cuda_semaphore) { CHECK(cudaDestroyExternalSemaphore(cuda_semaphore)); cuda_semaphore = nullptr; }
+        CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
+        if (device.producer_stream) CHECK(cuStreamSynchronize(device.producer_stream));
+        if (address) { CHECK(cuMemFree(address)); address = 0; }
+        if (external_memory) { CHECK(cuDestroyExternalMemory(external_memory)); external_memory = nullptr; }
+        if (native) { CHECK(cuMemFreeHost(native)); native = nullptr; }
+        if (backing.value >= 0) {
+            const int fd = backing.value;
+            backing.value = -1;
+            if (close(fd)) throw std::runtime_error("retained backing close failed");
+        }
     }
     void barrier(uint32_t from, uint32_t to, VkImageLayout old_layout,
                  VkAccessFlags source, VkAccessFlags destination) {
@@ -358,7 +387,7 @@ struct Image {
         vkCmdPipelineBarrier(device.command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
-    void initialize() {
+    void initialize(bool vulkan_only = false) {
         constexpr auto usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         VkFormatProperties format_properties{};
         vkGetPhysicalDeviceFormatProperties(device.physical, VK_FORMAT_R8G8B8A8_UNORM, &format_properties);
@@ -405,9 +434,9 @@ struct Image {
         auto image_info = vk_structure<VkImageMemoryRequirementsInfo2>(VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2);
         image_info.image = image;
         vkGetImageMemoryRequirements2(device.vk, &image_info, &requirements);
-        CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
+        if (!vulkan_only) CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
         bytes = std::max<uint64_t>(requirements.memoryRequirements.size, layout.offset + layout.rowPitch * height);
-        const bool needs_dedicated = dedicated.requiresDedicatedAllocation ||
+        needs_dedicated = dedicated.requiresDedicatedAllocation ||
                                     (features & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT) ||
                                     memory_owner == MemoryOwner::VulkanDedicated;
         auto dedicate = vk_structure<VkMemoryDedicatedAllocateInfo>(VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO);
@@ -458,17 +487,8 @@ struct Image {
             get.memory = image_memory;
             get.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
             CHECK(get_fd(device.vk, &get, &exported.value));
-            transfer_fd(exported.value, received);
-            CUDA_EXTERNAL_MEMORY_HANDLE_DESC import{};
-            import.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
-            import.handle.fd = received.value;
-            import.size = bytes;
-            if (needs_dedicated) import.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
-            CHECK(cuImportExternalMemory(&external_memory, &import));
-            received.value = -1; // CUDA owns the imported FD after success.
-            CUDA_EXTERNAL_MEMORY_BUFFER_DESC mapping{};
-            mapping.size = bytes;
-            CHECK(cuExternalMemoryGetMappedBuffer(&address, external_memory, &mapping));
+            transfer_fd(exported.value, backing);
+            if (!vulkan_only) import_memory();
         }
         std::printf("image=%ux%u pitch=%lu offset=%lu bytes=%zu memory_type=%u dedicated=%d cuda_va=%llu memory_owner=%s\n",
                     width, height, layout.rowPitch, layout.offset, bytes, allocate.memoryTypeIndex,
@@ -486,12 +506,9 @@ struct Image {
         get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
         Fd semaphore_fd;
         CHECK(get_fd(device.vk, &get, &semaphore_fd.value));
-        cudaExternalSemaphoreHandleDesc cuda_import{};
-        cuda_import.type = cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
-        cuda_import.handle.fd = semaphore_fd.value;
-        CHECK(cuCtxSetCurrent(device.context));
-        CHECK(cudaImportExternalSemaphore(&cuda_semaphore, &cuda_import));
+        exported_semaphore.value = semaphore_fd.value;
         semaphore_fd.value = -1;
+        if (!vulkan_only) import_semaphore();
         // Complete initialization before any CUDA pixel write.
         device.begin();
         barrier(VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_IMAGE_LAYOUT_UNDEFINED, 0, 0);
@@ -511,9 +528,57 @@ struct Image {
         CHECK(vkAllocateMemory(device.vk, &allocate, nullptr, &host_memory));
         CHECK(vkBindBufferMemory(device.vk, readback, host_memory, 0));
         CHECK(vkMapMemory(device.vk, host_memory, 0, VK_WHOLE_SIZE, 0, &host));
-        CHECK(cuMemAllocHost(&native, buffer.size));
+        if (!vulkan_only) CHECK(cuMemAllocHost(&native, buffer.size));
     }
-    void transfer(uint32_t expected) {
+    void import_memory() {
+        CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
+        Fd consumed;
+        consumed.value = fcntl(backing.value, F_DUPFD_CLOEXEC, 0);
+        if (consumed.value < 0) throw std::runtime_error("duplicate retained backing");
+        CUDA_EXTERNAL_MEMORY_HANDLE_DESC import{};
+        import.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+        import.handle.fd = consumed.value;
+        import.size = bytes;
+        if (needs_dedicated) import.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
+        CHECK(cuImportExternalMemory(&external_memory, &import));
+        consumed.value = -1;
+        CUDA_EXTERNAL_MEMORY_BUFFER_DESC mapping{};
+        mapping.size = bytes;
+        CHECK(cuExternalMemoryGetMappedBuffer(&address, external_memory, &mapping));
+    }
+    void import_semaphore() {
+        cudaExternalSemaphoreHandleDesc import{};
+        import.type = cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
+        import.handle.fd = exported_semaphore.value;
+        CHECK(cuCtxSetCurrent(device.context));
+        CHECK(cudaImportExternalSemaphore(&cuda_semaphore, &import));
+        exported_semaphore.value = -1;
+    }
+    void compare(const void* pixels, uint32_t seed, const char* owner) const {
+        const auto* values = static_cast<const uint32_t*>(pixels);
+        size_t bad = 0;
+        for (uint32_t y = 0; y < height; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                bad += values[size_t(y) * width + x] != cuda_vulkan_pixel(seed, x, y);
+        if (bad) throw std::runtime_error(std::string(owner) + " pixel mismatch count=" + std::to_string(bad));
+    }
+    void native_read(uint32_t seed) {
+        CHECK(cuCtxSetCurrent(device.producer_context ? device.producer_context : device.context));
+        const auto writing_stream = device.producer_context ? device.producer_stream : device.stream;
+        CUDA_MEMCPY2D copy{};
+        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        copy.srcDevice = address + layout.offset;
+        copy.srcPitch = layout.rowPitch;
+        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+        copy.dstHost = native;
+        copy.dstPitch = size_t(width) * 4;
+        copy.WidthInBytes = copy.dstPitch;
+        copy.Height = height;
+        CHECK(cuMemcpy2DAsync(&copy, writing_stream));
+        CHECK(cuStreamSynchronize(writing_stream));
+        compare(native, seed, "CUDA");
+    }
+    uint64_t produce(uint32_t expected) {
         CHECK(cuCtxSetCurrent(device.context));
         const uint64_t timeline_base = memory_owner == MemoryOwner::Cuda ? 0 : 1;
         if (sequence || timeline_base) {
@@ -532,21 +597,16 @@ struct Image {
             CHECK(cuCtxSetCurrent(device.context));
             CHECK(cuStreamWaitEvent(device.stream, device.producer_complete, 0));
         }
-        CUDA_MEMCPY2D copy{};
-        copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        copy.srcDevice = address + layout.offset;
-        copy.srcPitch = layout.rowPitch;
-        copy.dstMemoryType = CU_MEMORYTYPE_HOST;
-        copy.dstHost = native;
-        copy.dstPitch = size_t(width) * 4;
-        copy.WidthInBytes = copy.dstPitch;
-        copy.Height = height;
-        CHECK(cuMemcpy2DAsync(&copy, device.stream));
+        native_read(expected);
+        CHECK(cuCtxSetCurrent(device.context));
         uint64_t ready = ++sequence * 2 - 1 + timeline_base;
         cudaExternalSemaphoreSignalParams signal{};
         signal.params.fence.value = ready;
         CHECK(cudaSignalExternalSemaphoresAsync(&cuda_semaphore, &signal, 1, device.stream));
         CHECK(cuStreamSynchronize(device.stream));
+        return ready;
+    }
+    void consume(uint64_t ready, uint32_t expected) {
         device.begin();
         barrier(VK_QUEUE_FAMILY_EXTERNAL, device.family, VK_IMAGE_LAYOUT_GENERAL, 0, VK_ACCESS_TRANSFER_READ_BIT);
         VkBufferImageCopy region{};
@@ -560,52 +620,305 @@ struct Image {
         vkCmdPipelineBarrier(device.command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                              0, 1, &host_barrier, 0, nullptr, 0, nullptr);
         device.submit(semaphore, ready);
-        size_t native_bad = 0, vulkan_bad = 0, zero = 0;
-        for (size_t i = 0; i < size_t(width) * height; ++i) {
-            native_bad += static_cast<uint32_t*>(native)[i] != expected;
-            vulkan_bad += static_cast<uint32_t*>(host)[i] != expected;
-            zero += static_cast<uint32_t*>(host)[i] == 0;
-        }
-        if (native_bad || vulkan_bad) {
-            std::printf("FAIL transfer=%lu expected=%08x native_first=%08x vulkan_first=%08x native_bad=%zu vulkan_bad=%zu vulkan_zero=%zu\n",
-                        sequence, expected, static_cast<uint32_t*>(native)[0], static_cast<uint32_t*>(host)[0],
-                        native_bad, vulkan_bad, zero);
-            throw std::runtime_error("pixel mismatch");
-        }
+        compare(host, expected, "Vulkan");
+    }
+    void transfer(uint32_t expected) {
+        consume(produce(expected), expected);
     }
 };
+
+// A single diagnostic record format, shared only by fresh instances of this executable.
+enum class Operation : uint32_t { Initialize, Allocation, Write, Compared, Next, Exit };
+struct Packet {
+    Operation operation{};
+    CUuuid uuid{};
+    uint32_t width = 0, height = 0, pairs = 0, transfers = 0, validation = 0, owner = 0;
+    uint32_t pair = 0, slot = 0, iteration = 0, seed = 0, dedicated = 0;
+    uint64_t bytes = 0, pitch = 0, offset = 0, ready = 0;
+};
+
+static void send_packet(int socket, const Packet& packet, int memory = -1, int semaphore = -1) {
+    iovec io{const_cast<Packet*>(&packet), sizeof(packet)};
+    alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
+    msghdr message{};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    if (memory >= 0) {
+        message.msg_control = control.data();
+        message.msg_controllen = control.size();
+        auto* header = CMSG_FIRSTHDR(&message);
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(2 * sizeof(int));
+        const int descriptors[]{memory, semaphore};
+        std::memcpy(CMSG_DATA(header), descriptors, sizeof(descriptors));
+    }
+    ssize_t sent;
+    do { sent = sendmsg(socket, &message, MSG_NOSIGNAL); } while (sent < 0 && errno == EINTR);
+    if (sent != sizeof(packet)) throw std::runtime_error("peer record send failed");
+}
+
+static Packet receive_packet(int socket, Operation expected, Fd* memory = nullptr, Fd* semaphore = nullptr) {
+    Packet packet{};
+    iovec io{&packet, sizeof(packet)};
+    alignas(cmsghdr) std::array<char, CMSG_SPACE(2 * sizeof(int))> control{};
+    msghdr message{};
+    message.msg_iov = &io;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    ssize_t received;
+    do { received = recvmsg(socket, &message, MSG_CMSG_CLOEXEC); } while (received < 0 && errno == EINTR);
+    Fd first, second;
+    unsigned count = 0;
+    bool valid = true;
+    for (auto* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+            header->cmsg_len < CMSG_LEN(0)) { valid = false; continue; }
+        const auto payload = header->cmsg_len - CMSG_LEN(0);
+        valid &= payload % sizeof(int) == 0;
+        for (size_t i = 0; i < payload / sizeof(int); ++i) {
+            int fd;
+            std::memcpy(&fd, CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
+            if (count == 0) first.value = fd;
+            else if (count == 1) second.value = fd;
+            else close(fd);
+            ++count;
+        }
+    }
+    if (received != sizeof(packet) || message.msg_flags & (MSG_TRUNC | MSG_CTRUNC) || !valid ||
+        count != (memory ? 2U : 0U) || packet.operation != expected)
+        throw std::runtime_error("missing, truncated, or unexpected peer record");
+    if (memory) {
+        memory->value = first.value;
+        semaphore->value = second.value;
+        first.value = second.value = -1;
+    }
+    return packet;
+}
+
+class Exporter {
+    Fd socket_;
+    pid_t pid_ = -1;
+public:
+    Exporter() {
+        int sockets[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets))
+            throw std::runtime_error("peer socketpair");
+        socket_.value = sockets[0];
+        Fd child;
+        child.value = sockets[1];
+        posix_spawn_file_actions_t actions;
+        int status = posix_spawn_file_actions_init(&actions);
+        if (status) throw std::runtime_error("spawn actions initialization");
+        status = posix_spawn_file_actions_addclose(&actions, socket_.value);
+        if (!status) status = posix_spawn_file_actions_adddup2(&actions, child.value, 3);
+        if (!status && child.value != 3) status = posix_spawn_file_actions_addclose(&actions, child.value);
+        // Replacement peers retain only stdio and their protocol endpoint,
+        // including when the caller already owns driver descriptors.
+        if (!status) status = posix_spawn_file_actions_addclosefrom_np(&actions, 4);
+        char executable[] = "/proc/self/exe";
+        char role[] = "--vulkan-peer";
+        char* arguments[]{executable, role, nullptr};
+        if (!status) status = posix_spawn(&pid_, executable, &actions, nullptr, arguments, environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (status) { pid_ = -1; throw std::runtime_error("fresh Vulkan peer spawn: " + std::to_string(status)); }
+    }
+    Exporter(const Exporter&) = delete;
+    Exporter& operator=(const Exporter&) = delete;
+    ~Exporter() {
+        if (pid_ > 0) {
+            kill(pid_, SIGKILL);
+            while (waitpid(pid_, nullptr, 0) < 0 && errno == EINTR) {}
+        }
+    }
+    int socket() const { return socket_.value; }
+    void settle_exit() {
+        Packet exit{};
+        exit.operation = Operation::Exit;
+        send_packet(socket_.value, exit);
+        int status = 0;
+        pid_t result;
+        do { result = waitpid(pid_, &status, 0); } while (result < 0 && errno == EINTR);
+        if (result != pid_) throw std::runtime_error("Vulkan peer wait failed");
+        pid_ = -1;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+            throw std::runtime_error("Vulkan exporter failed before settled exit");
+    }
+};
+
+static uint32_t pixel_seed(unsigned pair, unsigned slot, unsigned iteration) {
+    return (pair << 16U) | (slot << 15U) | iteration;
+}
+
+static int vulkan_peer() {
+    Fd socket;
+    socket.value = 3;
+    const auto settings = receive_packet(socket.value, Operation::Initialize);
+    Device device;
+    device.uuid = settings.uuid;
+    device.initialize_vulkan(settings.validation != 0);
+    for (unsigned pair = 0; pair < settings.pairs; ++pair) {
+        Image first(device, settings.width, settings.height, static_cast<MemoryOwner>(settings.owner));
+        Image second(device, settings.width, settings.height, static_cast<MemoryOwner>(settings.owner));
+        const std::array<Image*, 2> images{&first, &second};
+        for (unsigned slot = 0; slot < images.size(); ++slot) {
+            auto& image = *images[slot];
+            image.initialize(true);
+            Packet allocation = settings;
+            allocation.operation = Operation::Allocation;
+            allocation.pair = pair;
+            allocation.slot = slot;
+            allocation.bytes = image.bytes;
+            allocation.pitch = image.layout.rowPitch;
+            allocation.offset = image.layout.offset;
+            allocation.dedicated = image.needs_dedicated;
+            send_packet(socket.value, allocation, image.backing.value, image.exported_semaphore.value);
+            std::printf("vulkan_export pair=%u slot=%u initial_timeline=1 descriptors=2\n", pair, slot);
+        }
+        for (unsigned iteration = 0; iteration < settings.transfers; ++iteration) {
+            for (unsigned slot = 0; slot < images.size(); ++slot) {
+                auto write = receive_packet(socket.value, Operation::Write);
+                if (write.pair != pair || write.slot != slot || write.iteration != iteration ||
+                    write.seed != pixel_seed(pair, slot, iteration) || write.ready != 2ULL * (iteration + 1))
+                    throw std::runtime_error("invalid producer timeline or pixel identity");
+                images[slot]->consume(write.ready, write.seed);
+                write.operation = Operation::Compared;
+                send_packet(socket.value, write);
+            }
+        }
+        receive_packet(socket.value, pair + 1 == settings.pairs ? Operation::Exit : Operation::Next);
+    }
+    CHECK(vkDeviceWaitIdle(device.vk));
+    if (device.validation_errors.load(std::memory_order_relaxed))
+        throw std::runtime_error("Vulkan peer validation errors");
+    return 0;
+}
+
+using NativePair = std::array<std::unique_ptr<Image>, 2>;
+static NativePair run_peer(Exporter& peer, Device& device, Packet settings) {
+    settings.operation = Operation::Initialize;
+    settings.uuid = device.uuid;
+    send_packet(peer.socket(), settings);
+    NativePair images;
+    for (unsigned pair = 0; pair < settings.pairs; ++pair) {
+        for (unsigned slot = 0; slot < images.size(); ++slot) {
+            if (images[slot]) images[slot]->release_native();
+            images[slot] = std::make_unique<Image>(device, settings.width, settings.height,
+                                                  static_cast<MemoryOwner>(settings.owner));
+            auto& image = *images[slot];
+            const auto allocation = receive_packet(peer.socket(), Operation::Allocation,
+                                                   &image.backing, &image.exported_semaphore);
+            if (allocation.pair != pair || allocation.slot != slot || allocation.width != settings.width ||
+                allocation.height != settings.height || std::memcmp(&allocation.uuid, &device.uuid, sizeof(CUuuid)) ||
+                allocation.dedicated > 1 || (settings.owner == 2 && !allocation.dedicated) ||
+                allocation.pitch < uint64_t(settings.width) * 4 || allocation.offset > allocation.bytes ||
+                allocation.pitch > (allocation.bytes - allocation.offset) / settings.height)
+                throw std::runtime_error("invalid exported layout or device");
+            image.bytes = allocation.bytes;
+            image.layout.offset = allocation.offset;
+            image.layout.rowPitch = allocation.pitch;
+            image.needs_dedicated = allocation.dedicated != 0;
+            image.import_memory();
+            image.import_semaphore();
+            CHECK(cuMemAllocHost(&image.native, size_t(settings.width) * settings.height * 4));
+            std::printf("native_import pair=%u slot=%u pitch=%lu offset=%lu bytes=%zu dedicated=%u retained_fd=%d cuda_va=%llu\n",
+                        pair, slot, image.layout.rowPitch, image.layout.offset, image.bytes,
+                        allocation.dedicated, image.backing.value, image.address);
+        }
+        for (unsigned iteration = 0; iteration < settings.transfers; ++iteration) {
+            for (unsigned slot = 0; slot < images.size(); ++slot) {
+                Packet write{};
+                write.operation = Operation::Write;
+                write.pair = pair;
+                write.slot = slot;
+                write.iteration = iteration;
+                write.seed = pixel_seed(pair, slot, iteration);
+                write.ready = images[slot]->produce(write.seed);
+                send_packet(peer.socket(), write);
+                const auto compared = receive_packet(peer.socket(), Operation::Compared);
+                if (compared.pair != pair || compared.slot != slot || compared.iteration != iteration ||
+                    compared.seed != write.seed || compared.ready != write.ready)
+                    throw std::runtime_error("Vulkan comparison acknowledgement mismatch");
+            }
+        }
+        if (pair + 1 != settings.pairs) {
+            Packet next{};
+            next.operation = Operation::Next;
+            send_packet(peer.socket(), next);
+        }
+    }
+    peer.settle_exit();
+    for (unsigned slot = 0; slot < images.size(); ++slot)
+        images[slot]->native_read(pixel_seed(settings.pairs - 1, slot, settings.transfers - 1));
+    std::puts("exporter_exit=settled retained_native_pixels=equal independent_backing_fd=held");
+    return images;
+}
+
+static void cross_process(Packet settings, unsigned context_mode) {
+    Exporter peer; // Fresh executable launched before any GPU initialization here.
+    Device device;
+    device.initialize_cuda(context_mode);
+    auto retained = run_peer(peer, device, settings);
+    Exporter replacement;
+    Packet replacement_settings = settings;
+    replacement_settings.pairs = 1;
+    auto replaced = run_peer(replacement, device, replacement_settings);
+    for (unsigned slot = 0; slot < retained.size(); ++slot)
+        retained[slot]->native_read(pixel_seed(settings.pairs - 1, slot, settings.transfers - 1));
+    for (auto& image : retained) image->release_native();
+    for (auto& image : replaced) image->release_native();
+    retained = {};
+    replaced = {};
+    std::printf("PASS process_mode=1 images=%u transfers=%u pixels_per_transfer=%lu replacement=settled final_release=complete\n",
+                (settings.pairs + 1) * 2, (settings.pairs + 1) * 2 * settings.transfers,
+                size_t(settings.width) * settings.height);
+}
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--vulkan-peer") == 0) return vulkan_peer();
         if (argc == 2 && std::strcmp(argv[1], "--help") == 0) {
-            std::puts("Usage: ./mmltk --test cuda-vulkan -- [width height allocation-pairs transfers validation context-mode memory-owner]");
-            std::puts("Defaults: 894 512 32 8 0 2 0. validation is 0/1; context-mode is 0=primary, 1=isolated, 2=separate producer/semaphore.");
+            std::puts("Usage: ./mmltk --test cuda-vulkan -- [width height allocation-pairs transfers validation context-mode memory-owner process-mode]");
+            std::puts("Defaults: 894 512 32 8 0 2 0 0. validation is 0/1; context-mode is 0=primary, 1=isolated, 2=separate producer/semaphore.");
             std::puts("memory-owner: 0=CUDA VMM, 1=Vulkan, 2=Vulkan dedicated. Vulkan-owned memory starts with Vulkan signal 1.");
             std::puts("Two alternating images per pair; a CUDA kernel writes every pixel before each timeline handoff and comparison.");
-            std::puts("CUDA and Vulkan share one process; FD transfer uses a local SCM_RIGHTS socket pair.");
+            std::puts("process-mode: 0=same process (all owners), 1=separate Vulkan/CUDA processes (owners 1/2), with exporter-exit retention and replacement.");
             return 0;
         }
-        std::array<unsigned, 7> options{894, 512, 32, 8, 0, 2, 0};
-        if (argc > 8) throw std::runtime_error("too many arguments; use --help");
+        std::array<unsigned, 8> options{894, 512, 32, 8, 0, 2, 0, 0};
+        if (argc > 9) throw std::runtime_error("too many arguments; use --help");
         for (int i = 1; i < argc; ++i) {
             const auto [end, error] = std::from_chars(argv[i], argv[i] + std::strlen(argv[i]), options[i - 1]);
             if (error != std::errc{} || *end) throw std::runtime_error("invalid numeric argument");
         }
-        auto [width, height, pairs, transfers, validation, context_mode, memory_owner] = options;
+        auto [width, height, pairs, transfers, validation, context_mode, memory_owner, process_mode] = options;
         if (!width || !height || width > 4096 || height > 4096 || !pairs || pairs > 256 ||
-            !transfers || transfers > 256 || validation > 1 || context_mode > 2 || memory_owner > 2)
+            !transfers || transfers > 256 || validation > 1 || context_mode > 2 || memory_owner > 2 || process_mode > 1 || (process_mode && !memory_owner))
             throw std::runtime_error("argument out of range");
+        if (process_mode) {
+            Packet settings{};
+            settings.width = width;
+            settings.height = height;
+            settings.pairs = pairs;
+            settings.transfers = transfers;
+            settings.validation = validation;
+            settings.owner = memory_owner;
+            cross_process(settings, context_mode);
+            return 0;
+        }
         Device device;
-        device.initialize(validation, context_mode);
+        device.initialize_cuda(context_mode);
+        device.initialize_vulkan(validation);
         for (unsigned pair = 0; pair < pairs; ++pair) {
             const auto owner = static_cast<MemoryOwner>(memory_owner);
             Image first(device, width, height, owner), second(device, width, height, owner);
             first.initialize();
             second.initialize();
             for (unsigned iteration = 0; iteration < transfers; ++iteration) {
-                first.transfer(0xff000001U | (pair << 16) | (iteration << 8));
-                second.transfer(0xff800002U | (pair << 16) | (iteration << 8));
+                first.transfer(pixel_seed(pair, 0, iteration));
+                second.transfer(pixel_seed(pair, 1, iteration));
             }
         }
         if (device.validation_errors.load(std::memory_order_relaxed))

@@ -3,6 +3,7 @@
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from itertools import permutations
+import errno
 import json
 import os
 from pathlib import Path
@@ -1045,7 +1046,9 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0, diagnostics)
         related = [row for row in rows if row["_log"]["match"] == "auto"]
         self.assertEqual(len(related), logs.MAX_AUTO_VULKAN_RELATED)
-        self.assertEqual({row["data"]["event"] for row in related}, logs.VULKAN_PROVENANCE_EVENTS)
+        self.assertEqual({row["data"]["event"] for row in related}, {
+            "firefox.workspace.image_created", "firefox.workspace.memory_import",
+            "firefox.workspace.memory_bound", "firefox.workspace.direct_binding"})
         self.assertTrue(all("same-file handle candidate; process unrecorded" in row["_log"]["auto_reason"]
                             for row in related))
         self.assertTrue(all(row["_log"]["file"].endswith("-firefox.log") for row in related))
@@ -1603,6 +1606,145 @@ class FileQueryTests(unittest.TestCase):
         status, _, report = self.run_query("--descriptor-lineage")
         self.assertEqual(status, 2)
         self.assertIn("requires --query", report)
+
+    def vulkan_export_lineage_fixture(self, mutate=None):
+        source = "00000000000000010000000000000002"
+        shared = {"source": source, "workspace_allocation": 34, "browser_process_id": 202}
+        layout = {"device_uuid": "00112233445566778899aabbccddeeff", "device_incarnation": 7,
+                  "memory_size": 8192, "row_pitch": 256, "image_offset": 128, "dedicated": True}
+        transport = {**shared, **layout, "native_process_id": 101, "descriptor_count": 2,
+                     "memory_descriptor_index": 0, "record_bytes": 256, "peer_credentials_known": True,
+                     "initialization": "vulkan_external_ownership_settled"}
+        physical = {**shared, "vk_device": "0x10", "vk_image": "0x20", "vk_memory": "0x30", "vk_status": 0}
+        imported = {**layout, "native_process_id": 101, "workspace_allocation": 34,
+                    "retained_memory_descriptor": 77, "cuda_status": 0}
+        browser = [
+            {"event": "firefox.workspace.memory_allocation", **physical},
+            {"event": "firefox.workspace.memory_bound", **physical},
+            {"event": "firefox.workspace.memory_export", **physical, **layout, "workspace_descriptor": 9},
+            {"event": "firefox.workspace.descriptor_send", **transport, "workspace_descriptor": 9},
+            {"event": "firefox.workspace.descriptor_send_result", **transport, "workspace_descriptor": 9,
+             "send_bytes": -1, "send_errno": errno.EAGAIN},
+            {"event": "firefox.workspace.descriptor_send", **transport, "workspace_descriptor": 9},
+            {"event": "firefox.workspace.descriptor_send_result", **transport, "workspace_descriptor": 9,
+             "send_bytes": 256, "send_errno": 0},
+        ]
+        native = [
+            {"event": "presentation.workspace.descriptor_received", **transport, "workspace_descriptor": 77},
+            {"event": "cuda.workspace.memory_import_started", **imported, "import_descriptor": 78},
+            {"event": "cuda.workspace.memory_import", **imported, "import_descriptor": -1,
+             "cuda_external_memory": 4096, "fd_consumed": True},
+            {"event": "cuda.workspace.memory_map", **imported, "cuda_external_memory": 4096, "cuda_mapped_base": 8192},
+            {"event": "cuda.workspace.memory_retirement_started", **imported,
+             "cuda_external_memory": 4096, "cuda_mapped_base": 8192},
+            {"event": "cuda.workspace.memory_retirement", **imported,
+             "cuda_external_memory": 0, "cuda_mapped_base": 0},
+        ]
+        if mutate:
+            mutate(native, browser)
+        self.write("build/validation/export-lineage-native.log", native)
+        self.write("build/validation/export-lineage-firefox.log", browser)
+        return ("--family", "export-lineage", "-q", "workspace_allocation=34", "--descriptor-lineage", "--limit", "64")
+
+    def test_vulkan_export_lineage_preserves_descriptor_roles_and_retry_results(self):
+        status, rows, report = self.exported(*self.vulkan_export_lineage_fixture())
+        self.assertEqual(status, 0, report)
+        self.assertEqual(len(rows), 13)
+        for text in ("direction=Vulkan_export_to_CUDA_import", "send_attempt(count=2)",
+                     "native_received(fd=77)", "retained_fd=77,import_fd=78,status=0",
+                     "conflicts: none observed in retained evidence"):
+            self.assertIn(text, report)
+        self.assertNotIn("(missing)", report)
+        self.assertNotIn("(ambiguous)", report)
+
+    def test_vulkan_export_lineage_missing_success_and_conflicting_import_are_explicit(self):
+        def change(native, browser):
+            browser.pop()
+            native[3].update(row_pitch=512, cuda_status=1)
+            native[1]["import_descriptor"] = 77
+        _, _, report = self.exported(*self.vulkan_export_lineage_fixture(change))
+        for text in ("send_result(no_unique_success)", "lacks an exact successful record-length result",
+                     "row_pitch differs", "cuda_map cuda_status=1", "not an independent duplicate"):
+            self.assertIn(text, report)
+
+    def test_vulkan_export_lineage_rejects_ambiguous_source_association(self):
+        def change(native, browser):
+            native.append({**native[0], "source": "00000000000000050000000000000006"})
+        _, _, report = self.exported(*self.vulkan_export_lineage_fixture(change))
+        self.assertIn("ambiguous native process/allocation source association", report)
+        self.assertIn("cuda_import(missing)", report)
+
+    def test_vulkan_export_lineage_keeps_process_scoped_imports_and_null_success_visible(self):
+        def unrelated(native, browser):
+            native.append({**native[3], "native_process_id": 303, "row_pitch": 4096})
+        _, _, report = self.exported(*self.vulkan_export_lineage_fixture(unrelated))
+        self.assertIn("conflicts: none observed in retained evidence", report)
+        def null_map(native, browser):
+            native[3]["cuda_mapped_base"] = 0
+        _, _, report = self.exported(*self.vulkan_export_lineage_fixture(null_map))
+        self.assertIn("cuda_map reports success with null cuda_mapped_base", report)
+
+    def test_vulkan_export_lineage_requires_retained_retirement_evidence(self):
+        arguments = self.vulkan_export_lineage_fixture()
+        _, _, report = self.exported(*arguments, "--where", "NOT @event:memory_retirement")
+        for stage in ("retirement_started", "retirement"):
+            self.assertIn(f"{stage}(missing)", report)
+        self.assertIn("conflicts: none observed in retained evidence", report)
+        self.assertIn("missing/ambiguous stages are not proof of a failed handoff", report)
+        def absent(native, browser):
+            del native[4:]
+        _, _, report = self.exported(*self.vulkan_export_lineage_fixture(absent))
+        self.assertIn("retirement_started(missing)", report)
+        self.assertIn("retirement(missing)", report)
+
+    def test_vulkan_export_lineage_retirement_requires_released_handles_and_same_backing(self):
+        for field, value, expected in (
+                ("cuda_mapped_base", 8192, "retirement reports success with unreleased cuda_mapped_base"),
+                ("cuda_external_memory", 4096, "retirement reports success with unreleased cuda_external_memory"),
+                ("cuda_status", 1, "retirement cuda_status=1"),
+                ("retained_memory_descriptor", 78, "retained_memory_descriptor differs")):
+            with self.subTest(field=field):
+                def change(native, browser):
+                    native[-1][field] = value
+                _, _, report = self.exported(*self.vulkan_export_lineage_fixture(change))
+                self.assertIn(expected, report)
+
+    def test_vulkan_export_lineage_compares_every_immutable_retry_observation(self):
+        for index in (3, 4, 5):  # Both attempts and the EAGAIN result precede the successful send.
+            for field, value in (("workspace_descriptor", 10), ("row_pitch", 512),
+                                 ("initialization", "not_settled"), ("record_bytes", 128),
+                                 ("memory_descriptor_index", 1), ("dedicated", False)):
+                with self.subTest(index=index, field=field):
+                    def change(native, browser):
+                        browser[index][field] = value
+                    _, _, report = self.exported(*self.vulkan_export_lineage_fixture(change))
+                    self.assertIn(f"{field} differs", report)
+                    self.assertNotIn("send_result(no_unique_success)", report)
+
+    def test_vulkan_export_lineage_distinguishes_missing_source_association(self):
+        def missing(native, browser):
+            for row in [native[0], *browser]:
+                row.pop("native_process_id", None)
+        def separated(native, browser):
+            missing(native, browser)
+            # A process observation and an allocation observation on separate
+            # rows do not establish an exact process/allocation association.
+            browser[0]["native_process_id"] = 101
+            browser[0].pop("workspace_allocation")
+        for mutate in (missing, separated):
+            with self.subTest(association=mutate.__name__):
+                _, _, report = self.exported(*self.vulkan_export_lineage_fixture(mutate))
+                self.assertIn("missing native process/allocation source association", report)
+                self.assertNotIn("ambiguous native process/allocation source association", report)
+                self.assertIn("cuda_import(missing)", report)
+                self.assertIn("conflicts: none observed in retained evidence", report)
+
+    def test_vulkan_export_lineage_source_query_correlates_process_allocation(self):
+        arguments = self.vulkan_export_lineage_fixture()
+        status, rows, report = self.exported(*arguments, "-q", 'source="00000000000000010000000000000002"')
+        self.assertEqual(status, 0, report)
+        self.assertIn("cuda.workspace.memory_map", {row["data"]["event"] for row in rows})
+        self.assertNotIn("cuda_map(missing)", report)
 
     def test_loaded_library_mapping_inventory_preserves_actual_paths_and_limits(self):
         path = "/usr/lib/x86_64-linux-gnu/libGLX_nvidia.so.580.42.09"
