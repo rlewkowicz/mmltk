@@ -345,16 +345,18 @@ mod tests {
             completed: None,
             retained_read: None,
             pending_sample: Some(super::super::PendingImage {
-                read,
+                read: Some(read),
                 surface,
                 gallery: Some(retained.clone()),
                 detail: None,
+                annotation: None,
                 placement: placement(&snapshot),
                 complete: false,
                 view_ready: false,
             }),
             gallery: None,
             detail: None,
+            annotation: None,
             placement: placement(&snapshot),
         };
         let mut model = crate::view_model::test_support::bootstrapped();
@@ -508,6 +510,62 @@ mod tests {
         confirm(native, &snapshot.frame, Some(&snapshot));
         assert!(matching(Some(native)).is_none());
 
+        clear();
+    }
+
+    #[test]
+    fn detail_return_reauthorizes_the_retained_gallery_with_independent_read_custody() {
+        use super::super::{
+            SampleRead, accept_publication, reset_test_releases, retire_publication, test_releases,
+        };
+
+        reset_test_releases();
+        let mut snapshot = gallery_snapshot();
+        snapshot.revision = 10;
+        let original = frame_ready();
+        select(Some(&snapshot), &snapshot.frame);
+        confirm(original, &snapshot.frame, Some(&snapshot));
+        let original_facts = matching(Some(original)).unwrap();
+        assert!(accept_publication(original));
+        let encoded_draw = SampleRead::acquire(original).unwrap();
+
+        let mut detail = snapshot.clone();
+        detail.mode = ExploreMode::Detail;
+        detail.selectedimage = Some(0);
+        detail.revision = 20;
+        detail.frame.revision += 1;
+        select(Some(&detail), &detail.frame);
+        assert!(matching(Some(original)).is_none());
+        retire_publication(original);
+        assert!(test_releases().is_empty());
+
+        snapshot.revision = 30;
+        let returned = FrameReady {
+            slot: 1,
+            presentation_revision: original.presentation_revision + 2,
+            ..original
+        };
+        select(Some(&snapshot), &snapshot.frame);
+        assert!(matching(Some(returned)).is_none());
+        // A late detail completion cannot authorize a gallery with older pixels.
+        confirm(returned, &detail.frame, Some(&detail));
+        assert!(matching(Some(returned)).is_none());
+        confirm(returned, &snapshot.frame, Some(&snapshot));
+        let returned_facts = matching(Some(returned)).unwrap();
+        assert_eq!(returned_facts.revision, 30);
+        assert_eq!(returned_facts.frame, original_facts.frame);
+        assert_eq!(returned_facts.gallery, original_facts.gallery);
+        assert_eq!(returned_facts.order, original_facts.order);
+        assert!(matching(Some(original)).is_none());
+        assert!(accept_publication(returned));
+        let returned_read = SampleRead::acquire(returned).unwrap();
+        // Return selection does not revoke an already encoded old draw.
+        drop(encoded_draw);
+        assert_eq!(test_releases(), vec![original]);
+        retire_publication(returned);
+        assert_eq!(test_releases(), vec![original]);
+        drop(returned_read);
+        assert_eq!(test_releases(), vec![original, returned]);
         clear();
     }
 

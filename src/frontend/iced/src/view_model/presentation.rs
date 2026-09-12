@@ -679,6 +679,58 @@ mod tests {
     }
 
     #[test]
+    fn gallery_return_orders_an_older_retained_product_by_its_new_observation() {
+        for domain_first in [false, true] {
+            let mut model = bootstrapped();
+            model.set_foreground_feature(FeatureId::Explore);
+            let gallery = visual_frame(PresentationSourceKind::Explore, 3);
+            let detail = visual_frame(PresentationSourceKind::Explore, 19);
+            {
+                let explore = model.explore.snapshot.as_mut().unwrap();
+                explore.ready = true;
+                explore.mode = crate::generated::ExploreMode::Detail;
+                explore.selectedimage = Some(0);
+                explore.revision = 20;
+                explore.frame = detail.clone();
+                let control = model.presentation.as_mut().unwrap();
+                control.completed = detail.clone();
+                control.completedsourcerevision = 20;
+            }
+            assert_eq!(
+                model.completed_presentation_reconciliation().unwrap(),
+                Reconciliation::Matching
+            );
+            for domain in [domain_first, !domain_first] {
+                if domain {
+                    let explore = model.explore.snapshot.as_mut().unwrap();
+                    explore.mode = crate::generated::ExploreMode::Gallery;
+                    explore.selectedimage = None;
+                    explore.revision = 30;
+                    explore.frame = gallery.clone();
+                } else {
+                    let control = model.presentation.as_mut().unwrap();
+                    control.completed = gallery.clone();
+                    control.completedsourcerevision = 30;
+                }
+                let both_arrived = model.explore.snapshot.as_ref().unwrap().revision == 30
+                    && model.presentation.as_ref().unwrap().completedsourcerevision == 30;
+                assert_eq!(
+                    model.completed_presentation_reconciliation().unwrap(),
+                    if both_arrived {
+                        Reconciliation::Matching
+                    } else if domain {
+                        Reconciliation::Superseded
+                    } else {
+                        Reconciliation::MetadataPending
+                    }
+                );
+            }
+            assert_eq!(model.explore.snapshot.as_ref().unwrap().frame, gallery);
+            assert!(!model.completed_presentation_is_obsolete().unwrap());
+        }
+    }
+
+    #[test]
     fn explore_upscale_reconciliation_uses_observation_order_for_cached_products() {
         let mut model = bootstrapped();
         let input = select_upscale_source(&mut model, crate::generated::UpscaleKernel::Default);

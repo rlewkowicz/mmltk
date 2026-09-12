@@ -25,6 +25,7 @@
 #include <new>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -719,9 +720,32 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
     gallery.Open(path);
     static_cast<void>(gallery.Step());
     pause.Wait();
+    auto ready = gallery.algorithm->AdvanceGallery().ready_slots;
+    std::array pixels{gallery.Pixels(0U), gallery.Pixels(1U)};
+    const auto check_visible_continuity = [&] {
+        const auto current = gallery.algorithm->AdvanceGallery().ready_slots;
+        REQUIRE(current.size() == ready.size());
+        const auto& layout = gallery.displayed_layout;
+        for (std::size_t plane = 0U; plane < pixels.size(); ++plane) {
+            auto next = gallery.Pixels(plane);
+            for (std::size_t slot = 0U; slot < ready.size(); ++slot) {
+                if (!ready[slot]) continue;
+                REQUIRE(current[slot]);
+                for (std::size_t row = 0U; row < layout.card_extent; ++row) {
+                    const auto offset = ((slot / layout.columns * layout.card_extent + row) * layout.columns +
+                                         slot % layout.columns) * layout.card_extent * 4U;
+                    CHECK(std::ranges::equal(std::span{pixels[plane]}.subspan(offset, layout.card_extent * 4U),
+                                              std::span{next}.subspan(offset, layout.card_extent * 4U)));
+                }
+            }
+            pixels[plane] = std::move(next);
+        }
+        ready = current;
+    };
     for (;;) {
         const auto observed = gallery.evidence.Epoch();
         const auto partial = gallery.Step();
+        check_visible_continuity();
         if (partial.remaining_tiles == 1U) break;
         gallery.evidence.Wait(observed);
     }
@@ -744,17 +768,24 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
         gallery.Begin();
         CHECK(gallery.Pixels(0U) == before);
         const auto retained_revision = gallery.runtime->Completed().revision();
+        const auto retained_allocation = gallery.runtime->Borrow().plane(0U).plane().allocation;
         gallery.plan.mode = ExploreMode::Detail;
         gallery.plan.selected_image = 0U;
         gallery.demand->store(++gallery.plan.generation);
         gallery.Begin();
         REQUIRE(gallery.algorithm->Document());
+        auto detail_read = gallery.runtime->Borrow();
+        const auto detail_revision = detail_read.plane(0U).revision();
         gallery.plan.mode = ExploreMode::Gallery;
         gallery.plan.selected_image.reset();
         gallery.demand->store(++gallery.plan.generation);
         gallery.Begin();
         CHECK(gallery.runtime->Completed().revision() == retained_revision);
+        CHECK(gallery.runtime->Borrow().plane(0U).plane().allocation == retained_allocation);
+        CHECK(detail_read.plane(0U).revision() == detail_revision);
+        CHECK(detail_revision > retained_revision);
         CHECK(gallery.Pixels(0U) == before);
+        check_visible_continuity();
         const auto returned = gallery.algorithm->AdvanceGallery();
         REQUIRE(returned.ready_slots.size() == 8U);
         CHECK_FALSE(returned.ready_slots[0U]);
@@ -764,6 +795,7 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
     gallery.runtime->BindContext();
     pause.Release();
     gallery.Drain();
+    check_visible_continuity();
     CHECK(std::ranges::all_of(gallery.algorithm->AdvanceGallery().ready_slots, [](bool ready) { return ready; }));
 }
 
