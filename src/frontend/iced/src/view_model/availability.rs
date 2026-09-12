@@ -380,7 +380,7 @@ impl ApplicationModel {
                 snapshot.ready
                     && !snapshot.busy
                     && !snapshot.cancellationrequested
-                    && Self::valid_visual_source(&snapshot.frame).is_some()
+                    && snapshot.ui.documentrevision != 0
             })
             && !self.has_annotation_pending()
     }
@@ -392,7 +392,6 @@ impl ApplicationModel {
                     && !snapshot.busy
                     && !snapshot.cancellationrequested
                     && snapshot.ui.documentrevision != 0
-                    && Self::valid_visual_source(&snapshot.frame).is_some()
             })
             && !self.has_annotation_pending()
     }

@@ -361,6 +361,7 @@ mod tests {
     fn pointer() -> AnnotationPointer {
         AnnotationPointer {
             phase: Phase::Begin, interactionid: 1, sequence: 1,
+            identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
             target: generated::AnnotationPointerTarget { object: None, element: None, role: None },
             point: AnnotationPoint { x: 1.25, y: 2.5 }, brushradius: 9,
         }
@@ -382,6 +383,7 @@ mod tests {
             AnnotationPointer { phase: Phase::End, ..next.clone() },
             AnnotationPointer { phase: Phase::Cancel, ..next.clone() },
             AnnotationPointer { target: generated::AnnotationPointerTarget { object: Some(1), element: None, role: None }, ..next.clone() },
+            AnnotationPointer { identity: generated::AnnotationTargetIdentity { object: 7, element: 0 }, ..next.clone() },
         ] {
             assert!(matches!(compact_sample(&changed, Some(&prior)), Wire::AnnotationPointer(value) if value == changed));
         }

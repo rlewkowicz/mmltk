@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +46,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -5308,9 +5310,11 @@ TEST_CASE("Annotation color sampling completes before following document command
     annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) { consumed = progress.consumed_sequence; events.Advance(); });
     annotation.Input({.document_epoch = annotation.snapshot().input_document_epoch, .sequence = 1U,
         .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U,
-                    .target = {.object = 0U}, .point = {4,5}},
+                    .target = {.object = 0U},
+                    .identity = {.object = annotation.snapshot().rendered_scene.identities.at(0)}, .point = {4,5}},
                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 2U,
-                    .target = {.object = 0U}, .point = {4,5}}}});
+                    .target = {.object = 0U},
+                    .identity = {.object = annotation.snapshot().rendered_scene.identities.at(0)}, .point = {4,5}}}});
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     CHECK(consumed.load() == 1U);
     const auto undo = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
@@ -6963,7 +6967,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
                        .device_uuid = {1U},
                        .memory_type_bits = 1U};
     const auto admitted = record;
-    REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), 19U, 23U));
+    REQUIRE(channel.admit_source(record, 7U, std::move(memory), edge.get(), signal.descriptor(), edge.get(), 19U, 23U));
     CHECK(channel.claimable(id) == !deferred);
     CHECK(channel.wants_write() == deferred);
     REQUIRE(capture.count == (capture.enabled ? (deferred ? 1U : 2U) : 0U));
@@ -6987,7 +6991,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
     for (std::size_t index = 0U; index < descriptors.descriptor_count; ++index)
         CHECK(::fcntl(descriptors.descriptors[index].get(), F_GETFD) >= 0);
     CHECK(abi::valid(sent));
-    // Record is the frozen, padding-free 144-byte wire layout.
+    // Record is the canonical ABI11 wire layout.
     CHECK(std::memcmp(&sent, &admitted, sizeof(sent)) == 0);
     REQUIRE(capture.count == (capture.enabled ? 2U : 0U));
     if (!capture.enabled) return;
@@ -7056,8 +7060,9 @@ class WorkspaceChannelFixture final {
                 .presentation_revision = 9U};
     }
 
-    Record AdmitArena(const Id id, const std::uint64_t generation) {
-        const auto layout = Layout(id);
+    Record AdmitArena(const Id id, const std::uint64_t generation, const bool direct = false) {
+        auto layout = Layout(id);
+        layout.direct_sampling = direct ? 1U : 0U;
         REQUIRE(channel.admit_arena(id, generation, layout.width, layout.height));
         ExpectRecord(id, Opcode::Arena);
         REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), layout));
@@ -7067,6 +7072,31 @@ class WorkspaceChannelFixture final {
         CHECK(outcome->id == id);
         REQUIRE(outcome->imported);
         return layout;
+    }
+
+    void AdmitSource(const Id id, const Id arena, const Record layout, const std::uint64_t generation) {
+        auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
+        auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
+        auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
+        auto imported = layout;
+        imported.id_high = id.high;
+        imported.id_low = id.low;
+        imported.arena_high = arena.high;
+        imported.arena_low = arena.low;
+        imported.allocation_identity = 6U;
+        REQUIRE(channel.admit_source(imported, generation, std::move(memory), edge.get(), signal.descriptor(), edge.get()));
+        Record received{};
+        CHECK(mmltk::testsupport::receive_workspace_record(peer.get(), received).descriptor_count ==
+              presentation::detail::workspace_surface_import::kImportDescriptorCount);
+        auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
+        const std::array descriptors{timeline.get()};
+        REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(),
+            {.opcode = Opcode::Ready, .id_high = id.high, .id_low = id.low,
+             .descriptors = presentation::detail::workspace_surface_import::kReadyDescriptorCount}, descriptors));
+        channel.pump();
+        const auto outcome = channel.take_outcome();
+        REQUIRE(outcome.has_value());
+        REQUIRE(outcome->imported);
     }
 
     void Withdraw(const Id id) {
@@ -7104,32 +7134,20 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     const presentation::WorkspaceSurfaceImportId source{3U, 4U};
     abi::Record received{};
     const auto layout = fixture.AdmitArena(arena, 1U);
-    auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
-    auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
-    auto signal = presentation::WorkspaceSurfaceFrameSignal::create();
-    auto imported = layout;
-    imported.id_high = source.high;
-    imported.id_low = source.low;
-    imported.arena_high = arena.high;
-    imported.arena_low = arena.low;
-    imported.allocation_identity = 6U;
-    REQUIRE(channel.admit_source(imported, 2U, std::move(memory), edge.get(), signal.descriptor()));
-    CHECK(receive_workspace_record(peer.get(), received).descriptor_count == abi::kImportDescriptorCount);
-    auto timeline = mmltk::testsupport::workspace_surface_event_descriptor();
-    const std::array descriptors{timeline.get()};
-    REQUIRE(send_workspace_record(
-        peer.get(), {.opcode = abi::Opcode::Ready, .id_high = source.high, .id_low = source.low, .descriptors = abi::kReadyDescriptorCount},
-        descriptors));
-    channel.pump();
-    const auto source_outcome = channel.take_outcome();
-    REQUIRE(source_outcome.has_value());
-    REQUIRE(source_outcome->imported);
+    fixture.AdmitSource(source, arena, layout, 2U);
     // A capacity retry may repeat content and presentation while representing
     // a new physical source transfer. The wire must preserve that distinction.
     for (const auto transfer : {1U, 2U}) {
-        REQUIRE(channel.copy_completed(source, {7U, 8U}, 9U, transfer));
+        REQUIRE(send_workspace_record(peer.get(), {.opcode = abi::Opcode::Acquired, .id_high = source.high,
+            .id_low = source.low, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = transfer}));
+        channel.pump();
+        const auto acquisition = channel.take_acquisition();
+        REQUIRE(acquisition.has_value());
+        CHECK(acquisition->offset == transfer);
+        CHECK_FALSE(channel.take_acquisition().has_value());
+        REQUIRE(channel.read_settled(source, {7U, 8U}, 9U, transfer));
         static_cast<void>(receive_workspace_record(peer.get(), received));
-        CHECK(received.opcode == abi::Opcode::CopyCompleted);
+        CHECK(received.opcode == abi::Opcode::ReadSettled);
         CHECK(received.offset == transfer);
         CHECK(received.stride == 7U);
         CHECK(received.size == 8U);
@@ -7143,7 +7161,7 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
         malformed.code = 1U;
         CHECK_FALSE(abi::valid(malformed));
     }
-    CHECK_FALSE(channel.copy_completed(source, {7U, 8U}, 9U, 0U));
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 0U));
     auto sample = WorkspaceChannelFixture::Sample(arena);
     REQUIRE(send_workspace_record(peer.get(), sample));
     channel.pump();
@@ -7156,6 +7174,124 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     REQUIRE(send_workspace_record(peer.get(), sample));
     fixture.Retire(arena, 1U);
     CHECK_FALSE(channel.terminal_error());
+}
+
+TEST_CASE("A blocked acquisition notification retains exact settlement after a racing Drop", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
+    const bool direct = GENERATE(false, true);
+    const bool terminal = GENERATE(false, true);
+    CAPTURE(direct, terminal);
+    WorkspaceChannelFixture fixture;
+    auto& channel = fixture.channel;
+    auto& peer = fixture.peer;
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    const presentation::WorkspaceSurfaceImportId source{3U, 4U};
+    const auto layout = fixture.AdmitArena(arena, 1U, direct);
+    fixture.AdmitSource(source, arena, layout, 2U);
+    const int send_bytes = 4096;
+    REQUIRE(::setsockopt(peer.get(), SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0);
+    const abi::Record filler{.opcode = abi::Opcode::Drop, .id_high = 101U, .id_low = 102U};
+    std::size_t fillers = 0U;
+    while (fillers < 256U && send_workspace_record(peer.get(), filler)) ++fillers;
+    REQUIRE(fillers > 0U);
+    REQUIRE(fillers < 256U);
+    const abi::Record acquired{.opcode = abi::Opcode::Acquired, .id_high = source.high,
+        .id_low = source.low, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
+    std::barrier blocked{2};
+    std::barrier drop_seen{2};
+    std::barrier writable{2};
+    bool backpressured = false;
+    bool dropped = false;
+    bool notified = false;
+    std::exception_ptr failure;
+    std::jthread browser([&] {
+        try { backpressured = !send_workspace_record(peer.get(), acquired); }
+        catch (...) { failure = std::current_exception(); }
+        blocked.arrive_and_wait();
+        try {
+            abi::Record received{};
+            static_cast<void>(receive_workspace_record(peer.get(), received));
+            dropped = received.opcode == abi::Opcode::Drop && received.id_high == source.high && received.id_low == source.low;
+        } catch (...) { failure = std::current_exception(); }
+        drop_seen.arrive_and_wait();
+        writable.arrive_and_wait();
+        try {
+            if (terminal) peer.reset();
+            else notified = send_workspace_record(peer.get(), acquired);
+        } catch (...) { failure = std::current_exception(); }
+    });
+    blocked.arrive_and_wait();
+    const auto withdrawal = channel.withdraw(source);
+    CHECK(withdrawal.progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
+    drop_seen.arrive_and_wait();
+    CHECK(backpressured);
+    CHECK(dropped);
+    // Remove transport fillers directly; they are deliberately not protocol
+    // messages delivered to the native channel. Drop already crossed in the
+    // opposite direction while the real Acquired datagram could not be sent.
+    for (std::size_t index = 0U; index < fillers; ++index) {
+        abi::Record received{};
+        static_cast<void>(receive_workspace_record(channel.poll_fd(), received));
+        CHECK(received.opcode == filler.opcode);
+    }
+    writable.arrive_and_wait();
+    browser.join();
+    if (failure) std::rethrow_exception(failure);
+    channel.pump();
+    if (terminal) {
+        CHECK_FALSE(channel.connected());
+        CHECK_FALSE(channel.take_acquisition());
+        CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
+        CHECK_FALSE(channel.take_retirement());
+        return;
+    }
+    REQUIRE(notified);
+    REQUIRE(channel.take_acquisition().has_value());
+    CHECK_FALSE(channel.claimable(source));
+    CHECK_FALSE(channel.take_retirement());
+    CHECK_FALSE(channel.read_settled(source, {7U, 99U}, 9U, 1U));
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 10U, 1U));
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 2U));
+    REQUIRE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    abi::Record settled{};
+    static_cast<void>(receive_workspace_record(peer.get(), settled));
+    CHECK(settled.opcode == abi::Opcode::ReadSettled);
+    CHECK(settled.stride == acquired.stride);
+    CHECK(settled.size == acquired.size);
+    CHECK(settled.presentation_revision == acquired.presentation_revision);
+    CHECK(settled.offset == acquired.offset);
+    fixture.Retire(source, 2U);
+    CHECK_FALSE(channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    CHECK_FALSE(channel.take_retirement());
+    CHECK_FALSE(channel.terminal_error());
+}
+
+TEST_CASE("Source admission rejects duplicate acquisition and retirement before exact settlement", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::send_workspace_record;
+    const bool premature_retirement = GENERATE(false, true);
+    WorkspaceChannelFixture fixture;
+    const presentation::WorkspaceSurfaceImportId arena{1U, 2U};
+    const presentation::WorkspaceSurfaceImportId source{3U, 4U};
+    fixture.AdmitSource(source, arena, fixture.AdmitArena(arena, 1U), 2U);
+    const abi::Record acquired{.opcode = abi::Opcode::Acquired, .id_high = source.high,
+        .id_low = source.low, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
+    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    fixture.channel.pump();
+    REQUIRE(fixture.channel.take_acquisition().has_value());
+    if (premature_retirement) {
+        fixture.Withdraw(source);
+        REQUIRE(send_workspace_record(fixture.peer.get(),
+            {.opcode = abi::Opcode::Retired, .id_high = source.high, .id_low = source.low}));
+    } else {
+        REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    }
+    fixture.channel.pump();
+    CHECK(fixture.channel.terminal_error().has_value());
+    CHECK_FALSE(fixture.channel.take_retirement());
 }
 
 TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[workspace][protocol]") {
@@ -7235,6 +7371,32 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
     CHECK(channel.connected());
 }
 
+TEST_CASE("Held acquired-read completion retains page capacity in either arrival order", "[workspace][protocol]") {
+    for (const bool capacity_first : {false, true}) {
+        PresentationAcceptanceGate gate;
+        std::vector<PresentationAcceptanceGate::Receipt> observed;
+        unsigned wakes = 0U;
+        gate.SetObserver([&](auto receipt) { observed.push_back(receipt); });
+        gate.SetWake([&] { ++wakes; });
+        REQUIRE(gate.Arm());
+        if (capacity_first) gate.ObserveCapacity();
+        REQUIRE(gate.Hold({.source_high = 1U, .source_low = 2U, .transfer = 3U, .publication = 4U}));
+        if (!capacity_first) gate.ObserveCapacity();
+        gate.ObserveCapacity();
+        REQUIRE(observed.size() == 2U);
+        CHECK_FALSE(observed[0].capacity_available);
+        CHECK(observed[1].capacity_available);
+        CHECK(observed[0].source_high == observed[1].source_high);
+        CHECK(observed[0].source_low == observed[1].source_low);
+        CHECK(observed[0].transfer == observed[1].transfer);
+        CHECK(observed[0].publication == observed[1].publication);
+        REQUIRE(gate.Release());
+        CHECK(wakes == 1U);
+        CHECK_FALSE(gate.Hold({.source_high = 8U}));
+        CHECK_FALSE(gate.Release());
+    }
+}
+
 TEST_CASE("Workspace capability ledgers survive sequential retirement beyond concurrent capacity", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7256,7 +7418,7 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                     layout.arena_low = 9U;
                     layout.allocation_identity = iteration;
                     REQUIRE(channel.admit_source(layout, iteration, mmltk::testsupport::workspace_surface_event_descriptor(), edge.get(),
-                                                 signal.descriptor()));
+                                                 signal.descriptor(), edge.get()));
                 } else {
                     REQUIRE(channel.admit_arena(id, iteration, 4U, 3U));
                 }

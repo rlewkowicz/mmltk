@@ -147,6 +147,7 @@ class PresentationAcceptanceGate final {
     std::function<void(Receipt)> observer_;
     bool armed_ = false;
     bool held_ = false;
+    bool capacity_seen_ = false;
     Receipt receipt_{};
     bool stopped_ = false;
 };

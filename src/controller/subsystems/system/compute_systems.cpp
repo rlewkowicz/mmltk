@@ -458,6 +458,7 @@ class PredictSystem::Impl final {
                       .device = visual.device,
                       .model = std::make_unique<PredictVisualModel>(factory),
                       .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                      .output_buffer_count = 2U,
                       .numa_node = visual.numa_node,
                       .execution = *execution,
                       .product_revisions = std::move(revisions),

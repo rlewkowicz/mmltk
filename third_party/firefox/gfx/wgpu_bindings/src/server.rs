@@ -1060,9 +1060,27 @@ pub extern "C" fn wgpu_server_texture_drop(global: &Global, id: id::TextureId) {
 pub extern "C" fn wgpu_server_attach_workspace_source(global: &Global, high: u64, low: u64) {
     let id = mmltk_workspace_channel::SurfaceId { high, low };
     match global.attach_mmltk_workspace_source(id) {
-        Ok(timeline) => mmltk_workspace_channel::send_ready(id, timeline),
+        Ok(()) => {},
         Err(error) => mmltk_workspace_channel::send_failed(id, error.code, error.stride, error.size),
     }
+}
+
+#[no_mangle]
+pub extern "C" fn wgpu_server_workspace_request(global: &Global, device: id::DeviceId,
+    high: u64, low: u64, width: u32, height: u32) {
+    let surface = mmltk_workspace_channel::SurfaceId { high, low };
+    if let Err(error) = global.request_mmltk_workspace(device, surface, width, height) {
+        mmltk_workspace_channel::send_failed(surface, error.code, error.stride, error.size);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wgpu_server_workspace_acquire(global: &Global, device_id: id::DeviceId,
+    high: u64, low: u64, session: u64, sequence: u64, publication: u64) {
+    let Some(identity) = MmltkWorkspaceFrameIdentity::new(0, session, sequence, publication) else { return; };
+    global.mmltk_workspace_dispatcher.shared.enqueue(MmltkWorkspaceDispatcherCommand::Acquire {
+        device_id, surface_id: mmltk_workspace_channel::SurfaceId { high, low }, identity,
+    });
 }
 
 #[no_mangle]
@@ -1518,8 +1536,13 @@ extern "C" {
         content_width: u32,
         content_height: u32,
         copy_complete: bool,
+        source_high: u64,
+        source_low: u64,
+        direct_sampling: bool,
     );
     fn wgpu_parent_workspace_source_requested(parent: WebGPUParentPtr, source_high: u64, source_low: u64);
+    fn wgpu_parent_workspace_request_ready(parent: WebGPUParentPtr, device: id::DeviceId,
+        high: u64, low: u64, width: u32, height: u32);
     fn wgpu_parent_external_texture_import_ready(
         parent: WebGPUParentPtr,
         device_id: id::DeviceId,
@@ -1751,11 +1774,37 @@ fn submit_mmltk_queue_and_wait(
 /// A registered private texture. All frame edges are consumed by the one
 /// bridge dispatcher; this handle only provides synchronous retirement before
 /// `wgpu` can destroy the destination image.
+struct MmltkWorkspaceImage {
+    device: ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    _device_custody: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl Drop for MmltkWorkspaceImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_image(self.image, None);
+            if self.memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.memory, None);
+            }
+        }
+    }
+}
+
 struct MmltkWorkspaceArena {
     device_id: id::DeviceId,
-    texture_id: id::TextureId,
+    texture_id: Mutex<Option<id::TextureId>>,
     surface_id: mmltk_workspace_channel::SurfaceId,
     destination: vk::Image,
+    storage: Option<Arc<MmltkWorkspaceImage>>,
+    initial_source: Mutex<Option<MmltkWorkspaceImage>>,
+    device: ash::Device,
+    queue: vk::Queue,
+    queue_family: u32,
+    queue_gate: Arc<Mutex<()>>,
+    ready: AtomicBool,
+    closed: AtomicBool,
     extent: vk::Extent3D,
     layout: mmltk_workspace_channel::Record,
     mailboxes: Mutex<MmltkWorkspaceMailboxes>,
@@ -1774,18 +1823,9 @@ impl MmltkWorkspaceMirror {
         }
         self.active = false;
         mmltk_workspace_channel::trace_state("mirror_stop", self.arena.surface_id, "texture_drop", false);
-        if !self.dispatcher.detach_destination(self.arena.texture_id) {
-            log::error!("WebGPU workspace mirror could not detach its page texture");
-            std::process::abort();
-        }
-        match mmltk_workspace_channel::release_live(self.arena.surface_id) {
-            mmltk_workspace_channel::LiveRelease::AwaitingDrop => {}
-            mmltk_workspace_channel::LiveRelease::Withdrawn => {
-                mmltk_workspace_channel::complete_retirement(self.arena.surface_id);
-            }
-            mmltk_workspace_channel::LiveRelease::NotLive => {
-            }
-        }
+        self.dispatcher.enqueue(MmltkWorkspaceDispatcherCommand::DetachDestination {
+            surface_id: self.arena.surface_id,
+        });
     }
 }
 
@@ -1843,42 +1883,38 @@ const MMLTK_WORKSPACE_MAILBOX_COUNT: usize =
     MMLTK_WORKSPACE_LAYER_COUNT * MMLTK_WORKSPACE_MAILBOX_SLOTS;
 
 enum MmltkWorkspaceDispatcherCommand {
-    RegisterArena { arena: Arc<MmltkWorkspaceArena>, response: mpsc::SyncSender<bool> },
+    RegisterArena { arena: Arc<MmltkWorkspaceArena> },
+    Acquire {
+        device_id: id::DeviceId,
+        surface_id: mmltk_workspace_channel::SurfaceId,
+        identity: MmltkWorkspaceFrameIdentity,
+    },
     Register {
         arena: Arc<MmltkWorkspaceArena>,
-        texture_id: id::TextureId,
+        texture_id: Option<id::TextureId>,
         device_id: id::DeviceId,
         surface_id: mmltk_workspace_channel::SurfaceId,
         frame: OwnedFd,
         frame_signal: MmltkWorkspaceFrameSignal,
         blit: MmltkWorkspaceBlit,
-        response: mpsc::SyncSender<Option<(OwnedFd, MmltkWorkspaceBlit)>>,
+        timeline_descriptor: OwnedFd,
     },
-    DetachDestination {
-        texture_id: id::TextureId,
-        response: mpsc::SyncSender<bool>,
-    },
+    DetachDestination { surface_id: mmltk_workspace_channel::SurfaceId },
     ReleaseSlot {
         surface_id: mmltk_workspace_channel::SurfaceId,
         identity: MmltkWorkspaceFrameIdentity,
         slot: u32,
     },
-    RetireDevice {
-        device_id: id::DeviceId,
-        response: mpsc::SyncSender<Vec<MmltkWorkspaceBlit>>,
-    },
-    RetireAll {
-        response: mpsc::SyncSender<Vec<MmltkWorkspaceBlit>>,
-    },
-    Shutdown {
-        response: mpsc::SyncSender<Vec<MmltkWorkspaceBlit>>,
-    },
+    RetireDevice { device_id: id::DeviceId },
+    RetireAll,
+    Shutdown { response: mpsc::SyncSender<()> },
 }
 
 use mmltk_workspace_channel::graphics_abi::WorkspaceFrameSignal as MmltkWorkspaceFrameSignalLayout;
 
 struct MmltkWorkspaceFrameSignal {
     mapping: *mut MmltkWorkspaceFrameSignalLayout,
+    access: *mut mmltk_workspace_channel::graphics_abi::ImageWorkspaceAccessSignal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1935,9 +1971,10 @@ struct MmltkWorkspaceMailboxReceipt {
 }
 
 struct MmltkWorkspacePhysicalReceipt {
-    transfer_sequence: u64,
-    snapshot: Option<MmltkWorkspaceFrameSnapshot>,
-    frame: Option<MmltkWorkspaceMailboxReceipt>,
+    access: u64,
+    slot: u32,
+    snapshot: MmltkWorkspaceFrameSnapshot,
+    frame: MmltkWorkspaceMailboxReceipt,
 }
 
 #[derive(Default)]
@@ -2044,7 +2081,7 @@ impl MmltkWorkspaceFrameSnapshot {
 unsafe impl Send for MmltkWorkspaceFrameSignal {}
 
 impl MmltkWorkspaceFrameSignal {
-    fn map(descriptor: OwnedFd) -> Option<Self> {
+    fn map_shared<T>(descriptor: OwnedFd) -> Option<*mut T> {
         let mut status = mem::MaybeUninit::<libc::stat>::uninit();
         if unsafe { libc::fstat(descriptor.as_raw_fd(), status.as_mut_ptr()) } != 0 {
             return None;
@@ -2052,7 +2089,7 @@ impl MmltkWorkspaceFrameSignal {
         let status = unsafe { status.assume_init() };
         let required_seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
         let seals = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_GET_SEALS) };
-        if status.st_size != mem::size_of::<MmltkWorkspaceFrameSignalLayout>() as libc::off_t
+        if status.st_size != mem::size_of::<T>() as libc::off_t
             || status.st_mode & libc::S_IFMT != libc::S_IFREG
             || seals < 0
             || seals & required_seals != required_seals
@@ -2062,7 +2099,7 @@ impl MmltkWorkspaceFrameSignal {
         let mapping = unsafe {
             libc::mmap(
                 ptr::null_mut(),
-                mem::size_of::<MmltkWorkspaceFrameSignalLayout>(),
+                mem::size_of::<T>(),
                 // Atomic references require writable mapping validity; this reader only loads.
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
@@ -2073,9 +2110,62 @@ impl MmltkWorkspaceFrameSignal {
         if mapping == libc::MAP_FAILED {
             return None;
         }
-        Some(Self {
-            mapping: mapping.cast(),
-        })
+        Some(mapping.cast())
+    }
+    fn map(descriptor: OwnedFd, access: OwnedFd, allocation: u64) -> Option<Self> {
+        let mapping = Self::map_shared::<MmltkWorkspaceFrameSignalLayout>(descriptor)?;
+        let Some(access) = Self::map_shared::<mmltk_workspace_channel::graphics_abi::ImageWorkspaceAccessSignal>(access) else {
+            unsafe { libc::munmap(mapping.cast(), mem::size_of::<MmltkWorkspaceFrameSignalLayout>()) };
+            return None;
+        };
+        let result = Self { mapping, access };
+        (unsafe { (*access).allocation_identity } == allocation && allocation != 0).then_some(result)
+    }
+    fn acquire(&self, snapshot: MmltkWorkspaceFrameSnapshot) -> Option<u64> {
+        use mmltk_workspace_channel::graphics_abi::{
+            WORKSPACE_ACCESS_AVAILABLE, WORKSPACE_ACCESS_READING, WORKSPACE_ACCESS_MASK, WORKSPACE_ACCESS_REVOKED,
+        };
+        let access = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.access).access)) };
+        let expected = access.load(Ordering::Acquire);
+        if expected & WORKSPACE_ACCESS_MASK != WORKSPACE_ACCESS_AVAILABLE || expected & WORKSPACE_ACCESS_REVOKED != 0 {
+            return None;
+        }
+        let generation = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.access).generation)).load(Ordering::Acquire) };
+        let offered = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.mapping).physical_revision)).load(Ordering::SeqCst) };
+        if generation == 0 || generation != offered || self.read() != Some(snapshot) {
+            return None;
+        }
+        let reading = (expected & !WORKSPACE_ACCESS_MASK) | WORKSPACE_ACCESS_READING;
+        access.compare_exchange(expected, reading, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| reading)
+    }
+
+    fn complete_terminal_read(&self, reading: u64) {
+        use mmltk_workspace_channel::graphics_abi::WORKSPACE_ACCESS_REVOKED;
+        let access = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.access).access)) };
+        let revoked = reading | WORKSPACE_ACCESS_REVOKED;
+        // This is called only after the physical owner's terminal GPU wait.
+        // Never let an earlier completion receipt authorize another read, even
+        // when the product generation itself did not advance.
+        if access.compare_exchange(reading, revoked, Ordering::AcqRel, Ordering::Acquire)
+            .is_err_and(|actual| actual != revoked) {
+            return;
+        }
+        unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.access).terminal_read_complete))
+            .store(revoked, Ordering::Release) };
+    }
+    fn abandon_acquisition(&self) {
+        use mmltk_workspace_channel::graphics_abi::{
+            WORKSPACE_ACCESS_MASK, WORKSPACE_ACCESS_AVAILABLE, WORKSPACE_ACCESS_EMPTY, WORKSPACE_ACCESS_REVOKED,
+        };
+        let access = unsafe { AtomicU64::from_ptr(ptr::addr_of_mut!((*self.access).access)) };
+        // Native withdrawal can race a failed GPU submission. Preserve its
+        // sticky revocation while returning the never-submitted physical read.
+        let _ = access.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            let role = if value & WORKSPACE_ACCESS_REVOKED != 0 {
+                WORKSPACE_ACCESS_EMPTY
+            } else { WORKSPACE_ACCESS_AVAILABLE };
+            Some((value & !WORKSPACE_ACCESS_MASK) | role)
+        });
     }
 
     fn read(&self) -> Option<MmltkWorkspaceFrameSnapshot> {
@@ -2125,6 +2215,8 @@ impl Drop for MmltkWorkspaceFrameSignal {
                 mem::size_of::<MmltkWorkspaceFrameSignalLayout>(),
             )
         };
+        unsafe { libc::munmap(self.access.cast(),
+            mem::size_of::<mmltk_workspace_channel::graphics_abi::ImageWorkspaceAccessSignal>()) };
     }
 }
 
@@ -2225,78 +2317,43 @@ struct MmltkWorkspaceDispatchEntry {
     blit: MmltkWorkspaceBlit,
     arena: Arc<MmltkWorkspaceArena>,
     next_transfer_sequence: u64,
-    physical_receipts: [Option<(Option<u32>, MmltkWorkspacePhysicalReceipt)>; 2],
+    physical_read: Option<MmltkWorkspacePhysicalReceipt>,
 }
 
-fn settle_mmltk_workspace_release_only(
-    entry: &mut MmltkWorkspaceDispatchEntry,
-    edges: u64,
-    allow_preconsumed: bool,
-) -> Result<Option<MmltkWorkspaceSettledTransfer>, vk::Result> {
-    let submitted = entry
-        .blit
-        .submission()
-        .submit_frame_edges(edges, None, None)
-        .inspect_err(|error| {
-            log::error!(
-                "mmltk workspace release-only submit failed; step=submit_frame_edges, \
-                 edges={edges}, sequence={}, allow_preconsumed={allow_preconsumed}, error={error:?}",
-                entry.next_transfer_sequence
-            );
-        })?;
-    settle_mmltk_workspace_cursor(
-        &mut entry.next_transfer_sequence,
-        submitted.map(|submitted| (submitted.ready(), submitted.copied_slot())),
-        None,
-        allow_preconsumed,
-    )
-    .inspect_err(|error| {
-        log::error!(
-            "mmltk workspace release-only settle failed; step=settle_cursor, edges={edges}, \
-             allow_preconsumed={allow_preconsumed}, error={error:?}"
-        );
-    })
+impl Drop for MmltkWorkspaceDispatchEntry {
+    fn drop(&mut self) {
+        if let Some(receipt) = self.physical_read.take() {
+            // Runs on the existing retirement worker, after its registry locks
+            // are released. A queued Acquired is never evidence of GPU safety.
+            self.blit.retire();
+            self.frame_signal.complete_terminal_read(receipt.access);
+            mmltk_workspace_channel::complete_terminal_read(self.surface_id);
+        }
+    }
 }
 
 fn submit_mmltk_workspace_transfer(
     shared: &MmltkWorkspaceDispatcherShared,
     entry: &mut MmltkWorkspaceDispatchEntry,
-    edges: u64,
     snapshot: Option<MmltkWorkspaceFrameSnapshot>,
-) -> Result<(), vk::Result> {
-    let plan = plan_mmltk_workspace_transfer(entry.next_transfer_sequence, snapshot)?;
-    let (snapshot, identity) = match plan {
-        MmltkWorkspaceTransferPlan::ReleaseOnly {
-            allow_preconsumed,
-            terminal_on_settlement,
-        } => {
-            let settled = settle_mmltk_workspace_release_only(entry, edges, allow_preconsumed)?;
-            return if terminal_on_settlement && (settled.is_some() || !allow_preconsumed) {
-                log::error!(
-                    "mmltk workspace transfer reached its terminal settlement; \
-                     step=terminal_on_settlement, edges={edges}, settled={}, \
-                     allow_preconsumed={allow_preconsumed}, device={:?}, texture={:?}",
-                    settled.is_some(),
-                    entry.device_id,
-                    entry.texture_id
-                );
-                Err(vk::Result::ERROR_UNKNOWN)
-            } else {
-                Ok(())
-            };
-        }
-        MmltkWorkspaceTransferPlan::Current { snapshot, identity } => (snapshot, identity),
-    };
+) -> Result<bool, vk::Result> {
+    let Some(snapshot) = snapshot else { return Ok(false); };
+    let Some(identity) = snapshot.identity() else { return Ok(false); };
+    if snapshot.transfer_sequence < entry.next_transfer_sequence || entry.physical_read.is_some() {
+        return Ok(false);
+    }
     let arena = entry.arena.clone();
+    if arena.closed.load(Ordering::Acquire) { return Ok(false); }
     let mut mailboxes = arena.mailboxes.lock().unwrap();
-    let visible_identity = entry.texture_id.is_some().then_some(identity);
-    let reserved = visible_identity.and_then(|identity| {
-        mailboxes
-            .writable_slot(identity)
-            .map(|slot| (identity, slot))
-    });
-    let copy_slot = reserved.and_then(|(identity, slot)| identity.copy_index(slot));
-    let mut pixels = if entry.blit.pixels.is_some() {
+    let Some(slot) = mailboxes.writable_slot(identity) else {
+        mailboxes.note_capacity_exhausted(identity);
+        return Ok(false);
+    };
+    let next_transfer = snapshot.transfer_sequence.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+    let release = snapshot.timeline_ready.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+    let copy_slot = identity.copy_index(slot);
+    let direct = arena.layout.direct_sampling != 0;
+    let mut pixels = if !direct && entry.blit.pixels.is_some() {
         if let Some(slot) = copy_slot {
             let extent = entry.blit.extent;
             if snapshot.content_width == 0 || snapshot.content_height == 0
@@ -2335,74 +2392,44 @@ fn submit_mmltk_workspace_transfer(
             }
         } else { None }
     } else { None };
-    let prepared_copy = copy_slot.map(|slot| wgh::vulkan::ExternalTimelineCopy {
-        slot,
-        command: pixels.as_ref().map(|_| entry.blit.pixels.as_ref().unwrap().commands[slot])
-            .unwrap_or(entry.blit.copy_commands[slot]),
-    });
-    let submitted = entry
-        .blit
-        .submission()
-        .submit_frame_edges(edges, Some(snapshot.timeline_ready), prepared_copy)
-        .inspect_err(|error| {
-            log::error!(
-                "mmltk workspace transfer submit failed; step=submit_frame_edges, edges={edges}, \
-                 timeline_ready={}, copy_slot={copy_slot:?}, sequence={}, device={:?}, \
-                 texture={:?}, error={error:?}",
-                snapshot.timeline_ready,
-                entry.next_transfer_sequence,
-                entry.device_id,
-                entry.texture_id
-            );
-        })?;
-    let Some(submitted) = submitted else {
-        log::error!(
-            "mmltk workspace transfer submitted no frame edge; step=submit_frame_edges_empty, \
-             edges={edges}, timeline_ready={}, copy_slot={copy_slot:?}, sequence={}, \
-             device={:?}, texture={:?}",
-            snapshot.timeline_ready,
-            entry.next_transfer_sequence,
-            entry.device_id,
-            entry.texture_id
-        );
-        return Err(vk::Result::ERROR_UNKNOWN);
+    let command = if direct { entry.blit.copy_commands[0] } else {
+        pixels.as_ref().map(|_| entry.blit.pixels.as_ref().unwrap().commands[slot as usize])
+            .unwrap_or(entry.blit.copy_commands[slot as usize])
     };
-    settle_mmltk_workspace_cursor(
-        &mut entry.next_transfer_sequence,
-        Some((submitted.ready(), submitted.copied_slot())),
-        copy_slot,
-        false,
-    )?;
+    if !mmltk_workspace_channel::reserve_acquisition(entry.surface_id, identity.session, identity.sequence,
+        identity.presentation_revision, snapshot.transfer_sequence) {
+        return Ok(false);
+    }
+    let Some(access) = entry.frame_signal.acquire(snapshot) else {
+        mmltk_workspace_channel::cancel_acquisition(entry.surface_id);
+        return Ok(false);
+    };
+    let submitted = match entry.blit.submission().acquire_completed(snapshot.timeline_ready, command,
+        (!direct).then_some(slot as usize)) {
+        Ok(submitted) => submitted,
+        Err(error) => {
+            entry.frame_signal.abandon_acquisition();
+            mmltk_workspace_channel::cancel_acquisition(entry.surface_id);
+            return Err(error);
+        }
+    };
+    entry.next_transfer_sequence = next_transfer;
     if let Some(receipt) = pixels.as_mut() {
-        receipt.release = submitted.ready().checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+        receipt.release = release;
     }
     if let (Some(probe), Some(slot)) = (entry.blit.pixels.as_mut(), copy_slot) {
         // Track every use, including a copy whose diagnostic receipt was
         // dropped. A later free-slot admission can recover without polling.
-        probe.submitted_release[slot] = submitted.ready().checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
+        probe.submitted_release[slot] = release;
     }
-    let pending = entry.physical_receipts.iter_mut().find(|pending| pending.is_none())
-        .ok_or(vk::Result::ERROR_UNKNOWN)?;
     let receipt = MmltkWorkspaceMailboxReceipt { identity, pixels };
-    *pending = Some((reserved.map(|(_, slot)| slot), MmltkWorkspacePhysicalReceipt {
-        transfer_sequence: snapshot.transfer_sequence, snapshot: Some(snapshot), frame: Some(receipt) }));
-    let Some((identity, slot)) = reserved else {
-        if let Some(identity) = visible_identity {
-            let retry_required = mailboxes.note_capacity_exhausted(identity);
-            if mmltk_workspace_acceptance_trace_enabled() {
-                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-                    "{{\"event\":\"firefox.workspace.frame_deferred\",\"surface\":\"{}\",\"detail\":\"{}\",\"layer\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{}}}",
-                    arena.surface_id,
-                    if retry_required { "newest_pending" } else { "already_presented" },
-                    identity.layer,
-                    identity.session,
-                    identity.sequence,
-                    identity.presentation_revision
-                ));
-            }
-        }
-        return Ok(());
-    };
+    entry.physical_read = Some(MmltkWorkspacePhysicalReceipt { access, slot, snapshot, frame: receipt });
+    // Native release waiting is armed only after a real GPU read submission.
+    // Failed command preparation or a lost acquisition never creates a wait
+    // for an even timeline value that no queue can signal.
+    if !mmltk_workspace_channel::submit_acquisition(entry.surface_id) {
+        return Err(vk::Result::ERROR_UNKNOWN);
+    }
     if !mailboxes.occupy(receipt, slot) {
         return Err(vk::Result::ERROR_UNKNOWN);
     }
@@ -2416,7 +2443,7 @@ fn submit_mmltk_workspace_transfer(
     );
     if mmltk_workspace_acceptance_trace_enabled() {
         mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"source\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{}}}",
+            "{{\"event\":\"firefox.workspace.frame_forwarded\",\"source\":\"{}\",\"surface\":\"{}\",\"layer\":{},\"slot\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{},\"content_width\":{},\"content_height\":{},\"transfer_sequence\":{},\"timeline_ready\":{},\"timeline_release\":{},\"pixel_probe\":{},\"direct_sampling\":{}}}",
             entry.surface_id,
             arena.surface_id,
             identity.layer,
@@ -2429,7 +2456,7 @@ fn submit_mmltk_workspace_transfer(
             snapshot.transfer_sequence,
             submitted.ready(),
             submitted.ready() + 1,
-            pixels.is_some()
+            pixels.is_some(), direct
         ));
     }
     unsafe {
@@ -2446,62 +2473,71 @@ fn submit_mmltk_workspace_transfer(
             snapshot.content_width,
             snapshot.content_height,
             false,
+            entry.surface_id.high,
+            entry.surface_id.low,
+            direct,
         )
     };
-    Ok(())
+    Ok(true)
 }
 
 struct MmltkWorkspaceDispatcherShared {
     owner: WebGPUParentPtr,
     wake: OwnedFd,
     commands: Mutex<VecDeque<MmltkWorkspaceDispatcherCommand>>,
+    arenas: Mutex<HashMap<mmltk_workspace_channel::SurfaceId, Arc<MmltkWorkspaceArena>>>,
+    entries: Mutex<HashMap<RawFd, MmltkWorkspaceDispatchEntry>>,
+    pending_requests: Mutex<HashMap<mmltk_workspace_channel::SurfaceId, (id::DeviceId, u32, u32)>>,
 }
 
 impl MmltkWorkspaceDispatcherShared {
     fn enqueue(&self, command: MmltkWorkspaceDispatcherCommand) {
-        self.commands
+        let mut commands = self.commands
             .lock()
             .unwrap_or_else(|_| {
                 log::error!("WebGPU workspace dispatcher command queue was poisoned");
                 std::process::abort();
-            })
-            .push_back(command);
+            });
+        // Three arenas, 24 admitted physical sources, and six page read slots
+        // bound ordinary commands. Repeated terminal/release notifications
+        // share their existing queued operation.
+        if commands.iter().any(|pending| match (pending, &command) {
+            (MmltkWorkspaceDispatcherCommand::ReleaseSlot { surface_id: a, identity: ai, slot: aslot },
+             MmltkWorkspaceDispatcherCommand::ReleaseSlot { surface_id: b, identity: bi, slot: bslot }) =>
+                a == b && ai == bi && aslot == bslot,
+            (MmltkWorkspaceDispatcherCommand::Acquire { device_id: a, surface_id: sa, identity: ia },
+             MmltkWorkspaceDispatcherCommand::Acquire { device_id: b, surface_id: sb, identity: ib }) =>
+                a == b && sa == sb && ia == ib,
+            (MmltkWorkspaceDispatcherCommand::RetireDevice { device_id: a },
+             MmltkWorkspaceDispatcherCommand::RetireDevice { device_id: b }) => a == b,
+            (MmltkWorkspaceDispatcherCommand::DetachDestination { surface_id: a },
+             MmltkWorkspaceDispatcherCommand::DetachDestination { surface_id: b }) => a == b,
+            (MmltkWorkspaceDispatcherCommand::RetireAll, MmltkWorkspaceDispatcherCommand::RetireAll) => true,
+            _ => false,
+        }) { return; }
+        if commands.len() == 128 {
+            // Never drop a GPU retirement owner onto the IPC/render caller or
+            // permit unbounded ownership growth after a broken protocol.
+            std::process::abort();
+        }
+        commands.push_back(command);
+        drop(commands);
         write_mmltk_workspace_eventfd(self.wake.as_raw_fd());
     }
 
-    fn register_arena(&self, arena: Arc<MmltkWorkspaceArena>) -> bool {
-        let (response, result) = mpsc::sync_channel(1);
-        self.enqueue(MmltkWorkspaceDispatcherCommand::RegisterArena { arena, response });
-        result.recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT).unwrap_or_else(|_| std::process::abort())
+    fn register_arena(&self, arena: Arc<MmltkWorkspaceArena>) {
+        self.enqueue(MmltkWorkspaceDispatcherCommand::RegisterArena { arena });
     }
     fn register(
         self: &Arc<Self>, arena: Arc<MmltkWorkspaceArena>, surface_id: mmltk_workspace_channel::SurfaceId,
         frame: OwnedFd, frame_signal: MmltkWorkspaceFrameSignal, blit: MmltkWorkspaceBlit,
-    ) -> bool {
-        let (response, result) = mpsc::sync_channel(1);
+        timeline_descriptor: OwnedFd,
+    ) {
+        let texture_id = *arena.texture_id.lock().unwrap();
         self.enqueue(MmltkWorkspaceDispatcherCommand::Register {
-            texture_id: arena.texture_id, device_id: arena.device_id, arena,
-            surface_id, frame, frame_signal, blit, response,
+            texture_id, device_id: arena.device_id, arena,
+            surface_id, frame, frame_signal, blit, timeline_descriptor,
         });
-        match result.recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT) {
-            Ok(None) => true,
-            Ok(Some((_frame, blit))) => { drop(blit); false }
-            Err(_) => std::process::abort(),
-        }
-    }
-
-    fn detach_destination(&self, texture_id: id::TextureId) -> bool {
-        let (response, result) = mpsc::sync_channel(1);
-        self.enqueue(MmltkWorkspaceDispatcherCommand::DetachDestination {
-            texture_id,
-            response,
-        });
-        result
-            .recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT)
-            .unwrap_or_else(|_| {
-                log::error!("WebGPU workspace destination detachment timed out");
-                std::process::abort();
-            })
     }
 
     fn release_slot(
@@ -2517,30 +2553,14 @@ impl MmltkWorkspaceDispatcherShared {
         });
     }
 
-    fn retire_device(&self, device_id: id::DeviceId) -> Vec<MmltkWorkspaceBlit> {
-        let (response, result) = mpsc::sync_channel(1);
-        self.enqueue(MmltkWorkspaceDispatcherCommand::RetireDevice {
-            device_id,
-            response,
-        });
-        result
-            .recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT)
-            .unwrap_or_else(|_| {
-                log::error!("WebGPU workspace device retirement timed out");
-                std::process::abort();
-            })
+    fn retire_device(&self, device_id: id::DeviceId) {
+        self.enqueue(MmltkWorkspaceDispatcherCommand::RetireDevice { device_id });
     }
 
-    fn retire_all(&self) -> Vec<MmltkWorkspaceBlit> {
-        let (response, result) = mpsc::sync_channel(1);
-        self.enqueue(MmltkWorkspaceDispatcherCommand::RetireAll { response });
-        result
-            .recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT)
-            .unwrap_or_else(|_| {
-                log::error!("WebGPU workspace global retirement timed out");
-                std::process::abort();
-            })
+    fn retire_all(&self) {
+        self.enqueue(MmltkWorkspaceDispatcherCommand::RetireAll);
     }
+
 }
 
 struct MmltkWorkspaceDispatcher {
@@ -2565,6 +2585,9 @@ impl MmltkWorkspaceDispatcher {
             owner,
             wake,
             commands: Mutex::new(VecDeque::new()),
+            arenas: Mutex::new(HashMap::new()),
+            entries: Mutex::new(HashMap::new()),
+            pending_requests: Mutex::new(HashMap::new()),
         });
         let worker = shared.clone();
         let thread = thread::Builder::new()
@@ -2633,49 +2656,42 @@ fn service_mmltk_workspace_admissions(
     surface_frames: &HashMap<mmltk_workspace_channel::SurfaceId, RawFd>,
     entries: &mut HashMap<RawFd, MmltkWorkspaceDispatchEntry>,
 ) {
+    shared.pending_requests.lock().unwrap().retain(|surface, (device, width, height)| {
+        if !mmltk_workspace_channel::arena_admitted(*surface) { return true; }
+        unsafe { wgpu_parent_workspace_request_ready(shared.owner, *device, surface.high, surface.low, *width, *height) };
+        false
+    });
     for source in mmltk_workspace_channel::take_source_requests() {
         unsafe { wgpu_parent_workspace_source_requested(shared.owner, source.high, source.low) };
     }
-    for (source, session, sequence, revision, transfer) in mmltk_workspace_channel::take_copy_completions() {
+    for (source, session, sequence, revision, transfer) in mmltk_workspace_channel::take_read_settlements() {
         let Some(entry) = surface_frames.get(&source).and_then(|fd| entries.get_mut(fd)) else {
             mmltk_workspace_channel::fail(); return;
         };
-        // A receipt is created by actual GPU submission, including detach's
-        // release-only preconsumption. Taking it once rejects old duplicates
-        // without treating a repeated logical publication as a duplicate.
-        let Some(index) = entry.physical_receipts.iter().position(|pending|
-            pending.as_ref().is_some_and(|(_, receipt)| receipt.transfer_sequence == transfer)) else {
+        // The physical source admits one GPU read at a time. Its exact receipt
+        // rejects duplicate and mismatched settlement without counting offers.
+        let Some(receipt) = entry.physical_read.as_ref() else {
             mmltk_workspace_channel::fail(); return;
         };
-        let (slot, receipt) = entry.physical_receipts[index].as_ref().unwrap();
-        if transfer >= entry.next_transfer_sequence || entry.physical_receipts.iter().any(|pending|
-            pending.as_ref().is_some_and(|(_, pending)| pending.transfer_sequence < transfer))
-            || receipt.snapshot.is_some_and(|snapshot|
-            snapshot.content_session != session || snapshot.content_sequence != sequence || snapshot.presentation_revision != revision)
-            || slot.is_some_and(|slot| slot >= MMLTK_WORKSPACE_MAILBOX_SLOTS as u32
-                || receipt.snapshot.and_then(|snapshot| snapshot.identity()) != receipt.frame.map(|frame| frame.identity)
-                || receipt.frame.is_none()) {
+        let snapshot = receipt.snapshot;
+        if transfer >= entry.next_transfer_sequence || transfer != snapshot.transfer_sequence
+            || snapshot.content_session != session || snapshot.content_sequence != sequence
+            || snapshot.presentation_revision != revision || receipt.slot >= MMLTK_WORKSPACE_MAILBOX_SLOTS as u32
+            || snapshot.identity() != Some(receipt.frame.identity) {
             mmltk_workspace_channel::fail(); return;
         }
-        let (slot, receipt) = entry.physical_receipts[index].take().unwrap();
-        let Some(slot) = slot else {
-            if mmltk_workspace_acceptance_trace_enabled() {
-                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
-                    "{{\"event\":\"firefox.workspace.frame_released\",\"surface\":\"{}\",\"source\":\"{}\",\"transfer_sequence\":{},\"content_session\":{},\"content_sequence\":{},\"presentation_revision\":{}}}",
-                    entry.arena.surface_id, source, transfer, session, sequence, revision));
-            }
-            continue;
-        };
+        let receipt = entry.physical_read.take().unwrap();
+        let slot = receipt.slot;
         let arena = &entry.arena;
-        let snapshot = receipt.snapshot.unwrap();
-        let frame = receipt.frame.unwrap();
+        let frame = receipt.frame;
         if let (Some(pixels), Some(probe)) = (frame.pixels, &entry.blit.pixels) {
             let completed = entry.blit.submission().submitted_release_complete(pixels.release);
             probe.report(source, arena.surface_id, frame.identity, slot, pixels, completed);
         }
         unsafe { wgpu_parent_external_texture_frame_ready(shared.owner, arena.device_id,
             arena.surface_id.high, arena.surface_id.low, 0, slot, session, sequence, revision,
-            snapshot.content_width, snapshot.content_height, true) };
+            snapshot.content_width, snapshot.content_height, true, entry.surface_id.high, entry.surface_id.low, entry.blit.direct) };
+        mmltk_workspace_channel::complete_read_settlement(source);
     }
 }
 
@@ -2683,19 +2699,21 @@ fn retire_settled_mmltk_workspace_releases(
     epoll: RawFd,
     surface_frames: &mut HashMap<mmltk_workspace_channel::SurfaceId, RawFd>,
     entries: &mut HashMap<RawFd, MmltkWorkspaceDispatchEntry>,
+    retired: &mut Vec<MmltkWorkspaceDispatchEntry>,
+    completed: &mut Vec<mmltk_workspace_channel::SurfaceId>,
 ) {
     for surface_id in mmltk_workspace_channel::take_settled_releases() {
         if surface_frames.get(&surface_id).and_then(|fd| entries.get(fd))
-            .is_some_and(|entry| entry.physical_receipts.iter().any(|receipt| receipt.is_some())) {
+            .is_some_and(|entry| entry.physical_read.is_some()) {
             mmltk_workspace_channel::fail(); return;
         }
         if let Some(frame_fd) = surface_frames.remove(&surface_id) {
             unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, frame_fd, ptr::null_mut()) };
             if let Some(entry) = entries.remove(&frame_fd) {
-                drop(entry);
+                retired.push(entry);
             }
         }
-        mmltk_workspace_channel::complete_retirement(surface_id);
+        completed.push(surface_id);
     }
 }
 
@@ -2715,9 +2733,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
         std::process::abort();
     }
     let mut channel = None;
-    let mut arenas = HashMap::new();
     let mut surface_frames = HashMap::new();
-    let mut entries: HashMap<RawFd, MmltkWorkspaceDispatchEntry> = HashMap::new();
     let mut events = [libc::epoll_event { events: 0, u64: 0 }; 16];
     let mut running = true;
     while running {
@@ -2732,6 +2748,13 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
             log::error!("WebGPU workspace dispatcher lost epoll");
             std::process::abort();
         }
+        let mut retired_blits = Vec::new();
+        let mut retired_entries = Vec::new();
+        let mut completed_retirements = Vec::new();
+        let mut close_channel = false;
+        let mut shutdown = None;
+        let mut arenas = shared.arenas.lock().unwrap();
+        let mut entries = shared.entries.lock().unwrap();
         for event in &events[..ready as usize] {
             let fd = event.u64 as RawFd;
             if fd == wake_fd {
@@ -2749,10 +2772,45 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                     .collect();
                 for command in commands {
                     match command {
-                        MmltkWorkspaceDispatcherCommand::RegisterArena { arena, response } => {
+                        MmltkWorkspaceDispatcherCommand::RegisterArena { arena } => {
                             let accepted = arenas.len() < 3 && !arenas.contains_key(&arena.surface_id);
-                            if accepted { arenas.insert(arena.surface_id, arena); }
-                            let _ = response.try_send(accepted);
+                            drop(entries);
+                            drop(arenas);
+                            let initialized = accepted && Global::initialize_mmltk_workspace_arena(&arena).is_ok();
+                            arenas = shared.arenas.lock().unwrap();
+                            entries = shared.entries.lock().unwrap();
+                            if initialized {
+                                shared.pending_requests.lock().unwrap().remove(&arena.surface_id);
+                                arena.ready.store(true, Ordering::Release);
+                                arenas.insert(arena.surface_id, arena.clone());
+                                mmltk_workspace_channel::trace_state("registry_inserted", arena.surface_id, "dispatcher_owned", false);
+                                unsafe { wgpu_parent_external_texture_import_ready(shared.owner, arena.device_id,
+                                    arena.surface_id.high, arena.surface_id.low) };
+                                mmltk_workspace_channel::trace_state("import_ready_emitted", arena.surface_id, "layout_negotiated", false);
+                                mmltk_workspace_channel::send_arena_ready(arena.surface_id, arena.layout);
+                            } else {
+                                mmltk_workspace_channel::send_failed(arena.surface_id,
+                                    mmltk_workspace_channel::FAILED_IMPORT, 0, 0);
+                            }
+                        }
+                        MmltkWorkspaceDispatcherCommand::Acquire { device_id, surface_id, identity } => {
+                            let newest = entries.iter().filter_map(|(fd, entry)| {
+                                let snapshot = entry.frame_signal.read()?;
+                                (entry.device_id == device_id && entry.arena.surface_id == surface_id &&
+                                    snapshot.identity() == Some(identity)).then_some((*fd, snapshot))
+                            }).max_by_key(|(_, snapshot)| snapshot.presentation_revision);
+                            let acquired = if let Some((fd, snapshot)) = newest {
+                                let entry = entries.get_mut(&fd).unwrap();
+                                match submit_mmltk_workspace_transfer(&shared, entry, Some(snapshot)) {
+                                    Ok(acquired) => acquired,
+                                    Err(_) => { mmltk_workspace_channel::fail(); false }
+                                }
+                            } else { false };
+                            if !acquired {
+                                unsafe { wgpu_parent_external_texture_frame_ready(shared.owner, device_id,
+                                    surface_id.high, surface_id.low, 0, u32::MAX, identity.session,
+                                    identity.sequence, identity.presentation_revision, 0, 0, false, 0, 0, false) };
+                            }
                         }
                         MmltkWorkspaceDispatcherCommand::Register {
                             arena,
@@ -2762,7 +2820,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             frame,
                             frame_signal,
                             blit,
-                            response,
+                            timeline_descriptor,
                         } => {
                             let frame_fd = frame.as_raw_fd();
                             let mut frame_event = libc::epoll_event {
@@ -2772,7 +2830,16 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             let duplicate = !arenas.contains_key(&arena.surface_id)
                                 || surface_frames.contains_key(&surface_id)
                                 || entries.contains_key(&frame_fd);
-                            if duplicate
+                            drop(entries);
+                            drop(arenas);
+                            let failed = duplicate || blit.initialize().is_err()
+                                || (if blit.direct {
+                                    blit.record_acquire().is_err()
+                                } else {
+                                    blit.copy_commands.iter().enumerate().any(|(slot, &command)|
+                                        blit.record_copy(command, arena.destination, arena.extent, slot, None).is_err())
+                                })
+                                || blit.record_read_release().is_err()
                                 || unsafe {
                                     libc::epoll_ctl(
                                         epoll,
@@ -2780,74 +2847,62 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                         frame_fd,
                                         &mut frame_event,
                                     )
-                                } != 0
-                            {
-                                let _ = response.try_send(Some((frame, blit)));
+                                } != 0;
+                            arenas = shared.arenas.lock().unwrap();
+                            entries = shared.entries.lock().unwrap();
+                            if failed {
+                                retired_blits.push(blit);
+                                mmltk_workspace_channel::send_failed(surface_id, mmltk_workspace_channel::FAILED_IMPORT, 0, 0);
                             } else {
                                 surface_frames.insert(surface_id, frame_fd);
                                 entries.insert(
                                     frame_fd,
                                     MmltkWorkspaceDispatchEntry {
                                         device_id,
-                                        texture_id: Some(texture_id),
+                                        texture_id,
                                         surface_id,
                                         frame,
                                         frame_signal,
                                         blit,
                                         arena,
                                         next_transfer_sequence: 1,
-                                        physical_receipts: [None, None],
+                                        physical_read: None,
                                     },
                                 );
-                                let _ = response.try_send(None);
+                                mmltk_workspace_channel::send_ready(surface_id, timeline_descriptor);
                             }
                         }
-                        MmltkWorkspaceDispatcherCommand::DetachDestination { texture_id, response } => {
-                            let arena_id = arenas.iter().find_map(|(id, arena)|
-                                (arena.texture_id == texture_id).then_some(*id));
-                            let mut detached = arena_id.is_some();
-                            for entry in entries.values_mut().filter(|entry| entry.texture_id == Some(texture_id)) {
-                                // Close destination admission before draining any ready edge.
-                                entry.texture_id = None;
-                                let edges = read_mmltk_workspace_eventfd(entry.frame.as_raw_fd());
-                                let snapshot = entry.frame_signal.read();
-                                if edges != 0 && submit_mmltk_workspace_transfer(&shared, entry, edges, snapshot).is_err() {
-                                    detached = false; break;
-                                }
-                                match entry.blit.detach_destination() {
-                                    Ok(Some(ready)) if expected_mmltk_workspace_ready(entry.next_transfer_sequence) == Ok(ready) => {
-                                        let snapshot = entry.frame_signal.read().filter(|snapshot|
-                                            snapshot.transfer_sequence == entry.next_transfer_sequence && snapshot.timeline_ready == ready);
-                                        let Some(pending) = entry.physical_receipts.iter_mut().find(|pending| pending.is_none()) else {
-                                            detached = false; break;
-                                        };
-                                        // Ready may precede publication of the frame signal.
-                                        // This transfer has no sample; its physical ready is
-                                        // sufficient to retain the exact release obligation.
-                                        *pending = Some((None, MmltkWorkspacePhysicalReceipt {
-                                            transfer_sequence: entry.next_transfer_sequence,
-                                            snapshot, frame: None }));
-                                        entry.next_transfer_sequence += 1;
-                                    }
-                                    Ok(None) => {}
-                                    _ => { detached = false; break; }
+                        MmltkWorkspaceDispatcherCommand::DetachDestination { surface_id } => {
+                            if let Some(arena) = arenas.remove(&surface_id) {
+                                arena.closed.store(true, Ordering::Release);
+                                arena.mailboxes.lock().unwrap().drain(|identity, slot|
+                                    mmltk_workspace_channel::send_mailbox_completed(surface_id, identity.layer, slot,
+                                        identity.session, identity.sequence, identity.presentation_revision));
+                                match mmltk_workspace_channel::release_live(surface_id) {
+                                    mmltk_workspace_channel::LiveRelease::Withdrawn =>
+                                        mmltk_workspace_channel::complete_retirement(surface_id),
+                                    _ => {}
                                 }
                             }
-                            if detached {
-                                if let Some(arena) = arena_id.and_then(|id| arenas.remove(&id)) {
-                                    arena.mailboxes.lock().unwrap().drain(|identity, slot|
-                                        mmltk_workspace_channel::send_mailbox_completed(arena.surface_id, identity.layer, slot,
-                                            identity.session, identity.sequence, identity.presentation_revision));
-                                }
-                            }
-                            let _ = response.try_send(detached);
                         }
                         MmltkWorkspaceDispatcherCommand::ReleaseSlot { surface_id, identity, slot } => {
                             if let Some(arena) = arenas.get(&surface_id) {
                                 let mut mailboxes = arena.mailboxes.lock().unwrap();
                                 if mailboxes.release(identity, slot).is_some() {
+                                    for entry in entries.values_mut().filter(|entry|
+                                        entry.arena.surface_id == surface_id && entry.blit.direct) {
+                                        if let Some(receipt) = entry.physical_read.as_ref().filter(|receipt|
+                                            receipt.slot == slot && receipt.frame.identity == identity) {
+                                            let ready = receipt.snapshot.timeline_ready;
+                                            if entry.blit.submission().release_acquired(ready).is_err() {
+                                                mmltk_workspace_channel::fail();
+                                            }
+                                        }
+                                    }
                                     mmltk_workspace_channel::send_mailbox_completed(surface_id, identity.layer, slot,
                                         identity.session, identity.sequence, identity.presentation_revision);
+                                    unsafe { wgpu_parent_external_texture_import_ready(shared.owner, arena.device_id,
+                                        surface_id.high, surface_id.low) };
                                     if mailboxes.take_retry_after_release(identity) {
                                         mmltk_workspace_channel::send_mailbox_available(surface_id, identity.layer, slot,
                                             identity.session, identity.sequence, identity.presentation_revision);
@@ -2855,17 +2910,14 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                 }
                             }
                         }
-                        MmltkWorkspaceDispatcherCommand::RetireDevice {
-                            device_id,
-                            response,
-                        } => {
+                        MmltkWorkspaceDispatcherCommand::RetireDevice { device_id } => {
+                            shared.pending_requests.lock().unwrap().retain(|_, (device, _, _)| *device != device_id);
                             let frame_fds: Vec<_> = entries
                                 .iter()
                                 .filter_map(|(frame_fd, entry)| {
                                     (entry.device_id == device_id).then_some(*frame_fd)
                                 })
                                 .collect();
-                            let mut blits = Vec::with_capacity(frame_fds.len());
                             for frame_fd in frame_fds {
                                 unsafe {
                                     libc::epoll_ctl(
@@ -2877,13 +2929,13 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                 };
                                 if let Some(entry) = entries.remove(&frame_fd) {
                                     surface_frames.remove(&entry.surface_id);
-                                    blits.push(entry.blit);
+                                    retired_entries.push(entry);
                                 }
                             }
                             arenas.retain(|_, arena| arena.device_id != device_id);
-                            let _ = response.try_send(blits);
                         }
-                        MmltkWorkspaceDispatcherCommand::RetireAll { response } => {
+                        MmltkWorkspaceDispatcherCommand::RetireAll => {
+                            shared.pending_requests.lock().unwrap().clear();
                             for frame_fd in entries.keys().copied().collect::<Vec<_>>() {
                                 unsafe {
                                     libc::epoll_ctl(
@@ -2896,10 +2948,11 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             }
                             arenas.clear();
                             surface_frames.clear();
-                            let blits = entries.drain().map(|(_, entry)| entry.blit).collect();
-                            let _ = response.try_send(blits);
+                            retired_entries.extend(entries.drain().map(|(_, entry)| entry));
+                            close_channel = true;
                         }
                         MmltkWorkspaceDispatcherCommand::Shutdown { response } => {
+                            shared.pending_requests.lock().unwrap().clear();
                             for frame_fd in entries.keys().copied().collect::<Vec<_>>() {
                                 unsafe {
                                     libc::epoll_ctl(
@@ -2912,8 +2965,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                             }
                             arenas.clear();
                             surface_frames.clear();
-                            let blits = entries.drain().map(|(_, entry)| entry.blit).collect();
-                            let _ = response.try_send(blits);
+                            retired_entries.extend(entries.drain().map(|(_, entry)| entry));
+                            shutdown = Some(response);
                             running = false;
                         }
                     }
@@ -2923,6 +2976,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                     epoll,
                     &mut surface_frames,
                     &mut entries,
+                    &mut retired_entries,
+                    &mut completed_retirements,
                 );
                 update_mmltk_workspace_channel_interest(epoll, &mut channel);
                 continue;
@@ -2934,6 +2989,8 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                     epoll,
                     &mut surface_frames,
                     &mut entries,
+                    &mut retired_entries,
+                    &mut completed_retirements,
                 );
                 update_mmltk_workspace_channel_interest(epoll, &mut channel);
                 continue;
@@ -2952,7 +3009,7 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
             if edges != 0 {
                 mmltk_workspace_channel::service(libc::EPOLLIN as u32);
                 service_mmltk_workspace_admissions(&shared, &surface_frames, &mut entries);
-                retire_settled_mmltk_workspace_releases(epoll, &mut surface_frames, &mut entries);
+                retire_settled_mmltk_workspace_releases(epoll, &mut surface_frames, &mut entries, &mut retired_entries, &mut completed_retirements);
                 let Some(entry) = entries.get_mut(&fd) else { continue; };
                 let snapshot = entry.frame_signal.read();
                 if mmltk_workspace_acceptance_trace_enabled() {
@@ -2961,20 +3018,30 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                         entry.surface_id, edges, snapshot
                     ));
                 }
-                let submitted = submit_mmltk_workspace_transfer(&shared, entry, edges, snapshot);
-                if let Err(error) = submitted {
-                    log::error!(
-                        "WebGPU workspace mirror could not submit or retain its frame; \
-                         device={:?}, texture={:?}, edges={edges}, sequence={}, error={error:?}",
-                        entry.device_id,
-                        entry.texture_id,
-                        entry.next_transfer_sequence
-                    );
-                    mmltk_workspace_channel::fail();
-                    unsafe { libc::epoll_ctl(epoll, libc::EPOLL_CTL_DEL, fd, ptr::null_mut()) };
+                unsafe { wgpu_parent_external_texture_import_ready(shared.owner, entry.device_id,
+                    entry.arena.surface_id.high, entry.arena.surface_id.low) };
+            }
+        }
+        for id in mmltk_workspace_channel::withdrawn_arenas() {
+            let disposable = arenas.get(&id).is_some_and(|arena|
+                (arena.storage.is_none() || arena.texture_id.lock().unwrap().is_none()) &&
+                arena.mailboxes.lock().unwrap().occupied.iter().flatten().all(Option::is_none));
+            if disposable {
+                if let Some(arena) = arenas.remove(&id) {
+                    arena.closed.store(true, Ordering::Release);
+                    if matches!(mmltk_workspace_channel::release_live(id), mmltk_workspace_channel::LiveRelease::Withdrawn) {
+                        completed_retirements.push(id);
+                    }
                 }
             }
         }
+        drop(entries);
+        drop(arenas);
+        drop(retired_blits);
+        drop(retired_entries);
+        for id in completed_retirements { mmltk_workspace_channel::complete_retirement(id); }
+        if close_channel { mmltk_workspace_channel::close_after_resource_shutdown(); }
+        if let Some(response) = shutdown { let _ = response.try_send(()); }
     }
     unsafe { libc::close(epoll) };
 }
@@ -3577,19 +3644,33 @@ struct MmltkWorkspaceBlit {
     pool: vk::CommandPool,
     copy_commands: Box<[vk::CommandBuffer]>,
     release_commands: vk::CommandBuffer,
-    /// Cross-API ownership. CUDA signals odd values after filling the shared
-    /// image; this copy waits for that odd value and signals the following even
-    /// value after releasing the image back to CUDA.
+    /// CUDA completes odd values before acquisition. The browser signals the
+    /// next even value after its actual read, independently for each source.
     timeline: vk::Semaphore,
     submission: Option<Arc<wgh::vulkan::ExternalTimelineQueueSubmission>>,
     source: vk::Image,
-    source_memory: vk::DeviceMemory,
+    storage: Arc<MmltkWorkspaceImage>,
+    direct: bool,
     pixels: Option<MmltkWorkspacePixels>,
     destination: vk::Image,
     extent: vk::Extent3D,
 }
 
 impl MmltkWorkspaceBlit {
+    fn record_acquire(&self) -> Result<(), vk::Result> {
+        let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1).layer_count(1);
+        let mut transition = mmltk_workspace_release_transitions(self.queue_family_index)[0];
+        transition.dst_access = vk::AccessFlags::SHADER_READ;
+        let barrier = mmltk_workspace_image_barrier(transition, self.source, range);
+        let command = self.copy_commands[0];
+        unsafe {
+            self.device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
+            self.device.cmd_pipeline_barrier(command, vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+            self.device.end_command_buffer(command)
+        }
+    }
     fn probe_slot_reusable(&self, slot: usize) -> Result<bool, vk::Result> {
         let release = self.pixels.as_ref().unwrap().submitted_release[slot];
         let mut observed = Ok(false);
@@ -3726,10 +3807,8 @@ impl MmltkWorkspaceBlit {
         }
     }
 
-    /// Records the destination-independent ownership round trip used after the
-    /// page texture is gone. It consumes each later odd value and returns the
-    /// matching even value while preserving the imported source for host Drop.
-    fn record_release_only(&self) -> Result<(), vk::Result> {
+    /// Returns direct source ownership after the final page and GPU readers.
+    fn record_read_release(&self) -> Result<(), vk::Result> {
         let source_subresource = vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
@@ -3750,15 +3829,12 @@ impl MmltkWorkspaceBlit {
                 self.release_commands,
                 &vk::CommandBufferBeginInfo::default(),
             )?;
-            self.device.cmd_pipeline_barrier(
-                self.release_commands,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &acquire,
-            );
+            if !self.direct {
+                self.device.cmd_pipeline_barrier(
+                    self.release_commands, vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(),
+                    &[], &[], &acquire);
+            }
             self.device.cmd_pipeline_barrier(
                 self.release_commands,
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -3772,18 +3848,8 @@ impl MmltkWorkspaceBlit {
         }
     }
 
-    /// Makes page texture destruction safe while retaining the source,
-    /// timeline, and frame edge. One registration keeps exact timeline
-    /// progress and permanently selects release-only work after detachment.
-    fn detach_destination(&mut self) -> Result<Option<u64>, vk::Result> {
-        self.submission()
-            .detach_destination(MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS)
-    }
-
-    /// Puts both images in the layouts the recorded copy assumes and clears the
-    /// private destination before the page can observe it. This defines the
-    /// import-without-a-frame state and leaves the destination in the layout
-    /// `wgpu` is told it starts in.
+    /// Establishes external producer ownership before its first write. The
+    /// independently owned Copy destination was initialized with its arena.
     fn initialize(&self) -> Result<(), vk::Result> {
         let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1);
         let (initial, _) = mmltk_workspace_initial_transitions(self.queue_family_index);
@@ -3808,8 +3874,8 @@ impl MmltkWorkspaceBlit {
 /// Releases everything the blit owns, on whichever path abandons it. The
 /// destination image and its memory belong to `wgpu` and are deliberately
 /// absent: the owner retires the watch before destroying them.
-impl Drop for MmltkWorkspaceBlit {
-    fn drop(&mut self) {
+impl MmltkWorkspaceBlit {
+    fn retire(&self) {
         // Retirement shares the HAL queue gate with submit/present/idle. It
         // releases one final producer-owned frame without touching the page
         // destination, deactivates the registration, and waits for its release.
@@ -3826,6 +3892,12 @@ impl Drop for MmltkWorkspaceBlit {
             // use its explicit peer-loss rescue path.
             std::process::abort();
         }
+    }
+}
+
+impl Drop for MmltkWorkspaceBlit {
+    fn drop(&mut self) {
+        self.retire();
         drop(self.submission.take());
         // The registration is inactive and its last submission is complete;
         // take the gate once more before the raw objects disappear.
@@ -3836,8 +3908,6 @@ impl Drop for MmltkWorkspaceBlit {
         unsafe {
             self.device.destroy_semaphore(self.timeline, None);
             self.device.destroy_command_pool(self.pool, None);
-            self.device.destroy_image(self.source, None);
-            self.device.free_memory(self.source_memory, None);
         }
         drop(self.pixels.take());
     }
@@ -3865,75 +3935,148 @@ impl Global {
     /// The page owns one two-slot destination independently of imported producer
     /// allocations. Source attachment initializes external ownership before the
     /// producer fills its workspace; only the queued source blit reads it here.
+    fn request_mmltk_workspace(
+        &self, device_id: id::DeviceId, id: mmltk_workspace_channel::SurfaceId, width: u32, height: u32,
+    ) -> Result<(), MmltkWorkspaceImportError> {
+        let unavailable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_NOT_ADMITTED);
+        let unimportable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT);
+        let shared = &self.mmltk_workspace_dispatcher.shared;
+        if let Some(arena) = shared.arenas.lock().unwrap().get(&id) {
+            return if arena.device_id == device_id && arena.extent.width == width && arena.extent.height == height {
+                Ok(())
+            } else { Err(unavailable()) };
+        }
+        if !mmltk_workspace_channel::arena_admitted(id) {
+            let mut pending = shared.pending_requests.lock().unwrap();
+            if pending.len() >= 3 && !pending.contains_key(&id) { return Err(unavailable()); }
+            if pending.get(&id).is_some_and(|request| *request != (device_id, width, height)) { return Err(unavailable()); }
+            pending.insert(id, (device_id, width, height));
+            write_mmltk_workspace_eventfd(shared.wake.as_raw_fd());
+            return Ok(());
+        }
+        shared.pending_requests.lock().unwrap().remove(&id);
+        let admission = mmltk_workspace_channel::take_admission(id, width, height).ok_or_else(unavailable)?;
+        if admission.layout.opcode != mmltk_workspace_channel::OPCODE_ARENA { return Err(unavailable()); }
+        let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(device_id) }.ok_or_else(unavailable)?;
+        let device = hal.raw_device();
+        let extent = vk::Extent3D { width, height, depth: 1 };
+        let (image, layout) = self.create_mmltk_workspace_source(&hal, device_id, extent, None)?;
+        // This is the first physical producer image, retained unbound until its
+        // allocation arrives. Negotiation creates no dummy WebGPU resource.
+        let initial_source = MmltkWorkspaceImage { device: device.clone(), image, memory: vk::DeviceMemory::null(),
+            _device_custody: hal.external_image_custody() };
+        let storage = if layout.direct_sampling == 0 {
+            let properties = unsafe { hal.shared_instance().raw_instance()
+                .get_physical_device_memory_properties(hal.raw_physical_device()) };
+            let (image, memory) = self.create_mmltk_workspace_destination(device, &properties, extent).ok_or_else(unimportable)?;
+            Some(Arc::new(MmltkWorkspaceImage { device: device.clone(), image, memory,
+                _device_custody: hal.external_image_custody() }))
+        } else { None };
+        let arena = Arc::new(MmltkWorkspaceArena {
+            device_id, texture_id: Mutex::new(None), surface_id: id,
+            destination: storage.as_ref().map_or(vk::Image::null(), |storage| storage.image), storage,
+            initial_source: Mutex::new(Some(initial_source)), device: device.clone(), queue: hal.raw_queue(),
+            queue_family: hal.queue_family_index(), queue_gate: hal.queue_operation_gate(), ready: AtomicBool::new(false), closed: AtomicBool::new(false),
+            extent, layout, mailboxes: Mutex::new(MmltkWorkspaceMailboxes::default()),
+        });
+        self.mmltk_workspace_dispatcher.shared.register_arena(arena);
+        Ok(())
+    }
+
     fn create_mmltk_workspace_texture(
         &self, device_id: id::DeviceId, texture_id: id::TextureId,
         desc: &wgc::resource::TextureDescriptor, id: mmltk_workspace_channel::SurfaceId,
-    ) -> Result<mmltk_workspace_channel::Record, MmltkWorkspaceImportError> {
+    ) -> Result<(), MmltkWorkspaceImportError> {
         let unsupported = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR);
-        let unimportable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_IMPORT);
+        let unavailable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_NOT_ADMITTED);
         if desc.format != wgt::TextureFormat::Rgba8Unorm || desc.dimension != wgt::TextureDimension::D2
             || desc.mip_level_count != 1 || desc.sample_count != 1
-            || desc.size.depth_or_array_layers != MMLTK_WORKSPACE_MAILBOX_COUNT as u32
             || desc.usage != wgt::TextureUsages::TEXTURE_BINDING || !desc.view_formats.is_empty() {
             return Err(unsupported());
         }
-        let admission = mmltk_workspace_channel::take_admission(id, desc.size.width, desc.size.height)
-            .ok_or_else(|| MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_NOT_ADMITTED))?;
-        if admission.layout.opcode != mmltk_workspace_channel::OPCODE_ARENA { return Err(unsupported()); }
-        let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(device_id) }.ok_or_else(unimportable)?;
-        let device = hal.raw_device();
-        let properties = unsafe { hal.shared_instance().raw_instance()
-            .get_physical_device_memory_properties(hal.raw_physical_device()) };
-        let extent = vk::Extent3D { width: desc.size.width, height: desc.size.height, depth: 1 };
-        let (layout_image, layout) = self.create_mmltk_workspace_source(&hal, extent)?;
-        unsafe { device.destroy_image(layout_image, None) };
-        let (destination, memory) = self.create_mmltk_workspace_destination(device, &properties, extent).ok_or_else(unimportable)?;
-        let release = || unsafe { device.destroy_image(destination, None); device.free_memory(memory, None); };
-        if self.initialize_mmltk_workspace_arena(&hal, destination).is_err() { release(); return Err(unimportable()); }
-        let arena = Arc::new(MmltkWorkspaceArena { device_id, texture_id, surface_id: id, destination, extent, layout,
-            mailboxes: Mutex::new(MmltkWorkspaceMailboxes::default()) });
-        if !self.mmltk_workspace_dispatcher.shared.register_arena(arena.clone()) { release(); return Err(unimportable()); }
-        let mirror = MmltkWorkspaceMirror { arena,
-            dispatcher: self.mmltk_workspace_dispatcher.shared.clone(), active: true };
+        let arena = self.mmltk_workspace_dispatcher.shared.arenas.lock().unwrap().get(&id).cloned();
+        let Some(arena) = arena else {
+            let source = self.mmltk_workspace_dispatcher.shared.entries.lock().unwrap().values().find(|entry|
+                    entry.surface_id == id && entry.device_id == device_id && entry.blit.direct)
+                    .map(|entry| (entry.blit.storage.clone(), entry.arena.extent)).ok_or_else(unavailable)?;
+            if desc.size.width != source.1.width || desc.size.height != source.1.height ||
+                desc.size.depth_or_array_layers != 1 { return Err(unsupported()); }
+            let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(device_id) }.ok_or_else(unavailable)?;
+            let hal_desc = wgh::TextureDescriptor { label: None, size: desc.size, mip_level_count: 1, sample_count: 1,
+                dimension: wgt::TextureDimension::D2, format: wgt::TextureFormat::Rgba8Unorm,
+                usage: wgt::TextureUses::RESOURCE, memory_flags: wgh::MemoryFlags::empty(), view_formats: vec![] };
+            let storage = source.0;
+            let mut texture = unsafe { hal.texture_from_raw(storage.image, &hal_desc,
+                Some(Box::new(move || drop(storage))), wgh::vulkan::TextureMemory::External) };
+            unsafe { texture.use_external_general_layout(); }
+            let (_, error) = unsafe { self.create_texture_from_hal(Box::new(texture), device_id, desc,
+                wgt::TextureUses::RESOURCE, Some(texture_id)) };
+            return if error.is_none() { Ok(()) } else { Err(unavailable()) };
+        };
+        if arena.device_id != device_id || !arena.ready.load(Ordering::Acquire)
+            || desc.size.width != arena.extent.width || desc.size.height != arena.extent.height
+            || desc.size.depth_or_array_layers != MMLTK_WORKSPACE_MAILBOX_COUNT as u32 {
+            return Err(unsupported());
+        }
+        let storage = arena.storage.clone().ok_or_else(unavailable)?;
+        let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(device_id) }.ok_or_else(unavailable)?;
         let hal_desc = wgh::TextureDescriptor { label: None, size: desc.size, mip_level_count: 1, sample_count: 1,
             dimension: wgt::TextureDimension::D2, format: wgt::TextureFormat::Rgba8Unorm,
             usage: wgt::TextureUses::COPY_DST | wgt::TextureUses::RESOURCE,
             memory_flags: wgh::MemoryFlags::empty(), view_formats: vec![] };
-        let texture = unsafe { hal.texture_from_raw(destination, &hal_desc, None, wgh::vulkan::TextureMemory::Dedicated(memory)) };
+        let texture = unsafe { hal.texture_from_raw(storage.image, &hal_desc,
+            Some(Box::new(move || drop(storage))), wgh::vulkan::TextureMemory::External) };
         let (_, error) = unsafe { self.create_texture_from_hal(Box::new(texture), device_id, desc,
             wgt::TextureUses::RESOURCE, Some(texture_id)) };
-        if error.is_some() { drop(mirror); release(); return Err(unimportable()); }
-        self.mmltk_workspace_mirrors.lock().unwrap().insert(texture_id, mirror);
-        mmltk_workspace_channel::trace_state("registry_inserted", id, "arena_registered", false);
-        unsafe { wgpu_parent_external_texture_import_ready(self.owner, device_id, id.high, id.low) };
-        mmltk_workspace_channel::trace_state("import_ready_emitted", id, "page_arena", false);
-        Ok(layout)
+        if error.is_some() { return Err(unavailable()); }
+        *arena.texture_id.lock().unwrap() = Some(texture_id);
+        self.mmltk_workspace_mirrors.lock().unwrap().insert(texture_id, MmltkWorkspaceMirror {
+            arena, dispatcher: self.mmltk_workspace_dispatcher.shared.clone(), active: true });
+        Ok(())
     }
 
-    fn create_mmltk_workspace_source(&self, hal: &wgh::vulkan::Device, extent: vk::Extent3D)
+    fn create_mmltk_workspace_source(&self, hal: &wgh::vulkan::Device, device_id: id::DeviceId,
+        extent: vk::Extent3D, required_direct: Option<bool>)
         -> Result<(vk::Image, mmltk_workspace_channel::Record), MmltkWorkspaceImportError> {
         let unsupported = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR);
         let instance = hal.shared_instance().raw_instance();
-        let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
-        let query = vk::PhysicalDeviceImageFormatInfo2::default().format(vk::Format::R8G8B8A8_UNORM)
-            .ty(vk::ImageType::TYPE_2D).tiling(vk::ImageTiling::LINEAR).usage(vk::ImageUsageFlags::TRANSFER_SRC)
-            .push_next(&mut external);
-        let mut external_properties = vk::ExternalImageFormatProperties::default();
-        let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
-        unsafe { instance.get_physical_device_image_format_properties2(hal.raw_physical_device(), &query, &mut properties) }
-            .map_err(|_| unsupported())?;
-        let format = properties.image_format_properties;
-        let external_memory = external_properties.external_memory_properties;
-        if !external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
-            || !external_memory.compatible_handle_types.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
-            || extent.width > format.max_extent.width || extent.height > format.max_extent.height {
-            return Err(unsupported());
+        let format_features = unsafe {
+            instance.get_physical_device_format_properties(hal.raw_physical_device(), vk::Format::R8G8B8A8_UNORM)
+        }.linear_tiling_features;
+        let mut supported = None;
+        for direct in [true, false] {
+            if required_direct.is_some_and(|required| direct != required) { continue; }
+            if direct && !format_features.contains(
+                vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            ) { continue; }
+            let usage = vk::ImageUsageFlags::TRANSFER_SRC
+                | if direct { vk::ImageUsageFlags::SAMPLED } else { vk::ImageUsageFlags::empty() };
+            let mut external = vk::PhysicalDeviceExternalImageFormatInfo::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+            let query = vk::PhysicalDeviceImageFormatInfo2::default().format(vk::Format::R8G8B8A8_UNORM)
+                .ty(vk::ImageType::TYPE_2D).tiling(vk::ImageTiling::LINEAR).usage(usage)
+                .push_next(&mut external);
+            let mut external_properties = vk::ExternalImageFormatProperties::default();
+            let mut properties = vk::ImageFormatProperties2::default().push_next(&mut external_properties);
+            if unsafe { instance.get_physical_device_image_format_properties2(hal.raw_physical_device(), &query, &mut properties) }.is_err() {
+                continue;
+            }
+            let format = properties.image_format_properties;
+            let external_memory = external_properties.external_memory_properties;
+            if external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::IMPORTABLE)
+                && external_memory.compatible_handle_types.contains(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+                && format.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+                && format.max_mip_levels >= 1 && format.max_array_layers >= 1
+                && extent.width <= format.max_extent.width && extent.height <= format.max_extent.height {
+                supported = Some((direct, usage, external_memory));
+                break;
+            }
         }
+        let (direct, usage, external_memory) = supported.ok_or_else(unsupported)?;
         let mut external_image = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let info = vk::ImageCreateInfo::default().image_type(vk::ImageType::TYPE_2D).format(vk::Format::R8G8B8A8_UNORM)
             .extent(extent).mip_levels(1).array_layers(1).samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR).usage(vk::ImageUsageFlags::TRANSFER_SRC)
+            .tiling(vk::ImageTiling::LINEAR).usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE).initial_layout(vk::ImageLayout::UNDEFINED).push_next(&mut external_image);
         let device = hal.raw_device();
         let image = unsafe { device.create_image(&info, None) }.map_err(|_| unsupported())?;
@@ -3949,26 +4092,32 @@ impl Global {
         let Some(required) = layout.row_pitch.checked_mul(u64::from(extent.height)).and_then(|size| size.checked_add(layout.offset)) else {
             unsafe { device.destroy_image(image, None) }; return Err(unsupported());
         };
+        let (device_index, device_epoch) = device_id.into_raw().unzip();
         let packet = mmltk_workspace_channel::Record { width: extent.width, height: extent.height,
             stride: layout.row_pitch, size: memory.size.max(required), offset: layout.offset, alignment: memory.alignment,
-            device_uuid: identifiers.device_uuid, device_incarnation: device.handle().as_raw(), memory_type_bits: memory.memory_type_bits,
+            device_uuid: identifiers.device_uuid,
+            device_incarnation: (u64::from(device_epoch) << 32) | u64::from(device_index),
+            memory_type_bits: memory.memory_type_bits,
             dedicated: u32::from(dedicated.requires_dedicated_allocation != 0 ||
                 external_memory.external_memory_features.contains(vk::ExternalMemoryFeatureFlags::DEDICATED_ONLY)),
+            direct_sampling: u64::from(direct),
             ..Default::default() };
         Ok((image, packet))
     }
 
-    fn initialize_mmltk_workspace_arena(&self, hal: &wgh::vulkan::Device, image: vk::Image) -> Result<(), vk::Result> {
-        let device = hal.raw_device();
+    fn initialize_mmltk_workspace_arena(arena: &MmltkWorkspaceArena) -> Result<(), vk::Result> {
+        if arena.storage.is_none() { return Ok(()); }
+        let image = arena.destination;
+        let device = &arena.device;
         let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default()
-            .queue_family_index(hal.queue_family_index()), None) }?;
+            .queue_family_index(arena.queue_family), None) }?;
         let result = (|| {
             let commands = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }?;
             let command = commands[0];
             let range = vk::ImageSubresourceRange::default().aspect_mask(vk::ImageAspectFlags::COLOR)
                 .level_count(1).layer_count(MMLTK_WORKSPACE_MAILBOX_COUNT as u32);
-            let (initial, ready) = mmltk_workspace_initial_transitions(hal.queue_family_index());
+            let (initial, ready) = mmltk_workspace_initial_transitions(arena.queue_family);
             unsafe {
                 device.begin_command_buffer(command, &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
@@ -3980,25 +4129,29 @@ impl Global {
                     vk::DependencyFlags::empty(), &[], &[], &[mmltk_workspace_image_barrier(ready, image, range)]);
                 device.end_command_buffer(command)?;
             }
-            submit_mmltk_queue_and_wait(device, hal.raw_queue(), &hal.queue_operation_gate(), &[command])
+            submit_mmltk_queue_and_wait(device, arena.queue, &arena.queue_gate, &[command])
         })();
         unsafe { device.destroy_command_pool(pool, None) };
         result
     }
 
-    fn attach_mmltk_workspace_source(&self, id: mmltk_workspace_channel::SurfaceId) -> Result<OwnedFd, MmltkWorkspaceImportError> {
+    fn attach_mmltk_workspace_source(&self, id: mmltk_workspace_channel::SurfaceId) -> Result<(), MmltkWorkspaceImportError> {
         let unavailable = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_NOT_ADMITTED);
         let invalid = || MmltkWorkspaceImportError::code(mmltk_workspace_channel::FAILED_UNSUPPORTED_DESCRIPTOR);
         let mut admission = mmltk_workspace_channel::take_source_admission(id).ok_or_else(unavailable)?;
         let arena_id = mmltk_workspace_channel::SurfaceId { high: admission.layout.arena_high, low: admission.layout.arena_low };
-        let arena = self.mmltk_workspace_mirrors.lock().unwrap().values()
-            .find(|mirror| mirror.active && mirror.arena.surface_id == arena_id).map(|mirror| mirror.arena.clone()).ok_or_else(unavailable)?;
+        let arena = self.mmltk_workspace_dispatcher.shared.arenas.lock().unwrap().get(&arena_id).cloned().ok_or_else(unavailable)?;
         let hal = unsafe { self.device_as_hal::<wgc::api::Vulkan>(arena.device_id) }.ok_or_else(unavailable)?;
-        let (source, actual) = self.create_mmltk_workspace_source(&hal, arena.extent)?;
+        let (source, actual) = if let Some(mut initial) = arena.initial_source.lock().unwrap().take() {
+            (std::mem::replace(&mut initial.image, vk::Image::null()), arena.layout)
+        } else {
+            self.create_mmltk_workspace_source(&hal, arena.device_id, arena.extent, Some(arena.layout.direct_sampling != 0))?
+        };
         let described = admission.layout;
         if actual.device_uuid != arena.layout.device_uuid || actual.device_incarnation != arena.layout.device_incarnation
             || described.width != actual.width || described.height != actual.height || described.stride != actual.stride
             || described.offset != actual.offset || described.alignment != actual.alignment || described.dedicated != actual.dedicated
+            || described.direct_sampling != actual.direct_sampling
             || described.memory_type_bits != actual.memory_type_bits || described.device_uuid != actual.device_uuid
             || described.device_incarnation != actual.device_incarnation || described.size < actual.size
             || described.size % actual.alignment != 0 || described.allocation_identity == 0 {
@@ -4010,7 +4163,8 @@ impl Global {
             Err(error) => { unsafe { hal.raw_device().destroy_image(source, None) }; return Err(error); }
         };
         let edge = admission.take_frame_edge();
-        let signal = admission.take_frame_signal().and_then(MmltkWorkspaceFrameSignal::map);
+        let signal = admission.take_frame_signal().zip(admission.take_access_signal())
+            .and_then(|(signal, access)| MmltkWorkspaceFrameSignal::map(signal, access, described.allocation_identity));
         let (Some(edge), Some(signal)) = (edge, signal) else {
             unsafe { hal.raw_device().destroy_image(source, None); hal.raw_device().free_memory(memory, None); }
             return Err(invalid());
@@ -4087,7 +4241,7 @@ impl Global {
         source_memory: vk::DeviceMemory,
         frame_edge: OwnedFd,
         frame_signal: MmltkWorkspaceFrameSignal,
-    ) -> Option<OwnedFd> {
+    ) -> Option<()> {
         let destination = arena.destination;
         let extent = arena.extent;
         let device = hal_device.raw_device();
@@ -4140,19 +4294,20 @@ impl Global {
             }
         };
         let blit = (|| -> Option<MmltkWorkspaceBlit> {
+            let read_commands = if arena.layout.direct_sampling != 0 { 1 } else { MMLTK_WORKSPACE_MAILBOX_COUNT };
             let allocate_info = vk::CommandBufferAllocateInfo::default()
                 .command_pool(pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count((MMLTK_WORKSPACE_MAILBOX_COUNT + 1) as u32);
+                .command_buffer_count((read_commands + 1) as u32);
             let allocated = unsafe { device.allocate_command_buffers(&allocate_info) }.ok()?;
-            if allocated.len() != MMLTK_WORKSPACE_MAILBOX_COUNT + 1 {
+            if allocated.len() != read_commands + 1 {
                 return None;
             }
-            let copy_commands = allocated[..MMLTK_WORKSPACE_MAILBOX_COUNT]
+            let copy_commands = allocated[..read_commands]
                 .to_vec()
                 .into_boxed_slice();
-            let release_commands = allocated[MMLTK_WORKSPACE_MAILBOX_COUNT];
-            let pixels = if mmltk_workspace_channel::workspace_pixel_probes_enabled() {
+            let release_commands = allocated[read_commands];
+            let pixels = if arena.layout.direct_sampling == 0 && mmltk_workspace_channel::workspace_pixel_probes_enabled() {
                 match MmltkWorkspacePixels::new(hal_device) {
                     Ok(probe) => Some(probe),
                     Err(vk::Result::ERROR_DEVICE_LOST) => return None,
@@ -4177,7 +4332,9 @@ impl Global {
                     timeline,
                 )),
                 source,
-                source_memory,
+                storage: Arc::new(MmltkWorkspaceImage { device: device.clone(), image: source, memory: source_memory,
+                    _device_custody: hal_device.external_image_custody() }),
+                direct: arena.layout.direct_sampling != 0,
                 pixels,
                 destination,
                 extent,
@@ -4191,20 +4348,8 @@ impl Global {
             release_source();
             return None;
         };
-        // Dropping `blit` on any path below releases the pool, semaphore, and
-        // the imported source; the caller still owns the destination.
-        if blit.initialize().is_err()
-            || blit
-                .copy_commands
-                .iter()
-                .enumerate()
-                .any(|(slot, &commands)| blit.record_copy(commands, destination, extent, slot, None).is_err())
-            || blit.record_release_only().is_err()
-        {
-            return None;
-        }
-        self.mmltk_workspace_dispatcher.shared.register(arena, surface_id, frame_edge, frame_signal, blit)
-            .then_some(timeline_descriptor)
+        self.mmltk_workspace_dispatcher.shared.register(arena, surface_id, frame_edge, frame_signal, blit, timeline_descriptor);
+        Some(())
     }
 
     /// Retires the mirror on `texture_id`, if it has one, before anything can
@@ -4234,14 +4379,10 @@ impl Global {
                 .collect()
         };
         mmltk_workspace_channel::fail();
-        let blits = self
-            .mmltk_workspace_dispatcher
-            .shared
-            .retire_device(device_id);
+        self.mmltk_workspace_dispatcher.shared.retire_device(device_id);
         for mirror in &mut retired {
             mirror.active = false;
         }
-        drop(blits);
     }
 
     fn stop_all_mmltk_workspace_mirrors(&self) {
@@ -4249,13 +4390,11 @@ impl Global {
             let mut mirrors = self.mmltk_workspace_mirrors.lock().unwrap();
             mem::take(&mut *mirrors)
         };
-        let blits = self.mmltk_workspace_dispatcher.shared.retire_all();
+        self.mmltk_workspace_dispatcher.shared.retire_all();
         for mirror in retired.values_mut() {
             mirror.active = false;
         }
-        drop(blits);
         drop(retired);
-        mmltk_workspace_channel::close_after_resource_shutdown();
     }
 
     /// Imports the descriptor backing `admission` as dedicated memory for
@@ -4663,7 +4802,7 @@ impl Global {
 
                 if let Some(workspace_id) = self.parse_mmltk_workspace_label(&desc) {
                     match self.create_mmltk_workspace_texture(device_id, id, &desc, workspace_id) {
-                        Ok(layout) => mmltk_workspace_channel::send_arena_ready(workspace_id, layout),
+                        Ok(()) => {},
                         Err(error) => {
                             if mmltk_workspace_channel::workspace_diagnostics_enabled() {
                                 mmltk_workspace_channel::write_diagnostic(|line| write!(line,

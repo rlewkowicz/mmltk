@@ -30,6 +30,7 @@ struct AnnotationPointer final {
     std::uint64_t interaction_id = 0U;
     std::uint64_t sequence = 0U;
     contracts::AnnotationPointerTarget target{};
+    contracts::AnnotationTargetIdentity identity{};
     contracts::AnnotationPoint point{};
     [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
         [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
@@ -139,6 +140,20 @@ struct AnnotationRenderedFacts final {
     std::uint64_t generation = 0U;
     std::uint64_t document_epoch = 0U;
     std::uint64_t scene_revision = 0U;
+    contracts::AnnotationEditorFacts editor{};
+    std::optional<contracts::AnnotationSelectedGeometry> selected{};
+    std::optional<contracts::AnnotationObjectIdentity> selected_identity{};
+    std::optional<contracts::AnnotationObjectGeometry> preview{};
+    std::optional<std::uint16_t> preview_object{};
+    std::uint64_t preview_identity = 0U;
+};
+struct AnnotationRenderedScene final {
+    bool operator==(const AnnotationRenderedScene&) const = default;
+    std::uint64_t document_epoch = 0U;
+    std::uint64_t scene_revision = 0U;
+    contracts::AnnotationSceneGeometry geometry{};
+    [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]]
+        std::vector<std::uint64_t> identities{};
 };
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
@@ -149,6 +164,7 @@ struct AnnotationSnapshot final {
     // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
     bool ready = false;
     contracts::AnnotationUiState ui{};
+    AnnotationRenderedScene rendered_scene{};
     AnnotationRenderedFacts rendered{};
     VisualFrame frame{};
     // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
@@ -237,6 +253,7 @@ MMLTK_REFLECT_FIELDS(AnnotationRedoEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEditRequest)
 MMLTK_REFLECT_FIELDS(AnnotationRenderedFacts)
+MMLTK_REFLECT_FIELDS(AnnotationRenderedScene)
 MMLTK_REFLECT_FIELDS(AnnotationSnapshot)
 MMLTK_REFLECT_FIELDS(AnnotationChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFrameState)

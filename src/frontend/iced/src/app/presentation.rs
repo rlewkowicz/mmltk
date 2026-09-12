@@ -585,6 +585,9 @@ impl Controller {
         recovery: bool,
     ) -> Result<(), UiError> {
         crate::presentation_surface::authorize_draw(None);
+        crate::presentation_surface::authorize_acquisition(
+            (!matches!(feature, FeatureId::Train | FeatureId::Validate | FeatureId::Export))
+                .then_some(self.surface).flatten(), model);
         // Transport loss clears domain facts, not retained sample custody.
         let Some(snapshot) = model.presentation.as_ref() else {
             return Ok(());
@@ -609,7 +612,8 @@ impl Controller {
         let Some(frame) = self.pending.and_then(|surface| surface.frame) else {
             return Ok(());
         };
-        let completed = frame.matches_completed(snapshot);
+        let acquired = crate::presentation_surface::acquired_publication(frame);
+        let completed = frame.matches_completed(snapshot) || acquired;
         if recovery && !completed {
             self.retire_pending();
             return Ok(());
@@ -624,9 +628,9 @@ impl Controller {
         // A future physical publication may be awaiting its control snapshot.
         // Neither that ordering nor a later domain snapshot alone abandons it.
         if frame.presentation_revision <= snapshot.presentationrevision {
-            if decision == crate::view_model::PresentationReconciliation::Superseded || !completed {
+            if !acquired && (decision == crate::view_model::PresentationReconciliation::Superseded || !completed) {
                 self.retire_pending();
-            } else if decision == crate::view_model::PresentationReconciliation::Matching {
+            } else if acquired || decision == crate::view_model::PresentationReconciliation::Matching {
                 crate::presentation_surface::gallery::confirm(
                     frame,
                     &snapshot.completed,

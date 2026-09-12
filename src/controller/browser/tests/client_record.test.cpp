@@ -703,6 +703,12 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
                        .device_uuid = {1U},
                        .memory_type_bits = 1U};
     REQUIRE(abi::valid(layout));
+    SECTION("direct sampling is a negotiated binary capability") {
+        layout.direct_sampling = 1U;
+        REQUIRE(abi::valid(layout));
+        layout.direct_sampling = 2U;
+        CHECK_FALSE(abi::valid(layout));
+    }
     SECTION("subresource offset is included in allocation bounds") {
         ++layout.offset;
         CHECK_FALSE(abi::valid(layout));
@@ -716,8 +722,14 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         CHECK_FALSE(abi::valid(layout));
     }
     abi::Record completed{
-        .opcode = abi::Opcode::CopyCompleted, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
+        .opcode = abi::Opcode::ReadSettled, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
     REQUIRE(abi::valid(completed));
+    SECTION("exact acquisition uses the same physical identity") {
+        completed.opcode = abi::Opcode::Acquired;
+        REQUIRE(abi::valid(completed));
+        completed.offset = 0U;
+        CHECK_FALSE(abi::valid(completed));
+    }
     SECTION("source completion requires a physical transfer") {
         completed.offset = 0U;
         CHECK_FALSE(abi::valid(completed));

@@ -234,7 +234,11 @@ class AnnotationSystem::Impl final {
         bool dirty = false;
         bool ui_changed = false;
         while (slot.next < slot.samples.size()) {
-            const auto pointer = slot.samples[slot.next++];
+            auto pointer = slot.samples[slot.next++];
+            if (!document_.ResolveTarget(pointer)) {
+                Reject("The displayed annotation target no longer exists", false);
+                continue;
+            }
             const auto prior = document_.ui().scene_revision;
             auto result = document_.Pointer(pointer);
             dirty = dirty || result.render_changed;
@@ -360,11 +364,15 @@ class AnnotationSystem::Impl final {
     }
     void FinishCancelled() { { std::scoped_lock lock(mutex_); gpu_continuation_ = false; } InstallUi(true); }
     void FinishRejected(std::string detail) { { std::scoped_lock lock(mutex_); gpu_continuation_ = false; } Reject(std::move(detail), true); }
-    void Sample(const AnnotationPointer pointer) {
+    void Sample(AnnotationPointer pointer) {
         { std::scoped_lock lock(mutex_); gpu_continuation_ = true; }
         if (!renderer_.SubmitOrdered([this, pointer](Runtime& runtime, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
             const auto color = annotation_algorithm(runtime).Sample(pointer.point);
-            return [this, pointer, color] { Post([this, pointer, color] {
+            return [this, pointer, color] { Post([this, pointer, color]() mutable {
+                if (!document_.ResolveTarget(pointer)) {
+                    FinishRejected("The sampled annotation target no longer exists");
+                    return;
+                }
                 const auto object = document_.ui().scene.objects.at(*pointer.target.object);
                 auto supported = object.sup;
                 supported.center = color;
@@ -432,6 +440,35 @@ class AnnotationSystem::Impl final {
         if (fresh_source) { clean_epoch_ = description.document_epoch; clean_revision_ = runtime.OutputFacts().revision; }
         auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
         frame.clean_revision = clean_revision_;
+        AnnotationRenderedFacts facts{description.generation, description.document_epoch, description.scene_revision, description.editor};
+        if (description.editor.selected_object &&
+            (description.preview_object == description.editor.selected_object ||
+             *description.editor.selected_object < description.scene->objects.size())) {
+            facts.selected.emplace();
+            const auto& selected = description.preview_object == description.editor.selected_object
+                                       ? description.preview : description.scene->objects[*description.editor.selected_object];
+            contracts::project_annotation_geometry(*facts.selected, selected);
+            if (*description.editor.selected_object < description.identities->size())
+                facts.selected_identity = description.identities->at(*description.editor.selected_object);
+        }
+        if (description.preview_object) {
+            facts.preview.emplace();
+            contracts::project_annotation_geometry(*facts.preview, description.preview);
+            facts.preview_object = static_cast<std::uint16_t>(*description.preview_object);
+            facts.preview_identity = description.preview_identity;
+        }
+        bool geometry_changed = false;
+        {
+            std::scoped_lock lock(mutex_);
+            if (state_.rendered.scene_revision != facts.scene_revision || state_.rendered.document_epoch != facts.document_epoch)
+                geometry_changed = true;
+        }
+        if (geometry_changed) {
+            contracts::project_annotation_geometry(geometry_scratch_, *description.scene);
+            identity_scratch_.resize(description.identities->size());
+            for (std::size_t index = 0U; index != identity_scratch_.size(); ++index)
+                identity_scratch_[index] = description.identities->at(index).object;
+        }
         std::optional<AnnotationSnapshot> changed;
         AnnotationFrameState rendered;
         {
@@ -440,14 +477,17 @@ class AnnotationSystem::Impl final {
             // the latest reduction while rendered facts identify these exact pixels.
             if (!state_.ready) return;
             state_.frame = frame;
-            const AnnotationRenderedFacts facts{description.generation, description.document_epoch, description.scene_revision};
-            const bool facts_changed = state_.rendered.scene_revision != facts.scene_revision ||
-                                       state_.rendered.document_epoch != facts.document_epoch;
-            state_.rendered = facts;
+            if (geometry_changed) {
+                state_.rendered_scene.document_epoch = description.document_epoch;
+                state_.rendered_scene.scene_revision = description.scene_revision;
+                std::swap(state_.rendered_scene.geometry, geometry_scratch_);
+                std::swap(state_.rendered_scene.identities, identity_scratch_);
+            }
+            state_.rendered = std::move(facts);
             state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision);
             // UI facts are already present for preview-only frames. Preserve
             // the compact progress path instead of resending masks per motion.
-            if (facts_changed) changed = state_;
+            if (geometry_changed) changed = state_;
             rendered = {state_.revision, state_.ui_revision, frame, state_.rendered};
         }
         if (changed) Publish(AnnotationChanged{std::move(*changed)});
@@ -512,6 +552,10 @@ class AnnotationSystem::Impl final {
     std::optional<mmltk::common::system::ScopedExecutionPolicy> input_policy_;
     std::uint64_t render_generation_ = 0U;
     AnnotationRenderState scratch_render_, pending_description_, active_description_;
+    // Two reusable projected body values (published state and renderer scratch)
+    // add no full editable-scene custody to the document's four scene backings.
+    contracts::AnnotationSceneGeometry geometry_scratch_;
+    std::vector<std::uint64_t> identity_scratch_;
     std::mutex render_mutex_;
     bool pending_render_ = false;
     Runtime::CompletedOutput pending_baseline_;

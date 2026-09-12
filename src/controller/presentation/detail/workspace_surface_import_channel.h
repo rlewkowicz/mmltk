@@ -183,8 +183,9 @@ class WorkspaceSurfaceImportChannel final {
     [[nodiscard]] bool admit_arena(WorkspaceSurfaceImportId, std::uint64_t generation, std::uint32_t width, std::uint32_t height,
                                    std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
     [[nodiscard]] bool admit_source(workspace_surface_import::Record, std::uint64_t generation, mmltk::common::io::ScopedFd, int frame_edge,
-                                    int frame_signal, std::uint64_t selection_generation = 0U, std::uint64_t frame_revision = 0U);
-    [[nodiscard]] bool copy_completed(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
+                                    int frame_signal, int access_signal, std::uint64_t selection_generation = 0U,
+                                    std::uint64_t frame_revision = 0U);
+    [[nodiscard]] bool read_settled(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
                                       std::uint64_t transfer_sequence);
     // Transfers one exact withdrawal ticket. Capacity retains the ticket in the
     // channel, and a claimed capability remains admitted through Retired.
@@ -194,7 +195,7 @@ class WorkspaceSurfaceImportChannel final {
     // readiness.
     void pump();
     [[nodiscard]] std::optional<WorkspaceSurfaceImportOutcome> take_outcome();
-    [[nodiscard]] bool has_capacity_wake(WorkspaceSurfaceImportId) const noexcept;
+    [[nodiscard]] std::optional<workspace_surface_import::Record> take_acquisition();
     [[nodiscard]] std::optional<WorkspaceSurfaceImportId> take_capacity_wake();
     [[nodiscard]] std::optional<WorkspaceSurfaceRetired> take_retirement();
     // Set once the active protocol session fails.

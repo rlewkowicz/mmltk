@@ -434,6 +434,7 @@ impl Swapchain for NativeSwapchain {
                     depth: 1,
                 },
                 identity,
+                external_layout: None,
             },
             metadata: Box::new(NativeSurfaceTextureMetadata {
                 acquire_semaphores: acquire_semaphore_arc,

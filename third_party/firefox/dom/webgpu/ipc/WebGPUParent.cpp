@@ -40,14 +40,21 @@ extern void wgpu_parent_external_texture_frame_ready(
     uint32_t aSlot,
     uint64_t aContentSession, uint64_t aContentSequence,
     uint64_t aPresentationRevision, uint32_t aContentWidth,
-    uint32_t aContentHeight, bool aCopyComplete) {
+    uint32_t aContentHeight, bool aCopyComplete,
+    uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling) {
   static_cast<WebGPUParent*>(aParent)->NotifyExternalTextureFrame(
       aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
-      aContentSequence, aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete);
+      aContentSequence, aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete,
+      aSourceHigh, aSourceLow, aDirectSampling);
 }
 
 extern void wgpu_parent_workspace_source_requested(WGPUWebGPUParentPtr aParent, uint64_t aHigh, uint64_t aLow) {
   static_cast<WebGPUParent*>(aParent)->NotifyWorkspaceSourceRequested(aHigh, aLow);
+}
+
+extern void wgpu_parent_workspace_request_ready(WGPUWebGPUParentPtr aParent,
+    WGPUDeviceId aDevice, uint64_t aHigh, uint64_t aLow, uint32_t aWidth, uint32_t aHeight) {
+  static_cast<WebGPUParent*>(aParent)->NotifyWorkspaceRequestReady(aDevice, aHigh, aLow, aWidth, aHeight);
 }
 
 extern void wgpu_parent_external_texture_import_ready(
@@ -484,18 +491,19 @@ void WebGPUParent::NotifyExternalTextureFrame(
     const uint32_t aSlot,
     const uint64_t aContentSession, const uint64_t aContentSequence,
     const uint64_t aPresentationRevision, const uint32_t aContentWidth,
-    const uint32_t aContentHeight, const bool aCopyComplete) {
+    const uint32_t aContentHeight, const bool aCopyComplete,
+    const uint64_t aSourceHigh, const uint64_t aSourceLow, const bool aDirectSampling) {
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
       "WebGPUParent::NotifyExternalTextureFrame",
       [self = std::move(self), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
        aLayer, aSlot, aContentSession, aContentSequence,
-       aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete]() {
+       aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling]() {
         if (self->CanSend() && !self->SendExternalTextureFrame(
                                    aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
                                    aLayer, aSlot, aContentSession, aContentSequence,
                                    aPresentationRevision, aContentWidth,
-                                   aContentHeight, aCopyComplete)) {
+                                   aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling)) {
           NS_WARNING("SendExternalTextureFrame failed");
         }
       });
@@ -508,6 +516,17 @@ void WebGPUParent::NotifyWorkspaceSourceRequested(const uint64_t aSourceHigh, co
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction("WebGPUParent::NotifyWorkspaceSourceRequested",
       [self = std::move(self), aSourceHigh, aSourceLow]() {
         if (self->CanSend()) ffi::wgpu_server_attach_workspace_source(self->mContext.get(), aSourceHigh, aSourceLow);
+      });
+  MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
+}
+
+void WebGPUParent::NotifyWorkspaceRequestReady(const RawId aDeviceId,
+    const uint64_t aHigh, const uint64_t aLow, const uint32_t aWidth, const uint32_t aHeight) {
+  RefPtr<WebGPUParent> self = this;
+  nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction("WebGPUParent::NotifyWorkspaceRequestReady",
+      [self = std::move(self), aDeviceId, aHigh, aLow, aWidth, aHeight]() {
+        if (self->CanSend() && self->mActiveDeviceIds.Contains(aDeviceId))
+          ffi::wgpu_server_workspace_request(self->mContext.get(), aDeviceId, aHigh, aLow, aWidth, aHeight);
       });
   MOZ_ALWAYS_SUCCEEDS(mOwningEventTarget->Dispatch(runnable.forget(), nsIThread::DISPATCH_NORMAL));
 }
@@ -1644,6 +1663,24 @@ ipc::IPCResult WebGPUParent::RecvExternalTextureSlotRelease(
     ffi::wgpu_server_external_texture_slot_release(
         mContext.get(), aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot,
         aContentSession, aContentSequence, aPresentationRevision);
+  }
+  return IPC_OK();
+}
+
+ipc::IPCResult WebGPUParent::RecvWorkspaceRequest(RawId aDeviceId, uint64_t aSurfaceIdHigh,
+                                                  uint64_t aSurfaceIdLow, uint32_t aWidth, uint32_t aHeight) {
+  if (mContext && mActiveDeviceIds.Contains(aDeviceId)) {
+    ffi::wgpu_server_workspace_request(mContext.get(), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aWidth, aHeight);
+  }
+  return IPC_OK();
+}
+
+ipc::IPCResult WebGPUParent::RecvWorkspaceAcquire(RawId aDeviceId, uint64_t aSurfaceIdHigh,
+                                                  uint64_t aSurfaceIdLow, uint64_t aContentSession,
+                                                  uint64_t aContentSequence, uint64_t aPublication) {
+  if (mContext && mActiveDeviceIds.Contains(aDeviceId)) {
+    ffi::wgpu_server_workspace_acquire(mContext.get(), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
+                                     aContentSession, aContentSequence, aPublication);
   }
   return IPC_OK();
 }

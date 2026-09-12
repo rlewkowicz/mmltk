@@ -104,6 +104,7 @@ add_custom_command(
         ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_surface_import_abi.h
         ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_frame_signal.h
         ${CMAKE_SOURCE_DIR}/src/controller/presentation/workspace_presentation_types.h
+        ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/image_workspace.h
         application_materializer.h
         ${CMAKE_SOURCE_DIR}/src/controller/contracts/application_systems.h
     VERBATIM)

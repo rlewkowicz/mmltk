@@ -4,9 +4,22 @@ use super::UiError;
 pub struct AnnotationModel {
     pub snapshot: Option<crate::generated::AnnotationSnapshot>,
     pending_frame: Option<crate::generated::AnnotationFrameState>,
+    rendered_scene: Option<std::sync::Arc<crate::generated::AnnotationRenderedScene>>,
 }
 
 impl AnnotationModel {
+    fn scene_matches(
+        snapshot: &crate::generated::AnnotationSnapshot,
+        rendered: &crate::generated::AnnotationRenderedFacts,
+    ) -> bool {
+        snapshot.renderedscene.documentepoch == rendered.documentepoch
+            && snapshot.renderedscene.scenerevision == rendered.scenerevision
+    }
+
+    pub(crate) fn rendered_scene(&self) -> Option<std::sync::Arc<crate::generated::AnnotationRenderedScene>> {
+        self.rendered_scene.clone()
+    }
+
     pub(super) fn install_snapshot(
         &mut self,
         mut incoming: crate::generated::AnnotationSnapshot,
@@ -35,7 +48,7 @@ impl AnnotationModel {
                 ));
             }
             if frame.revision > incoming.revision {
-                if frame.uirevision == incoming.uirevision
+                if frame.uirevision == incoming.uirevision && Self::scene_matches(&incoming, &frame.rendered)
                 {
                     incoming.frame = frame.frame.clone();
                     incoming.revision = frame.revision;
@@ -58,6 +71,9 @@ impl AnnotationModel {
             }
             Some(installed) if incoming == *installed => Observation::Current,
             _ => {
+                if self.rendered_scene.as_ref().is_none_or(|scene| **scene != incoming.renderedscene) {
+                    self.rendered_scene = Some(std::sync::Arc::new(incoming.renderedscene.clone()));
+                }
                 self.snapshot = Some(incoming);
                 Observation::Installed
             }
@@ -97,7 +113,7 @@ impl AnnotationModel {
             {
                 return Ok(Observation::Stale);
             }
-            if incoming.uirevision == installed.uirevision
+            if incoming.uirevision == installed.uirevision && Self::scene_matches(installed, &incoming.rendered)
             {
                 if self
                     .pending_frame
@@ -199,7 +215,16 @@ mod tests {
             generation: 7,
             documentepoch: 1,
             scenerevision: 6,
+            editor: full.ui.editor.clone(),
+            selected: full.ui.editor.selectedobject.and_then(|index| full.ui.scene.objects.get(index as usize)).map(From::from),
+            selectedidentity: None,
+            preview: None,
+            previewobject: None,
+            previewidentity: 0,
         };
+        full.renderedscene.documentepoch = 1;
+        full.renderedscene.scenerevision = 6;
+        full.renderedscene.geometry = (&full.ui.scene).into();
         full
     }
 
@@ -210,6 +235,50 @@ mod tests {
             frame: full.frame.clone(),
             rendered: full.rendered.clone(),
         }
+    }
+
+    #[test]
+    fn reopen_and_dropped_scene_events_preserve_both_logical_and_retained_drawable_geometry() {
+        let mut first = full_state();
+        first.renderedscene.geometry.framewidth = 640;
+        first.renderedscene.geometry.frameheight = 480;
+        let mut model = AnnotationModel::default();
+        model.install_snapshot(first.clone()).unwrap();
+        let retained = model.rendered_scene().unwrap();
+
+        let mut reopened = first;
+        reopened.revision = 6;
+        reopened.uirevision = 6;
+        reopened.inputdocumentepoch = 3;
+        reopened.ui.scenerevision = 11;
+        reopened.ui.scene.framewidth = 320;
+        reopened.ui.scene.frameheight = 240;
+        model.install_snapshot(reopened.clone()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retained, &model.rendered_scene().unwrap()));
+        assert_eq!(model.snapshot.as_ref().unwrap().ui.scene.framewidth, 320);
+        assert_eq!(retained.geometry.framewidth, 640);
+
+        // Intermediate full scenes may be coalesced. The newest full snapshot
+        // owns its actual body data and resolves a newer compact preview.
+        reopened.revision = 8;
+        reopened.uirevision = 8;
+        reopened.renderedscene.documentepoch = 3;
+        reopened.renderedscene.scenerevision = 11;
+        reopened.renderedscene.geometry = (&reopened.ui.scene).into();
+        reopened.rendered.documentepoch = 3;
+        reopened.rendered.scenerevision = 11;
+        let mut preview = compact(&reopened);
+        preview.revision = 9;
+        preview.rendered.generation += 1;
+        model.install_frame(preview.clone()).unwrap();
+        model.install_snapshot(reopened).unwrap();
+        assert_eq!(model.snapshot.as_ref().unwrap().rendered, preview.rendered);
+        assert_eq!(model.snapshot.as_ref().unwrap().revision, 9);
+        let current = model.rendered_scene().unwrap();
+        assert_eq!(current.documentepoch, 3);
+        assert_eq!((current.geometry.framewidth, current.geometry.frameheight), (320, 240));
+        assert!(!std::sync::Arc::ptr_eq(&retained, &current));
+        assert_eq!((retained.geometry.framewidth, retained.geometry.frameheight), (640, 480));
     }
 
     #[test]

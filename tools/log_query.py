@@ -1988,6 +1988,7 @@ class PixelChainSample:
     stages: dict = field(default_factory=dict)
     mailbox_count: int = 0
     mailbox: tuple | None = None
+    direct_transfer: tuple | None = None
 
 
 def lifecycle_identity(identities):
@@ -2255,6 +2256,27 @@ class Triage:
                 for pending in self.pixel_pending.pop(key, ()):
                     self.pixel_pending_count -= 1
                     self.observe_pixel_chain(pending, emit, bridge=previous)
+                if record.get("direct_sampling") is True:
+                    transfer = source, key[3]
+                    for index in range(25):
+                        sample_key = (*key[:3], index)
+                        if sample_key not in self.pixel_samples:
+                            if len(self.pixel_samples) >= MAX_TRIAGE_PIXEL_SAMPLES:
+                                self.notes.add("Pixel-chain sample capacity reached; additional direct publications were not compared.")
+                                break
+                            self.pixel_samples[sample_key] = PixelChainSample()
+                        chain = self.pixel_samples[sample_key]
+                        if chain.direct_transfer is not None and chain.direct_transfer != transfer:
+                            self.pixel_divergence("pixel-transfer-conflict", "direct publication acquired conflicting physical sources",
+                                                  record, previous[1], key[:3], emit)
+                            break
+                        chain.direct_transfer = transfer
+                        if any(stage[0] in ("import", "mailbox") for stage in chain.stages):
+                            self.pixel_divergence("pixel-mode-conflict", "direct sampling contains a forbidden sample-arena copy receipt",
+                                                  record, None, key[:3], emit)
+                        sample = chain.stages.get(("sample", None))
+                        if sample is not None:
+                            self.observe_pixel_chain(sample[1], emit)
                 return
             if bridge is None:
                 bridge = self.pixel_sources.get(key)
@@ -2320,6 +2342,13 @@ class Triage:
         # Only edges adjacent to this stage can have changed. Rechecking every
         # transfer makes repeated transfers of one publication quadratic.
         name, transfer = stage
+        if chain.direct_transfer is not None:
+            if name in ("import", "mailbox"):
+                self.pixel_divergence("pixel-mode-conflict", "direct sampling contains a forbidden sample-arena copy receipt",
+                                      record, None, publication, emit)
+            elif name in ("native", "sample"):
+                compare(("native", chain.direct_transfer), ("sample", None))
+            return
         if name in ("native", "import"):
             compare(("native", transfer), ("import", transfer))
         if name in ("import", "mailbox"):
@@ -3040,6 +3069,13 @@ Pasted errors:
   and native run-tail evidence has at most min(5, --top) rows.
 
 Automatic triage:
+  Graphics pixel joins follow the acquired mode: direct_sampling=true compares
+  native source -> Iced sample, without import/mailbox copy stages. Copy mode
+  compares native -> import -> mailbox -> sample. An exact frame_forwarded
+  source+transfer bridge selects the physical source; arena identity alone
+  never identifies source storage. Direct GPU read_settled receipts prove
+  released source custody; copy_completed proves the Copy-mode transfer.
+  Offered publications need no read settlement until actually acquired.
   --triage selects a run using ranked failure/assertion/error/terminal/parse
   anchors, or an unmatched start when no explicit failure is available. --query
   narrows anchors; --where constrains every pass. --error keeps its first-physical

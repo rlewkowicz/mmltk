@@ -11,7 +11,7 @@
 // kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
 
-inline constexpr std::uint32_t kAbiVersion = 10U;
+inline constexpr std::uint32_t kAbiVersion = 11U;
 
 // The underlying type is the wire type: the Rust half of this record declares
 // `u32` fields, and the static assertions below are what keep the two frozen
@@ -51,7 +51,9 @@ enum class Opcode : std::uint32_t {
     ArenaReady = 10U,
     // Host observed the source's matching even timeline value. Independent of
     // queue-ordered frame delivery and of the page's final sample release.
-    CopyCompleted = 11U,
+    ReadSettled = 11U,
+    // Shell won the physical generation gate for this exact completed offer.
+    Acquired = 12U,
 };
 
 // Why the shell produced no texture. These describe what happened in the shell,
@@ -89,7 +91,8 @@ inline constexpr std::uint64_t kModifierLinear = 0U;
 inline constexpr std::size_t kImportMemoryDescriptor = 0U;
 inline constexpr std::size_t kImportFrameEdgeDescriptor = 1U;
 inline constexpr std::size_t kImportFrameSignalDescriptor = 2U;
-inline constexpr std::uint32_t kImportDescriptorCount = 3U;
+inline constexpr std::size_t kImportAccessDescriptor = 3U;
+inline constexpr std::uint32_t kImportDescriptorCount = 4U;
 inline constexpr std::size_t kReadyTimelineDescriptor = 0U;
 inline constexpr std::uint32_t kReadyDescriptorCount = 1U;
 
@@ -116,18 +119,21 @@ struct Record {
     std::uint64_t arena_low = 0U;
     std::uint64_t allocation_identity = 0U;
     std::uint64_t device_incarnation = 0U;
-    // Import/ArenaReady: image byte offset. CopyCompleted: exact source transfer sequence.
+    // Import/ArenaReady: image byte offset. ReadSettled: exact source transfer sequence.
     std::uint64_t offset = 0U;
     std::uint64_t alignment = 0U;
     std::uint8_t device_uuid[16]{};
     std::uint32_t dedicated = 0U;
     std::uint32_t memory_type_bits = 0U;
+    // Exact negotiated external-image usage: zero uses the capability copy
+    // route; one permits sampling the producer image in GENERAL layout.
+    std::uint64_t direct_sampling = 0U;
 };
 
 static_assert(std::is_standard_layout_v<Record>);
 static_assert(std::is_trivially_copyable_v<Record>);
 static_assert(alignof(Record) == 8U);
-static_assert(sizeof(Record) == 144U);
+static_assert(sizeof(Record) == 152U);
 static_assert(offsetof(Record, abi_version) == 0U);
 static_assert(offsetof(Record, opcode) == 4U);
 static_assert(offsetof(Record, id_high) == 8U);
@@ -186,7 +192,7 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
     const bool known = record.opcode == Opcode::Import || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready ||
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
                        record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
-                       record.opcode == Opcode::ArenaReady || record.opcode == Opcode::CopyCompleted;
+                       record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired;
     if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
         record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
         return false;
@@ -196,15 +202,18 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
     for (const auto byte : record.device_uuid)
         uuid_valid = uuid_valid || byte != 0U;
     const bool empty_layout = record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
-                              record.device_incarnation == 0U && (record.offset == 0U || record.opcode == Opcode::CopyCompleted) &&
-                              record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U;
+                              record.device_incarnation == 0U &&
+                              (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired) &&
+                              record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U &&
+                              record.direct_sampling == 0U;
     if (record.opcode != Opcode::Import && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
     const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
                               record.offset <= record.size && record.stride != 0U &&
                               record.height <= (record.size - record.offset) / record.stride && record.alignment != 0U &&
                               (record.alignment & (record.alignment - 1U)) == 0U &&
                               record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) &&
-                              record.device_incarnation != 0U && uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U;
+                              record.device_incarnation != 0U && uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U &&
+                              record.direct_sampling <= 1U;
     switch (record.opcode) {
         case Opcode::Import: {
             return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) &&
@@ -216,7 +225,8 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
         case Opcode::ArenaReady:
             return layout_valid && record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
                    record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
-        case Opcode::CopyCompleted:
+        case Opcode::ReadSettled:
+        case Opcode::Acquired:
             return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U &&
                    (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Drop:

@@ -1,6 +1,6 @@
 use crate::generated::{
     AnnotationHandleRole as Role, AnnotationPoint, AnnotationPointerTarget as Target,
-    AnnotationShape as Shape, AnnotationTool as Tool, AnnotationUiState,
+    AnnotationShape as Shape, AnnotationTool as Tool,
 };
 
 fn empty() -> Target {
@@ -13,15 +13,15 @@ fn empty() -> Target {
 
 // Image coordinates arrive through the presentation viewport's inverse transform.
 // Selection is resolved once at press; the gesture owner retains the target.
-pub(super) fn target(state: &AnnotationUiState, x: f32, y: f32) -> Target {
-    let selected = state.editor.selectedobject.and_then(|index| {
-        state
-            .scene
-            .objects
-            .get(index as usize)
-            .map(|object| (index, object))
-    });
-    match state.editor.tool {
+fn target_geometry<'a>(
+    object_at: impl Fn(usize) -> Option<&'a crate::generated::AnnotationObjectBody>,
+    count: usize,
+    tool: Tool,
+    selected: Option<(u16, &'a crate::generated::AnnotationSelectedGeometry)>,
+    x: f32,
+    y: f32,
+) -> Target {
+    match tool {
         Tool::Box | Tool::Point => return empty(),
         Tool::MaskPaint | Tool::MaskErase | Tool::MaskFill | Tool::ColorSample => {
             return selected
@@ -36,7 +36,7 @@ pub(super) fn target(state: &AnnotationUiState, x: f32, y: f32) -> Target {
             return selected
                 .filter(|(_, object)| {
                     matches!(
-                        (state.editor.tool, object.shape),
+                        (tool, object.shape),
                         (Tool::Spline, Shape::Spline) | (Tool::Skeleton, Shape::Skeleton)
                     )
                 })
@@ -95,21 +95,22 @@ pub(super) fn target(state: &AnnotationUiState, x: f32, y: f32) -> Target {
             }
         }
     }
-    for (index, object) in state.scene.objects.iter().enumerate().rev() {
+    for index in (0..count).rev() {
+        let Some(object) = object_at(index) else { continue; };
         if !object.enabled {
             continue;
         }
         let hit = match object.shape {
-            Shape::Box => {
-                x >= object.box_.first.x - 3.0
-                    && x <= object.box_.second.x + 3.0
-                    && y >= object.box_.first.y - 3.0
-                    && y <= object.box_.second.y + 3.0
-            }
-            Shape::Mask => object.mask.runs.iter().any(|run| {
-                run.row == y as u16 && x >= run.first as f32 && x < run.last as f32 + 1.0
+            Shape::Box => object.box_.as_ref().is_some_and(|bounds| {
+                x >= bounds.first.x - 3.0
+                    && x <= bounds.second.x + 3.0
+                    && y >= bounds.first.y - 3.0
+                    && y <= bounds.second.y + 3.0
             }),
-            Shape::Point => near(&object.point),
+            Shape::Mask => object.mask.as_ref().is_some_and(|mask| mask.runs.iter().any(|run| {
+                run.row == y as u16 && x >= run.first as f32 && x < run.last as f32 + 1.0
+            })),
+            Shape::Point => object.point.as_ref().is_some_and(near),
             Shape::Spline => object.splineknots.iter().any(|knot| near(&knot.point)),
             Shape::Skeleton => object
                 .skeletonnodes
@@ -127,11 +128,22 @@ pub(super) fn target(state: &AnnotationUiState, x: f32, y: f32) -> Target {
     empty()
 }
 
+#[cfg(test)]
+pub(super) fn target(state: &crate::generated::AnnotationUiState, x: f32, y: f32) -> Target {
+    let scene = crate::generated::AnnotationSceneGeometry::from(&state.scene);
+    let selected = state.editor.selectedobject
+        .and_then(|index| state.scene.objects.get(index as usize).map(|object|
+            (index, crate::generated::AnnotationSelectedGeometry::from(object))));
+    target_geometry(|index| scene.objects.get(index), scene.objects.len(), state.editor.tool,
+        selected.as_ref().map(|(index, object)| (*index, object)), x, y)
+}
+
 struct GestureState {
     pointer_active: bool,
     pointer_interaction: u64,
     pointer_sequence: u64,
     gesture_target: Option<Target>,
+    gesture_identity: crate::generated::AnnotationTargetIdentity,
     last_pointer: AnnotationPoint,
 }
 impl Default for GestureState {
@@ -141,6 +153,7 @@ impl Default for GestureState {
             pointer_interaction: 0,
             pointer_sequence: 0,
             gesture_target: None,
+            gesture_identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
             last_pointer: AnnotationPoint { x: 0.0, y: 0.0 },
         }
     }
@@ -176,6 +189,7 @@ impl GestureState {
             interactionid: self.pointer_interaction,
             sequence: self.pointer_sequence,
             target,
+            identity: self.gesture_identity.clone(),
             point: AnnotationPoint { x, y },
             brushradius: crate::generated::default_uiannotationbrushradius().unwrap() as u16,
         })
@@ -208,6 +222,7 @@ impl GestureState {
             interactionid: self.pointer_interaction,
             sequence: self.pointer_sequence,
             target,
+            identity: self.gesture_identity.clone(),
             point: AnnotationPoint { x, y },
             brushradius: crate::generated::default_uiannotationbrushradius().unwrap() as u16,
         })
@@ -215,7 +230,7 @@ impl GestureState {
 
     pub(super) fn pointer_from_gesture(
         &mut self,
-        ui: &AnnotationUiState,
+        resolve: impl FnOnce(f32, f32) -> Option<(Target, crate::generated::AnnotationTargetIdentity)>,
         gesture: crate::presentation_surface::SurfaceGesture,
     ) -> Option<crate::generated::AnnotationPointer> {
         let x = gesture.sample.content_x;
@@ -228,7 +243,8 @@ impl GestureState {
             {
                 return None;
             }
-            let target = target(ui, x, y);
+            let (target, identity) = resolve(x, y)?;
+            self.gesture_identity = identity;
             self.gesture_target = Some(target.clone());
             target
         };
@@ -251,9 +267,8 @@ impl GestureState {
 }
 
 struct InputState {
-    ui_revision: u64,
     input_document_epoch: u64,
-    ui: AnnotationUiState,
+    content: crate::presentation_surface::AnnotationContent,
 }
 
 #[derive(Default)]
@@ -262,6 +277,7 @@ struct Retained {
     input: Option<InputState>,
     available: bool,
     radius: u16,
+    tool: Option<Tool>,
     connection: Option<crate::transport_connection::Connection>,
 }
 #[derive(Default)]
@@ -269,6 +285,16 @@ pub(super) struct Component {
     retained: std::sync::Arc<std::sync::Mutex<Retained>>,
 }
 impl Component {
+    #[cfg(test)]
+    pub(super) fn test_install_displayed(&self, content: crate::presentation_surface::AnnotationContent) {
+        let mut retained = self.retained.lock().expect("annotation canvas");
+        retained.available = true;
+        retained.input = Some(InputState {
+            input_document_epoch: content.rendered.documentepoch,
+            content,
+        });
+    }
+
     pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
         let mut retained = self.retained.lock().expect("annotation canvas");
         retained.gesture.clear_pointer_lifecycle();
@@ -291,47 +317,53 @@ impl Component {
     }
     pub fn pointer_from_gesture(
         &self,
-        ui: &AnnotationUiState,
+        document_epoch: u64,
+        tool: Tool,
         gesture: crate::presentation_surface::SurfaceGesture,
     ) -> Option<crate::generated::AnnotationPointer> {
-        self.retained
-            .lock()
-            .expect("annotation canvas")
-            .gesture
-            .pointer_from_gesture(ui, gesture)
+        let mut retained = self.retained.lock().expect("annotation canvas");
+        let Retained { gesture: lifecycle, input, available, .. } = &mut *retained;
+        if !*available { lifecycle.clear_pointer_lifecycle(); return None; }
+        let input = input.as_ref()?;
+        if input.input_document_epoch != document_epoch {
+            lifecycle.clear_pointer_lifecycle();
+            return None;
+        }
+        lifecycle.pointer_from_gesture(|x, y| {
+            let target = target_geometry(
+                |index| input.content.object(index), input.content.object_count(), tool,
+                input.content.selected(), x, y);
+            let identity = input.content.target_identity(&target)?;
+            Some((target, identity))
+        }, gesture)
     }
     pub fn dispatch(
         &self,
         model: &crate::view_model::ApplicationModel,
         radius: u16,
+        drawable: impl Fn() -> Option<crate::presentation_surface::AnnotationContent> + Send + Sync + 'static,
         keyboard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::sync::Arc<
         dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<super::Message> + Send + Sync,
     > {
         {
             let mut retained = self.retained.lock().expect("annotation canvas");
-            if retained
-                .input
-                .as_ref()
-                .map(|input| (input.ui_revision, input.input_document_epoch))
-                != model
-                    .annotation
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| (snapshot.uirevision, snapshot.inputdocumentepoch))
-            {
-                retained.input = model
-                    .annotation
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| InputState {
-                        ui_revision: snapshot.uirevision,
-                        input_document_epoch: snapshot.inputdocumentepoch,
-                        ui: snapshot.ui.clone(),
-                    });
-            }
-            retained.available = model.annotation_edit_available();
+            let drawable = drawable();
+            retained.available = model.annotation_edit_available()
+                && drawable.as_ref().is_some_and(|content| model.annotation.snapshot.as_ref()
+                    .is_some_and(|snapshot| snapshot.inputdocumentepoch == content.rendered.documentepoch));
+            if let Some(content) = drawable {
+                if retained.input.as_ref().is_some_and(|input|
+                    input.input_document_epoch != content.rendered.documentepoch) {
+                    retained.gesture.clear_pointer_lifecycle();
+                }
+                retained.input = Some(InputState {
+                    input_document_epoch: content.rendered.documentepoch,
+                    content,
+                });
+            } else { retained.input = None; }
             retained.radius = radius;
+            retained.tool = model.annotation.snapshot.as_ref().map(|snapshot| snapshot.ui.editor.tool);
         }
         let owner = self.retained.clone();
         std::sync::Arc::new(move |gesture| {
@@ -345,6 +377,7 @@ impl Component {
                 input,
                 available,
                 radius,
+                tool,
                 connection,
             } = &mut *retained;
             if !*available {
@@ -352,7 +385,19 @@ impl Component {
                 return None;
             }
             let input = input.as_ref()?;
-            let mut pointer = lifecycle.pointer_from_gesture(&input.ui, gesture)?;
+            let displayed = drawable()?;
+            if displayed.rendered.documentepoch != input.input_document_epoch {
+                lifecycle.clear_pointer_lifecycle();
+                return None;
+            }
+            let tool = (*tool)?;
+            let mut pointer = lifecycle.pointer_from_gesture(|x, y| {
+                let target = target_geometry(
+                    |index| displayed.object(index), displayed.object_count(), tool,
+                    displayed.selected(), x, y);
+                let identity = displayed.target_identity(&target)?;
+                Some((target, identity))
+            }, gesture)?;
             pointer.brushradius = *radius;
             let result = connection
                 .as_mut()

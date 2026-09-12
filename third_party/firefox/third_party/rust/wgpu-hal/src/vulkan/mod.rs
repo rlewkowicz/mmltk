@@ -571,10 +571,8 @@ pub struct ExternalTimelineQueueSubmission {
     release_command_buffer: vk::CommandBuffer,
     timeline: vk::Semaphore,
     submitted_release: AtomicU64,
-    /// Retirement can observe and release an odd value before its eventfd edge
-    /// is readable. The later edge is a stale credit, never permission to wait
-    /// for another producer value.
-    preconsumed_edges: AtomicU64,
+    /// Exact acquired direct read; offers and eventfd edges own no GPU read.
+    acquired_ready: AtomicU64,
     destination_attached: AtomicBool,
     active: AtomicBool,
 }
@@ -672,175 +670,60 @@ impl ExternalTimelineQueueSubmission {
         }?)
     }
 
-    fn submit_ready_locked(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        wait_stage: vk::PipelineStageFlags,
-        ready: u64,
-        preconsume_edge: bool,
+    fn submit_acquired_locked(
+        &self, ready: u64, command: vk::CommandBuffer, release: bool,
     ) -> Result<(), vk::Result> {
-        let previous = self.submitted_release.load(Ordering::Acquire);
-        let expected = previous
-            .checked_add(1)
-            .ok_or(vk::Result::ERROR_UNKNOWN)?;
-        if ready & 1 == 0 || ready != expected {
-            log::error!(
-                "external timeline refused an out-of-order ready value; step=ready_parity, \
-                 ready={ready}, expected={expected}, previous={previous}, \
-                 preconsume_edge={preconsume_edge}"
-            );
+        if !self.active.load(Ordering::Acquire) || ready == 0 || ready & 1 == 0
+            || command == vk::CommandBuffer::null() {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-        let release = ready.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?;
-        let next_credits = if preconsume_edge {
-            Some(
-                self.preconsumed_edges
-                    .load(Ordering::Acquire)
-                    .checked_add(1)
-                    .ok_or(vk::Result::ERROR_UNKNOWN)?,
-            )
-        } else {
-            None
-        };
-        let command_buffers = [command_buffer];
-        let wait_semaphores = [self.timeline];
-        let signal_semaphores = [self.timeline];
-        let wait_stages = [wait_stage];
+        let commands = [command];
+        let signals = [self.timeline];
+        let waits = [self.timeline];
         let wait_values = [ready];
-        let signal_values = [release];
-        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
-            .wait_semaphore_values(&wait_values)
-            .signal_semaphore_values(&signal_values);
-        let submission = [vk::SubmitInfo::default()
-            .wait_semaphores(&wait_semaphores)
-            .wait_dst_stage_mask(&wait_stages)
-            .command_buffers(&command_buffers)
-            .signal_semaphores(&signal_semaphores)
-            .push_next(&mut timeline)];
-        unsafe {
-            self.device
-                .raw
-                .queue_submit(self.device.raw_queue, &submission, vk::Fence::null())?;
-        }
-        self.submitted_release.store(release, Ordering::Release);
-        if let Some(credits) = next_credits {
-            self.preconsumed_edges.store(credits, Ordering::Release);
+        let wait_stages = [vk::PipelineStageFlags::ALL_COMMANDS];
+        let values = [ready.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?];
+        let mut timeline = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
+        if release { timeline = timeline.signal_semaphore_values(&values); }
+        let mut submit = vk::SubmitInfo::default().command_buffers(&commands)
+            .wait_semaphores(&waits).wait_dst_stage_mask(&wait_stages).push_next(&mut timeline);
+        if release { submit = submit.signal_semaphores(&signals); }
+        // The shared CPU gate already grants exclusive read custody and the
+        // ready value was observed complete. The already-satisfied semaphore
+        // wait establishes memory visibility; a counter query alone does not.
+        unsafe { self.device.raw.queue_submit(self.device.raw_queue, &[submit], vk::Fence::null())?; }
+        if release {
+            self.submitted_release.store(values[0], Ordering::Release);
+            self.acquired_ready.store(0, Ordering::Release);
+        } else {
+            self.acquired_ready.store(ready, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Consumes producer eventfd edges at the sole external-frame submission
-    /// point. `published_ready` comes from the stable sidecar and
-    /// `copy` carries the prepared command for one validated writable
-    /// destination mailbox slot. A rejected edge releases the producer
-    /// slot without mutating the visible destination.
-    pub fn submit_frame_edges(
-        &self,
-        edges: u64,
-        published_ready: Option<u64>,
-        copy: Option<ExternalTimelineCopy>,
-    ) -> Result<Option<ExternalTimelineSubmittedFrame>, vk::Result> {
-        let copy_slot = copy.map(|copy| copy.slot);
-        if edges == 0 {
-            return Ok(None);
-        }
-        let _queue_operation = self
-            .device
-            .queue_operation_gate
-            .lock()
+    pub fn acquire_completed(
+        &self, ready: u64, command: vk::CommandBuffer, copied_slot: Option<usize>,
+    ) -> Result<ExternalTimelineSubmittedFrame, vk::Result> {
+        let _queue_operation = self.device.queue_operation_gate.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.active.load(Ordering::Acquire) {
-            log::error!(
-                "external timeline rejected a frame edge on an inactive submission; \
-                 step=inactive, edges={edges}, published_ready={published_ready:?}, \
-                 copy_slot={copy_slot:?}"
-            );
+        if !self.destination_attached.load(Ordering::Acquire)
+            || self.acquired_ready.load(Ordering::Acquire) != 0
+            || ready <= self.submitted_release.load(Ordering::Acquire)
+            || self.timeline_value()? < ready
+            || copied_slot.is_some_and(|slot| slot >= self.copy_slot_count) {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-
-        let credits = self.preconsumed_edges.load(Ordering::Acquire);
-        let submitted_release = self.submitted_release.load(Ordering::Acquire);
-        let destination_attached = self.destination_attached.load(Ordering::Acquire);
-        let copy = copy.map(|copy| copy.validate(self.copy_slot_count)).transpose()
-            .inspect_err(|error| {
-                log::error!(
-                    "external timeline rejected an invalid prepared copy; step=copy_slot_range, \
-                     copy_slot={copy_slot:?}, slot_count={}, edges={edges}, error={error:?}",
-                    self.copy_slot_count
-                );
-            })?;
-        let Some(expected_ready) = submitted_release.checked_add(1) else {
-            log::error!(
-                "external timeline exhausted its release counter; step=release_overflow, \
-                 submitted_release={submitted_release}, edges={edges}"
-            );
-            return Err(vk::Result::ERROR_UNKNOWN);
-        };
-        let sidecar_authorized = published_ready == Some(expected_ready);
-        let observed_timeline = if sidecar_authorized {
-            None
-        } else {
-            Some(self.timeline_value()?)
-        };
-        let (remaining_credits, submission) = plan_external_timeline_edge(
-            submitted_release,
-            credits,
-            edges,
-            published_ready,
-            copy_slot,
-            destination_attached,
-            observed_timeline,
-        )
-        .inspect_err(|error| {
-            log::error!(
-                "external timeline could not plan a frame edge; step=plan_edge, edges={edges}, \
-                 credits={credits}, submitted_release={submitted_release}, \
-                 expected_ready={expected_ready}, published_ready={published_ready:?}, \
-                 sidecar_authorized={sidecar_authorized}, copy_slot={copy_slot:?}, \
-                 destination_attached={destination_attached}, \
-                 observed_timeline={observed_timeline:?}, error={error:?}"
-            );
-        })?;
-        self.preconsumed_edges
-            .store(remaining_credits, Ordering::Release);
-        let Some((ready, copied_slot)) = submission else {
-            return Ok(None);
-        };
-        let (command_buffer, wait_stage) = if let Some(slot) = copied_slot {
-            let prepared = copy.filter(|copy| copy.slot == slot).ok_or(vk::Result::ERROR_UNKNOWN)?;
-            (
-                prepared.command,
-                vk::PipelineStageFlags::TRANSFER,
-            )
-        } else {
-            (
-                self.release_command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-            )
-        };
-        self.submit_ready_locked(command_buffer, wait_stage, ready, false)?;
-        Ok(Some(ExternalTimelineSubmittedFrame {
-            ready,
-            copied_slot,
-        }))
+        self.submit_acquired_locked(ready, command, copied_slot.is_some())?;
+        Ok(ExternalTimelineSubmittedFrame { ready, copied_slot })
     }
 
-    fn release_observed_ready_locked(&self) -> Result<Option<u64>, vk::Result> {
-        let previous = self.submitted_release.load(Ordering::Acquire);
-        let current = self.timeline_value()?;
-        if current <= previous {
-            return Ok(None);
-        }
-        if current & 1 == 0 {
+    pub fn release_acquired(&self, ready: u64) -> Result<(), vk::Result> {
+        let _queue_operation = self.device.queue_operation_gate.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ready == 0 || self.acquired_ready.load(Ordering::Acquire) != ready {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-        self.submit_ready_locked(
-            self.release_command_buffer,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            current,
-            true,
-        )?;
-        Ok(Some(current))
+        self.submit_acquired_locked(ready, self.release_command_buffer, true)
     }
 
     /// A single nonblocking observation for effect-only receiver diagnostics.
@@ -874,42 +757,22 @@ impl ExternalTimelineQueueSubmission {
         }
     }
 
-    /// Permanently disables visible copies, releases an already-observed odd
-    /// value through the destination-independent command, and waits for every
-    /// prior visible copy before the destination can be destroyed.
-    pub fn detach_destination(&self, timeout_ns: u64) -> Result<Option<u64>, vk::Result> {
-        let _queue_operation = self
-            .device
-            .queue_operation_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.active.load(Ordering::Acquire) {
-            return Err(vk::Result::ERROR_UNKNOWN);
-        }
-        self.destination_attached.store(false, Ordering::Release);
-        let preconsumed_ready = self.release_observed_ready_locked()?;
-        self.wait_for_submitted_release(timeout_ns)?;
-        Ok(preconsumed_ready)
-    }
-
     /// Serializes retirement with every queue operation. Retirement uses only
     /// the release command, so cancellation and shutdown cannot overwrite the
     /// last frame whose identity reached the page.
     pub fn retire(&self, timeout_ns: u64) -> Result<(), vk::Result> {
-        let _queue_operation = self
-            .device
-            .queue_operation_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !self.active.load(Ordering::Acquire) {
-            return Ok(());
+        {
+            let _queue_operation = self.device.queue_operation_gate.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.active.load(Ordering::Acquire) { return Ok(()); }
+            self.destination_attached.store(false, Ordering::Release);
+            let ready = self.acquired_ready.load(Ordering::Acquire);
+            if ready != 0 { self.submit_acquired_locked(ready, self.release_command_buffer, true)?; }
+            self.active.store(false, Ordering::Release);
         }
-        self.destination_attached.store(false, Ordering::Release);
-        let release = self.release_observed_ready_locked();
-        self.active.store(false, Ordering::Release);
-        release?;
         self.wait_for_submitted_release(timeout_ns)
     }
+
 }
 
 #[cfg(test)]
@@ -1325,6 +1188,7 @@ pub struct Texture {
     format: wgt::TextureFormat,
     copy_size: crate::CopyExtent,
     identity: ResourceIdentity<vk::Image>,
+    external_layout: Option<vk::ImageLayout>,
 
     drop_guard: Option<crate::DropGuard>,
 }
@@ -1332,6 +1196,16 @@ pub struct Texture {
 impl crate::DynTexture for Texture {}
 
 impl Texture {
+    /// Preserve the layout negotiated for an externally owned sampled image.
+    ///
+    /// # Safety
+    /// The image must already contain initialized pixels in GENERAL, and its
+    /// importer must hold external ownership through every encoded use.
+    pub unsafe fn use_external_general_layout(&mut self) {
+        assert!(matches!(self.memory, TextureMemory::External));
+        self.external_layout = Some(vk::ImageLayout::GENERAL);
+    }
+
     /// # Safety
     ///
     /// - The image handle must not be manually destroyed
@@ -1359,6 +1233,7 @@ pub struct TextureView {
     dimension: wgt::TextureViewDimension,
     texture_identity: ResourceIdentity<vk::Image>,
     view_identity: ResourceIdentity<vk::ImageView>,
+    external_layout: Option<vk::ImageLayout>,
 }
 
 impl crate::DynTextureView for TextureView {}

@@ -142,13 +142,13 @@ updates.
 
 ```text
 Independent producers: raw products + final shared display workspaces
-                      │ exact selected workspace read
+                      │ completed workspace and exact model facts
                       ▼
-PresentationSystem: layout/import coordination + ready/release timeline
-                      │ direct producer workspace
+PresentationSystem: layout/import coordination + completed offers
+                      │ nonblocking exact read acquisition
                       ▼
-Firefox: imported source → retained sample arena
-                      │ queue-ordered sample + matching model
+Firefox: directly sampled source, or capability-selected single copy
+                      │ acquired sample + matching model
                       ▼
 Iced rendering → Firefox swapchain/compositor → Wayland
 ```
@@ -168,28 +168,34 @@ the producer fills the final workspace. Late admission uses retained raw data
 without rerunning inference, reapplying edits, or requiring another camera frame.
 Logical completion and ordered input consumption never wait for the browser.
 
-Presentation borrows the selected completed workspace, awaits producer readiness,
-and publishes its exact identity on that source's native graphics timeline. Its
-counted source read lasts through Firefox's matching GPU release, including
-release-only consumption when no sample slot is available. Source observation,
+Presentation publishes a completed workspace's exact identity on that source's
+native graphics timeline. Availability alone grants no browser read custody.
+Firefox acquires the newest completed publication authorized by available model
+facts during draw preparation. Acquisition and producer reservation share the
+physical allocation's nonblocking gate. A failed acquisition retains the completed
+fallback without waiting for unfinished production. Source observation,
 product revision, physical allocation, source admission, and sample-arena
 identity have separate meanings. Selecting a retained gallery may publish an
 older real product revision under a newer domain observation.
 
-Firefox retains a reusable sample arena across producer and pool-slot rotation,
-with independent storage for a completed fallback and an incoming sample.
-Source retirement waits for that source's GPU reads. Copied browser pixels
-retain their own lifetime for future draws. Arena retirement waits for page
-references and GPU readers. Capacity growth prepares an unpublished replacement,
-retains the old completed arena until replacement is usable, then drains its
-readers. Active, candidate, and retiring storage remain bounded.
+Each selected producer has reusable current and overflow capacity. Promotion
+exchanges roles without copying pixels. Raw consumers and externally acquired
+readers independently prevent reuse; unacquired overflow remains replaceable.
+Firefox directly samples exported storage when the actual requesting device
+supports the exact linear image, sampled usage, external handle, and legal image
+layout. Otherwise, it uses one copy into a reusable two-slot sample arena.
+Direct mode allocates no sample arena and performs no presentation copy.
+Source retirement waits for that source's GPU reads. Copied pixels retain their
+own lifetime for future draws. Capacity growth retains the old completed image
+until replacement is usable. Setup and retirement run through asynchronous
+graphics owners; active, candidate, and retiring storage remain bounded.
 
-Matching native model state authorizes a queue-ordered browser sample immediately
-after submission. Physical native-to-sample completion and page sample release
-are separate receipts. Iced directly samples that exact arena slot. Display
+Physical source-read settlement and page sample release are separate receipts.
+Copy mode additionally proves actual native-to-sample completion. Iced samples
+the exact acquired source or copied slot with its retained model facts. Display
 custody and each encoded draw retain independent references; actual submission
-settlement or unsubmitted abandonment releases draw custody. Only physical copy
-completion with matching model authorization promotes a completed fallback.
+settlement or unsubmitted abandonment releases draw custody. A completed direct
+acquisition or a completed capability copy promotes the matching fallback.
 Page and device teardown settle terminal resource ownership independently from
 rendering success. The last completed browser image remains drawable through
 newer work, capacity pressure, source changes, or presentation failure.
@@ -252,7 +258,16 @@ and memory churn.
 Logical annotation UI facts describe the latest committed document. Published
 frame facts retain the exact rendered scene and preview generation, including
 completed frames overtaken by newer input. Preview-only publications use compact
-progress without repeating document storage. Input credits acknowledge reduction;
+progress without repeating document storage. Canonical structural projections
+retain body hit geometry and selected handles separately from editable names and
+other persisted scene data. Reconnect supplies current logical state and retained
+drawable facts within the existing snapshot and Bootstrap bounds. New gestures
+bind to displayed document geometry and the current logical tool. Runtime object
+and element identities belong to the document and its history, so surviving
+targets remain editable while rendering lags, deleted targets cannot silently
+retarget reused indices, and Undo/Redo preserves identity without changing saved
+formats. Same-document accepted progress retains its gesture target independently
+of newer rendering. Input credits acknowledge reduction;
 GPU-dependent command continuations retain their separate settlement ordering.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and

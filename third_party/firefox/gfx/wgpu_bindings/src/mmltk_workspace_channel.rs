@@ -156,6 +156,7 @@ fn valid_import_shape(record: &Record) -> bool {
         && record.size % record.alignment == 0
         && record.device_uuid.iter().any(|byte| *byte != 0)
         && record.dedicated <= 1
+        && record.direct_sampling <= 1
         && record.memory_type_bits != 0
 }
 
@@ -190,6 +191,7 @@ pub struct Admission {
     memory: Option<OwnedFd>,
     frame_edge: Option<OwnedFd>,
     frame_signal: Option<OwnedFd>,
+    access_signal: Option<OwnedFd>,
 }
 
 impl Admission {
@@ -217,13 +219,32 @@ impl Admission {
     pub fn take_frame_signal(&mut self) -> Option<OwnedFd> {
         self.frame_signal.take()
     }
+    pub fn take_access_signal(&mut self) -> Option<OwnedFd> {
+        self.access_signal.take()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcquisitionState {
+    Reserved,
+    Submitted,
+    Notified,
+    Settling,
+}
+
+struct SourceAcquisition {
+    record: Record,
+    state: AcquisitionState,
 }
 
 struct Channel {
     fd: RawFd,
-    sources: HashSet<SurfaceId>,
+    // One exact obligation per live source. Submitted records use this bounded
+    // owner directly until sent, so ordinary outbound backpressure cannot lose
+    // a GPU read that has already been accepted.
+    sources: HashMap<SurfaceId, Option<SourceAcquisition>>,
     source_requests: VecDeque<SurfaceId>,
-    copy_completions: VecDeque<(SurfaceId, u64, u64, u64, u64)>,
+    read_settlements: VecDeque<(SurfaceId, u64, u64, u64, u64)>,
     admitted: HashMap<SurfaceId, Admission>,
     seen: HashSet<SurfaceId>,
     claimed: HashSet<SurfaceId>,
@@ -301,9 +322,9 @@ impl Channel {
         }
         Some(Self {
             fd,
-            sources: HashSet::new(),
+            sources: HashMap::with_capacity(PENDING_RECORD_CAPACITY),
             source_requests: VecDeque::new(),
-            copy_completions: VecDeque::new(),
+            read_settlements: VecDeque::new(),
             admitted: HashMap::new(),
             seen: HashSet::new(),
             claimed: HashSet::new(),
@@ -339,9 +360,11 @@ impl Channel {
                 self.withdrawn.len()
             )
         });
-        self.sources.clear();
+        // Acquisitions survive transport loss until the dispatcher's physical
+        // owners finish terminal GPU retirement and publish shared receipts.
+        self.sources.retain(|_, acquisition| acquisition.is_some());
         self.source_requests.clear();
-        self.copy_completions.clear();
+        self.read_settlements.clear();
         self.pending.clear();
         self.admitted.clear();
         self.seen.clear();
@@ -360,6 +383,7 @@ impl Channel {
             || !self.live.is_empty()
             || !self.released.is_empty()
             || !self.pending.is_empty()
+            || self.sources.values().any(Option::is_some)
             || !self.withdrawn.is_empty()
             || !self.replied.is_empty()
             || !self.settled_releases.is_empty()
@@ -425,14 +449,14 @@ impl Channel {
         let Some(admission) = self.admitted.get(&id) else {
             write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"missing\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
-                if self.sources.contains(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
+                if self.sources.contains_key(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
             ));
             return None;
         };
         if admission.width != width || admission.height != height {
             write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"mismatch\",\"width\":{width},\"height\":{height},\"admitted_width\":{},\"admitted_height\":{}}}",
-                if self.sources.contains(&id) { "source." } else { "" }, admission.width, admission.height
+                if self.sources.contains_key(&id) { "source." } else { "" }, admission.width, admission.height
             ));
             return None;
         }
@@ -440,30 +464,29 @@ impl Channel {
         self.claimed.insert(id);
         write_diagnostic(|line| write!(line,
             "{{\"event\":\"firefox.workspace.{}claim_outcome\",\"surface\":\"{id}\",\"outcome\":\"claimed\",\"width\":{width},\"height\":{height},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
-            if self.sources.contains(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
+            if self.sources.contains_key(&id) { "source." } else { "" }, self.admitted.len(), self.claimed.len(), self.live.len()
         ));
         Some(admission)
     }
 
     fn apply_drop(&mut self, id: SurfaceId) {
-        if self.sources.contains(&id) && self.live.remove(&id) {
-            trace_state("withdrawal", id, "source_read_released", true);
-            self.replied.remove(&id);
+        if self.sources.contains_key(&id) && self.live.contains(&id) {
             self.withdrawn.insert(id);
-            self.settled_releases.push_back(id);
-            self.wake_dispatcher();
+            if self.sources.get(&id).is_some_and(Option::is_none) {
+                self.retire_source(id);
+            }
         } else if self.admitted.remove(&id).is_some() {
-            trace_state("withdrawal", id, "before_claim", self.sources.contains(&id));
+            trace_state("withdrawal", id, "before_claim", self.sources.contains_key(&id));
             // An unclaimed import will never otherwise produce its one
             // outcome. Settle the host's withdrawal tombstone and release
             // both descriptors immediately.
             self.withdrawn.insert(id);
             self.send(OPCODE_FAILED, id, FAILED_NOT_ADMITTED, 0, 0, 0, None);
         } else if self.claimed.contains(&id) || self.live.contains(&id) {
-            trace_state("withdrawal", id, "claimed_or_live", self.sources.contains(&id));
+            trace_state("withdrawal", id, "claimed_or_live", self.sources.contains_key(&id));
             self.withdrawn.insert(id);
         } else if self.released.remove(&id) {
-            trace_state("withdrawal", id, "page_released", self.sources.contains(&id));
+            trace_state("withdrawal", id, "page_released", self.sources.contains_key(&id));
             self.replied.remove(&id);
             self.withdrawn.insert(id);
             self.settled_releases.push_back(id);
@@ -473,6 +496,14 @@ impl Channel {
         } else {
             self.fail();
         }
+    }
+
+    fn retire_source(&mut self, id: SurfaceId) {
+        trace_state("withdrawal", id, "source_read_released", true);
+        self.live.remove(&id);
+        self.replied.remove(&id);
+        self.settled_releases.push_back(id);
+        self.wake_dispatcher();
     }
 
     /// Reads every record the host has already written. Returns once the socket
@@ -533,9 +564,9 @@ impl Channel {
             }
             if record.opcode != OPCODE_IMPORT && (record.arena_high != 0 || record.arena_low != 0
                 || record.allocation_identity != 0 || record.device_incarnation != 0
-                || (record.offset != 0 && record.opcode != OPCODE_COPY_COMPLETED)
+                || (record.offset != 0 && record.opcode != OPCODE_READ_SETTLED)
                 || record.alignment != 0 || record.device_uuid.iter().any(|byte| *byte != 0)
-                || record.dedicated != 0 || record.memory_type_bits != 0) {
+                || record.dedicated != 0 || record.memory_type_bits != 0 || record.direct_sampling != 0) {
                 self.fail(); return;
             }
             match record.opcode {
@@ -547,16 +578,18 @@ impl Channel {
                     let mut memory = None;
                     let mut frame_edge = None;
                     let mut frame_signal = None;
+                    let mut access_signal = None;
                     for (index, descriptor) in descriptors.into_iter().enumerate() {
                         match index {
                             IMPORT_MEMORY_DESCRIPTOR => memory = Some(descriptor),
                             IMPORT_FRAME_EDGE_DESCRIPTOR => frame_edge = Some(descriptor),
                             IMPORT_FRAME_SIGNAL_DESCRIPTOR => frame_signal = Some(descriptor),
+                            IMPORT_ACCESS_DESCRIPTOR => access_signal = Some(descriptor),
                             _ => {}
                         }
                     }
-                    let (Some(memory), Some(frame_edge), Some(frame_signal)) =
-                        (memory, frame_edge, frame_signal)
+                    let (Some(memory), Some(frame_edge), Some(frame_signal), Some(access_signal)) =
+                        (memory, frame_edge, frame_signal, access_signal)
                     else {
                         self.fail();
                         return;
@@ -576,15 +609,16 @@ impl Channel {
                             memory: Some(memory),
                             frame_edge: Some(frame_edge),
                             frame_signal: Some(frame_signal),
+                            access_signal: Some(access_signal),
                         },
                     );
-                    self.sources.insert(id);
+                    self.sources.insert(id, None);
                     self.source_requests.push_back(id);
                     self.wake_dispatcher();
                     write_diagnostic(|line| write!(line,
-                        "{{\"event\":\"firefox.workspace.source.admitted\",\"surface\":\"{id}\",\"arena\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"width\":{},\"height\":{},\"admitted\":{},\"claimed\":{},\"live\":{}}}",
+                        "{{\"event\":\"firefox.workspace.source.admitted\",\"surface\":\"{id}\",\"arena\":\"{:016x}{:016x}\",\"workspace_allocation\":{},\"width\":{},\"height\":{},\"admitted\":{},\"claimed\":{},\"live\":{},\"direct_sampling\":{}}}",
                         record.arena_high, record.arena_low, record.allocation_identity,
-                        record.width, record.height, self.admitted.len(), self.claimed.len(), self.live.len()
+                        record.width, record.height, self.admitted.len(), self.claimed.len(), self.live.len(), record.direct_sampling != 0
                     ));
                 }
                 OPCODE_ARENA => {
@@ -594,24 +628,35 @@ impl Channel {
                     }
                     self.admitted.insert(id, Admission { width: record.width, height: record.height,
                         stride: 0, size: 0, modifier: MODIFIER_LINEAR, layout: record,
-                        memory: None, frame_edge: None, frame_signal: None });
+                        memory: None, frame_edge: None, frame_signal: None, access_signal: None });
                     write_diagnostic(|line| write!(line,
                         "{{\"event\":\"firefox.workspace.admitted\",\"surface\":\"{id}\",\"width\":{},\"height\":{}}}",
                         record.width, record.height));
                 }
-                OPCODE_COPY_COMPLETED => {
-                    if !self.sources.contains(&id) || !self.live.contains(&id)
+                OPCODE_READ_SETTLED => {
+                    if !self.sources.contains_key(&id) || !self.live.contains(&id)
                         || record.width != 0 || record.height != 0 || record.code != 0
                         || record.presentation_revision == 0 || record.offset == 0 || (record.stride == 0 && record.size == 0)
-                        || self.copy_completions.iter().any(|pending| pending.0 == id && pending.4 == record.offset)
-                        || self.copy_completions.len() >= PENDING_RECORD_CAPACITY {
+                        || self.read_settlements.iter().any(|pending| pending.0 == id && pending.4 == record.offset)
+                        || self.read_settlements.len() >= PENDING_RECORD_CAPACITY {
                         self.fail(); return;
                     }
-                    self.copy_completions.push_back((id, record.stride, record.size, record.presentation_revision, record.offset));
+                    let Some(acquisition) = self.sources.get_mut(&id).and_then(Option::as_mut) else {
+                        self.fail(); return;
+                    };
+                    if acquisition.state != AcquisitionState::Notified
+                        || acquisition.record.stride != record.stride
+                        || acquisition.record.size != record.size
+                        || acquisition.record.presentation_revision != record.presentation_revision
+                        || acquisition.record.offset != record.offset {
+                        self.fail(); return;
+                    }
+                    acquisition.state = AcquisitionState::Settling;
+                    self.read_settlements.push_back((id, record.stride, record.size, record.presentation_revision, record.offset));
                     self.wake_dispatcher();
                 }
                 OPCODE_DROP => {
-                    trace_state("drop_received", id, "native_withdrawal", self.sources.contains(&id));
+                    trace_state("drop_received", id, "native_withdrawal", self.sources.contains_key(&id));
                     if record.width != 0
                         || record.height != 0
                         || record.stride != 0
@@ -673,9 +718,9 @@ impl Channel {
         if opcode == OPCODE_FAILED {
             write_diagnostic(|line| write!(line,
                 "{{\"event\":\"firefox.workspace.{}import_failed\",\"surface\":\"{id}\",\"code\":{code},\"required_stride\":{stride},\"required_size\":{size}}}",
-                if self.sources.contains(&id) { "source." } else { "" }));
+                if self.sources.contains_key(&id) { "source." } else { "" }));
         } else if opcode == OPCODE_READY {
-            trace_state("ready", id, "vulkan_import_complete", self.sources.contains(&id));
+            trace_state("ready", id, "vulkan_import_complete", self.sources.contains_key(&id));
         }
         self.flush();
         if !self.pending.is_empty() {
@@ -795,18 +840,24 @@ impl Channel {
 
     fn flush(&mut self) {
         while self.terminal == ChannelTerminal::Open {
-            let Some(pending) = self.pending.front() else {
+            let acquired = self.sources.iter().find_map(|(id, acquisition)| acquisition.as_ref().and_then(|acquisition|
+                (acquisition.state == AcquisitionState::Submitted).then_some((*id, acquisition.record))));
+            let (record, descriptor) = if let Some((_, record)) = acquired {
+                (record, None)
+            } else if let Some(pending) = self.pending.front() {
+                (pending.record, pending.descriptor.as_ref())
+            } else {
                 return;
             };
             let mut payload = libc::iovec {
-                iov_base: &pending.record as *const Record as *mut libc::c_void,
+                iov_base: &record as *const Record as *mut libc::c_void,
                 iov_len: RECORD_BYTES,
             };
             let mut control = [0u8; CONTROL_BYTES];
             let mut message: libc::msghdr = unsafe { mem::zeroed() };
             message.msg_iov = &mut payload;
             message.msg_iovlen = 1;
-            if let Some(descriptor) = pending.descriptor.as_ref() {
+            if let Some(descriptor) = descriptor {
                 message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
                 message.msg_controllen =
                     unsafe { libc::CMSG_SPACE(mem::size_of::<RawFd>() as _) } as usize;
@@ -837,11 +888,15 @@ impl Channel {
                 self.fail();
                 return;
             }
+            if let Some((id, _)) = acquired {
+                self.sources.get_mut(&id).unwrap().as_mut().unwrap().state = AcquisitionState::Notified;
+                continue;
+            }
             let record = self.pending.pop_front().unwrap().record;
             let id = SurfaceId { high: record.id_high, low: record.id_low };
             if record.opcode == OPCODE_RETIRED
                 || (record.opcode == OPCODE_FAILED && self.withdrawn.contains(&id)) {
-                trace_state("retired", id, "resources_released", self.sources.contains(&id));
+                trace_state("retired", id, "resources_released", self.sources.contains_key(&id));
                 // The terminal has left the socket queue and no physical owner
                 // can refer to this capability. A late independent page claim
                 // is simply unknown and its local failure sends no new terminal.
@@ -924,7 +979,8 @@ pub fn poll_state() -> Option<(RawFd, u32)> {
         return None;
     }
     let mut events = libc::EPOLLIN as u32;
-    if !channel.pending.is_empty() {
+    if !channel.pending.is_empty()
+        || channel.sources.values().flatten().any(|acquisition| acquisition.state == AcquisitionState::Submitted) {
         events |= libc::EPOLLOUT as u32;
     }
     Some((channel.fd, events))
@@ -977,11 +1033,23 @@ pub fn take_admission(id: SurfaceId, width: u32, height: u32) -> Option<Admissio
     channel.claim(id, width, height)
 }
 
+pub fn arena_admitted(id: SurfaceId) -> bool {
+    channel().and_then(|channel| channel.lock().ok().map(|channel|
+        channel.admitted.get(&id).is_some_and(|admission| admission.layout.opcode == OPCODE_ARENA)))
+        .unwrap_or(false)
+}
+
+pub fn withdrawn_arenas() -> Vec<SurfaceId> {
+    channel().and_then(|channel| channel.lock().ok().map(|channel|
+        channel.withdrawn.iter().filter(|id| !channel.sources.contains_key(id) && channel.live.contains(id))
+            .copied().collect())).unwrap_or_default()
+}
+
 pub fn send_ready(id: SurfaceId, timeline: OwnedFd) {
     if let Some(channel) = channel() {
         if let Ok(mut channel) = channel.lock() {
             channel.send_outcome(OPCODE_READY, id, 0, 0, 0, Some(timeline));
-            if channel.sources.contains(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
+            if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
                 channel.settled_releases.push_back(id);
                 channel.wake_dispatcher();
             }
@@ -1140,9 +1208,70 @@ pub fn take_source_requests() -> Vec<SurfaceId> {
     channel().and_then(|channel| channel.lock().ok().map(|mut channel|
         channel.source_requests.drain(..).collect())).unwrap_or_default()
 }
-pub fn take_copy_completions() -> Vec<(SurfaceId, u64, u64, u64, u64)> {
+pub fn reserve_acquisition(id: SurfaceId, session: u64, sequence: u64, publication: u64, transfer: u64) -> bool {
+    let Some(channel) = channel() else { return false; };
+    let Ok(mut channel) = channel.lock() else { return false; };
+    if channel.terminal != ChannelTerminal::Open || !channel.live.contains(&id) || channel.withdrawn.contains(&id) {
+        return false;
+    }
+    let Some(source) = channel.sources.get_mut(&id) else { return false; };
+    if source.is_some() { return false; }
+    *source = Some(SourceAcquisition {
+        record: Record { abi_version: ABI_VERSION, opcode: OPCODE_ACQUIRED,
+            id_high: id.high, id_low: id.low, stride: session, size: sequence,
+            presentation_revision: publication, offset: transfer, ..Default::default() },
+        state: AcquisitionState::Reserved,
+    });
+    true
+}
+
+pub fn submit_acquisition(id: SurfaceId) -> bool {
+    let Some(channel) = channel() else { return false; };
+    let Ok(mut channel) = channel.lock() else { return false; };
+    let Some(acquisition) = channel.sources.get_mut(&id).and_then(Option::as_mut) else { channel.fail(); return false; };
+    if acquisition.state != AcquisitionState::Reserved { channel.fail(); return false; }
+    acquisition.state = AcquisitionState::Submitted;
+    channel.flush();
+    channel.wake_dispatcher();
+    channel.terminal == ChannelTerminal::Open
+}
+
+pub fn cancel_acquisition(id: SurfaceId) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Reserved) {
+        channel.fail(); return;
+    }
+    *channel.sources.get_mut(&id).unwrap() = None;
+    if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
+        channel.retire_source(id);
+    }
+}
+
+pub fn complete_read_settlement(id: SurfaceId) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    if !channel.sources.get(&id).and_then(Option::as_ref).is_some_and(|acquisition| acquisition.state == AcquisitionState::Settling) {
+        channel.fail(); return;
+    }
+    *channel.sources.get_mut(&id).unwrap() = None;
+    if channel.terminal == ChannelTerminal::Open && channel.withdrawn.contains(&id) {
+        channel.retire_source(id);
+    }
+}
+
+pub fn complete_terminal_read(id: SurfaceId) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    channel.sources.remove(&id);
+    // Device/bridge retirement can overtake ReadSettled while the transport is
+    // still open. This source can no longer fulfill the live protocol; close
+    // the boundary so native consumes the shared receipt only after shutdown.
+    channel.terminalize(ChannelTerminal::OrderlyBridgeClose);
+}
+pub fn take_read_settlements() -> Vec<(SurfaceId, u64, u64, u64, u64)> {
     channel().and_then(|channel| channel.lock().ok().map(|mut channel|
-        channel.copy_completions.drain(..).collect())).unwrap_or_default()
+        channel.read_settlements.drain(..).collect())).unwrap_or_default()
 }
 pub fn take_source_admission(id: SurfaceId) -> Option<Admission> {
     let mut channel = channel()?.lock().ok()?;

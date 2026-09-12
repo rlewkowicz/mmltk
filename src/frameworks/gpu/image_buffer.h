@@ -253,6 +253,8 @@ class ImageProductBuffer final {
                                                            bool preserve_clean = false,
                                                            ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] bool writable() const;
+    [[nodiscard]] bool ReserveWorkspaceWrite();
+    void CancelWorkspaceWrite() noexcept;
     [[nodiscard]] bool terminal() const noexcept;
     [[nodiscard]] bool Owns(const BorrowedImageProductReadView&) const noexcept;
     // Wake-only notification: may run at receiver completion on a GPU callback

@@ -64,6 +64,7 @@ struct DiagnosticWorkspace final {
     std::uint64_t workspace_pitch = 0U;
     std::uint64_t workspace_width = 0U;
     std::uint64_t workspace_height = 0U;
+    bool direct_sampling = false;
 };
 struct DiagnosticExploreAdmission final {
     std::uint64_t admission_position = 0U;

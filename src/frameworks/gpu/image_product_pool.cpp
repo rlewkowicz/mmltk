@@ -162,6 +162,7 @@ void ImageProductPool::Candidate::Release() noexcept {
     auto slot = std::move(slot_);
     {
         std::scoped_lock lock(slot->admission->mutex);
+        slot->buffer.CancelWorkspaceWrite();
         slot->reserved = false;
     }
     baseline_ = {};
@@ -202,14 +203,22 @@ void ImageProductPool::ValidateBaseline(const Product& baseline) const {
 ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, ImagePlanePreservation preservation) {
     ValidateBaseline(baseline);
     std::scoped_lock lock(admission_->mutex);
-    for (const auto& slot : slots_) {
-        if (slot->buffer.terminal()) throw std::runtime_error("image product storage is quarantined");
-        const bool in_place = slots_.size() == 1U;
-        const auto owned_baseline = static_cast<std::size_t>(in_place && baseline.slot_ == slot);
-        if (slot->reserved || slot->products != owned_baseline || (slot->selected && !in_place)) continue;
-        if (!slot->buffer.writable()) continue;
-        slot->reserved = true;
-        return Candidate{slot, std::move(baseline), preservation};
+    // Prefer exchanging the current and overflow roles. When the current image
+    // is externally held, an unobserved overflow may instead be replaced in
+    // place. Neither policy changes a retained Product or a counted GPU read.
+    for (const bool replace_selected : {false, true}) {
+        for (const auto& slot : slots_) {
+            if (slot->buffer.terminal()) throw std::runtime_error("image product storage is quarantined");
+            if (slot->selected != replace_selected) continue;
+            const bool owns_baseline = baseline.slot_ == slot;
+            const auto owned_baseline = static_cast<std::size_t>(owns_baseline);
+            if (slot->reserved || slot->products != owned_baseline ||
+                (slot->selected && !owns_baseline && slots_.size() != 1U)) continue;
+            if (!slot->buffer.writable()) continue;
+            if (!slot->buffer.ReserveWorkspaceWrite()) continue;
+            slot->reserved = true;
+            return Candidate{slot, std::move(baseline), preservation};
+        }
     }
     return {};
 }
@@ -345,6 +354,7 @@ ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
         for (const auto& slot : slots_)
             slot->selected = slot == candidate.slot_;
         candidate.slot_->reserved = false;
+        candidate.slot_->buffer.CancelWorkspaceWrite();
         ++candidate.slot_->products;
         completed = Product{candidate.slot_, candidate.revision_};
     }

@@ -104,6 +104,174 @@ TEST_CASE("Annotation private document enforces the canonical fixed text policy"
     CHECK(apply(contracts::AnnotationText::From("category")) == document::DocumentOutcome::Applied);
 }
 
+TEST_CASE("Displayed annotation targets survive index shifts and journal reversal without retargeting") {
+    namespace document = subsystems::annotation;
+    document::AnnotationDocument editor;
+    auto scene = test_scene("direct://displayed-identities");
+    contracts::AnnotationObject point{.name = contracts::AnnotationText::From("point"),
+        .shape = contracts::AnnotationShape::Point, .point = {12.0F, 14.0F}};
+    scene.objects = {point, point};
+    REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
+    AnnotationRenderState displayed;
+    editor.CaptureRender(displayed);
+    REQUIRE(displayed.identities->size() == 2U);
+    AnnotationPointer target{
+        .interaction_id = 1U, .sequence = 1U,
+        .target = {.object = 1U, .element = 0U, .role = contracts::AnnotationHandleRole::Point},
+        .identity = {.object = displayed.identities->at(1).object, .element = 1U},
+        .point = {12.0F, 14.0F},
+    };
+    REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::Delete}}).outcome ==
+            document::DocumentOutcome::Applied);
+    auto current_target = target;
+    REQUIRE(editor.ResolveTarget(current_target));
+    CHECK(current_target.target.object == 0U);
+    REQUIRE(editor.Pointer(current_target).outcome == document::DocumentOutcome::Applied);
+    editor.PeerClosed();
+    REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    current_target = target;
+    REQUIRE(editor.ResolveTarget(current_target));
+    CHECK(current_target.target.object == 1U);
+    REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::Delete}}).outcome ==
+            document::DocumentOutcome::Applied);
+    CHECK_FALSE(editor.ResolveTarget(target));
+    REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.ResolveTarget(target));
+    CHECK(target.target.object == 0U);
+    // Reusing a deleted index with a newly created object never reuses identity.
+    REQUIRE(editor.Edit({.value = AnnotationSceneEdit{}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationToolEdit{contracts::AnnotationTool::Point}}).outcome == document::DocumentOutcome::Applied);
+    AnnotationPointer create{.interaction_id = 2U, .sequence = 1U, .point = {20.0F, 20.0F}};
+    apply_gesture(editor, create, {20.0F, 20.0F});
+    CHECK_FALSE(editor.ResolveTarget(target));
+    CHECK(displayed.scene->objects == scene.objects);
+}
+
+TEST_CASE("Displayed spline knot identities retain surviving elements across delete undo and redo") {
+    namespace document = subsystems::annotation;
+    document::AnnotationDocument editor;
+    auto scene = test_scene("direct://displayed-elements");
+    contracts::AnnotationObject spline{.name = contracts::AnnotationText::From("spline"),
+        .shape = contracts::AnnotationShape::Spline};
+    spline.spline_knots = {{{12.0F, 12.0F}}, {{24.0F, 24.0F}}, {{36.0F, 36.0F}}};
+    scene.objects = {spline};
+    REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
+    AnnotationRenderState displayed;
+    editor.CaptureRender(displayed);
+    const auto& identity = displayed.identities->front();
+    AnnotationPointer survivor{
+        .interaction_id = 1U, .sequence = 1U,
+        .target = {.object = 0U, .element = 2U, .role = contracts::AnnotationHandleRole::SplineKnot},
+        .identity = {.object = identity.object, .element = identity.elements[2]},
+        .point = {36.0F, 36.0F},
+    };
+    auto removed = survivor;
+    removed.target.element = 1U;
+    removed.identity.element = identity.elements[1];
+    REQUIRE(editor.Edit({.value = AnnotationObjectEdit{0U}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationSplineEdit{1U}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationSidebarEdit{contracts::AnnotationSidebarCommand::SplineDeleteKnot}}).outcome ==
+            document::DocumentOutcome::Applied);
+    REQUIRE(editor.ResolveTarget(survivor));
+    CHECK(survivor.target.element == 1U);
+    CHECK_FALSE(editor.ResolveTarget(removed));
+    REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.ResolveTarget(removed));
+    CHECK(removed.target.element == 1U);
+    REQUIRE(editor.ResolveTarget(survivor));
+    CHECK(survivor.target.element == 2U);
+    REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.ResolveTarget(survivor));
+    CHECK(survivor.target.element == 1U);
+    CHECK_FALSE(editor.ResolveTarget(removed));
+}
+
+TEST_CASE("A completed creation preview keeps its target identity after commit while rendering lags") {
+    namespace document = subsystems::annotation;
+    document::AnnotationDocument editor;
+    REQUIRE(editor.Open(test_scene("direct://creation-preview")).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}).outcome == document::DocumentOutcome::Applied);
+    AnnotationPointer create{.interaction_id = 1U, .sequence = 1U, .point = {4.0F, 5.0F}};
+    REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
+    create.phase = contracts::AnnotationPointerPhase::Update;
+    ++create.sequence;
+    create.point = {20.0F, 25.0F};
+    REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
+    AnnotationRenderState preview;
+    editor.CaptureRender(preview);
+    REQUIRE(preview.preview_identity != 0U);
+    AnnotationPointer displayed{
+        .interaction_id = 2U, .sequence = 1U, .target = {.object = 0U},
+        .identity = {.object = preview.preview_identity}, .point = {10.0F, 12.0F},
+    };
+    CHECK_FALSE(editor.ResolveTarget(displayed));
+    create.phase = contracts::AnnotationPointerPhase::End;
+    ++create.sequence;
+    REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.ResolveTarget(displayed));
+    REQUIRE(editor.Edit({.value = AnnotationToolEdit{contracts::AnnotationTool::Select}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Pointer(displayed).outcome == document::DocumentOutcome::Applied);
+    editor.PeerClosed();
+    REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    CHECK_FALSE(editor.ResolveTarget(displayed));
+    REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    CHECK(editor.ResolveTarget(displayed));
+    CHECK(preview.scene->objects.empty());
+}
+
+TEST_CASE("New indexed Annotation objects keep initial element identities through history") {
+    namespace document = subsystems::annotation;
+    for (const auto tool : {contracts::AnnotationTool::Spline, contracts::AnnotationTool::Skeleton}) {
+        CAPTURE(tool);
+        document::AnnotationDocument editor;
+        REQUIRE(editor.Open(test_scene("direct://indexed-creation")).outcome == document::DocumentOutcome::Applied);
+        REQUIRE(editor.Edit({.value = AnnotationToolEdit{tool}}).outcome == document::DocumentOutcome::Applied);
+        AnnotationPointer create{.interaction_id = 1U, .sequence = 1U, .point = {12.0F, 14.0F}};
+        REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
+        AnnotationRenderState pending;
+        editor.CaptureRender(pending);
+        CHECK(pending.preview_identity == 0U);
+        CHECK_FALSE(pending.preview_object);
+        create.phase = contracts::AnnotationPointerPhase::End;
+        ++create.sequence;
+        REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
+        AnnotationRenderState committed;
+        editor.CaptureRender(committed);
+        REQUIRE(committed.identities->size() == 1U);
+        const auto identity = committed.identities->front();
+        REQUIRE(identity.object != 0U);
+        REQUIRE(identity.elements.size() == 1U);
+        REQUIRE(identity.elements.front() != 0U);
+        AnnotationPointer handle{
+            .interaction_id = 2U, .sequence = 1U,
+            .target = {.object = 0U, .element = 0U,
+                .role = tool == contracts::AnnotationTool::Spline
+                    ? contracts::AnnotationHandleRole::SplineKnot : contracts::AnnotationHandleRole::SkeletonNode},
+            .identity = {.object = identity.object, .element = identity.elements.front()},
+            .point = {12.0F, 14.0F},
+        };
+        REQUIRE(editor.ResolveTarget(handle));
+        auto absent = handle;
+        absent.identity.element = 0U;
+        CHECK_FALSE(editor.ResolveTarget(absent));
+        auto stale = handle;
+        stale.identity.element = identity.object;
+        CHECK_FALSE(editor.ResolveTarget(stale));
+        REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+        CHECK(editor.ui().scene.objects.empty());
+        CHECK_FALSE(editor.ResolveTarget(handle));
+        REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+        REQUIRE(editor.ResolveTarget(handle));
+        editor.CaptureRender(committed);
+        REQUIRE(committed.identities->size() == 1U);
+        CHECK(committed.identities->front() == identity);
+        CHECK_FALSE(editor.ResolveTarget(stale));
+    }
+}
+
 TEST_CASE("Visual document projection transforms every canonical spatial member with clipped crop coordinates") {
     auto source = std::make_shared<VisualDocument>();
     source->scene = test_scene("direct://all-geometry");

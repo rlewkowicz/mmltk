@@ -26,6 +26,9 @@
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/services/file_dialog_catalog.h"
+#include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/frameworks/reflection/field_policy.h"
 
 namespace mmltk::controller::browser::relation_audit_test {
@@ -1352,4 +1355,106 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("Atomic") == std::string::npos);
     CHECK(generated.find("cbor") == std::string::npos);
     CHECK(generated.find("application_bindings") == std::string::npos);
+}
+
+TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the existing wire budgets",
+          "[browser][annotation][capacity]") {
+    using namespace mmltk::controller;
+    namespace c = contracts;
+    namespace serialization = mmltk::frameworks::serialization;
+    AnnotationSnapshot snapshot;
+    snapshot.revision = snapshot.ui_revision = snapshot.input_document_epoch = 1U;
+    snapshot.ready = true;
+    auto& ui = snapshot.ui;
+    ui.document_revision = ui.scene_revision = ui.interaction_revision = 1U;
+    auto& scene = ui.scene;
+    scene.document = c::WorkspaceResource::From(std::string(c::kWorkspaceResourceCapacity, 'd'), 1U);
+    scene.frame_width = scene.frame_height = std::numeric_limits<std::uint16_t>::max();
+    scene.frame_ready = true;
+    scene.categories.resize(c::kAnnotationCategoryCapacity,
+                            {.value = std::string(c::kArtifactClassNameCapacity, 'c')});
+    scene.palette.resize(c::kAnnotationCategoryCapacity, {.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F});
+    const c::AnnotationPoint point{1234.5678F, 2345.6789F};
+    c::AnnotationObject object{
+        .name = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'n')),
+        .shape = c::AnnotationShape::Box, .box = {point, point}, .point = point,
+        .mask = {.cleanup_radius = std::numeric_limits<std::uint16_t>::max()},
+        .sup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
+        .nosup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
+        .mask_points = std::vector<c::AnnotationPoint>(c::kAnnotationGeometryCapacity, point),
+        .spline_knots = std::vector<c::AnnotationSplineKnot>(c::kAnnotationGeometryCapacity,
+            {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
+        .skeleton_nodes = std::vector<c::AnnotationSkeletonNode>(c::kAnnotationGeometryCapacity,
+            {.key = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'k')), .point = point}),
+        .skeleton_edges = std::vector<c::AnnotationEdge>(c::kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
+        .category = static_cast<std::uint16_t>(c::kAnnotationCategoryCapacity - 1U),
+    };
+    scene.objects.resize(c::kAnnotationObjectCapacity, object);
+    scene.objects.front().mask = {
+        .runs = std::vector<c::AnnotationMaskRun>(c::kAnnotationMaskRunCapacity, {65534U, 65532U, 65534U}),
+        .cleanup_radius = std::numeric_limits<std::uint16_t>::max(), .present = true,
+    };
+    ui.editor.selected_object = 0U;
+    REQUIRE(ui.valid());
+    // The aggregate mask bound belongs to each scene, not each object. A
+    // retained drawable may differ at every point from the logical document.
+    auto displayed = scene;
+    for (auto& item : displayed.objects) {
+        item.shape = c::AnnotationShape::Skeleton;
+        item.point.x += 0.12345F;
+        for (auto& knot : item.spline_knots) knot.in.point.x += 0.23456F;
+    }
+    displayed.objects.front().shape = c::AnnotationShape::Mask;
+    snapshot.rendered_scene.document_epoch = 2U;
+    snapshot.rendered_scene.scene_revision = 3U;
+    c::project_annotation_geometry(snapshot.rendered_scene.geometry, displayed);
+    snapshot.rendered_scene.identities.resize(c::kAnnotationObjectCapacity, std::numeric_limits<std::uint64_t>::max());
+    snapshot.rendered.document_epoch = 2U;
+    snapshot.rendered.scene_revision = 3U;
+    snapshot.rendered.editor = ui.editor;
+    snapshot.rendered.selected.emplace();
+    snapshot.rendered.selected_identity = c::AnnotationObjectIdentity{
+        .object = std::numeric_limits<std::uint64_t>::max(),
+        .elements = std::vector<std::uint64_t>(c::kAnnotationGeometryCapacity, std::numeric_limits<std::uint64_t>::max())};
+    c::project_annotation_geometry(*snapshot.rendered.selected, displayed.objects.front());
+    snapshot.rendered.preview.emplace();
+    c::project_annotation_geometry(*snapshot.rendered.preview, displayed.objects.front());
+    snapshot.rendered.preview_object = 0U;
+    REQUIRE(snapshot.rendered_scene.geometry.objects.front().mask.has_value());
+    CHECK(snapshot.rendered_scene.geometry.objects.front().mask->runs == displayed.objects.front().mask.runs);
+    CHECK(snapshot.rendered.selected->spline_knots == displayed.objects.front().spline_knots);
+    CHECK(snapshot.rendered_scene.geometry.objects.back().skeleton_nodes.back().point ==
+          displayed.objects.back().skeleton_nodes.back().point);
+    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().box.has_value());
+    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().point.has_value());
+    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().mask.has_value());
+    CHECK(snapshot.rendered_scene.geometry.objects.back().spline_knots.empty());
+    CHECK_FALSE(ui.scene.objects.back().spline_knots.empty());
+
+    std::vector<std::byte> encoded(browser::kMaxOutputValueBytes);
+    serialization::FixedCborEncoder writer(encoded);
+    REQUIRE(serialization::encode_compact(writer, snapshot));
+    CHECK(writer.size() <= c::kAnnotationUiStateByteBudget);
+    auto value = browser::application_materializer_detail::reflected_value(snapshot);
+    REQUIRE(value.has_value());
+    browser::Bootstrap bootstrap{
+        .snapshots = {{.system_id = browser::application_stable_id("annotation"), .value = std::move(*value)}},
+    };
+    // Reconnect may also retain the full editable source in Explore and its
+    // transformed Upscale result while Annotation shows a distinct body scene.
+    ExploreSnapshot explore;
+    explore.scene = scene;
+    UpscaleSnapshot upscale;
+    upscale.scene = displayed;
+    const auto retain = [&](std::string_view name, const auto& state) {
+        auto retained = browser::application_materializer_detail::reflected_value(state);
+        REQUIRE(retained.has_value());
+        bootstrap.snapshots.push_back({.system_id = browser::application_stable_id(name), .value = std::move(*retained)});
+    };
+    retain("explore", explore);
+    retain("upscale", upscale);
+    encoded.resize(browser::kMaxRecordWireBytes);
+    serialization::FixedCborEncoder bootstrap_writer(encoded);
+    REQUIRE(serialization::encode_compact(bootstrap_writer, bootstrap));
+    CHECK(bootstrap_writer.size() < browser::kMaxRecordWireBytes);
 }

@@ -89,8 +89,9 @@ class ImageProductPool final {
     ~ImageProductPool();
     ImageProductPool(const ImageProductPool&) = delete;
     ImageProductPool& operator=(const ImageProductPool&) = delete;
-    // Moving the sole completed handle permits bounded in-place reuse in a
-    // one-slot pool. Multi-slot candidates retain their exact baseline.
+    // Moving the sole completed handle permits bounded in-place replacement
+    // when the other display role is held. Unselected writable storage is
+    // preferred, and candidates retain their exact baseline.
     // Clean preservation requires the publication callback to replace semantics.
     [[nodiscard]] Candidate Acquire(std::stop_token = {}, Product baseline = {}, ImagePlanePreservation = ImagePlanePreservation::All);
     // Transfer the baseline only on success. A failed try retains custody without

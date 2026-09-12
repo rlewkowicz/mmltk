@@ -24,7 +24,7 @@ iced-fluent-theme = { path = "../../../third_party/iced-fluent-theme" }
 iced_aw = { path = "../../../third_party/iced_aw", default-features = false, features = ["number_input", "selection_list"] }
 js-sys = "0.3"
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["CustomEvent", "CustomEventInit", "Event", "EventTarget", "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Location", "Navigator", "UrlSearchParams", "Window", "console"] }
+web-sys = { version = "0.3", features = ["CustomEvent", "CustomEventInit", "Event", "EventTarget", "WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Location", "Navigator", "UrlSearchParams", "Window", "Document", "NodeList", "HtmlCanvasElement", "console"] }
 wgpu = { version = "29", default-features = false, features = ["webgpu"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

@@ -338,6 +338,13 @@ class BindingEmitter final {
         EmitType<mmltk::controller::contracts::ApplicationErrorCategory>();
         EmitType<mmltk::controller::contracts::reflection::EventDelivery>();
         VisitBoundaryTypes();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSkeletonGeometry, mmltk::controller::contracts::AnnotationSkeletonNode>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSplineBody, mmltk::controller::contracts::AnnotationSplineKnot>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectGeometry, mmltk::controller::contracts::AnnotationObject>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSelectedGeometry, mmltk::controller::contracts::AnnotationObject>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody, mmltk::controller::contracts::AnnotationObject>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody, mmltk::controller::contracts::AnnotationObjectGeometry>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSceneGeometry, mmltk::controller::contracts::AnnotationSceneContent>();
         EmitRecordPreflight();
         EmitMetadata();
         EmitIdentitiesAndApplicationEnums();
@@ -364,6 +371,35 @@ class BindingEmitter final {
     }
 
    private:
+    template <class Destination, class Source>
+    void EmitAnnotationGeometry() {
+        output_ << "impl From<&" << rust_type<Source>() << "> for " << rust_type<Destination>()
+                << " { fn from(source: &" << rust_type<Source>() << ") -> Self { Self {\n";
+        template for (constexpr auto target :
+                      std::define_static_array(std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::unchecked()))) {
+            constexpr auto source = mmltk::controller::contracts::annotation_geometry_member<Source, target>();
+            constexpr auto shape = mmltk::controller::contracts::annotation_geometry_shape<target>();
+            using Member = typename[:std::meta::type_of(target):];
+            using SourceMember = typename[:std::meta::type_of(source):];
+            constexpr bool optional = requires(Member value) { value.has_value(); };
+            const auto name = rust_identifier(std::meta::identifier_of(target), false);
+            output_ << name << ": ";
+            if constexpr (shape.has_value())
+                output_ << "if source.shape == AnnotationShape::"
+                        << rust_identifier(mmltk::frameworks::reflection::enum_name(*shape), true) << " { ";
+            if constexpr (optional) output_ << "Some(";
+            output_ << "source." << name;
+            if constexpr (std::is_assignable_v<Member&, const SourceMember&>)
+                output_ << ".clone()";
+            else
+                output_ << ".iter().map(From::from).collect()";
+            if constexpr (optional) output_ << ")";
+            if constexpr (shape.has_value()) output_ << " } else { Default::default() }";
+            output_ << ",\n";
+        }
+        output_ << "} } }\n";
+    }
+
     template <class Value>
     void EmitType() {
         using Type = std::remove_cvref_t<Value>;

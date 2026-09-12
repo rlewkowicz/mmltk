@@ -13,6 +13,7 @@
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
+#include "src/frameworks/gpu/image_workspace.h"
 
 namespace mmltk::controller::browser {
 
@@ -29,6 +30,7 @@ class ApplicationWorkspaceAbiEmitter final {
         Constant("IMPORT_MEMORY_DESCRIPTOR", "usize", abi::kImportMemoryDescriptor);
         Constant("IMPORT_FRAME_EDGE_DESCRIPTOR", "usize", abi::kImportFrameEdgeDescriptor);
         Constant("IMPORT_FRAME_SIGNAL_DESCRIPTOR", "usize", abi::kImportFrameSignalDescriptor);
+        Constant("IMPORT_ACCESS_DESCRIPTOR", "usize", abi::kImportAccessDescriptor);
         Constant("IMPORT_DESCRIPTOR_COUNT", "usize", abi::kImportDescriptorCount);
         Constant("READY_TIMELINE_DESCRIPTOR", "usize", abi::kReadyTimelineDescriptor);
         Constant("READY_DESCRIPTOR_COUNT", "usize", abi::kReadyDescriptorCount);
@@ -39,6 +41,14 @@ class ApplicationWorkspaceAbiEmitter final {
         Record<abi::LayoutPacket>();
         Record<presentation::WorkspaceContentIdentity>();
         Record<presentation::detail::WorkspaceFrameSignal>();
+        namespace gpu = frameworks::gpu;
+        Constant("WORKSPACE_ACCESS_EMPTY", "u64", gpu::kWorkspaceAccessEmpty);
+        Constant("WORKSPACE_ACCESS_WRITING", "u64", gpu::kWorkspaceAccessWriting);
+        Constant("WORKSPACE_ACCESS_AVAILABLE", "u64", gpu::kWorkspaceAccessAvailable);
+        Constant("WORKSPACE_ACCESS_READING", "u64", gpu::kWorkspaceAccessReading);
+        Constant("WORKSPACE_ACCESS_MASK", "u64", gpu::kWorkspaceAccessMask);
+        Constant("WORKSPACE_ACCESS_REVOKED", "u64", gpu::kWorkspaceAccessRevoked);
+        Record<gpu::ImageWorkspaceAccessSignal>();
     }
 
    private:

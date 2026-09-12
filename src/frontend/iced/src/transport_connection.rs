@@ -604,6 +604,7 @@ mod tests {
             phase,
             interactionid: 1,
             sequence: 1,
+            identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
             target: crate::generated::AnnotationPointerTarget {
                 object: None,
                 element: None,

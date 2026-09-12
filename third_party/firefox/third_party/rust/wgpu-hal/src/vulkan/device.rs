@@ -306,6 +306,7 @@ impl super::Device {
             format: desc.format,
             copy_size: desc.copy_extent(),
             identity,
+            external_layout: None,
         }
     }
 
@@ -757,6 +758,10 @@ fn import_dmabuf_memory(
     pub fn queue_operation_gate(&self) -> Arc<std::sync::Mutex<()>> {
         Arc::clone(&self.shared.queue_operation_gate)
     }
+    /// Keeps this device alive through asynchronous external-image destruction.
+    pub fn external_image_custody(&self) -> Arc<dyn std::any::Any + Send + Sync> {
+        self.shared.clone()
+    }
 
     pub fn register_external_timeline_submission(
         &self,
@@ -770,7 +775,7 @@ fn import_dmabuf_memory(
             release_command_buffer,
             timeline,
             submitted_release: core::sync::atomic::AtomicU64::new(0),
-            preconsumed_edges: core::sync::atomic::AtomicU64::new(0),
+            acquired_ready: core::sync::atomic::AtomicU64::new(0),
             destination_attached: core::sync::atomic::AtomicBool::new(true),
             active: core::sync::atomic::AtomicBool::new(true),
         })
@@ -1235,6 +1240,7 @@ impl crate::Device for super::Device {
             dimension: desc.dimension,
             texture_identity: texture.identity,
             view_identity: identity,
+            external_layout: texture.external_layout,
         })
     }
     unsafe fn destroy_texture_view(&self, view: super::TextureView) {
@@ -1672,7 +1678,8 @@ impl crate::Device for super::Device {
                         image_infos.extend(desc.textures[start as usize..end as usize].iter().map(
                             |binding| {
                                 let layout =
-                                    conv::derive_image_layout(binding.usage, binding.view.format);
+                                    binding.view.external_layout.unwrap_or_else(||
+                                        conv::derive_image_layout(binding.usage, binding.view.format));
                                 vk::DescriptorImageInfo::default()
                                     .image_view(binding.view.raw)
                                     .image_layout(layout)

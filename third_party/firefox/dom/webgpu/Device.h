@@ -153,6 +153,9 @@ class Device final : public DOMEventTargetHelper,
       Maybe<layers::RemoteTextureOwnerId> aOwnerId);
   already_AddRefed<ExternalTexture> ImportExternalTexture(
       const dom::GPUExternalTextureDescriptor& aDesc, ErrorResult& aRv);
+  void RequestWorkspace(const nsAString& aCapability, uint32_t aWidth, uint32_t aHeight);
+  void AcquireWorkspace(const nsAString& aCapability, const nsAString& aContentSession,
+                        const nsAString& aContentSequence, const nsAString& aPublication);
   already_AddRefed<Sampler> CreateSampler(
       const dom::GPUSamplerDescriptor& aDesc);
 

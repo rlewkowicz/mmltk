@@ -238,10 +238,12 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 &self.device.private_caps,
             );
             let (src_stage, src_access) = conv::map_texture_usage_to_barrier(bar.usage.from);
-            let src_layout = conv::derive_image_layout(bar.usage.from, bar.texture.format);
+            let src_layout = bar.texture.external_layout.unwrap_or_else(||
+                conv::derive_image_layout(bar.usage.from, bar.texture.format));
             src_stages |= src_stage;
             let (dst_stage, dst_access) = conv::map_texture_usage_to_barrier(bar.usage.to);
-            let dst_layout = conv::derive_image_layout(bar.usage.to, bar.texture.format);
+            let dst_layout = bar.texture.external_layout.unwrap_or_else(||
+                conv::derive_image_layout(bar.usage.to, bar.texture.format));
             dst_stages |= dst_stage;
 
             vk_barriers.push(
@@ -343,7 +345,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) where
         T: Iterator<Item = crate::TextureCopy>,
     {
-        let src_layout = conv::derive_image_layout(src_usage, src.format);
+        let src_layout = src.external_layout.unwrap_or_else(|| conv::derive_image_layout(src_usage, src.format));
 
         let vk_regions_iter = regions.map(|r| {
             let (src_subresource, src_offset) = conv::map_subresource_layers(&r.src_base);
@@ -367,7 +369,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 src.raw,
                 src_layout,
                 dst.raw,
-                DST_IMAGE_LAYOUT,
+                dst.external_layout.unwrap_or(DST_IMAGE_LAYOUT),
                 &smallvec::SmallVec::<[vk::ImageCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
@@ -388,7 +390,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 self.active,
                 src.raw,
                 dst.raw,
-                DST_IMAGE_LAYOUT,
+                dst.external_layout.unwrap_or(DST_IMAGE_LAYOUT),
                 &smallvec::SmallVec::<[vk::BufferImageCopy; 32]>::from_iter(vk_regions_iter),
             )
         };
@@ -403,7 +405,7 @@ impl crate::CommandEncoder for super::CommandEncoder {
     ) where
         T: Iterator<Item = crate::BufferTextureCopy>,
     {
-        let src_layout = conv::derive_image_layout(src_usage, src.format);
+        let src_layout = src.external_layout.unwrap_or_else(|| conv::derive_image_layout(src_usage, src.format));
         let vk_regions_iter = src.map_buffer_copies(regions);
 
         unsafe {

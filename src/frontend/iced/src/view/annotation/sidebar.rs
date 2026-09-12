@@ -1151,7 +1151,8 @@ mod tests {
     fn pointer_sequence_has_one_begin_updates_and_one_end() {
         let inspector = super::super::canvas::Component::default();
         let model = model_with_objects();
-        let ui = &model.snapshot.as_ref().unwrap().ui;
+        inspector.test_install_displayed(crate::presentation_surface::AnnotationContent::test_displayed(
+            model.snapshot.as_ref().unwrap()));
         let gesture = |pressed, x, y| crate::presentation_surface::SurfaceGesture {
             kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
             sample: crate::presentation_surface::SurfaceSample {
@@ -1165,13 +1166,13 @@ mod tests {
             },
         };
         let begin = inspector
-            .pointer_from_gesture(ui, gesture(true, 1, 2))
+            .pointer_from_gesture(0, model.snapshot.as_ref().unwrap().ui.editor.tool, gesture(true, 1, 2))
             .unwrap();
         let update = inspector
-            .pointer_from_gesture(ui, gesture(true, 2, 3))
+            .pointer_from_gesture(0, model.snapshot.as_ref().unwrap().ui.editor.tool, gesture(true, 2, 3))
             .unwrap();
         let end = inspector
-            .pointer_from_gesture(ui, gesture(false, 2, 3))
+            .pointer_from_gesture(0, model.snapshot.as_ref().unwrap().ui.editor.tool, gesture(false, 2, 3))
             .unwrap();
         assert_eq!(begin.phase, crate::generated::AnnotationPointerPhase::Begin);
         assert_eq!(
@@ -1182,7 +1183,7 @@ mod tests {
         assert_eq!(begin.interactionid, end.interactionid);
         assert!(
             inspector
-                .pointer_from_gesture(ui, gesture(false, 0, 0))
+                .pointer_from_gesture(0, model.snapshot.as_ref().unwrap().ui.editor.tool, gesture(false, 0, 0))
                 .is_none()
         );
     }
@@ -1207,10 +1208,12 @@ mod tests {
             crate::presentation_surface::SurfaceGestureKind::Cancel,
         ] {
             let inspector = super::super::canvas::Component::default();
-            let ui = &model.snapshot.as_ref().unwrap().ui;
+            inspector.test_install_displayed(crate::presentation_surface::AnnotationContent::test_displayed(
+                model.snapshot.as_ref().unwrap()));
             let begin = inspector
                 .pointer_from_gesture(
-                    ui,
+                    0,
+                    model.snapshot.as_ref().unwrap().ui.editor.tool,
                     gesture(
                         crate::presentation_surface::SurfaceGestureKind::Pointer,
                         true,
@@ -1218,11 +1221,12 @@ mod tests {
                 )
                 .unwrap();
             let terminal = inspector
-                .pointer_from_gesture(ui, gesture(terminal_kind, false))
+                .pointer_from_gesture(0, model.snapshot.as_ref().unwrap().ui.editor.tool, gesture(terminal_kind, false))
                 .unwrap();
             let next = inspector
                 .pointer_from_gesture(
-                    ui,
+                    0,
+                    model.snapshot.as_ref().unwrap().ui.editor.tool,
                     gesture(
                         crate::presentation_surface::SurfaceGestureKind::Pointer,
                         true,
@@ -1251,9 +1255,12 @@ mod tests {
         inspector.handle_x_draft = "12".into();
         inspector.handle_y_draft = "34".into();
         let model = model_with_objects();
+        canvas.test_install_displayed(crate::presentation_surface::AnnotationContent::test_displayed(
+            model.snapshot.as_ref().unwrap()));
         canvas
             .pointer_from_gesture(
-                &model.snapshot.as_ref().unwrap().ui,
+                0,
+                    model.snapshot.as_ref().unwrap().ui.editor.tool,
                 crate::presentation_surface::SurfaceGesture {
                     kind: crate::presentation_surface::SurfaceGestureKind::Pointer,
                     sample: crate::presentation_surface::SurfaceSample {

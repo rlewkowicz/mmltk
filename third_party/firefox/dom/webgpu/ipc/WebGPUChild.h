@@ -174,7 +174,8 @@ class WebGPUChild final : public PWebGPUChild {
                                           uint64_t aContentSequence,
                                           uint64_t aPresentationRevision,
                                           uint32_t aContentWidth,
-                                          uint32_t aContentHeight, bool aCopyComplete);
+                                          uint32_t aContentHeight, bool aCopyComplete,
+                                  uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling);
   ipc::IPCResult RecvExternalTextureImportReady(RawId aDeviceId,
                                                  uint64_t aSurfaceIdHigh,
                                                  uint64_t aSurfaceIdLow);

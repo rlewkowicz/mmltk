@@ -23,11 +23,12 @@ struct alignas(64) WorkspaceFrameSignal final {
     std::uint64_t presentation_revision = 0U;
     std::uint32_t content_width = 0U;
     std::uint32_t content_height = 0U;
+    std::uint64_t physical_revision = 0U;
 };
 
 static_assert(std::is_standard_layout_v<WorkspaceFrameSignal>);
 static_assert(std::is_trivially_copyable_v<WorkspaceFrameSignal>);
-static_assert(sizeof(WorkspaceFrameSignal) == 64U);
+static_assert(sizeof(WorkspaceFrameSignal) == 128U);
 static_assert(alignof(WorkspaceFrameSignal) == 64U);
 static_assert(offsetof(WorkspaceFrameSignal, sequence_lock) == 0U);
 static_assert(offsetof(WorkspaceFrameSignal, timeline_ready) == 8U);
@@ -51,7 +52,8 @@ static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free);
 inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, const std::uint64_t timeline_ready,
                                            const std::uint64_t transfer_sequence, const WorkspacePresentationLayer layer,
                                            const WorkspaceContentIdentity logical_content, const std::uint64_t presentation_revision,
-                                           const std::uint32_t content_width, const std::uint32_t content_height) noexcept {
+                                           const std::uint32_t content_width, const std::uint32_t content_height,
+                                           const std::uint64_t physical_revision) noexcept {
     if (signal == nullptr) return;
     std::atomic_ref<std::uint64_t> sequence{signal->sequence_lock};
     static_cast<void>(sequence.fetch_add(1U, std::memory_order_seq_cst));
@@ -63,6 +65,7 @@ inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, c
     std::atomic_ref<std::uint64_t>{signal->presentation_revision}.store(presentation_revision, std::memory_order_seq_cst);
     std::atomic_ref<std::uint32_t>{signal->content_width}.store(content_width, std::memory_order_seq_cst);
     std::atomic_ref<std::uint32_t>{signal->content_height}.store(content_height, std::memory_order_seq_cst);
+    std::atomic_ref<std::uint64_t>{signal->physical_revision}.store(physical_revision, std::memory_order_seq_cst);
     static_cast<void>(sequence.fetch_add(1U, std::memory_order_seq_cst));
 }
 

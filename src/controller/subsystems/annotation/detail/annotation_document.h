@@ -38,6 +38,9 @@ class AnnotationDocument final {
 
     [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
+    // Translate an exact displayed target into the current document's indices.
+    // The reducer itself continues to operate on ordinary current-index targets.
+    [[nodiscard]] bool ResolveTarget(mmltk::controller::AnnotationPointer&) const noexcept;
     bool PeerClosed() noexcept;
     [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);
     [[nodiscard]] DocumentResult Save(std::string_view);

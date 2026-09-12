@@ -2,6 +2,7 @@
 
 #include <cuda_runtime_api.h>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -28,6 +29,27 @@ namespace test_support {
 struct ImageWorkspaceTestAccess;
 }
 
+inline constexpr std::uint64_t kWorkspaceAccessEmpty = 0U;
+inline constexpr std::uint64_t kWorkspaceAccessWriting = 1U;
+inline constexpr std::uint64_t kWorkspaceAccessAvailable = 2U;
+inline constexpr std::uint64_t kWorkspaceAccessReading = 3U;
+inline constexpr std::uint64_t kWorkspaceAccessMask = 3U;
+inline constexpr std::uint64_t kWorkspaceAccessRevoked = std::uint64_t{1U} << 63U;
+
+// The exporter owns this shared, generation-scoped physical access gate.
+// Availability advertises completed pixels; it grants no reader custody.
+struct alignas(64) ImageWorkspaceAccessSignal final {
+    std::uint64_t access = kWorkspaceAccessEmpty;
+    std::uint64_t generation = 0U;
+    std::uint64_t allocation_identity = 0U;
+    // Exact revoked Reading access token, published only after terminal GPU
+    // retirement. Revocation forbids another browser read of this token;
+    // reserving a subsequent native write clears it and advances the epoch.
+    std::uint64_t terminal_read_complete = 0U;
+};
+static_assert(sizeof(ImageWorkspaceAccessSignal) == 64U);
+static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
+
 struct ImageWorkspaceLayout final {
     std::uint64_t device_incarnation = 0U;
     std::array<std::uint8_t, 16U> device_uuid{};
@@ -39,6 +61,7 @@ struct ImageWorkspaceLayout final {
     std::size_t required_allocation_bytes = 0U;
     std::size_t alignment_bytes = 0U;
     bool dedicated = false;
+    bool direct_sampling = false;
     ImageFormat format = ImageFormat::Rgba8;
     [[nodiscard]] bool valid() const noexcept;
     constexpr bool operator==(const ImageWorkspaceLayout&) const noexcept = default;
@@ -72,6 +95,14 @@ class ImageWorkspace final {
     [[nodiscard]] std::size_t allocation_bytes() const noexcept;
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] mmltk::common::io::ScopedFd ExportDescriptor() const;
+    [[nodiscard]] mmltk::common::io::ScopedFd ExportAccessDescriptor() const;
+    [[nodiscard]] bool WriteAvailable() const noexcept;
+    [[nodiscard]] bool ReserveWrite();
+    void InvalidateWrite() noexcept;
+    void CancelWrite() noexcept;
+    [[nodiscard]] bool Acquired(std::uint64_t generation) const noexcept;
+    [[nodiscard]] bool TerminalReadComplete(std::uint64_t generation) const noexcept;
+    void CompleteRead(std::uint64_t generation);
     // Called only after the importing device completed initial ownership setup.
     void Admit(std::uint64_t allocation_identity, std::uint64_t device_incarnation);
     [[nodiscard]] bool admitted() const noexcept;
@@ -113,6 +144,7 @@ class ImageWorkspace final {
     [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
     void CheckOwner(const std::shared_ptr<Owner>& = {}) const;
     void Attach(std::uint64_t product_owner);
+    void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>) noexcept;
     void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
     friend class ImageProductBuffer;
     friend class BorrowedImageWorkspace;

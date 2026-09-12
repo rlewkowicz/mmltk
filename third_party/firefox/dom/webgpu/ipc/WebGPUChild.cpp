@@ -574,7 +574,8 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
     const uint32_t aSlot,
     const uint64_t aContentSession, const uint64_t aContentSequence,
     const uint64_t aPresentationRevision, const uint32_t aContentWidth,
-    const uint32_t aContentHeight, const bool aCopyComplete) {
+    const uint32_t aContentHeight, const bool aCopyComplete,
+    const uint64_t aSourceHigh, const uint64_t aSourceLow, const bool aDirectSampling) {
   const auto entry = mDeviceMap.find(aDeviceId);
   if (entry == mDeviceMap.end()) {
     return IPC_OK();
@@ -586,18 +587,20 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
   nsIGlobalObject* const global = device->GetParentObject();
   nsPIDOMWindowInner* const window = global ? global->GetAsInnerWindow() : nullptr;
   dom::Document* const document = window ? window->GetExtantDoc() : nullptr;
-  if (document && aLayer == 0 && aSlot < 2 &&
+  const bool acquisitionMiss = aSlot == UINT32_MAX && aContentWidth == 0 && aContentHeight == 0;
+  if (document && aLayer == 0 && (aSlot < 2 || acquisitionMiss) &&
       (aContentSession != 0 || aContentSequence != 0) &&
-      aPresentationRevision != 0 && aContentWidth != 0 && aContentHeight != 0) {
+      aPresentationRevision != 0 && ((aContentWidth != 0 && aContentHeight != 0) || acquisitionMiss)) {
     dom::AutoJSAPI api;
     if (!api.Init(global)) {
       return IPC_OK();
     }
     const nsPrintfCString identity(
         "%016" PRIx64 "%016" PRIx64 ":%" PRIu64 ":%" PRIu32 ":%" PRIu64 ":%" PRIu64
-        ":%" PRIu64 ":%" PRIu32 ":%" PRIu32,
+        ":%" PRIu64 ":%" PRIu32 ":%" PRIu32 ":%016" PRIx64 "%016" PRIx64 ":%u",
         aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
-        aContentSequence, aPresentationRevision, aContentWidth, aContentHeight);
+        aContentSequence, aPresentationRevision, aContentWidth, aContentHeight,
+        aSourceHigh, aSourceLow, unsigned(aDirectSampling));
     JSString* const identityString =
         JS_NewStringCopyN(api.cx(), identity.get(), identity.Length());
     if (!identityString) {
@@ -606,7 +609,7 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
     JS::Rooted<JS::Value> detail(api.cx(), JS::StringValue(identityString));
     RefPtr<dom::CustomEvent> event =
         NS_NewDOMCustomEvent(nsGlobalWindowInner::Cast(window), nullptr, nullptr);
-    event->InitCustomEvent(api.cx(), aCopyComplete ? u"gpuexternaltexturecopycomplete"_ns : u"gpuexternaltextureframe"_ns, false,
+    event->InitCustomEvent(api.cx(), acquisitionMiss ? u"gpuexternaltextureacquiremiss"_ns : aCopyComplete ? (aDirectSampling ? u"gpuexternaltexturereadsettled"_ns : u"gpuexternaltexturecopycomplete"_ns) : u"gpuexternaltextureframe"_ns, false,
                            false, detail);
     event->SetTrusted(true);
     if (WorkspaceAcceptanceTraceEnabled()) {
@@ -622,11 +625,11 @@ ipc::IPCResult WebGPUChild::RecvExternalTextureFrame(
           ",\"content_sequence\":%" PRIu64
           ",\"presentation_revision\":%" PRIu64
           ",\"content_width\":%" PRIu32 ",\"content_height\":%" PRIu32
-          "}\n",
-          aCopyComplete ? "copy_completed" : "frame_dispatched",
+          ",\"source\":\"%016" PRIx64 "%016" PRIx64 "\",\"direct_sampling\":%s}\n",
+          acquisitionMiss ? "acquire_missed" : aCopyComplete ? (aDirectSampling ? "read_settled" : "copy_completed") : "frame_dispatched",
           aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
           aContentSequence, aPresentationRevision, aContentWidth,
-          aContentHeight);
+          aContentHeight, aSourceHigh, aSourceLow, aDirectSampling ? "true" : "false");
       if (length > 0 && static_cast<size_t>(length) < sizeof(line)) {
         ssize_t written;
         do {

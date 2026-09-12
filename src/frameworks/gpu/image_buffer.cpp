@@ -629,6 +629,11 @@ struct ImageProductBuffer::State final {
         if (unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
         if (generation_sequence_ == std::numeric_limits<std::uint64_t>::max())
             throw std::overflow_error("image product generation exhausted");
+        if (!ReservePhysicalWork()) throw std::runtime_error("image product workspace is acquired");
+        if (workspace_) {
+            workspace_->InvalidateWrite();
+            if (workspace_reserved_ != workspace_) workspace_reserved_->InvalidateWrite();
+        }
         generation_ = 0U;
         return generation_sequence_ + 1U;
     }
@@ -638,6 +643,20 @@ struct ImageProductBuffer::State final {
             receiver_reads_.wait(readers, std::memory_order_acquire);
             readers = receiver_reads_.load(std::memory_order_acquire);
         }
+    }
+    bool ReservePhysicalWork() {
+        if (workspace_reserved_) return true;
+        if (raw_workspace_ && planes_[0U]->state_->external_storage != raw_workspace_)
+            raw_workspace_.reset();
+        const auto first = raw_workspace_ ? raw_workspace_ : workspace_;
+        if (!first) return true;
+        if (!first->ReserveWrite()) return false;
+        if (workspace_ && workspace_ != first && !workspace_->ReserveWrite()) {
+            first->CancelWrite();
+            return false;
+        }
+        workspace_reserved_ = first;
+        return true;
     }
     [[nodiscard]] std::array<std::unique_lock<std::shared_mutex>, 2U> LockPlanes() {
         std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
@@ -650,6 +669,8 @@ struct ImageProductBuffer::State final {
     }
     DeviceContext context_;
     std::shared_ptr<ImageWorkspace> workspace_;
+    std::shared_ptr<ImageWorkspace> workspace_reserved_;
+    std::shared_ptr<ImageWorkspace> raw_workspace_;
     ImageWorkspaceFinalize finalize_;
     ImageProductLayout layout_;
     std::array<std::unique_ptr<ImageBuffer>, 2U> planes_{};
@@ -812,6 +833,7 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
             if (raw.plane.data != 0U && !raw.external_storage)
                 state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.plane.data);
             raw.external_storage = state_->workspace_;
+            state_->raw_workspace_ = state_->workspace_;
             raw.external_bytes = state_->workspace_->allocation_bytes();
             destination.allocation.owner = raw.allocation_owner;
             raw.plane = destination;
@@ -961,10 +983,22 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
     if (!workspace || !workspace->admitted() || !finalize) throw std::invalid_argument("workspace configuration is incomplete");
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock() || state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
-    workspace->Attach(state_->planes_[0U]->state_->allocation_owner);
+    const bool reserved_replacement = workspace != state_->workspace_ && state_->workspace_reserved_;
+    if (reserved_replacement) {
+        if (!workspace->ReserveWrite()) return false;
+    }
+    try {
+        workspace->Attach(state_->planes_[0U]->state_->allocation_owner);
+    } catch (...) {
+        if (reserved_replacement) workspace->CancelWrite();
+        throw;
+    }
+    if (reserved_replacement && state_->workspace_ != state_->workspace_reserved_ && state_->workspace_)
+        state_->workspace_->CancelWrite();
     // Retained raw plane custody is unchanged until the next exclusive write.
     if (state_->workspace_ && state_->workspace_ != workspace) state_->workspace_->Withdraw();
     state_->workspace_ = std::move(workspace);
+    state_->workspace_->SetAvailabilitySink(state_->availability_sink_);
     state_->finalize_ = std::move(finalize);
     // Dropping the replaced owner can reveal failed physical cleanup even
     // though the new workspace and source execution are healthy.
@@ -981,6 +1015,7 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     const auto extent = source.plane(0U).plane().descriptor;
     if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
+    CancelWorkspaceWrite();
 }
 BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
     std::shared_lock transaction(state_->transaction_, std::try_to_lock);
@@ -1043,6 +1078,8 @@ bool ImageProductBuffer::writable() const {
     if (!transaction.owns_lock()) return false;
     if (state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
     if (state_->unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
+    if (state_->workspace_ && !state_->workspace_reserved_ && !state_->workspace_->WriteAvailable()) return false;
+    if (state_->raw_workspace_ && !state_->workspace_reserved_ && !state_->raw_workspace_->WriteAvailable()) return false;
     std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
         locks[index] = std::unique_lock{state_->planes_[index]->state_->access, std::try_to_lock};
@@ -1051,6 +1088,19 @@ bool ImageProductBuffer::writable() const {
             throw std::runtime_error("image product storage is quarantined");
     }
     return true;
+}
+bool ImageProductBuffer::ReserveWorkspaceWrite() {
+    std::unique_lock transaction(state_->transaction_, std::try_to_lock);
+    if (!transaction.owns_lock()) return false;
+    if (state_->workspace_reserved_) return false;
+    return state_->ReservePhysicalWork();
+}
+void ImageProductBuffer::CancelWorkspaceWrite() noexcept {
+    std::unique_lock transaction(state_->transaction_);
+    if (!state_->workspace_reserved_) return;
+    state_->workspace_reserved_->CancelWrite();
+    if (state_->workspace_ != state_->workspace_reserved_ && state_->workspace_) state_->workspace_->CancelWrite();
+    state_->workspace_reserved_.reset();
 }
 bool ImageProductBuffer::terminal() const noexcept {
     for (std::size_t index = 0U; index != state_->plane_count_; ++index)
@@ -1063,5 +1113,8 @@ bool ImageProductBuffer::Owns(const BorrowedImageProductReadView& source) const 
 void ImageProductBuffer::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) {
     std::unique_lock transaction(state_->transaction_);
     state_->availability_sink_ = std::move(sink);
+    if (state_->workspace_) state_->workspace_->SetAvailabilitySink(state_->availability_sink_);
+    if (state_->raw_workspace_ && state_->raw_workspace_ != state_->workspace_)
+        state_->raw_workspace_->SetAvailabilitySink(state_->availability_sink_);
 }
 }  // namespace mmltk::frameworks::gpu

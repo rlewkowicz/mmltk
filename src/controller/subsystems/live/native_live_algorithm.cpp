@@ -154,6 +154,7 @@ VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings
         mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
             .device = settings.device,
             .model = std::make_unique<NativeLiveAlgorithm>(settings, configuration, execution),
+            .output_buffer_count = 2U,
             .numa_node = settings.numa_node,
             .execution = execution,
             .product_revisions = std::move(revisions),

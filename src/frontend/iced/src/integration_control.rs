@@ -7365,7 +7365,11 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                self.phase = Phase::AwaitCapacityRelease;
+                if !crate::presentation_surface::release_capacity_sample() {
+                    self.fail("capacity acquisition lacks its held physical sample");
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitCapacityCompletion;
                 explore_message(explore::Message::Gallery(
                     explore::gallery::Message::Overlay(explore::overlay::Message::BoxesToggled(
                         !snapshot.overlay.showboxes,
@@ -7387,7 +7391,7 @@ impl Controller {
                     sink.record(
                         "integration.capacity_retry",
                         EXPLORE_GALLERY,
-                        "same-publication-new-physical-transfer",
+                        "completed-acquisition-after-physical-slot-release",
                         [
                             ready.content_sequence as f64,
                             ready.presentation_revision as f64,

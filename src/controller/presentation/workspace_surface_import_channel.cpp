@@ -57,7 +57,8 @@ contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surfa
             .workspace_bytes = record.size,
             .workspace_pitch = record.stride,
             .workspace_width = record.width,
-            .workspace_height = record.height};
+            .workspace_height = record.height,
+            .direct_sampling = record.direct_sampling != 0U};
 }
 
 namespace {
@@ -183,6 +184,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
         std::uint32_t width = 0U;
         std::uint32_t height = 0U;
         bool arena = false;
+        std::optional<Record> acquired;
+        std::uint64_t last_transfer = 0U;
     };
 
     struct PendingRecord {
@@ -200,6 +203,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
     explicit Impl(const VisualDiagnosticSink sink) : diagnostics(sink) {
         // CLEANUP-IGNORE: This channel reserves each owner-specific fixed-capacity record collection once.
         outcomes.reserve(kLedgerCapacity);
+        acquisitions.reserve(kLedgerCapacity);
         retirements.reserve(kLedgerCapacity);
         renderer_presentations.reserve(kLedgerCapacity);
         pending.reserve(kPendingRecordCapacity);
@@ -238,6 +242,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
     ScopedFd peer;
     pid_t expected_process_group = -1;
     std::vector<WorkspaceSurfaceImportOutcome> outcomes;
+    std::vector<Record> acquisitions;
     std::optional<WorkspaceSurfaceImportId> capacity_wake;
     std::vector<WorkspaceSurfaceRetired> retirements;
     std::vector<WorkspaceRendererPresentation> renderer_presentations;
@@ -469,11 +474,24 @@ struct WorkspaceSurfaceImportChannel::Impl {
             }
             const WorkspaceSurfaceImportId id{.high = record.id_high, .low = record.id_low};
             const auto admission = find_admission(id);
+            if (record.opcode == Opcode::Acquired) {
+                if (admission == admitted.end() || admission->second.arena || !contains(replied, id) ||
+                    acquisitions.size() == kLedgerCapacity || admission->second.acquired ||
+                    record.offset <= admission->second.last_transfer) {
+                    fail("workspace acquisition is unknown, duplicate, or exceeds capacity");
+                    return;
+                }
+                admission->second.acquired = record;
+                admission->second.last_transfer = record.offset;
+                acquisitions.push_back(record);
+                continue;
+            }
             if (record.opcode == Opcode::Retired) {
                 const auto retirement = std::ranges::find(retired, id, &RetirementRecord::first);
                 const bool presentation_outstanding =
                     std::ranges::any_of(renderer_presentations, [id](const auto& presentation) { return presentation.resource == id; });
                 if (admission == admitted.end() || retirement == retired.end() || !contains(withdrawn, id) || !contains(replied, id) ||
+                    (admission != admitted.end() && admission->second.acquired) ||
                     (admission != admitted.end() && admission->second.arena && presentation_outstanding) ||
                     retirements.size() >= kLedgerCapacity) {
                     fail("workspace import channel received an invalid retirement terminal");
@@ -521,6 +539,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     }
                     if (active != renderer_presentations.end() - 1) { *active = renderer_presentations.back(); }
                     renderer_presentations.pop_back();
+                    if (!contains(withdrawn, id)) capacity_wake = id;
                     continue;
                 }
                 if (contains(withdrawn, id)) { continue; }
@@ -594,7 +613,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().required_size = record.size;
                     break;
                 case Opcode::Arena:
-                case Opcode::CopyCompleted:
+                case Opcode::ReadSettled:
                 case Opcode::Import:
                 case Opcode::Drop:
                 case Opcode::Available:
@@ -656,6 +675,7 @@ void WorkspaceSurfaceImportChannel::reset_peer() noexcept {
     impl_->peer.reset();
     impl_->peer_epoch = Impl::PeerEpochState::Accepting;
     impl_->outcomes.clear();
+    impl_->acquisitions.clear();
     impl_->capacity_wake.reset();
     impl_->retirements.clear();
     impl_->renderer_presentations.clear();
@@ -677,28 +697,36 @@ bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId i
                         {}, selection_generation, frame_revision);
 }
 bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, ScopedFd descriptor, const int frame_edge,
-                                                 const int frame_signal, const std::uint64_t selection_generation,
+                                                 const int frame_signal, const int access_signal, const std::uint64_t selection_generation,
                                                  const std::uint64_t frame_revision) {
-    if (!connected() || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0) return false;
+    if (!connected() || descriptor.get() < 0 || frame_edge < 0 || frame_signal < 0 || access_signal < 0) return false;
     record.opcode = Opcode::Import;
-    const std::array descriptors{descriptor.get(), frame_edge, frame_signal};
+    const std::array descriptors{descriptor.get(), frame_edge, frame_signal, access_signal};
     return impl_->admit(record, generation, descriptors, selection_generation, frame_revision);
 }
-bool WorkspaceSurfaceImportChannel::copy_completed(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,
+bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,
                                                    const std::uint64_t revision, const std::uint64_t transfer_sequence) {
-    if (!connected() || !claimable(id) || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
+    if (!connected() || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
     const auto admission = impl_->find_admission(id);
     if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) ||
-        Impl::contains(impl_->withdrawn, id))
+        !admission->second.acquired)
         return false;
-    return impl_->send(Record{.opcode = Opcode::CopyCompleted,
+    const auto& acquired = *admission->second.acquired;
+    if (acquired.stride != content.session || acquired.size != content.sequence ||
+        acquired.presentation_revision != revision || acquired.offset != transfer_sequence ||
+        std::ranges::any_of(impl_->acquisitions, [id](const Record& pending) {
+            return pending.id_high == id.high && pending.id_low == id.low;
+        })) return false;
+    if (!impl_->send(Record{.opcode = Opcode::ReadSettled,
                               .id_high = id.high,
                               .id_low = id.low,
                               .stride = content.session,
                               .size = content.sequence,
                               .presentation_revision = revision,
                               .offset = transfer_sequence},
-                       {});
+                       {})) return false;
+    admission->second.acquired.reset();
+    return true;
 }
 
 WorkspaceSurfaceWithdrawal WorkspaceSurfaceImportChannel::withdraw(const WorkspaceSurfaceImportId id) {
@@ -768,9 +796,11 @@ std::optional<WorkspaceSurfaceImportOutcome> WorkspaceSurfaceImportChannel::take
     impl_->outcomes.erase(impl_->outcomes.begin());
     return outcome;
 }
-
-bool WorkspaceSurfaceImportChannel::has_capacity_wake(const WorkspaceSurfaceImportId id) const noexcept {
-    return impl_->capacity_wake == id;
+std::optional<Record> WorkspaceSurfaceImportChannel::take_acquisition() {
+    if (impl_->acquisitions.empty()) return std::nullopt;
+    auto record = impl_->acquisitions.back();
+    impl_->acquisitions.pop_back();
+    return record;
 }
 
 std::optional<WorkspaceSurfaceImportId> WorkspaceSurfaceImportChannel::take_capacity_wake() {

@@ -174,6 +174,9 @@ interface GPUDevice : EventTarget {
     [Throws]
     GPUBuffer createBuffer(GPUBufferDescriptor descriptor);
     GPUTexture createTexture(GPUTextureDescriptor descriptor);
+    undefined requestWorkspace(DOMString capability, unsigned long width, unsigned long height);
+    undefined acquireWorkspace(DOMString capability, DOMString contentSession,
+                               DOMString contentSequence, DOMString publication);
     [Throws, Func="mozilla::webgpu::Instance::ExternalTexturePrefEnabled"]
     GPUExternalTexture importExternalTexture(GPUExternalTextureDescriptor descriptor);
     GPUSampler createSampler(optional GPUSamplerDescriptor descriptor = {});

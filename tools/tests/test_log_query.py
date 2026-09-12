@@ -355,6 +355,34 @@ class TriageSelectionTests(unittest.TestCase):
                 self.assertEqual(finding.other.get("boundary"), "native")
                 self.assertEqual(self.triage.pixel_pending_count, 0)
 
+    def test_direct_pixels_join_only_the_acquired_source_in_every_arrival_order(self):
+        for order in permutations(("native", "forwarded", "sample")):
+            for rgba in (10, 11):
+                with self.subTest(order=order, rgba=rgba):
+                    triage = logs.Triage(self.triage.options, self.triage.where, {})
+                    for boundary in order:
+                        record = self.pixel_row(boundary, rgba=rgba if boundary == "sample" else 10)
+                        record.data["direct_sampling"] = True
+                        triage.observe_pixel_chain(record, emit=True)
+                    triage.finalize_pixel_chain(emit=True)
+                    if rgba == 10:
+                        self.assertFalse(triage.findings)
+                    else:
+                        finding, = triage.findings.values()
+                        self.assertEqual(finding.kind, "pixel-chain-divergence")
+                        self.assertIn("native -> sample", finding.message)
+
+    def test_direct_pixels_reject_copy_receipts_before_or_after_acquisition(self):
+        for order in permutations(("forwarded", "import", "sample")):
+            with self.subTest(order=order):
+                triage = logs.Triage(self.triage.options, self.triage.where, {})
+                for boundary in order:
+                    record = self.pixel_row(boundary)
+                    record.data["direct_sampling"] = True
+                    triage.observe_pixel_chain(record, emit=True)
+                finding, = triage.findings.values()
+                self.assertEqual(finding.kind, "pixel-mode-conflict")
+
     def test_absent_pixel_bridges_finalize_each_exact_transfer_once(self):
         for boundary, transfer, line in (("import", 7, 9), ("mailbox", 7, 3), ("import", 8, 4)):
             self.triage.observe_pixel_chain(self.pixel_row(boundary, transfer, line=line), emit=True)

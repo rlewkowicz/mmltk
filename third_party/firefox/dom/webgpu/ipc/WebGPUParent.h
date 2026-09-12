@@ -81,6 +81,11 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
       uint64_t aSurfaceIdHigh, uint64_t aSurfaceIdLow, uint64_t aLayer,
       uint32_t aSlot, uint64_t aContentSession, uint64_t aContentSequence,
       uint64_t aPresentationRevision);
+  ipc::IPCResult RecvWorkspaceRequest(RawId aDeviceId, uint64_t aSurfaceIdHigh,
+                                     uint64_t aSurfaceIdLow, uint32_t aWidth, uint32_t aHeight);
+  ipc::IPCResult RecvWorkspaceAcquire(RawId aDeviceId, uint64_t aSurfaceIdHigh,
+                                     uint64_t aSurfaceIdLow, uint64_t aContentSession,
+                                     uint64_t aContentSequence, uint64_t aPublication);
   void QueueSubmit(RawId aQueueId, RawId aDeviceId,
                    Span<const RawId> aCommandBuffers,
                    Span<const RawId> aTextureIds,
@@ -176,8 +181,11 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
                                   uint64_t aContentSequence,
                                   uint64_t aPresentationRevision,
                                   uint32_t aContentWidth,
-                                  uint32_t aContentHeight, bool aCopyComplete);
+                                  uint32_t aContentHeight, bool aCopyComplete,
+                                  uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling);
   void NotifyWorkspaceSourceRequested(uint64_t aSourceHigh, uint64_t aSourceLow);
+  void NotifyWorkspaceRequestReady(RawId aDeviceId, uint64_t aHigh,
+                                  uint64_t aLow, uint32_t aWidth, uint32_t aHeight);
   void NotifyExternalTextureImportReady(RawId aDeviceId,
                                         uint64_t aSurfaceIdHigh,
                                         uint64_t aSurfaceIdLow);

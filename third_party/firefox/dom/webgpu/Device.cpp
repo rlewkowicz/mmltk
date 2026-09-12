@@ -3,6 +3,8 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "Device.h"
+#include <charconv>
+#include <string_view>
 
 #include "Adapter.h"
 #include "BindGroup.h"
@@ -63,6 +65,17 @@ bool IsLoopbackDocument(nsIGlobalObject* aGlobal) {
   }
   return host.EqualsLiteral("127.0.0.1") || host.EqualsLiteral("localhost") ||
          host.EqualsLiteral("[::1]");
+}
+bool ParseWorkspaceWord(std::string_view aText, uint64_t& aValue) {
+  if (aText.empty() || aText.size() > 16) return false;
+  const auto result = std::from_chars(aText.data(), aText.data() + aText.size(), aValue, 16);
+  return result.ec == std::errc{} && result.ptr == aText.data() + aText.size();
+}
+bool ParseWorkspaceCapability(const nsAString& aText, uint64_t& aHigh, uint64_t& aLow) {
+  const NS_ConvertUTF16toUTF8 text(aText);
+  const std::string_view encoded{text.BeginReading(), text.Length()};
+  return encoded.size() == 32 && ParseWorkspaceWord(encoded.substr(0, 16), aHigh) &&
+         ParseWorkspaceWord(encoded.substr(16), aLow) && (aHigh != 0 || aLow != 0);
 }
 
 }  // namespace
@@ -167,7 +180,7 @@ already_AddRefed<Texture> Device::CreateTexture(
   // a foreign texture. Only a document the host itself served over loopback may
   // do so, and any other document's label is disarmed here rather than in the
   // server, which sees only a label.
-  constexpr auto kWorkspaceLabelPrefix = u"mmltk-workspace-v3/"_ns;
+  constexpr auto kWorkspaceLabelPrefix = u"mmltk-surface-v4/"_ns;
   nsAutoString disarmedLabel;
   if (StringBeginsWith(aDesc.mLabel, kWorkspaceLabelPrefix) &&
       !IsLoopbackDocument(GetParentObject())) {
@@ -254,6 +267,28 @@ void Device::ExpireExternalTextures() {
     }
   }
   mExternalTexturesToExpire.Clear();
+}
+
+void Device::RequestWorkspace(const nsAString& aCapability, uint32_t aWidth, uint32_t aHeight) {
+  uint64_t high = 0, low = 0;
+  if (!IsLoopbackDocument(GetParentObject()) || !aWidth || !aHeight ||
+      !ParseWorkspaceCapability(aCapability, high, low)) return;
+  GetChild()->FlushQueuedMessages();
+  static_cast<void>(GetChild()->SendWorkspaceRequest(GetId(), high, low, aWidth, aHeight));
+}
+
+void Device::AcquireWorkspace(const nsAString& aCapability, const nsAString& aContentSession,
+                              const nsAString& aContentSequence, const nsAString& aPublication) {
+  uint64_t high = 0, low = 0, session = 0, sequence = 0, publication = 0;
+  const NS_ConvertUTF16toUTF8 encodedSession(aContentSession), encodedSequence(aContentSequence),
+      encodedPublication(aPublication);
+  if (!IsLoopbackDocument(GetParentObject()) || !ParseWorkspaceCapability(aCapability, high, low) ||
+      !ParseWorkspaceWord({encodedSession.BeginReading(), encodedSession.Length()}, session) ||
+      !ParseWorkspaceWord({encodedSequence.BeginReading(), encodedSequence.Length()}, sequence) ||
+      !ParseWorkspaceWord({encodedPublication.BeginReading(), encodedPublication.Length()}, publication) ||
+      (session == 0 && sequence == 0) || publication == 0) return;
+  GetChild()->FlushQueuedMessages();
+  static_cast<void>(GetChild()->SendWorkspaceAcquire(GetId(), high, low, session, sequence, publication));
 }
 
 already_AddRefed<Sampler> Device::CreateSampler(

@@ -187,10 +187,10 @@ impl Component {
                         self.canvas.clear_pointer_lifecycle();
                         return Ok(None);
                     }
-                    let Some(snapshot) = application.annotation.snapshot.as_ref() else {
-                        return Ok(None);
-                    };
-                    let Some(mut pointer) = self.canvas.pointer_from_gesture(&snapshot.ui, gesture)
+                    let document_epoch = application.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch);
+                    let tool = application.annotation.snapshot.as_ref().map_or(
+                        crate::generated::AnnotationTool::Select, |snapshot| snapshot.ui.editor.tool);
+                    let Some(mut pointer) = self.canvas.pointer_from_gesture(document_epoch, tool, gesture)
                     else {
                         return Ok(None);
                     };
@@ -328,6 +328,7 @@ impl Component {
                     || crate::generated::default_uiannotationbrushradius().unwrap(),
                     |draft| draft.ui.annotationbrushradius,
                 ) as u16,
+                move || surface.and_then(crate::presentation_surface::drawable_annotation).map(|(_, content)| content),
                 self.keyboard_canvas.clone(),
             ),
         ))
@@ -496,11 +497,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gestures_use_retained_mask_pixels_and_keep_same_document_targets_until_end() {
+        use crate::generated::{AnnotationMaskRun, AnnotationPointerPhase, AnnotationTool};
+        use crate::presentation_surface::{AnnotationContent, SurfaceGestureKind};
+        let mut model = ready_model();
+        let snapshot = model.annotation.snapshot.as_mut().unwrap();
+        let mut hit = mask_object();
+        hit.mask.runs = vec![AnnotationMaskRun { row: 30, first: 20, last: 20 }];
+        let mut hole = mask_object();
+        hole.mask.runs = vec![
+            AnnotationMaskRun { row: 30, first: 0, last: 10 },
+            AnnotationMaskRun { row: 30, first: 30, last: 40 },
+        ];
+        snapshot.ui.editor.tool = AnnotationTool::Select;
+        snapshot.ui.editor.selectedobject = None;
+        snapshot.ui.scene.objects = vec![hit.clone(), hole];
+        let displayed = AnnotationContent::test_displayed(snapshot);
+        let canvas = canvas::Component::default();
+        canvas.test_install_displayed(displayed.clone());
+        // Logical input overtakes the displayed mask without changing its
+        // retained body geometry or substituting an enclosing box hit.
+        snapshot.ui.scene.objects[0].mask.runs.clear();
+        snapshot.ui.scene.objects[1] = hit;
+        assert_eq!(canvas::target(&snapshot.ui, 20.0, 30.0).object, Some(1));
+        let begin = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        assert_eq!(begin.target.object, Some(0));
+        canvas.test_install_displayed(AnnotationContent::test_displayed(snapshot));
+        let update = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        assert_eq!(update.target, begin.target);
+        assert_eq!(update.phase, AnnotationPointerPhase::Update);
+        let end = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::End)).unwrap();
+        assert_eq!(end.target, begin.target);
+        let next = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        assert_eq!(next.target.object, Some(1));
+        assert_ne!(next.interactionid, begin.interactionid);
+        assert!(canvas.pointer_from_gesture(2, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).is_none());
+        canvas.test_install_displayed(displayed);
+        let mut empty = gesture(SurfaceGestureKind::Pointer);
+        empty.sample.content_x = 25.0;
+        assert_eq!(canvas.pointer_from_gesture(1, AnnotationTool::Select, empty).unwrap().target.object, None);
+        canvas.clear_pointer_lifecycle();
+        // The displayed pixels still carry Select's old handles; changing the
+        // logical tool immediately changes the next gesture's policy.
+        let create = canvas.pointer_from_gesture(1, AnnotationTool::Point,
+            gesture(SurfaceGestureKind::Pointer)).unwrap();
+        assert_eq!(create.target.object, None);
+        assert_eq!(create.identity.object, 0);
+    }
+
     fn pointer_outcome(
         component: &mut Component,
         model: &mut ApplicationModel,
         settings: &mut crate::view::settings::SettingsModel,
     ) -> crate::generated::AnnotationPointer {
+        component.canvas.test_install_displayed(crate::presentation_surface::AnnotationContent::test_displayed(
+            model.annotation.snapshot.as_ref().unwrap()));
         let Some(Outcome::Pointer(pointer)) = component
             .update(
                 model,
@@ -616,14 +668,18 @@ mod tests {
         snapshot.ui.editor.tool = crate::generated::AnnotationTool::Select;
         snapshot.ui.editor.selectedobject = Some(0);
         let dispatch = |model: &ApplicationModel, radius| {
+            let displayed = model.annotation.snapshot.as_ref()
+                .map(crate::presentation_surface::AnnotationContent::test_displayed);
             component
                 .canvas
-                .dispatch(model, radius, component.keyboard_canvas.clone())
+                .dispatch(model, radius, move || displayed.clone(), component.keyboard_canvas.clone())
         };
         let mut expected = pointer;
         expected.interactionid += 1;
         expected.target =
             canvas::target(&model.annotation.snapshot.as_ref().unwrap().ui, 20.0, 30.0);
+        expected.identity = crate::presentation_surface::AnnotationContent::test_displayed(
+            model.annotation.snapshot.as_ref().unwrap()).target_identity(&expected.target).unwrap();
         expected.brushradius = 9;
         component
             .keyboard_canvas
@@ -673,6 +729,7 @@ mod tests {
         expected.interactionid += 1;
         expected.sequence = 1;
         expected.target.object = Some(1);
+        expected.identity.object = 2;
         samples.push(expected.clone());
         assert!(dispatch(&model, 11)(gesture(Kind::Cancel)).is_none());
         expected.phase = Phase::Cancel;
@@ -700,6 +757,7 @@ mod tests {
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.interactionid += 1;
         expected.target.object = Some(0);
+        expected.identity.object = 1;
         assert_batch(&connection, &mut capture, 3, 2, vec![expected.clone()]);
 
         // Availability is refreshed even without changing the cached identity.
@@ -735,6 +793,7 @@ mod tests {
         assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
         expected.interactionid += 1;
         expected.target.object = Some(1);
+        expected.identity.object = 2;
         assert_batch(&replacement, &mut replacement_capture, 1, 2, vec![expected]);
         assert!(capture.try_recv().is_err());
         component.set_connection(None);

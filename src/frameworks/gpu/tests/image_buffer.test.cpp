@@ -9,6 +9,7 @@
 #include <catch2/matchers/catch_matchers.hpp>
 
 #include <atomic>
+#include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
@@ -19,7 +20,9 @@
 #include <cstring>
 #include <string_view>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <vector>
 
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
@@ -1357,6 +1360,43 @@ TEST_CASE("failed retained publication preserves the selected product and expose
     CHECK(runtime.CommitOutput(std::move(candidate)).valid());
 }
 
+TEST_CASE("held current display leaves replaceable overflow and exact readers close both slots", "[gpu][product][retained]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_buffer_count = 2U});
+    const auto fill = [](std::uint8_t value) {
+        return [value](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), value, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        };
+    };
+    runtime.Publish(4U, 4U, fill(11U));
+    auto current = runtime.Borrow();
+    const auto current_pointer = current.plane(0U).plane().data;
+    auto baseline = runtime.Completed();
+    auto overflow = runtime.TryAcquireOutput(baseline);
+    REQUIRE(overflow.valid());
+    runtime.Publish(overflow, 4U, 4U, fill(22U));
+    baseline = runtime.CommitOutput(std::move(overflow));
+    const auto overflow_allocation = baseline.ObserveWorkspace().product_owner;
+    const auto copies = backend->same_copies;
+    auto replacement = runtime.TryAcquireOutput(baseline);
+    REQUIRE(replacement.valid());
+    runtime.Publish(replacement, 4U, 4U, fill(33U));
+    baseline = runtime.CommitOutput(std::move(replacement));
+    CHECK(baseline.ObserveWorkspace().product_owner == overflow_allocation);
+    CHECK(backend->same_copies == copies);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(current_pointer) == 11U);
+    auto encoded = baseline.Borrow();
+    REQUIRE(encoded.valid());
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    REQUIRE(baseline.valid());
+    encoded = {};
+    replacement = runtime.TryAcquireOutput(baseline);
+    REQUIRE(replacement.valid());
+    replacement = {};
+    current = {};
+    CHECK(runtime.TryAcquireOutput(baseline).valid());
+}
+
 TEST_CASE("final borrowed view retires on the owning runtime path") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -1494,6 +1534,235 @@ struct WorkspaceRuntimeFixture final {
         test_support::ImageWorkspaceTestAccess::Install(runtime);
     }
 };
+
+class WorkspaceAccessPeer final {
+   public:
+    explicit WorkspaceAccessPeer(std::shared_ptr<ImageWorkspace> workspace) : workspace_(std::move(workspace)) {
+        auto descriptor = workspace_->ExportAccessDescriptor();
+        void* mapping = ::mmap(nullptr, sizeof(ImageWorkspaceAccessSignal), PROT_READ | PROT_WRITE, MAP_SHARED, descriptor.get(), 0);
+        if (mapping == MAP_FAILED) throw std::runtime_error("test workspace access mapping failed");
+        signal_ = static_cast<ImageWorkspaceAccessSignal*>(mapping);
+    }
+    ~WorkspaceAccessPeer() {
+        Release();
+        ::munmap(signal_, sizeof(ImageWorkspaceAccessSignal));
+    }
+    std::uint64_t Access() const { return std::atomic_ref{signal_->access}.load(std::memory_order_acquire); }
+    bool Acquire(std::uint64_t access, std::uint64_t generation) {
+        if ((access & kWorkspaceAccessMask) != kWorkspaceAccessAvailable ||
+            (access & kWorkspaceAccessRevoked) != 0U ||
+            std::atomic_ref{signal_->generation}.load(std::memory_order_relaxed) != generation) return false;
+        return std::atomic_ref{signal_->access}.compare_exchange_strong(
+            access, (access & ~kWorkspaceAccessMask) | kWorkspaceAccessReading, std::memory_order_acq_rel);
+    }
+    void Release() {
+        const auto generation = std::atomic_ref{signal_->generation}.load(std::memory_order_acquire);
+        if (workspace_->Acquired(generation)) workspace_->CompleteRead(generation);
+    }
+    void Abandon() {
+        auto access = std::atomic_ref{signal_->access};
+        auto expected = access.load(std::memory_order_acquire);
+        do {
+            const auto role = (expected & kWorkspaceAccessRevoked) != 0U ? kWorkspaceAccessEmpty : kWorkspaceAccessAvailable;
+            if (access.compare_exchange_weak(expected, (expected & ~kWorkspaceAccessMask) | role,
+                                             std::memory_order_acq_rel)) return;
+        } while (true);
+    }
+    void TerminalComplete(std::uint64_t reading) {
+        const auto revoked = reading | kWorkspaceAccessRevoked;
+        auto expected = reading;
+        if (std::atomic_ref{signal_->access}.compare_exchange_strong(expected, revoked, std::memory_order_acq_rel) ||
+            expected == revoked)
+            std::atomic_ref{signal_->terminal_read_complete}.store(revoked, std::memory_order_release);
+    }
+    void StaleTerminalReceipt(std::uint64_t receipt) {
+        std::atomic_ref{signal_->terminal_read_complete}.store(receipt, std::memory_order_release);
+    }
+
+   private:
+    std::shared_ptr<ImageWorkspace> workspace_;
+    ImageWorkspaceAccessSignal* signal_ = nullptr;
+};
+
+TEST_CASE("Exact external acquisition races replacement without reusing a held fallback", "[gpu][workspace][acquisition]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_buffer_count = 2U,
+                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    ImageWorkspaceTestAccess::Install(runtime);
+    const auto workspace = [&] {
+        auto result = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+        result->Admit(result->identity(), result->layout().device_incarnation);
+        return result;
+    };
+    const auto fill = [](std::uint8_t value) { return [value](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), value, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    }; };
+    auto current = workspace();
+    auto overflow = workspace();
+    WorkspaceAccessPeer current_peer(current);
+    WorkspaceAccessPeer overflow_peer(overflow);
+    auto candidate = runtime.AcquireOutput();
+    REQUIRE(runtime.ConfigureWorkspace(candidate, current));
+    runtime.Publish(candidate, 4U, 3U, fill(11U));
+    auto baseline = runtime.CommitOutput(std::move(candidate));
+    const auto held_revision = current->revision();
+    REQUIRE(current_peer.Acquire(current_peer.Access(), held_revision));
+    CHECK_FALSE(current->ReserveWrite());
+    candidate = runtime.TryAcquireOutput(baseline);
+    REQUIRE(candidate.valid());
+    REQUIRE(runtime.ConfigureWorkspace(candidate, overflow));
+    runtime.Publish(candidate, 4U, 3U, fill(22U));
+    baseline = runtime.CommitOutput(std::move(candidate));
+
+    const auto old_access = overflow_peer.Access();
+    const auto old_revision = overflow->revision();
+    const auto copies = backend->same_copies.load();
+    candidate = runtime.TryAcquireOutput(baseline);
+    REQUIRE(candidate.valid());
+    CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
+    runtime.Publish(candidate, 4U, 3U, fill(33U));
+    baseline = runtime.CommitOutput(std::move(candidate));
+    CHECK(backend->same_copies == copies);
+    CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
+    CHECK(current->revision() == held_revision);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(current->plane(4U, 3U).data) == 11U);
+    REQUIRE(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    CHECK_FALSE(overflow->ReserveWrite());
+    current_peer.Release();
+    candidate = runtime.TryAcquireOutput(baseline);
+    REQUIRE(candidate.valid());
+    candidate = {};
+    overflow_peer.Release();
+    // Canceling an untouched offer still advances admission's epoch: a stale
+    // reader cannot win an ABA even when the physical pixel generation repeats.
+    const auto prior = overflow_peer.Access();
+    REQUIRE(overflow->ReserveWrite());
+    overflow->CancelWrite();
+    CHECK_FALSE(overflow_peer.Acquire(prior, overflow->revision()));
+    CHECK(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
+    // Withdrawal and acquisition share the same gate in either order. An
+    // acquired reader settles normally; an unacquired offer cannot be acquired
+    // after the native receiver has begun retiring its timeline and memory.
+    const auto current_offer = current_peer.Access();
+    current->Withdraw();
+    CHECK_FALSE(current_peer.Acquire(current_offer, current->revision()));
+    CHECK(current->WriteAvailable());
+    REQUIRE(current->ReserveWrite());
+    current->CancelWrite();
+    CHECK_FALSE(current_peer.Acquire(current_peer.Access(), current->revision()));
+    overflow->Withdraw();
+    CHECK(overflow->Acquired(overflow->revision()));
+    SECTION("Submitted read settles positively") { overflow_peer.Release(); }
+    SECTION("Failed submission abandons without reopening withdrawn acquisition") { overflow_peer.Abandon(); }
+    CHECK_FALSE(overflow->Acquired(overflow->revision()));
+    CHECK_FALSE(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
+    REQUIRE(overflow->ReserveWrite());
+    overflow->CancelWrite();
+    CHECK_FALSE(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
+}
+
+TEST_CASE("Workspace withdrawal linearizes against an external thread holding an observed offer", "[gpu][workspace][acquisition]") {
+    for (const bool withdrawal_first : {false, true}) {
+        CAPTURE(withdrawal_first);
+        WorkspaceRuntimeFixture fixture;
+        auto& runtime = fixture.runtime;
+        auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        auto output = runtime.AcquireOutput();
+        REQUIRE(runtime.ConfigureWorkspace(output, workspace));
+        runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
+        auto baseline = runtime.CommitOutput(std::move(output));
+        WorkspaceAccessPeer peer(workspace);
+        const auto offer = peer.Access();
+        const auto revision = workspace->revision();
+        std::barrier boundary{2};
+        bool acquired = false;
+        std::jthread browser([&] {
+            if (!withdrawal_first) acquired = peer.Acquire(offer, revision);
+            boundary.arrive_and_wait();
+            if (withdrawal_first) acquired = peer.Acquire(offer, revision);
+            boundary.arrive_and_wait();
+        });
+        if (withdrawal_first) workspace->Withdraw();
+        boundary.arrive_and_wait();
+        if (!withdrawal_first) workspace->Withdraw();
+        boundary.arrive_and_wait();
+        browser.join();
+        CHECK(workspace->retired());
+        CHECK(acquired == !withdrawal_first);
+        CHECK(workspace->Acquired(revision) == acquired);
+        CHECK((peer.Access() & kWorkspaceAccessRevoked) != 0U);
+        CHECK_FALSE(peer.Acquire(offer, revision));
+        if (acquired) {
+            CHECK_FALSE(workspace->ReserveWrite());
+            workspace->CompleteRead(revision);
+            CHECK_THROWS(workspace->CompleteRead(revision));
+        }
+        REQUIRE(workspace->ReserveWrite());
+        workspace->CancelWrite();
+        CHECK_FALSE(peer.Acquire(peer.Access(), revision));
+    }
+}
+
+TEST_CASE("Lost acquisition notification requires the exact terminal completion receipt before source reuse",
+          "[gpu][workspace][acquisition]") {
+    WorkspaceRuntimeFixture fixture;
+    auto& runtime = fixture.runtime;
+    auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout());
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto output = runtime.AcquireOutput();
+    REQUIRE(runtime.ConfigureWorkspace(output, workspace));
+    runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
+    auto baseline = runtime.CommitOutput(std::move(output));
+    WorkspaceAccessPeer peer(workspace);
+    const auto revision = workspace->revision();
+    REQUIRE(peer.Acquire(peer.Access(), revision));
+    const auto previous_read = peer.Access();
+    peer.Release();
+    // A canceled write changes physical admission even if no pixels changed.
+    REQUIRE(workspace->ReserveWrite());
+    workspace->CancelWrite();
+    CHECK(workspace->revision() == revision);
+    peer.StaleTerminalReceipt(previous_read | kWorkspaceAccessRevoked);
+    std::barrier submitted{2};
+    std::barrier finish_gpu{2};
+    std::barrier completed{2};
+    bool acquired = false;
+    std::jthread browser([&] {
+        acquired = peer.Acquire(peer.Access(), revision);
+        const auto read = peer.Access();
+        submitted.arrive_and_wait();
+        finish_gpu.arrive_and_wait();
+        // The peer publishes this only at the physical GPU owner's completion
+        // boundary. The host receives no Acquired socket record in this case.
+        if (acquired) peer.TerminalComplete(read);
+        completed.arrive_and_wait();
+    });
+    submitted.arrive_and_wait();
+    CHECK(acquired);
+    workspace->Withdraw();
+    CHECK(workspace->Acquired(revision));
+    CHECK_FALSE(workspace->TerminalReadComplete(revision));
+    CHECK_FALSE(workspace->ReserveWrite());
+    finish_gpu.arrive_and_wait();
+    completed.arrive_and_wait();
+    browser.join();
+    REQUIRE(workspace->TerminalReadComplete(revision));
+    CHECK_FALSE(workspace->TerminalReadComplete(revision + 1U));
+    CHECK_FALSE(peer.Acquire(peer.Access(), revision));
+    workspace->CompleteRead(revision);
+    CHECK_FALSE(workspace->TerminalReadComplete(revision));
+    CHECK_THROWS(workspace->CompleteRead(revision));
+    const auto old_receipt = (peer.Access() & ~kWorkspaceAccessMask) | kWorkspaceAccessReading;
+    REQUIRE(workspace->ReserveWrite());
+    workspace->CancelWrite();
+    peer.StaleTerminalReceipt(old_receipt);
+    CHECK_FALSE(workspace->TerminalReadComplete(revision));
+    CHECK_FALSE(peer.Acquire(peer.Access(), revision));
+}
 
 TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the runtime", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
