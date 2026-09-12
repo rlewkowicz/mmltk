@@ -36,6 +36,11 @@ The build publishes the canonical bundle at `build/browser-app/dist`; every
 location. A missing or incompatible bundle fails launch, so rebuild after a
 native contract change.
 
+`./mmltk --build-gui` formats/checks the owned Iced frontend and rebuilds only
+the browser bundle in the GUI graph. It can be followed by `--gui` in the same
+invocation. Native host and Firefox changes still require the full
+`./mmltk --build` package operation.
+
 Firefox source comes from `third_party/firefox`; the wrapper does not fetch a
 replacement source checkout. Its host toolchain and sysroot have separate
 cached preparation. Validation uses the repository's first-party browser
@@ -122,6 +127,7 @@ operations in [validation](validation.md).
 ./mmltk --generate-application-bindings
 ./mmltk --generate-protocol
 ./mmltk --update-gui-lock
+./mmltk --update-firefox-lock
 ```
 
 The first builds typed application bindings in its dedicated
@@ -133,10 +139,10 @@ Under the selected graph's `generated/frontend/iced/`, generation owns:
 | Artifact | Purpose |
 | --- | --- |
 | `application_bindings.rs` | Typed native domain projection, codecs, schema fingerprint, and interaction limits |
-| `browser_protocol.marker` | Current application package marker, `MMLTK_HOST_API_PROTOCOL_15` |
-| `protocol_v15_client_records.hex` | Rust-to-native application fixture |
-| `protocol_v15_server_records.cbor` | Native-to-Rust application fixture |
-| `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 10 |
+| `browser_protocol.marker` | Application package marker for the [current typed boundary](gui-interaction.md#typed-application-boundary), `MMLTK_HOST_API_PROTOCOL_16` |
+| `protocol_v16_client_records.hex` | Rust-to-native application fixture |
+| `protocol_v16_server_records.cbor` | Native-to-Rust application fixture |
+| `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 13 |
 
 Application-binding generation produces the bindings, marker, and graphics
 artifact; protocol generation also produces the two application fixtures.
@@ -160,6 +166,9 @@ Generated Rust stays in build output: change canonical native declarations
 or generators, then regenerate. `--update-gui-lock` performs the containerized
 Cargo fetch used to refresh the native browser-test dependency lock; ordinary
 builds use the locked dependency set.
+`--update-firefox-lock` runs offline Cargo metadata against Firefox's vendored
+sources and `.cargo/config.toml.in`; it updates that dependency lock without
+replacing the source checkout or running Firefox tests.
 
 The private [Wayland validation image](headless-wayland.md) is separately
 fingerprinted from the packaged runtime and build images. It adds Weston and

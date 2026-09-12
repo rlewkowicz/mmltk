@@ -24,7 +24,7 @@ RF-DETR aims for mathematical equivalence with the official Python repo. Hungari
 
 The GUI is a highly custom Firefox app shell with a Rust UI built on Iced. Ancillary features such as crash reporting, telemetry, WebRTC, and various third-party assets have been pruned from the owned runtime. Compilation publishes the native reflected browser contract, and logical controls communicate typed intents to the native backend over a session-bound WebSocket.
 
-Iced owns the interface, scrolling, layout, and pan/zoom. Native CUDA systems own image processing, annotations, augmentation, neural restoration, and their final display images. Firefox copies each selected image into reusable GPU sample storage that Iced draws through WebGPU/Vulkan and Wayland. See [GUI interaction and presentation](docs/gui-interaction.md) for input ordering, reusable buffers, image custody, and redraw behavior.
+Iced owns the interface, scrolling, layout, and pan/zoom. Native systems own image processing, annotations, augmentation, neural restoration, and final display production. Annotation consumes editing input independently of GPU rendering. Firefox allocates shared Vulkan workspaces that native CUDA fills; Iced samples them directly when the device and layout support it, otherwise Firefox makes one GPU copy into reusable sample storage. Display runs through WebGPU/Vulkan and Wayland. See [GUI interaction and presentation](docs/gui-interaction.md) for input ordering, reusable buffers, image custody, and redraw behavior.
 
 Explore retains individual GPU thumbnails and the gallery while you visit an image. Scrolling prioritizes visible rows, then four rows ahead and four behind. Returning to the gallery reuses ready tiles and resumes unfinished work.
 
@@ -69,7 +69,7 @@ hardware acceptance; [logging](docs/logging.md) explains captured evidence.
 
 Independent C++ systems own application work; Rust/Iced owns the interface.
 `PresentationSystem` selects and publishes producer-owned display workspaces.
-Firefox owns their import, reusable sample storage, and display cadence.
+Firefox owns Vulkan allocation/export, sampling resources, and display cadence.
 
 | Start here | Purpose |
 | --- | --- |

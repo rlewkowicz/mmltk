@@ -37,11 +37,12 @@ IDs internally. For example:
 }
 ```
 
-Optional `splits.<name>.total` values declare a positive image count for each
-split. Without one, the compiler scans for matching contiguous PNG/JSONL
-sequences. With one, it uses the declared count and opens those numbered
-assets. Additional metadata may describe the dataset, but the category names,
-IDs, split counts, and actual images/annotations drive compilation.
+An optional `splits.<name>` entry must provide a positive `total` image count.
+When the selected split has no such entry, the compiler scans for matching
+contiguous PNG/JSONL sequences. With an entry, it uses the declared count and
+opens those numbered assets. Additional metadata may describe the dataset, but
+the category names, IDs, split counts, and actual images/annotations drive
+compilation.
 
 ## Instance records
 

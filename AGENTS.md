@@ -7,6 +7,8 @@ Start with [CONTRACT.md](CONTRACT.md) for architecture and the
 Use [commands](docs/commands.md), [validation](docs/validation.md), and
 [logging](docs/logging.md) for wrapper operations and evidence. GUI work also
 uses [interaction and presentation](docs/gui-interaction.md).
+[Build reference](docs/build.md) owns generated-artifact paths and cache rules;
+[GPU execution](docs/gpu-execution.md) owns capability-inspection commands.
 
 ## Sub Agents
 

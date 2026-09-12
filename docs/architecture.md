@@ -32,6 +32,14 @@ Live, and Upscale have their own implementation directories. Shared settings,
 file dialogs, external-provider access, Firefox process ownership, and
 diagnostics live under `src/controller/services/`.
 
+Annotation's [input executor](../src/controller/subsystems/annotation/annotation_system.cpp)
+owns the mutable document and ordered history through
+[AnnotationDocument](../src/controller/subsystems/annotation/detail/annotation_document.h).
+Its separate GPU execution owner receives
+[immutable render descriptions](../src/controller/subsystems/annotation/detail/annotation_render_state.h).
+The [interaction guide](gui-interaction.md#ordered-annotation-input-and-retained-storage)
+describes their bounded handoff and command continuations.
+
 The implementation layers below those systems are:
 
 | Directory | Contents |
@@ -91,8 +99,10 @@ Annotation, Predict, Live, and Upscale. Predict's implementation is in
 
 [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) owns product
 storage and counted reads;
-[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) owns a final
-exportable allocation and its immutable display layout. The controller's
+[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) owns native custody
+of a final Vulkan allocation and its immutable display layout;
+[ImportedImageBuffer](../src/frameworks/gpu/imported_image_buffer.h) retains
+its CUDA mapping, context, and independent backing descriptor. The controller's
 [finalization policy](../src/controller/presentation/visual_runtime.cpp)
 connects these GPU owners to the raster backend. The GPU framework has no
 reverse dependency on that backend.
@@ -107,10 +117,12 @@ explains their handoffs.
 
 The Rust browser-image boundary is
 [presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
-and its child modules. Firefox import and WebGPU/Vulkan integration live in
-the owned [third_party/firefox](../third_party/firefox) tree, including
+and its child modules. Firefox allocation/export and WebGPU/Vulkan integration
+live in the owned [third_party/firefox](../third_party/firefox) tree, including
 `gfx/wgpu_bindings/src/server.rs`. Iced owns view transforms and rendering;
-matching metadata authorizes queue-ordered browser-image draws.
+matching metadata authorizes nonblocking acquisition of a completed workspace
+and queue-ordered browser-image draws. Physical Vulkan image and semaphore
+owners retain device custody beyond registry and IPC removal.
 The vendored Iced [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
 retains sampled resources through the actual encoder's submission or
 abandonment; it carries no application schema or selection policy.

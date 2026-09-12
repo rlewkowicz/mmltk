@@ -75,7 +75,7 @@ Pixman, a software renderer, X11 or Firefox's headless mode. Successful startup
 does not prove that every exported native format/modifier is accepted: those
 negotiations remain covered by the application hardware assertions. The
 compositor's DMA-BUF capability is distinct from the producer's
-[CUDA opaque-FD workspace import](gpu-execution.md#shared-workspace-interoperability).
+[Vulkan opaque-FD export and CUDA import](gpu-execution.md#shared-workspace-interoperability).
 A headless output also does not exercise physical KMS scanout, monitor timing,
 or the host desktop compositor; retain visible runs when those are required.
 

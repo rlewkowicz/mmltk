@@ -72,6 +72,16 @@ the exact sampled slot through completion. They preserve the shared sample's
 shader-read layout and do not introduce a full-image capture texture. Ordinary
 display execution has no pixel-probe owner.
 
+Native and Iced frame probes compare the same 25 points: the Cartesian product
+of five positions per axis, bounded by the exact content extent. Explore also
+records 25 samples per card at 5%, 35%, 50%, 65%, and 95% along each axis, plus
+rendered semantic/padding checks. Card records include clean, semantic, and
+retained-reference RGBA arrays and their actual integer coordinates. Probes are
+explicit GPU readback, separate from the same-GPU display path. Native kernel
+probes and direct CUDA source-to-host samples are independent observations.
+Optional Firefox direct-image probes require successful completion and valid
+readback markers; undefined buffer-alias samples cannot prove image contents.
+
 GPU-specific trace variables are covered in [GPU execution](gpu-execution.md).
 
 ## Delivery and acceptance ownership
@@ -133,20 +143,23 @@ different purposes from these strict acceptance assertions.
 ```
 
 The packaged harness independently joins native source admission,
-`workspace_allocation`, exact source read and ready/release, Firefox forwarding,
-child dispatch, and physical copy completion. Arena identity does not replace
-producer-source identity. Capacity retry can repeat a logical publication with
-a new `transfer_sequence`; source plus transfer identifies that physical attempt.
-Release-only work requires its positive `firefox.workspace.frame_released`
-receipt and has no copied sample slot.
+`workspace_allocation`, exact acquisition and ready/release, Firefox forwarding,
+child dispatch, and physical read settlement. Copy mode also requires actual
+copy completion. Arena identity does not replace producer-source identity.
+Capacity retry can repeat a logical publication with a new `transfer_sequence`;
+source plus transfer identifies that physical attempt. Unacquired offers own
+no GPU read. Acquired direct reads require `firefox.workspace.read_settled`;
+copied samples require `firefox.workspace.copy_completed`, each after matching
+forwarding and child-dispatch evidence.
 
 `acceptance.physical_inventory` reports these observed facts:
 
 | Fields | Interpretation |
 | --- | --- |
 | `live_workspaces`, `workspace_bytes` | Nonretired admitted native source allocations and their allocation bytes |
-| `live_sample_arenas`, `live_sample_slots` | Live browser arenas and their physical sample capacity |
-| `completed_browser_copies`, `release_only_transfers` | Fully joined copy receipts and explicit release-only receipts |
+| `live_sample_arenas`, `live_sample_slots` | Live copied-sample arenas and their physical sample capacity; direct source wrappers are separate from sample storage |
+| `completed_browser_copies`, `settled_direct_reads` | Fully joined copy receipts or direct GPU-read settlement, according to the acquired mode |
+| `unacquired_offers` | Observed offers without an acquired/releasing transfer |
 | `encoded_draws`, `settled_draws`, `abandoned_draws` | Actual Iced encoding and its terminal resource-custody outcomes |
 | `final_reader_releases` | Exact samples returned after their final read hold |
 | `explore_peak_pinned_bytes` | Observed Explore staging high-water footprint |
@@ -154,7 +167,8 @@ receipt and has no copied sample slot.
 These are allocation/lifetime and cumulative operation facts for the retained
 session, not frame latency or hardware throughput measurements. They do not
 count every internal algorithm transfer. The harness rejects obsolete
-`presentation.copy.*` and Iced capture events, while source inspection and the
+`presentation.copy.*`, offer-driven `firefox.workspace.frame_released`, and
+Iced capture events, while source inspection and the
 complete direct-read/draw chain establish the removed passes. Absence of an
 event in a best-effort log alone cannot establish zero copies.
 
@@ -232,12 +246,30 @@ An `error=0` metric alone is not an error.
 
 ## Fields and correlation
 
-JSON paths such as `fields.name` work directly. Unqualified names also look
-inside `fields`. Useful metadata includes:
+JSON paths such as `fields.name` work directly. Canonical nonnegative decimal
+segments index nested lists: `referenced_objects.0.handle` and
+`message_fields.clean_rgba.24` are examples. Negative, out-of-range, or noncanonical
+indices such as `01` are missing fields. Unqualified names also look inside
+`fields`; qualified paths specify the complete location.
+
+A `message` or `fields.message` containing a complete JSON object of at most
+4096 characters is also exposed as `message_fields`. Its original message stays
+verbatim. Invalid, oversized, or non-object message content stays ordinary text.
+This supports filters and projections over structured diagnostic details
+without maintaining an event-specific schema:
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q '@event=explore.card.pixel_samples AND has(message_fields.clean_rgba.24)' \
+  --fields @event,message_fields.compiled_index,message_fields.clean_rgba.24 \
+  --format jsonl
+```
+
+Useful metadata includes:
 
 | Fields | Meaning |
 | --- | --- |
-| `@file`, `@line`, `@text`, `@format` | Physical provenance and input representation |
+| `@file`, `@line`, `@line_end`, `@text`, `@format` | Physical provenance, multiline span, and input representation |
 | `@clock`, `@time_ns`, `@mtime_ns` | Recorded clock/time and captured file modification time |
 | `@event`, `@owner`, `@level`, `@error` | Normalized event and failure-candidate metadata |
 | `@surface` | Joined native/browser sample-arena identity; source lifecycle records normalize their arena into this field |
@@ -267,6 +299,65 @@ identity. It joins original matches, excludes empty/zero identities, and
 does not expand transitively. Family/history correlations are scoped to each
 run. `--where` filters correlated and context rows too.
 
+## Vulkan diagnostics and descriptor provenance
+
+```bash
+./mmltk --logs --family latest-wayland-test -q '@event=vulkan.validation' \
+  --group-by validation_id --representatives --format timeline --limit 40
+./mmltk --logs --family latest-wayland-test \
+  -q 'validation_id:SYNC-HAZARD' \
+  --group-by validation_id --representatives --format jsonl --auto-correlate
+./mmltk --logs --family latest-wayland-test \
+  -q 'workspace_allocation=34' --descriptor-lineage --format timeline --limit 32
+```
+
+Adjacent Rust `VALIDATION` headers, indented bodies, and matching logger object
+lines form one searchable `vulkan.validation` record, bounded to 128 lines and
+1 MiB. Original text and physical line spans remain available. Overflow becomes
+a parse error and subsequent lines remain searchable.
+
+`validation_id` identifies a VUID or SYNC-HAZARD; `message_id`, `api`, and `level`
+retain reported facts. `objects` contains typed callback objects and names.
+`referenced_objects` separately contains explicitly typed handles mentioned in
+the message, such as `VkImage` or `VkSemaphore`. Types normalize to Vulkan
+object names and handles to hexadecimal. A name or bare hexadecimal number
+does not establish another resource. Both collections share a 64-entry bound;
+overflow preserves the original text and reports the limit.
+
+Use `referenced_objects.0.type` or `objects.0.handle` for an exact list entry.
+A sole reported image or memory handle is also available as `vk_image` or
+`vk_memory`. The message is a validation-layer allegation; a handle match does
+not establish its cause.
+
+`--representatives` retains one first record per `--group-by` value, preferring
+physical records to copied test context. Full occurrence counts remain
+available as `@representative_count`. Add `api` or `message` when one VUID covers
+different conditions. This option cannot combine with `--tail`, `--error`, or
+`--triage`.
+
+Automatic correlation adds bounded image/memory creation, allocation, binding,
+and direct-binding evidence for exact typed handles. Explicit matching process
+IDs may join files within one run; conflicting device, process, source, or
+allocation facts reject the join. PID-free stderr yields only labeled
+same-file candidates. Handle reuse and ambiguous owners suppress uncertain
+matches. Missing provenance is not evidence of an unrelated object.
+
+`--descriptor-lineage` follows Vulkan allocation/export, `SCM_RIGHTS` send
+attempts and exact send results, native receipt, CUDA import/mapping, and
+retirement. It also understands historical CUDA-export captures. Numeric FDs
+are process-local and never join different processes; `fstat` metadata does
+not prove common GPU backing. `descriptor_send` is only an attempt. An exact
+record-length `descriptor_send_result` with `send_errno=0` proves send success.
+The native `retained_memory_descriptor` owns backing; `import_descriptor` is
+the duplicate consumed by successful CUDA import.
+
+This report uses retained rows only, subject to `--where`, `--limit`, and
+`--top`; missing and ambiguous links stay explicit. Diagnostics retain no extra
+FDs or GPU resources. `loaded_library`/`library_inventory` observe existing
+`/proc/self/maps` once at native first import or Firefox first export, bounded
+to 1 MiB and 32 paths shorter than 1024 bytes. Query those by process separately
+so they do not consume an allocation chain's row budget.
+
 ## Automatic timeline context
 
 Human `--format timeline` queries with `--query` or `--errors` add bounded
@@ -290,9 +381,12 @@ surface, publication, allocation, or trace identities must agree wherever both
 records provide them. Bare counters and generic numeric report slots do not
 establish identity.
 
-For pixel chains, native and Firefox import/mailbox samples join through the
-observed source-to-arena forwarding record and exact physical transfer. Iced
-samples join the arena publication. The bounded query indexes accept either
+For pixel chains, direct mode compares native source to Iced sample; copy mode
+compares native source, Firefox import, mailbox, and Iced sample. The observed
+source-to-arena forwarding record and exact physical transfer choose the source.
+Direct read settlement and copy completion remain separate mode-specific facts.
+Optional valid direct-image and source-copy probes extend those comparisons
+without replacing required evidence. The bounded query indexes accept either
 arrival order, report conflicting source facts, and distinguish missing
 evidence from evidence discarded at an index limit.
 

@@ -79,6 +79,7 @@ packaged application. Neither is a Firefox-specific test runner.
 | `rfdetr-profile` | Instrumented training profile runner; selects `dev` |
 | `browser-app` | Rust/Iced protocol, state, transport, image-custody, and integration-driver tests, plus direct JavaScript adapter tests |
 | `workspace-wayland` | Packaged Firefox/NVIDIA hardware acceptance |
+| `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
 | `headless-compositor` | Real NVIDIA Weston availability and protocol checks |
 | `headless-compositor-tool` | Supervisor ownership/failure fixtures without GPU |
 | `cleanup-tool` | Cleanup-report tooling fixtures |
@@ -87,8 +88,8 @@ packaged application. Neither is a Firefox-specific test runner.
 | `all` | Build the native test targets; run the ordinary native executables |
 
 `all` builds `mmltk_workspace_wayland_integration` but excludes it from its run
-list. It also does not execute `browser-app`, the tooling suites, or the
-profile runner. Run those explicitly. `gui` and `tsan` suite names are
+list. It also does not execute `cuda-vulkan`, `browser-app`, the tooling suites,
+or the profile runner. Run those explicitly. `gui` and `tsan` suite names are
 currently unavailable even though other GUI/development build facilities exist.
 
 Some RF-DETR tests download model checkpoints and derive normalized weights,
@@ -127,9 +128,10 @@ For example:
 ```
 
 Noninteractive GDB uses batch mode; without supplied commands it runs the
-executable and prints a backtrace. The wrapper applies no arbitrary
-whole-executable or whole-suite test timeout. `MMLTK_TEST_TIMEOUT_SECONDS`
-is no longer a supported timeout control.
+executable and prints a backtrace. Native Catch2 runs have no wrapper-imposed
+whole-executable or whole-suite timeout. `MMLTK_TEST_TIMEOUT_SECONDS`
+is no longer a supported timeout control. Standalone GPU diagnostics have
+their own bounded execution described below.
 
 Fixtures retain bounded startup, entered-boundary, progress, operation, and
 shutdown waits. The packaged Wayland harness currently uses these deadlines:
@@ -157,6 +159,56 @@ always runs in full, even when Cargo receives a test filter.
 `headless-compositor-tool`, `log-query-tool`, and `cleanup-tool` own their
 fixture invocations and reject extra arguments and native test options.
 
+## Standalone CUDA/Vulkan diagnostic
+
+```bash
+./mmltk --test cuda-vulkan -- --help
+./mmltk --test cuda-vulkan -- 894 512 2 2 1 2 0 0
+./mmltk --test cuda-vulkan -- 894 512 2 2 1 2 1 0
+./mmltk --test cuda-vulkan -- 894 512 2 2 1 2 2 0
+./mmltk --test cuda-vulkan -- 894 512 2 2 1 2 1 1
+./mmltk --test cuda-vulkan -- 894 512 2 2 1 2 2 1
+```
+
+The wrapper builds the small opt-in `mmltk_cuda_vulkan_interop` target in the
+Release graph and runs it in the validation image, without starting Firefox
+or a compositor. Even its program help uses this target-selection path.
+It rejects `--env` and debugger options and has a 120-second execution deadline.
+Arguments after `--` are positional:
+
+| Position | Meaning and default |
+| --- | --- |
+| `width height` | Pixel extent, default `894 512`; each dimension is 1–4096 |
+| `allocation-pairs transfers` | Two alternating images per pair and transfers per image, default `32 8`; each is 1–256 |
+| `validation` | `0` off (default), `1` Vulkan validation |
+| `context-mode` | `0` primary, `1` isolated, `2` separate producer/semaphore contexts (default) |
+| `memory-owner` | `0` CUDA VMM (default), `1` Vulkan, `2` Vulkan dedicated |
+| `process-mode` | `0` same process (default), `1` separate Vulkan/CUDA processes; requires owner `1` or `2` |
+
+The five examples cover the three allocation owners and both Vulkan-owned
+cross-process cases. A CUDA kernel writes every pixel before each timeline
+handoff and comparison. Cross-process mode checks native retention after the
+Vulkan exporter exits and after replacement. The source is
+[cuda_vulkan_interop.cpp](../src/acceptance/diagnostics/cuda_vulkan_interop.cpp).
+This establishes low-level interop behavior for the selected case; packaged
+Wayland acceptance owns application input, draw custody, compositor behavior,
+and rendered UI evidence.
+
+For a focused standalone `.cpp` diagnostic outside that retained target:
+
+```bash
+./mmltk --diagnose-gpu-program ./probe.cpp
+```
+
+This wrapper capability compiles one C++26 source against the CUDA driver and
+Vulkan using the existing development image, then runs it in the existing
+Wayland validation image. Extra arguments go directly to the program.
+Compilation and execution each have a 120-second deadline; neither starts a
+compositor, builds/pulls images, nor uses the network. It writes its executable
+under a printed unique `build/diagnostics/gpu-program.*` directory. Use this
+only during the permitted validation stage; it is not the product build or a
+replacement for the retained interop and application suites.
+
 ## Packaged Wayland acceptance
 
 ```bash
@@ -164,10 +216,13 @@ fixture invocations and reject extra arguments and native test options.
 ./mmltk --test workspace-wayland --headless-compositor
 ./mmltk --test workspace-wayland --headless-compositor \
   -- 'workspace_wayland_retained,workspace_wayland_dpi'
+./mmltk --test workspace-wayland --headless-compositor \
+  --env WGPU_VALIDATION=1 --env WGPU_DEBUG=1 --env RUST_LOG=wgpu_hal=warn
 ```
 
-Both use the packaged runtime and the native acceptance executable. The
-visible path mounts the active host Wayland session. The private path adds a
+Visible and private-compositor runs use the packaged runtime and native
+acceptance executable. The visible path mounts the active host Wayland session.
+The private path adds a
 GPU-rendered Weston output and retains the same product assertions.
 Build the package first with `./mmltk --build`.
 
@@ -209,13 +264,22 @@ Native controlled fixtures separately establish disk/GPU admission priority;
 completion order alone cannot establish that priority.
 
 The physical ledger distinguishes native source allocations from retained
-browser arenas and requires each exact source read, transfer, copied or
-release-only receipt, encoded draw, and final sample release. The capacity
+browser arenas and requires each exact acquisition, transfer, mode-specific
+settlement receipt, encoded draw, and final sample release. The capacity
 scenario deliberately delivers arena availability before the held native
 completion receipt, then verifies the exact retry. Allocation inventories,
 actual copy receipts, resource settlement, and rendered pixels have independent
 assertions; [logging evidence](logging.md#physical-presentation-evidence)
 describes the fields and their limits.
+
+The ledger follows the negotiated mode: direct acquisitions retain the native
+source until actual GPU read settlement; copied samples require physical copy
+completion. Unacquired offers require no read receipt. Per-card and full-frame
+probes check pixels independently of allocation and submission facts.
+Use the [Vulkan log queries](logging.md#vulkan-diagnostics-and-descriptor-provenance)
+for validation-layer output. A controlled window close and an intentional
+process loss have different terminal evidence; process exit alone does not
+establish balanced userspace destruction or native GPU completion.
 
 See [headless details](headless-wayland.md) for compositor readiness,
 shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and-acceptance-ownership)
@@ -226,15 +290,15 @@ at a time.
 
 | Existing target | Evidence it owns |
 | --- | --- |
-| `mmltk_controller_annotation_tests` | Ordered reduction, document/history/save behavior, pressure, command barriers, rejection, and cancellation |
-| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, bounded compact codecs, owned/borrowed validation, and control receipts |
+| `mmltk_controller_annotation_tests` | Independent input/render progress, document/history/save behavior, stable target identity through Undo/Redo, pressure, command barriers, rejection, and cancellation |
+| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
-| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and priority, allocation-local atlas rollback, late workspace admission, exact raw/workspace reads, receiver copies and device routes, ready/release callbacks, pressure, failure, and retirement |
+| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and priority, allocation-local atlas rollback, current/overflow reuse, late workspace admission, Vulkan-owned CUDA import and backing lifetime, exact raw/workspace reads, receiver/device transfers, separate acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `browser-app` | Retained input and credits, typed state reduction, canvas identity, all model/sample/copy arrival orders, encoded/submitted draw custody, completed fallback, exact displayed gallery interaction, quiet reporting, and JavaScript probe/callback settlement |
-| `workspace-wayland` | Actual packaged interaction, retained sessions, native-source/browser-arena identity, direct sample draws, rendered pixels, recovery, and shutdown |
+| `browser-app` | Retained input and credits, typed state reduction, canvas identity, logical versus displayed annotation geometry, all model/sample/copy arrival orders, encoded/submitted draw custody, completed fallback, exact displayed gallery interaction, quiet reporting, and JavaScript probe/callback settlement |
+| `workspace-wayland` | Actual packaged interaction, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, rendered pixels, recovery, and shutdown |
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable

@@ -12,22 +12,32 @@ reuse a repository-scoped container and stream the application output.
 | Invocation | Purpose |
 | --- | --- |
 | `./mmltk --build` | Build and package the Release runtime |
+| `./mmltk --build-gui` | Format/check Iced and rebuild the canonical browser bundle in the GUI graph |
 | `./mmltk --gui` | Launch the packaged browser host with the canonical bundle |
 | `./mmltk --prepare-gui-container` | Prepare the GUI runtime container without starting the app |
 | `./mmltk --generate-application-bindings` | Generate typed application bindings and the data-only graphics ABI |
 | `./mmltk --generate-protocol` | Generate those artifacts and the application cross-language fixtures |
 | `./mmltk --update-gui-lock` | Refresh the Cargo lock inputs for browser tests |
+| `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
 | `./mmltk --tidy` | Run configured formatting and static analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
 | `./mmltk --test list` | List supported suites and test options |
+| `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
 | `./mmltk --diagnose-io FILE` | Report a compiled file's storage/GPU capabilities |
+| `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
+| `./mmltk --diagnose-gpu-program SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic using existing images |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
 
 The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
-Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`, or `--cleanup-report`
+Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
+`--diagnose-gpu-environment`, `--diagnose-gpu-program`, or `--cleanup-report`
 first when invoking that standalone operation.
+
+The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
+CUDA/Vulkan cases and argument meanings; [logging](logging.md) owns query,
+Vulkan-message, and descriptor-lineage examples.
 
 ## Native CLI
 

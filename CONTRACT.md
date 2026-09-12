@@ -162,14 +162,14 @@ receiver-owned copies; their clean pixels, documents, and semantic meaning
 remain independent of display preparation.
 
 Layout negotiation belongs to the exact browser device incarnation and physical
-capacity. Firefox validates external-image support, UUID, memory requirements,
-pitch, offset, and ownership. Firefox creates and binds each independent Vulkan
-allocation and completes initial external ownership before exporting memory and
-timeline descriptors. Native CUDA imports the full allocation on the producer
-execution owner and exposes its pitched image view. It retains its CUDA context
-and an independent backing descriptor through every native alias, including
-browser replacement and process exit. The producer then fills the final workspace. Late admission uses retained raw data
-without rerunning inference, reapplying edits, or requiring another camera frame.
+capacity. Firefox validates the shared-image capabilities and layout, creates
+each independent Vulkan allocation, and completes initial external ownership
+before exporting memory and timeline resources. Native CUDA imports the full
+allocation on the matching producer execution owner. It retains its context
+and independent backing custody through every native alias, including browser
+replacement and process exit. The producer then fills the final workspace.
+Late admission uses retained raw data without rerunning inference, reapplying
+edits, or requiring another camera frame.
 Logical completion and ordered input consumption never wait for the browser.
 
 Presentation publishes a completed workspace's exact identity on that source's
@@ -185,16 +185,17 @@ older real product revision under a newer domain observation.
 Each selected producer has reusable current and overflow capacity. Promotion
 exchanges roles without copying pixels. Raw consumers and externally acquired
 readers independently prevent reuse; unacquired overflow remains replaceable.
-Firefox directly samples its shared source storage when the actual requesting device
-supports the exact linear image, sampled usage, external handle, and legal image
-layout. Otherwise, it uses one copy into a reusable two-slot sample arena.
-Direct mode allocates no sample arena and performs no presentation copy.
+Firefox directly samples shared source storage when the actual requesting device
+supports its exact layout and usage. Otherwise, it uses one GPU copy into
+bounded reusable sample storage.
+Direct mode allocates no sample-arena pixel storage and performs no presentation copy.
 Source retirement waits for that source's GPU reads. Copied pixels retain their
 own lifetime for future draws. Capacity growth retains the old completed image
 until replacement is usable. Setup and retirement run through asynchronous
 graphics owners; active, candidate, and retiring storage remain bounded.
 
-Physical source-read settlement and page sample release are separate receipts.
+Source acquisition, release submission, physical read settlement, and page
+sample release are separate facts.
 Copy mode additionally proves actual native-to-sample completion. Iced samples
 the exact acquired source or copied slot with its retained model facts. Display
 custody and each encoded draw retain independent references; actual submission
@@ -205,9 +206,10 @@ rendering success. The last completed browser image remains drawable through
 newer work, capacity pressure, source changes, or presentation failure.
 
 Display-device mismatch uses producer-owned finalization through the existing
-same-device, peer, or reusable pinned transfer route. Browser display remains
-entirely on the GPU. Firefox owns downstream graphics queues, swapchain,
-compositor cadence, and Wayland presentation independently of Live capture rate.
+peer or reusable pinned transfer route. Same-GPU display keeps pixels on the
+GPU; explicit diagnostic probes may read back samples. Firefox owns downstream
+graphics queues, swapchain, compositor cadence, and Wayland presentation
+independently of Live capture rate.
 
 ## Execution, failure, and shutdown
 
@@ -243,9 +245,11 @@ Stop browser ingress → request system stops → return from browser loop
 ```
 
 The shell initiates shutdown; systems finish their own work and reverse-order
-RAII releases physical resources. Vulkan images and native CUDA imports each
-retain physical backing through their own completed uses. Failures leave resources safe to destroy and shutdown outcomes
-observable.
+RAII releases physical resources. Vulkan images and semaphores retain their
+device, and native CUDA imports retain their context and independent backing,
+through their own completed uses. Registry removal, IPC closure, and exporter
+exit do not substitute for physical resource settlement. Failures leave
+resources safe to destroy and shutdown outcomes observable.
 
 ## Performance and observability
 
@@ -260,19 +264,15 @@ graphics work avoids allocation and unnecessary CPU/GPU transfers, blocking,
 and memory churn.
 
 Logical annotation UI facts describe the latest committed document. Published
-frame facts retain the exact rendered scene and preview generation, including
-completed frames overtaken by newer input. Preview-only publications use compact
-progress without repeating document storage. Canonical structural projections
-retain body hit geometry and selected handles separately from editable names and
-other persisted scene data. Reconnect supplies current logical state and retained
-drawable facts within the existing snapshot and Bootstrap bounds. New gestures
-bind to displayed document geometry and the current logical tool. Runtime object
-and element identities belong to the document and its history, so surviving
-targets remain editable while rendering lags, deleted targets cannot silently
-retarget reused indices, and Undo/Redo preserves identity without changing saved
-formats. Same-document accepted progress retains its gesture target independently
-of newer rendering. Input credits acknowledge reduction;
-GPU-dependent command continuations retain their separate settlement ordering.
+frames retain their exact rendered geometry while newer input progresses.
+Compact preview updates and reconnect preserve current logical state and
+retained drawable facts within bounded transport. New gestures use displayed
+geometry and the current logical tool. Document/history-owned runtime identities
+keep surviving targets editable while rendering lags, prevent deleted targets
+from silently retargeting reused positions, and survive Undo/Redo without
+changing saved formats. Accepted gestures retain their target independently
+of newer rendering. Input consumption and GPU-dependent command completion
+retain separate settlement ordering.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and
 failure context. Disabled diagnostics create no active diagnostic or probe

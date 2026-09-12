@@ -12,8 +12,9 @@ The project's stated future directions include:
 - Keypoint and pose workflows.
 
 These are directions, not supported-feature or delivery-date commitments.
-The native model catalog and exposed CLI/UI operations describe current
-capabilities; see the [command reference](commands.md). Use the relevant
+The [native model catalog](../src/backend/models/catalog/module.cpp) and exposed
+CLI/UI operations describe current capabilities; see the
+[command reference](commands.md). Use the relevant
 [validation suites](validation.md) to establish acceptance for a workflow.
 
 Product distribution and any future paid features remain undecided. Current

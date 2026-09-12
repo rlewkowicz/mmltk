@@ -71,44 +71,60 @@ NUMA transfer trace. See [logging](logging.md) for joining captured identities.
 
 ## Shared-workspace interoperability
 
-Producer display workspaces use the existing
-[ExportedImageBuffer](../src/frameworks/gpu/exported_image_buffer.cpp) CUDA VMM
-allocation with a POSIX opaque file descriptor, imported by Firefox as memory
-for a linear Vulkan `R8G8B8A8_UNORM` image. Native writers receive a pitched
-linear device view. This route is distinct from CUDA DMA-BUF CPU mapping for
-GDRCopy and from the compositor's DMA-BUF interfaces. It does not import an
-arbitrary CUDA pointer or use a Vulkan-exported optimal image.
-The CUDA VMM `PINNED` allocation property here has a device location; it is
-device backing, separate from [host-page pinning](datasets.md#explore-thumbnails-and-atlas-residency).
+Firefox allocates a linear Vulkan `R8G8B8A8_UNORM` image and one independent
+device-memory allocation per physical workspace slot. It exports opaque
+memory and timeline-semaphore file descriptors over the existing `SCM_RIGHTS`
+channel. Native CUDA imports them on the matching device and writes a pitched
+linear image view. This is separate from CUDA DMA-BUF CPU mapping for GDRCopy
+and from the compositor's DMA-BUF interfaces.
 
 Firefox's [workspace integration](../third_party/firefox/gfx/wgpu_bindings/src/server.rs)
-queries the actual device's image format/type/tiling/usage and opaque-FD import
-support. Its result supplies the physical device UUID, device incarnation,
-capacity, row pitch, subresource byte offset, required allocation size,
-alignment, memory-type requirements, and dedicated-allocation requirement.
-The native [ImageWorkspace](../src/frameworks/gpu/image_workspace.h) validates
-the device and allocation layout and creates its exportable allocation on the
-matching CUDA device. Capacity and byte arithmetic must fit both APIs; Firefox
-rechecks the actual image's pitch, offset, alignment, memory-type and dedicated
-requirements before import.
+queries the actual rendering device's image format/type/tiling/usage and
+opaque-FD export support. Direct sampling additionally requires linear
+`SAMPLED_IMAGE` and linear-filter support with the exact external image usage.
+The result supplies the physical device UUID, device incarnation, capacity,
+row pitch, subresource byte offset, allocation size, alignment, memory-type
+bits, and dedicated-allocation requirement. Firefox rechecks these facts
+against the image it actually allocates and binds. Direct images retain legal
+tracked `GENERAL` layout; unsupported sampling uses one GPU copy into the
+reusable sample arena described in [presentation custody](gui-interaction.md#native-gpu-custody-and-completion).
 
 Source admission follows this ownership order:
 
 ```text
-Firefox queries layout for the sample arena's device and capacity
-    → producer creates an unpublished exportable workspace
-    → Firefox imports it and completes initial Vulkan ownership
+Native producer requests capacity on the browser's rendering device
+    → Firefox negotiates layout, allocates and binds independent Vulkan storage
+    → Firefox completes initial external ownership and exports memory/timeline FDs
+    → native producer execution owner imports the full allocation into CUDA
     → producer fills/finalizes it from authoritative raw data
-    → Presentation borrows and publishes the exact completed workspace
+    → Presentation offers the exact completed workspace for browser acquisition
 ```
 
 The initial `UNDEFINED` transition occurs before producer filling. It cannot
 preserve an already produced image. First admission, browser/device replacement,
 or capacity growth therefore prepares a new allocation while retaining the
 previous completed product. Subsequent source reads acquire/release the
-external image in `GENERAL`; the browser sample returns to its shared
-shader-read layout after copying. Source and sample storage retain separate
-lifetimes as described in [presentation custody](gui-interaction.md#native-gpu-custody-and-completion).
+external image in `GENERAL`; copied sample storage returns to its shared
+shader-read layout.
+
+[ImageWorkspace](../src/frameworks/gpu/image_workspace.h) coordinates native
+admission and physical access.
+[ImportedImageBuffer](../src/frameworks/gpu/imported_image_buffer.cpp) validates
+the CUDA device UUID, retains the received backing FD, and gives CUDA a separate
+consuming duplicate. It imports and maps the full reported allocation at offset
+zero, then exposes `mapped_base + image_offset` with the negotiated row pitch.
+Release frees the mapped base, destroys external memory, and only then releases
+backing and context custody. Allocation size, image offset, dedicated flags,
+and Vulkan alignment are distinct facts; CUDA VMM granularity is not mapping
+metadata for this path.
+
+The independent backing reference survives browser resource retirement,
+replacement, and exporter process exit while native aliases or GPU work remain.
+Firefox's physical image and semaphore owners likewise retain their Vulkan
+device through partial construction and final destruction, even after registry
+or IPC removal. Exporter exit alone proves neither GPU completion nor safe
+native reuse. [Presentation lifetime](gui-interaction.md#native-gpu-custody-and-completion)
+owns source-read, callback, draw, and terminal-settlement rules.
 
 When the raw producer device differs from the display device, workspace
 finalization owns the existing peer or reusable pinned transfer route and any
@@ -116,7 +132,14 @@ required receiver storage. Matching display UUIDs are required for the imported
 allocation even in this case. A clean-only same-device product can write final
 storage directly; products with semantic planes use the controller-bound fused
 raster finalizer. Late layout readiness completes retained raw work without
-repeating its domain operation.
+repeating its domain operation. Same-GPU display performs no
+GPU-to-CPU-to-GPU pixel transfer. A cross-device route without peer access may
+use pinned host staging; explicitly enabled pixel probes also read back small
+GPU samples. These are separate from the same-GPU display path.
+
+The [standalone CUDA/Vulkan diagnostic](validation.md#standalone-cudavulkan-diagnostic)
+exercises allocation, descriptor, timeline, pixel, and exporter-exit behavior
+without a browser. It complements packaged Wayland acceptance.
 
 ## ONNX capture and verification storage
 
@@ -159,6 +182,25 @@ Docker/image/GPU startup failures reach stderr before JSON can be produced.
 An accepted open or installed library does not prove storage-to-GPU DMA,
 functional NUMA binding, pinned allocation, or available mapping capacity.
 DMA-BUF export and CPU-mmap support are reported separately per visible GPU.
+
+For a bounded container/driver/library inventory without a dataset:
+
+```bash
+./mmltk --diagnose-gpu-environment runtime
+./mmltk --diagnose-gpu-environment wayland-validation
+./mmltk --diagnose-gpu-environment development
+```
+
+The default is `runtime`. Each selection requires its existing wrapper image
+and a running Docker daemon; it neither builds nor pulls an image and uses no
+network. The report includes image identity, kernel, GPU/driver details,
+library locations and version queries, Vulkan ICD manifests, and observed
+virtualization evidence. Version queries load a library in an isolated
+diagnostic process without creating a CUDA context or Vulkan instance.
+Available library files and that process's loader resolution do not prove
+which libraries the application loaded; use the [runtime provenance records](logging.md#vulkan-diagnostics-and-descriptor-provenance)
+for that evidence. The source is
+[diagnose_gpu_environment.py](../tools/diagnose_gpu_environment.py).
 
 ## Functional GDR checks
 
