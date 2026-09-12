@@ -282,9 +282,9 @@ impl State {
                 *sent == committed
                     || (sent.viewport == snapshot.viewport
                         && snapshot.focusedimage.is_none()
-                        && sent.focusedcompiledindex.is_some_and(|index| {
-                            !snapshot.order.visibleindices.contains(&index)
-                        }))
+                        && sent
+                            .focusedcompiledindex
+                            .is_some_and(|index| !snapshot.order.visibleindices.contains(&index)))
             }) {
                 self.sent_viewport = None;
             }
@@ -429,7 +429,11 @@ impl State {
             return false;
         }
         self.measured_gallery = Some(measurement);
-        *self.gallery_hover.focused.lock().expect("gallery local focus") = None;
+        *self
+            .gallery_hover
+            .focused
+            .lock()
+            .expect("gallery local focus") = None;
         true
     }
 
@@ -526,7 +530,11 @@ impl State {
                     .filter(|value| GallerySource::current(Some(value)).is_some())
                     .map(|value| value.focusedimage)
             });
-        *self.gallery_hover.focused.lock().expect("gallery local focus") = focused;
+        *self
+            .gallery_hover
+            .focused
+            .lock()
+            .expect("gallery local focus") = focused;
     }
 
     pub(crate) fn gallery_input(
@@ -537,9 +545,9 @@ impl State {
         if !Arc::ptr_eq(&input.owner, &self.gallery_hover) {
             return None;
         }
-        let source = input.source.filter(|source| {
-            GallerySource::current(snapshot).as_ref() == Some(source)
-        });
+        let source = input
+            .source
+            .filter(|source| GallerySource::current(snapshot).as_ref() == Some(source));
         let selected = source.as_ref().and(input.selected);
         match input.kind {
             crate::presentation_surface::SurfaceGestureKind::Pointer => {
@@ -578,13 +586,16 @@ impl State {
         let hit = source
             .as_ref()
             .and_then(|source| source.hit(displayed_snapshot?, gesture.sample));
-        self.gallery_input(snapshot, GalleryInput {
-            owner: self.gallery_hover.clone(),
-            source: hit.and(source),
-            selected: hit.flatten(),
-            kind: gesture.kind,
-            pressed: gesture.sample.pressed,
-        })
+        self.gallery_input(
+            snapshot,
+            GalleryInput {
+                owner: self.gallery_hover.clone(),
+                source: hit.and(source),
+                selected: hit.flatten(),
+                kind: gesture.kind,
+                pressed: gesture.sample.pressed,
+            },
+        )
     }
 }
 
@@ -718,15 +729,24 @@ mod tests {
                 kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
                 sample: gallery_sample(150, 150),
             },
-            state.measured_layout_request(Some(snapshot), 4, snapshot.order.matchingcount).is_some(),
+            state
+                .measured_layout_request(Some(snapshot), 4, snapshot.order.matchingcount)
+                .is_some(),
         )
     }
 
-    fn accept_local_focus(state: &mut State, snapshot: &ExploreSnapshot, input: GalleryInput) -> ExploreViewportUpdate {
+    fn accept_local_focus(
+        state: &mut State,
+        snapshot: &ExploreSnapshot,
+        input: GalleryInput,
+    ) -> ExploreViewportUpdate {
         let outcome = super::super::gallery::update(
-            state, Some(snapshot), &mut crate::view::settings::SettingsModel::default(),
+            state,
+            Some(snapshot),
+            &mut crate::view::settings::SettingsModel::default(),
             super::super::gallery::Message::Surface(input),
-        ).unwrap();
+        )
+        .unwrap();
         let Some(super::super::gallery::Outcome::ViewportChanged(request)) = outcome else {
             panic!("local focus must become a retained viewport request");
         };
@@ -750,25 +770,40 @@ mod tests {
             snapshot.gallery.slots.fill(ready);
             state.clear_viewport_admission();
             let input = local_focus(&state, &snapshot).unwrap();
-            assert!(local_focus(&state, &snapshot).is_none(), "one focus per cell in an Iced batch");
+            assert!(
+                local_focus(&state, &snapshot).is_none(),
+                "one focus per cell in an Iced batch"
+            );
             let request = accept_local_focus(&mut state, &snapshot, input);
             assert_eq!(request.focusedcompiledindex, Some(21));
             assert!(local_focus(&state, &snapshot).is_none());
             assert!(state.arm_viewport_writable_wait());
             state.viewport_writable();
-            assert!(local_focus(&state, &snapshot).is_none(), "writable wake retains pending focus");
+            assert!(
+                local_focus(&state, &snapshot).is_none(),
+                "writable wake retains pending focus"
+            );
             state.viewport_queued(request.clone());
             snapshot.revision += 1;
             state.rebase(Some(&snapshot), false);
-            assert!(local_focus(&state, &snapshot).is_none(), "unrelated state keeps admitted focus");
+            assert!(
+                local_focus(&state, &snapshot).is_none(),
+                "unrelated state keeps admitted focus"
+            );
             snapshot.viewport = request.viewport;
             snapshot.focusedimage = Some(21);
             state.rebase(Some(&snapshot), false);
             assert!(state.sent_viewport.is_none());
-            assert!(local_focus(&state, &snapshot).is_none(), "committed focus suppresses motion");
+            assert!(
+                local_focus(&state, &snapshot).is_none(),
+                "committed focus suppresses motion"
+            );
             snapshot.focusedimage = None;
             state.rebase(Some(&snapshot), false);
-            assert!(local_focus(&state, &snapshot).is_some(), "native focus clearing permits renewed focus");
+            assert!(
+                local_focus(&state, &snapshot).is_some(),
+                "native focus clearing permits renewed focus"
+            );
         }
     }
 
@@ -806,13 +841,19 @@ mod tests {
         snapshot.focusedimage = None;
         snapshot.order.visibleindices = (40..48).collect();
         state.rebase(Some(&snapshot), false);
-        assert!(state.sent_viewport.is_none(), "native clearing settles the normalized request");
+        assert!(
+            state.sent_viewport.is_none(),
+            "native clearing settles the normalized request"
+        );
         state.record_gallery_scroll(0);
         snapshot.viewport.firstrow = 0;
         snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
         state.rebase(Some(&snapshot), false);
         let input = local_focus(&state, &snapshot).unwrap();
-        assert_eq!(accept_local_focus(&mut state, &snapshot, input).focusedcompiledindex, Some(21));
+        assert_eq!(
+            accept_local_focus(&mut state, &snapshot, input).focusedcompiledindex,
+            Some(21)
+        );
     }
 
     #[test]
@@ -833,8 +874,10 @@ mod tests {
         changed.order.visibleindices.reverse();
         // A delayed message carries its hit, not coordinates to reinterpret
         // against whichever displayed directory happens to exist at reduction.
-        assert_eq!(state.gallery_input(Some(&changed), input),
-            Some(GalleryGestureOutcome::Focused(Some(21))));
+        assert_eq!(
+            state.gallery_input(Some(&changed), input),
+            Some(GalleryGestureOutcome::Focused(Some(21)))
+        );
         state.clear_viewport_admission();
         let input = local_focus(&state, &snapshot).unwrap();
         changed.frame.revision += 1;
@@ -844,11 +887,26 @@ mod tests {
             kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
             sample: gallery_sample(150, 150),
         };
-        assert!(state.gallery_hover.capture(source.as_ref(), Some(&changed), gesture, true).is_none());
+        assert!(
+            state
+                .gallery_hover
+                .capture(source.as_ref(), Some(&changed), gesture, true)
+                .is_none()
+        );
         changed = snapshot.clone();
         changed.dataset.identity += 1;
-        assert!(state.gallery_hover.capture(source.as_ref(), Some(&changed), gesture, true).is_none());
-        assert!(state.gallery_hover.capture(source.as_ref(), None, gesture, true).is_none());
+        assert!(
+            state
+                .gallery_hover
+                .capture(source.as_ref(), Some(&changed), gesture, true)
+                .is_none()
+        );
+        assert!(
+            state
+                .gallery_hover
+                .capture(source.as_ref(), None, gesture, true)
+                .is_none()
+        );
     }
 
     fn submit_toggled_labels(state: &mut State, snapshot: &ExploreSnapshot) -> ExploreFilterUpdate {

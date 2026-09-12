@@ -450,8 +450,6 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
             } else if (command == Command::ReleaseNativeCompletion) {
                 if (!completion->Release()) return false;
                 kind = Kind::CapacityCompletionReleased;
-            } else if (command == Command::ReleaseSample) {
-                kind = Kind::CapacityReleaseSample;
             } else
                 return false;
             return owner->publish_record(IntegrationControl{.receipt = {.kind = kind, .sequence = owner->integration->FrontendSequence()}},

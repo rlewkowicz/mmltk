@@ -402,7 +402,6 @@ class ExploreAcceptanceGate final {
         Redraw = 16U,
         ArmNativeCompletion = 32U,
         ReleaseNativeCompletion = 64U,
-        ReleaseSample = 128U,
     };
     [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
     void SetCompletionCommand(std::function<bool(ControlCommand)>);

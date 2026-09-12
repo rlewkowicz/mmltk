@@ -478,11 +478,25 @@ mod tests {
                     crate::generated::AnnotationInputBatch {
                         documentepoch: 1,
                         sequence: first_sequence + index as u64,
-                        samples: batch.iter().map(|pointer| {
-                            let sample = crate::annotation_input::compact_sample(pointer, prior.as_ref());
-                            prior = if matches!(pointer.phase, crate::generated::AnnotationPointerPhase::End | crate::generated::AnnotationPointerPhase::Cancel) { None } else { Some(pointer.clone()) };
-                            sample
-                        }).collect(),
+                        samples: batch
+                            .iter()
+                            .map(|pointer| {
+                                let sample = crate::annotation_input::compact_sample(
+                                    pointer,
+                                    prior.as_ref(),
+                                );
+                                prior = if matches!(
+                                    pointer.phase,
+                                    crate::generated::AnnotationPointerPhase::End
+                                        | crate::generated::AnnotationPointerPhase::Cancel
+                                ) {
+                                    None
+                                } else {
+                                    Some(pointer.clone())
+                                };
+                                sample
+                            })
+                            .collect(),
                     },
                 )
                 .unwrap()
@@ -604,7 +618,10 @@ mod tests {
             phase,
             interactionid: 1,
             sequence: 1,
-            identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
+            identity: crate::generated::AnnotationTargetIdentity {
+                object: 0,
+                element: 0,
+            },
             target: crate::generated::AnnotationPointerTarget {
                 object: None,
                 element: None,

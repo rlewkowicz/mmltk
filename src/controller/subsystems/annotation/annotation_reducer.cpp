@@ -81,8 +81,8 @@ struct JournalEntry final {
     struct Objects final {
         std::vector<domain::AnnotationObject> before;
         std::vector<domain::AnnotationObject> after;
-        std::vector<domain::AnnotationObjectIdentity> before_identities;
-        std::vector<domain::AnnotationObjectIdentity> after_identities;
+        std::vector<domain::AnnotationObjectIdentity> before_identities{};
+        std::vector<domain::AnnotationObjectIdentity> after_identities{};
     };
     struct Frame final {
         std::uint32_t before_index = 0U;
@@ -280,8 +280,7 @@ struct ObjectAfterView final {
             if constexpr (std::same_as<Mutation, JournalEntry::Object> || std::same_as<Mutation, JournalEntry::Category>) {
                 std::swap(mutation.before_present, mutation.after_present);
                 std::swap(mutation.before, mutation.after);
-                if constexpr (std::same_as<Mutation, JournalEntry::Object>)
-                    std::swap(mutation.before_identity, mutation.after_identity);
+                if constexpr (std::same_as<Mutation, JournalEntry::Object>) std::swap(mutation.before_identity, mutation.after_identity);
             } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
                 std::swap(mutation.before, mutation.after);
                 std::swap(mutation.before_identities, mutation.after_identities);
@@ -368,7 +367,7 @@ void mark_edited(DocumentState& state) {
 }
 
 [[nodiscard]] domain::AnnotationObjectIdentity make_identity(DocumentState& state, const domain::AnnotationObject& object,
-                                                            const std::uint64_t created_identity = 0U) {
+                                                             const std::uint64_t created_identity = 0U) {
     domain::AnnotationObjectIdentity identity{.object = created_identity ? created_identity : allocate_identity(state)};
     const auto count = identity_element_count(object);
     if (count != 0U) identity.elements.reserve(domain::kAnnotationGeometryCapacity);
@@ -392,16 +391,18 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
         if (elements.size() > count) {
             // The sole element-removal operation removes the selected spline
             // knot. Keep the surviving knots' identities even at reused indices.
-            if (object->before.shape != domain::AnnotationShape::Spline ||
-                elements.size() != count + 1U || !entry.before.selected_spline_segment)
+            if (object->before.shape != domain::AnnotationShape::Spline || elements.size() != count + 1U ||
+                !entry.before.selected_spline_segment)
                 throw std::logic_error("Annotation element identity mutation is incomplete");
             elements.erase(elements.begin() + *entry.before.selected_spline_segment);
         }
-        while (elements.size() < count) elements.push_back(allocate_identity(state));
+        while (elements.size() < count)
+            elements.push_back(allocate_identity(state));
     } else if (auto* objects = std::get_if<JournalEntry::Objects>(&entry.mutation)) {
         objects->before_identities = state.identities;
         objects->after_identities.reserve(objects->after.size());
-        for (const auto& object : objects->after) objects->after_identities.push_back(make_identity(state, object));
+        for (const auto& next_object : objects->after)
+            objects->after_identities.push_back(make_identity(state, next_object));
     }
 }
 
@@ -809,9 +810,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 object.box = box_between(origin, request.point);
                 object.category = after.selected_category.value_or(0U);
                 after.selected_object = static_cast<std::uint16_t>(scene.objects.size());
-                return commit(state,
-                              object_entry(before, after, static_cast<std::uint16_t>(scene.objects.size()), false, {}, true, object,
-                                           created_identity));
+                return commit(state, object_entry(before, after, static_cast<std::uint16_t>(scene.objects.size()), false, {}, true, object,
+                                                  created_identity));
             }
             const auto& existing = scene.objects[*target.object];
             if (existing.shape != domain::AnnotationShape::Box && existing.shape != domain::AnnotationShape::Mask) return refuse_pointer();
@@ -1302,11 +1302,8 @@ class AnnotationDocument::Impl final {
         target.identities.reset();
         if (!render_scene_ || render_scene_revision_ != state_.ui.scene_revision) {
             if (!state_.ui.valid()) throw contracts::UnavailableError("Annotation document state is invalid");
-            auto available = std::ranges::find_if(render_storage_, [](const auto& scene) {
-                return !scene || scene.use_count() == 1;
-            });
-            if (available == render_storage_.end())
-                throw std::logic_error("Annotation render description custody exceeded");
+            auto available = std::ranges::find_if(render_storage_, [](const auto& scene) { return !scene || scene.use_count() == 1; });
+            if (available == render_storage_.end()) throw std::logic_error("Annotation render description custody exceeded");
             if (!*available) *available = std::make_shared<RenderBacking>();
             (*available)->scene = state_.ui.scene;
             (*available)->identities = state_.identities;
@@ -1379,7 +1376,9 @@ AnnotationDocument::AnnotationDocument() : impl_(std::make_unique<Impl>()) {}
 AnnotationDocument::~AnnotationDocument() = default;
 DocumentResult AnnotationDocument::Open(domain::AnnotationSceneContent content) { return impl_->Open(std::move(content)); }
 DocumentResult AnnotationDocument::Pointer(const mmltk::controller::AnnotationPointer& pointer) { return impl_->Pointer(pointer); }
-bool AnnotationDocument::ResolveTarget(mmltk::controller::AnnotationPointer& pointer) const noexcept { return impl_->ResolveTarget(pointer); }
+bool AnnotationDocument::ResolveTarget(mmltk::controller::AnnotationPointer& pointer) const noexcept {
+    return impl_->ResolveTarget(pointer);
+}
 bool AnnotationDocument::PeerClosed() noexcept { return impl_->PeerClosed(); }
 DocumentResult AnnotationDocument::Edit(const mmltk::controller::AnnotationEdit& edit) {
     const bool preview = impl_->HasPreview();
@@ -1387,7 +1386,8 @@ DocumentResult AnnotationDocument::Edit(const mmltk::controller::AnnotationEdit&
     try {
         return impl_->Edit(edit);
     } catch (const std::length_error& error) {
-        return {.outcome = DocumentOutcome::Capacity, .detail = error.what(),
+        return {.outcome = DocumentOutcome::Capacity,
+                .detail = error.what(),
                 .render_changed = preview || revision != impl_->ui().scene_revision};
     }
 }

@@ -160,7 +160,7 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
 [[nodiscard]] TrainProcessClient launch_train_ignoring_term(mmltk::testsupport::ScopedTempDir& temp) {
     const auto executable = script(temp, "trap '' TERM\nprintf ready\nexec sleep 30\n");
     auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
-                                            {.escalation_delay = std::chrono::milliseconds{10}});
+                                             {.escalation_delay = std::chrono::milliseconds{10}});
     REQUIRE(ready(client.stdout_fd()));
     std::string readiness;
     client.consume_output(readiness, 5U);

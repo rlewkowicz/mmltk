@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(label.y, 112.75);
         assert_eq!(
             super::super::inverse_content_point(geometry, Point::new(label.x, label.y), (400, 400)),
-            Some((100, 100))
+            Some((100.0, 100.0))
         );
         let clip = Rectangle {
             x: 15.0,

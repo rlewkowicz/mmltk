@@ -212,8 +212,7 @@ ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, Imag
             if (slot->selected != replace_selected) continue;
             const bool owns_baseline = baseline.slot_ == slot;
             const auto owned_baseline = static_cast<std::size_t>(owns_baseline);
-            if (slot->reserved || slot->products != owned_baseline ||
-                (slot->selected && !owns_baseline && slots_.size() != 1U)) continue;
+            if (slot->reserved || slot->products != owned_baseline || (slot->selected && !owns_baseline && slots_.size() != 1U)) continue;
             if (!slot->buffer.writable()) continue;
             if (!slot->buffer.ReserveWorkspaceWrite()) continue;
             slot->reserved = true;

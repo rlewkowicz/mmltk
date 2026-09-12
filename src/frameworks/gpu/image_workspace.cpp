@@ -108,8 +108,8 @@ struct ImageWorkspace::State final {
         access_descriptor.reset(::memfd_create("mmltk-workspace-access", MFD_CLOEXEC | MFD_ALLOW_SEALING));
         if (access_descriptor.get() < 0 || ::ftruncate(access_descriptor.get(), sizeof(ImageWorkspaceAccessSignal)) != 0)
             throw std::runtime_error("workspace access allocation failed");
-        const auto mapping = ::mmap(nullptr, sizeof(ImageWorkspaceAccessSignal), PROT_READ | PROT_WRITE, MAP_SHARED,
-                                    access_descriptor.get(), 0);
+        const auto mapping =
+            ::mmap(nullptr, sizeof(ImageWorkspaceAccessSignal), PROT_READ | PROT_WRITE, MAP_SHARED, access_descriptor.get(), 0);
         if (mapping == MAP_FAILED) throw std::runtime_error("workspace access mapping failed");
         access_signal = static_cast<ImageWorkspaceAccessSignal*>(mapping);
         *access_signal = {.allocation_identity = identity};
@@ -128,26 +128,25 @@ struct ImageWorkspace::State final {
         if (access_signal) static_cast<void>(::munmap(access_signal, sizeof(ImageWorkspaceAccessSignal)));
     }
     bool ReservePhysicalWrite() {
-        auto access = std::atomic_ref{access_signal->access};
-        auto expected = access.load(std::memory_order_acquire);
+        auto gate = std::atomic_ref{access_signal->access};
+        auto expected = gate.load(std::memory_order_acquire);
         const auto role = expected & kWorkspaceAccessMask;
         if (role != kWorkspaceAccessEmpty && role != kWorkspaceAccessAvailable) return false;
         const auto epoch = expected & ~kWorkspaceAccessMask;
         if ((epoch & ~kWorkspaceAccessRevoked) > kWorkspaceAccessRevoked - 2U * (kWorkspaceAccessMask + 1U))
             throw std::overflow_error("workspace physical access epoch exhausted");
-        if (!access.compare_exchange_strong(expected, epoch + kWorkspaceAccessMask + 1U + kWorkspaceAccessWriting,
-                                            std::memory_order_acq_rel)) return false;
+        if (!gate.compare_exchange_strong(expected, epoch + kWorkspaceAccessMask + 1U + kWorkspaceAccessWriting, std::memory_order_acq_rel))
+            return false;
         std::atomic_ref{access_signal->terminal_read_complete}.store(0U, std::memory_order_release);
         write_reserved = true;
         write_invalidated = false;
         return true;
     }
     void PublishAccess(std::uint64_t role) noexcept {
-        if (role == kWorkspaceAccessAvailable && withdrawn.load(std::memory_order_acquire))
-            role = kWorkspaceAccessEmpty;
-        auto access = std::atomic_ref{access_signal->access};
-        const auto epoch = access.load(std::memory_order_relaxed) & ~kWorkspaceAccessMask;
-        access.store(epoch | role, std::memory_order_release);
+        if (role == kWorkspaceAccessAvailable && withdrawn.load(std::memory_order_acquire)) role = kWorkspaceAccessEmpty;
+        auto gate = std::atomic_ref{access_signal->access};
+        const auto epoch = gate.load(std::memory_order_relaxed) & ~kWorkspaceAccessMask;
+        gate.store(epoch | role, std::memory_order_release);
     }
     void Withdraw() noexcept {
         std::scoped_lock lock(access);
@@ -155,8 +154,8 @@ struct ImageWorkspace::State final {
         auto expected = gate.fetch_or(kWorkspaceAccessRevoked, std::memory_order_acq_rel) | kWorkspaceAccessRevoked;
         if ((expected & kWorkspaceAccessMask) == kWorkspaceAccessAvailable)
             // A winning external reader retains custody through settlement.
-            static_cast<void>(gate.compare_exchange_strong(expected,
-                (expected & ~kWorkspaceAccessMask) | kWorkspaceAccessEmpty, std::memory_order_acq_rel));
+            static_cast<void>(gate.compare_exchange_strong(expected, (expected & ~kWorkspaceAccessMask) | kWorkspaceAccessEmpty,
+                                                           std::memory_order_acq_rel));
         withdrawn.store(true, std::memory_order_release);
     }
     std::shared_ptr<Owner> owner;
@@ -269,9 +268,7 @@ bool ImageWorkspace::retired() const noexcept {
     state_->Withdraw();
     return true;
 }
-void ImageWorkspace::Withdraw() noexcept {
-    state_->Withdraw();
-}
+void ImageWorkspace::Withdraw() noexcept { state_->Withdraw(); }
 std::uint64_t ImageWorkspace::revision() const noexcept { return state_->revision.load(std::memory_order_acquire); }
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
     if (width == 0U || height == 0U || width > layout().width || height > layout().height)
@@ -293,8 +290,7 @@ mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {
 }
 bool ImageWorkspace::WriteAvailable() const noexcept {
     const auto access = std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
-    return (access & kWorkspaceAccessMask) == kWorkspaceAccessEmpty ||
-           (access & kWorkspaceAccessMask) == kWorkspaceAccessAvailable;
+    return (access & kWorkspaceAccessMask) == kWorkspaceAccessEmpty || (access & kWorkspaceAccessMask) == kWorkspaceAccessAvailable;
 }
 bool ImageWorkspace::ReserveWrite() {
     std::unique_lock lock(state_->access, std::try_to_lock);
@@ -316,12 +312,15 @@ void ImageWorkspace::CancelWrite() noexcept {
         state_->PublishAccess(state_->revision != 0U ? kWorkspaceAccessAvailable : kWorkspaceAccessEmpty);
     }
     if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 bool ImageWorkspace::Acquired(std::uint64_t generation) const noexcept {
     return generation != 0U &&
-           (std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask) == kWorkspaceAccessReading &&
+           (std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask) ==
+               kWorkspaceAccessReading &&
            std::atomic_ref{state_->access_signal->generation}.load(std::memory_order_relaxed) == generation;
 }
 bool ImageWorkspace::TerminalReadComplete(std::uint64_t generation) const noexcept {
@@ -341,7 +340,9 @@ void ImageWorkspace::CompleteRead(std::uint64_t generation) {
             throw std::runtime_error("workspace read settlement lost physical custody");
     }
     if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 void ImageWorkspace::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
@@ -381,8 +382,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
     if (!coverage.full_image && coverage.allocation_identity != identity())
         throw std::invalid_argument("workspace coverage belongs to another physical allocation");
     if (!state_->write_reserved) {
-        if (!state_->ReservePhysicalWrite())
-            throw std::runtime_error("workspace physical generation is acquired");
+        if (!state_->ReservePhysicalWrite()) throw std::runtime_error("workspace physical generation is acquired");
     }
     state_->write_invalidated = true;
     state_->revision = 0U;

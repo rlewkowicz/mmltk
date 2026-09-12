@@ -132,8 +132,9 @@ class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion) = 0;
     [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
     // A missing source preserves the initialized clean plane; semantics are replaced completely.
-    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
-                        mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
+    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source,
+                        mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
+                        std::uintptr_t stream) const = 0;
 };
 struct AnnotationRenderedFacts final {
     bool operator==(const AnnotationRenderedFacts&) const = default;
@@ -152,8 +153,7 @@ struct AnnotationRenderedScene final {
     std::uint64_t document_epoch = 0U;
     std::uint64_t scene_revision = 0U;
     contracts::AnnotationSceneGeometry geometry{};
-    [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]]
-        std::vector<std::uint64_t> identities{};
+    [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<std::uint64_t> identities{};
 };
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;

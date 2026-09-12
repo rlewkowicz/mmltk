@@ -141,7 +141,9 @@ struct PixelDeviceDeleter final {
 };
 struct AdmittedSource final {
     explicit AdmittedSource(const abi::Record& imported, gpu::DeviceContext context, int wake)
-        : description(imported), release_stream(std::move(context)) { completion.fd = wake; }
+        : description(imported), release_stream(std::move(context)) {
+        completion.fd = wake;
+    }
     ~AdmittedSource() noexcept {
         // The callback's wake can precede its return. Keep its source-owned
         // storage alive until this native completion owner settles the stream.
@@ -174,7 +176,6 @@ struct AdmittedSource final {
     bool probe_failed = false;
     bool probe_pending = false;
 };
-
 
 class NativePresentationWriter final : public PresentationNativeWriter {
    public:
@@ -236,8 +237,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             Accept(std::move(*outcome));
         while (auto acquisition = channel_.take_acquisition())
             Acquire(*acquisition);
-        if (channel_.take_capacity_wake() && configuration_.completion_acceptance)
-            configuration_.completion_acceptance->ObserveCapacity();
+        if (channel_.take_capacity_wake() && configuration_.completion_acceptance) configuration_.completion_acceptance->ObserveCapacity();
         DrainCompletion();
         RetireSources();
         PresentationNativeOutcome result;
@@ -254,7 +254,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     Retirement BrowserPeerLost() noexcept override {
         static_cast<void>(channel_.consume_peer_loss());
         channel_.reset_peer();
-        for (auto& source : sources_) source->workspace->Withdraw();
+        for (auto& source : sources_)
+            source->workspace->Withdraw();
         if (!SettlePhysicalWork(true)) return {.all_released = false, .safe_to_destroy = false};
         bool released = true;
         try {
@@ -306,8 +307,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             // A lost socket notification is not GPU completion. After browser
             // shutdown, its terminal dispatcher receipt proves the exact read
             // and final Vulkan release completed even if Acquired never arrived.
-            const bool terminal_complete = browser_terminal && acquired &&
-                source->workspace->TerminalReadComplete(source->transfer->physical_revision);
+            const bool terminal_complete =
+                browser_terminal && acquired && source->workspace->TerminalReadComplete(source->transfer->physical_revision);
             if (acquired && !source->release_submitted && !terminal_complete) return false;
             if (source->release_submitted &&
                 cudaStreamQuery(reinterpret_cast<cudaStream_t>(source->release_stream.native_handle())) != cudaSuccess &&
@@ -316,8 +317,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             const auto settled = source->release_stream.Settle();
             if (!settled.completion_reached) return false;
             if (acquired && !source->release_complete && (source->release_submitted || terminal_complete)) {
-                try { source->workspace->CompleteRead(source->transfer->physical_revision); }
-                catch (...) { return false; }
+                try {
+                    source->workspace->CompleteRead(source->transfer->physical_revision);
+                } catch (...) { return false; }
             }
             source->workspace->CancelWrite();
             source->transfer.reset();
@@ -334,7 +336,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     void DrainCompletion() {
         std::uint64_t edge = 0U;
         ssize_t read;
-        do { read = ::read(wake_->get(), &edge, sizeof(edge)); } while (read < 0 && errno == EINTR);
+        do {
+            read = ::read(wake_->get(), &edge, sizeof(edge));
+        } while (read < 0 && errno == EINTR);
         if (read < 0 && errno != EAGAIN) throw std::runtime_error("presentation completion wake failed");
         if (completion_.ready.exchange(false, std::memory_order_acq_rel)) {
             if (completion_.status != cudaSuccess) throw std::runtime_error("presentation asynchronous graphics work failed");
@@ -348,8 +352,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             if (!source->transfer) continue;
             auto& transfer = *source->transfer;
             if (configuration_.completion_acceptance && source->completion.ready.load(std::memory_order_acquire) &&
-                configuration_.completion_acceptance->Hold({source->description.id_high, source->description.id_low,
-                                                            (transfer.ready + 1U) / 2U, transfer.publication})) continue;
+                configuration_.completion_acceptance->Hold(
+                    {source->description.id_high, source->description.id_low, (transfer.ready + 1U) / 2U, transfer.publication}))
+                continue;
             if (source->completion.ready.exchange(false, std::memory_order_acq_rel)) {
                 if (source->completion.status != cudaSuccess) throw std::runtime_error("presentation asynchronous source release failed");
                 ReportPixels(transfer, VisualDiagnosticOperation::PresentationPixelAfterRelease);
@@ -359,8 +364,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             }
             if (!source->release_complete) continue;
             const auto& frame = transfer.pending.submitted.observation.frame;
-            if (!channel_.read_settled(source->id(), {presentation_source_session(frame.source.kind), frame.revision},
-                                         transfer.publication, (transfer.ready + 1U) / 2U)) continue;
+            if (!channel_.read_settled(source->id(), {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication,
+                                       (transfer.ready + 1U) / 2U))
+                continue;
             if (source->release_span) source->release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
             source->release_span.reset();
             source->transfer.reset();
@@ -473,7 +479,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (source.withdrawing) return;
         source.workspace->Withdraw();
         if (source.release_submitted || (transfer_ && transfer_->source == &source) ||
-            (source.transfer && source.workspace->Acquired(source.transfer->physical_revision))) return;
+            (source.transfer && source.workspace->Acquired(source.transfer->physical_revision)))
+            return;
         const auto withdrawal = channel_.withdraw(source.id());
         if (withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Invalid ||
             withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Capacity)
@@ -572,8 +579,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             stream_.Await(read);
             const auto transfer = mmltk::common::types::take_monotonic_identity(admitted->next_transfer);
             transfer_.emplace(Transfer{admitted, *pending_, native::detail::workspace_timeline_ready(transfer),
-                                       mmltk::common::types::take_monotonic_identity(next_publication_),
-                                       read.plane(), read.revision()});
+                                       mmltk::common::types::take_monotonic_identity(next_publication_), read.plane(), read.revision()});
             source_read_ = std::move(read).TakeCompletion();
             diagnostics_.Emit([&] {
                 auto fact = Fact(VisualDiagnosticOperation::PresentationSourceReadSubmitted, *transfer_, 0U);
@@ -610,11 +616,10 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         // A completed offer consumes no external read. Acquisition alone arms
         // its source's independent physical-release completion.
         static_cast<void>(channel_.take_capacity_wake());
-        native::detail::publish_workspace_frame_signal(source.signal.mapping(), transfer.ready, (transfer.ready + 1U) / 2U,
-                                                       native::WorkspacePresentationLayer::Primary,
-                                                       {presentation_source_session(frame.source.kind), frame.revision},
-                                                       transfer.publication, frame.extent.width, frame.extent.height,
-                                                       transfer.physical_revision);
+        native::detail::publish_workspace_frame_signal(
+            source.signal.mapping(), transfer.ready, (transfer.ready + 1U) / 2U, native::WorkspacePresentationLayer::Primary,
+            {presentation_source_session(frame.source.kind), frame.revision}, transfer.publication, frame.extent.width, frame.extent.height,
+            transfer.physical_revision);
         source.workspace->CancelWrite();
         source.exposed = true;
         if (!mmltk::common::io::signal_event_fd(source.edge.get())) throw std::runtime_error("native source frame publication failed");
@@ -699,8 +704,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     {reinterpret_cast<const std::uint8_t*>(plane.data), plane.descriptor.pitch_bytes,
                      static_cast<int>(plane.descriptor.width), static_cast<int>(plane.descriptor.height)},
                     source.pixel_device.get(), coordinates, stream.native_handle()) != cudaSuccess ||
-                cudaMemcpyAsync(source.pixels->data(), source.pixel_device.get(), 25U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost, reinterpret_cast<cudaStream_t>(stream.native_handle())) !=
-                    cudaSuccess)
+                cudaMemcpyAsync(source.pixels->data(), source.pixel_device.get(), 25U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                                reinterpret_cast<cudaStream_t>(stream.native_handle())) != cudaSuccess)
                 throw std::runtime_error("probe submission failed");
             source.probe_pending = true;
             probe_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });

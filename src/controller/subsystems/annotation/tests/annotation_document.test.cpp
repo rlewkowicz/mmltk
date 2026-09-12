@@ -108,15 +108,16 @@ TEST_CASE("Displayed annotation targets survive index shifts and journal reversa
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
     auto scene = test_scene("direct://displayed-identities");
-    contracts::AnnotationObject point{.name = contracts::AnnotationText::From("point"),
-        .shape = contracts::AnnotationShape::Point, .point = {12.0F, 14.0F}};
+    contracts::AnnotationObject point{
+        .name = contracts::AnnotationText::From("point"), .shape = contracts::AnnotationShape::Point, .point = {12.0F, 14.0F}};
     scene.objects = {point, point};
     REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
     AnnotationRenderState displayed;
     editor.CaptureRender(displayed);
     REQUIRE(displayed.identities->size() == 2U);
     AnnotationPointer target{
-        .interaction_id = 1U, .sequence = 1U,
+        .interaction_id = 1U,
+        .sequence = 1U,
         .target = {.object = 1U, .element = 0U, .role = contracts::AnnotationHandleRole::Point},
         .identity = {.object = displayed.identities->at(1).object, .element = 1U},
         .point = {12.0F, 14.0F},
@@ -154,8 +155,7 @@ TEST_CASE("Displayed spline knot identities retain surviving elements across del
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
     auto scene = test_scene("direct://displayed-elements");
-    contracts::AnnotationObject spline{.name = contracts::AnnotationText::From("spline"),
-        .shape = contracts::AnnotationShape::Spline};
+    contracts::AnnotationObject spline{.name = contracts::AnnotationText::From("spline"), .shape = contracts::AnnotationShape::Spline};
     spline.spline_knots = {{{12.0F, 12.0F}}, {{24.0F, 24.0F}}, {{36.0F, 36.0F}}};
     scene.objects = {spline};
     REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
@@ -163,7 +163,8 @@ TEST_CASE("Displayed spline knot identities retain surviving elements across del
     editor.CaptureRender(displayed);
     const auto& identity = displayed.identities->front();
     AnnotationPointer survivor{
-        .interaction_id = 1U, .sequence = 1U,
+        .interaction_id = 1U,
+        .sequence = 1U,
         .target = {.object = 0U, .element = 2U, .role = contracts::AnnotationHandleRole::SplineKnot},
         .identity = {.object = identity.object, .element = identity.elements[2]},
         .point = {36.0F, 36.0F},
@@ -204,8 +205,11 @@ TEST_CASE("A completed creation preview keeps its target identity after commit w
     editor.CaptureRender(preview);
     REQUIRE(preview.preview_identity != 0U);
     AnnotationPointer displayed{
-        .interaction_id = 2U, .sequence = 1U, .target = {.object = 0U},
-        .identity = {.object = preview.preview_identity}, .point = {10.0F, 12.0F},
+        .interaction_id = 2U,
+        .sequence = 1U,
+        .target = {.object = 0U},
+        .identity = {.object = preview.preview_identity},
+        .point = {10.0F, 12.0F},
     };
     CHECK_FALSE(editor.ResolveTarget(displayed));
     create.phase = contracts::AnnotationPointerPhase::End;
@@ -246,10 +250,12 @@ TEST_CASE("New indexed Annotation objects keep initial element identities throug
         REQUIRE(identity.elements.size() == 1U);
         REQUIRE(identity.elements.front() != 0U);
         AnnotationPointer handle{
-            .interaction_id = 2U, .sequence = 1U,
-            .target = {.object = 0U, .element = 0U,
-                .role = tool == contracts::AnnotationTool::Spline
-                    ? contracts::AnnotationHandleRole::SplineKnot : contracts::AnnotationHandleRole::SkeletonNode},
+            .interaction_id = 2U,
+            .sequence = 1U,
+            .target = {.object = 0U,
+                       .element = 0U,
+                       .role = tool == contracts::AnnotationTool::Spline ? contracts::AnnotationHandleRole::SplineKnot
+                                                                         : contracts::AnnotationHandleRole::SkeletonNode},
             .identity = {.object = identity.object, .element = identity.elements.front()},
             .point = {12.0F, 14.0F},
         };
@@ -493,12 +499,14 @@ TEST_CASE("Annotation render descriptions retain exact previews independently of
         d::AnnotationDocument editor;
         c::contracts::AnnotationSceneContent scene{.document = c::contracts::WorkspaceResource::From("test://immutable-render", 1U),
                                                    .categories = {{.value = "object"}},
-                                                   .frame_width = 64U, .frame_height = 64U, .frame_ready = true};
+                                                   .frame_width = 64U,
+                                                   .frame_height = 64U,
+                                                   .frame_ready = true};
         REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
         REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
         CHECK_FALSE(editor.Edit({.value = c::AnnotationToolEdit{tool}}).render_changed);
         const auto committed = editor.ui().document_revision;
-        c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {4,5}, .brush_radius = 2U};
+        c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {4, 5}, .brush_radius = 2U};
         REQUIRE(editor.Pointer(pointer).render_changed);
         c::AnnotationRenderState held;
         editor.CaptureRender(held);
@@ -507,7 +515,7 @@ TEST_CASE("Annotation render descriptions retain exact previews independently of
         pointer.phase = c::contracts::AnnotationPointerPhase::Update;
         ++pointer.sequence;
         CHECK_FALSE(editor.Pointer(pointer).render_changed);
-        pointer.point = {20,25};
+        pointer.point = {20, 25};
         ++pointer.sequence;
         REQUIRE(editor.Pointer(pointer).render_changed);
         CHECK(editor.ui().document_revision == committed);

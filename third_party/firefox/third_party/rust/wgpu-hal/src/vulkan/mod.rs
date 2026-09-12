@@ -577,13 +577,25 @@ pub struct ExternalTimelineQueueSubmission {
     active: AtomicBool,
 }
 
+impl fmt::Debug for ExternalTimelineQueueSubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalTimelineQueueSubmission")
+            .field("timeline", &self.timeline)
+            .field("copy_slot_count", &self.copy_slot_count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One shell-prepared command and its original physical destination mailbox.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub struct ExternalTimelineCopy {
     pub slot: usize,
     pub command: vk::CommandBuffer,
 }
 
+#[cfg(test)]
 impl ExternalTimelineCopy {
     fn validate(self, slot_count: usize) -> Result<Self, vk::Result> {
         if self.slot >= slot_count || self.command == vk::CommandBuffer::null() {
@@ -595,6 +607,7 @@ impl ExternalTimelineCopy {
 
 /// The exact odd timeline value consumed at the external transfer boundary.
 /// `copied_slot` is present only when the destination mailbox was written.
+#[derive(Debug)]
 pub struct ExternalTimelineSubmittedFrame {
     ready: u64,
     copied_slot: Option<usize>,
@@ -610,11 +623,13 @@ impl ExternalTimelineSubmittedFrame {
     }
 }
 
+#[cfg(test)]
 fn reconcile_external_timeline_edges(preconsumed: u64, edges: u64) -> (u64, u64) {
     let consumed = preconsumed.min(edges);
     (preconsumed - consumed, edges - consumed)
 }
 
+#[cfg(test)]
 fn plan_external_timeline_edge(
     submitted_release: u64,
     preconsumed_edges: u64,
@@ -1332,7 +1347,7 @@ struct ResourceIdentityFactory<T> {
     #[cfg(not(target_has_atomic = "64"))]
     next_id: Mutex<u64>,
     #[cfg(target_has_atomic = "64")]
-    next_id: core::sync::atomic::AtomicU64,
+    next_id: AtomicU64,
     _phantom: PhantomData<T>,
 }
 
@@ -1342,7 +1357,7 @@ impl<T> ResourceIdentityFactory<T> {
             #[cfg(not(target_has_atomic = "64"))]
             next_id: Mutex::new(0),
             #[cfg(target_has_atomic = "64")]
-            next_id: core::sync::atomic::AtomicU64::new(0),
+            next_id: AtomicU64::new(0),
             _phantom: PhantomData,
         }
     }
@@ -1364,7 +1379,7 @@ impl<T> ResourceIdentityFactory<T> {
         ResourceIdentity {
             id: self
                 .next_id
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                .fetch_add(1, Ordering::Relaxed),
             _phantom: PhantomData,
         }
     }

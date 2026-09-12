@@ -1,4 +1,8 @@
 fn main() {
+    // Recognize upstream condition names without enabling removed backends.
+    for backend in ["dx12", "gles", "gles_with_std", "metal", "Emscripten", "webgl"] {
+        println!("cargo:rustc-check-cfg=cfg({backend})");
+    }
     cfg_aliases::cfg_aliases! {
         native: { target_os = "linux" },
         send_sync: { target_os = "linux" },

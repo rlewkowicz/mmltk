@@ -338,13 +338,16 @@ class BindingEmitter final {
         EmitType<mmltk::controller::contracts::ApplicationErrorCategory>();
         EmitType<mmltk::controller::contracts::reflection::EventDelivery>();
         VisitBoundaryTypes();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSkeletonGeometry, mmltk::controller::contracts::AnnotationSkeletonNode>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSkeletonGeometry,
+                               mmltk::controller::contracts::AnnotationSkeletonNode>();
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSplineBody, mmltk::controller::contracts::AnnotationSplineKnot>();
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectGeometry, mmltk::controller::contracts::AnnotationObject>();
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSelectedGeometry, mmltk::controller::contracts::AnnotationObject>();
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody, mmltk::controller::contracts::AnnotationObject>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody, mmltk::controller::contracts::AnnotationObjectGeometry>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSceneGeometry, mmltk::controller::contracts::AnnotationSceneContent>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody,
+                               mmltk::controller::contracts::AnnotationObjectGeometry>();
+        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSceneGeometry,
+                               mmltk::controller::contracts::AnnotationSceneContent>();
         EmitRecordPreflight();
         EmitMetadata();
         EmitIdentitiesAndApplicationEnums();
@@ -358,7 +361,8 @@ class BindingEmitter final {
                 << ";\npub const ANNOTATION_INPUT_ADMISSION_SLOTS: usize = " << mmltk::controller::kAnnotationInputAdmissionSlots << ";\n";
         symbols_.Reserve("module", "ANNOTATION_INPUT_ENCODED_CAPACITY", "native annotation input wire bound");
         constexpr auto input_wire_bound = cbor::compact_maximum_cbor_bytes<mmltk::controller::AnnotationInputBatch>();
-        constexpr auto encoded_capacity = cbor::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(input_wire_bound);
+        constexpr auto encoded_capacity =
+            cbor::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(input_wire_bound);
         static_assert(input_wire_bound <= kMaxIntentValueBytes);
         output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << encoded_capacity << ";\n";
         EmitInteractionEnvelope();
@@ -373,10 +377,10 @@ class BindingEmitter final {
    private:
     template <class Destination, class Source>
     void EmitAnnotationGeometry() {
-        output_ << "impl From<&" << rust_type<Source>() << "> for " << rust_type<Destination>()
-                << " { fn from(source: &" << rust_type<Source>() << ") -> Self { Self {\n";
-        template for (constexpr auto target :
-                      std::define_static_array(std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::unchecked()))) {
+        output_ << "impl From<&" << rust_type<Source>() << "> for " << rust_type<Destination>() << " { fn from(source: &"
+                << rust_type<Source>() << ") -> Self { Self {\n";
+        template for (constexpr auto target : std::define_static_array(
+                          std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::unchecked()))) {
             constexpr auto source = mmltk::controller::contracts::annotation_geometry_member<Source, target>();
             constexpr auto shape = mmltk::controller::contracts::annotation_geometry_shape<target>();
             using Member = typename[:std::meta::type_of(target):];
@@ -385,8 +389,8 @@ class BindingEmitter final {
             const auto name = rust_identifier(std::meta::identifier_of(target), false);
             output_ << name << ": ";
             if constexpr (shape.has_value())
-                output_ << "if source.shape == AnnotationShape::"
-                        << rust_identifier(mmltk::frameworks::reflection::enum_name(*shape), true) << " { ";
+                output_ << "if source.shape == AnnotationShape::" << rust_identifier(mmltk::frameworks::reflection::enum_name(*shape), true)
+                        << " { ";
             if constexpr (optional) output_ << "Some(";
             output_ << "source." << name;
             if constexpr (std::is_assignable_v<Member&, const SourceMember&>)
@@ -862,19 +866,22 @@ class BindingEmitter final {
         symbols_.Reserve("module", "encode_interaction_record", "canonical numeric interaction envelope");
         symbols_.Reserve("module", "interaction_endpoint", "canonical numeric interaction dispatch");
         output_ << "pub fn interaction_endpoint(opcode: u64) -> Option<u64> { match opcode {\n";
-        visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto opcode) {
-            output_ << opcode << " => Some(" << Endpoint::stable_id << "),\n";
-        });
+        visit_interaction_opcodes<ApplicationSystems>(
+            [&]<class Endpoint>(const auto opcode) { output_ << opcode << " => Some(" << Endpoint::stable_id << "),\n"; });
         output_ << "_ => None } }\n";
-        output_ << "pub fn encode_interaction_record(endpoint: u64, value: &[u8], output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> {\n"
+        output_ << "pub fn encode_interaction_record(endpoint: u64, value: &[u8], output: &mut Vec<u8>) -> Result<(), "
+                   "crate::protocol::ProtocolError> {\n"
                    "let opcode: u64 = match endpoint {\n";
-        visit_interaction_opcodes<ApplicationSystems>([&]<class Endpoint>(const auto opcode) {
-            output_ << Endpoint::stable_id << " => " << opcode << ",\n";
-        });
+        visit_interaction_opcodes<ApplicationSystems>(
+            [&]<class Endpoint>(const auto opcode) { output_ << Endpoint::stable_id << " => " << opcode << ",\n"; });
         output_ << "_ => return Err(crate::protocol::ProtocolError(\"unknown interaction endpoint\".into())) };\n"
-                   "if value.len() > MAX_INTENT_VALUE_BYTES { return Err(crate::protocol::ProtocolError(\"interaction byte capacity exceeded\".into())) }\n"
-                   "output.clear(); crate::protocol::client_records::reserve(output, value.len() + crate::protocol::cbor::head_len(value.len() as u64) + "
-                << mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(0U) - 1U
+                   "if value.len() > MAX_INTENT_VALUE_BYTES { return Err(crate::protocol::ProtocolError(\"interaction byte capacity "
+                   "exceeded\".into())) }\n"
+                   "output.clear(); crate::protocol::client_records::reserve(output, value.len() + "
+                   "crate::protocol::cbor::head_len(value.len() as u64) + "
+                << mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(
+                       0U) -
+                       1U
                 << ", MAX_RECORD_WIRE_BYTES)?;\nuse crate::protocol::cbor::head;\n";
         output_ << "head(4, " << mmltk::frameworks::serialization::reflected_cbor_member_count<CompactInteraction>() << ", output);\n";
         VisitRustFields<CompactInteraction>([&]<class Field, class>(const auto&, const std::string& member) {

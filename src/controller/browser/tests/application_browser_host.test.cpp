@@ -295,7 +295,8 @@ class ReadyHostAnnotation final {
               }) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
-        const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
+        const bool ready =
+            Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
         INFO("Annotation startup failure: " << failure_);
         REQUIRE(ready);
         REQUIRE(failure_.empty());
@@ -626,8 +627,11 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     const auto epoch = annotation.snapshot().input_document_epoch;
     annotation.SetInputPeer(1U, {});
     const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t batch, std::uint64_t sequence) {
-        annotation.Input({.document_epoch = epoch, .sequence = batch,
-            .samples = {AnnotationPointer{.phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
+        annotation.Input(
+            {.document_epoch = epoch,
+             .sequence = batch,
+             .samples = {AnnotationPointer{
+                 .phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
     };
     auto rendered = annotation.snapshot().rendered.generation;
     gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
@@ -645,7 +649,6 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     callbacks.closed(callbacks.context.get());
     gesture(1U, contracts::AnnotationPointerPhase::End, 2U, 2U);
     REQUIRE(ready.Wait([&] { return annotation.snapshot().ui.scene.objects.size() == 1U; }));
-
 }
 
 TEST_CASE("browser admission settles acceptance redraw callbacks before releasing systems") {

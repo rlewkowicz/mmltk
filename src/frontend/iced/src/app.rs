@@ -515,7 +515,10 @@ mod tests {
             phase,
             interactionid: 1,
             sequence,
-            identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
+            identity: crate::generated::AnnotationTargetIdentity {
+                object: 0,
+                element: 0,
+            },
             target: crate::generated::AnnotationPointerTarget {
                 object: None,
                 element: None,
@@ -714,7 +717,9 @@ mod tests {
             fit_revision: 0,
         });
         let retained = FrameReady {
-            source_high: 0, source_low: 0, direct_sampling: false,
+            source_high: 0,
+            source_low: 0,
+            direct_sampling: false,
             high: 1,
             low: 2,
             layer: 0,

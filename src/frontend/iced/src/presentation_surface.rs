@@ -445,9 +445,15 @@ fn arena_has_readers(surface: Surface) -> bool {
             .iter()
             .flatten()
             .filter_map(std::sync::Weak::upgrade)
-            .any(|read| read.0.high == surface.high && read.0.low == surface.low
-                && surface.frame.is_none_or(|frame| !frame.direct_sampling
-                    || (read.0.source_high == frame.source_high && read.0.source_low == frame.source_low)))
+            .any(|read| {
+                read.0.high == surface.high
+                    && read.0.low == surface.low
+                    && surface.frame.is_none_or(|frame| {
+                        !frame.direct_sampling
+                            || (read.0.source_high == frame.source_high
+                                && read.0.source_low == frame.source_low)
+                    })
+            })
     })
 }
 
@@ -585,7 +591,13 @@ const MISS_EVENT: &str = "gpuexternaltextureacquiremiss";
 #[cfg(target_arch = "wasm32")]
 const SETTLED_EVENT: &str = "gpuexternaltexturereadsettled";
 #[cfg(target_arch = "wasm32")]
-const SURFACE_EVENTS: [&str; 5] = [FRAME_EVENT, COPY_EVENT, IMPORT_EVENT, MISS_EVENT, SETTLED_EVENT];
+const SURFACE_EVENTS: [&str; 5] = [
+    FRAME_EVENT,
+    COPY_EVENT,
+    IMPORT_EVENT,
+    MISS_EVENT,
+    SETTLED_EVENT,
+];
 #[cfg(target_arch = "wasm32")]
 const RELEASE_EVENT: &str = "gpuexternaltextureslotrelease";
 
@@ -655,18 +667,30 @@ impl FrameReady {
             direct_sampling: false,
         };
         let source = fields.next()?;
-        if source.len() != 32 || !source.is_ascii() { return None; }
+        if source.len() != 32 || !source.is_ascii() {
+            return None;
+        }
         let mut ready = ready;
         ready.source_high = u64::from_str_radix(&source[..16], 16).ok()?;
         ready.source_low = u64::from_str_radix(&source[16..], 16).ok()?;
-        ready.direct_sampling = match fields.next()? { "0" => false, "1" => true, _ => return None };
+        ready.direct_sampling = match fields.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
         (fields.next().is_none()
             && ready.layer == 0
             && (ready.content_session != 0 || ready.content_sequence != 0)
             && ready.presentation_revision != 0
-            && ((ready.slot < MAILBOX_SLOTS && ready.content_width != 0 && ready.content_height != 0)
-                || (ready.slot == u32::MAX && ready.content_width == 0 && ready.content_height == 0
-                    && ready.source_high == 0 && ready.source_low == 0 && !ready.direct_sampling)))
+            && ((ready.slot < MAILBOX_SLOTS
+                && ready.content_width != 0
+                && ready.content_height != 0)
+                || (ready.slot == u32::MAX
+                    && ready.content_width == 0
+                    && ready.content_height == 0
+                    && ready.source_high == 0
+                    && ready.source_low == 0
+                    && !ready.direct_sampling)))
             .then_some(ready)
     }
 }
@@ -819,14 +843,22 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return;
             };
             if event.type_() == MISS_EVENT {
-                if ready.slot != u32::MAX { return; }
+                if ready.slot != u32::MAX {
+                    return;
+                }
                 let changed = DRAW_AUTHORIZATION.with(|authorization| {
                     let mut authorization = authorization.borrow_mut();
-                    if authorization.acquiring.as_ref().and_then(|offer| offer.surface.frame)
+                    if authorization
+                        .acquiring
+                        .as_ref()
+                        .and_then(|offer| offer.surface.frame)
                         .is_some_and(|offer| same_publication(offer, ready))
                     {
                         authorization.acquiring = None;
-                        return authorization.offered.as_ref().and_then(|offer| offer.surface.frame)
+                        return authorization
+                            .offered
+                            .as_ref()
+                            .and_then(|offer| offer.surface.frame)
                             .is_some_and(|offer| !same_publication(offer, ready));
                     }
                     false
@@ -837,9 +869,13 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 }
                 return;
             }
-            if ready.slot >= MAILBOX_SLOTS { return; }
+            if ready.slot >= MAILBOX_SLOTS {
+                return;
+            }
             if event.type_() == SETTLED_EVENT {
-                if !ready.direct_sampling { return; }
+                if !ready.direct_sampling {
+                    return;
+                }
                 trace_frame("read_settlement_received", ready);
                 pending.borrow_mut().drawn = true;
                 notify.wake();
@@ -858,9 +894,15 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
             notify.wake();
         }) as Box<dyn FnMut(web_sys::Event)>);
         for (index, name) in SURFACE_EVENTS.iter().enumerate() {
-            if window.add_event_listener_with_callback(name, callback.as_ref().unchecked_ref()).is_err() {
+            if window
+                .add_event_listener_with_callback(name, callback.as_ref().unchecked_ref())
+                .is_err()
+            {
                 for prior in &SURFACE_EVENTS[..index] {
-                    let _ = window.remove_event_listener_with_callback(prior, callback.as_ref().unchecked_ref());
+                    let _ = window.remove_event_listener_with_callback(
+                        prior,
+                        callback.as_ref().unchecked_ref(),
+                    );
                 }
                 return None;
             }
@@ -894,7 +936,9 @@ impl Drop for FrameListener {
     fn drop(&mut self) {
         COMPLETION_WAKE.with(|notify| *notify.borrow_mut() = None);
         for name in SURFACE_EVENTS {
-            let _ = self.window.remove_event_listener_with_callback(name, self.callback.as_ref().unchecked_ref());
+            let _ = self
+                .window
+                .remove_event_listener_with_callback(name, self.callback.as_ref().unchecked_ref());
         }
     }
 }
@@ -1448,7 +1492,8 @@ fn inverse_content_point(
     point: Point,
     content: (u32, u32),
 ) -> Option<(f32, f32)> {
-    if !point.x.is_finite() || !point.y.is_finite()
+    if !point.x.is_finite()
+        || !point.y.is_finite()
         || point.x < geometry.x
         || point.y < geometry.y
         || point.x >= geometry.x + geometry.width
@@ -1459,8 +1504,7 @@ fn inverse_content_point(
         return None;
     }
     Some((
-        (((point.x - geometry.x) / geometry.width) * content.0 as f32)
-            .clamp(0.0, content.0 as f32),
+        (((point.x - geometry.x) / geometry.width) * content.0 as f32).clamp(0.0, content.0 as f32),
         (((point.y - geometry.y) / geometry.height) * content.1 as f32)
             .clamp(0.0, content.1 as f32),
     ))
@@ -1570,7 +1614,10 @@ pub(crate) fn authorize_draw(frame: Option<FrameReady>) {
     DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().draw = frame);
 }
 
-pub(crate) fn authorize_acquisition(surface: Option<Surface>, model: &crate::view_model::ApplicationModel) {
+pub(crate) fn authorize_acquisition(
+    surface: Option<Surface>,
+    model: &crate::view_model::ApplicationModel,
+) {
     DRAW_AUTHORIZATION.with(|authorization| {
         let mut authorization = authorization.borrow_mut();
         let Some((surface, snapshot)) = surface.zip(model.presentation.as_ref()) else {
@@ -1578,29 +1625,62 @@ pub(crate) fn authorize_acquisition(surface: Option<Surface>, model: &crate::vie
             return;
         };
         if model.completed_presentation_reconciliation().ok()
-            != Some(crate::view_model::PresentationReconciliation::Matching) {
+            != Some(crate::view_model::PresentationReconciliation::Matching)
+        {
             authorization.offered = None;
             return;
         }
         let visual = &snapshot.completed;
         let frame = FrameReady {
-            high: surface.high, low: surface.low, layer: 0, slot: 0,
+            high: surface.high,
+            low: surface.low,
+            layer: 0,
+            slot: 0,
             content_session: crate::generated::presentation_source_session(visual.source.kind),
-            content_sequence: visual.revision, presentation_revision: snapshot.presentationrevision,
-            content_width: visual.extent.width, content_height: visual.extent.height,
-            source_high: 0, source_low: 0, direct_sampling: false,
+            content_sequence: visual.revision,
+            presentation_revision: snapshot.presentationrevision,
+            content_width: visual.extent.width,
+            content_height: visual.extent.height,
+            source_high: 0,
+            source_low: 0,
+            direct_sampling: false,
         };
-        if authorization.offered.as_ref().and_then(|offer| offer.surface.frame) == Some(frame) { return; }
+        if authorization
+            .offered
+            .as_ref()
+            .and_then(|offer| offer.surface.frame)
+            == Some(frame)
+        {
+            return;
+        }
         gallery::confirm(frame, visual, model.explore.snapshot.as_ref());
-        let annotation = (visual.source.kind == crate::generated::PresentationSourceKind::Annotation)
-            .then(|| AnnotationContent::from_model(model, frame)).flatten();
-        if visual.source.kind == crate::generated::PresentationSourceKind::Annotation && annotation.is_none() { return; }
+        let annotation = (visual.source.kind
+            == crate::generated::PresentationSourceKind::Annotation)
+            .then(|| AnnotationContent::from_model(model, frame))
+            .flatten();
+        if visual.source.kind == crate::generated::PresentationSourceKind::Annotation
+            && annotation.is_none()
+        {
+            return;
+        }
         authorization.offered = Some(PendingImage {
-            read: None, surface: Surface { frame: Some(frame), ..surface },
+            read: None,
+            surface: Surface {
+                frame: Some(frame),
+                ..surface
+            },
             gallery: gallery::matching(Some(frame)),
-            detail: matches!(visual.source.kind, crate::generated::PresentationSourceKind::Explore |
-                crate::generated::PresentationSourceKind::Upscale).then(|| DetailContent::from_model(model)).flatten(),
-            annotation, placement: Placement::Contain, complete: false, view_ready: true,
+            detail: matches!(
+                visual.source.kind,
+                crate::generated::PresentationSourceKind::Explore
+                    | crate::generated::PresentationSourceKind::Upscale
+            )
+            .then(|| DetailContent::from_model(model))
+            .flatten(),
+            annotation,
+            placement: Placement::Contain,
+            complete: false,
+            view_ready: true,
         });
     });
 }
@@ -1617,15 +1697,29 @@ pub(crate) fn retire_imports() {
 }
 
 pub(crate) fn acquired_publication(frame: FrameReady) -> bool {
-    DRAW_AUTHORIZATION.with(|authorization| authorization.borrow().acquiring.as_ref()
-        .and_then(|pending| pending.surface.frame)
-        .is_some_and(|offered| same_publication(offered, frame)))
-        || RENDERER.with(|renderer| renderer.borrow().as_ref().is_some_and(|renderer| {
-            [&renderer.imported, &renderer.pending].into_iter().flatten().any(|imported| {
-                imported.image.pending_sample.as_ref().is_some_and(|pending|
-                    pending.view_ready && pending.surface.frame == Some(frame))
-            })
-        }))
+    DRAW_AUTHORIZATION.with(|authorization| {
+        authorization
+            .borrow()
+            .acquiring
+            .as_ref()
+            .and_then(|pending| pending.surface.frame)
+            .is_some_and(|offered| same_publication(offered, frame))
+    }) || RENDERER.with(|renderer| {
+        renderer.borrow().as_ref().is_some_and(|renderer| {
+            [&renderer.imported, &renderer.pending]
+                .into_iter()
+                .flatten()
+                .any(|imported| {
+                    imported
+                        .image
+                        .pending_sample
+                        .as_ref()
+                        .is_some_and(|pending| {
+                            pending.view_ready && pending.surface.frame == Some(frame)
+                        })
+                })
+        })
+    })
 }
 
 pub(crate) fn completed_content(
@@ -1688,13 +1782,17 @@ pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, Annota
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
-        [&renderer.pending, &renderer.imported].into_iter().flatten().find_map(|imported| {
-            let pending = imported.image.submitted_draw(requested)?;
-            Some((requested, pending.annotation.clone()?))
-        }).or_else(|| {
-            let image = &renderer.imported.as_ref()?.image;
-            Some((image.retained()?, image.annotation.clone()?))
-        })
+        [&renderer.pending, &renderer.imported]
+            .into_iter()
+            .flatten()
+            .find_map(|imported| {
+                let pending = imported.image.submitted_draw(requested)?;
+                Some((requested, pending.annotation.clone()?))
+            })
+            .or_else(|| {
+                let image = &renderer.imported.as_ref()?.image;
+                Some((image.retained()?, image.annotation.clone()?))
+            })
     })
 }
 
@@ -1731,42 +1829,78 @@ struct BrowserDevice {
 impl BrowserDevice {
     fn configured(canvas: &web_sys::HtmlCanvasElement) -> Option<wasm_bindgen::JsValue> {
         let context = canvas.get_context("webgpu").ok()??;
-        let getter = js_sys::Reflect::get(&context, &"getConfiguration".into()).ok()?
-            .dyn_into::<js_sys::Function>().ok()?;
+        let getter = js_sys::Reflect::get(&context, &"getConfiguration".into())
+            .ok()?
+            .dyn_into::<js_sys::Function>()
+            .ok()?;
         let configuration = getter.call0(&context).ok()?;
-        if configuration.is_null() || configuration.is_undefined() { return None; }
-        js_sys::Reflect::get(&configuration, &"device".into()).ok()
+        if configuration.is_null() || configuration.is_undefined() {
+            return None;
+        }
+        js_sys::Reflect::get(&configuration, &"device".into())
+            .ok()
             .filter(|device| !device.is_null() && !device.is_undefined())
     }
     fn discover() -> Option<Self> {
-        let canvases = web_sys::window()?.document()?.query_selector_all("canvas").ok()?;
+        let canvases = web_sys::window()?
+            .document()?
+            .query_selector_all("canvas")
+            .ok()?;
         let mut selected: Option<Self> = None;
         for index in 0..canvases.length() {
-            let Some(canvas) = canvases.item(index).and_then(|node| node.dyn_into::<web_sys::HtmlCanvasElement>().ok()) else { continue; };
-            let Some(device) = Self::configured(&canvas) else { continue; };
-            if selected.as_ref().is_some_and(|selected| !js_sys::Object::is(&selected.device, &device)) { return None; }
-            if selected.is_none() { selected = Some(Self { canvas, device, requested: None }); }
+            let Some(canvas) = canvases
+                .item(index)
+                .and_then(|node| node.dyn_into::<web_sys::HtmlCanvasElement>().ok())
+            else {
+                continue;
+            };
+            let Some(device) = Self::configured(&canvas) else {
+                continue;
+            };
+            if selected
+                .as_ref()
+                .is_some_and(|selected| !js_sys::Object::is(&selected.device, &device))
+            {
+                return None;
+            }
+            if selected.is_none() {
+                selected = Some(Self {
+                    canvas,
+                    device,
+                    requested: None,
+                });
+            }
         }
         selected
     }
     fn call(&self, name: &str, arguments: &js_sys::Array) -> bool {
-        js_sys::Reflect::get(&self.device, &name.into()).ok()
+        js_sys::Reflect::get(&self.device, &name.into())
+            .ok()
             .and_then(|method| method.dyn_into::<js_sys::Function>().ok())
             .is_some_and(|method| method.apply(&self.device, arguments).is_ok())
     }
     fn request(&mut self, surface: Surface) -> bool {
-        let Some(device) = Self::configured(&self.canvas) else { return false; };
+        let Some(device) = Self::configured(&self.canvas) else {
+            return false;
+        };
         if !js_sys::Object::is(&self.device, &device) {
             self.device = device;
             self.requested = None;
             DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().acquiring = None);
         }
-        if self.requested.is_some_and(|requested| same_allocation(requested, surface)) { return true; }
+        if self
+            .requested
+            .is_some_and(|requested| same_allocation(requested, surface))
+        {
+            return true;
+        }
         let arguments = js_sys::Array::new();
         arguments.push(&format!("{:016x}{:016x}", surface.high, surface.low).into());
         arguments.push(&surface.width.into());
         arguments.push(&surface.height.into());
-        if !self.call("requestWorkspace", &arguments) { return false; }
+        if !self.call("requestWorkspace", &arguments) {
+            return false;
+        }
         if let Some(previous) = self.requested.replace(surface) {
             trace_surface("capability_replaced", previous);
         }
@@ -1779,15 +1913,27 @@ impl BrowserDevice {
             let offer = authorization.offered.as_ref()?;
             let frame = offer.surface.frame?;
             if authorization.acquiring.is_some()
-                || authorization.draw.is_some_and(|draw| same_publication(draw, frame)) { return None; }
+                || authorization
+                    .draw
+                    .is_some_and(|draw| same_publication(draw, frame))
+            {
+                return None;
+            }
             authorization.acquiring = Some(offer.clone());
             Some(frame)
         });
-        let Some(frame) = offer else { return; };
+        let Some(frame) = offer else {
+            return;
+        };
         let arguments = js_sys::Array::new();
-        for word in [format!("{:016x}{:016x}", frame.high, frame.low),
-            format!("{:016x}", frame.content_session), format!("{:016x}", frame.content_sequence),
-            format!("{:016x}", frame.presentation_revision)] { arguments.push(&word.into()); }
+        for word in [
+            format!("{:016x}{:016x}", frame.high, frame.low),
+            format!("{:016x}", frame.content_session),
+            format!("{:016x}", frame.content_sequence),
+            format!("{:016x}", frame.presentation_revision),
+        ] {
+            arguments.push(&word.into());
+        }
         if !self.call("acquireWorkspace", &arguments) {
             DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().acquiring = None);
         }
@@ -1795,8 +1941,11 @@ impl BrowserDevice {
 }
 
 fn same_publication(left: FrameReady, right: FrameReady) -> bool {
-    left.high == right.high && left.low == right.low && left.layer == right.layer
-        && left.content_session == right.content_session && left.content_sequence == right.content_sequence
+    left.high == right.high
+        && left.low == right.low
+        && left.layer == right.layer
+        && left.content_session == right.content_session
+        && left.content_sequence == right.content_sequence
         && left.presentation_revision == right.presentation_revision
 }
 
@@ -1824,7 +1973,6 @@ struct ImagePublication {
 
 #[derive(Clone)]
 pub(crate) struct AnnotationContent {
-    pub(crate) frame: crate::generated::VisualFrame,
     pub(crate) scene: std::sync::Arc<crate::generated::AnnotationRenderedScene>,
     pub(crate) rendered: std::sync::Arc<crate::generated::AnnotationRenderedFacts>,
     preview_body: Option<std::sync::Arc<crate::generated::AnnotationObjectBody>>,
@@ -1837,14 +1985,19 @@ impl AnnotationContent {
             documentepoch: snapshot.inputdocumentepoch,
             scenerevision: snapshot.ui.scenerevision,
             geometry: (&snapshot.ui.scene).into(),
-            identities: (0..snapshot.ui.scene.objects.len()).map(|index| index as u64 + 1).collect(),
+            identities: (0..snapshot.ui.scene.objects.len())
+                .map(|index| index as u64 + 1)
+                .collect(),
         };
         let mut rendered = snapshot.rendered.clone();
         rendered.documentepoch = scene.documentepoch;
         rendered.scenerevision = scene.scenerevision;
         rendered.editor = snapshot.ui.editor.clone();
-        rendered.selected = rendered.editor.selectedobject
-            .and_then(|index| snapshot.ui.scene.objects.get(index as usize)).map(From::from);
+        rendered.selected = rendered
+            .editor
+            .selectedobject
+            .and_then(|index| snapshot.ui.scene.objects.get(index as usize))
+            .map(From::from);
         rendered.selectedidentity = rendered.editor.selectedobject.and_then(|index| {
             let object = snapshot.ui.scene.objects.get(index as usize)?;
             let count = match object.shape {
@@ -1860,8 +2013,11 @@ impl AnnotationContent {
         rendered.preview = None;
         rendered.previewobject = None;
         rendered.previewidentity = 0;
-        Self { frame: snapshot.frame.clone(), scene: std::sync::Arc::new(scene),
-            rendered: std::sync::Arc::new(rendered), preview_body: None }
+        Self {
+            scene: std::sync::Arc::new(scene),
+            rendered: std::sync::Arc::new(rendered),
+            preview_body: None,
+        }
     }
 
     fn from_model(model: &crate::view_model::ApplicationModel, frame: FrameReady) -> Option<Self> {
@@ -1873,9 +2029,10 @@ impl AnnotationContent {
             && u32::from(scene.geometry.framewidth) == frame.content_width
             && u32::from(scene.geometry.frameheight) == frame.content_height)
             .then(|| Self {
-                frame: snapshot.frame.clone(), scene,
-                preview_body: snapshot.rendered.preview.as_ref().map(|preview|
-                    std::sync::Arc::new(crate::generated::AnnotationObjectBody::from(preview))),
+                scene,
+                preview_body: snapshot.rendered.preview.as_ref().map(|preview| {
+                    std::sync::Arc::new(crate::generated::AnnotationObjectBody::from(preview))
+                }),
                 rendered: std::sync::Arc::new(snapshot.rendered.clone()),
             })
     }
@@ -1894,10 +2051,15 @@ impl AnnotationContent {
         Some((index, object))
     }
 
-    pub(crate) fn target_identity(&self, target: &crate::generated::AnnotationPointerTarget)
-        -> Option<crate::generated::AnnotationTargetIdentity> {
+    pub(crate) fn target_identity(
+        &self,
+        target: &crate::generated::AnnotationPointerTarget,
+    ) -> Option<crate::generated::AnnotationTargetIdentity> {
         let Some(index) = target.object else {
-            return Some(crate::generated::AnnotationTargetIdentity { object: 0, element: 0 });
+            return Some(crate::generated::AnnotationTargetIdentity {
+                object: 0,
+                element: 0,
+            });
         };
         let identity = self.scene.identities.get(index as usize);
         let object = if let Some(identity) = identity {
@@ -1909,10 +2071,20 @@ impl AnnotationContent {
         };
         let element = match (target.element, target.role) {
             (None, None) => 0,
-            (Some(element), Some(crate::generated::AnnotationHandleRole::BoxCorner
-                | crate::generated::AnnotationHandleRole::Point)) => u64::from(element) + 1,
-            (Some(element), Some(_)) => *self.rendered.selectedidentity.as_ref()
-                .filter(|identity| identity.object == object)?.elements.get(element as usize)?,
+            (
+                Some(element),
+                Some(
+                    crate::generated::AnnotationHandleRole::BoxCorner
+                    | crate::generated::AnnotationHandleRole::Point,
+                ),
+            ) => u64::from(element) + 1,
+            (Some(element), Some(_)) => *self
+                .rendered
+                .selectedidentity
+                .as_ref()
+                .filter(|identity| identity.object == object)?
+                .elements
+                .get(element as usize)?,
             _ => return None,
         };
         Some(crate::generated::AnnotationTargetIdentity { object, element })
@@ -1920,7 +2092,10 @@ impl AnnotationContent {
 
     pub(crate) fn object_count(&self) -> usize {
         self.scene.geometry.objects.len()
-            + usize::from(self.rendered.previewobject.map(usize::from) == Some(self.scene.geometry.objects.len()))
+            + usize::from(
+                self.rendered.previewobject.map(usize::from)
+                    == Some(self.scene.geometry.objects.len()),
+            )
     }
 }
 
@@ -2143,7 +2318,10 @@ impl SurfaceRenderer {
             same_allocation(pending.image.surface, requested) && pending.image.completed.is_none()
         });
         #[cfg(target_arch = "wasm32")]
-        let pending_capability = self.browser_device.as_ref().and_then(|browser| browser.requested)
+        let pending_capability = self
+            .browser_device
+            .as_ref()
+            .and_then(|browser| browser.requested)
             .is_some_and(|surface| same_allocation(surface, requested));
         #[cfg(not(target_arch = "wasm32"))]
         let pending_capability = false;
@@ -2343,9 +2521,15 @@ impl SurfaceRenderer {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            if self.browser_device.is_none() { self.browser_device = BrowserDevice::discover(); }
-            let Some(browser) = self.browser_device.as_mut() else { return; };
-            if !browser.request(surface) { return; }
+            if self.browser_device.is_none() {
+                self.browser_device = BrowserDevice::discover();
+            }
+            let Some(browser) = self.browser_device.as_mut() else {
+                return;
+            };
+            if !browser.request(surface) {
+                return;
+            }
             browser.acquire();
         }
         if self
@@ -2362,11 +2546,18 @@ impl SurfaceRenderer {
             imported.prepare(surface, placement);
             return;
         }
-        let Some(frame) = surface.frame else { return; };
+        let Some(frame) = surface.frame else {
+            return;
+        };
         trace_surface("texture_create", surface);
         let label = if frame.direct_sampling {
-            format!("mmltk-surface-v4/{:016x}{:016x}", frame.source_high, frame.source_low)
-        } else { surface.label() };
+            format!(
+                "mmltk-surface-v4/{:016x}{:016x}",
+                frame.source_high, frame.source_low
+            )
+        } else {
+            surface.label()
+        };
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label),
             size: wgpu::Extent3d {
@@ -2384,20 +2575,29 @@ impl SurfaceRenderer {
         let arena = ArenaTexture {
             surface,
             texture: Some(texture),
-            lifetime: surface_trace_enabled().then(|| std::sync::Arc::new(ImportedTextureLifetime(surface))),
+            lifetime: surface_trace_enabled()
+                .then(|| std::sync::Arc::new(ImportedTextureLifetime(surface))),
         };
         trace_source_texture("source_texture_create", surface);
         let texture = arena.texture.as_ref().expect("new page texture");
         let views = std::array::from_fn(|slot| {
             texture.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: if frame.direct_sampling { 0 } else { slot as u32 },
+                base_array_layer: if frame.direct_sampling {
+                    0
+                } else {
+                    slot as u32
+                },
                 array_layer_count: Some(1),
                 ..wgpu::TextureViewDescriptor::default()
             })
         });
         let mut pixel_trace = [None, None];
-        let texture_index = if frame.direct_sampling { frame.slot as usize } else { 0 };
+        let texture_index = if frame.direct_sampling {
+            frame.slot as usize
+        } else {
+            0
+        };
         pixel_trace[texture_index] = pixel_trace::PixelTrace::new(device, queue, texture);
         let mut textures = [None, None];
         textures[texture_index] = Some(arena);
@@ -2720,12 +2920,13 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
     let Some(frame) = surface.frame else {
         return;
     };
-    if !acquired_publication(frame) && (model.completed_presentation_reconciliation().ok()
-        != Some(crate::view_model::PresentationReconciliation::Matching)
-        || model
-            .presentation
-            .as_ref()
-            .is_none_or(|snapshot| !frame.matches_completed(snapshot)))
+    if !acquired_publication(frame)
+        && (model.completed_presentation_reconciliation().ok()
+            != Some(crate::view_model::PresentationReconciliation::Matching)
+            || model
+                .presentation
+                .as_ref()
+                .is_none_or(|snapshot| !frame.matches_completed(snapshot)))
     {
         return;
     }
@@ -2803,7 +3004,11 @@ impl ImagePublication {
             return;
         }
         pending.view_ready = true;
-        if frame.content_session == crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Annotation) {
+        if frame.content_session
+            == crate::generated::presentation_source_session(
+                crate::generated::PresentationSourceKind::Annotation,
+            )
+        {
             if pending.annotation.is_none() {
                 pending.annotation = AnnotationContent::from_model(model, frame);
             }
@@ -2891,13 +3096,17 @@ impl ImagePublication {
     }
 
     fn promote(&mut self, frame: FrameReady, model: &crate::view_model::ApplicationModel) -> bool {
-        let authorized = self.pending_sample.as_ref().is_some_and(|pending| pending.view_ready);
-        if (!authorized && (model.completed_presentation_reconciliation().ok()
-            != Some(crate::view_model::PresentationReconciliation::Matching)
-            || model
-                .presentation
-                .as_ref()
-                .is_none_or(|snapshot| !frame.matches_completed(snapshot))))
+        let authorized = self
+            .pending_sample
+            .as_ref()
+            .is_some_and(|pending| pending.view_ready);
+        if (!authorized
+            && (model.completed_presentation_reconciliation().ok()
+                != Some(crate::view_model::PresentationReconciliation::Matching)
+                || model
+                    .presentation
+                    .as_ref()
+                    .is_none_or(|snapshot| !frame.matches_completed(snapshot))))
             || !self
                 .pending_sample
                 .as_ref()
@@ -2933,19 +3142,34 @@ impl ImagePublication {
 
 impl Imported {
     fn ensure_source(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, surface: Surface) {
-        let Some(frame) = surface.frame.filter(|frame| frame.direct_sampling) else { return; };
+        let Some(frame) = surface.frame.filter(|frame| frame.direct_sampling) else {
+            return;
+        };
         let index = frame.slot as usize;
         if self._arena[index].as_ref().is_some_and(|arena| {
-            arena.surface.frame.is_some_and(|prior|
-                prior.source_high == frame.source_high && prior.source_low == frame.source_low)
-        }) { return; }
-        let label = format!("mmltk-surface-v4/{:016x}{:016x}", frame.source_high, frame.source_low);
+            arena.surface.frame.is_some_and(|prior| {
+                prior.source_high == frame.source_high && prior.source_low == frame.source_low
+            })
+        }) {
+            return;
+        }
+        let label = format!(
+            "mmltk-surface-v4/{:016x}{:016x}",
+            frame.source_high, frame.source_low
+        );
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&label),
-            size: wgpu::Extent3d { width: surface.width, height: surface.height, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            size: wgpu::Extent3d {
+                width: surface.width,
+                height: surface.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
         self.views[index] = texture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2),
@@ -2953,9 +3177,20 @@ impl Imported {
             ..wgpu::TextureViewDescriptor::default()
         });
         self.pixel_trace[index] = pixel_trace::PixelTrace::new(device, queue, &texture);
-        let lifetime = self._arena.iter().flatten().next().expect("import owns a physical texture").lifetime.clone();
+        let lifetime = self
+            ._arena
+            .iter()
+            .flatten()
+            .next()
+            .expect("import owns a physical texture")
+            .lifetime
+            .clone();
         trace_source_texture("source_texture_create", surface);
-        self._arena[index] = Some(ArenaTexture { surface, texture: Some(texture), lifetime });
+        self._arena[index] = Some(ArenaTexture {
+            surface,
+            texture: Some(texture),
+            lifetime,
+        });
     }
 
     fn reconcile_sample(&mut self, surface: Surface, placement: Placement) {
@@ -3045,20 +3280,34 @@ impl Imported {
             );
             return;
         };
-        let trace_index = if frame.direct_sampling { frame.slot as usize } else { 0 };
+        let trace_index = if frame.direct_sampling {
+            frame.slot as usize
+        } else {
+            0
+        };
         if let Some(probe) = &self.pixel_trace[trace_index] {
             probe.sample(self.image.surface, borrow.clone());
         }
         let acquired = DRAW_AUTHORIZATION.with(|authorization| {
             let mut authorization = authorization.borrow_mut();
-            if authorization.acquiring.as_ref().and_then(|pending| pending.surface.frame)
+            if authorization
+                .acquiring
+                .as_ref()
+                .and_then(|pending| pending.surface.frame)
                 .is_some_and(|offered| same_publication(offered, frame))
-            { authorization.acquiring.take() } else { None }
+            {
+                authorization.acquiring.take()
+            } else {
+                None
+            }
         });
         self.image.pending_sample = Some(PendingImage {
             read: Some(borrow),
             surface: self.image.surface,
-            gallery: acquired.as_ref().and_then(|facts| facts.gallery.clone()).or_else(|| self.image.gallery.clone()),
+            gallery: acquired
+                .as_ref()
+                .and_then(|facts| facts.gallery.clone())
+                .or_else(|| self.image.gallery.clone()),
             detail: acquired.as_ref().and_then(|facts| facts.detail.clone()),
             annotation: acquired.as_ref().and_then(|facts| facts.annotation.clone()),
             placement: self.image.placement,
@@ -3205,8 +3454,12 @@ pub(crate) fn release(frame: FrameReady) {
     }
     DRAW_AUTHORIZATION.with(|authorization| {
         let mut authorization = authorization.borrow_mut();
-        if authorization.acquiring.as_ref().and_then(|offer| offer.surface.frame)
-            .is_some_and(|offer| same_publication(offer, frame)) {
+        if authorization
+            .acquiring
+            .as_ref()
+            .and_then(|offer| offer.surface.frame)
+            .is_some_and(|offer| same_publication(offer, frame))
+        {
             authorization.acquiring = None;
         }
     });
@@ -3541,7 +3794,7 @@ mod tests {
                             surface: target,
                             gallery: None,
                             detail: None,
-                annotation: None,
+                            annotation: None,
                             placement: Placement::Contain,
                             complete: copy_completed(next),
                             view_ready: false,
@@ -3554,7 +3807,7 @@ mod tests {
                                 retained_read: None,
                                 gallery: None,
                                 detail: None,
-                annotation: None,
+                                annotation: None,
                                 placement: Placement::Contain,
                             });
                         } else {
@@ -3643,7 +3896,7 @@ mod tests {
                     },
                     gallery: None,
                     detail: None,
-                annotation: None,
+                    annotation: None,
                     placement: Placement::Contain,
                     complete: false,
                     view_ready: false,
@@ -3712,14 +3965,14 @@ mod tests {
                         surface,
                         gallery: None,
                         detail: None,
-                annotation: None,
+                        annotation: None,
                         placement: Placement::Contain,
                         complete: false,
                         view_ready: false,
                     }),
                     gallery: None,
                     detail: None,
-                annotation: None,
+                    annotation: None,
                     placement: Placement::Contain,
                 };
                 authorize_draw(None);
@@ -4179,8 +4432,10 @@ mod tests {
 
     #[test]
     fn native_frame_payload_is_direct_and_bounded() {
-        let ready =
-            FrameReady::parse("00000000000000010000000000000002:0:1:3:4:5:640:480:00000000000000060000000000000007:1").expect("frame");
+        let ready = FrameReady::parse(
+            "00000000000000010000000000000002:0:1:3:4:5:640:480:00000000000000060000000000000007:1",
+        )
+        .expect("frame");
         assert_eq!(ready.slot, 1);
         assert_eq!(ready.presentation_revision, 5);
         assert!(ready.direct_sampling);
@@ -4231,22 +4486,45 @@ mod tests {
 
     #[test]
     fn final_content_cells_keep_continuous_fractions_through_crop_pan_and_zoom() {
-        let bounds = Rectangle { x: 40.0, y: 30.0, width: 640.0, height: 480.0 };
-        let viewport = ViewportOwner { zoom: 0.5, pan_x: 10.0, pan_y: -5.0, ..ViewportOwner::default() };
+        let bounds = Rectangle {
+            x: 40.0,
+            y: 30.0,
+            width: 640.0,
+            height: 480.0,
+        };
+        let viewport = ViewportOwner {
+            zoom: 0.5,
+            pan_x: 10.0,
+            pan_y: -5.0,
+            ..ViewportOwner::default()
+        };
         for crop in [None, Some([100, 60, 20, 10]), Some([7, 9, 1, 1])] {
-            let surface = Surface { crop, ..surface_for_content_session(1) };
+            let surface = Surface {
+                crop,
+                ..surface_for_content_session(1)
+            };
             let extent = surface.content_extent();
             let [crop_x, crop_y, _, _] = surface.content_region();
-            let geometry = placement_geometry(Rectangle::with_size(bounds.size()), extent,
-                Placement::Contain, viewport.transform()).unwrap();
+            let geometry = placement_geometry(
+                Rectangle::with_size(bounds.size()),
+                extent,
+                Placement::Contain,
+                viewport.transform(),
+            )
+            .unwrap();
             let mut previous = None;
             for fraction in [0.25, 0.75] {
-                let content = Point::new(extent.0 as f32 - 1.0 + fraction, extent.1 as f32 - 1.0 + fraction);
+                let content = Point::new(
+                    extent.0 as f32 - 1.0 + fraction,
+                    extent.1 as f32 - 1.0 + fraction,
+                );
                 let cursor = mouse::Cursor::Available(Point::new(
                     bounds.x + geometry.x + content.x / extent.0 as f32 * geometry.width,
                     bounds.y + geometry.y + content.y / extent.1 as f32 * geometry.height,
                 ));
-                let sample = viewport.sample(bounds, cursor, surface, Placement::Contain, true).unwrap();
+                let sample = viewport
+                    .sample(bounds, cursor, surface, Placement::Contain, true)
+                    .unwrap();
                 assert!((sample.content_x - (crop_x as f32 + content.x)).abs() < 0.0001);
                 assert!((sample.content_y - (crop_y as f32 + content.y)).abs() < 0.0001);
                 if let Some((x, y)) = previous {
@@ -4254,16 +4532,28 @@ mod tests {
                 }
                 previous = Some((sample.content_x, sample.content_y));
             }
-            assert!(inverse_content_point(geometry,
-                Point::new(geometry.x + geometry.width, geometry.y), extent).is_none());
-            assert!(inverse_content_point(geometry,
-                Point::new(geometry.x, geometry.y + geometry.height), extent).is_none());
+            assert!(
+                inverse_content_point(
+                    geometry,
+                    Point::new(geometry.x + geometry.width, geometry.y),
+                    extent
+                )
+                .is_none()
+            );
+            assert!(
+                inverse_content_point(
+                    geometry,
+                    Point::new(geometry.x, geometry.y + geometry.height),
+                    extent
+                )
+                .is_none()
+            );
         }
     }
 
     #[test]
     fn iced_batched_events_preserve_cursor_order_and_overlay_capture() {
-        use iced_runtime::core as core;
+        use iced_runtime::core;
         use std::{cell::RefCell, rc::Rc};
         type Observed = (core::Event, core::mouse::Cursor);
 
@@ -4274,12 +4564,19 @@ mod tests {
             fn start_transformation(&mut self, _: core::Transformation) {}
             fn end_transformation(&mut self) {}
             fn fill_quad(&mut self, _: core::renderer::Quad, _: impl Into<core::Background>) {}
-            fn allocate_image(&mut self, _: &core::image::Handle,
-                callback: impl FnOnce(Result<core::image::Allocation, core::image::Error>) + Send + 'static) {
+            fn allocate_image(
+                &mut self,
+                _: &core::image::Handle,
+                callback: impl FnOnce(Result<core::image::Allocation, core::image::Error>)
+                + Send
+                + 'static,
+            ) {
                 callback(Err(core::image::Error::Unsupported));
             }
             fn hint(&mut self, _: f32) {}
-            fn scale_factor(&self) -> Option<f32> { None }
+            fn scale_factor(&self) -> Option<f32> {
+                None
+            }
             fn reset(&mut self, _: core::Rectangle) {}
         }
         impl core::text::Renderer for TestRenderer {
@@ -4294,11 +4591,23 @@ mod tests {
             const SCROLL_LEFT_ICON: char = ' ';
             const SCROLL_RIGHT_ICON: char = ' ';
             const ICED_LOGO: char = ' ';
-            fn default_font(&self) -> core::Font { core::Font::DEFAULT }
-            fn default_size(&self) -> core::Pixels { core::Pixels(16.0) }
-            fn fill_paragraph(&mut self, _: &Self::Paragraph, _: Point, _: core::Color, _: Rectangle) {}
+            fn default_font(&self) -> core::Font {
+                core::Font::DEFAULT
+            }
+            fn default_size(&self) -> core::Pixels {
+                core::Pixels(16.0)
+            }
+            fn fill_paragraph(
+                &mut self,
+                _: &Self::Paragraph,
+                _: Point,
+                _: core::Color,
+                _: Rectangle,
+            ) {
+            }
             fn fill_editor(&mut self, _: &Self::Editor, _: Point, _: core::Color, _: Rectangle) {}
-            fn fill_text(&mut self, _: core::Text<String>, _: Point, _: core::Color, _: Rectangle) {}
+            fn fill_text(&mut self, _: core::Text<String>, _: Point, _: core::Color, _: Rectangle) {
+            }
         }
         struct Probe {
             overlay_events: Option<Rc<RefCell<Vec<Observed>>>>,
@@ -4310,52 +4619,113 @@ mod tests {
 
         impl core::Widget<Observed, iced::Theme, TestRenderer> for Probe {
             fn size(&self) -> core::Size<core::Length> {
-                core::Size::new(core::Length::Fixed(self.size.width), core::Length::Fixed(self.size.height))
+                core::Size::new(
+                    core::Length::Fixed(self.size.width),
+                    core::Length::Fixed(self.size.height),
+                )
             }
-            fn layout(&mut self, _tree: &mut core::widget::Tree, _renderer: &TestRenderer,
-                _limits: &core::layout::Limits) -> core::layout::Node {
+            fn layout(
+                &mut self,
+                _tree: &mut core::widget::Tree,
+                _renderer: &TestRenderer,
+                _limits: &core::layout::Limits,
+            ) -> core::layout::Node {
                 core::layout::Node::new(self.size)
             }
-            fn draw(&self, _tree: &core::widget::Tree, _renderer: &mut TestRenderer, _theme: &iced::Theme,
-                _style: &core::renderer::Style, _layout: core::Layout<'_>,
-                _cursor: core::mouse::Cursor, _viewport: &core::Rectangle) {}
-            fn update(&mut self, _tree: &mut core::widget::Tree, event: &core::Event,
-                layout: core::Layout<'_>, cursor: core::mouse::Cursor, _renderer: &TestRenderer,
-                shell: &mut core::Shell<'_, Observed>, _viewport: &core::Rectangle) {
+            fn draw(
+                &self,
+                _tree: &core::widget::Tree,
+                _renderer: &mut TestRenderer,
+                _theme: &iced::Theme,
+                _style: &core::renderer::Style,
+                _layout: core::Layout<'_>,
+                _cursor: core::mouse::Cursor,
+                _viewport: &core::Rectangle,
+            ) {
+            }
+            fn update(
+                &mut self,
+                _tree: &mut core::widget::Tree,
+                event: &core::Event,
+                layout: core::Layout<'_>,
+                cursor: core::mouse::Cursor,
+                _renderer: &TestRenderer,
+                shell: &mut core::Shell<'_, Observed>,
+                _viewport: &core::Rectangle,
+            ) {
                 shell.publish((event.clone(), cursor));
                 let publish = |gesture| {
                     self.gestures.borrow_mut().push(gesture);
                     shader::Action::<()>::capture()
                 };
-                let _ = self.viewport.update(event, layout.bounds(), cursor,
-                    surface_for_content_session(1), Placement::Contain, Some(&publish));
+                let _ = self.viewport.update(
+                    event,
+                    layout.bounds(),
+                    cursor,
+                    surface_for_content_session(1),
+                    Placement::Contain,
+                    Some(&publish),
+                );
             }
-            fn overlay<'a>(&'a mut self, _tree: &'a mut core::widget::Tree,
-                _layout: core::Layout<'a>, _renderer: &TestRenderer, _viewport: &core::Rectangle,
-                _translation: core::Vector) -> Option<core::overlay::Element<'a, Observed, iced::Theme, TestRenderer>> {
-                self.overlay_events.as_ref().map(|events| {
-                    core::overlay::Element::new(Box::new(ModalProbe(events.clone())))
-                })
+            fn overlay<'a>(
+                &'a mut self,
+                _tree: &'a mut core::widget::Tree,
+                _layout: core::Layout<'a>,
+                _renderer: &TestRenderer,
+                _viewport: &core::Rectangle,
+                _translation: core::Vector,
+            ) -> Option<core::overlay::Element<'a, Observed, iced::Theme, TestRenderer>>
+            {
+                self.overlay_events
+                    .as_ref()
+                    .map(|events| core::overlay::Element::new(Box::new(ModalProbe(events.clone()))))
             }
         }
         impl core::Overlay<Observed, iced::Theme, TestRenderer> for ModalProbe {
-            fn layout(&mut self, _renderer: &TestRenderer, _bounds: core::Size) -> core::layout::Node {
+            fn layout(
+                &mut self,
+                _renderer: &TestRenderer,
+                _bounds: core::Size,
+            ) -> core::layout::Node {
                 core::layout::Node::new(core::Size::new(50.0, 100.0))
             }
-            fn draw(&self, _renderer: &mut TestRenderer, _theme: &iced::Theme, _style: &core::renderer::Style,
-                _layout: core::Layout<'_>, _cursor: core::mouse::Cursor) {}
-            fn update(&mut self, event: &core::Event, layout: core::Layout<'_>,
-                cursor: core::mouse::Cursor, _renderer: &TestRenderer, shell: &mut core::Shell<'_, Observed>) {
+            fn draw(
+                &self,
+                _renderer: &mut TestRenderer,
+                _theme: &iced::Theme,
+                _style: &core::renderer::Style,
+                _layout: core::Layout<'_>,
+                _cursor: core::mouse::Cursor,
+            ) {
+            }
+            fn update(
+                &mut self,
+                event: &core::Event,
+                layout: core::Layout<'_>,
+                cursor: core::mouse::Cursor,
+                _renderer: &TestRenderer,
+                shell: &mut core::Shell<'_, Observed>,
+            ) {
                 self.0.borrow_mut().push((event.clone(), cursor));
-                if matches!(event, core::Event::Mouse(core::mouse::Event::ButtonPressed(_)))
-                    && cursor.is_over(layout.bounds()) {
+                if matches!(
+                    event,
+                    core::Event::Mouse(core::mouse::Event::ButtonPressed(_))
+                ) && cursor.is_over(layout.bounds())
+                {
                     shell.capture_event();
                 }
             }
-            fn mouse_interaction(&self, layout: core::Layout<'_>, cursor: core::mouse::Cursor,
-                _renderer: &TestRenderer) -> core::mouse::Interaction {
-                if cursor.is_over(layout.bounds()) { core::mouse::Interaction::Pointer }
-                else { core::mouse::Interaction::None }
+            fn mouse_interaction(
+                &self,
+                layout: core::Layout<'_>,
+                cursor: core::mouse::Cursor,
+                _renderer: &TestRenderer,
+            ) -> core::mouse::Interaction {
+                if cursor.is_over(layout.bounds()) {
+                    core::mouse::Interaction::Pointer
+                } else {
+                    core::mouse::Interaction::None
+                }
             }
         }
 
@@ -4365,12 +4735,30 @@ mod tests {
         let second_cursor = mouse::Cursor::Available(second);
         let unavailable = mouse::Cursor::Unavailable;
         let events = vec![
-            (Event::Mouse(mouse::Event::CursorMoved { position: first }), first_cursor),
-            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), first_cursor),
-            (Event::Mouse(mouse::Event::CursorMoved { position: second }), second_cursor),
-            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), second_cursor),
-            (Event::Mouse(mouse::Event::CursorMoved { position: first }), unavailable),
-            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), unavailable),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: first }),
+                first_cursor,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                first_cursor,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: second }),
+                second_cursor,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                second_cursor,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: first }),
+                unavailable,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                unavailable,
+            ),
         ];
         for modal in [false, true] {
             let observed_overlay = Rc::new(RefCell::new(Vec::new()));
@@ -4381,20 +4769,44 @@ mod tests {
                 gestures: Rc::default(),
             });
             let mut renderer = TestRenderer;
-            let mut ui = iced_runtime::UserInterface::build(root, core::Size::new(100.0, 100.0),
-                iced_runtime::user_interface::Cache::default(), &mut renderer);
+            let mut ui = iced_runtime::UserInterface::build(
+                root,
+                core::Size::new(100.0, 100.0),
+                iced_runtime::user_interface::Cache::default(),
+                &mut renderer,
+            );
             let mut observed_base = Vec::new();
-            let (_, statuses) = ui.update(&core::window::Headless, &core::shell::Waker::noop(),
-                &events, second_cursor, &mut renderer, &mut observed_base);
+            let (_, statuses) = ui.update(
+                &core::window::Headless,
+                &core::shell::Waker::noop(),
+                &events,
+                second_cursor,
+                &mut renderer,
+                &mut observed_base,
+            );
             if modal {
                 assert_eq!(*observed_overlay.borrow(), events);
-                assert_eq!(observed_base, vec![
-                    (events[0].0.clone(), unavailable),
-                    events[2].clone(), events[3].clone(), events[4].clone(), events[5].clone(),
-                ]);
-                assert_eq!(statuses, vec![core::event::Status::Ignored, core::event::Status::Captured,
-                    core::event::Status::Ignored, core::event::Status::Ignored,
-                    core::event::Status::Ignored, core::event::Status::Ignored]);
+                assert_eq!(
+                    observed_base,
+                    vec![
+                        (events[0].0.clone(), unavailable),
+                        events[2].clone(),
+                        events[3].clone(),
+                        events[4].clone(),
+                        events[5].clone(),
+                    ]
+                );
+                assert_eq!(
+                    statuses,
+                    vec![
+                        core::event::Status::Ignored,
+                        core::event::Status::Captured,
+                        core::event::Status::Ignored,
+                        core::event::Status::Ignored,
+                        core::event::Status::Ignored,
+                        core::event::Status::Ignored
+                    ]
+                );
             } else {
                 assert_eq!(observed_base, events);
                 assert_eq!(statuses, vec![core::event::Status::Ignored; events.len()]);
@@ -4410,34 +4822,66 @@ mod tests {
                     gestures: gestures.clone(),
                 });
                 let inner = iced::widget::scrollable(probe).id("inner").height(300.0);
-                let content = iced::widget::column![
-                    iced::widget::space::vertical().height(200.0),
-                    inner,
-                ].spacing(0);
+                let content =
+                    iced::widget::column![iced::widget::space::vertical().height(200.0), inner,]
+                        .spacing(0);
                 let root = iced::widget::scrollable(content).id("outer").height(100.0);
                 let mut renderer = TestRenderer;
-                let mut ui = iced_runtime::UserInterface::build(root, core::Size::new(640.0, 100.0),
-                    iced_runtime::user_interface::Cache::default(), &mut renderer);
+                let mut ui = iced_runtime::UserInterface::build(
+                    root,
+                    core::Size::new(640.0, 100.0),
+                    iced_runtime::user_interface::Cache::default(),
+                    &mut renderer,
+                );
                 for (id, y) in [("outer", outer_scroll), ("inner", inner_scroll)] {
-                    ui.operate(&renderer, &mut core::widget::operation::scrollable::scroll_to::<()>(
-                        core::widget::Id::new(id),
-                        core::widget::operation::scrollable::AbsoluteOffset { x: None, y: Some(y) },
-                    ));
+                    ui.operate(
+                        &renderer,
+                        &mut core::widget::operation::scrollable::scroll_to::<()>(
+                            core::widget::Id::new(id),
+                            core::widget::operation::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(y),
+                            },
+                        ),
+                    );
                 }
                 let mut observed = Vec::new();
-                let _ = ui.update(&core::window::Headless, &core::shell::Waker::noop(),
-                    &events, second_cursor, &mut renderer, &mut observed);
+                let _ = ui.update(
+                    &core::window::Headless,
+                    &core::shell::Waker::noop(),
+                    &events,
+                    second_cursor,
+                    &mut renderer,
+                    &mut observed,
+                );
                 // Scrollable rounds each physical translation independently;
                 // the event's remaining fractional coordinates stay untouched.
-                let translation = core::Vector::new(0.0, outer_scroll.round() + inner_scroll.round());
+                let translation =
+                    core::Vector::new(0.0, outer_scroll.round() + inner_scroll.round());
                 let expected_events = if modal {
-                    vec![(events[0].0.clone(), unavailable), events[2].clone(),
-                        events[3].clone(), events[4].clone(), events[5].clone()]
-                } else { events.clone() };
-                assert_eq!(observed, expected_events.into_iter()
-                    .map(|(event, cursor)| (event, cursor + translation)).collect::<Vec<_>>());
+                    vec![
+                        (events[0].0.clone(), unavailable),
+                        events[2].clone(),
+                        events[3].clone(),
+                        events[4].clone(),
+                        events[5].clone(),
+                    ]
+                } else {
+                    events.clone()
+                };
+                assert_eq!(
+                    observed,
+                    expected_events
+                        .into_iter()
+                        .map(|(event, cursor)| (event, cursor + translation))
+                        .collect::<Vec<_>>()
+                );
                 let gestures = gestures.borrow();
-                let expected = if modal { vec![second] } else { vec![first, first, second, second] };
+                let expected = if modal {
+                    vec![second]
+                } else {
+                    vec![first, first, second, second]
+                };
                 assert_eq!(gestures.len(), expected.len());
                 for (gesture, raw) in gestures.iter().zip(expected) {
                     assert_eq!(gesture.sample.content_x, raw.x);
@@ -4460,12 +4904,31 @@ mod tests {
         let first = Point::new(10.25, 20.5);
         let second = Point::new(30.75, 40.125);
         for (event, position) in [
-            (Event::Mouse(mouse::Event::CursorMoved { position: first }), first),
-            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), first),
-            (Event::Mouse(mouse::Event::CursorMoved { position: second }), second),
-            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), second),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: first }),
+                first,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                first,
+            ),
+            (
+                Event::Mouse(mouse::Event::CursorMoved { position: second }),
+                second,
+            ),
+            (
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                second,
+            ),
         ] {
-            let _ = viewport.update(&event, bounds, mouse::Cursor::Available(position), surface, Placement::Contain, Some(&publish));
+            let _ = viewport.update(
+                &event,
+                bounds,
+                mouse::Cursor::Available(position),
+                surface,
+                Placement::Contain,
+                Some(&publish),
+            );
         }
         let gestures = captured.borrow();
         assert_eq!(gestures.len(), 4);
@@ -4477,28 +4940,69 @@ mod tests {
         assert!(!gestures[3].sample.pressed);
         drop(gestures);
         captured.borrow_mut().clear();
-        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), bounds,
-            mouse::Cursor::Unavailable, surface, Placement::Contain, Some(&publish));
+        let _ = viewport.update(
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            bounds,
+            mouse::Cursor::Unavailable,
+            surface,
+            Placement::Contain,
+            Some(&publish),
+        );
         assert!(captured.borrow().is_empty());
         assert!(!viewport.pointer_active);
         for cursor in [mouse::Cursor::Unavailable, mouse::Cursor::Levitating(first)] {
-            let _ = viewport.update(&Event::Mouse(mouse::Event::CursorMoved { position: first }),
-                bounds, cursor, surface, Placement::Contain, Some(&publish));
+            let _ = viewport.update(
+                &Event::Mouse(mouse::Event::CursorMoved { position: first }),
+                bounds,
+                cursor,
+                surface,
+                Placement::Contain,
+                Some(&publish),
+            );
             assert!(captured.borrow().is_empty());
         }
 
-        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
-            bounds, mouse::Cursor::Available(first), surface, Placement::Contain, Some(&publish));
+        let _ = viewport.update(
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+            bounds,
+            mouse::Cursor::Available(first),
+            surface,
+            Placement::Contain,
+            Some(&publish),
+        );
         let raw_window_position = Point::new(1.0, 2.0);
-        let motion = Event::Mouse(mouse::Event::CursorMoved { position: raw_window_position });
-        let _ = viewport.update(&motion, bounds, mouse::Cursor::Levitating(second),
-            surface, Placement::Contain, Some(&publish));
+        let motion = Event::Mouse(mouse::Event::CursorMoved {
+            position: raw_window_position,
+        });
+        let _ = viewport.update(
+            &motion,
+            bounds,
+            mouse::Cursor::Levitating(second),
+            surface,
+            Placement::Contain,
+            Some(&publish),
+        );
         assert_eq!(viewport.pan_origin, Some(first));
-        let _ = viewport.update(&motion, bounds, mouse::Cursor::Available(second),
-            surface, Placement::Contain, Some(&publish));
-        assert_eq!((viewport.pan_x, viewport.pan_y), (second.x - first.x, second.y - first.y));
-        let _ = viewport.update(&Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-            bounds, mouse::Cursor::Unavailable, surface, Placement::Contain, Some(&publish));
+        let _ = viewport.update(
+            &motion,
+            bounds,
+            mouse::Cursor::Available(second),
+            surface,
+            Placement::Contain,
+            Some(&publish),
+        );
+        assert_eq!(
+            (viewport.pan_x, viewport.pan_y),
+            (second.x - first.x, second.y - first.y)
+        );
+        let _ = viewport.update(
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            bounds,
+            mouse::Cursor::Unavailable,
+            surface,
+            Placement::Contain,
+            Some(&publish),
+        );
         assert!(viewport.pan_origin.is_none());
     }
 
@@ -4774,7 +5278,8 @@ mod tests {
                         geometry.y + geometry.height - 0.001,
                     ),
                     content,
-                ).unwrap();
+                )
+                .unwrap();
                 assert!(edge.0 > (content.0 - 1) as f32 && edge.0 <= content.0 as f32);
                 assert!(edge.1 > (content.1 - 1) as f32 && edge.1 <= content.1 as f32);
             }
@@ -4909,7 +5414,9 @@ mod tests {
             assert!(key.image_origin[1] < 0.0);
             let uv_y = (visible.y - key.image_origin[1]) / key.draw_extent[1];
             assert!((uv_y - 37.25 / 750.0).abs() < 0.00001);
-            let point = inverse_content_point(geometry, Point::new(visible.x, visible.y), (400, 500)).unwrap();
+            let point =
+                inverse_content_point(geometry, Point::new(visible.x, visible.y), (400, 500))
+                    .unwrap();
             assert_eq!(point.0, 0.0);
             assert!((point.1 - 37.25 / 1.5).abs() < 0.0001);
             assert!(

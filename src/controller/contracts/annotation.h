@@ -234,8 +234,7 @@ struct AnnotationTargetIdentity final {
 };
 struct AnnotationObjectIdentity final {
     std::uint64_t object = 0U;
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        std::vector<std::uint64_t> elements{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<std::uint64_t> elements{};
     auto operator<=>(const AnnotationObjectIdentity&) const = default;
 };
 
@@ -333,31 +332,28 @@ struct AnnotationObjectGeometry final {
     decltype(AnnotationObject::box) box{};
     decltype(AnnotationObject::point) point{};
     decltype(AnnotationObject::mask) mask{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        decltype(AnnotationObject::spline_knots) spline_knots{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] decltype(AnnotationObject::spline_knots) spline_knots{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
     decltype(AnnotationObject::enabled) enabled = true;
     auto operator<=>(const AnnotationObjectGeometry&) const = default;
 };
 
 // Only the selected object exposes spline handles. The scene retains all body
 // hits; compact rendered facts supply the exact selected and preview geometry.
-struct AnnotationGeometryShape final { AnnotationShape shape; };
+struct AnnotationGeometryShape final {
+    AnnotationShape shape;
+};
 struct AnnotationObjectBody final {
     decltype(AnnotationObject::shape) shape{};
-    [[= AnnotationGeometryShape{AnnotationShape::Box}]]
-        std::optional<decltype(AnnotationObject::box)> box{};
-    [[= AnnotationGeometryShape{AnnotationShape::Point}]]
-        std::optional<decltype(AnnotationObject::point)> point{};
-    [[= AnnotationGeometryShape{AnnotationShape::Mask}]]
-        std::optional<decltype(AnnotationObject::mask)> mask{};
+    [[= AnnotationGeometryShape{AnnotationShape::Box}]] std::optional<decltype(AnnotationObject::box)> box{};
+    [[= AnnotationGeometryShape{AnnotationShape::Point}]] std::optional<decltype(AnnotationObject::point)> point{};
+    [[= AnnotationGeometryShape{AnnotationShape::Mask}]] std::optional<decltype(AnnotationObject::mask)> mask{};
     [[= AnnotationGeometryShape{AnnotationShape::Spline}]]
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        std::vector<AnnotationSplineBody> spline_knots{};
+        [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSplineBody>
+            spline_knots{};
     [[= AnnotationGeometryShape{AnnotationShape::Skeleton}]]
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
+        [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry>
+            skeleton_nodes{};
     decltype(AnnotationObject::enabled) enabled = true;
     auto operator<=>(const AnnotationObjectBody&) const = default;
 };
@@ -366,17 +362,14 @@ struct AnnotationSelectedGeometry final {
     decltype(AnnotationObject::shape) shape{};
     decltype(AnnotationObject::box) box{};
     decltype(AnnotationObject::point) point{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        decltype(AnnotationObject::spline_knots) spline_knots{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]]
-        std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] decltype(AnnotationObject::spline_knots) spline_knots{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
     auto operator<=>(const AnnotationSelectedGeometry&) const = default;
 };
 
 struct AnnotationSceneGeometry final {
     decltype(AnnotationSceneContent::document) document{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationObjectCapacity}]]
-        std::vector<AnnotationObjectBody> objects{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationObjectCapacity}]] std::vector<AnnotationObjectBody> objects{};
     decltype(AnnotationSceneContent::frame_width) frame_width = 0U;
     decltype(AnnotationSceneContent::frame_height) frame_height = 0U;
     auto operator<=>(const AnnotationSceneGeometry&) const = default;
@@ -422,9 +415,12 @@ void project_annotation_geometry(Destination& destination, const Source& source)
             }
         };
         if constexpr (shape.has_value()) {
-            if (source.shape == *shape) assign();
-            else output = {};
-        } else assign();
+            if (source.shape == *shape)
+                assign();
+            else
+                output = {};
+        } else
+            assign();
     }
 }
 

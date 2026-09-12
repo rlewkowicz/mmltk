@@ -150,20 +150,26 @@ fn local_gestures(
     state: &super::state::State,
     snapshot: Option<&crate::generated::ExploreSnapshot>,
     columns: u32,
-) -> std::sync::Arc<dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync> {
+) -> std::sync::Arc<
+    dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync,
+> {
     let hover = state.gallery_hover.clone();
     let current = super::state::GallerySource::current(snapshot);
     let focus_ready = snapshot.is_some_and(|snapshot| {
-        state.measured_layout_request(Some(snapshot), columns, snapshot.order.matchingcount).is_some()
+        state
+            .measured_layout_request(Some(snapshot), columns, snapshot.order.matchingcount)
+            .is_some()
     });
     std::sync::Arc::new(move |gesture| {
         let shown = crate::presentation_surface::gallery::displayed();
-        hover.capture(
-            current.as_ref(),
-            shown.as_ref().map(|(_, snapshot)| snapshot.as_ref()),
-            gesture,
-            focus_ready,
-        ).map(Message::Surface)
+        hover
+            .capture(
+                current.as_ref(),
+                shown.as_ref().map(|(_, snapshot)| snapshot.as_ref()),
+                gesture,
+                focus_ready,
+            )
+            .map(Message::Surface)
     })
 }
 

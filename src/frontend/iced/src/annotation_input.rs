@@ -296,7 +296,11 @@ impl AnnotationInput {
             }
             self.batch.documentepoch = self.samples[self.sent_samples].document_epoch;
             self.batch.samples.clear();
-            let mut prior = if self.encoded_document_epoch == self.batch.documentepoch { self.encoded_pointer.clone() } else { None };
+            let mut prior = if self.encoded_document_epoch == self.batch.documentepoch {
+                self.encoded_pointer.clone()
+            } else {
+                None
+            };
             let count = available.min(generated::ANNOTATION_INPUT_BATCH_CAPACITY as u64) as usize;
             for sample in self
                 .samples
@@ -305,8 +309,14 @@ impl AnnotationInput {
                 if sample.document_epoch != self.batch.documentepoch {
                     break;
                 }
-                self.batch.samples.push(compact_sample(&sample.pointer, prior.as_ref()));
-                prior = if matches!(sample.pointer.phase, generated::AnnotationPointerPhase::End | generated::AnnotationPointerPhase::Cancel) {
+                self.batch
+                    .samples
+                    .push(compact_sample(&sample.pointer, prior.as_ref()));
+                prior = if matches!(
+                    sample.pointer.phase,
+                    generated::AnnotationPointerPhase::End
+                        | generated::AnnotationPointerPhase::Cancel
+                ) {
                     None
                 } else {
                     Some(sample.pointer.clone())
@@ -335,18 +345,27 @@ impl AnnotationInput {
 
 // A delta is used only when reconstruction is bit-exact and all retained
 // metadata is unchanged. Absolute samples are also ordered parameter changes.
-pub(crate) fn compact_sample(pointer: &AnnotationPointer, prior: Option<&AnnotationPointer>) -> generated::AnnotationPointerOrAnnotationPointVariant {
+pub(crate) fn compact_sample(
+    pointer: &AnnotationPointer,
+    prior: Option<&AnnotationPointer>,
+) -> generated::AnnotationPointerOrAnnotationPointVariant {
     use generated::AnnotationPointerOrAnnotationPointVariant as Sample;
     if let Some(prior) = prior.filter(|pointer| pointer.sequence != u64::MAX) {
-        let delta = generated::AnnotationPoint { x: pointer.point.x - prior.point.x, y: pointer.point.y - prior.point.y };
+        let delta = generated::AnnotationPoint {
+            x: pointer.point.x - prior.point.x,
+            y: pointer.point.y - prior.point.y,
+        };
         let mut reconstructed = prior.clone();
         reconstructed.phase = generated::AnnotationPointerPhase::Update;
         reconstructed.sequence = prior.sequence + 1;
         reconstructed.point.x += delta.x;
         reconstructed.point.y += delta.y;
-        if delta.x.is_finite() && delta.y.is_finite() && reconstructed == *pointer
+        if delta.x.is_finite()
+            && delta.y.is_finite()
+            && reconstructed == *pointer
             && reconstructed.point.x.to_bits() == pointer.point.x.to_bits()
-            && reconstructed.point.y.to_bits() == pointer.point.y.to_bits() {
+            && reconstructed.point.y.to_bits() == pointer.point.y.to_bits()
+        {
             return Sample::AnnotationPoint(delta);
         }
     }
@@ -356,14 +375,27 @@ pub(crate) fn compact_sample(pointer: &AnnotationPointer, prior: Option<&Annotat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use generated::{AnnotationPoint, AnnotationPointerPhase as Phase, AnnotationPointerOrAnnotationPointVariant as Wire};
+    use generated::{
+        AnnotationPoint, AnnotationPointerOrAnnotationPointVariant as Wire,
+        AnnotationPointerPhase as Phase,
+    };
 
     fn pointer() -> AnnotationPointer {
         AnnotationPointer {
-            phase: Phase::Begin, interactionid: 1, sequence: 1,
-            identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
-            target: generated::AnnotationPointerTarget { object: None, element: None, role: None },
-            point: AnnotationPoint { x: 1.25, y: 2.5 }, brushradius: 9,
+            phase: Phase::Begin,
+            interactionid: 1,
+            sequence: 1,
+            identity: crate::generated::AnnotationTargetIdentity {
+                object: 0,
+                element: 0,
+            },
+            target: generated::AnnotationPointerTarget {
+                object: None,
+                element: None,
+                role: None,
+            },
+            point: AnnotationPoint { x: 1.25, y: 2.5 },
+            brushradius: 9,
         }
     }
 
@@ -374,25 +406,73 @@ mod tests {
         next.phase = Phase::Update;
         next.sequence = 2;
         next.point = AnnotationPoint { x: 1.375, y: 2.25 };
-        assert_eq!(compact_sample(&next, Some(&prior)), Wire::AnnotationPoint(AnnotationPoint { x: 0.125, y: -0.25 }));
-        assert!(matches!(compact_sample(&next, None), Wire::AnnotationPointer(_)));
+        assert_eq!(
+            compact_sample(&next, Some(&prior)),
+            Wire::AnnotationPoint(AnnotationPoint { x: 0.125, y: -0.25 })
+        );
+        assert!(matches!(
+            compact_sample(&next, None),
+            Wire::AnnotationPointer(_)
+        ));
         for changed in [
-            AnnotationPointer { brushradius: 10, ..next.clone() },
-            AnnotationPointer { interactionid: 2, ..next.clone() },
-            AnnotationPointer { sequence: 3, ..next.clone() },
-            AnnotationPointer { phase: Phase::End, ..next.clone() },
-            AnnotationPointer { phase: Phase::Cancel, ..next.clone() },
-            AnnotationPointer { target: generated::AnnotationPointerTarget { object: Some(1), element: None, role: None }, ..next.clone() },
-            AnnotationPointer { identity: generated::AnnotationTargetIdentity { object: 7, element: 0 }, ..next.clone() },
+            AnnotationPointer {
+                brushradius: 10,
+                ..next.clone()
+            },
+            AnnotationPointer {
+                interactionid: 2,
+                ..next.clone()
+            },
+            AnnotationPointer {
+                sequence: 3,
+                ..next.clone()
+            },
+            AnnotationPointer {
+                phase: Phase::End,
+                ..next.clone()
+            },
+            AnnotationPointer {
+                phase: Phase::Cancel,
+                ..next.clone()
+            },
+            AnnotationPointer {
+                target: generated::AnnotationPointerTarget {
+                    object: Some(1),
+                    element: None,
+                    role: None,
+                },
+                ..next.clone()
+            },
+            AnnotationPointer {
+                identity: generated::AnnotationTargetIdentity {
+                    object: 7,
+                    element: 0,
+                },
+                ..next.clone()
+            },
         ] {
-            assert!(matches!(compact_sample(&changed, Some(&prior)), Wire::AnnotationPointer(value) if value == changed));
+            assert!(
+                matches!(compact_sample(&changed, Some(&prior)), Wire::AnnotationPointer(value) if value == changed)
+            );
         }
-        let large = AnnotationPointer { point: AnnotationPoint { x: 1.0e20, y: 2.5 }, ..prior.clone() };
+        let large = AnnotationPointer {
+            point: AnnotationPoint { x: 1.0e20, y: 2.5 },
+            ..prior.clone()
+        };
         next.point.x = 1.0;
-        assert!(matches!(compact_sample(&next, Some(&large)), Wire::AnnotationPointer(_)));
-        let zero = AnnotationPointer { point: AnnotationPoint { x: 0.0, y: 2.5 }, ..prior };
+        assert!(matches!(
+            compact_sample(&next, Some(&large)),
+            Wire::AnnotationPointer(_)
+        ));
+        let zero = AnnotationPointer {
+            point: AnnotationPoint { x: 0.0, y: 2.5 },
+            ..prior
+        };
         next.point.x = -0.0;
-        assert!(matches!(compact_sample(&next, Some(&zero)), Wire::AnnotationPointer(_)));
+        assert!(matches!(
+            compact_sample(&next, Some(&zero)),
+            Wire::AnnotationPointer(_)
+        ));
     }
 
     #[test]
@@ -403,9 +483,18 @@ mod tests {
         for index in 0..257 {
             let mut next = pointer();
             next.sequence = index + 1;
-            next.phase = if index == 0 { Phase::Begin } else if index == 256 { Phase::End } else { Phase::Update };
+            next.phase = if index == 0 {
+                Phase::Begin
+            } else if index == 256 {
+                Phase::End
+            } else {
+                Phase::Update
+            };
             let angle = index as f32 / 32.0;
-            next.point = AnnotationPoint { x: 100.0 + angle.cos() * 40.0, y: 100.0 + angle.sin() * 40.0 };
+            next.point = AnnotationPoint {
+                x: 100.0 + angle.cos() * 40.0,
+                y: 100.0 + angle.sin() * 40.0,
+            };
             next.brushradius = if index < 129 { 9 } else { 11 };
             let wire = compact_sample(&next, prior.as_ref());
             let restored = match wire {

@@ -150,10 +150,8 @@ std::expected<void, RecordCodecError> encode_client_record(const ClientRecord& r
         using CompactWire = mmltk::frameworks::serialization::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>;
         destination.resize(CompactWire::EncodedCapacity(interaction->value.size()));
         mmltk::frameworks::serialization::FixedCborEncoder writer(destination);
-        const CompactWire compact{
-            CompactInteraction{.opcode = *opcode}, {.first = interaction->value}};
-        if (!compact.EncodeCompact(writer))
-            return failure(wire::ErrorCode::LimitExceeded);
+        const CompactWire compact{CompactInteraction{.opcode = *opcode}, {.first = interaction->value}};
+        if (!compact.EncodeCompact(writer)) return failure(wire::ErrorCode::LimitExceeded);
         destination.resize(writer.size());
         return {};
     }

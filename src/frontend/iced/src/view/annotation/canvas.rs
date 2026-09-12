@@ -96,7 +96,9 @@ fn target_geometry<'a>(
         }
     }
     for index in (0..count).rev() {
-        let Some(object) = object_at(index) else { continue; };
+        let Some(object) = object_at(index) else {
+            continue;
+        };
         if !object.enabled {
             continue;
         }
@@ -107,9 +109,11 @@ fn target_geometry<'a>(
                     && y >= bounds.first.y - 3.0
                     && y <= bounds.second.y + 3.0
             }),
-            Shape::Mask => object.mask.as_ref().is_some_and(|mask| mask.runs.iter().any(|run| {
-                run.row == y as u16 && x >= run.first as f32 && x < run.last as f32 + 1.0
-            })),
+            Shape::Mask => object.mask.as_ref().is_some_and(|mask| {
+                mask.runs.iter().any(|run| {
+                    run.row == y as u16 && x >= run.first as f32 && x < run.last as f32 + 1.0
+                })
+            }),
             Shape::Point => object.point.as_ref().is_some_and(near),
             Shape::Spline => object.splineknots.iter().any(|knot| near(&knot.point)),
             Shape::Skeleton => object
@@ -131,11 +135,22 @@ fn target_geometry<'a>(
 #[cfg(test)]
 pub(super) fn target(state: &crate::generated::AnnotationUiState, x: f32, y: f32) -> Target {
     let scene = crate::generated::AnnotationSceneGeometry::from(&state.scene);
-    let selected = state.editor.selectedobject
-        .and_then(|index| state.scene.objects.get(index as usize).map(|object|
-            (index, crate::generated::AnnotationSelectedGeometry::from(object))));
-    target_geometry(|index| scene.objects.get(index), scene.objects.len(), state.editor.tool,
-        selected.as_ref().map(|(index, object)| (*index, object)), x, y)
+    let selected = state.editor.selectedobject.and_then(|index| {
+        state.scene.objects.get(index as usize).map(|object| {
+            (
+                index,
+                crate::generated::AnnotationSelectedGeometry::from(object),
+            )
+        })
+    });
+    target_geometry(
+        |index| scene.objects.get(index),
+        scene.objects.len(),
+        state.editor.tool,
+        selected.as_ref().map(|(index, object)| (*index, object)),
+        x,
+        y,
+    )
 }
 
 struct GestureState {
@@ -153,7 +168,10 @@ impl Default for GestureState {
             pointer_interaction: 0,
             pointer_sequence: 0,
             gesture_target: None,
-            gesture_identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
+            gesture_identity: crate::generated::AnnotationTargetIdentity {
+                object: 0,
+                element: 0,
+            },
             last_pointer: AnnotationPoint { x: 0.0, y: 0.0 },
         }
     }
@@ -286,7 +304,10 @@ pub(super) struct Component {
 }
 impl Component {
     #[cfg(test)]
-    pub(super) fn test_install_displayed(&self, content: crate::presentation_surface::AnnotationContent) {
+    pub(super) fn test_install_displayed(
+        &self,
+        content: crate::presentation_surface::AnnotationContent,
+    ) {
         let mut retained = self.retained.lock().expect("annotation canvas");
         retained.available = true;
         retained.input = Some(InputState {
@@ -322,26 +343,45 @@ impl Component {
         gesture: crate::presentation_surface::SurfaceGesture,
     ) -> Option<crate::generated::AnnotationPointer> {
         let mut retained = self.retained.lock().expect("annotation canvas");
-        let Retained { gesture: lifecycle, input, available, .. } = &mut *retained;
-        if !*available { lifecycle.clear_pointer_lifecycle(); return None; }
+        let Retained {
+            gesture: lifecycle,
+            input,
+            available,
+            ..
+        } = &mut *retained;
+        if !*available {
+            lifecycle.clear_pointer_lifecycle();
+            return None;
+        }
         let input = input.as_ref()?;
         if input.input_document_epoch != document_epoch {
             lifecycle.clear_pointer_lifecycle();
             return None;
         }
-        lifecycle.pointer_from_gesture(|x, y| {
-            let target = target_geometry(
-                |index| input.content.object(index), input.content.object_count(), tool,
-                input.content.selected(), x, y);
-            let identity = input.content.target_identity(&target)?;
-            Some((target, identity))
-        }, gesture)
+        lifecycle.pointer_from_gesture(
+            |x, y| {
+                let target = target_geometry(
+                    |index| input.content.object(index),
+                    input.content.object_count(),
+                    tool,
+                    input.content.selected(),
+                    x,
+                    y,
+                );
+                let identity = input.content.target_identity(&target)?;
+                Some((target, identity))
+            },
+            gesture,
+        )
     }
     pub fn dispatch(
         &self,
         model: &crate::view_model::ApplicationModel,
         radius: u16,
-        drawable: impl Fn() -> Option<crate::presentation_surface::AnnotationContent> + Send + Sync + 'static,
+        drawable: impl Fn() -> Option<crate::presentation_surface::AnnotationContent>
+        + Send
+        + Sync
+        + 'static,
         keyboard: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::sync::Arc<
         dyn Fn(crate::presentation_surface::SurfaceGesture) -> Option<super::Message> + Send + Sync,
@@ -350,24 +390,36 @@ impl Component {
             let mut retained = self.retained.lock().expect("annotation canvas");
             let drawable = drawable();
             retained.available = model.annotation_edit_available()
-                && drawable.as_ref().is_some_and(|content| model.annotation.snapshot.as_ref()
-                    .is_some_and(|snapshot| snapshot.inputdocumentepoch == content.rendered.documentepoch));
+                && drawable.as_ref().is_some_and(|content| {
+                    model.annotation.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.inputdocumentepoch == content.rendered.documentepoch
+                    })
+                });
             if let Some(content) = drawable {
-                if retained.input.as_ref().is_some_and(|input|
-                    input.input_document_epoch != content.rendered.documentepoch) {
+                if retained.input.as_ref().is_some_and(|input| {
+                    input.input_document_epoch != content.rendered.documentepoch
+                }) {
                     retained.gesture.clear_pointer_lifecycle();
                 }
                 retained.input = Some(InputState {
                     input_document_epoch: content.rendered.documentepoch,
                     content,
                 });
-            } else { retained.input = None; }
+            } else {
+                retained.input = None;
+            }
             retained.radius = radius;
-            retained.tool = model.annotation.snapshot.as_ref().map(|snapshot| snapshot.ui.editor.tool);
+            retained.tool = model
+                .annotation
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.ui.editor.tool);
         }
         let owner = self.retained.clone();
         std::sync::Arc::new(move |gesture| {
-            if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport { return None; }
+            if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Viewport {
+                return None;
+            }
             let mut retained = owner.lock().expect("annotation canvas");
             if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
                 keyboard.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -391,13 +443,21 @@ impl Component {
                 return None;
             }
             let tool = (*tool)?;
-            let mut pointer = lifecycle.pointer_from_gesture(|x, y| {
-                let target = target_geometry(
-                    |index| displayed.object(index), displayed.object_count(), tool,
-                    displayed.selected(), x, y);
-                let identity = displayed.target_identity(&target)?;
-                Some((target, identity))
-            }, gesture)?;
+            let mut pointer = lifecycle.pointer_from_gesture(
+                |x, y| {
+                    let target = target_geometry(
+                        |index| displayed.object(index),
+                        displayed.object_count(),
+                        tool,
+                        displayed.selected(),
+                        x,
+                        y,
+                    );
+                    let identity = displayed.target_identity(&target)?;
+                    Some((target, identity))
+                },
+                gesture,
+            )?;
             pointer.brushradius = *radius;
             let result = connection
                 .as_mut()

@@ -2500,17 +2500,28 @@ run_gui_build() {
     release_mutation_locks
 }
 
-run_gui_lock_update() {
+run_dependency_lock_update() {
+    local owner="$1"
     acquire_mutation_locks
     ensure_docker
     prepare_cache_layout
     ensure_build_image
-    if (( ! gui_diagnostics_quiet )); then log "updating iced dependency lock for the native browser test graph"; fi
-    run_owned_toolchain_command "${gui_build_container_name}" \
-        'set -euo pipefail
-         cargo fetch \
-             --manifest-path /workspace/src/frontend/iced/Cargo.toml \
-             --target x86_64-unknown-linux-gnu'
+    if [[ "${owner}" == "firefox" ]]; then
+        log "refreshing the Firefox dependency lock from vendored sources"
+        run_owned_toolchain_command "${release_build_container_name}-lock" \
+            'set -euo pipefail
+             cd /workspace/third_party/firefox
+             cargo --config .cargo/config.toml.in metadata \
+                 --manifest-path Cargo.toml --offline \
+                 --format-version 1 >/dev/null'
+    else
+        if (( ! gui_diagnostics_quiet )); then log "updating iced dependency lock for the native browser test graph"; fi
+        run_owned_toolchain_command "${gui_build_container_name}" \
+            'set -euo pipefail
+             cargo fetch \
+                 --manifest-path /workspace/src/frontend/iced/Cargo.toml \
+                 --target x86_64-unknown-linux-gnu'
+    fi
     release_mutation_locks
 }
 
@@ -3414,6 +3425,7 @@ export_shiftlut_mode=0
 shiftlut_source=""
 shiftlut_operation=""
 update_gui_lock_mode=0
+update_firefox_lock_mode=0
 tidy_mode=0
 tidy_third_party=0
 prepare_gui_container_mode=0
@@ -3461,6 +3473,10 @@ for arg in "$@"; do
     fi
     if [[ "${arg}" == "--update-gui-lock" ]]; then
         update_gui_lock_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--update-firefox-lock" ]]; then
+        update_firefox_lock_mode=1
         continue
     fi
     if [[ "${arg}" == "--prepare-gui-container" ]]; then
@@ -3623,9 +3639,9 @@ if (( test_mode )) && [[ "${test_suite}" == "tsan" ]] && (( build_jobs > 8 )); t
 fi
 
 if (( build_mode + build_gui_mode + generate_protocol_mode + generate_application_bindings_mode + export_shiftlut_mode +
-      update_gui_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode > 1 ||
-      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || export_shiftlut_mode) && gui_mode )); then
-    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
+      update_gui_lock_mode + update_firefox_lock_mode + tidy_mode + test_mode + cleanup_report_mode + diagnose_io_mode + diagnose_nvidia_mode > 1 ||
+      (build_mode || tidy_mode || test_mode || cleanup_report_mode || diagnose_io_mode || diagnose_nvidia_mode || export_shiftlut_mode || update_firefox_lock_mode) && gui_mode )); then
+    die "--build, --build-gui, --generate-protocol, --generate-application-bindings, --export-shiftlut, --update-gui-lock, --update-firefox-lock, --test, --tidy, --cleanup-report, --diagnose-io, and --diagnose-nvidia-payload are standalone"
 fi
 
 if (( export_shiftlut_mode )); then
@@ -3701,12 +3717,14 @@ if (( generate_application_bindings_mode )); then
     exit $?
 fi
 
-if (( update_gui_lock_mode )); then
+if (( update_gui_lock_mode || update_firefox_lock_mode )); then
+    lock_owner="gui"
+    if (( update_firefox_lock_mode )); then lock_owner="firefox"; fi
     if ((${#passthrough_args[@]} > 0)); then
-        die "--update-gui-lock does not accept application arguments"
+        die "--update-${lock_owner}-lock does not accept application arguments"
     fi
-    invocation_mode="update-gui-lock"
-    run_gui_lock_update
+    invocation_mode="update-${lock_owner}-lock"
+    run_dependency_lock_update "${lock_owner}"
     exit $?
 fi
 

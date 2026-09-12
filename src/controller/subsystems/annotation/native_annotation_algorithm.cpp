@@ -33,7 +33,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop) override {
         crop_ = crop;
         source_ = source;
-        for (auto& geometry : geometry_) geometry.scene_revision = 0U;
+        for (auto& geometry : geometry_)
+            geometry.scene_revision = 0U;
     }
     Release ReleaseResources() noexcept override {
         if (mask_upload_ != nullptr) {
@@ -51,10 +52,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     [[nodiscard]] domain::AnnotationColor Sample(const domain::AnnotationPoint point) override {
         if (!sample_host_) sample_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         sample_host_->ensure_bytes(4);
-        const auto x =
-            std::min(static_cast<unsigned>(point.x), (crop_.valid() ? crop_.width : source_.descriptor.width) - 1) + crop_.x;
-        const auto y =
-            std::min(static_cast<unsigned>(point.y), (crop_.valid() ? crop_.height : source_.descriptor.height) - 1) + crop_.y;
+        const auto x = std::min(static_cast<unsigned>(point.x), (crop_.valid() ? crop_.width : source_.descriptor.width) - 1) + crop_.x;
+        const auto y = std::min(static_cast<unsigned>(point.y), (crop_.valid() ? crop_.height : source_.descriptor.height) - 1) + crop_.y;
         if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4,
                        cudaMemcpyDeviceToHost) != cudaSuccess)
             throw std::runtime_error("Annotation color sample failed");
@@ -75,8 +74,9 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     }
 
    private:
-    void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
-                const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream_value) const override {
+    void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source,
+                const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                const std::uintptr_t stream_value) const override {
         auto stream = reinterpret_cast<cudaStream_t>(stream_value);
         cudaError_t status =
             source.valid()

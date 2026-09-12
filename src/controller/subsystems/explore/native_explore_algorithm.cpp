@@ -283,8 +283,7 @@ class ExploreAcceptanceGate::Impl final {
                 } else if (command == 4U) {
                     release_held_ = true;
                 } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) ||
-                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
-                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseSample)) &&
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion)) &&
                            completion_command_) {
                     completion = completion_command_;
                 } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U &&

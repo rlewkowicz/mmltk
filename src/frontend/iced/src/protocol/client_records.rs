@@ -137,9 +137,5 @@ pub fn encode_interaction_bytes(
     payload: &[u8],
     output: &mut Vec<u8>,
 ) -> Result<(), super::ProtocolError> {
-    crate::generated::encode_interaction_record(
-        endpoint,
-        payload,
-        output,
-    )
+    crate::generated::encode_interaction_record(endpoint, payload, output)
 }

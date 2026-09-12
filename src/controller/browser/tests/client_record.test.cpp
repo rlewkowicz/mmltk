@@ -350,7 +350,8 @@ TEST_CASE("Rust Protocol-16 client fixtures are accepted by native codec", "[con
     unknown[1] = std::byte{0x17};
     CHECK_FALSE(decode_interaction_view(unknown));
     CHECK_FALSE(decode_client_record({.first = unknown}));
-    REQUIRE(mmltk::frameworks::serialization::encode(ClientRecord{interaction}, projected,
+    REQUIRE(mmltk::frameworks::serialization::encode(
+        ClientRecord{interaction}, projected,
         {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
     CHECK_FALSE(decode_interaction_view(projected));
     CHECK_FALSE(decode_client_record({.first = projected}));
@@ -745,12 +746,16 @@ TEST_CASE("compact sample alternatives retain exact fractional values and reject
     using namespace mmltk::controller::browser;
     namespace cbor = mmltk::frameworks::serialization;
     constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
-    const AnnotationPointer absolute{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 9U, .sequence = 1U,
-                                     .point = {1.25F, 2.5F}};
-    const AnnotationInputBatch source{.document_epoch = 3U, .sequence = 1U,
-        .samples = {absolute, contracts::AnnotationPoint{0.125F, -0.25F},
-                    AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 9U, .sequence = 3U,
-                                      .point = {1.375F, 2.25F}, .brush_radius = contracts::kMaxAnnotationBrushRadius}}};
+    const AnnotationPointer absolute{
+        .phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 9U, .sequence = 1U, .point = {1.25F, 2.5F}};
+    const AnnotationInputBatch source{.document_epoch = 3U,
+                                      .sequence = 1U,
+                                      .samples = {absolute, contracts::AnnotationPoint{0.125F, -0.25F},
+                                                  AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update,
+                                                                    .interaction_id = 9U,
+                                                                    .sequence = 3U,
+                                                                    .point = {1.375F, 2.25F},
+                                                                    .brush_radius = contracts::kMaxAnnotationBrushRadius}}};
     wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>());
     cbor::FixedCborEncoder encoder(bytes);
     REQUIRE(cbor::encode_compact(encoder, source));

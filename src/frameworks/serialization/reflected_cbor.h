@@ -137,8 +137,8 @@ class BorrowedByteRecord final {
             if constexpr (std::meta::reflect_constant(Declaration::pointer) == std::meta::reflect_constant(BytesMember)) {
                 // Encoding receives one contiguous retained payload.
                 constexpr auto policy = d::serialized_member_policy<Declaration>();
-                valid = valid && bytes_.second.empty() && bytes_.size() <= policy.maximum_bytes &&
-                        bytes_.size() >= policy.minimum_bytes && writer.bytes(bytes_.first);
+                valid = valid && bytes_.second.empty() && bytes_.size() <= policy.maximum_bytes && bytes_.size() >= policy.minimum_bytes &&
+                        writer.bytes(bytes_.first);
             } else {
                 valid = valid && d::member_constraints_accept<Declaration>(record_.*Declaration::pointer) &&
                         encode_compact(writer, record_.*Declaration::pointer);

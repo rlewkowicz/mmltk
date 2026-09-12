@@ -1,4 +1,4 @@
-use alloc::{borrow::ToOwned as _, boxed::Box, collections::BTreeMap, ffi::CString, sync::Arc, vec::Vec};
+use alloc::{borrow::ToOwned as _, collections::BTreeMap, ffi::CString, sync::Arc, vec::Vec};
 use core::{
     ffi::CStr,
     mem::{self, MaybeUninit},

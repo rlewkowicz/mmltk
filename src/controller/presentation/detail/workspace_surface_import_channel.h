@@ -186,7 +186,7 @@ class WorkspaceSurfaceImportChannel final {
                                     int frame_signal, int access_signal, std::uint64_t selection_generation = 0U,
                                     std::uint64_t frame_revision = 0U);
     [[nodiscard]] bool read_settled(WorkspaceSurfaceImportId, WorkspaceContentIdentity, std::uint64_t presentation_revision,
-                                      std::uint64_t transfer_sequence);
+                                    std::uint64_t transfer_sequence);
     // Transfers one exact withdrawal ticket. Capacity retains the ticket in the
     // channel, and a claimed capability remains admitted through Retired.
     [[nodiscard]] WorkspaceSurfaceWithdrawal withdraw(WorkspaceSurfaceImportId id);

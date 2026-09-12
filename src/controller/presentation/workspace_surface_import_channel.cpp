@@ -184,7 +184,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         std::uint32_t width = 0U;
         std::uint32_t height = 0U;
         bool arena = false;
-        std::optional<Record> acquired;
+        std::optional<Record> acquired{};
         std::uint64_t last_transfer = 0U;
     };
 
@@ -613,6 +613,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().required_size = record.size;
                     break;
                 case Opcode::Arena:
+                case Opcode::Acquired:
                 case Opcode::ReadSettled:
                 case Opcode::Import:
                 case Opcode::Drop:
@@ -705,26 +706,26 @@ bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint6
     return impl_->admit(record, generation, descriptors, selection_generation, frame_revision);
 }
 bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,
-                                                   const std::uint64_t revision, const std::uint64_t transfer_sequence) {
+                                                 const std::uint64_t revision, const std::uint64_t transfer_sequence) {
     if (!connected() || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
     const auto admission = impl_->find_admission(id);
-    if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) ||
-        !admission->second.acquired)
+    if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) || !admission->second.acquired)
         return false;
     const auto& acquired = *admission->second.acquired;
-    if (acquired.stride != content.session || acquired.size != content.sequence ||
-        acquired.presentation_revision != revision || acquired.offset != transfer_sequence ||
-        std::ranges::any_of(impl_->acquisitions, [id](const Record& pending) {
+    if (acquired.stride != content.session || acquired.size != content.sequence || acquired.presentation_revision != revision ||
+        acquired.offset != transfer_sequence || std::ranges::any_of(impl_->acquisitions, [id](const Record& pending) {
             return pending.id_high == id.high && pending.id_low == id.low;
-        })) return false;
+        }))
+        return false;
     if (!impl_->send(Record{.opcode = Opcode::ReadSettled,
-                              .id_high = id.high,
-                              .id_low = id.low,
-                              .stride = content.session,
-                              .size = content.sequence,
-                              .presentation_revision = revision,
-                              .offset = transfer_sequence},
-                       {})) return false;
+                            .id_high = id.high,
+                            .id_low = id.low,
+                            .stride = content.session,
+                            .size = content.sequence,
+                            .presentation_revision = revision,
+                            .offset = transfer_sequence},
+                     {}))
+        return false;
     admission->second.acquired.reset();
     return true;
 }

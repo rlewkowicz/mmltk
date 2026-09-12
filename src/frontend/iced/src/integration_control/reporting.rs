@@ -1194,7 +1194,10 @@ mod tests {
                         },
                         interactionid: 1,
                         sequence: index as u64 + 1,
-                        identity: crate::generated::AnnotationTargetIdentity { object: 0, element: 0 },
+                        identity: crate::generated::AnnotationTargetIdentity {
+                            object: 0,
+                            element: 0,
+                        },
                         target: crate::generated::AnnotationPointerTarget {
                             object: None,
                             element: None,

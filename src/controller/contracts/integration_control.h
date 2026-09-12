@@ -26,7 +26,6 @@ enum class IntegrationControlKind : std::uint8_t {
     PressureEntered[[= IntegrationCommandDirection{false}]],
     CapacityArmRequested[[= IntegrationCommandDirection{false}]],
     CapacityArmed[[= IntegrationCommandDirection{true}]],
-    CapacityReleaseSample[[= IntegrationCommandDirection{true}]],
     CapacityCompletionReleased[[= IntegrationCommandDirection{true}]],
     VisibleReadArmRequested[[= IntegrationCommandDirection{false, false, true}]],
     VisibleReadArmed[[= IntegrationCommandDirection{true}]],

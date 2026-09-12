@@ -43,7 +43,6 @@ use std::time::Duration;
 use std::ffi::CString;
 
 use ash::{khr, vk};
-use ash::vk::Handle;
 
 /// We limit the size of buffer allocations for stability reason.
 /// We can reconsider this limit in the future. Note that some drivers (mesa for example),
@@ -1891,7 +1890,6 @@ enum MmltkWorkspaceDispatcherCommand {
     },
     Register {
         arena: Arc<MmltkWorkspaceArena>,
-        texture_id: Option<id::TextureId>,
         device_id: id::DeviceId,
         surface_id: mmltk_workspace_channel::SurfaceId,
         frame: OwnedFd,
@@ -2220,6 +2218,7 @@ impl Drop for MmltkWorkspaceFrameSignal {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MmltkWorkspaceTransferPlan {
     ReleaseOnly {
@@ -2232,6 +2231,7 @@ enum MmltkWorkspaceTransferPlan {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MmltkWorkspaceSettledTransfer {
     ready: u64,
@@ -2239,6 +2239,7 @@ struct MmltkWorkspaceSettledTransfer {
     copied_slot: Option<usize>,
 }
 
+#[cfg(test)]
 fn expected_mmltk_workspace_ready(next_transfer_sequence: u64) -> Result<u64, vk::Result> {
     next_transfer_sequence
         .checked_mul(2)
@@ -2246,6 +2247,7 @@ fn expected_mmltk_workspace_ready(next_transfer_sequence: u64) -> Result<u64, vk
         .ok_or(vk::Result::ERROR_UNKNOWN)
 }
 
+#[cfg(test)]
 fn plan_mmltk_workspace_transfer(
     next_transfer_sequence: u64,
     snapshot: Option<MmltkWorkspaceFrameSnapshot>,
@@ -2279,6 +2281,7 @@ fn plan_mmltk_workspace_transfer(
     Ok(MmltkWorkspaceTransferPlan::Current { snapshot, identity })
 }
 
+#[cfg(test)]
 fn settle_mmltk_workspace_cursor(
     next_transfer_sequence: &mut u64,
     submitted: Option<(u64, Option<usize>)>,
@@ -2310,7 +2313,6 @@ fn settle_mmltk_workspace_cursor(
 
 struct MmltkWorkspaceDispatchEntry {
     device_id: id::DeviceId,
-    texture_id: Option<id::TextureId>,
     surface_id: mmltk_workspace_channel::SurfaceId,
     frame: OwnedFd,
     frame_signal: MmltkWorkspaceFrameSignal,
@@ -2533,9 +2535,8 @@ impl MmltkWorkspaceDispatcherShared {
         frame: OwnedFd, frame_signal: MmltkWorkspaceFrameSignal, blit: MmltkWorkspaceBlit,
         timeline_descriptor: OwnedFd,
     ) {
-        let texture_id = *arena.texture_id.lock().unwrap();
         self.enqueue(MmltkWorkspaceDispatcherCommand::Register {
-            texture_id, device_id: arena.device_id, arena,
+            device_id: arena.device_id, arena,
             surface_id, frame, frame_signal, blit, timeline_descriptor,
         });
     }
@@ -2612,13 +2613,12 @@ impl Drop for MmltkWorkspaceDispatcher {
         let (response, result) = mpsc::sync_channel(1);
         self.shared
             .enqueue(MmltkWorkspaceDispatcherCommand::Shutdown { response });
-        let abandoned = result
+        result
             .recv_timeout(MMLTK_WORKSPACE_DISPATCH_TIMEOUT)
             .unwrap_or_else(|_| {
                 log::error!("WebGPU workspace dispatcher shutdown timed out");
                 std::process::abort();
             });
-        drop(abandoned);
         if thread.join().is_err() {
             log::error!("WebGPU workspace dispatcher panicked");
             std::process::abort();
@@ -2814,7 +2814,6 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                         }
                         MmltkWorkspaceDispatcherCommand::Register {
                             arena,
-                            texture_id,
                             device_id,
                             surface_id,
                             frame,
@@ -2859,7 +2858,6 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                     frame_fd,
                                     MmltkWorkspaceDispatchEntry {
                                         device_id,
-                                        texture_id,
                                         surface_id,
                                         frame,
                                         frame_signal,

@@ -1357,11 +1357,9 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("application_bindings") == std::string::npos);
 }
 
-TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the existing wire budgets",
-          "[browser][annotation][capacity]") {
+TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the existing wire budgets", "[browser][annotation][capacity]") {
     using namespace mmltk::controller;
     namespace c = contracts;
-    namespace serialization = mmltk::frameworks::serialization;
     AnnotationSnapshot snapshot;
     snapshot.revision = snapshot.ui_revision = snapshot.input_document_epoch = 1U;
     snapshot.ready = true;
@@ -1371,28 +1369,31 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     scene.document = c::WorkspaceResource::From(std::string(c::kWorkspaceResourceCapacity, 'd'), 1U);
     scene.frame_width = scene.frame_height = std::numeric_limits<std::uint16_t>::max();
     scene.frame_ready = true;
-    scene.categories.resize(c::kAnnotationCategoryCapacity,
-                            {.value = std::string(c::kArtifactClassNameCapacity, 'c')});
+    scene.categories.resize(c::kAnnotationCategoryCapacity, {.value = std::string(c::kArtifactClassNameCapacity, 'c')});
     scene.palette.resize(c::kAnnotationCategoryCapacity, {.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F});
     const c::AnnotationPoint point{1234.5678F, 2345.6789F};
     c::AnnotationObject object{
         .name = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'n')),
-        .shape = c::AnnotationShape::Box, .box = {point, point}, .point = point,
+        .shape = c::AnnotationShape::Box,
+        .box = {point, point},
+        .point = point,
         .mask = {.cleanup_radius = std::numeric_limits<std::uint16_t>::max()},
         .sup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
         .nosup = {.center = scene.palette.front(), .minus = scene.palette.front(), .plus = scene.palette.front()},
         .mask_points = std::vector<c::AnnotationPoint>(c::kAnnotationGeometryCapacity, point),
-        .spline_knots = std::vector<c::AnnotationSplineKnot>(c::kAnnotationGeometryCapacity,
+        .spline_knots = std::vector<c::AnnotationSplineKnot>(
+            c::kAnnotationGeometryCapacity,
             {.point = point, .in = {.point = point, .enabled = true}, .out = {.point = point, .enabled = true}}),
-        .skeleton_nodes = std::vector<c::AnnotationSkeletonNode>(c::kAnnotationGeometryCapacity,
-            {.key = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'k')), .point = point}),
+        .skeleton_nodes = std::vector<c::AnnotationSkeletonNode>(
+            c::kAnnotationGeometryCapacity, {.key = c::AnnotationText::From(std::string(c::kAnnotationNameCapacity, 'k')), .point = point}),
         .skeleton_edges = std::vector<c::AnnotationEdge>(c::kAnnotationGeometryCapacity, {.source = 6U, .target = 7U}),
         .category = static_cast<std::uint16_t>(c::kAnnotationCategoryCapacity - 1U),
     };
     scene.objects.resize(c::kAnnotationObjectCapacity, object);
     scene.objects.front().mask = {
         .runs = std::vector<c::AnnotationMaskRun>(c::kAnnotationMaskRunCapacity, {65534U, 65532U, 65534U}),
-        .cleanup_radius = std::numeric_limits<std::uint16_t>::max(), .present = true,
+        .cleanup_radius = std::numeric_limits<std::uint16_t>::max(),
+        .present = true,
     };
     ui.editor.selected_object = 0U;
     REQUIRE(ui.valid());
@@ -1402,7 +1403,8 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     for (auto& item : displayed.objects) {
         item.shape = c::AnnotationShape::Skeleton;
         item.point.x += 0.12345F;
-        for (auto& knot : item.spline_knots) knot.in.point.x += 0.23456F;
+        for (auto& knot : item.spline_knots)
+            knot.in.point.x += 0.23456F;
     }
     displayed.objects.front().shape = c::AnnotationShape::Mask;
     snapshot.rendered_scene.document_epoch = 2U;
@@ -1431,13 +1433,17 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     CHECK(snapshot.rendered_scene.geometry.objects.back().spline_knots.empty());
     CHECK_FALSE(ui.scene.objects.back().spline_knots.empty());
 
-    std::vector<std::byte> encoded(browser::kMaxOutputValueBytes);
-    serialization::FixedCborEncoder writer(encoded);
-    REQUIRE(serialization::encode_compact(writer, snapshot));
-    CHECK(writer.size() <= c::kAnnotationUiStateByteBudget);
     auto value = browser::application_materializer_detail::reflected_value(snapshot);
     REQUIRE(value.has_value());
+    browser::wire::ByteBuffer encoded;
+    REQUIRE(browser::wire::encode(*value, encoded,
+                                  {.max_bytes = browser::kMaxOutputValueBytes,
+                                   .max_items = browser::kMaxOutputValueItems,
+                                   .max_depth = browser::kMaxIntentValueDepth}));
+    CHECK(encoded.size() <= c::kAnnotationUiStateByteBudget);
     browser::Bootstrap bootstrap{
+        .schema_fingerprint = browser::application_schema_fingerprint<ApplicationSystems>().words,
+        .input_epoch = 1U,
         .snapshots = {{.system_id = browser::application_stable_id("annotation"), .value = std::move(*value)}},
     };
     // Reconnect may also retain the full editable source in Explore and its
@@ -1453,8 +1459,6 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
     };
     retain("explore", explore);
     retain("upscale", upscale);
-    encoded.resize(browser::kMaxRecordWireBytes);
-    serialization::FixedCborEncoder bootstrap_writer(encoded);
-    REQUIRE(serialization::encode_compact(bootstrap_writer, bootstrap));
-    CHECK(bootstrap_writer.size() < browser::kMaxRecordWireBytes);
+    REQUIRE(browser::encode_server_record(browser::ServerRecord{std::move(bootstrap)}, encoded));
+    CHECK(encoded.size() < browser::kMaxRecordWireBytes);
 }

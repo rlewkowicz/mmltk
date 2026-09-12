@@ -253,7 +253,8 @@ struct CompiledImageStream::Impl {
         slot.unfenced = false;
     }
     void settle_unfenced() {
-        for (auto& slot : slots) settle_unfenced(*slot);
+        for (auto& slot : slots)
+            settle_unfenced(*slot);
     }
     void complete_loop() noexcept {
         try {

@@ -646,8 +646,7 @@ struct ImageProductBuffer::State final {
     }
     bool ReservePhysicalWork() {
         if (workspace_reserved_) return true;
-        if (raw_workspace_ && planes_[0U]->state_->external_storage != raw_workspace_)
-            raw_workspace_.reset();
+        if (raw_workspace_ && planes_[0U]->state_->external_storage != raw_workspace_) raw_workspace_.reset();
         const auto first = raw_workspace_ ? raw_workspace_ : workspace_;
         if (!first) return true;
         if (!first->ReserveWrite()) return false;
@@ -993,8 +992,7 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
         if (reserved_replacement) workspace->CancelWrite();
         throw;
     }
-    if (reserved_replacement && state_->workspace_ != state_->workspace_reserved_ && state_->workspace_)
-        state_->workspace_->CancelWrite();
+    if (reserved_replacement && state_->workspace_ != state_->workspace_reserved_ && state_->workspace_) state_->workspace_->CancelWrite();
     // Retained raw plane custody is unchanged until the next exclusive write.
     if (state_->workspace_ && state_->workspace_ != workspace) state_->workspace_->Withdraw();
     state_->workspace_ = std::move(workspace);

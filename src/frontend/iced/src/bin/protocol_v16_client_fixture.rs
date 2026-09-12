@@ -710,7 +710,10 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
                 },
                 interactionid: 1,
                 sequence: index as u64 + 1,
-                identity: generated::AnnotationTargetIdentity { object: 0, element: 0 },
+                identity: generated::AnnotationTargetIdentity {
+                    object: 0,
+                    element: 0,
+                },
                 target: generated::AnnotationPointerTarget {
                     object: Some(1),
                     element: Some(2),

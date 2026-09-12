@@ -137,7 +137,9 @@ pub(crate) fn physical_frame(
     content_height: u32,
 ) -> crate::presentation_surface::FrameReady {
     crate::presentation_surface::FrameReady {
-        source_high: 0, source_low: 0, direct_sampling: false,
+        source_high: 0,
+        source_low: 0,
+        direct_sampling: false,
         high: 1,
         low: 2,
         layer: 0,

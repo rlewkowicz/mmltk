@@ -85,18 +85,35 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<Envelope, ProtocolError> {
     #[cfg(test)]
     if bytes.first() == Some(&0x82) {
         let mut cursor = 0;
-        let Value::Array(mut fields) = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0)? else { unreachable!() };
-        if cursor != bytes.len() || fields.len() != 2 { return Err(ProtocolError("invalid compact interaction".into())); }
+        let Value::Array(mut fields) = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0)?
+        else {
+            unreachable!()
+        };
+        if cursor != bytes.len() || fields.len() != 2 {
+            return Err(ProtocolError("invalid compact interaction".into()));
+        }
         let value = fields.pop().unwrap();
-        let opcode = fields.pop().unwrap().integer_u64().ok_or_else(|| ProtocolError("invalid interaction opcode".into()))?;
-        let endpoint = crate::generated::interaction_endpoint(opcode).ok_or_else(|| ProtocolError("unknown interaction opcode".into()))?;
+        let opcode = fields
+            .pop()
+            .unwrap()
+            .integer_u64()
+            .ok_or_else(|| ProtocolError("invalid interaction opcode".into()))?;
+        let endpoint = crate::generated::interaction_endpoint(opcode)
+            .ok_or_else(|| ProtocolError("unknown interaction opcode".into()))?;
         if !matches!(&value, Value::Bytes(bytes) if bytes.len() <= MAX_INTENT_VALUE_BYTES) {
             return Err(ProtocolError("invalid compact interaction bytes".into()));
         }
-        return Ok(Envelope { kind: "Interaction".into(), payload: object([
-            ("protocol_version", Value::Unsigned(crate::generated::BROWSER_PROTOCOL_VERSION)),
-            ("endpoint_id", Value::Unsigned(endpoint)), ("value", value),
-        ]) });
+        return Ok(Envelope {
+            kind: "Interaction".into(),
+            payload: object([
+                (
+                    "protocol_version",
+                    Value::Unsigned(crate::generated::BROWSER_PROTOCOL_VERSION),
+                ),
+                ("endpoint_id", Value::Unsigned(endpoint)),
+                ("value", value),
+            ]),
+        });
     }
     preflight_protocol_record(bytes)?;
     let mut cursor = 0;

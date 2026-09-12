@@ -5088,7 +5088,6 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "30.0.0"
-source = "git+https://github.com/gfx-rs/wgpu?rev=93e00976015c937fc86f02bd9efcf343c6ce5e5d#93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 dependencies = [
  "arrayvec",
  "ash",

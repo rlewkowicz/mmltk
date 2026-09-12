@@ -187,10 +187,21 @@ impl Component {
                         self.canvas.clear_pointer_lifecycle();
                         return Ok(None);
                     }
-                    let document_epoch = application.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch);
-                    let tool = application.annotation.snapshot.as_ref().map_or(
-                        crate::generated::AnnotationTool::Select, |snapshot| snapshot.ui.editor.tool);
-                    let Some(mut pointer) = self.canvas.pointer_from_gesture(document_epoch, tool, gesture)
+                    let document_epoch = application
+                        .annotation
+                        .snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.inputdocumentepoch);
+                    let tool = application
+                        .annotation
+                        .snapshot
+                        .as_ref()
+                        .map_or(crate::generated::AnnotationTool::Select, |snapshot| {
+                            snapshot.ui.editor.tool
+                        });
+                    let Some(mut pointer) =
+                        self.canvas
+                            .pointer_from_gesture(document_epoch, tool, gesture)
                     else {
                         return Ok(None);
                     };
@@ -328,7 +339,11 @@ impl Component {
                     || crate::generated::default_uiannotationbrushradius().unwrap(),
                     |draft| draft.ui.annotationbrushradius,
                 ) as u16,
-                move || surface.and_then(crate::presentation_surface::drawable_annotation).map(|(_, content)| content),
+                move || {
+                    surface
+                        .and_then(crate::presentation_surface::drawable_annotation)
+                        .map(|(_, content)| content)
+                },
                 self.keyboard_canvas.clone(),
             ),
         ))
@@ -504,11 +519,23 @@ mod tests {
         let mut model = ready_model();
         let snapshot = model.annotation.snapshot.as_mut().unwrap();
         let mut hit = mask_object();
-        hit.mask.runs = vec![AnnotationMaskRun { row: 30, first: 20, last: 20 }];
+        hit.mask.runs = vec![AnnotationMaskRun {
+            row: 30,
+            first: 20,
+            last: 20,
+        }];
         let mut hole = mask_object();
         hole.mask.runs = vec![
-            AnnotationMaskRun { row: 30, first: 0, last: 10 },
-            AnnotationMaskRun { row: 30, first: 30, last: 40 },
+            AnnotationMaskRun {
+                row: 30,
+                first: 0,
+                last: 10,
+            },
+            AnnotationMaskRun {
+                row: 30,
+                first: 30,
+                last: 40,
+            },
         ];
         snapshot.ui.editor.tool = AnnotationTool::Select;
         snapshot.ui.editor.selectedobject = None;
@@ -521,27 +548,67 @@ mod tests {
         snapshot.ui.scene.objects[0].mask.runs.clear();
         snapshot.ui.scene.objects[1] = hit;
         assert_eq!(canvas::target(&snapshot.ui, 20.0, 30.0).object, Some(1));
-        let begin = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        let begin = canvas
+            .pointer_from_gesture(
+                1,
+                AnnotationTool::Select,
+                gesture(SurfaceGestureKind::Pointer),
+            )
+            .unwrap();
         assert_eq!(begin.target.object, Some(0));
         canvas.test_install_displayed(AnnotationContent::test_displayed(snapshot));
-        let update = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        let update = canvas
+            .pointer_from_gesture(
+                1,
+                AnnotationTool::Select,
+                gesture(SurfaceGestureKind::Pointer),
+            )
+            .unwrap();
         assert_eq!(update.target, begin.target);
         assert_eq!(update.phase, AnnotationPointerPhase::Update);
-        let end = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::End)).unwrap();
+        let end = canvas
+            .pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::End))
+            .unwrap();
         assert_eq!(end.target, begin.target);
-        let next = canvas.pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).unwrap();
+        let next = canvas
+            .pointer_from_gesture(
+                1,
+                AnnotationTool::Select,
+                gesture(SurfaceGestureKind::Pointer),
+            )
+            .unwrap();
         assert_eq!(next.target.object, Some(1));
         assert_ne!(next.interactionid, begin.interactionid);
-        assert!(canvas.pointer_from_gesture(2, AnnotationTool::Select, gesture(SurfaceGestureKind::Pointer)).is_none());
+        assert!(
+            canvas
+                .pointer_from_gesture(
+                    2,
+                    AnnotationTool::Select,
+                    gesture(SurfaceGestureKind::Pointer)
+                )
+                .is_none()
+        );
         canvas.test_install_displayed(displayed);
         let mut empty = gesture(SurfaceGestureKind::Pointer);
         empty.sample.content_x = 25.0;
-        assert_eq!(canvas.pointer_from_gesture(1, AnnotationTool::Select, empty).unwrap().target.object, None);
+        assert_eq!(
+            canvas
+                .pointer_from_gesture(1, AnnotationTool::Select, empty)
+                .unwrap()
+                .target
+                .object,
+            None
+        );
         canvas.clear_pointer_lifecycle();
         // The displayed pixels still carry Select's old handles; changing the
         // logical tool immediately changes the next gesture's policy.
-        let create = canvas.pointer_from_gesture(1, AnnotationTool::Point,
-            gesture(SurfaceGestureKind::Pointer)).unwrap();
+        let create = canvas
+            .pointer_from_gesture(
+                1,
+                AnnotationTool::Point,
+                gesture(SurfaceGestureKind::Pointer),
+            )
+            .unwrap();
         assert_eq!(create.target.object, None);
         assert_eq!(create.identity.object, 0);
     }
@@ -551,8 +618,11 @@ mod tests {
         model: &mut ApplicationModel,
         settings: &mut crate::view::settings::SettingsModel,
     ) -> crate::generated::AnnotationPointer {
-        component.canvas.test_install_displayed(crate::presentation_surface::AnnotationContent::test_displayed(
-            model.annotation.snapshot.as_ref().unwrap()));
+        component.canvas.test_install_displayed(
+            crate::presentation_surface::AnnotationContent::test_displayed(
+                model.annotation.snapshot.as_ref().unwrap(),
+            ),
+        );
         let Some(Outcome::Pointer(pointer)) = component
             .update(
                 model,
@@ -624,7 +694,11 @@ mod tests {
         use crate::presentation_surface::SurfaceGestureKind as Kind;
         use crate::transport_connection::{Capture, CapturedRecord, Connection};
         let assert_batch =
-            |connection: &Connection, capture: &mut Capture, sequence, documentepoch, samples: Vec<crate::generated::AnnotationPointer>| {
+            |connection: &Connection,
+             capture: &mut Capture,
+             sequence,
+             documentepoch,
+             samples: Vec<crate::generated::AnnotationPointer>| {
                 let mut prior = None;
                 let CapturedRecord::Other(actual) = capture.try_recv().unwrap() else {
                     panic!("direct annotation interaction")
@@ -633,11 +707,21 @@ mod tests {
                     crate::generated::AnnotationInputBatch {
                         documentepoch,
                         sequence,
-                        samples: samples.iter().map(|pointer| {
-                            let sample = crate::annotation_input::compact_sample(pointer, prior.as_ref());
-                            prior = if matches!(pointer.phase, Phase::End | Phase::Cancel) { None } else { Some(pointer.clone()) };
-                            sample
-                        }).collect(),
+                        samples: samples
+                            .iter()
+                            .map(|pointer| {
+                                let sample = crate::annotation_input::compact_sample(
+                                    pointer,
+                                    prior.as_ref(),
+                                );
+                                prior = if matches!(pointer.phase, Phase::End | Phase::Cancel) {
+                                    None
+                                } else {
+                                    Some(pointer.clone())
+                                };
+                                sample
+                            })
+                            .collect(),
                     },
                 )
                 .unwrap()
@@ -668,18 +752,27 @@ mod tests {
         snapshot.ui.editor.tool = crate::generated::AnnotationTool::Select;
         snapshot.ui.editor.selectedobject = Some(0);
         let dispatch = |model: &ApplicationModel, radius| {
-            let displayed = model.annotation.snapshot.as_ref()
+            let displayed = model
+                .annotation
+                .snapshot
+                .as_ref()
                 .map(crate::presentation_surface::AnnotationContent::test_displayed);
-            component
-                .canvas
-                .dispatch(model, radius, move || displayed.clone(), component.keyboard_canvas.clone())
+            component.canvas.dispatch(
+                model,
+                radius,
+                move || displayed.clone(),
+                component.keyboard_canvas.clone(),
+            )
         };
         let mut expected = pointer;
         expected.interactionid += 1;
         expected.target =
             canvas::target(&model.annotation.snapshot.as_ref().unwrap().ui, 20.0, 30.0);
         expected.identity = crate::presentation_surface::AnnotationContent::test_displayed(
-            model.annotation.snapshot.as_ref().unwrap()).target_identity(&expected.target).unwrap();
+            model.annotation.snapshot.as_ref().unwrap(),
+        )
+        .target_identity(&expected.target)
+        .unwrap();
         expected.brushradius = 9;
         component
             .keyboard_canvas

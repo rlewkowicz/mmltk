@@ -284,7 +284,7 @@ struct GalleryGpuPause final {
 }
 
 [[nodiscard]] std::vector<std::uint8_t> copy_atlas_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product,
-                                                       const std::size_t plane_index, const ExploreAtlasLayout& layout) {
+                                                         const std::size_t plane_index, const ExploreAtlasLayout& layout) {
     REQUIRE(product.valid());
     REQUIRE(layout.row_capacity != 0U);
     REQUIRE(layout.row_count <= layout.row_capacity);
@@ -705,7 +705,8 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
     gallery.Drain();
 }
 
-TEST_CASE("Native gallery rollback and detail retain an unfinished independent image read", "[explore][native][atlas][transaction][detail]") {
+TEST_CASE("Native gallery rollback and detail retain an unfinished independent image read",
+          "[explore][native][atlas][transaction][detail]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     const bool change_geometry = GENERATE(false, true);
@@ -732,10 +733,10 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
                 if (!ready[slot]) continue;
                 REQUIRE(current[slot]);
                 for (std::size_t row = 0U; row < layout.card_extent; ++row) {
-                    const auto offset = ((slot / layout.columns * layout.card_extent + row) * layout.columns +
-                                         slot % layout.columns) * layout.card_extent * 4U;
+                    const auto offset = ((slot / layout.columns * layout.card_extent + row) * layout.columns + slot % layout.columns) *
+                                        layout.card_extent * 4U;
                     CHECK(std::ranges::equal(std::span{pixels[plane]}.subspan(offset, layout.card_extent * 4U),
-                                              std::span{next}.subspan(offset, layout.card_extent * 4U)));
+                                             std::span{next}.subspan(offset, layout.card_extent * 4U)));
                 }
             }
             pixels[plane] = std::move(next);
@@ -796,7 +797,7 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
     pause.Release();
     gallery.Drain();
     check_visible_continuity();
-    CHECK(std::ranges::all_of(gallery.algorithm->AdvanceGallery().ready_slots, [](bool ready) { return ready; }));
+    CHECK(std::ranges::all_of(gallery.algorithm->AdvanceGallery().ready_slots, [](bool slot_ready) { return slot_ready; }));
 }
 
 TEST_CASE("Native gallery retains slot products across hot reuse semantic changes collisions and artifact replacement",

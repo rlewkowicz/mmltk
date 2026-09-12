@@ -218,10 +218,14 @@ impl Probe {
                 label: Some("mmltk receiver pixel evidence"),
             });
         let mut parameters = [0u8; 16];
-        for (index, value) in [frame.content_width, frame.content_height,
-            if frame.direct_sampling { 0 } else { frame.slot }, 0]
-            .into_iter()
-            .enumerate()
+        for (index, value) in [
+            frame.content_width,
+            frame.content_height,
+            if frame.direct_sampling { 0 } else { frame.slot },
+            0,
+        ]
+        .into_iter()
+        .enumerate()
         {
             parameters[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }

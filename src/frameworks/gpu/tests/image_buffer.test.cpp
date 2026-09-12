@@ -1377,7 +1377,7 @@ TEST_CASE("held current display leaves replaceable overflow and exact readers cl
     runtime.Publish(overflow, 4U, 4U, fill(22U));
     baseline = runtime.CommitOutput(std::move(overflow));
     const auto overflow_allocation = baseline.ObserveWorkspace().product_owner;
-    const auto copies = backend->same_copies;
+    const auto copies = backend->same_copies.load();
     auto replacement = runtime.TryAcquireOutput(baseline);
     REQUIRE(replacement.valid());
     runtime.Publish(replacement, 4U, 4U, fill(33U));
@@ -1549,11 +1549,11 @@ class WorkspaceAccessPeer final {
     }
     std::uint64_t Access() const { return std::atomic_ref{signal_->access}.load(std::memory_order_acquire); }
     bool Acquire(std::uint64_t access, std::uint64_t generation) {
-        if ((access & kWorkspaceAccessMask) != kWorkspaceAccessAvailable ||
-            (access & kWorkspaceAccessRevoked) != 0U ||
-            std::atomic_ref{signal_->generation}.load(std::memory_order_relaxed) != generation) return false;
-        return std::atomic_ref{signal_->access}.compare_exchange_strong(
-            access, (access & ~kWorkspaceAccessMask) | kWorkspaceAccessReading, std::memory_order_acq_rel);
+        if ((access & kWorkspaceAccessMask) != kWorkspaceAccessAvailable || (access & kWorkspaceAccessRevoked) != 0U ||
+            std::atomic_ref{signal_->generation}.load(std::memory_order_relaxed) != generation)
+            return false;
+        return std::atomic_ref{signal_->access}.compare_exchange_strong(access, (access & ~kWorkspaceAccessMask) | kWorkspaceAccessReading,
+                                                                        std::memory_order_acq_rel);
     }
     void Release() {
         const auto generation = std::atomic_ref{signal_->generation}.load(std::memory_order_acquire);
@@ -1564,15 +1564,13 @@ class WorkspaceAccessPeer final {
         auto expected = access.load(std::memory_order_acquire);
         do {
             const auto role = (expected & kWorkspaceAccessRevoked) != 0U ? kWorkspaceAccessEmpty : kWorkspaceAccessAvailable;
-            if (access.compare_exchange_weak(expected, (expected & ~kWorkspaceAccessMask) | role,
-                                             std::memory_order_acq_rel)) return;
+            if (access.compare_exchange_weak(expected, (expected & ~kWorkspaceAccessMask) | role, std::memory_order_acq_rel)) return;
         } while (true);
     }
     void TerminalComplete(std::uint64_t reading) {
         const auto revoked = reading | kWorkspaceAccessRevoked;
         auto expected = reading;
-        if (std::atomic_ref{signal_->access}.compare_exchange_strong(expected, revoked, std::memory_order_acq_rel) ||
-            expected == revoked)
+        if (std::atomic_ref{signal_->access}.compare_exchange_strong(expected, revoked, std::memory_order_acq_rel) || expected == revoked)
             std::atomic_ref{signal_->terminal_read_complete}.store(revoked, std::memory_order_release);
     }
     void StaleTerminalReceipt(std::uint64_t receipt) {
@@ -1588,17 +1586,19 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_buffer_count = 2U,
-                                .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    SystemImageRuntime runtime(
+        {.device = 0, .backend = backend, .output_buffer_count = 2U, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
     ImageWorkspaceTestAccess::Install(runtime);
     const auto workspace = [&] {
         auto result = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
         result->Admit(result->identity(), result->layout().device_incarnation);
         return result;
     };
-    const auto fill = [](std::uint8_t value) { return [value](auto clean, auto, auto) {
-        std::memset(reinterpret_cast<void*>(clean.data), value, clean.descriptor.pitch_bytes * clean.descriptor.height);
-    }; };
+    const auto fill = [](std::uint8_t value) {
+        return [value](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), value, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        };
+    };
     auto current = workspace();
     auto overflow = workspace();
     WorkspaceAccessPeer current_peer(current);
@@ -1608,6 +1608,10 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     runtime.Publish(candidate, 4U, 3U, fill(11U));
     auto baseline = runtime.CommitOutput(std::move(candidate));
     const auto held_revision = current->revision();
+    auto current_read = baseline.BorrowWorkspace();
+    REQUIRE(current_read.valid());
+    const auto current_pointer = current_read.plane().data;
+    current_read = {};
     REQUIRE(current_peer.Acquire(current_peer.Access(), held_revision));
     CHECK_FALSE(current->ReserveWrite());
     candidate = runtime.TryAcquireOutput(baseline);
@@ -1627,7 +1631,7 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     CHECK(backend->same_copies == copies);
     CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
     CHECK(current->revision() == held_revision);
-    CHECK(*reinterpret_cast<const std::uint8_t*>(current->plane(4U, 3U).data) == 11U);
+    CHECK(*reinterpret_cast<const std::uint8_t*>(current_pointer) == 11U);
     REQUIRE(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
     CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
     CHECK_FALSE(overflow->ReserveWrite());

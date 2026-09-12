@@ -458,7 +458,9 @@ mod tests {
         assert_eq!(model.explore.sent_upscale, Some(request.clone()));
         assert_eq!(model.displayed_upscale_kernel(), None);
         let drawn = crate::presentation_surface::FrameReady {
-            source_high: 0, source_low: 0, direct_sampling: false,
+            source_high: 0,
+            source_low: 0,
+            direct_sampling: false,
             high: 1,
             low: 2,
             layer: 0,

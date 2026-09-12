@@ -201,19 +201,17 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
     bool uuid_valid = false;
     for (const auto byte : record.device_uuid)
         uuid_valid = uuid_valid || byte != 0U;
-    const bool empty_layout = record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U &&
-                              record.device_incarnation == 0U &&
-                              (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired) &&
-                              record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U &&
-                              record.direct_sampling == 0U;
+    const bool empty_layout =
+        record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
+        (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired) && record.alignment == 0U &&
+        !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
     if (record.opcode != Opcode::Import && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
-    const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
-                              record.offset <= record.size && record.stride != 0U &&
-                              record.height <= (record.size - record.offset) / record.stride && record.alignment != 0U &&
-                              (record.alignment & (record.alignment - 1U)) == 0U &&
-                              record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) &&
-                              record.device_incarnation != 0U && uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U &&
-                              record.direct_sampling <= 1U;
+    const bool layout_valid =
+        record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
+        record.offset <= record.size && record.stride != 0U && record.height <= (record.size - record.offset) / record.stride &&
+        record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
+        record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) && record.device_incarnation != 0U &&
+        uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U && record.direct_sampling <= 1U;
     switch (record.opcode) {
         case Opcode::Import: {
             return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) &&

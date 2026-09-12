@@ -115,7 +115,8 @@ pub(super) fn matching(frame: Option<FrameReady>) -> Option<Arc<ExploreSnapshot>
                             .borrow()
                             .as_ref()
                             .is_some_and(|(publication, source)| {
-                                super::same_publication(*publication, frame) && *source == value.frame
+                                super::same_publication(*publication, frame)
+                                    && *source == value.frame
                             })
                     })
             })
@@ -241,7 +242,9 @@ mod tests {
 
     fn frame_ready() -> FrameReady {
         FrameReady {
-            source_high: 0, source_low: 0, direct_sampling: false,
+            source_high: 0,
+            source_low: 0,
+            direct_sampling: false,
             high: 1,
             low: 2,
             layer: 0,

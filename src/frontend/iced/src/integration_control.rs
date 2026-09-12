@@ -2165,7 +2165,6 @@ enum Phase {
     AwaitCapacitySlots(u64),
     AwaitCapacityArm,
     CapacityPublish,
-    AwaitCapacityRelease,
     AwaitCapacityCompletion,
     AwaitCapacityRetry,
     AtlasOverlay(usize),
@@ -2327,7 +2326,6 @@ impl Phase {
             | Self::AwaitVisibleReadComplete(_)
             | Self::AwaitCapacitySlots(_)
             | Self::AwaitCapacityArm
-            | Self::AwaitCapacityRelease
             | Self::AwaitCapacityCompletion
             | Self::AwaitCapacityRetry
             | Self::AwaitAtlasOverlay(_)
@@ -2889,11 +2887,6 @@ impl Controller {
                     Phase::AwaitVisibleReadPixels(*index, receipt.readgeneration)
                 }
                 (Kind::CapacityArmed, Phase::AwaitCapacityArm) => Phase::CapacityPublish,
-                (Kind::CapacityReleaseSample, Phase::AwaitCapacityRelease)
-                    if crate::presentation_surface::release_capacity_sample() =>
-                {
-                    Phase::AwaitCapacityCompletion
-                }
                 (Kind::CapacityCompletionReleased, Phase::AwaitCapacityCompletion) => {
                     Phase::AwaitCapacityRetry
                 }
