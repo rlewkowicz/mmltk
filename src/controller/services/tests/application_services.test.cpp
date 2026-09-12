@@ -778,13 +778,16 @@ TEST_CASE("complete diagnostic records and batches wait atomically and settle on
         REQUIRE(operation.submit({"{\"event\":\"filler\"}"}) == DiagnosticSubmitResult::Accepted);
     const auto before = diagnostics.counters().accepted;
     std::future<std::string> output;
-    auto submission = std::async(std::launch::async, [target = runtime.target(), batch] {
+    auto submission = std::async(std::launch::async, [&diagnostics, target = runtime.target(), batch, outcome] {
         const std::array facts{RuntimeDiagnosticFact{.event = "batch", .sequence = 1U},
                                RuntimeDiagnosticFact{.event = "batch", .sequence = 2U}};
         if (batch)
             target.write_batch(facts);
         else
             target.write(facts.front());
+        // Submission establishes queue admission. Flush establishes delivery
+        // while the reader drains; close remains nonblocking on a stalled pipe.
+        if (outcome == 0) diagnostics.flush();
     });
     ScopedTestCleanup close{[&] { diagnostics.close(DiagnosticsCloseMode::Discard); }};
     REQUIRE(DiagnosticsClientTestAccess::WaitForCapacityWaiter(diagnostics));

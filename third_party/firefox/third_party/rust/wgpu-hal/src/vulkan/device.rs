@@ -307,6 +307,7 @@ impl super::Device {
             copy_size: desc.copy_extent(),
             identity,
             external_layout: None,
+            initial_alias_usage: wgt::TextureUses::empty(),
         }
     }
 

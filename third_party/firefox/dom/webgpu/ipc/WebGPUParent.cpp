@@ -1895,24 +1895,10 @@ std::shared_ptr<SharedTexture> WebGPUParent::GetSharedTexture(
 
 #if defined(XP_LINUX) && !0
 VkImageHandle::~VkImageHandle() {
-  if (!mParent) {
-    return;
-  }
-  auto* context = mParent->GetContext();
-  if (context && mParent->IsDeviceActive(mDeviceId) && mVkImageHandle) {
-    wgpu_vkimage_destroy(context, mDeviceId, mVkImageHandle);
-  }
   wgpu_vkimage_delete(mVkImageHandle);
 }
 
 VkSemaphoreHandle::~VkSemaphoreHandle() {
-  if (!mParent) {
-    return;
-  }
-  auto* context = mParent->GetContext();
-  if (context && mParent->IsDeviceActive(mDeviceId) && mVkSemaphoreHandle) {
-    wgpu_vksemaphore_destroy(context, mDeviceId, mVkSemaphoreHandle);
-  }
   wgpu_vksemaphore_delete(mVkSemaphoreHandle);
 }
 #endif

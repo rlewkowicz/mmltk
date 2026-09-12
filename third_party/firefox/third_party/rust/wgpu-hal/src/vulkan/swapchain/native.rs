@@ -435,6 +435,7 @@ impl Swapchain for NativeSwapchain {
                 },
                 identity,
                 external_layout: None,
+                initial_alias_usage: wgt::TextureUses::empty(),
             },
             metadata: Box::new(NativeSurfaceTextureMetadata {
                 acquire_semaphores: acquire_semaphore_arc,

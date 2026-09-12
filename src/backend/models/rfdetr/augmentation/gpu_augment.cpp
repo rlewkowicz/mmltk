@@ -4,16 +4,25 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
+#include <locale>
+#include <meta>
+#include <ranges>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include "mmltk/frameworks/reflection/materializer.h"
 #include "detail/gpu_augment_cuda_launch.h"
 #include "detail/gpu_augment_plan_math.h"
 #include "detail/gpu_augmentation_donor_index.h"
 #include "src/frameworks/gpu/cuda_error.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 
 namespace mmltk::backend::models::rfdetr {
 
@@ -23,6 +32,45 @@ namespace {
 
 void require(const bool condition, const std::string_view message) {
     if (!condition) { throw std::runtime_error(std::string(message)); }
+}
+
+// This projection is limited to the executor's numeric configuration and plans.
+// Borrowed support addresses are omitted; their ordinary count/shape facts remain.
+template <class T>
+void append_prepared_diagnostic(std::ostream& output, const T& value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        output << (value ? "true" : "false");
+    } else if constexpr (std::is_floating_point_v<T>) {
+        if (std::isfinite(value))
+            output << value;
+        else
+            output << '"' << value << '"';
+    } else if constexpr (std::is_integral_v<T>) {
+        output << +value;
+    } else if constexpr (std::ranges::range<T>) {
+        output << '[';
+        bool first = true;
+        for (const auto& element : value) {
+            if (!std::exchange(first, false)) output << ',';
+            append_prepared_diagnostic(output, element);
+        }
+        output << ']';
+    } else {
+        static constexpr auto members = mmltk::frameworks::reflection::materialize<T>([]<class Owner, class Reflection>() consteval {
+            static_assert(Reflection::bases.empty());
+            return Reflection::members;
+        });
+        output << '{';
+        bool first = true;
+        template for (constexpr auto member : members) {
+            if constexpr (!std::is_pointer_v<typename[:std::meta::type_of(member):]>) {
+                if (!std::exchange(first, false)) output << ',';
+                output << '"' << std::meta::identifier_of(member) << "\":";
+                append_prepared_diagnostic(output, value.[:member:]);
+            }
+        }
+        output << '}';
+    }
 }
 
 GpuAugmentationGroupLaunchConfig launch_group(const AugmentationGroupConfig& group) {
@@ -554,6 +602,37 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
 }
 
 const AugmentationBatchPlan& GpuAugmentationExecutor::plan() const noexcept { return impl_->plan; }
+std::string GpuAugmentationExecutor::prepared_image_diagnostic(const std::size_t image, const std::size_t staging_slot) const {
+    require(impl_ && image < impl_->plan.active_size && staging_slot < kStagingSlots,
+            "augmentation prepared diagnostic image or staging slot is unavailable");
+    const auto offset = staging_slot * impl_->capacity + image;
+    constexpr auto parameter_count = static_cast<std::size_t>(kGpuAugmentationParameterCount);
+    constexpr auto paste_parameter_count = static_cast<std::size_t>(kGpuCopyPasteParameterCount);
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(std::numeric_limits<float>::max_digits10);
+    output << "{\"image_key\":" << impl_->plan.images[image].erasure.key << ",\"image_slot\":" << image
+           << ",\"staging_slot\":" << staging_slot << ",\"source_width\":" << impl_->width << ",\"source_height\":" << impl_->height
+           << ",\"config\":";
+    append_prepared_diagnostic(output, impl_->config);
+    output << ",\"plan\":";
+    append_prepared_diagnostic(output, impl_->plan.images[image]);
+    output << ",\"parameters\":";
+    append_prepared_diagnostic(output, std::span{impl_->staged_parameters.data() + offset * parameter_count, parameter_count});
+    output << ",\"parameter_indices\":{";
+    bool first = true;
+    for (const auto entry : mmltk::frameworks::reflection::kReflectedEnumEntries<augment_math::ParameterIndex>) {
+        if (!std::exchange(first, false)) output << ',';
+        output << '"' << entry.name << "\":" << static_cast<unsigned int>(entry.value);
+    }
+    output << "},\"paste_parameters\":";
+    if (impl_->copy_paste)
+        append_prepared_diagnostic(output, std::span{impl_->staged_paste.data() + offset * paste_parameter_count, paste_parameter_count});
+    else
+        output << "null";
+    output << '}';
+    return std::move(output).str();
+}
 bool GpuAugmentationExecutor::enabled() const noexcept { return impl_->config.enabled; }
 bool GpuAugmentationExecutor::transforms_geometry() const noexcept { return impl_->transforms_geometry; }
 bool GpuAugmentationExecutor::copy_paste_enabled() const noexcept { return impl_->copy_paste; }

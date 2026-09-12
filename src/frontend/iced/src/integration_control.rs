@@ -3370,6 +3370,9 @@ impl Controller {
 
     fn invalidate_atlas_draw(&mut self) {
         // The next ordinary physical draw can arm the same frame at settled geometry.
+        self.atlas_receipt = None;
+        self.atlas_pixels = None;
+        self.atlas_composition = None;
         SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None);
     }
 
@@ -3661,6 +3664,9 @@ impl Controller {
                 viewer,
             } => {
                 if let Some(viewer) = viewer {
+                    // Returning to a retained gallery still requires a draw
+                    // after Detail; an earlier receipt cannot prove that return.
+                    self.invalidate_atlas_draw();
                     self.viewer_drawn = Some((presentation_revision, source_revision, viewer));
                 } else {
                     self.annotation_drawn = Some((presentation_revision, source_revision));

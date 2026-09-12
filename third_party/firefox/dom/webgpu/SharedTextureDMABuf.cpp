@@ -32,7 +32,7 @@ UniquePtr<SharedTextureDMABuf> SharedTextureDMABuf::Create(
     return nullptr;
   }
   UniquePtr<VkImageHandle> handle =
-      MakeUnique<VkImageHandle>(aParent, aDeviceId, vkImage);
+      MakeUnique<VkImageHandle>(vkImage);
 
   const auto dmaBufInfo = wgpu_vkimage_get_dma_buf_info(vkImage);
   if (!dmaBufInfo.is_valid) {
@@ -184,6 +184,7 @@ void SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
     gfxCriticalNoteOnce << "Failed to create VkSemaphore";
     return;
   }
+  auto handle = MakeUnique<VkSemaphoreHandle>(vkSemaphore);
 
   auto rawFd =
       wgpu_vksemaphore_get_file_descriptor(context, mDeviceId, vkSemaphore);
@@ -192,8 +193,7 @@ void SharedTextureDMABuf::onBeforeQueueSubmit(RawId aQueueId) {
     return;
   }
 
-  mVkSemaphoreHandles.AppendElement(
-      MakeUnique<VkSemaphoreHandle>(mParent, mDeviceId, vkSemaphore));
+  mVkSemaphoreHandles.AppendElement(std::move(handle));
   mSemaphoreFds.AppendElement(
       new gfx::FileHandleWrapper(UniqueFileHandle(rawFd)));
 }

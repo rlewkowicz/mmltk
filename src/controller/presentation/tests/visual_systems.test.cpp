@@ -4454,9 +4454,26 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         auto probe = std::make_shared<OpenPreparationProbe>(blocked_call);
         auto entered = probe->entered.get_future();
         auto cancelled = probe->cancelled.get_future();
-        ExploreScenario scenario{settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); }};
+        std::atomic_uint64_t settled_revision{0U};
+        ExploreScenario scenario{
+            settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); },
+            [&](ExploreSystem::event_type event) {
+                if (const auto* changed = std::get_if<ExploreChanged>(&event); changed && !changed->snapshot.busy)
+                    settled_revision.store(changed->snapshot.revision, std::memory_order_release);
+            }};
         auto& explore = scenario.system();
-        if (blocked_call != 0U) { scenario.OpenAndWait({.extent = {64U, 64U}}, "/first"); }
+        const auto wait_settled = [&](const ExploreSnapshot& admitted) {
+            // The typed completion is delivered after worker admission is released.
+            // A snapshot can expose the result while that worker is still returning.
+            REQUIRE(scenario.Wait([&] { return settled_revision.load(std::memory_order_acquire) > admitted.revision; }));
+            CHECK_FALSE(explore.snapshot().busy);
+            CHECK(explore.snapshot().revision > admitted.revision);
+        };
+        if (blocked_call != 0U) {
+            const auto opened = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/first"});
+            wait_settled(opened);
+            REQUIRE(explore.snapshot().ready);
+        }
 
         const auto admission = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/cancelled"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
@@ -4465,7 +4482,7 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         CHECK_FALSE((stopping.busy && !stopping.cancellation_requested));
         REQUIRE(cancelled.wait_for(2s) == std::future_status::ready);
         cancelled.get();
-        REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admission.revision; }));
+        wait_settled(admission);
         const auto settled = explore.snapshot();
         CHECK(settled.ready == (blocked_call != 0U));
         CHECK(settled.dataset.image_count == blocked_call);
@@ -4477,7 +4494,8 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call);
 
         const auto reopened = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/fresh"});
-        REQUIRE(scenario.Wait([&] { return explore.snapshot().ready && explore.snapshot().revision > reopened.revision; }));
+        wait_settled(reopened);
+        REQUIRE(explore.snapshot().ready);
         CHECK(explore.snapshot().dataset.image_count == 1U);
         CHECK(explore.snapshot().frame.valid());
         CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call + 1U);

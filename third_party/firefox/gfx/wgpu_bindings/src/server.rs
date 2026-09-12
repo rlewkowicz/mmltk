@@ -1154,16 +1154,15 @@ pub struct DMABufInfo {
     pub strides: [u64; 3],
 }
 
-#[derive(Debug)]
-
 pub struct VkImageHandle {
-    pub device: vk::Device,
+    device: ash::Device,
     pub image: vk::Image,
     pub memory: vk::DeviceMemory,
     pub memory_size: u64,
     pub memory_type_index: u32,
     pub modifier: u64,
     pub layouts: Vec<vk::SubresourceLayout>,
+    _device_custody: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 // Shared canvas textures support rendering and the copies used by WebGPU
@@ -1175,18 +1174,15 @@ const SHARED_CANVAS_IMAGE_USAGE: vk::ImageUsageFlags = vk::ImageUsageFlags::from
         | vk::ImageUsageFlags::TRANSFER_DST.as_raw(),
 );
 
-impl VkImageHandle {
-    fn destroy(&self, global: &Global, device_id: id::DeviceId) {
+impl Drop for VkImageHandle {
+    fn drop(&mut self) {
         unsafe {
-            let Some(hal_device) = global.device_as_hal::<wgc::api::Vulkan>(device_id) else {
-                return;
-            };
-
-            let device = hal_device.raw_device();
-
-            (device.fp_v1_0().destroy_image)(self.device, self.image, ptr::null());
-            (device.fp_v1_0().free_memory)(self.device, self.memory, ptr::null());
-        };
+            self.device.destroy_image(self.image, None);
+            self.device.free_memory(self.memory, None);
+        }
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.canvas.export_destroyed\",\"vk_device\":\"{:?}\",\"vk_image\":\"{:?}\",\"vk_memory\":\"{:?}\"}}",
+            self.device.handle(), self.image, self.memory));
     }
 }
 
@@ -1320,6 +1316,18 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             }
             Ok(image) => image,
         };
+        // Canvas owners can outlive the WebGPU registry and its IPC parent.
+        // Retain the physical device, including on partial-construction exits.
+        let mut image_handle = VkImageHandle {
+            device: device.clone(),
+            image,
+            memory: vk::DeviceMemory::null(),
+            memory_size: 0,
+            memory_type_index: 0,
+            modifier: 0,
+            layouts: Vec::new(),
+            _device_custody: hal_device.external_image_custody(),
+        };
 
         let mut image_modifier_properties = vk::ImageDrmFormatModifierPropertiesEXT::default();
         let image_drm_format_modifier =
@@ -1372,6 +1380,7 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             }
             Ok(memory) => memory,
         };
+        image_handle.memory = memory;
 
         let result = device.bind_image_memory(image, memory, 0);
         if result.is_err() {
@@ -1406,28 +1415,16 @@ pub extern "C" fn wgpu_vkimage_create_with_dma_buf(
             layouts.push(layout);
         }
 
-        let image_handle = VkImageHandle {
-            device: device.handle(),
-            image,
-            memory,
-            memory_size: memory_req.size,
-            memory_type_index: index as u32,
-            modifier: image_modifier_properties.drm_format_modifier,
-            layouts,
-        };
+        image_handle.memory_size = memory_req.size;
+        image_handle.memory_type_index = index as u32;
+        image_handle.modifier = image_modifier_properties.drm_format_modifier;
+        image_handle.layouts = layouts;
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.canvas.export_created\",\"vk_device\":\"{:?}\",\"vk_image\":\"{:?}\",\"vk_memory\":\"{:?}\",\"memory_size\":{},\"width\":{},\"height\":{}}}",
+            device.handle(), image, memory, memory_req.size, width, height));
 
         Box::into_raw(Box::new(image_handle))
     }
-}
-
-#[no_mangle]
-
-pub unsafe extern "C" fn wgpu_vkimage_destroy(
-    global: &Global,
-    device_id: id::DeviceId,
-    handle: &VkImageHandle,
-) {
-    handle.destroy(global, device_id);
 }
 
 #[no_mangle]
@@ -1747,36 +1744,6 @@ impl MmltkWorkspaceImportError {
 
 const MMLTK_WORKSPACE_DISPATCH_TIMEOUT: Duration = Duration::from_secs(6);
 const MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS: u64 = 6_000_000_000;
-
-fn submit_mmltk_queue_and_wait(
-    device: &ash::Device,
-    queue: vk::Queue,
-    queue_gate: &Arc<Mutex<()>>,
-    command_buffers: &[vk::CommandBuffer],
-) -> Result<(), vk::Result> {
-    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
-    let submission = [vk::SubmitInfo::default().command_buffers(command_buffers)];
-    let submit_result = {
-        let _serialized = queue_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        unsafe { device.queue_submit(queue, &submission, fence) }
-    };
-    if let Err(error) = submit_result {
-        unsafe { device.destroy_fence(fence, None) };
-        return Err(error);
-    }
-    if unsafe { device.wait_for_fences(&[fence], true, MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS) }.is_err()
-    {
-        // The fence and any resources protected by it may still be in use. A
-        // bounded process exit is the only safe terminal; the host owns
-        // peer-loss recovery for its imported allocation.
-        log::error!("WebGPU queue boundary did not complete within the safety deadline");
-        std::process::abort();
-    }
-    unsafe { device.destroy_fence(fence, None) };
-    Ok(())
-}
 
 /// A registered private texture. All frame edges are consumed by the one
 /// bridge dispatcher; this handle only provides synchronous retirement before
@@ -4054,7 +4021,12 @@ impl MmltkWorkspaceBlit {
 
     fn submit_initialization(&self) -> Result<(), vk::Result> {
         let buffers = [self.copy_commands[0]];
-        submit_mmltk_queue_and_wait(&self.device, self.queue, &self.queue_gate, &buffers)
+        unsafe {
+            wgh::vulkan::submit_external_commands_and_wait(
+                &self.device, self.queue, &self.queue_gate, &buffers,
+                MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+            )
+        }
     }
 }
 
@@ -4342,7 +4314,12 @@ impl Global {
                     vk::DependencyFlags::empty(), &[], &[], &[mmltk_workspace_image_barrier(ready, image, range)]);
                 device.end_command_buffer(command)?;
             }
-            submit_mmltk_queue_and_wait(device, arena.queue, &arena.queue_gate, &[command])
+            unsafe {
+                wgh::vulkan::submit_external_commands_and_wait(
+                    device, arena.queue, &arena.queue_gate, &[command],
+                    MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+                )
+            }
         })();
         unsafe { device.destroy_command_pool(pool, None) };
         result
@@ -4832,8 +4809,10 @@ impl Global {
                 }
             }
 
+            let diagnostic_label = mmltk_workspace_channel::workspace_diagnostics_enabled()
+                .then(|| format!("mmltk shared canvas {:?}", texture_id));
             let hal_desc = wgh::TextureDescriptor {
-                label: None,
+                label: diagnostic_label.as_deref(),
                 size: desc.size,
                 mip_level_count: desc.mip_level_count,
                 sample_count: desc.sample_count,
@@ -4844,13 +4823,19 @@ impl Global {
                 view_formats: vec![],
             };
 
-            let hal_texture = <wgh::api::Vulkan as wgh::Api>::Device::texture_from_raw(
+            let mut hal_texture = <wgh::api::Vulkan as wgh::Api>::Device::texture_from_raw(
                 &hal_device,
                 image,
                 &hal_desc,
                 None,
                 wgh::vulkan::TextureMemory::Dedicated(memory),
             );
+            // The swap chain recycles DMA-BUF storage under fresh image IDs.
+            // A new UNDEFINED image still aliases the preceding canvas, whose
+            // final use can be a snapshot copy rather than a render attachment.
+            // Recycling settles compositor custody; order same-queue accesses
+            // within the first image transition without a host wait or copy.
+            hal_texture.set_initial_alias_usage(hal_desc.usage);
 
             let (_, error) = self.create_texture_from_hal(
                 Box::new(hal_texture),
@@ -4866,6 +4851,13 @@ impl Global {
                 return false;
             }
 
+            if mmltk_workspace_channel::workspace_diagnostics_enabled() {
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+                    "{{\"event\":\"firefox.canvas.texture_imported\",\"device_id\":\"{:?}\",\"texture_id\":\"{:?}\",\"vk_device\":\"{:?}\",\"vk_queue\":\"{:?}\",\"vk_image\":\"{:?}\",\"vk_memory\":\"{:?}\",\"export_image\":\"{:?}\",\"export_memory\":\"{:?}\",\"memory_size\":{},\"width\":{},\"height\":{}}}",
+                    device_id, texture_id, device.handle(), hal_device.raw_queue(), image, memory,
+                    vk_image_wrapper.image, vk_image_wrapper.memory, vk_image_wrapper.memory_size,
+                    desc.size.width, desc.size.height));
+            }
             true
         }
     }
@@ -6029,11 +6021,8 @@ pub struct SubmittedWorkDoneClosure {
     pub user_data: *mut u8,
 }
 
-#[derive(Debug)]
-
 pub struct VkSemaphoreHandle {
-    pub semaphore: vk::Semaphore,
-    queue_id: id::QueueId,
+    semaphore: wgh::vulkan::ExternalSignalSemaphore,
 }
 
 #[no_mangle]
@@ -6062,11 +6051,13 @@ pub extern "C" fn wgpu_vksemaphore_create_signal_semaphore(
             Ok(semaphore) => semaphore,
         };
 
-        hal_queue.add_signal_semaphore(semaphore, None);
-
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.canvas.signal_created\",\"vk_device\":\"{:?}\",\"vk_queue\":\"{:?}\",\"vk_semaphore\":\"{:?}\"}}",
+            device.handle(), hal_queue.as_raw(), semaphore));
         VkSemaphoreHandle {
-            semaphore,
-            queue_id,
+            semaphore: hal_queue.own_signal_semaphore(
+                semaphore, None, MMLTK_WORKSPACE_QUEUE_TIMEOUT_NS,
+            ),
         }
     };
 
@@ -6093,7 +6084,7 @@ pub unsafe extern "C" fn wgpu_vksemaphore_get_file_descriptor(
                 let external_semaphore_fd =
                     khr::external_semaphore_fd::Device::new(instance, device);
                 let get_fd_info = vk::SemaphoreGetFdInfoKHR::default()
-                    .semaphore(handle.semaphore)
+                    .semaphore(handle.semaphore.as_raw())
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
 
                 external_semaphore_fd.get_semaphore_fd(&get_fd_info).ok()
@@ -6106,41 +6097,15 @@ pub unsafe extern "C" fn wgpu_vksemaphore_get_file_descriptor(
 
 #[no_mangle]
 
-pub unsafe extern "C" fn wgpu_vksemaphore_destroy(
-    global: &Global,
-    device_id: id::DeviceId,
-    handle: &VkSemaphoreHandle,
-) {
-    unsafe {
-        if let Some(hal_queue) = global.queue_as_hal::<wgc::api::Vulkan>(handle.queue_id) {
-            if !hal_queue.remove_signal_semaphore(handle.semaphore) {
-                let queue_gate = hal_queue.queue_operation_gate();
-                if submit_mmltk_queue_and_wait(
-                    hal_queue.raw_device(),
-                    hal_queue.as_raw(),
-                    &queue_gate,
-                    &[],
-                )
-                .is_err()
-                {
-                    std::process::abort();
-                }
-            }
-        }
-
-        let Some(hal_device) = global.device_as_hal::<wgc::api::Vulkan>(device_id) else {
-            emit_critical_invalid_note("Vulkan device");
-            return;
-        };
-        let device = hal_device.raw_device();
-        device.destroy_semaphore(handle.semaphore, None);
-    };
-}
-
-#[no_mangle]
-
 pub unsafe extern "C" fn wgpu_vksemaphore_delete(handle: *mut VkSemaphoreHandle) {
+    let diagnostic_semaphore = mmltk_workspace_channel::workspace_diagnostics_enabled()
+        .then(|| (*handle).semaphore.as_raw());
     let _ = Box::from_raw(handle);
+    if let Some(semaphore) = diagnostic_semaphore {
+        mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+            "{{\"event\":\"firefox.canvas.signal_destroyed\",\"vk_semaphore\":\"{:?}\"}}",
+            semaphore));
+    }
 }
 
 #[no_mangle]

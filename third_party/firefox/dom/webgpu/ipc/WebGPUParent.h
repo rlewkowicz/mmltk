@@ -250,41 +250,33 @@ class WebGPUParent final : public PWebGPUParent, public SupportsWeakPtr {
 };
 
 #if defined(XP_LINUX) && !0
-class VkImageHandle {
+class VkImageHandle final {
  public:
-  explicit VkImageHandle(WebGPUParent* aParent,
-                         const ffi::WGPUDeviceId aDeviceId,
-                         ffi::WGPUVkImageHandle* aVkImageHandle)
-      : mParent(aParent),
-        mDeviceId(aDeviceId),
-        mVkImageHandle(aVkImageHandle) {}
+  explicit VkImageHandle(ffi::WGPUVkImageHandle* aVkImageHandle)
+      : mVkImageHandle(aVkImageHandle) {}
+  VkImageHandle(const VkImageHandle&) = delete;
+  VkImageHandle& operator=(const VkImageHandle&) = delete;
 
   const ffi::WGPUVkImageHandle* Get() { return mVkImageHandle; }
 
   ~VkImageHandle();
 
- protected:
-  const WeakPtr<WebGPUParent> mParent;
-  const RawId mDeviceId;
+ private:
   ffi::WGPUVkImageHandle* mVkImageHandle;
 };
 
-class VkSemaphoreHandle {
+class VkSemaphoreHandle final {
  public:
-  explicit VkSemaphoreHandle(WebGPUParent* aParent,
-                             const ffi::WGPUDeviceId aDeviceId,
-                             ffi::WGPUVkSemaphoreHandle* aVkSemaphoreHandle)
-      : mParent(aParent),
-        mDeviceId(aDeviceId),
-        mVkSemaphoreHandle(aVkSemaphoreHandle) {}
+  explicit VkSemaphoreHandle(ffi::WGPUVkSemaphoreHandle* aVkSemaphoreHandle)
+      : mVkSemaphoreHandle(aVkSemaphoreHandle) {}
+  VkSemaphoreHandle(const VkSemaphoreHandle&) = delete;
+  VkSemaphoreHandle& operator=(const VkSemaphoreHandle&) = delete;
 
   const ffi::WGPUVkSemaphoreHandle* Get() { return mVkSemaphoreHandle; }
 
   ~VkSemaphoreHandle();
 
- protected:
-  const WeakPtr<WebGPUParent> mParent;
-  const RawId mDeviceId;
+ private:
   ffi::WGPUVkSemaphoreHandle* mVkSemaphoreHandle;
 };
 #endif

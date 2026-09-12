@@ -113,4 +113,14 @@ ExploreStorageStatus probe_explore_rendered_card(const ExploreRenderTargetView& 
         detail::probe_explore_rendered_card_cuda(clean, semantic, probe, device_counts, reinterpret_cast<cudaStream_t>(stream)));
 }
 
+ExploreStorageStatus sample_explore_rendered_card(const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic,
+                                                  const ExploreRenderTargetView& reference, std::uint64_t* const device_samples,
+                                                  const std::uintptr_t stream) noexcept {
+    if (stream == 0U || device_samples == nullptr || !clean.valid() || !semantic.valid() || clean.width != semantic.width ||
+        clean.height != semantic.height || (reference.data != nullptr && !reference.valid()))
+        return static_cast<ExploreStorageStatus>(cudaErrorInvalidValue);
+    return static_cast<ExploreStorageStatus>(
+        detail::sample_explore_rendered_card_cuda(clean, semantic, reference, device_samples, reinterpret_cast<cudaStream_t>(stream)));
+}
+
 }  // namespace mmltk::backend::imaging::explore

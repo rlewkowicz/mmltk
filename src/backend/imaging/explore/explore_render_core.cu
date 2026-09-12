@@ -390,6 +390,26 @@ __global__ void probe_rendered_card_kernel(const ExploreRenderTargetView clean_v
     atomicAdd(counts + (on_edge ? 2U : 3U), 1ULL);
 }
 
+__global__ void sample_rendered_card_kernel(const ExploreRenderTargetView clean, const ExploreRenderTargetView semantic,
+                                            const ExploreRenderTargetView reference, const ExploreRenderedCardSampleGridAbi grid,
+                                            std::uint64_t* samples) {
+    const auto index = static_cast<std::size_t>(threadIdx.x);
+    if (index >= grid.kSampleCount) return;
+    const auto x_percent = grid.percent[index % grid.kAxisCount];
+    const auto y_percent = grid.percent[index / grid.kAxisCount];
+    const auto sample = [&](const ExploreRenderTargetView target) -> std::uint64_t {
+        if (target.data == nullptr) return 0U;
+        const auto x = static_cast<std::uint32_t>(static_cast<std::uint64_t>(x_percent) * target.width / 100U);
+        const auto y = static_cast<std::uint32_t>(static_cast<std::uint64_t>(y_percent) * target.height / 100U);
+        const auto* row = reinterpret_cast<const uchar4*>(target.data + static_cast<std::size_t>(y) * target.pitch_bytes);
+        const auto pixel = row[x];
+        return static_cast<std::uint64_t>(pixel.x) | (static_cast<std::uint64_t>(pixel.y) << 8U) |
+               (static_cast<std::uint64_t>(pixel.z) << 16U) | (static_cast<std::uint64_t>(pixel.w) << 24U);
+    };
+    samples[index * grid.kWordsPerSample] = sample(clean) | (sample(semantic) << 32U);
+    samples[index * grid.kWordsPerSample + 1U] = sample(reference);
+}
+
 }  // namespace
 
 cudaError_t render_explore_atlas_tiles_cuda(const ExploreRenderAtlasView& view, const ExploreRenderTileBatchView& tiles,
@@ -458,6 +478,13 @@ cudaError_t probe_explore_rendered_card_cuda(const ExploreRenderTargetView& clea
     const std::uint64_t pixels = static_cast<std::uint64_t>(clean.width) * clean.height;
     probe_rendered_card_kernel<<<static_cast<unsigned int>((pixels + threads - 1U) / threads), threads, 0U, stream>>>(
         clean, semantic, probe, reinterpret_cast<unsigned long long*>(counts));
+    return cudaPeekAtLastError();
+}
+
+cudaError_t sample_explore_rendered_card_cuda(const ExploreRenderTargetView& clean, const ExploreRenderTargetView& semantic,
+                                              const ExploreRenderTargetView& reference, std::uint64_t* const samples,
+                                              const cudaStream_t stream) noexcept {
+    sample_rendered_card_kernel<<<1U, 32U, 0U, stream>>>(clean, semantic, reference, ExploreRenderedCardSampleGridAbi{}, samples);
     return cudaPeekAtLastError();
 }
 

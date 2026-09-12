@@ -1035,8 +1035,88 @@ pub struct Queue {
     device: Arc<DeviceShared>,
     family_index: u32,
     relay_semaphores: Mutex<RelaySemaphores>,
-    signal_semaphores: Mutex<SemaphoreList>,
+    signal_semaphores: Arc<Mutex<SemaphoreList>>,
     wait_semaphores: Mutex<SemaphoreList>,
+}
+
+/// An externally exported signal and its physical device custody. The owner may
+/// outlive the WebGPU queue registry, but not the completion of its submitted
+/// signal. Dropping a signal that has not yet been submitted cancels it.
+pub struct ExternalSignalSemaphore {
+    raw: vk::Semaphore,
+    device: Arc<DeviceShared>,
+    pending: Arc<Mutex<SemaphoreList>>,
+    timeout_ns: u64,
+}
+
+impl fmt::Debug for ExternalSignalSemaphore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExternalSignalSemaphore")
+            .field("raw", &self.raw)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExternalSignalSemaphore {
+    pub fn as_raw(&self) -> vk::Semaphore {
+        self.raw
+    }
+}
+
+impl Drop for ExternalSignalSemaphore {
+    fn drop(&mut self) {
+        // Submit takes the queue gate before draining the pending list. Release
+        // the list lock before taking that gate, preserving the same ordering.
+        let was_pending = self.pending.lock().remove(self.raw);
+        if !was_pending {
+            let result = unsafe {
+                submit_external_commands_and_wait(
+                    &self.device.raw, self.device.raw_queue,
+                    &self.device.queue_operation_gate, &[], self.timeout_ns,
+                )
+            };
+            if result.is_err() {
+                // No completion proof: destroying a possibly submitted signal
+                // would be unsafe, even if its WebGPU registry entry is gone.
+                std::process::abort();
+            }
+        }
+        unsafe { self.device.raw.destroy_semaphore(self.raw, None) };
+    }
+}
+
+/// Submit external work on the shared queue and establish physical completion
+/// within a bounded wait. Failure after submission is terminal: callers must
+/// never resume resource cleanup while that work may still be using it.
+///
+/// # Safety
+///
+/// The device and queue must be live, `queue_gate` must serialize every operation
+/// on this queue, and command buffers and their resources must remain valid.
+pub unsafe fn submit_external_commands_and_wait(
+    device: &ash::Device,
+    queue: vk::Queue,
+    queue_gate: &Arc<std::sync::Mutex<()>>,
+    command_buffers: &[vk::CommandBuffer],
+    timeout_ns: u64,
+) -> Result<(), vk::Result> {
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+    let submission = [vk::SubmitInfo::default().command_buffers(command_buffers)];
+    let submit_result = {
+        let _serialized = queue_gate.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe { device.queue_submit(queue, &submission, fence) }
+    };
+    if let Err(error) = submit_result {
+        unsafe { device.destroy_fence(fence, None) };
+        return Err(error);
+    }
+    if unsafe { device.wait_for_fences(&[fence], true, timeout_ns) }.is_err() {
+        log::error!("External queue boundary did not complete within the safety deadline");
+        std::process::abort();
+    }
+    unsafe { device.destroy_fence(fence, None) };
+    Ok(())
 }
 
 impl fmt::Debug for Queue {
@@ -1204,6 +1284,7 @@ pub struct Texture {
     copy_size: crate::CopyExtent,
     identity: ResourceIdentity<vk::Image>,
     external_layout: Option<vk::ImageLayout>,
+    initial_alias_usage: wgt::TextureUses,
 
     drop_guard: Option<crate::DropGuard>,
 }
@@ -1211,6 +1292,16 @@ pub struct Texture {
 impl crate::DynTexture for Texture {}
 
 impl Texture {
+    /// Order initialization after earlier accesses through an alias of this
+    /// image's backing memory, even though this image starts in UNDEFINED.
+    ///
+    /// # Safety
+    /// `usage` must cover every earlier alias access on this queue. The caller
+    /// must separately settle external users and prevent concurrent alias use.
+    pub unsafe fn set_initial_alias_usage(&mut self, usage: wgt::TextureUses) {
+        self.initial_alias_usage = usage;
+    }
+
     /// Preserve the layout negotiated for an externally owned sampled image.
     ///
     /// # Safety
@@ -1898,21 +1989,27 @@ impl Queue {
         Arc::clone(&self.device.queue_operation_gate)
     }
 
-    pub fn add_signal_semaphore(&self, semaphore: vk::Semaphore, semaphore_value: Option<u64>) {
+    /// Take ownership of an external semaphore and signal it on the next submit.
+    ///
+    /// # Safety
+    ///
+    /// `semaphore` must belong to this device. The returned owner is its sole
+    /// Vulkan owner; callers must not submit other operations using this handle.
+    pub unsafe fn own_signal_semaphore(
+        &self, semaphore: vk::Semaphore, semaphore_value: Option<u64>, timeout_ns: u64,
+    ) -> ExternalSignalSemaphore {
         let mut guard = self.signal_semaphores.lock();
         if let Some(value) = semaphore_value {
             guard.push_signal(SemaphoreType::Timeline(semaphore, value));
         } else {
             guard.push_signal(SemaphoreType::Binary(semaphore));
         }
-    }
-
-    /// Remove `semaphore` from the pending signal list if it is still present.
-    ///
-    /// Returns `true` if the semaphore was found and removed. If the submit
-    /// already consumed it, this is a harmless no-op that returns `false`.
-    pub fn remove_signal_semaphore(&self, semaphore: vk::Semaphore) -> bool {
-        self.signal_semaphores.lock().remove(semaphore)
+        ExternalSignalSemaphore {
+            raw: semaphore,
+            device: Arc::clone(&self.device),
+            pending: Arc::clone(&self.signal_semaphores),
+            timeout_ns,
+        }
     }
 
     /// Stage a semaphore wait on the next [`crate::Queue::submit`] call.

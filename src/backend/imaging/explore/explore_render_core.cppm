@@ -88,6 +88,7 @@ using ExploreRenderSemanticView = detail::ExploreRenderSemanticViewAbi;
 using ExploreRenderAtlasView = detail::ExploreRenderAtlasViewAbi;
 using ExploreRenderDetailView = detail::ExploreRenderDetailViewAbi;
 using ExploreRenderedCardProbe = detail::ExploreRenderedCardProbeAbi;
+using ExploreRenderedCardSampleGrid = detail::ExploreRenderedCardSampleGridAbi;
 
 // Patches one or more disjoint regions of an already allocated atlas. A tile
 // with placeholder set writes the deterministic placeholder without reading a
@@ -121,5 +122,15 @@ using ExploreRenderedCardProbe = detail::ExploreRenderedCardProbeAbi;
                                                                const ExploreRenderTargetView& semantic,
                                                                const ExploreRenderedCardProbe& probe, std::uint64_t* device_counts,
                                                                std::uintptr_t stream) noexcept;
+
+// Samples a fixed compact grid of clean, semantic, and optional retained clean
+// pixels at floor(percent * extent / 100) independently in each target.
+// The caller supplies ExploreRenderedCardSampleGrid::kSampleCount *
+// ExploreRenderedCardSampleGrid::kWordsPerSample device values
+// and owns all storage, submission, and transfer as for the other probes.
+[[nodiscard]] ExploreStorageStatus sample_explore_rendered_card(const ExploreRenderTargetView& clean,
+                                                                const ExploreRenderTargetView& semantic,
+                                                                const ExploreRenderTargetView& reference, std::uint64_t* device_samples,
+                                                                std::uintptr_t stream) noexcept;
 
 }  // namespace mmltk::backend::imaging::explore

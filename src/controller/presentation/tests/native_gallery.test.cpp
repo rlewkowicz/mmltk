@@ -819,7 +819,8 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
             if (fact.operation == VisualDiagnosticOperation::ExploreProbeBatchSubmitted) {
                 CHECK(fact.value > 0U);
                 CHECK(fact.value <= kExploreVisibleItemCapacity);
-                CHECK(fact.context.staging_bytes == fact.value * 7U * sizeof(std::uint64_t));
+                // Seven counters plus two packed pixel words at each of 25 grid points.
+                CHECK(fact.context.staging_bytes == fact.value * 57U * sizeof(std::uint64_t));
             }
             if (fact.operation != VisualDiagnosticOperation::ExploreRenderSubmitted || fact.context.condition == 0U) continue;
             CHECK(fact.detail == columns * 2U);

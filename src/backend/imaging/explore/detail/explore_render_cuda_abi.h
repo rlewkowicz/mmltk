@@ -108,6 +108,16 @@ struct ExploreRenderedCardProbeAbi final {
     std::uint32_t box_height = 0U;
 };
 
+// A bounded row-major grid shared by collection and diagnostic formatting.
+// Each point produces two uint64 values: clean/semantic RGBA in low/high
+// halves of the first, and retained clean RGBA in the low half of the second.
+struct ExploreRenderedCardSampleGridAbi final {
+    static constexpr std::size_t kAxisCount = 5U;
+    static constexpr std::size_t kSampleCount = kAxisCount * kAxisCount;
+    static constexpr std::size_t kWordsPerSample = 2U;
+    std::uint32_t percent[kAxisCount]{5U, 35U, 50U, 65U, 95U};
+};
+
 struct ExploreRenderScratchCapacitiesAbi final {
     std::uint32_t cards = 0U;
     std::uint32_t annotations = 0U;

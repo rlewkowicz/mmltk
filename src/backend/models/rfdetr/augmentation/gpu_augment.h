@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment_cuda.h"
@@ -115,6 +116,10 @@ class GpuAugmentationExecutor final {
     // Image parameters and returned semantic geometry/erasure are planned together.
     // The returned plan remains owned by this executor and is replaced by the next run.
     [[nodiscard]] const AugmentationBatchPlan& plan() const noexcept;
+    // Opt-in diagnostic JSON from the actual host plan and staged launch parameters.
+    // Call after Run/RunTraining returns, with that run's staging slot, before
+    // reconfiguration or another run. Reads no device storage and retains nothing.
+    [[nodiscard]] std::string prepared_image_diagnostic(std::size_t image, std::size_t staging_slot) const;
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] bool transforms_geometry() const noexcept;
     [[nodiscard]] bool copy_paste_enabled() const noexcept;

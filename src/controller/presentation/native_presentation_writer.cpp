@@ -281,10 +281,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirement, *source, 1U);
                 return true;
             });
-            if (retiring_ && retiring_->id == retired->id) {
-                DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *retiring_, 1U);
-                retiring_.reset();
-            }
+            for (auto& arena : retiring_)
+                if (arena && arena->id == retired->id) {
+                    DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *arena, 1U);
+                    arena.reset();
+                }
         }
         while (auto outcome = channel_.take_outcome())
             Accept(std::move(*outcome));
@@ -320,11 +321,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirement, *source, source_released ? 1U : 0U);
             }
             sources_.clear();
-            for (const auto* arena : {active_.get(), candidate_.get(), retiring_.get()})
+            for (const auto* arena : {active_.get(), candidate_.get(), retiring_[0].get(), retiring_[1].get()})
                 if (arena) DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *arena, released ? 1U : 0U);
             active_.reset();
             candidate_.reset();
-            retiring_.reset();
+            for (auto& arena : retiring_)
+                arena.reset();
             pending_.reset();
         } catch (...) { return Retirement::UnsafeFailure; }
         return released ? Retirement::Released : Retirement::ReleasedWithFailure;
@@ -463,22 +465,32 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     static bool Contains(const SampleArena& arena, VisualExtent extent) noexcept {
         return arena.extent.width >= extent.width && arena.extent.height >= extent.height;
     }
+    void RetireArena(std::unique_ptr<SampleArena>& arena, VisualDiagnosticOperation operation) {
+        const auto slot = std::ranges::find_if(retiring_, [](const auto& value) { return !value; });
+        if (slot == retiring_.end()) throw std::runtime_error("Firefox arena retirement capacity exceeded");
+        const auto withdrawal = channel_.withdraw(arena->id);
+        if (withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Invalid ||
+            withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Capacity)
+            throw std::runtime_error("Firefox arena withdrawal failed");
+        DiagnoseArena(operation, *arena, 1U);
+        *slot = std::move(arena);
+        RetireSources();
+    }
     SampleArena* EnsureArena(VisualExtent extent) {
         if (candidate_) {
             if (Contains(*candidate_, extent)) return candidate_.get();
-            if (candidate_->ready && !retiring_) {
-                const auto withdrawal = channel_.withdraw(candidate_->id);
-                if (withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Invalid ||
-                    withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Capacity)
-                    throw std::runtime_error("Firefox candidate arena withdrawal failed");
-                DiagnoseArena(VisualDiagnosticOperation::PresentationCandidateWithdrawal, *candidate_, 1U);
-                retiring_ = std::move(candidate_);
-                RetireSources();
-            }
+            if (candidate_->ready && std::ranges::any_of(retiring_, [](const auto& arena) { return !arena; }))
+                RetireArena(candidate_, VisualDiagnosticOperation::PresentationCandidateWithdrawal);
             return nullptr;
         }
         if (active_ && Contains(*active_, extent)) return active_.get();
-        if (retiring_) return nullptr;
+        // A retained browser fallback can outlive a newer native publication
+        // that was superseded before acquisition. Admit the third arena so
+        // growth can replace that intermediate image without waiting for the
+        // fallback it must preserve. Every retiring arena still needs its
+        // own physical retirement receipt.
+        const auto live = std::ranges::count_if(retiring_, [](const auto& arena) { return bool(arena); }) + bool(active_);
+        if (live >= 3) return nullptr;
         auto arena = std::make_unique<SampleArena>();
         arena->id = native::WorkspaceSurfaceImportId::generate();
         arena->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
@@ -598,7 +610,9 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     }
     void RetireSources() {
         for (auto& source : sources_)
-            if (source->workspace->retired() || (retiring_ && source->arena() == retiring_->id)) Withdraw(*source);
+            if (source->workspace->retired() ||
+                std::ranges::any_of(retiring_, [&](const auto& arena) { return arena && source->arena() == arena->id; }))
+                Withdraw(*source);
     }
     PresentationNativeOutcome Supersede() {
         const auto submitted = pending_->submitted;
@@ -782,14 +796,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         Diagnose(VisualDiagnosticOperation::PresentationFrameEdge, transfer, transfer.publication.timeline_ready);
         stage_ = Stage::Idle;
         if (candidate_ && source.arena() == candidate_->id) {
-            if (active_) {
-                const auto withdrawal = channel_.withdraw(active_->id);
-                if (withdrawal.progress == native::WorkspaceSurfaceWithdrawalProgress::Invalid)
-                    throw std::runtime_error("Firefox sample arena withdrawal failed");
-                DiagnoseArena(VisualDiagnosticOperation::PresentationActiveWithdrawal, *active_, 1U);
-                retiring_ = std::move(active_);
-                RetireSources();
-            }
+            if (active_) RetireArena(active_, VisualDiagnosticOperation::PresentationActiveWithdrawal);
             active_ = std::move(candidate_);
             DiagnoseArena(VisualDiagnosticOperation::PresentationReplacement, *active_, 1U);
         }
@@ -957,7 +964,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::shared_ptr<ScopedFd> wake_;
     Completion completion_;
     std::vector<std::unique_ptr<AdmittedSource>> sources_;
-    std::unique_ptr<SampleArena> active_, candidate_, retiring_;
+    std::unique_ptr<SampleArena> active_, candidate_;
+    std::array<std::unique_ptr<SampleArena>, 2> retiring_;
     std::optional<Pending> pending_;
     std::optional<Transfer> transfer_;
     std::unique_ptr<gpu::ImageProductReadCompletion> source_read_;

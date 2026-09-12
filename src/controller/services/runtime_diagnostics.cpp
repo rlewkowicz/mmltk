@@ -56,6 +56,14 @@ namespace {
     return true;
 }
 
+[[nodiscard]] bool valid_message_size(const RuntimeDiagnosticFact& fact) noexcept {
+    // These bounded numeric objects batch one prepared image or one card grid.
+    // The final encoder still enforces the unchanged whole-record capacity.
+    const bool image_details = fact.owner == contracts::DiagnosticOwner::Explore &&
+                               (fact.event == "explore.augmentation.image.prepared" || fact.event == "explore.card.pixel_samples");
+    return fact.message.size() <= (image_details ? 4096U : 1024U);
+}
+
 namespace wire = mmltk::frameworks::serialization::wire;
 
 class BoundedJsonWriter;
@@ -393,7 +401,7 @@ void RuntimeDiagnosticTarget::State::write(const DiagnosticsProducer::Operation&
         fail_delivery();
         return;
     }
-    if (fact.message.size() > 1024U) {
+    if (!valid_message_size(fact)) {
         fail_delivery();
         return;
     }
@@ -421,7 +429,7 @@ void RuntimeDiagnosticTarget::State::write_batch(const std::span<const RuntimeDi
     for (const auto& fact : facts) {
         const std::string_view owner = owner_name(fact.owner);
         if (owner.empty() || !valid_event_name(fact.event) || (!fact.participant.empty() && !valid_event_name(fact.participant)) ||
-            fact.message.size() > 1024U) {
+            !valid_message_size(fact)) {
             fail_delivery();
             return;
         }

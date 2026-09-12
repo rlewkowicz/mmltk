@@ -237,7 +237,16 @@ impl crate::CommandEncoder for super::CommandEncoder {
                 bar.texture.format,
                 &self.device.private_caps,
             );
-            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(bar.usage.from);
+            // Discarding contents does not discard dependencies on earlier
+            // accesses through a recycled backing allocation's previous image.
+            let src_usage = if bar.usage.from == wgt::TextureUses::UNINITIALIZED
+                && !bar.texture.initial_alias_usage.is_empty()
+            {
+                bar.texture.initial_alias_usage
+            } else {
+                bar.usage.from
+            };
+            let (src_stage, src_access) = conv::map_texture_usage_to_barrier(src_usage);
             let src_layout = bar.texture.external_layout.unwrap_or_else(||
                 conv::derive_image_layout(bar.usage.from, bar.texture.format));
             src_stages |= src_stage;

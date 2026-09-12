@@ -73,9 +73,15 @@ VULKAN_RUST_OBJECT = re.compile(
     r"\(type:\s*(?P<type>[A-Z0-9_]+),\s*hndl:\s*(?P<handle>0x[0-9a-fA-F]+)"
     r"(?:,\s*name:\s*(?P<name>[^)\r\n]*))?\)"
 )
-# Project only physical workspace resource types into the existing native fields.
-# Device/queue/command-buffer handles remain message facts, never broad join keys.
-VULKAN_RESOURCE_FIELDS = {"IMAGE": "vk_image", "DEVICE_MEMORY": "vk_memory"}
+VULKAN_REFERENCE = re.compile(
+    r"\bVk(?P<type>[A-Z][A-Za-z0-9]*)[ \t]+(?P<handle>0x[0-9a-fA-F]+)"
+    r"\[(?P<name>[^\]\r\n]*)\]"
+)
+# Typed resource joins retain the existing process/file scopes. Device and queue
+# references remain message facts, never broad join keys.
+VULKAN_RESOURCE_FIELDS = {
+    "IMAGE": "vk_image", "DEVICE_MEMORY": "vk_memory", "COMMAND_BUFFER": "vk_command_buffer",
+}
 FAILURE_WORD = re.compile(
     r"(?<![a-z])(?:error|fatal|panic|failed|failure|exception|crash|timeout|timed out"
     r"|segmentation fault|sigsegv|sigabrt|sigbus|aborted)(?![a-z])",
@@ -440,9 +446,18 @@ def lookup(data, name):
         return data[name]
     value = data
     for part in name.split("."):
-        if not isinstance(value, dict) or part not in value:
+        if isinstance(value, dict) and part in value:
+            value = value[part]
+        elif isinstance(value, list):
+            try:
+                index = int(part)
+            except ValueError:
+                return MISSING
+            if str(index) != part or not 0 <= index < len(value):
+                return MISSING
+            value = value[index]
+        else:
             return MISSING
-        value = value[part]
     return value
 
 
@@ -532,14 +547,17 @@ def vulkan_handle(value, *, allow_null=False):
 
 def vulkan_resources(data):
     """One typed projection for diagnostic objects and existing workspace records."""
-    objects = data.get("objects", ())
     result = {}
-    if isinstance(objects, list):
-        for item in objects[:MAX_VULKAN_OBJECTS]:
-            if (isinstance(item, dict) and isinstance(item.get("type"), str)
-                    and (name := VULKAN_RESOURCE_FIELDS.get(item["type"]))):
-                if handle := vulkan_handle(item.get("handle")):
-                    result[name, handle] = None
+    remaining = MAX_VULKAN_OBJECTS
+    for collection in ("objects", "referenced_objects"):
+        objects = data.get(collection)
+        if isinstance(objects, list):
+            for item in objects[:remaining]:
+                if (isinstance(item, dict) and isinstance(item.get("type"), str)
+                        and (name := VULKAN_RESOURCE_FIELDS.get(item["type"]))):
+                    if handle := vulkan_handle(item.get("handle")):
+                        result[name, handle] = None
+            remaining -= min(len(objects), remaining)
     for name in VULKAN_RESOURCE_FIELDS.values():
         if handle := vulkan_handle(value_from(data, name, "fields." + name)):
             result[name, handle] = None
@@ -734,23 +752,34 @@ def vulkan_diagnostic(message, data):
     api = re.search(r"\b(vk[A-Z][A-Za-z0-9]+)\s*\(", message)
     if api:
         data["api"] = api[1]
-    objects = {}
+    objects, references = {}, {}
     overflow = False
-    for pattern in (VULKAN_OBJECT, VULKAN_RUST_OBJECT):
-        for match in pattern.finditer(message):
+    for pattern, destination in ((VULKAN_OBJECT, objects), (VULKAN_RUST_OBJECT, objects),
+                                 (VULKAN_REFERENCE, references)):
+        # Callback debug names are labels, not additional resource assertions.
+        text = VULKAN_RUST_OBJECT.sub("", message) if pattern is VULKAN_REFERENCE else message
+        for match in pattern.finditer(text):
             handle = vulkan_handle(match["handle"], allow_null=True)
             if handle is None:
                 continue
-            key = match["type"], handle
-            if key not in objects:
-                if len(objects) == MAX_VULKAN_OBJECTS:
+            kind = match["type"]
+            if pattern is VULKAN_REFERENCE:
+                # The validation formatter names the type explicitly. Normalize
+                # CamelCase (including extension suffixes), never infer it from
+                # a bare hexadecimal value or surrounding access terminology.
+                kind = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", kind).upper()
+            key = kind, handle
+            if key not in destination:
+                if len(objects) + len(references) == MAX_VULKAN_OBJECTS:
                     overflow = True
                     continue
-                objects[key] = {"type": match["type"], "handle": handle}
+                destination[key] = {"type": kind, "handle": handle}
             name = match.groupdict().get("name")
             if name is not None:
-                objects[key]["name"] = name
+                destination[key]["name"] = name
     data["objects"] = list(objects.values())
+    if references:
+        data["referenced_objects"] = list(references.values())
     return "Vulkan object facts exceed bounded capacity; original text retained" if overflow else ""
 
 
@@ -813,6 +842,16 @@ def parse_record(source, line, raw, truncated=False):
                 data[key] = scalar(value, value.startswith(("'", '"')))
             except (ValueError, SyntaxError):
                 data[key] = value
+    details = value_from(data, "message", "fields.message")
+    if isinstance(details, str) and len(details) <= 4096 and details.lstrip().startswith("{"):
+        try:
+            decoded_details = JSON_DECODER.decode(details)
+            if isinstance(decoded_details, dict):
+                # Keep the message verbatim and expose bounded object details to
+                # ordinary nested-field filters and projections, without an event schema.
+                data.setdefault("message_fields", decoded_details)
+        except (ValueError, RecursionError):
+            pass
     return Record(source, line, clean, data, log_format, error)
 
 
@@ -3260,7 +3299,7 @@ def render_record(item, options):
     if "representative_count" in record.metadata:
         facts.append(f"occurrences={record.metadata['representative_count']}")
     if event == "vulkan.validation":
-        for name in ("validation_id", "message_id", "api", "objects"):
+        for name in ("validation_id", "message_id", "api", "objects", "referenced_objects"):
             if (value := record.get(name)) is not MISSING:
                 facts.append(f"{name}={compact(value, None)}")
     for name in ("trace_id", "span_id", "@surface", "@workspace_source", "source_session", "source_instance",

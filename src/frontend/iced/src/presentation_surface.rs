@@ -15,7 +15,14 @@ thread_local! {
 }
 
 pub(crate) fn initialize_diagnostics(surface_trace: bool, pixel_trace: bool) {
-    SURFACE_TRACE_ENABLED.with(|flag| flag.set(surface_trace));
+    SURFACE_TRACE_ENABLED.with(|flag| {
+        #[cfg(target_arch = "wasm32")]
+        if flag.get() && !surface_trace {
+            LAST_ACQUISITION_AUTHORIZATION.with(|last| *last.borrow_mut() = None);
+            LAST_ACQUISITION_REQUEST.with(|last| last.set(None));
+        }
+        flag.set(surface_trace);
+    });
     pixel_trace::initialize(surface_trace && pixel_trace);
 }
 
@@ -919,20 +926,39 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 }
                 let changed = DRAW_AUTHORIZATION.with(|authorization| {
                     let mut authorization = authorization.borrow_mut();
-                    if authorization
+                    let trace = surface_trace_enabled()
+                        .then(|| acquisition_trace_fields(&authorization));
+                    let matched = authorization
                         .acquiring
                         .as_ref()
                         .and_then(|offer| offer.surface.frame)
-                        .is_some_and(|offer| same_publication(offer, ready))
-                    {
+                        .is_some_and(|offer| same_publication(offer, ready));
+                    let changed = if matched {
                         authorization.acquiring = None;
-                        return authorization
+                        authorization
                             .offered
                             .as_ref()
                             .and_then(|offer| offer.surface.frame)
-                            .is_some_and(|offer| !same_publication(offer, ready));
+                            .is_some_and(|offer| !same_publication(offer, ready))
+                    } else {
+                        false
+                    };
+                    if let Some(trace) = trace {
+                        let reason = if changed {
+                            "different_offer_waiting"
+                        } else if matched {
+                            "no_different_offer"
+                        } else {
+                            "no_matching_acquisition"
+                        };
+                        emit_surface_trace(&format!(
+                            "{{\"event\":\"iced.frame.acquire_miss_received\",\"surface\":\"{:016x}{:016x}\",\"reason\":\"{reason}\",\"matched_acquisition\":{matched},\"acquiring_cleared\":{matched},\"wake_required\":{changed}{},\"authorization_before\":{{{trace}}}}}",
+                            ready.high,
+                            ready.low,
+                            frame_trace_fields(Some(ready)),
+                        ));
                     }
-                    false
+                    changed
                 });
                 if changed {
                     pending.borrow_mut().drawn = true;
@@ -1681,6 +1707,216 @@ struct DrawAuthorization {
     acquiring: Option<PendingImage>,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AcquisitionRequestTrace {
+    reason: &'static str,
+    requested: Option<Surface>,
+    offered: Option<Surface>,
+    acquiring: Option<Surface>,
+    draw: Option<FrameReady>,
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    // Only enabled diagnostics access these bounded, effect-only comparisons.
+    // They retain identities and text, never sample readers or model owners.
+    static LAST_ACQUISITION_AUTHORIZATION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static LAST_ACQUISITION_REQUEST: std::cell::Cell<Option<AcquisitionRequestTrace>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+fn acquisition_trace_fields(authorization: &DrawAuthorization) -> String {
+    // Offers precede Firefox's physical source selection, so their source
+    // identity is still zero. Preserve receipt identities when known; never
+    // substitute the arena identity for an unknown producer source.
+    let image = |pending: Option<&PendingImage>| {
+        pending.map_or_else(
+            || "null".to_owned(),
+            |pending| {
+                format!(
+                    "{{{},\"read_held\":{},\"complete\":{},\"view_ready\":{},\"gallery\":{},\"detail\":{},\"annotation\":{}}}",
+                    surface_trace_fields(pending.surface, pending.surface),
+                    pending.read.is_some(),
+                    pending.complete,
+                    pending.view_ready,
+                    pending.gallery.is_some(),
+                    pending.detail.is_some(),
+                    pending.annotation.is_some(),
+                )
+            },
+        )
+    };
+    let draw = authorization.draw.map_or_else(
+        || "null".to_owned(),
+        |frame| {
+            format!(
+                "{{\"surface\":\"{:016x}{:016x}\"{}}}",
+                frame.high,
+                frame.low,
+                frame_trace_fields(Some(frame)),
+            )
+        },
+    );
+    format!(
+        "\"offered\":{},\"acquiring\":{},\"draw\":{draw}",
+        image(authorization.offered.as_ref()),
+        image(authorization.acquiring.as_ref()),
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn visual_frame_trace_fields(frame: &crate::generated::VisualFrame) -> String {
+    format!(
+        "\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"content_width\":{},\"content_height\":{},\"content\":[{},{},{},{}]",
+        crate::generated::presentation_source_session(frame.source.kind),
+        frame.source.instance,
+        frame.revision,
+        frame.cleanrevision,
+        frame.extent.width,
+        frame.extent.height,
+        frame.content.x,
+        frame.content.y,
+        frame.content.width,
+        frame.content.height,
+    )
+}
+
+fn trace_acquisition_authorization(
+    reason: &'static str,
+    surface: Option<Surface>,
+    model: &crate::view_model::ApplicationModel,
+    decision: Option<
+        &Result<crate::view_model::PresentationReconciliation, crate::view_model::UiError>,
+    >,
+    authorization: &DrawAuthorization,
+) {
+    #[cfg(target_arch = "wasm32")]
+    if surface_trace_enabled() {
+        use crate::view_model::PresentationReconciliation;
+        let reconciliation = match decision {
+            None => "not_checked",
+            Some(Err(_)) => "error",
+            Some(Ok(PresentationReconciliation::Matching)) => "matching",
+            Some(Ok(PresentationReconciliation::MetadataPending)) => "metadata_pending",
+            Some(Ok(PresentationReconciliation::Superseded)) => "superseded",
+        };
+        let surface = surface.map_or_else(String::new, |surface| {
+            format!("{},", surface_trace_fields(surface, surface))
+        });
+        let presentation = model.presentation.as_ref().map_or_else(
+            || "null".to_owned(),
+            |snapshot| {
+                let observed = model
+                    .frame_observation_for(snapshot.completed.source.kind)
+                    .map_or_else(
+                        || "null".to_owned(),
+                        |observation| {
+                            format!(
+                                "{{\"source_observation_revision\":{},{}}}",
+                                observation.snapshotrevision,
+                                visual_frame_trace_fields(observation.frame),
+                            )
+                        },
+                    );
+                format!(
+                    "{{\"revision\":{},\"presentation_revision\":{},\"timeline_ready\":{},\"selected_source_kind\":{},\"selected_source_instance\":{},\"completed_source_revision\":{},\"completed\":{{{}}},\"observed_completed_source\":{observed},\"capability_surface\":\"{:016x}{:016x}\",\"capability_generation\":{},\"capability_condition\":\"{:?}\",\"capability_width\":{},\"capability_height\":{}}}",
+                    snapshot.revision,
+                    snapshot.presentationrevision,
+                    snapshot.timelineready,
+                    crate::generated::presentation_source_session(snapshot.selected.kind),
+                    snapshot.selected.instance,
+                    snapshot.completedsourcerevision,
+                    visual_frame_trace_fields(&snapshot.completed),
+                    snapshot.capability.surfacehigh,
+                    snapshot.capability.surfacelow,
+                    snapshot.capability.generation,
+                    snapshot.capability.condition,
+                    snapshot.capability.extent.width,
+                    snapshot.capability.extent.height,
+                )
+            },
+        );
+        let explore = model.explore.snapshot.as_ref().map_or_else(
+            || "null".to_owned(),
+            |snapshot| {
+                let selected = snapshot
+                    .selectedimage
+                    .map_or_else(|| "null".to_owned(), |image| image.to_string());
+                format!(
+                    "{{\"revision\":{},\"ready\":{},\"mode\":\"{:?}\",\"dataset_identity\":{},\"selected_image\":{selected},{}}}",
+                    snapshot.revision,
+                    snapshot.ready,
+                    snapshot.mode,
+                    snapshot.dataset.identity,
+                    visual_frame_trace_fields(&snapshot.frame),
+                )
+            },
+        );
+        let requested_selection = model
+            .explore
+            .requested_selection
+            .map_or_else(|| "null".to_owned(), |image| image.to_string());
+        let line = format!(
+            "{{\"event\":\"iced.presentation.acquire_authorization\",\"reason\":\"{reason}\",\"reconciliation\":\"{reconciliation}\",{surface}\"foreground\":\"{:?}\",\"presentation\":{presentation},\"explore\":{explore},\"requested_selection\":{requested_selection},\"requested_upscale\":{},\"current_upscale\":{},{}}}",
+            model.foreground_visual(),
+            model.explore.requested_upscale.is_some(),
+            model.current_upscale().is_some(),
+            acquisition_trace_fields(authorization),
+        );
+        LAST_ACQUISITION_AUTHORIZATION.with(|last| {
+            if last.borrow().as_ref() == Some(&line) {
+                return;
+            }
+            emit_surface_trace(&line);
+            *last.borrow_mut() = Some(line);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (reason, surface, model, decision, authorization);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trace_acquisition_request(
+    reason: &'static str,
+    requested: Option<Surface>,
+    authorization: &DrawAuthorization,
+) {
+    if !surface_trace_enabled() {
+        return;
+    }
+    let state = AcquisitionRequestTrace {
+        reason,
+        requested,
+        offered: authorization.offered.as_ref().map(|offer| offer.surface),
+        acquiring: authorization.acquiring.as_ref().map(|offer| offer.surface),
+        draw: authorization.draw,
+    };
+    LAST_ACQUISITION_REQUEST.with(|last| {
+        if last.get() == Some(state) {
+            return;
+        }
+        last.set(Some(state));
+        let surface = state
+            .offered
+            .or(requested)
+            .map_or_else(String::new, |surface| {
+                format!(
+                    "{},",
+                    surface_trace_fields(surface, requested.unwrap_or(surface)),
+                )
+            });
+        let requested = requested.map_or_else(
+            || "null".to_owned(),
+            |surface| format!("{{{}}}", surface_trace_fields(surface, surface)),
+        );
+        emit_surface_trace(&format!(
+            "{{\"event\":\"iced.presentation.acquire_request\",\"reason\":\"{reason}\",{surface}\"requested\":{requested},{}}}",
+            acquisition_trace_fields(authorization),
+        ));
+    });
+}
+
 pub(crate) fn authorize_draw(frame: Option<FrameReady>) {
     DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().draw = frame);
 }
@@ -1693,12 +1929,28 @@ pub(crate) fn authorize_acquisition(
         let mut authorization = authorization.borrow_mut();
         let Some((surface, snapshot)) = surface.zip(model.presentation.as_ref()) else {
             authorization.offered = None;
+            trace_acquisition_authorization(
+                "surface_or_presentation_missing",
+                surface,
+                model,
+                None,
+                &authorization,
+            );
             return;
         };
-        if model.completed_presentation_reconciliation().ok()
-            != Some(crate::view_model::PresentationReconciliation::Matching)
-        {
+        let decision = model.completed_presentation_reconciliation();
+        if !matches!(
+            decision,
+            Ok(crate::view_model::PresentationReconciliation::Matching)
+        ) {
             authorization.offered = None;
+            trace_acquisition_authorization(
+                "model_not_matching",
+                Some(surface),
+                model,
+                Some(&decision),
+                &authorization,
+            );
             return;
         }
         let visual = &snapshot.completed;
@@ -1722,6 +1974,13 @@ pub(crate) fn authorize_acquisition(
             .and_then(|offer| offer.surface.frame)
             == Some(frame)
         {
+            trace_acquisition_authorization(
+                "offer_unchanged",
+                Some(surface),
+                model,
+                Some(&decision),
+                &authorization,
+            );
             return;
         }
         gallery::confirm(frame, visual, model.explore.snapshot.as_ref());
@@ -1732,6 +1991,13 @@ pub(crate) fn authorize_acquisition(
         if visual.source.kind == crate::generated::PresentationSourceKind::Annotation
             && annotation.is_none()
         {
+            trace_acquisition_authorization(
+                "annotation_metadata_unavailable",
+                Some(surface),
+                model,
+                Some(&decision),
+                &authorization,
+            );
             return;
         }
         authorization.offered = Some(PendingImage {
@@ -1753,6 +2019,13 @@ pub(crate) fn authorize_acquisition(
             complete: false,
             view_ready: true,
         });
+        trace_acquisition_authorization(
+            "offered",
+            Some(surface),
+            model,
+            Some(&decision),
+            &authorization,
+        );
     });
 }
 
@@ -2040,16 +2313,31 @@ impl BrowserDevice {
     fn acquire(&self) {
         let offer = DRAW_AUTHORIZATION.with(|authorization| {
             let mut authorization = authorization.borrow_mut();
-            let offer = authorization.offered.as_ref()?;
-            let frame = offer.surface.frame?;
-            if authorization.acquiring.is_some()
-                || authorization
-                    .draw
-                    .is_some_and(|draw| same_publication(draw, frame))
+            let Some(offer) = authorization.offered.as_ref() else {
+                trace_acquisition_request("no_offer", self.requested, &authorization);
+                return None;
+            };
+            let Some(frame) = offer.surface.frame else {
+                trace_acquisition_request("offer_has_no_frame", self.requested, &authorization);
+                return None;
+            };
+            if authorization.acquiring.is_some() {
+                trace_acquisition_request("acquisition_in_flight", self.requested, &authorization);
+                return None;
+            }
+            if authorization
+                .draw
+                .is_some_and(|draw| same_publication(draw, frame))
             {
+                trace_acquisition_request(
+                    "publication_already_authorized",
+                    self.requested,
+                    &authorization,
+                );
                 return None;
             }
             authorization.acquiring = Some(offer.clone());
+            trace_acquisition_request("request_prepared", self.requested, &authorization);
             Some(frame)
         });
         let Some(frame) = offer else {
@@ -2065,7 +2353,15 @@ impl BrowserDevice {
             arguments.push(&word.into());
         }
         if !self.call("acquireWorkspace", &arguments) {
-            DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().acquiring = None);
+            DRAW_AUTHORIZATION.with(|authorization| {
+                let mut authorization = authorization.borrow_mut();
+                authorization.acquiring = None;
+                trace_acquisition_request("browser_call_failed", self.requested, &authorization);
+            });
+        } else if surface_trace_enabled() {
+            DRAW_AUTHORIZATION.with(|authorization| {
+                trace_acquisition_request("request_sent", self.requested, &authorization.borrow());
+            });
         }
     }
 }

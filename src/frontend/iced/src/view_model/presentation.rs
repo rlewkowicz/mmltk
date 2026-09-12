@@ -267,7 +267,7 @@ impl ApplicationModel {
             .filter(|frame| Self::valid_visual_source(frame).is_some())
     }
 
-    fn frame_observation_for(
+    pub(crate) fn frame_observation_for(
         &self,
         kind: PresentationSourceKind,
     ) -> Option<crate::generated::ApplicationVisualObservation<'_>> {

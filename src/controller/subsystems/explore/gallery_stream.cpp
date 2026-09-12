@@ -16,12 +16,15 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <locale>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <unordered_map>
@@ -417,6 +420,7 @@ class GalleryStream::Impl final {
     void AcceptanceDiagnostic(VisualDiagnosticOperation, const Lane&, std::uint64_t = 0U) const noexcept;
     void ReadLanePayload(Lane&);
     [[nodiscard]] const rfdetr::AugmentationBatchPlan* PrepareImages(std::span<Lane* const>, DescriptorBudget, cudaStream_t);
+    void DiagnosePreparedImage(const Lane&, std::size_t, std::size_t) const noexcept;
     [[nodiscard]] explore::ExploreRenderCardDescriptor AssembleImageMeaning(const Lane&, const rfdetr::AugmentationImagePlan*, const float*,
                                                                             std::size_t, std::size_t&, std::size_t&);
     void CompleteLane(std::size_t, std::exception_ptr) noexcept;
@@ -450,11 +454,17 @@ class GalleryStream::Impl final {
         bool augmented = false;
         bool card = false;
         bool probe_annotation = false;
+        std::uint64_t dataset_identity = 0U;
+        std::uint64_t image_key = 0U;
+        std::array<std::uint32_t, 2U> source_extent{};
+        bool sampled_card = false;
+        bool augmentation_config_enabled = false;
     };
     void FlushProbes(std::uintptr_t);
     [[nodiscard]] bool InitializeProbes() noexcept;
     void CollectProbes() noexcept;
     void EmitProbe(const RenderedProbe&, const std::uint64_t*) const noexcept;
+    void EmitCardSamples(const RenderedProbe&, const std::uint64_t*) const noexcept;
     [[nodiscard]] explore::ExploreRenderScratchView Scratch() const;
     [[nodiscard]] explore::ExploreRenderSemanticView Semantics(const ExploreOverlay&, bool) const;
     void PrepareDescriptors(std::size_t, std::size_t, std::size_t, std::size_t, std::size_t);
@@ -573,7 +583,9 @@ class GalleryStream::Impl final {
     // older lane callback may run while newer work is already queued.
     bool descriptors_pending_ = false;
     VisualDiagnosticSink diagnostics_{};
-    static constexpr std::size_t kProbeFacts = 7U;
+    static constexpr std::size_t kCardSamplesOffset = 7U;
+    static constexpr std::size_t kProbeFacts =
+        kCardSamplesOffset + explore::ExploreRenderedCardSampleGrid::kSampleCount * explore::ExploreRenderedCardSampleGrid::kWordsPerSample;
     std::array<RenderedProbe, kExploreVisibleItemCapacity> probes_{};
     std::size_t probe_count_ = 0U;
     std::size_t submitted_probes_ = 0U;
@@ -2133,7 +2145,25 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
                                               .output_domain = rfdetr::GpuAugmentationOutputDomain::UnitRgb,
                                               .input_slots = batch_input_slots_},
                                              batch_keys_, batch_donors_, donor_view, cuda_stream, State().plan.augmentation.seed % 2U);
+    if (augmentation_plan != nullptr && diagnostics_.valid())
+        for (std::size_t slot = 0U; slot != ready_lanes.size(); ++slot)
+            DiagnosePreparedImage(*ready_lanes[slot], slot, State().plan.augmentation.seed % 2U);
     return augmentation_plan;
+}
+
+void GalleryStream::Impl::DiagnosePreparedImage(const Lane& lane, const std::size_t image, const std::size_t staging_slot) const noexcept
+    try {
+    if (!diagnostics_.valid()) return;
+    const auto payload = "{\"dataset_identity\":" + std::to_string(State().plan.dataset_identity) +
+                         ",\"augmentation_seed\":" + std::to_string(State().plan.augmentation.seed) +
+                         ",\"compiled_index\":" + std::to_string(lane.compiled_index) +
+                         ",\"slot\":" + std::to_string(lane.destination_slot) + ",\"lane\":" + std::to_string(lane.index) +
+                         ",\"output_domain\":\"UnitRgb\",\"prepared\":" + augmenter_->prepared_image_diagnostic(image, staging_slot) + "}";
+    auto fact = LaneDiagnostic(VisualDiagnosticOperation::ExploreAugmentationImagePrepared, lane);
+    fact.failure_detail = payload;
+    diagnostics_(fact);
+} catch (...) {
+    // Collecting optional plan details cannot change augmentation submission.
 }
 
 explore::ExploreRenderCardDescriptor GalleryStream::Impl::AssembleImageMeaning(const Lane& lane,
@@ -2723,6 +2753,11 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
         card = load_payload<explore::ExploreRenderCardDescriptor>(
             storage_.buffers_.descriptors_.data(),
             descriptor_layout_.cards.offset + *card_index * sizeof(explore::ExploreRenderCardDescriptor));
+    const auto* sample_card = card ? &*card : nullptr;
+    if (!sample_card && width != 0U && State().plan.mode == ExploreMode::Gallery && slot < State().tile_meanings.size()) {
+        const auto& meaning = State().tile_meanings[slot];
+        if (meaning && meaning->card.compiled_index == compiled_index) sample_card = &meaning->card;
+    }
     std::size_t selected_annotations = 0U;
     std::size_t hidden_annotations = 0U;
     std::size_t selected_rle = 0U;
@@ -2798,7 +2833,7 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
     const auto [content_y, content_height] =
         card ? scale_interval(letterbox.offset_y, letterbox.resized_height, card->image_height, card->source_height) : std::pair{0U, 0U};
     explore::ExploreRenderTargetView reference{};
-    if (card && State().cache.size() != 0U) {
+    if (sample_card && State().cache.size() != 0U) {
         reference = Target(CachePlane(false));
         const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
         const auto* retained = State().cache.Find(compiled_index);
@@ -2813,6 +2848,10 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
         .content_width = content_width,
         .content_height = content_height,
     };
+    if (sample_card &&
+        explore::sample_explore_rendered_card(checksum_target, count_target, reference, device_facts + kCardSamplesOffset, stream) !=
+            explore::kExploreStorageSuccess)
+        throw std::runtime_error("Explore rendered card diagnostic sampling failed");
     auto rendered_probe = probe;
     if (card && probe_annotation) {
         rendered_probe.box_x =
@@ -2852,7 +2891,12 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
                                .seed = State().plan.augmentation.seed,
                                .augmented = State().plan.augmentation.enabled,
                                .card = card.has_value(),
-                               .probe_annotation = probe_annotation.has_value()};
+                               .probe_annotation = probe_annotation.has_value(),
+                               .dataset_identity = State().plan.dataset_identity,
+                               .image_key = sample_card ? sample_card->erasure.key : 0U,
+                               .source_extent = {State().store->header().image_width, State().store->header().image_height},
+                               .sampled_card = sample_card != nullptr,
+                               .augmentation_config_enabled = State().plan.augmentation_config.enabled};
 } catch (...) {
     // Optional diagnostics may fail independently of the rendered product.
     // Partial launches retain their buffers until normal stream settlement.
@@ -2916,7 +2960,8 @@ void GalleryStream::Impl::CollectProbes() noexcept {
 }
 
 void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint64_t* facts) const noexcept {
-    const auto& [generation, slot, compiled_index, count_target, checksum_target, probe, seed, augmented, card, probe_annotation] = record;
+    const auto& [generation, slot, compiled_index, count_target, checksum_target, probe, seed, augmented, card, probe_annotation,
+                 dataset_identity, image_key, source_extent, sampled_card, augmentation_config_enabled] = record;
     diagnostics_.Emit([&] {
         return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
                                     .operation = VisualDiagnosticOperation::ExploreSemanticPixels,
@@ -2938,6 +2983,7 @@ void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint
                                                 .staging_bytes = (checksum_target.width == checksum_target.height ? 1U : 0U) |
                                                                  (augmented ? 2U : 0U) | (card ? 4U : 0U)}};
     });
+    if (sampled_card) EmitCardSamples(record, facts);
     if (!card) return;
     const auto packed_content = (static_cast<std::uint64_t>(probe.content_x & 0xffffU) << 48U) |
                                 (static_cast<std::uint64_t>(probe.content_y & 0xffffU) << 32U) |
@@ -2987,6 +3033,63 @@ void GalleryStream::Impl::EmitProbe(const RenderedProbe& record, const std::uint
                                                     .staging_bytes = transition_count}};
         });
     }
+}
+
+void GalleryStream::Impl::EmitCardSamples(const RenderedProbe& record, const std::uint64_t* facts) const noexcept try {
+    if (!diagnostics_.pixel_probes_enabled()) return;
+    constexpr explore::ExploreRenderedCardSampleGrid grid{};
+    const auto& clean = record.checksum_target;
+    const auto& reference = record.probe.reference;
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\"dataset_identity\":" << record.dataset_identity << ",\"augmentation_seed\":" << record.seed
+           << ",\"image_key\":" << record.image_key << ",\"compiled_index\":" << record.compiled_index << ",\"slot\":" << record.slot
+           << ",\"augmentation_enabled\":" << (record.augmented ? "true" : "false")
+           << ",\"augmentation_config_enabled\":" << (record.augmentation_config_enabled ? "true" : "false")
+           << ",\"source_width\":" << record.source_extent[0] << ",\"source_height\":" << record.source_extent[1]
+           << ",\"width\":" << clean.width << ",\"height\":" << clean.height
+           << ",\"reference_width\":" << reference.width << ",\"reference_height\":" << reference.height
+           << ",\"reference_present\":" << (reference.data != nullptr ? "true" : "false") << ",\"checksum\":" << facts[1]
+           << ",\"axis_percent\":[";
+    for (std::size_t axis = 0U; axis != grid.kAxisCount; ++axis) {
+        if (axis != 0U) output << ',';
+        output << grid.percent[axis];
+    }
+    // Arrays share row-major grid order. Each RGBA integer has R in its low byte.
+    // Dimensions and integer coordinates distinguish thumbnail and final-card
+    // samples even when those physical targets have different extents.
+    const auto coordinates = [&](const char* name, const std::uint32_t extent) {
+        output << "],\"" << name << "\":[";
+        for (std::size_t axis = 0U; axis != grid.kAxisCount; ++axis) {
+            if (axis != 0U) output << ',';
+            output << static_cast<std::uint64_t>(grid.percent[axis]) * extent / 100U;
+        }
+    };
+    coordinates("x", clean.width);
+    coordinates("y", clean.height);
+    coordinates("reference_x", reference.width);
+    coordinates("reference_y", reference.height);
+    const auto pixels = [&](const char* name, const std::size_t word, const unsigned int shift) {
+        output << "],\"" << name << "\":[";
+        for (std::size_t sample = 0U; sample != grid.kSampleCount; ++sample) {
+            if (sample != 0U) output << ',';
+            output << static_cast<std::uint32_t>(facts[kCardSamplesOffset + sample * grid.kWordsPerSample + word] >> shift);
+        }
+    };
+    pixels("clean_rgba", 0U, 0U);
+    pixels("semantic_rgba", 0U, 32U);
+    pixels("reference_rgba", 1U, 0U);
+    output << "]}";
+    const auto payload = std::move(output).str();
+    auto fact = Diagnostic(VisualDiagnosticOperation::ExploreCardPixelSamples, record.generation);
+    fact.value = record.slot;
+    fact.detail = record.compiled_index;
+    fact.context.capacity_width = clean.width;
+    fact.context.capacity_height = clean.height;
+    fact.failure_detail = payload;
+    diagnostics_(fact);
+} catch (...) {
+    // Diagnostic serialization runs on the existing probe completion callback.
 }
 
 explore::ExploreRenderScratchView GalleryStream::Impl::Scratch() const {

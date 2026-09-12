@@ -27,4 +27,9 @@ namespace mmltk::backend::imaging::explore::detail {
                                                            const ExploreRenderedCardProbeAbi& probe, std::uint64_t* device_counts,
                                                            cudaStream_t stream) noexcept;
 
+[[nodiscard]] cudaError_t sample_explore_rendered_card_cuda(const ExploreRenderTargetViewAbi& clean,
+                                                            const ExploreRenderTargetViewAbi& semantic,
+                                                            const ExploreRenderTargetViewAbi& reference, std::uint64_t* device_samples,
+                                                            cudaStream_t stream) noexcept;
+
 }  // namespace mmltk::backend::imaging::explore::detail

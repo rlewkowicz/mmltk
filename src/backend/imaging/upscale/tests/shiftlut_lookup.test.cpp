@@ -151,7 +151,7 @@ TEST_CASE("ONNX graph capture permits independent worker allocation and retains 
     DeviceBuffer output(sizeof(float));
     Stream stream;
     const float expected = 1.25F;
-    REQUIRE(cudaMemcpy(input.as<void>(), &expected, sizeof(expected), cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpyAsync(input.as<void>(), &expected, sizeof(expected), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
     Ort::SessionOptions options;
     options.SetIntraOpNumThreads(1);
     options.SetInterOpNumThreads(1);
@@ -231,7 +231,7 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
     DeviceBuffer device_tile(3U * 256U * 256U * sizeof(float));
     DeviceBuffer device_reference(3U * width * height * sizeof(float));
     Stream stream;
-    REQUIRE(cudaMemcpy(device_source.as<void>(), source.data(), source.size(), cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpyAsync(device_source.as<void>(), source.data(), source.size(), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
     mmltk::backend::imaging::upscale::tests::normalize_reference(device_source.as<std::uint8_t>(), pitch, width, height,
                                                                  device_reference.as<float>(), stream.get());
     const std::uint32_t halo = lut ? 32U : 16U;
@@ -281,8 +281,9 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
     DeviceBuffer input(model.size() * sizeof(float));
     DeviceBuffer target(result.size());
     Stream stream;
-    REQUIRE(cudaMemcpy(input.as<void>(), model.data(), model.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess);
-    REQUIRE(cudaMemcpy(target.as<void>(), result.data(), result.size(), cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpyAsync(input.as<void>(), model.data(), model.size() * sizeof(float), cudaMemcpyHostToDevice, stream.get()) ==
+            cudaSuccess);
+    REQUIRE(cudaMemcpyAsync(target.as<void>(), result.data(), result.size(), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
     constexpr std::array<tiles::Tile, 2> layout{{
         {.origin_x = 0, .origin_y = 0, .core_width = 47, .core_height = 3},
         {.origin_x = 47, .origin_y = 0, .core_width = 2, .core_height = 3},
