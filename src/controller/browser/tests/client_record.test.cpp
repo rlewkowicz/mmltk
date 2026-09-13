@@ -737,5 +737,9 @@ TEST_CASE("compact workspace mouse records preserve fractional coordinates and w
         CHECK(decoded.wheel_unit == source.wheel_unit);
         CHECK(decoded.other_button == source.other_button);
         CHECK(decoded.modifiers == source.modifiers);
+        CHECK(decoded.brush_radius == WorkspaceMouse{}.brush_radius);
+        CHECK(decoded.click_count == source.click_count);
+        CHECK(decoded.peer_epoch == source.peer_epoch);
+        CHECK(decoded.document_epoch == source.document_epoch);
     }
 }

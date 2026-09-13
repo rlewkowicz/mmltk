@@ -70,7 +70,7 @@ pub(super) fn view<'a>(
     let overlay = content.overlay().clone();
     let image = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {
-                input: Some(input.for_source(content.frame().source.kind, 0, 12)),
+                input: Some(input.for_source(content.frame().source.kind, 0, None)),
             local: None,
             surface: content.configure_surface(surface, original, state.fit_revision),
             publish: None,

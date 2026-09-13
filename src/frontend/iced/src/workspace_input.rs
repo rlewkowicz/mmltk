@@ -10,7 +10,7 @@ pub struct Binding {
     connection: Arc<Mutex<Option<crate::transport_connection::Connection>>>,
     source: Option<PresentationSourceKind>,
     document_epoch: u64,
-    radius: u16,
+    radius: Option<u16>,
 }
 
 impl Binding {
@@ -18,7 +18,7 @@ impl Binding {
         *self.connection.lock().expect("workspace connection") = connection;
     }
 
-    pub fn for_source(&self, source: PresentationSourceKind, document_epoch: u64, radius: u16) -> Self {
+    pub fn for_source(&self, source: PresentationSourceKind, document_epoch: u64, radius: Option<u16>) -> Self {
         Self { source: Some(source), document_epoch, radius, ..self.clone() }
     }
 
@@ -26,7 +26,9 @@ impl Binding {
         let Some(source) = self.source else { return };
         mouse.source = source;
         mouse.documentepoch = self.document_epoch;
-        mouse.brushradius = self.radius.max(1);
+        if source == PresentationSourceKind::Annotation {
+            if let Some(radius) = self.radius { mouse.brushradius = radius; }
+        }
         if let Some(connection) = self.connection.lock().expect("workspace connection").as_mut() {
             if connection.send_workspace_mouse(mouse).is_err() {
                 connection.close();
@@ -41,18 +43,9 @@ impl Binding {
 
 pub fn record(kind: WorkspaceMouseKind, point: Option<WorkspacePoint>) -> WorkspaceMouse {
     WorkspaceMouse {
-        source: PresentationSourceKind::None,
-        peerepoch: 0,
-        documentepoch: 0,
         kind,
         point,
-        button: WorkspaceMouseButton::Left,
-        otherbutton: 0,
-        clickcount: 0,
-        modifiers: 0,
-        wheelunit: WorkspaceWheelUnit::Lines,
-        wheel: WorkspacePoint { x: 0.0, y: 0.0 },
-        brushradius: 12,
+        ..crate::generated::default_workspace_mouse()
     }
 }
 
@@ -178,11 +171,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_defaults_and_annotation_radius_overrides_use_both_encoders() {
+        let (connection, _capture) = crate::transport_connection::Connection::test_channel();
+        let input = Binding::default();
+        input.set_connection(Some(connection.clone()));
+        let mut scratch = Vec::new();
+        let mut encoded = Vec::new();
+        let mut expected = Vec::new();
+        for source in crate::generated::PRESENTATION_SOURCE_KIND_VALUES {
+            if *source == PresentationSourceKind::None { continue; }
+            for radius in [None, Some(7), Some(19)] {
+                let binding = input.for_source(*source, 2, radius);
+                binding.send(record(WorkspaceMouseKind::Motion, None));
+                let mut mouse = crate::generated::default_workspace_mouse();
+                mouse.source = *source;
+                mouse.peerepoch = 1;
+                mouse.documentepoch = 2;
+                if *source == PresentationSourceKind::Annotation {
+                    if let Some(radius) = radius { mouse.brushradius = radius; }
+                }
+                crate::generated::encode_workspace_mouse_into(&mouse, &mut scratch, &mut encoded).unwrap();
+                let owned = crate::generated::encode_workspace_mouse(mouse).unwrap().encode().unwrap();
+                assert_eq!(encoded, owned);
+                expected.push(owned);
+            }
+        }
+        let mut actual = Vec::new();
+        connection.flush(|bytes| { actual.push(bytes.to_vec()); Ok(()) }).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn every_source_retains_all_mouse_kinds_without_an_image() {
         for source in crate::generated::PRESENTATION_SOURCE_KIND_VALUES {
             if *source == PresentationSourceKind::None { continue; }
             let (connection, _capture) = crate::transport_connection::Connection::test_channel();
-            let binding = Binding::default().for_source(*source, 3, 12);
+            let binding = Binding::default().for_source(*source, 3, None);
             binding.set_connection(Some(connection.clone()));
             let mut expected = Vec::new();
             for kind in crate::generated::WORKSPACE_MOUSE_KIND_VALUES {
@@ -208,7 +232,7 @@ mod tests {
     #[test]
     fn capture_keeps_release_outside_and_cancels_a_retired_widget() {
         let (connection, _channel) = crate::transport_connection::Connection::test_channel();
-        let binding = Binding::default().for_source(PresentationSourceKind::Live, 0, 12);
+        let binding = Binding::default().for_source(PresentationSourceKind::Live, 0, None);
         binding.set_connection(Some(connection.clone()));
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(80.0, 80.0));
         let inside = mouse::Cursor::Available(Point::new(20.0, 30.0));
@@ -245,7 +269,7 @@ mod tests {
     #[test]
     fn captured_buttons_and_wheel_keep_fractional_image_coordinates() {
         let (connection, _capture) = crate::transport_connection::Connection::test_channel();
-        let binding = Binding::default().for_source(PresentationSourceKind::Predict, 0, 12);
+        let binding = Binding::default().for_source(PresentationSourceKind::Predict, 0, None);
         binding.set_connection(Some(connection.clone()));
         let mut capture = Capture::default();
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(80.0, 80.0));

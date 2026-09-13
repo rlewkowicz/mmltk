@@ -304,7 +304,7 @@ pub(super) fn view<'a>(
     let empty_source = model.foreground_visual()
         .filter(|source| matches!(source, crate::generated::PresentationSourceKind::Explore | crate::generated::PresentationSourceKind::Upscale))
         .unwrap_or(crate::generated::PresentationSourceKind::Explore);
-    let input = input.for_source(empty_source, 0, 12);
+    let input = input.for_source(empty_source, 0, None);
     let gallery = responsive(move |size| {
         gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns, input.clone())
     })
@@ -387,12 +387,13 @@ fn gallery_viewport<'a>(
             stack![input_layer, container(column![space::vertical(), text(presentation_title).size(22),
                 text(snapshot.map_or("", |value| value.failure.as_str())).size(12)
                     .style(crate::fluent_theme::text_secondary), space::vertical()].align_x(Center))
-                .id(super::GALLERY_EMPTY_ID).center(Fill).width(Fill).height(Fill)].into()
+                .id(super::GALLERY_EMPTY_ID).center(Fill).width(Fill).height(Fill)
+                .style(crate::fluent_theme::container_workspace)].into()
         },
         |(surface, metadata)| {
             let image = crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
-                input: Some(input.for_source(crate::generated::PresentationSourceKind::Explore, 0, 12)),
+                input: Some(input.for_source(crate::generated::PresentationSourceKind::Explore, 0, None)),
                     local: Some(local_gestures(state, snapshot, columns)),
                     surface: *surface,
                     publish: None,

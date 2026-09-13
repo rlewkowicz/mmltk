@@ -796,7 +796,6 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
     STATIC_REQUIRE(cbor::compact_shape<wire::Value> == cbor::CompactShape::Unsupported);
     STATIC_REQUIRE(cbor::compact_shape<std::variant<AnnotationPointer>> == cbor::CompactShape::Variant);
     STATIC_REQUIRE(cbor::compact_shape<long double> == cbor::CompactShape::Unsupported);
-    STATIC_REQUIRE(kWorkspaceMouseCapacity == 32U);
     STATIC_REQUIRE(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>() <= kMaxIntentValueBytes);
     const auto structural = []<class T>() {
         application_schema_detail::FingerprintSink sink;

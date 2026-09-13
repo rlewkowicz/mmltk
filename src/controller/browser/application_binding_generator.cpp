@@ -1,4 +1,5 @@
 #include "src/controller/contracts/application_systems.h"
+#include "src/controller/contracts/workspace_input.h"
 #include "src/controller/browser/application_outer_routing_emitter.h"
 #include "src/controller/browser/application_visual_projection_emitter.h"
 #include "src/controller/browser/application_schema.h"
@@ -352,6 +353,10 @@ class BindingEmitter final {
         });
         EmitInteractionEnvelope();
         EmitEndpoints();
+        symbols_.Reserve("module", "default_workspace_mouse", "canonical workspace mouse defaults");
+        output_ << "pub fn default_workspace_mouse() -> WorkspaceMouse { ";
+        emit_catalog_value(output_, mmltk::controller::WorkspaceMouse{});
+        output_ << " }\n";
         for (const bool retained : {false, true}) {
             output_ << "pub fn encode_workspace_mouse" << (retained ? "_into(mouse: &WorkspaceMouse, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), " : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::Interaction, ")
                     << "crate::protocol::ProtocolError> { match mouse.source {\n";

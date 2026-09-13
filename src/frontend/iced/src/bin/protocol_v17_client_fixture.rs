@@ -742,9 +742,8 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
     let mouse = generated::WorkspaceMouse {
         source: generated::PresentationSourceKind::Annotation, peerepoch: 1, documentepoch: 1,
         kind: generated::WorkspaceMouseKind::Motion, point: Some(generated::WorkspacePoint { x: 1.25, y: 2.5 }),
-        button: generated::WorkspaceMouseButton::Left, otherbutton: 0, clickcount: 0, modifiers: 0,
         wheelunit: generated::WorkspaceWheelUnit::Pixels, wheel: generated::WorkspacePoint { x: 0.125, y: -0.25 },
-        brushradius: 12,
+        ..generated::default_workspace_mouse()
     };
     let batch_encoded = generated::encode_workspace_mouse(mouse)?.encode()?;
     Ok(vec![

@@ -9,10 +9,11 @@ impl Component {
     }
     pub fn binding(&self, model: &crate::view_model::ApplicationModel, radius: u16) -> crate::workspace_input::Binding {
         self.input.for_source(crate::generated::PresentationSourceKind::Annotation,
-            model.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch), radius)
+            model.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch), Some(radius))
     }
     pub fn cancel(&self, model: &crate::view_model::ApplicationModel) {
-        self.binding(model, 12).cancel();
+        self.input.for_source(crate::generated::PresentationSourceKind::Annotation,
+            model.annotation.snapshot.as_ref().map_or(0, |snapshot| snapshot.inputdocumentepoch), None).cancel();
     }
 }
 

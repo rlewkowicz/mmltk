@@ -218,6 +218,12 @@ class AnnotationSystem::Impl final {
             if (CancelGesture() && ready) QueueRender();
             return;
         }
+        if (!ready) {
+            static_cast<void>(CancelGesture());
+            if (mouse.kind == WorkspaceMouseKind::Press && mouse.button == WorkspaceMouseButton::Left && mouse.point)
+                Reject("Annotation source image is unavailable", false);
+            return;
+        }
         if (mouse.button == WorkspaceMouseButton::Right) {
             if (mouse.kind == WorkspaceMouseKind::Press) right_pressed_ = true;
             if (mouse.kind == WorkspaceMouseKind::Release) right_pressed_ = false;
@@ -229,7 +235,8 @@ class AnnotationSystem::Impl final {
         const bool end = mouse.kind == WorkspaceMouseKind::Release && mouse.button == WorkspaceMouseButton::Left;
         if (!begin && !end && mouse.kind != WorkspaceMouseKind::Motion) return;
         if (begin) {
-            if (!mouse.point || !document_.ui().scene.frame_ready) {
+            if (!mouse.point) return;
+            if (!document_.ui().scene.frame_ready) {
                 Reject("Annotation image coordinates are unavailable", false);
                 return;
             }
@@ -267,6 +274,10 @@ class AnnotationSystem::Impl final {
         return state_.cancellation_requested || stopping_;
     }
     void Execute(Command command) {
+        {
+            std::scoped_lock lock(mutex_);
+            active_command_ = true;
+        }
         if (CancelRequested()) {
             InstallUi(true);
             return;
@@ -277,6 +288,15 @@ class AnnotationSystem::Impl final {
                 if constexpr (std::same_as<Request, AnnotationOpen>)
                     OpenSource(request);
                 else {
+                    bool ready;
+                    {
+                        std::scoped_lock lock(mutex_);
+                        ready = state_.ready;
+                    }
+                    if (!ready) {
+                        Reject("Annotation source image is unavailable", true);
+                        return;
+                    }
                     const auto result = [&] {
                         if constexpr (std::same_as<Request, AnnotationSave>)
                             return document_.Save(request.destination);
@@ -340,7 +360,16 @@ class AnnotationSystem::Impl final {
                                                     .copy_path = paths[0U]};
                     });
                     const auto input = runtime.BorrowInput();
-                    annotation_algorithm(runtime).Open(input.plane(0U).plane(), crop);
+                    auto& algorithm = annotation_algorithm(runtime);
+                    const auto plane = input.plane(0U).plane();
+                    std::exception_ptr preparation_failure;
+                    try {
+                        algorithm.Open(plane, crop);
+                    } catch (...) {
+                        preparation_failure = std::current_exception();
+                    }
+                    if (preparation_failure)
+                        return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
                     std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;
                     if (const auto* execution = runtime.execution())
                         policy = mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus,      "annot-input", 0U,
@@ -430,6 +459,7 @@ class AnnotationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             state_.ui = document_.ui();
             if (settle) {
+                active_command_ = false;
                 if (pending_commands_) --pending_commands_;
                 state_.busy = pending_commands_ != 0U || sampling_;
                 state_.cancellation_requested = false;
@@ -459,12 +489,13 @@ class AnnotationSystem::Impl final {
         });
     }
     void QueueRender() {
-        document_.CaptureRender(scratch_render_);
-        scratch_render_.generation = render_generation_ = mmltk::common::types::advance_monotonic_identity(render_generation_);
         {
             std::scoped_lock lock(mutex_);
+            if (!state_.ready) return;
             scratch_render_.document_epoch = state_.input_document_epoch;
         }
+        document_.CaptureRender(scratch_render_);
+        scratch_render_.generation = render_generation_ = mmltk::common::types::advance_monotonic_identity(render_generation_);
         {
             std::scoped_lock lock(render_mutex_);
             std::swap(scratch_render_, pending_description_);
@@ -541,6 +572,7 @@ class AnnotationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             state_.ui = document_.ui();
             if (settle) {
+                active_command_ = false;
                 if (pending_commands_) --pending_commands_;
                 state_.busy = pending_commands_ != 0U || sampling_;
                 state_.cancellation_requested = false;
@@ -567,19 +599,23 @@ class AnnotationSystem::Impl final {
         static_cast<void>(CancelGesture());
         {
             std::scoped_lock lock(mutex_);
-            input_.Clear();
-            pending_commands_ = 0U;
+            // Failure settles the executing operation. Later admitted commands
+            // retain their order, including an Open that can restore the source.
+            if (active_command_ && pending_commands_) --pending_commands_;
+            active_command_ = false;
             gpu_continuation_ = sampling_ = false;
             state_.ready = false;
             state_.frame = {};
             image_.diagnostics.reset();
-            state_.busy = state_.cancellation_requested = false;
+            state_.busy = pending_commands_ != 0U;
+            state_.cancellation_requested = false;
             state_.ui = document_.ui();
             AdvanceUi();
             failed = state_;
         }
         report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Annotation, settings_.device, detail);
         Publish(AnnotationFailed{std::move(failed), std::move(detail)});
+        input_worker_.Wake();
     }
     template <class Event>
     void Publish(Event event) noexcept {
@@ -598,6 +634,7 @@ class AnnotationSystem::Impl final {
     std::uint64_t input_epoch_ = 0U;
     std::uint64_t next_interaction_ = 0U;
     std::size_t pending_commands_ = 0U;
+    bool active_command_ = false;
     std::optional<AnnotationPointer> pointer_;
     bool right_pressed_ = false;
     bool gpu_continuation_ = false, sampling_ = false, stopping_ = false;

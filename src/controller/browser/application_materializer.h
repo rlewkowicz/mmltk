@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "src/controller/browser/application_schema.h"
+#include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/frameworks/serialization/serialization.h"

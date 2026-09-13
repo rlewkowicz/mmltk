@@ -1293,6 +1293,7 @@ struct MutationCommitProbe final {
 
 struct AnnotationRenderProbe final {
     std::atomic_uint64_t calls{0U};
+    std::atomic_uint64_t samples{0U};
     std::atomic_bool fail_open{false};
     std::atomic_bool fail_render{false};
     std::atomic_bool exact_content{true};
@@ -1322,6 +1323,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (probe_ && probe_->fail_open.exchange(false)) throw std::runtime_error("deterministic source preparation failure");
     }
     contracts::AnnotationColor Sample(contracts::AnnotationPoint) override {
+        if (probe_) ++probe_->samples;
         if (probe_) probe_->Wait(probe_->sample_hold);
         return {120.0F, 1.0F, 1.0F};
     }
@@ -5204,6 +5206,102 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     complete_annotation_box_drag(annotation, events, 1U);
     CHECK(failures.load() == 2U);
+}
+
+TEST_CASE("Annotation unavailable source settles ordered input and commands before queued Open recovery") {
+    const auto tool = GENERATE(contracts::AnnotationTool::Box, contracts::AnnotationTool::ColorSample);
+    const bool request_stop = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    MutableVisualSource source{backend, {32U, 32U}};
+    auto semantic = std::make_shared<VisualDocument>();
+    semantic->scene.document = contracts::WorkspaceResource::From("test://unavailable-source", 1U);
+    semantic->scene.categories = {{.value = "object"}};
+    semantic->scene.objects = {
+        {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
+    auto probe = std::make_shared<AnnotationRenderProbe>();
+    auto hold = std::make_shared<MutationCommitProbe>();
+    auto entered = hold->committed.get_future();
+    EventGate events;
+    std::mutex observations_mutex;
+    std::vector<AnnotationFailed> failures;
+    std::vector<std::uint64_t> failure_render_counts;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
+                                [&](const VisualFrame& frame) {
+                                    auto read = source.BorrowExact(frame);
+                                    read.document = semantic;
+                                    return read;
+                                },
+                                [&](AnnotationSystem::event_type event) {
+                                    if (const auto* failure = std::get_if<AnnotationFailed>(&event)) {
+                                        std::scoped_lock lock(observations_mutex);
+                                        failures.push_back(*failure);
+                                        failure_render_counts.push_back(probe->calls.load());
+                                    }
+                                    events.Advance();
+                                }, mmltk::testsupport::annotation_render_evidence()};
+    mmltk::testsupport::ScopedTestCleanup release{[&] {
+        mmltk::testsupport::release_test_promise(hold->release);
+        annotation.Shutdown();
+    }};
+    mmltk::testsupport::open_annotation(annotation, events, source.frame());
+    annotation.SetInputPeer(1U);
+    auto command = annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("retained history")}}});
+    mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
+    command = annotation.Edit({.edit = {.value = AnnotationObjectEdit{0U}}});
+    mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
+    auto retained = hold_annotation_frame(annotation, events, tool);
+    const auto prior = annotation.snapshot();
+    REQUIRE(prior.ui.can_undo);
+    const auto rendered = probe->calls.load();
+    {
+        std::scoped_lock lock(probe->mutex);
+        probe->open_hold = hold;
+    }
+    probe->fail_open = true;
+    static_cast<void>(annotation.Open({.source = source.frame()}));
+    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Motion, WorkspaceMouseKind::Release})
+        annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, kind, {4.25F, 5.125F}));
+    // Empty and passive captures share admission without manufacturing edits.
+    for (const auto entry : mmltk::frameworks::reflection::enum_entries<WorkspaceMouseKind>()) {
+        auto mouse = mmltk::testsupport::annotation_mouse(annotation, 1U, entry.value, {});
+        mouse.point.reset();
+        annotation.Input(mouse);
+    }
+    command = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
+    CHECK(command.busy);
+    mmltk::testsupport::ScopedTempDir saved{"mmltk-annotation-source-readiness"};
+    const auto destination = saved.path() / "annotation.cbor";
+    CHECK(annotation.Save({.destination = destination.string()}).busy);
+    CHECK(annotation.Open({.source = source.frame()}).busy);
+    if (request_stop) CHECK(annotation.Stop().cancellation_requested);
+    hold->release.set_value();
+    REQUIRE(events.Wait([&] {
+        const auto state = annotation.snapshot();
+        return state.ready && !state.busy && state.input_document_epoch == prior.input_document_epoch + 1U;
+    }));
+    {
+        std::scoped_lock lock(observations_mutex);
+        REQUIRE(failures.size() == 4U);
+        CHECK(failures.front().detail == "deterministic source preparation failure");
+        for (std::size_t index = 0U; index != failures.size(); ++index) {
+            CHECK_FALSE(failures[index].snapshot.ready);
+            CHECK(failures[index].snapshot.ui == prior.ui);
+            CHECK(failure_render_counts[index] == rendered);
+            if (index != 0U) CHECK(failures[index].detail == "Annotation source image is unavailable");
+        }
+    }
+    CHECK_FALSE(std::filesystem::exists(destination));
+    CHECK(probe->samples.load() == 0U);
+    REQUIRE(retained.valid());
+    retained = {};
+    complete_annotation_box_drag(annotation, events, 1U);
+    command = annotation.Save({.destination = destination.string()});
+    mmltk::testsupport::await_annotation_command(annotation, events, command.revision);
+    CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Saved);
+    CHECK(std::filesystem::exists(destination));
 }
 
 TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {

@@ -84,7 +84,7 @@ impl Component {
             crate::generated::FeatureId::Live,
             width,
             Message::Workspace,
-            self.input.for_source(crate::generated::PresentationSourceKind::Live, 0, 12),
+            self.input.for_source(crate::generated::PresentationSourceKind::Live, 0, None),
         );
         let advanced = crate::view::shared::card(
             "Advanced",
