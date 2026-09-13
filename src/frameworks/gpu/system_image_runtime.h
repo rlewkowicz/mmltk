@@ -87,6 +87,8 @@ class SystemImageRuntime final {
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit,
                          ImageSubmission = ImageSubmission::Complete);
+    // Wake on successful or failed GPU completion. CompleteWork consumes
+    // terminal status and establishes physical settlement on the owner.
     void NotifyWorkCompletion(std::function<void()>);
     void CompleteWork();
     CompletedOutput CommitOutput(OutputCandidate&&);

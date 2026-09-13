@@ -2819,6 +2819,192 @@ TEST_CASE("Shutdown settles pending workspace finalization with allocation-local
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
 
+TEST_CASE("Stream notifications retain independent terminal status across moves and reuse", "[gpu][workspace]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_notifications = true;
+    {
+        DeviceContext context(0, backend);
+        ImageStream first(context), second(context);
+        std::atomic_uint first_wakes{0U}, second_wakes{0U};
+        first.Notify([&] { ++first_wakes; });
+        second.Notify([&] { ++second_wakes; });
+        const auto first_handle = first.native_handle();
+        ImageStream moved(std::move(first));
+        backend->CompleteNotifications(first_handle);
+        CHECK(first_wakes == 1U);
+        CHECK(second_wakes == 0U);
+        CHECK(moved.Settle().completion_reached);
+        CHECK(second_wakes == 0U);
+        moved.Notify([&] { ++first_wakes; });
+        backend->CompleteNotifications(first_handle, CUDA_ERROR_LAUNCH_FAILED);
+        const auto failed = moved.Settle();
+        CHECK(failed.completion_reached);
+        CHECK(is_image_execution_failure(failed.failure));
+        CHECK(first_wakes == 2U);
+        CHECK(second_wakes == 0U);
+        // Replacement settles the destination's pending callback before moving
+        // the source's terminal status and its retained stream custody.
+        second = std::move(moved);
+        CHECK(second_wakes == 1U);
+        CHECK(second.Settle().failure == failed.failure);
+    }
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+    CHECK(backend->streams_destroyed == 2U);
+}
+
+TEST_CASE("Stream notification registration failure releases only unregistered callback storage", "[gpu][workspace]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    const auto rejected = std::make_exception_ptr(std::runtime_error("notification registration rejected"));
+    {
+        DeviceContext context(0, backend);
+        ImageStream stream(context);
+        auto closure = std::make_shared<int>(7);
+        std::weak_ptr<int> observed = closure;
+        backend->FailAfter(FakeImageBackend::FailurePoint::NotifyStream, 0U, rejected);
+        try {
+            stream.Notify([retained = std::move(closure)] {});
+            FAIL("notification registration must report its failure");
+        } catch (...) {
+            CHECK(std::current_exception() == rejected);
+        }
+        CHECK(observed.expired());
+        unsigned wakes = 0U;
+        stream.Notify([&] { ++wakes; });
+        CHECK(stream.Settle().completion_reached);
+        CHECK(wakes == 1U);
+    }
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Owner completion retains notification captures until the wake callback returns", "[gpu][workspace]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_notifications = true;
+    SystemImageRuntime runtime({.device = 0, .backend = backend});
+    mmltk::testsupport::TestGate callback_return("notification wake callback return");
+    auto captured = std::make_shared<int>(19);
+    std::weak_ptr<int> retained = captured;
+    auto admitted = backend->ObserveNextNotificationStream();
+    runtime.NotifyWorkCompletion([capture = std::move(captured), gate = callback_return.receipt()] {
+        gate.ArriveAndWait();
+    });
+    const auto stream = mmltk::testsupport::await_test_future(admitted, "notification capture admitted");
+    auto callback = std::async(std::launch::async, [&] { backend->CompleteNotifications(stream); });
+    std::future<void> completed;
+    auto cleanup = mmltk::testsupport::ScopedTestCleanup{[&] {
+        callback_return.Release();
+        if (callback.valid()) callback.wait();
+        if (completed.valid()) completed.wait();
+    }};
+    REQUIRE(callback_return.WaitEntered(std::chrono::seconds{2}));
+    completed = std::async(std::launch::async, [&] { runtime.CompleteWork(); });
+    CHECK_FALSE(retained.expired());
+    CHECK(completed.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+    callback_return.Release();
+    mmltk::testsupport::await_test_future(callback, "notification callback returned");
+    mmltk::testsupport::await_test_future(completed, "owner completion after callback return");
+    CHECK(retained.expired());
+}
+
+TEST_CASE("Output admission drains its completed workspace read without another render cycle", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+        .workspace_finalize = test_support::FakeWorkspaceFinalizer(backend)});
+    runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 83, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    backend->defer_notifications = true;
+    auto notified = backend->ObserveNextNotificationStream();
+    CHECK_FALSE(runtime.PrepareDisplay(runtime.OutputFacts().revision, workspace));
+    const auto stream = mmltk::testsupport::await_test_future(notified, "display notification admitted");
+    auto baseline = runtime.Completed();
+    REQUIRE_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    std::stop_source stop;
+    std::promise<void> entered;
+    std::future<SystemImageRuntime::OutputCandidate> acquired;
+    auto cleanup = mmltk::testsupport::ScopedTestCleanup{[&] {
+        stop.request_stop();
+        backend->CompleteNotifications(stream);
+        if (acquired.valid()) acquired.wait();
+    }};
+    SECTION("Notification precedes the admission epoch") {
+        backend->CompleteNotifications(stream);
+        auto candidate = runtime.AcquireOutput(stop.get_token(), std::move(baseline));
+        REQUIRE(candidate.valid());
+        CHECK(workspace->revision() != 0U);
+    }
+    SECTION("Notification races the admission check and wait") {
+        acquired = std::async(std::launch::async, [&] {
+            entered.set_value();
+            return runtime.AcquireOutput(stop.get_token(), std::move(baseline));
+        });
+        mmltk::testsupport::await_test_promise(entered, "output acquisition entered");
+        backend->CompleteNotifications(stream);
+        auto candidate = mmltk::testsupport::await_test_future(acquired, "output acquisition after display completion");
+        REQUIRE(candidate.valid());
+        CHECK(workspace->revision() != 0U);
+    }
+    SECTION("An admission drain retains custody until physical settlement") {
+        backend->CompleteNotifications(stream);
+        auto settlement = backend->HoldStreamSettlements("output admission physical display settlement");
+        acquired = std::async(std::launch::async, [&] {
+            return runtime.AcquireOutput(stop.get_token(), std::move(baseline));
+        });
+        REQUIRE(settlement->WaitEntered(std::chrono::seconds{2}));
+        CHECK(acquired.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+        CHECK(backend->planes_freed == 0U);
+        settlement->Release();
+        REQUIRE(mmltk::testsupport::await_test_future(acquired, "output admission physical completion").valid());
+    }
+    SECTION("Stop wakes admission with the workspace read still pending") {
+        acquired = std::async(std::launch::async, [&] {
+            entered.set_value();
+            return runtime.AcquireOutput(stop.get_token(), std::move(baseline));
+        });
+        mmltk::testsupport::await_test_promise(entered, "stoppable output acquisition entered");
+        stop.request_stop();
+        CHECK_FALSE(mmltk::testsupport::await_test_future(acquired, "stopped output acquisition").valid());
+        CHECK(workspace->revision() == 0U);
+    }
+}
+
+TEST_CASE("Workspace terminal notification propagates exact failure while preserving retained raw pixels", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    const auto failure = std::make_exception_ptr(std::runtime_error("display execution failed"));
+    {
+        SystemImageRuntime runtime({.device = 0, .backend = backend,
+            .workspace_finalize = test_support::FakeWorkspaceFinalizer(backend)});
+        runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), 61, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        });
+        auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        backend->defer_notifications = true;
+        auto admitted = backend->ObserveNextNotificationStream();
+        CHECK_FALSE(runtime.PrepareDisplay(runtime.OutputFacts().revision, workspace));
+        const auto stream = mmltk::testsupport::await_test_future(admitted, "failing workspace notification");
+        backend->SetStreamSettlement(stream, {.completion_reached = true, .failure = failure});
+        backend->CompleteNotifications(stream, CUDA_ERROR_LAUNCH_FAILED);
+        auto baseline = runtime.Completed();
+        try {
+            static_cast<void>(runtime.AcquireOutput({}, std::move(baseline)));
+            FAIL("workspace admission must report terminal execution failure");
+        } catch (...) {
+            CHECK(test_support::ContainsImageFailure(std::current_exception(), failure));
+        }
+        CHECK(workspace->revision() == 0U);
+        CHECK(*reinterpret_cast<const std::byte*>(runtime.Borrow().plane(0U).plane().data) == std::byte{61});
+        CHECK(runtime.DetachDisplay(workspace));
+    }
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
 TEST_CASE("Workspace damage accumulates skipped raw revisions for each display baseline", "[gpu][workspace]") {
     ImageWorkspaceDamage damage;
     const std::array<ImageWorkspaceRegion, 2U> first{{{2, 3, 5, 7}, {9, 10, 12, 15}}};

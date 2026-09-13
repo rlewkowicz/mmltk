@@ -173,6 +173,7 @@ class FakeImageBackend final : public ImageCopyBackend {
         RecordEvent,
         SynchronizeEvent,
         SynchronizeStream,
+        NotifyStream,
         // CLEANUP-IGNORE: The fake backend's failure inventory is independent from its deliberately granular counters.
     };
 
@@ -209,19 +210,37 @@ class FakeImageBackend final : public ImageCopyBackend {
         notification_observer_ = std::move(observed);
         return result;
     }
-    [[nodiscard]] std::unique_ptr<mmltk::testsupport::TestGate> HoldStreamSettlements(std::string name) {
+    [[nodiscard]] std::future<std::uintptr_t> ObserveNextNotificationStream() {
+        auto observed = std::make_shared<std::promise<std::uintptr_t>>();
+        auto result = observed->get_future();
+        std::scoped_lock lock(mutex_);
+        notification_stream_observer_ = std::move(observed);
+        return result;
+    }
+    [[nodiscard]] std::unique_ptr<mmltk::testsupport::TestGate> HoldStreamSettlements(std::string name, std::uintptr_t stream = 0U) {
         auto gate = std::make_unique<mmltk::testsupport::TestGate>(std::move(name));
         std::scoped_lock lock(mutex_);
-        settlement_gate_ = gate->receipt();
+        settlement_gates_.insert_or_assign(stream, gate->receipt());
         return gate;
     }
-    void CompleteNotifications() {
-        std::vector<std::function<void()>> completed;
+    void CompleteNotifications(std::uintptr_t stream = 0U, CUresult status = CUDA_SUCCESS) {
+        std::vector<StreamNotification*> completed;
         {
             std::scoped_lock lock(mutex_);
-            completed.swap(notifications_);
+            for (auto entry = notifications_.begin(); entry != notifications_.end();) {
+                if (stream != 0U && entry->first != stream) {
+                    ++entry;
+                    continue;
+                }
+                completed.push_back(entry->second);
+                entry = notifications_.erase(entry);
+            }
         }
-        for (auto& wake : completed) { try { wake(); } catch (...) {} }
+        for (auto* notification : completed) notification->Notify(status);
+    }
+    void SetStreamSettlement(std::uintptr_t stream, StreamSettlement result) {
+        std::scoped_lock lock(mutex_);
+        stream_settlements_.insert_or_assign(stream, std::move(result));
     }
 
     void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U, std::exception_ptr failure = {}) noexcept {
@@ -388,26 +407,40 @@ class FakeImageBackend final : public ImageCopyBackend {
         MaybeFail(FailurePoint::SynchronizeEvent);
         Wait(event);
     }
-    void NotifyStream(std::uintptr_t, std::uintptr_t, std::function<void()> wake) override {
+    void NotifyStream(std::uintptr_t, std::uintptr_t stream, StreamNotification& notification) override {
+        MaybeFail(FailurePoint::NotifyStream);
         std::shared_ptr<std::promise<void>> observed;
+        std::shared_ptr<std::promise<std::uintptr_t>> stream_observed;
         bool deferred = false;
         {
             std::scoped_lock lock(mutex_);
             observed = std::exchange(notification_observer_, {});
+            stream_observed = std::exchange(notification_stream_observer_, {});
             deferred = defer_notifications.load();
-            if (deferred) notifications_.push_back(std::move(wake));
+            if (deferred && !notifications_.emplace(stream, &notification).second)
+                throw std::logic_error("fake stream notification is already pending");
         }
-        if (!deferred) wake();
+        if (!deferred) notification.Notify(CUDA_SUCCESS);
         if (observed) observed->set_value();
+        if (stream_observed) stream_observed->set_value(stream);
     }
-    StreamSettlement SettleStream(const std::uintptr_t context, std::uintptr_t) noexcept override {
-        CompleteNotifications();
+    StreamSettlement SettleStream(const std::uintptr_t context, std::uintptr_t stream) noexcept override {
+        CompleteNotifications(stream);
         std::optional<mmltk::testsupport::TestGate::Receipt> gate;
+        std::optional<StreamSettlement> result;
         {
             std::scoped_lock lock(mutex_);
-            gate = settlement_gate_;
+            if (const auto found = settlement_gates_.find(stream); found != settlement_gates_.end())
+                gate = found->second;
+            else if (const auto all = settlement_gates_.find(0U); all != settlement_gates_.end())
+                gate = all->second;
+            if (const auto found = stream_settlements_.find(stream); found != stream_settlements_.end()) result = found->second;
         }
         if (gate) gate->ArriveAndWait();
+        if (result) {
+            ++synchronized;
+            return *result;
+        }
         try {
             MaybeFail(FailurePoint::Bind);
             CheckDeviceBinding(context);
@@ -458,9 +491,11 @@ class FakeImageBackend final : public ImageCopyBackend {
 
     std::atomic<std::uintptr_t> next_{1U};
     std::mutex mutex_;
-    std::vector<std::function<void()>> notifications_;
+    std::unordered_map<std::uintptr_t, StreamNotification*> notifications_;
+    std::unordered_map<std::uintptr_t, StreamSettlement> stream_settlements_;
     std::shared_ptr<std::promise<void>> notification_observer_;
-    std::optional<mmltk::testsupport::TestGate::Receipt> settlement_gate_;
+    std::shared_ptr<std::promise<std::uintptr_t>> notification_stream_observer_;
+    std::unordered_map<std::uintptr_t, mmltk::testsupport::TestGate::Receipt> settlement_gates_;
     std::condition_variable event_ready_;
     std::mutex copy_mutex_;
     std::optional<mmltk::testsupport::TestGate::Receipt> copy_gate_;

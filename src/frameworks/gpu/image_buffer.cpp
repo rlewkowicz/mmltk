@@ -1,5 +1,6 @@
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 
 #include <algorithm>
 #include <atomic>
@@ -248,15 +249,12 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         BindContext(context);
         CheckCuda("synchronize image event", cuEventSynchronize(reinterpret_cast<CUevent>(event)));
     }
-    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, std::function<void()> wake) override {
+    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification& notification) override {
         BindContext(context);
-        auto callback = std::make_unique<std::function<void()>>(std::move(wake));
-        CheckCuda("enqueue image completion notification", cuLaunchHostFunc(reinterpret_cast<CUstream>(stream),
-            [](void* value) {
-                std::unique_ptr<std::function<void()>> notify(static_cast<std::function<void()>*>(value));
-                try { (*notify)(); } catch (...) {}
-            }, callback.get()));
-        static_cast<void>(callback.release());
+        CheckCuda("enqueue image completion notification", cuStreamAddCallback(reinterpret_cast<CUstream>(stream),
+            [](CUstream, CUresult status, void* value) {
+                static_cast<StreamNotification*>(value)->Notify(status);
+            }, &notification, 0U));
     }
     StreamSettlement SettleStream(const std::uintptr_t context, const std::uintptr_t stream) noexcept override {
         const auto bound = cuCtxSetCurrent(reinterpret_cast<CUcontext>(context));
@@ -341,9 +339,38 @@ DeviceContext DeviceContext::OnDevice(int device, std::optional<DeviceExecution>
 void DeviceContext::DestroyEvent(std::uintptr_t event) const noexcept {
     if (event != 0U) state_->backend->DestroyEvent(state_->context, event);
 }
+void ImageCopyBackend::StreamNotification::Notify(CUresult status) noexcept {
+    std::scoped_lock lock(return_mutex_);
+    status_.store(status, std::memory_order_release);
+    try { wake_(); } catch (...) {}
+    completed_ = true;
+    returned_.notify_all();
+}
+struct ImageStream::NotificationState final {
+    explicit NotificationState(DeviceContext retained) : context(std::move(retained)) {}
+    DeviceContext context;
+    ImageCopyBackend::StreamNotification callback;
+    bool armed = false;
+    TerminalCudaRetirementOwner terminal{1U};
+    TerminalCudaRetirementLease retention = ReserveTerminalCudaLease(terminal);
+};
 void ImageStream::Record(std::uintptr_t event) { context_.state_->backend->RecordEvent(context_.state_->context, stream_, event); }
 void ImageStream::Notify(std::function<void()> wake) {
-    context_.state_->backend->NotifyStream(context_.state_->context, stream_, std::move(wake));
+    if (!wake) throw std::invalid_argument("image completion notification is empty");
+    if (!notification_) notification_ = std::make_shared<NotificationState>(context_);
+    if (notification_->armed) throw std::logic_error("image completion notification is awaiting settlement");
+    auto& callback = notification_->callback;
+    callback.wake_ = std::move(wake);
+    callback.status_.store(CUDA_SUCCESS, std::memory_order_relaxed);
+    callback.completed_ = false;
+    notification_->armed = true;
+    try {
+        context_.state_->backend->NotifyStream(context_.state_->context, stream_, callback);
+    } catch (...) {
+        notification_->armed = false;
+        callback.wake_ = {};
+        throw;
+    }
 }
 void ImageStream::AwaitEvent(std::uintptr_t event) { context_.state_->backend->WaitEvent(context_.state_->context, stream_, event); }
 
@@ -351,19 +378,32 @@ ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
     stream_ = context_.state_->backend->CreateStream(context_.state_->context);
     if (stream_ == 0U) throw std::runtime_error("image stream creation returned no stream");
 }
-ImageStream::~ImageStream() {
+ImageStream::~ImageStream() { Close(); }
+void ImageStream::Close() noexcept {
+    if (notification_ && notification_->armed && !Settle().completion_reached) {
+        // The existing stream boundary retains the callback and its context
+        // when even terminal CUDA completion cannot establish safe release.
+        auto retained = std::move(notification_);
+        std::move(retained->retention).Install(TerminalCudaCustody::Share(retained), cudaErrorUnknown);
+        stream_ = 0U;
+        return;
+    }
     if (stream_ != 0U) context_.state_->backend->DestroyStream(context_.state_->context, stream_);
+    stream_ = 0U;
+    notification_.reset();
 }
 ImageStream::ImageStream(ImageStream&& other) noexcept
     : context_(std::move(other.context_)),
       stream_(std::exchange(other.stream_, 0U)),
-      settlement_failure_(std::move(other.settlement_failure_)) {}
+      settlement_failure_(std::move(other.settlement_failure_)),
+      notification_(std::move(other.notification_)) {}
 ImageStream& ImageStream::operator=(ImageStream&& other) noexcept {
     if (this == &other) return *this;
-    if (stream_ != 0U) context_.state_->backend->DestroyStream(context_.state_->context, stream_);
+    Close();
     context_ = std::move(other.context_);
     stream_ = std::exchange(other.stream_, 0U);
     settlement_failure_ = std::move(other.settlement_failure_);
+    notification_ = std::move(other.notification_);
     return *this;
 }
 void ImageStream::Synchronize() {
@@ -372,6 +412,22 @@ void ImageStream::Synchronize() {
 }
 ImageCopyBackend::StreamSettlement ImageStream::Settle() noexcept {
     auto settled = context_.state_->backend->SettleStream(context_.state_->context, stream_);
+    if (notification_ && notification_->armed) {
+        auto& callback = notification_->callback;
+        std::unique_lock<std::mutex> returned;
+        if (settled.completion_reached) {
+            returned = std::unique_lock(callback.return_mutex_);
+            callback.returned_.wait(returned, [&callback] { return callback.completed_; });
+        }
+        const auto status = callback.status_.exchange(CUDA_SUCCESS, std::memory_order_acq_rel);
+        // Translate on the ordinary owner, never inside the CUDA callback.
+        settled.failure = combine_image_failures(
+            CudaFailure("image stream completion notification", status), settled.failure);
+        if (settled.completion_reached) {
+            notification_->armed = false;
+            callback.wake_ = {};
+        }
+    }
     if ((!settled.completion_reached || settled.failure) && !is_image_execution_failure(settled.failure)) {
         try {
             throw ImageStreamExecutionFailure(settled.failure);

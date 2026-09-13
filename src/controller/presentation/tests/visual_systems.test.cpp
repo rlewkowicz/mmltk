@@ -10012,13 +10012,15 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
         return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
             .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
     };
-    std::promise<void> failure, submitted, completed, following, independent;
+    std::promise<void> failure, submitted, completed, following, independent, second_submitted;
+    std::uintptr_t first_stream = 0U, second_stream = 0U;
     std::atomic<unsigned> order{0U};
     detail::VisualRuntimeOwner first(factory, [&](auto) { failure.set_value(); });
     detail::VisualRuntimeOwner second(factory, [&](auto) { failure.set_value(); });
     REQUIRE(first.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
-        runtime.PublishRetained(candidate, 4U, 3U, [](auto, auto, auto) {}, gpu::ImageSubmission::Enqueue);
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { first_stream = stream; },
+                                gpu::ImageSubmission::Enqueue);
         first.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
             runtime.CommitOutput(std::move(candidate));
             CHECK(order.fetch_add(1U) == 0U);
@@ -10032,13 +10034,24 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
         following.set_value();
         return detail::VisualRuntimeOwner::Notification{};
     }));
-    REQUIRE(second.SubmitOrdered([&](auto&, std::stop_token) {
-        independent.set_value();
-        return detail::VisualRuntimeOwner::Notification{};
+    REQUIRE(second.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto candidate = runtime.AcquireOutput();
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { second_stream = stream; },
+                                gpu::ImageSubmission::Enqueue);
+        second.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
+            runtime.CommitOutput(std::move(candidate));
+            independent.set_value();
+        });
+        return detail::VisualRuntimeOwner::Notification{[&] { second_submitted.set_value(); }};
     }));
+    mmltk::testsupport::await_test_promise(second_submitted, "second asynchronous producer submission");
+    auto settlement = backend->HoldStreamSettlements("first producer physical settlement", first_stream);
+    backend->CompleteNotifications(first_stream);
+    REQUIRE(settlement->WaitEntered(2s));
+    backend->CompleteNotifications(second_stream);
     mmltk::testsupport::await_test_promise(independent, "independent producer progress");
     CHECK(order.load() == 0U);
-    backend->CompleteNotifications();
+    settlement->Release();
     mmltk::testsupport::await_test_promise(completed, "settled raster completion");
     mmltk::testsupport::await_test_promise(following, "ordered work after GPU completion");
     first.StopAndWait();
@@ -10046,6 +10059,122 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
     CHECK(order.load() == 2U);
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Deferred product completion reports terminal failure without additional application traffic", "[presentation][workspace]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    const bool registration_failure = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_notifications = true;
+    const auto expected = std::make_exception_ptr(std::runtime_error("deferred product terminal failure"));
+    std::promise<std::exception_ptr> failed;
+    std::promise<void> submitted;
+    std::atomic_uint failures{0U}, completions{0U};
+    detail::VisualRuntimeOwner owner([backend](auto revisions) {
+        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+            .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+    }, [&](auto error) {
+        if (failures.fetch_add(1U) == 0U) failed.set_value(error);
+    });
+    auto admitted = backend->ObserveNextNotificationStream();
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto candidate = runtime.AcquireOutput();
+        std::uintptr_t stream = 0U;
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; },
+                                gpu::ImageSubmission::Enqueue);
+        if (registration_failure)
+            backend->FailAfter(FakeImageBackend::FailurePoint::NotifyStream, 0U, expected);
+        else
+            backend->SetStreamSettlement(stream, {.completion_reached = true, .failure = expected});
+        owner.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
+            runtime.CommitOutput(std::move(candidate));
+            ++completions;
+        });
+        return detail::VisualRuntimeOwner::Notification{[&] { submitted.set_value(); }};
+    }));
+    if (!registration_failure) {
+        const auto stream = mmltk::testsupport::await_test_future(admitted, "deferred terminal notification admitted");
+        mmltk::testsupport::await_test_promise(submitted, "deferred product submitted");
+        backend->CompleteNotifications(stream, CUDA_ERROR_LAUNCH_FAILED);
+    }
+    const auto failure = mmltk::testsupport::await_test_promise(failed, "autonomous deferred product failure");
+    CHECK(gpu::test_support::ContainsImageFailure(failure, expected));
+    CHECK(completions == 0U);
+    owner.StopAndWait();
+    CHECK(failures == 1U);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Stopping a deferred product settles pending notification before candidate destruction", "[presentation][workspace]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_notifications = true;
+    std::atomic_uint completions{0U}, failures{0U};
+    detail::VisualRuntimeOwner owner([backend](auto revisions) {
+        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+            .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+    }, [&](auto) { ++failures; });
+    auto admitted = backend->ObserveNextNotification();
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto candidate = runtime.AcquireOutput();
+        runtime.PublishRetained(candidate, 4U, 3U, [](auto, auto, auto) {}, gpu::ImageSubmission::Enqueue);
+        owner.DeferCompletion(runtime, [candidate = std::move(candidate), &completions] { ++completions; });
+        return detail::VisualRuntimeOwner::Notification{};
+    }));
+    mmltk::testsupport::await_test_future(admitted, "pending notification before stop");
+    auto settlement = backend->HoldStreamSettlements("shutdown callback physical settlement");
+    std::future<void> stopped = std::async(std::launch::async, [&] { owner.StopAndWait(); });
+    auto cleanup = mmltk::testsupport::ScopedTestCleanup{[&] {
+        settlement->Release();
+        if (stopped.valid()) stopped.wait();
+    }};
+    REQUIRE(settlement->WaitEntered(2s));
+    CHECK(backend->planes_freed == 0U);
+    CHECK(stopped.wait_for(0s) == std::future_status::timeout);
+    settlement->Release();
+    mmltk::testsupport::await_test_future(stopped, "deferred product shutdown");
+    CHECK(completions == 0U);
+    CHECK(failures == 0U);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Terminal product notification reports unproved settlement with physical custody retained", "[presentation][workspace]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->defer_notifications = true;
+    const auto expected = std::make_exception_ptr(std::runtime_error("producer context unavailable for settlement"));
+    std::promise<std::exception_ptr> failed;
+    std::atomic_uint failures{0U}, completions{0U};
+    {
+        detail::VisualRuntimeOwner owner([backend](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+        }, [&](auto failure) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+        });
+        auto admitted = backend->ObserveNextNotificationStream();
+        REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+            auto candidate = runtime.AcquireOutput();
+            std::uintptr_t stream = 0U;
+            runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; },
+                                    gpu::ImageSubmission::Enqueue);
+            backend->SetStreamSettlement(stream, {.failure = expected});
+            owner.DeferCompletion(runtime, [candidate = std::move(candidate), &completions] { ++completions; });
+            return detail::VisualRuntimeOwner::Notification{};
+        }));
+        const auto stream = mmltk::testsupport::await_test_future(admitted, "unproved product notification admitted");
+        backend->CompleteNotifications(stream, CUDA_ERROR_INVALID_CONTEXT);
+        const auto failure = mmltk::testsupport::await_test_promise(failed, "unproved product terminal failure");
+        CHECK(gpu::test_support::ContainsImageFailure(failure, expected));
+        owner.StopAndWait();
+        CHECK(completions == 0U);
+    }
+    CHECK(failures == 1U);
+    CHECK(backend->planes_allocated > backend->planes_freed);
+    CHECK(backend->contexts_created > backend->contexts_destroyed);
+    CHECK(backend->streams_destroyed == 0U);
 }
 
 struct ProducerWorkspaceRequest final {
@@ -10079,6 +10208,63 @@ struct ProducerWorkspaceRequest final {
                                                        borrowed.plane().descriptor.height).data);
     }
 };
+
+TEST_CASE("Display terminal failure wakes request readiness and preserves the last completed display", "[presentation][workspace]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace fixture = gpu::test_support;
+    fixture::ImageWorkspaceTestAccess::Reset();
+    const bool registration_failure = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    const auto expected = std::make_exception_ptr(std::runtime_error("display terminal failure"));
+    std::promise<std::exception_ptr> failed;
+    std::atomic_uint failures{0U};
+    detail::VisualRuntimeOwner owner([backend](auto revisions) {
+        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+            .device = 0, .backend = backend, .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend),
+            .product_revisions = std::move(revisions)});
+    }, [&](auto failure) {
+        if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+    });
+    std::promise<void> published;
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), 93, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        });
+        return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
+    }));
+    mmltk::testsupport::await_test_promise(published, "initial display product");
+    auto make_workspace = [&] {
+        auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout(0));
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        return workspace;
+    };
+    ProducerWorkspaceRequest previous{.workspace = make_workspace()};
+    previous.Request(owner);
+    previous.CheckCompleted(owner);
+    const auto previous_pixel = *reinterpret_cast<const std::byte*>(previous.workspace->plane(4U, 3U).data);
+    ProducerWorkspaceRequest candidate{.workspace = make_workspace()};
+    backend->defer_notifications = true;
+    auto admitted = backend->ObserveNextNotificationStream();
+    if (registration_failure) backend->FailAfter(FakeImageBackend::FailurePoint::NotifyStream, 0U, expected);
+    candidate.Request(owner);
+    if (!registration_failure) {
+        const auto stream = mmltk::testsupport::await_test_future(admitted, "failing display notification admitted");
+        backend->SetStreamSettlement(stream, {.completion_reached = true, .failure = expected});
+        backend->CompleteNotifications(stream, CUDA_ERROR_LAUNCH_FAILED);
+    }
+    const auto failure = mmltk::testsupport::await_test_promise(failed, "display terminal failure delivery");
+    mmltk::testsupport::await_test_future(candidate.ready, "failed display request readiness");
+    CHECK(fixture::ContainsImageFailure(failure, expected));
+    CHECK_FALSE(candidate.workspace->Contains(candidate.content));
+    CHECK(previous.workspace->Contains(previous.content));
+    CHECK(*reinterpret_cast<const std::byte*>(previous.workspace->plane(4U, 3U).data) == previous_pixel);
+    previous.workspace.reset();
+    candidate.workspace.reset();
+    owner.StopAndWait();
+    CHECK(failures == 1U);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
 
 template<class Producer>
 ProducerWorkspaceRequest request_delayed_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend) {

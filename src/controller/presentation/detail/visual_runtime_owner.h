@@ -73,7 +73,8 @@ class VisualRuntimeOwner final {
     [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(Runtime&, Runtime::CompletedOutput&,
         mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
     // Retain the submitted operation and its candidate until owner-thread GPU
-    // settlement. Later GPU work waits for the notification; input admission
+    // settlement. Success and execution failure both notify; later GPU work
+    // waits for owner-thread failure handling or completion. Input admission
     // and independent system execution remain live.
     void DeferCompletion(Runtime&, Notification);
     bool RequestActiveStop() noexcept;

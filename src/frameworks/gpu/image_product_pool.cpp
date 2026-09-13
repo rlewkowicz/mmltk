@@ -191,7 +191,11 @@ ImageProductPool::~ImageProductPool() {
 ImageProductPool::Candidate ImageProductPool::Acquire(std::stop_token stop, Product baseline, ImagePlanePreservation preservation) {
     ValidateBaseline(baseline);
     while (!stop.stop_requested()) {
+        // Observe before the drain: a terminal callback can arrive during
+        // either the completion check or reservation. Its epoch change must
+        // survive until Wait, and settlement must run outside admission locks.
         const auto available = ObserveAvailability();
+        CompleteWorkspaces();
         auto candidate = TryAcquire(baseline, preservation);
         if (candidate.valid()) return candidate;
         if (!available.Wait(stop)) return {};
@@ -335,7 +339,12 @@ void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCov
     candidate.slot_->buffer.FinalizeWorkspace(coverage);
 }
 void ImageProductPool::CompleteWorkspaces() {
-    for (const auto& slot : slots_) slot->buffer.CompleteWorkspace();
+    std::exception_ptr failure;
+    for (const auto& slot : slots_) {
+        try { slot->buffer.CompleteWorkspace(); }
+        catch (...) { failure = combine_image_failures(failure, std::current_exception()); }
+    }
+    if (failure) std::rethrow_exception(failure);
 }
 ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
     ImageStreamSettlement result{.completion_reached = true};

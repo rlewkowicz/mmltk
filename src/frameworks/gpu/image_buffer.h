@@ -10,6 +10,7 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <stdexcept>
 
 #include "src/frameworks/gpu/image_geometry.h"
@@ -22,6 +23,19 @@ namespace mmltk::frameworks::gpu {
 
 class ImageCopyBackend {
    public:
+    class StreamNotification final {
+       public:
+        // Backend callback: publish status and wake only. Never call CUDA here.
+        void Notify(CUresult status) noexcept;
+
+       private:
+        friend class ImageStream;
+        std::function<void()> wake_;
+        std::atomic<CUresult> status_{CUDA_SUCCESS};
+        std::mutex return_mutex_;
+        std::condition_variable returned_;
+        bool completed_ = false;
+    };
     virtual ~ImageCopyBackend() = default;
     [[nodiscard]] virtual std::optional<DeviceExecution> ResolveExecution(int device, int numa_node);
     [[nodiscard]] virtual std::uintptr_t CreateContext(int device, DeviceContextMode) = 0;
@@ -51,9 +65,11 @@ class ImageCopyBackend {
                                   std::size_t source_pitch, const ImagePlaneView& destination) = 0;
     virtual void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) = 0;
     virtual void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) = 0;
-    // Notification is wake-only. The owner must settle the following stream
-    // boundary before releasing any callback or GPU resource custody.
-    virtual void NotifyStream(std::uintptr_t context, std::uintptr_t stream, std::function<void()>) = 0;
+    // Terminal notification runs on success and execution/context error.
+    // Registration failure throws without retaining the supplied storage.
+    // The stream owner retains and reuses storage only after callback return
+    // and physical settlement; the callback never releases GPU custody.
+    virtual void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification&) = 0;
     using StreamSettlement = ImageStreamSettlement;
     [[nodiscard]] virtual StreamSettlement SettleStream(std::uintptr_t context, std::uintptr_t stream) noexcept = 0;
 };
@@ -110,9 +126,12 @@ class ImageStream final {
     [[nodiscard]] std::uintptr_t native_handle() const noexcept { return stream_; }
 
    private:
+    struct NotificationState;
+    void Close() noexcept;
     DeviceContext context_;
     std::uintptr_t stream_ = 0U;
     std::exception_ptr settlement_failure_;
+    std::shared_ptr<NotificationState> notification_;
     friend class ImageBuffer;
     friend class ImageProductBuffer;
 };
