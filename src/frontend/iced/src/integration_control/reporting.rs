@@ -718,6 +718,53 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_conflict_reporting_projects_fields_and_retains_installed_state() {
+        let capture = Capture::new(true);
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let installed = model.explore.snapshot.as_mut().unwrap();
+        installed.revision = 11;
+        let installed = installed.clone();
+        let mut incoming = installed.clone();
+        incoming.renderpending = !incoming.renderpending;
+        for multiple_fields in [false, true] {
+            if multiple_fields {
+                incoming.busy = !incoming.busy;
+                incoming.selectedimage = Some(7);
+                incoming.order.visibleindices.push(7);
+                incoming.labels.push(crate::generated::ExploreLabel {
+                    box_: crate::view_model::test_support::annotation_object(2).box_,
+                    category: 2,
+                    compiledindex: 7,
+                });
+            }
+            model.reduce_event(crate::generated::ApplicationEvent::ExploreExploreChanged(
+                crate::generated::ExploreChanged {
+                    snapshot: incoming.clone(),
+                },
+            ));
+            assert_eq!(model.explore.snapshot.as_ref(), Some(&installed));
+            assert_eq!(
+                model.error.as_ref().unwrap().detail,
+                "inconsistent Explore snapshot observation revision"
+            );
+            assert_eq!(
+                capture.records(),
+                vec![(
+                    "integration.snapshot_conflict".into(),
+                    "Explore".into(),
+                    if multiple_fields {
+                        "busy,renderpending,order,selectedimage,labels"
+                    } else {
+                        "renderpending"
+                    }
+                    .into(),
+                    [11.0, 0.0, 0.0, 0.0],
+                )]
+            );
+        }
+    }
+
+    #[test]
     fn controller_reporting_is_lazy_and_preserves_snapshot_phase_and_style_records() {
         for enabled in [false, true] {
             let capture = Capture::new(enabled);

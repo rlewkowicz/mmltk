@@ -591,40 +591,17 @@ pub(super) fn merge_explore_snapshot(
         && installed.revision == incoming.revision
         && installed != &incoming
     {
-        let mut fields = Vec::new();
-        macro_rules! differing {
-            ($field:ident) => {
-                if installed.$field != incoming.$field {
-                    fields.push(stringify!($field));
-                }
-            };
-        }
-        differing!(busy);
-        differing!(cancellationrequested);
-        differing!(ready);
-        differing!(failure);
-        differing!(failurekind);
-        differing!(nproc);
-        differing!(maximumatlasextent);
-        differing!(dataset);
-        differing!(order);
-        differing!(gallery);
-        differing!(viewport);
-        differing!(viewportresult);
-        differing!(filter);
-        differing!(overlay);
-        differing!(augmentation);
-        differing!(detail);
-        differing!(mode);
-        differing!(selectedimage);
-        differing!(frame);
-        differing!(document);
-        differing!(scene);
-        differing!(labels);
+        let mut fields = String::new();
+        installed.visit_differing_fields(&incoming, |field| {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str(field);
+        });
         crate::integration_control::report_snapshot_conflict(
             "Explore",
             incoming.revision,
-            &fields.join(","),
+            &fields,
         );
     }
     merge_observation(target, incoming, |value| value.revision, "Explore")
@@ -1249,6 +1226,43 @@ mod tests {
         let mut conflicting = settled;
         conflicting.ready = !conflicting.ready;
         assert!(merge_explore_snapshot(&mut model.explore.snapshot, conflicting).is_err());
+    }
+
+    #[test]
+    fn snapshot_field_comparison_preserves_root_fields_and_declaration_order() {
+        let installed = explore_snapshot();
+        let mut incoming = installed.clone();
+        let mut fields = Vec::new();
+        installed.visit_differing_fields(&incoming, |field| fields.push(field));
+        assert!(fields.is_empty());
+        let mut target = Some(installed.clone());
+        assert_eq!(
+            merge_explore_snapshot(&mut target, incoming.clone()).unwrap(),
+            Observation::Current
+        );
+
+        incoming.renderpending = !incoming.renderpending;
+        installed.visit_differing_fields(&incoming, |field| fields.push(field));
+        assert_eq!(fields, ["renderpending"]);
+        assert!(merge_explore_snapshot(&mut target, incoming.clone()).is_err());
+        assert_eq!(target.as_ref(), Some(&installed));
+
+        incoming.busy = !incoming.busy;
+        incoming.selectedimage = Some(7);
+        incoming.order.visibleindices.push(7);
+        incoming.labels.push(crate::generated::ExploreLabel {
+            box_: annotation_object(2).box_,
+            category: 2,
+            compiledindex: 7,
+        });
+        fields.clear();
+        installed.visit_differing_fields(&incoming, |field| fields.push(field));
+        assert_eq!(
+            fields,
+            ["busy", "renderpending", "order", "selectedimage", "labels"]
+        );
+        assert!(merge_explore_snapshot(&mut target, incoming).is_err());
+        assert_eq!(target.as_ref(), Some(&installed));
     }
 
     #[test]

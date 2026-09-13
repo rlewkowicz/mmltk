@@ -711,6 +711,7 @@ class BindingEmitter final {
         mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitSystems([&]<class SystemCell, std::meta::info Snapshot>() {
             using Signature = mmltk::controller::browser::SystemMethodSignature<decltype(&[:Snapshot:])>;
             EmitType<typename Signature::result_type>();
+            EmitSnapshotFieldComparison<typename Signature::result_type>();
         });
         mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
             if constexpr (Endpoint::signature::has_request) EmitType<typename Endpoint::request_type>();
@@ -720,6 +721,18 @@ class BindingEmitter final {
             [&]<class Identity, class Event>(const auto&) { EmitType<Event>(); });
         mmltk::controller::browser::ApplicationSchema<ApplicationSystems>::VisitCatalogProviders(
             [&]<class Provider, class Row>(const auto&) { EmitCatalogDependencies<Row>(); });
+    }
+
+    template <class Type>
+    void EmitSnapshotFieldComparison() {
+        const auto name = rust_type<Type>();
+        if (!symbols_.Reserve("impl " + name, "visit_differing_fields", NativeSource<Type>() + " snapshot field comparison")) return;
+        output_ << "impl " << name
+                << " {\n    pub fn visit_differing_fields(&self, other: &Self, mut visitor: impl FnMut(&'static str)) {\n";
+        VisitRustFields<Type>([&]<class, class>(const auto&, const std::string& member) {
+            output_ << "        if self." << member << " != other." << member << " { visitor(\"" << member << "\"); }\n";
+        });
+        output_ << "    }\n}\n\n";
     }
 
     template <class Type>
