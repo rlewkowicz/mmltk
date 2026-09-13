@@ -1590,8 +1590,6 @@ template <class Composition>
     application_schema_detail::append_type<ClientRecord>(sink);
     application_schema_detail::append_type<ServerRecord>(sink);
     application_schema_detail::append_type<WorkspaceImageMetadata>(sink);
-    sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
-    sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
     sink.append("visual-source-projections");
     application_schema_detail::append_type<VisualSourceObservation>(sink);
     application_schema_detail::append_type<VisualCleanContentIdentity>(sink);

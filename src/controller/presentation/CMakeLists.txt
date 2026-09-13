@@ -27,11 +27,11 @@ add_library(mmltk::controller::visual_runtime ALIAS
 mmltk_configure_component(mmltk_controller_visual_runtime PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_controller_visual_runtime
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES visual_runtime.h visual_diagnostics.h)
+    FILES visual_runtime.h visual_diagnostics.h workspace_input.h)
 mmltk_register_private_headers(mmltk_controller_visual_runtime
     detail/visual_runtime_owner.h)
 mmltk_register_ordinary_sources(mmltk_controller_visual_runtime
-    visual_diagnostics.cpp detail/visual_runtime_owner.cpp)
+    visual_diagnostics.cpp workspace_input.cpp detail/visual_runtime_owner.cpp)
 mmltk_register_retained_module_importers(mmltk_controller_visual_runtime visual_runtime.cpp)
 target_link_libraries(mmltk_controller_visual_runtime
     PUBLIC

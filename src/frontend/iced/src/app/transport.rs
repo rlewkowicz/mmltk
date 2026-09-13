@@ -12,7 +12,7 @@ impl App {
         if let Some(connection) = &self.connection {
             connection.close();
         }
-        self.workspace.set_annotation_connection(None);
+        self.workspace.set_workspace_connection(None);
         self.connection = None;
         self.model.peer_disconnected(error);
         self.settings.reset_transport();
@@ -70,7 +70,7 @@ impl App {
                 self.settings.reset_transport();
                 self.workspace.reset_transport(&self.model);
                 self.workspace
-                    .set_annotation_connection(Some(connection.clone()));
+                    .set_workspace_connection(Some(connection.clone()));
                 self.connection = Some(connection);
             }
             TransportEvent::Bootstrap(bootstrap) => self.install_bootstrap(bootstrap),

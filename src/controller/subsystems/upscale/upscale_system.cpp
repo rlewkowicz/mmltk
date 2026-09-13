@@ -1,3 +1,4 @@
+#include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -265,6 +266,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
 }  // namespace
 
 class UpscaleSystem::Impl final {
+    WorkspaceInput input_;
    public:
     Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
          SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
@@ -925,3 +927,15 @@ VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSetti
 }
 
 }  // namespace mmltk::controller
+
+namespace mmltk::controller {
+void UpscaleSystem::Input(WorkspaceMouse mouse) {
+    std::scoped_lock lock(impl_->mutex_);
+    if (impl_->worker_.stopped()) throw contracts::UnavailableError("Upscale input is unavailable");
+    impl_->input_.Accept(std::move(mouse), PresentationSourceKind::Upscale);
+}
+void UpscaleSystem::SetInputPeer(std::uint64_t epoch) {
+    std::scoped_lock lock(impl_->mutex_);
+    impl_->input_.SetPeer(epoch);
+}
+}

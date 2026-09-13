@@ -9171,6 +9171,11 @@ impl Controller {
                         return Task::none();
                     }
                 }
+                let Some((_, image)) = crate::presentation_surface::retained_surface().and_then(crate::presentation_surface::drawable_annotation) else {
+                    return Task::none();
+                };
+                let Some(rendered) = image.diagnostics.as_deref() else { return Task::none(); };
+
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.annotation_settlement",
@@ -9185,10 +9190,10 @@ impl Controller {
                             self.copy_product_settlement,
                             self.copy_product_ui_revision,
                             snapshot.inputdocumentepoch,
-                            snapshot.rendered.documentepoch,
+                            rendered.documentepoch,
                             snapshot.ui.scenerevision,
-                            snapshot.rendered.scenerevision,
-                            snapshot.ui.editor == snapshot.rendered.editor,
+                            rendered.scenerevision,
+                            snapshot.ui.editor == rendered.editor,
                             self.annotation_frame_ready,
                             frame.and_then(|frame| crate::presentation_surface::metadata::product(frame)
                                 .map(|product| (product.source.kind, product.revision, frame.presentation_revision))),
@@ -9221,9 +9226,9 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                if snapshot.rendered.documentepoch != snapshot.inputdocumentepoch
-                    || snapshot.rendered.scenerevision != snapshot.ui.scenerevision
-                    || snapshot.rendered.editor != snapshot.ui.editor
+                if rendered.documentepoch != snapshot.inputdocumentepoch
+                    || rendered.scenerevision != snapshot.ui.scenerevision
+                    || rendered.editor != snapshot.ui.editor
                 {
                     reporting::emit(|sink| {
                         sink.record(
@@ -9232,9 +9237,9 @@ impl Controller {
                             "logical-scene-and-rendered-scene",
                             [
                                 snapshot.inputdocumentepoch as f64,
-                                snapshot.rendered.documentepoch as f64,
+                                rendered.documentepoch as f64,
                                 snapshot.ui.scenerevision as f64,
-                                snapshot.rendered.scenerevision as f64,
+                                rendered.scenerevision as f64,
                             ],
                         )
                     });

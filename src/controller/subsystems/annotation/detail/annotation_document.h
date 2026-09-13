@@ -38,8 +38,8 @@ class AnnotationDocument final {
 
     [[nodiscard]] DocumentResult Open(contracts::AnnotationSceneContent);
     [[nodiscard]] DocumentResult Pointer(const mmltk::controller::AnnotationPointer&);
-    // Translate an exact displayed target into the current document's indices.
-    // The reducer itself continues to operate on ordinary current-index targets.
+    // Resolve a press from current native geometry; later progress retains the
+    // document/history-owned target selected by that press.
     [[nodiscard]] bool ResolveTarget(mmltk::controller::AnnotationPointer&) const noexcept;
     bool PeerClosed() noexcept;
     [[nodiscard]] DocumentResult Edit(const mmltk::controller::AnnotationEdit&);

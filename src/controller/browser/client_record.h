@@ -18,7 +18,7 @@
 
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/integration_control.h"
-#include "src/controller/subsystems/annotation/annotation_system.h"
+#include "src/controller/presentation/visual_system_types.h"
 #include "src/frameworks/serialization/serialization.h"
 
 namespace mmltk::controller::browser {
@@ -127,14 +127,6 @@ struct InteractionRejected final {
 };
 MMLTK_REFLECT_FIELDS(InteractionRejected)
 
-struct InputProgress final {
-    bool operator==(const InputProgress&) const = default;
-    std::uint64_t protocol_version = kBrowserProtocolVersion;
-    AnnotationInputProgress progress{};
-    std::optional<ApplicationErrorRecord> error{};
-};
-MMLTK_REFLECT_FIELDS(InputProgress)
-
 struct IntegrationControl final {
     std::uint64_t protocol_version = kBrowserProtocolVersion;
     contracts::IntegrationControlReceipt receipt{};
@@ -143,7 +135,7 @@ struct IntegrationControl final {
 MMLTK_REFLECT_FIELDS(IntegrationControl)
 
 using ClientRecord = std::variant<Intent, Interaction, IntegrationControl>;
-using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InputProgress, InteractionRejected, IntegrationControl>;
+using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InteractionRejected, IntegrationControl>;
 
 MMLTK_REFLECT_FIELDS(IntentField)
 MMLTK_REFLECT_FIELDS(Intent)

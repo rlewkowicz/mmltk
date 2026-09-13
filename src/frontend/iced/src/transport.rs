@@ -137,7 +137,6 @@ fn worker(
         loop {
             let (sender, mut outbound) = futures_channel::mpsc::channel(1);
             let mut connection = Connection::new(sender);
-            connection.enable_integration(config.integration);
             let (socket, mut incoming) = match Socket::open(&config.websocket_url) {
                 Ok(value) => value,
                 Err(error) => {
@@ -206,8 +205,7 @@ fn worker(
                                 break error;
                             }
                         }
-                        // Credits are reduced independently of the consumer. Every
-                        // ordinary event enters the coalescer before the sole handoff.
+                        // Ordinary events enter the coalescer before the sole handoff.
                         if let Some(event) = application_event(record) {
                             if let Err(error) = retain_event(&mut pending_events, event) {
                                 break error;
@@ -256,7 +254,6 @@ fn application_event(record: ServerRecord) -> Option<TransportEvent> {
         ServerRecord::Bootstrap(record) => Some(TransportEvent::Bootstrap(record)),
         ServerRecord::IntentReply(record) => Some(TransportEvent::IntentReply(record)),
         ServerRecord::SystemEvent(record) => Some(TransportEvent::SystemEvent(record)),
-        ServerRecord::InputProgress(_) => None,
         ServerRecord::IntegrationControl(record) => {
             Some(TransportEvent::IntegrationControl(record.receipt))
         }

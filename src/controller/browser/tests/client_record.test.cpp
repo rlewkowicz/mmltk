@@ -103,10 +103,10 @@ class FixtureAnnotationSystem final {
         return {};
     }
     [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void Input(
-        mmltk::controller::AnnotationInputBatch batch) {
+        mmltk::controller::WorkspaceMouse batch) {
         input = std::move(batch);
     }
-    mmltk::controller::AnnotationInputBatch input;
+    mmltk::controller::WorkspaceMouse input;
     std::vector<std::size_t> alternatives;
 };
 
@@ -300,38 +300,17 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     const auto batch_view = decode_interaction_view(batch_fixture.bytes);
     REQUIRE(batch_view);
     CHECK(dispatch_interaction(systems, *batch_view).disposition == InteractionDispatchDisposition::Accepted);
-    REQUIRE(annotation.input.samples.size() == kAnnotationInputBatchCapacity);
-    CHECK(std::get<AnnotationPointer>(annotation.input.samples.front()).target.role == contracts::AnnotationHandleRole::BoxCorner);
+    REQUIRE(annotation.input.point);
+    CHECK(annotation.input.point->x == 1.25F);
+    CHECK(annotation.input.point->y == 2.5F);
     CHECK(annotation.input.document_epoch == 1U);
-    CHECK(annotation.input.sequence == 1U);
-    CHECK(std::get<AnnotationPointer>(annotation.input.samples.front()).phase == contracts::AnnotationPointerPhase::Begin);
-    CHECK(std::get<AnnotationPointer>(annotation.input.samples.back()).phase == contracts::AnnotationPointerPhase::End);
-    CHECK(std::get<contracts::AnnotationPoint>(annotation.input.samples[1]) == contracts::AnnotationPoint{1.0F, 0.0F});
-    CHECK(std::get<AnnotationPointer>(annotation.input.samples[kAnnotationInputBatchCapacity / 2U]).brush_radius ==
-          contracts::kDefaultAnnotationBrushRadius + 1U);
-    const auto batch_owned = decode_client_record({.first = batch_fixture.bytes});
-    REQUIRE(batch_owned);
-    auto batch_interaction = std::get<Interaction>(*batch_owned);
-    constexpr wire::Limits compact_limits{
-        .max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
-    auto compact_value = wire::decode({.first = batch_interaction.value}, compact_limits);
-    REQUIRE(compact_value);
-    auto& compact_fields = std::get<wire::Value::Array>(compact_value->storage);
-    REQUIRE(compact_fields.size() == 3U);
-    auto& compact_samples = std::get<wire::Value::Array>(compact_fields.back().storage);
-    REQUIRE(compact_samples.size() == kAnnotationInputBatchCapacity);
-    compact_samples.push_back(compact_samples.front());
-    REQUIRE(wire::encode(*compact_value, batch_interaction.value, compact_limits));
-    CHECK(dispatch_interaction(systems, batch_interaction).disposition == InteractionDispatchDisposition::ProtocolInvalid);
-    compact_samples.pop_back();
-    auto& first_pointer = std::get<wire::Value::Array>(compact_samples.front().storage);
-    first_pointer.front() = wire::Value(std::uint64_t{255U});
-    REQUIRE(wire::encode(*compact_value, batch_interaction.value, compact_limits));
-    CHECK(dispatch_interaction(systems, batch_interaction).disposition == InteractionDispatchDisposition::ProtocolInvalid);
-    batch_interaction = std::get<Interaction>(*batch_owned);
-    batch_interaction.value.push_back(std::byte{0xf6});
-    CHECK(dispatch_interaction(systems, batch_interaction).disposition == InteractionDispatchDisposition::ProtocolInvalid);
-    CHECK(annotation.input.samples.size() == kAnnotationInputBatchCapacity);
+    CHECK(annotation.input.kind == WorkspaceMouseKind::Motion);
+    CHECK(annotation.input.wheel_unit == WorkspaceWheelUnit::Pixels);
+    const auto mouse_owned = decode_client_record({.first = batch_fixture.bytes});
+    REQUIRE(mouse_owned);
+    auto malformed_mouse = std::get<Interaction>(*mouse_owned);
+    malformed_mouse.value.push_back(std::byte{0xf6});
+    CHECK(dispatch_interaction(systems, malformed_mouse).disposition == InteractionDispatchDisposition::ProtocolInvalid);
     // The numeric envelope accepts every segmented boundary, rejects obsolete
     // named records, and never tolerates truncation, unknown opcodes or trailing bytes.
     wire::ByteBuffer projected;
@@ -533,7 +512,7 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
     zero_epoch.input_epoch = 0U;
     CHECK_FALSE(encode_server_record(ServerRecord{zero_epoch}, encoded));
     for (const ServerRecord& record : std::array<ServerRecord, 2U>{
-             InputProgress{.progress = {.epoch = 7U, .consumed_sequence = 2U}},
+             InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
              InteractionRejected{
                  .endpoint_id = 1U,
                  .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
@@ -618,14 +597,11 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
     CHECK(bounded.detail[2U] == '?');
 
     wire::ByteBuffer encoded;
-    InputProgress progress{.progress = {.epoch = 1U, .consumed_sequence = 2U, .rejection = std::string(kVisualFailureByteCapacity, 'r')}};
-    REQUIRE(encode_server_record(ServerRecord{progress}, encoded));
+    InteractionRejected rejected{.endpoint_id = 1U, .error = {.detail = std::string(kMaxErrorDetailBytes, 'r')}};
+    REQUIRE(encode_server_record(ServerRecord{rejected}, encoded));
     REQUIRE(decode_server_record({.first = encoded}));
-    progress.progress.rejection->push_back('r');
-    CHECK_FALSE(encode_server_record(ServerRecord{progress}, encoded));
-    progress.progress.rejection.reset();
-    REQUIRE(encode_server_record(ServerRecord{progress}, encoded));
-    REQUIRE(decode_server_record({.first = encoded}));
+    rejected.error.detail.push_back('r');
+    CHECK_FALSE(encode_server_record(ServerRecord{rejected}, encoded));
     REQUIRE(encode_server_record(ServerRecord{IntentReply{.correlation = 1U, .result = {}, .error = bounded}}, encoded));
     CHECK_FALSE(encode_server_record(ServerRecord{IntentReply{
                                          .correlation = 1U,
@@ -739,41 +715,27 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
     }
 }
 
-TEST_CASE("compact sample alternatives retain exact fractional values and reject invalid opcodes", "[controller][browser][protocol]") {
+TEST_CASE("compact workspace mouse records preserve fractional coordinates and wheel units", "[controller][browser][protocol]") {
     using namespace mmltk::controller;
     using namespace mmltk::controller::browser;
     namespace cbor = mmltk::frameworks::serialization;
     constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
-    const AnnotationPointer absolute{
-        .phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 9U, .sequence = 1U, .point = {1.25F, 2.5F}};
-    const AnnotationInputBatch source{.document_epoch = 3U,
-                                      .sequence = 1U,
-                                      .samples = {absolute, contracts::AnnotationPoint{0.125F, -0.25F},
-                                                  AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update,
-                                                                    .interaction_id = 9U,
-                                                                    .sequence = 3U,
-                                                                    .point = {1.375F, 2.25F},
-                                                                    .brush_radius = contracts::kMaxAnnotationBrushRadius}}};
-    wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>());
+    const WorkspaceMouse source{.source = PresentationSourceKind::Annotation, .peer_epoch = 9U, .document_epoch = 3U,
+                                .kind = WorkspaceMouseKind::Wheel, .point = WorkspacePoint{1.25F, 2.5F},
+                                .button = WorkspaceMouseButton::Other, .other_button = 127U, .click_count = 2U,
+                                .modifiers = 15U, .wheel_unit = WorkspaceWheelUnit::Pixels, .wheel = {0.125F, -0.25F}};
+    wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>());
     cbor::FixedCborEncoder encoder(bytes);
     REQUIRE(cbor::encode_compact(encoder, source));
     bytes.resize(encoder.size());
     for (std::size_t split = 0U; split <= bytes.size(); ++split) {
-        AnnotationInputBatch decoded;
+        WorkspaceMouse decoded;
         const auto span = std::span<const std::byte>(bytes);
         REQUIRE(cbor::decode_compact_into(decoded, {.first = span.first(split), .second = span.subspan(split)}, limits));
-        REQUIRE(decoded.samples.size() == 3U);
-        CHECK(std::get<AnnotationPointer>(decoded.samples[0]).point == absolute.point);
-        CHECK(std::get<contracts::AnnotationPoint>(decoded.samples[1]) == contracts::AnnotationPoint{0.125F, -0.25F});
-        CHECK(std::get<AnnotationPointer>(decoded.samples[2]).brush_radius == contracts::kMaxAnnotationBrushRadius);
+        CHECK(decoded.point == source.point);
+        CHECK(decoded.wheel == source.wheel);
+        CHECK(decoded.wheel_unit == source.wheel_unit);
+        CHECK(decoded.other_button == source.other_button);
+        CHECK(decoded.modifiers == source.modifiers);
     }
-    auto malformed = wire::decode({.first = bytes}, limits);
-    REQUIRE(malformed);
-    auto& fields = std::get<wire::Value::Array>(malformed->storage);
-    auto& samples = std::get<wire::Value::Array>(fields.back().storage);
-    auto& delta = std::get<wire::Value::Array>(samples[1].storage);
-    delta.front() = wire::Value(std::uint64_t{2U});
-    REQUIRE(wire::encode(*malformed, bytes, limits));
-    AnnotationInputBatch decoded;
-    CHECK_FALSE(cbor::decode_compact_into(decoded, {.first = bytes}, limits));
 }

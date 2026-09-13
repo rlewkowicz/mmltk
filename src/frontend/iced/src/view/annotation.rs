@@ -35,7 +35,6 @@ pub enum Shortcut {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    InputFailed(crate::transport_connection::OutboundSendError),
     Shortcut(Shortcut),
     ShortcutResolved { shortcut: Shortcut, focused: bool },
     TextFocused,
@@ -52,14 +51,12 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    InputFailed(crate::transport_connection::OutboundSendError),
     ShortcutRequested(Shortcut),
     OpenRequested,
     SaveRequested,
     StopRequested,
     DialogRequested(u64),
     EditRequested(crate::generated::AnnotationEditRequest),
-    Pointer(crate::generated::AnnotationPointer),
     SettingsEdited(crate::view::settings::EditSchedule),
 }
 
@@ -73,20 +70,10 @@ pub struct Component {
 }
 
 impl Component {
-    #[cfg(test)]
-    pub(crate) fn test_install_displayed(&self, snapshot: &crate::generated::AnnotationSnapshot) {
-        self.canvas.test_install_displayed(
-            crate::presentation_surface::AnnotationContent::test_displayed(snapshot),
-        );
-    }
-
     pub fn set_connection(&self, connection: Option<crate::transport_connection::Connection>) {
         self.canvas.set_connection(connection);
     }
     pub fn rebase(&mut self, model: &ApplicationModel) {
-        if !model.annotation_edit_available() {
-            self.canvas.clear_pointer_lifecycle();
-        }
         self.sidebar.rebase(&model.annotation);
     }
 
@@ -146,9 +133,9 @@ impl Component {
                 return Ok(None);
             }
             Message::CancelRequested => {
-                return Ok(self.canvas.cancel_pointer().map(Outcome::Pointer));
+                self.canvas.cancel(application);
+                return Ok(None);
             }
-            Message::InputFailed(error) => Outcome::InputFailed(error),
             Message::OpenRequested => Outcome::OpenRequested,
             Message::SaveRequested => Outcome::SaveRequested,
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
@@ -187,36 +174,9 @@ impl Component {
             Message::Workspace(message) => match workspace::update(message) {
                 workspace::Outcome::Gesture(gesture) => {
                     if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
-                        self.keyboard_canvas
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
-                    if !application.annotation_edit_available() {
-                        self.canvas.clear_pointer_lifecycle();
-                        return Ok(None);
-                    }
-                    let document_epoch = application
-                        .annotation
-                        .snapshot
-                        .as_ref()
-                        .map_or(0, |snapshot| snapshot.inputdocumentepoch);
-                    let tool = application
-                        .annotation
-                        .snapshot
-                        .as_ref()
-                        .map_or(crate::generated::AnnotationTool::Select, |snapshot| {
-                            snapshot.ui.editor.tool
-                        });
-                    let Some(mut pointer) =
-                        self.canvas
-                            .pointer_from_gesture(document_epoch, tool, gesture)
-                    else {
-                        return Ok(None);
-                    };
-                    pointer.brushradius = settings.draft.as_ref().map_or_else(
-                        || crate::generated::default_uiannotationbrushradius().unwrap(),
-                        |draft| draft.ui.annotationbrushradius,
-                    ) as u16;
-                    Outcome::Pointer(pointer)
+                    return Ok(None);
                 }
                 workspace::Outcome::AspectSelected(aspect) => {
                     Outcome::SettingsEdited(workspace::edit_aspect(settings, aspect)?)
@@ -340,19 +300,10 @@ impl Component {
             aspect,
             settings_edit_available,
             canvas_width,
-            self.canvas.dispatch(
-                model,
-                settings.draft.as_ref().map_or_else(
-                    || crate::generated::default_uiannotationbrushradius().unwrap(),
-                    |draft| draft.ui.annotationbrushradius,
-                ) as u16,
-                move || {
-                    surface
-                        .and_then(crate::presentation_surface::drawable_annotation)
-                        .map(|(_, content)| content)
-                },
-                self.keyboard_canvas.clone(),
-            ),
+            self.canvas.binding(model, settings.draft.as_ref().map_or_else(
+                || crate::generated::default_uiannotationbrushradius().unwrap(),
+                |draft| draft.ui.annotationbrushradius) as u16),
+            self.keyboard_canvas.clone(),
         ))
         .into();
         let advanced = self
@@ -501,146 +452,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn selected_point_handle_has_precedence_over_overlapping_geometry() {
-        let mut model = ready_model();
-        let state = &mut model.annotation.snapshot.as_mut().unwrap().ui;
-        let mut point = mask_object();
-        point.shape = crate::generated::AnnotationShape::Point;
-        point.point = crate::generated::AnnotationPoint { x: 20.0, y: 30.0 };
-        state.scene.objects = vec![point.clone(), point];
-        state.editor.selectedobject = Some(0);
-        state.editor.tool = crate::generated::AnnotationTool::Select;
-        let target = super::canvas::target(state, 20.0, 30.0);
-        assert_eq!(target.object, Some(0));
-        assert_eq!(
-            target.role,
-            Some(crate::generated::AnnotationHandleRole::Point)
-        );
-    }
-
-    #[test]
-    fn gestures_use_retained_mask_pixels_and_keep_same_document_targets_until_end() {
-        use crate::generated::{AnnotationMaskRun, AnnotationPointerPhase, AnnotationTool};
-        use crate::presentation_surface::{AnnotationContent, SurfaceGestureKind};
-        let mut model = ready_model();
-        let snapshot = model.annotation.snapshot.as_mut().unwrap();
-        let mut hit = mask_object();
-        hit.mask.runs = vec![AnnotationMaskRun {
-            row: 30,
-            first: 20,
-            last: 20,
-        }];
-        let mut hole = mask_object();
-        hole.mask.runs = vec![
-            AnnotationMaskRun {
-                row: 30,
-                first: 0,
-                last: 10,
-            },
-            AnnotationMaskRun {
-                row: 30,
-                first: 30,
-                last: 40,
-            },
-        ];
-        snapshot.ui.editor.tool = AnnotationTool::Select;
-        snapshot.ui.editor.selectedobject = None;
-        snapshot.ui.scene.objects = vec![hit.clone(), hole];
-        let displayed = AnnotationContent::test_displayed(snapshot);
-        let canvas = canvas::Component::default();
-        canvas.test_install_displayed(displayed.clone());
-        // Logical input overtakes the displayed mask without changing its
-        // retained body geometry or substituting an enclosing box hit.
-        snapshot.ui.scene.objects[0].mask.runs.clear();
-        snapshot.ui.scene.objects[1] = hit;
-        assert_eq!(canvas::target(&snapshot.ui, 20.0, 30.0).object, Some(1));
-        let begin = canvas
-            .pointer_from_gesture(
-                1,
-                AnnotationTool::Select,
-                gesture(SurfaceGestureKind::Pointer),
-            )
-            .unwrap();
-        assert_eq!(begin.target.object, Some(0));
-        canvas.test_install_displayed(AnnotationContent::test_displayed(snapshot));
-        let update = canvas
-            .pointer_from_gesture(
-                1,
-                AnnotationTool::Select,
-                gesture(SurfaceGestureKind::Pointer),
-            )
-            .unwrap();
-        assert_eq!(update.target, begin.target);
-        assert_eq!(update.phase, AnnotationPointerPhase::Update);
-        let end = canvas
-            .pointer_from_gesture(1, AnnotationTool::Select, gesture(SurfaceGestureKind::End))
-            .unwrap();
-        assert_eq!(end.target, begin.target);
-        let next = canvas
-            .pointer_from_gesture(
-                1,
-                AnnotationTool::Select,
-                gesture(SurfaceGestureKind::Pointer),
-            )
-            .unwrap();
-        assert_eq!(next.target.object, Some(1));
-        assert_ne!(next.interactionid, begin.interactionid);
-        assert!(
-            canvas
-                .pointer_from_gesture(
-                    2,
-                    AnnotationTool::Select,
-                    gesture(SurfaceGestureKind::Pointer)
-                )
-                .is_none()
-        );
-        canvas.test_install_displayed(displayed);
-        let mut empty = gesture(SurfaceGestureKind::Pointer);
-        empty.sample.content_x = 25.0;
-        assert_eq!(
-            canvas
-                .pointer_from_gesture(1, AnnotationTool::Select, empty)
-                .unwrap()
-                .target
-                .object,
-            None
-        );
-        canvas.clear_pointer_lifecycle();
-        // The displayed pixels still carry Select's old handles; changing the
-        // logical tool immediately changes the next gesture's policy.
-        let create = canvas
-            .pointer_from_gesture(
-                1,
-                AnnotationTool::Point,
-                gesture(SurfaceGestureKind::Pointer),
-            )
-            .unwrap();
-        assert_eq!(create.target.object, None);
-        assert_eq!(create.identity.object, 0);
-    }
-
-    fn pointer_outcome(
-        component: &mut Component,
-        model: &mut ApplicationModel,
-        settings: &mut crate::view::settings::SettingsModel,
-    ) -> crate::generated::AnnotationPointer {
-        component.test_install_displayed(model.annotation.snapshot.as_ref().unwrap());
-        let Some(Outcome::Pointer(pointer)) = component
-            .update(
-                model,
-                settings,
-                Message::Workspace(workspace::Message::Gesture(gesture(
-                    crate::presentation_surface::SurfaceGestureKind::Pointer,
-                ))),
-            )
-            .unwrap()
-        else {
-            panic!("typed annotation pointer")
-        };
-        pointer
-    }
-
     fn assert_gesture_suppressed(
         component: &mut Component,
         model: &mut ApplicationModel,
@@ -673,231 +484,6 @@ mod tests {
                 )
                 .unwrap(),
             Some(Outcome::EditRequested(_))
-        ));
-    }
-
-    #[test]
-    fn eligible_workspace_pointer_becomes_one_typed_pointer_outcome() {
-        let mut model = ready_model();
-        let mut component = Component::default();
-        component.rebase(&model);
-        let mut settings = crate::view::settings::SettingsModel::default();
-        let pointer = pointer_outcome(&mut component, &mut model, &mut settings);
-        assert_eq!(
-            pointer.phase,
-            crate::generated::AnnotationPointerPhase::Begin
-        );
-        assert_eq!(pointer.sequence, 1);
-        assert_eq!(
-            pointer.point,
-            crate::generated::AnnotationPoint { x: 20.0, y: 30.0 }
-        );
-
-        use crate::generated::AnnotationPointerPhase as Phase;
-        use crate::presentation_surface::SurfaceGestureKind as Kind;
-        use crate::transport_connection::{Capture, CapturedRecord, Connection};
-        let assert_batch =
-            |connection: &Connection,
-             capture: &mut Capture,
-             sequence,
-             documentepoch,
-             samples: Vec<crate::generated::AnnotationPointer>| {
-                let mut prior = None;
-                let CapturedRecord::Other(actual) = capture.try_recv().unwrap() else {
-                    panic!("direct annotation interaction")
-                };
-                let expected = crate::generated::encode_annotation_Input(
-                    crate::generated::AnnotationInputBatch {
-                        documentepoch,
-                        sequence,
-                        samples: samples
-                            .iter()
-                            .map(|pointer| {
-                                let sample = crate::annotation_input::compact_sample(
-                                    pointer,
-                                    prior.as_ref(),
-                                );
-                                prior = if matches!(pointer.phase, Phase::End | Phase::Cancel) {
-                                    None
-                                } else {
-                                    Some(pointer.clone())
-                                };
-                                sample
-                            })
-                            .collect(),
-                    },
-                )
-                .unwrap()
-                .encode()
-                .unwrap();
-                assert_eq!(actual, crate::protocol::decode_envelope(&expected).unwrap());
-                connection
-                    .observe(&crate::protocol::ServerRecord::InputProgress(
-                        crate::generated::InputProgress {
-                            protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                            progress: crate::generated::AnnotationInputProgress {
-                                epoch: 1,
-                                consumedsequence: sequence,
-                                rejection: None,
-                            },
-                            error: None,
-                        },
-                    ))
-                    .unwrap();
-            };
-        let (connection, mut capture) = Connection::test_channel();
-        component.set_connection(Some(connection.clone()));
-        let mut object = mask_object();
-        object.shape = crate::generated::AnnotationShape::Point;
-        object.point = pointer.point.clone();
-        let snapshot = model.annotation.snapshot.as_mut().unwrap();
-        snapshot.ui.scene.objects = vec![object.clone(), object];
-        snapshot.ui.editor.tool = crate::generated::AnnotationTool::Select;
-        snapshot.ui.editor.selectedobject = Some(0);
-        let dispatch = |model: &ApplicationModel, radius| {
-            let displayed = model
-                .annotation
-                .snapshot
-                .as_ref()
-                .map(crate::presentation_surface::AnnotationContent::test_displayed);
-            component.canvas.dispatch(
-                model,
-                radius,
-                move || displayed.clone(),
-                component.keyboard_canvas.clone(),
-            )
-        };
-        let mut expected = pointer;
-        expected.interactionid += 1;
-        expected.target =
-            canvas::target(&model.annotation.snapshot.as_ref().unwrap().ui, 20.0, 30.0);
-        expected.identity = crate::presentation_surface::AnnotationContent::test_displayed(
-            model.annotation.snapshot.as_ref().unwrap(),
-        )
-        .target_identity(&expected.target)
-        .unwrap();
-        expected.brushradius = 9;
-        component
-            .keyboard_canvas
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(dispatch(&model, 9)(gesture(Kind::Pointer)).is_none());
-        assert!(
-            component
-                .keyboard_canvas
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-        let mut samples = vec![expected.clone()];
-
-        let mut frame = model.annotation.snapshot.as_ref().unwrap().frame.clone();
-        frame.revision += 1;
-        model.reduce_event(
-            crate::generated::ApplicationEvent::AnnotationAnnotationFrameChanged(
-                crate::generated::AnnotationFrameChanged {
-                    snapshot: crate::generated::AnnotationFrameState {
-                        rendered: model.annotation.snapshot.as_ref().unwrap().rendered.clone(),
-                        revision: 2,
-                        uirevision: 1,
-                        frame: frame.clone(),
-                    },
-                },
-            ),
-        );
-        assert_eq!(model.annotation.snapshot.as_ref().unwrap().frame, frame);
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.phase = Phase::Update;
-        expected.sequence += 1;
-        expected.brushradius = 11;
-        samples.push(expected.clone());
-
-        let snapshot = model.annotation.snapshot.as_mut().unwrap();
-        snapshot.revision = 3;
-        snapshot.uirevision = 3;
-        snapshot.ui.editor.selectedobject = Some(1);
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.sequence += 1;
-        samples.push(expected.clone());
-        assert!(dispatch(&model, 11)(gesture(Kind::End)).is_none());
-        expected.phase = Phase::End;
-        expected.sequence += 1;
-        samples.push(expected.clone());
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.phase = Phase::Begin;
-        expected.interactionid += 1;
-        expected.sequence = 1;
-        expected.target.object = Some(1);
-        expected.identity.object = 2;
-        samples.push(expected.clone());
-        assert!(dispatch(&model, 11)(gesture(Kind::Cancel)).is_none());
-        expected.phase = Phase::Cancel;
-        expected.sequence += 1;
-        samples.push(expected.clone());
-        assert_batch(&connection, &mut capture, 1, 1, samples);
-
-        // An input epoch change must refresh even when full UI identity repeats.
-        model
-            .annotation
-            .snapshot
-            .as_mut()
-            .unwrap()
-            .inputdocumentepoch = 2;
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.phase = Phase::Begin;
-        expected.interactionid += 1;
-        expected.sequence = 1;
-        assert_batch(&connection, &mut capture, 2, 2, vec![expected.clone()]);
-        let mut restored = model.annotation.snapshot.take().unwrap();
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        assert!(capture.try_recv().is_err());
-        restored.ui.editor.selectedobject = Some(0);
-        model.annotation.snapshot = Some(restored);
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.interactionid += 1;
-        expected.target.object = Some(0);
-        expected.identity.object = 1;
-        assert_batch(&connection, &mut capture, 3, 2, vec![expected.clone()]);
-
-        // Availability is refreshed even without changing the cached identity.
-        model.annotation.snapshot.as_mut().unwrap().busy = true;
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        assert!(capture.try_recv().is_err());
-        model.annotation.snapshot.as_mut().unwrap().busy = false;
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.interactionid += 1;
-        assert_batch(&connection, &mut capture, 4, 2, vec![expected.clone()]);
-        component
-            .keyboard_canvas
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(dispatch(&model, 11)(gesture(Kind::Viewport)).is_none());
-        assert!(
-            !component
-                .keyboard_canvas
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-        assert!(capture.try_recv().is_err());
-
-        // Replacement may bootstrap identical numeric identities with new UI.
-        let (replacement, mut replacement_capture) = Connection::test_channel();
-        component.set_connection(Some(replacement.clone()));
-        model
-            .annotation
-            .snapshot
-            .as_mut()
-            .unwrap()
-            .ui
-            .editor
-            .selectedobject = Some(1);
-        assert!(dispatch(&model, 11)(gesture(Kind::Pointer)).is_none());
-        expected.interactionid += 1;
-        expected.target.object = Some(1);
-        expected.identity.object = 2;
-        assert_batch(&replacement, &mut replacement_capture, 1, 2, vec![expected]);
-        assert!(capture.try_recv().is_err());
-        component.set_connection(None);
-        assert!(matches!(
-            dispatch(&model, 11)(gesture(Kind::Pointer)),
-            Some(Message::InputFailed(
-                crate::transport_connection::OutboundSendError::Closed
-            ))
         ));
     }
 
@@ -959,37 +545,6 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_present_snapshot_rebase_preserves_drafts_and_ends_pointer_lifecycle() {
-        let mut model = ready_model();
-        let snapshot = model.annotation.snapshot.as_mut().unwrap();
-        snapshot.ui.scene.objects = vec![mask_object()];
-        snapshot.ui.editor.selectedobject = Some(0);
-        let mut component = Component::default();
-        let mut settings = crate::view::settings::SettingsModel::default();
-        component.rebase(&model);
-        let first = pointer_outcome(&mut component, &mut model, &mut settings);
-        component.sidebar.category_draft = "vehicle".into();
-        component.sidebar.mask_sup_draft.as_mut().unwrap().center[0] = "77".into();
-        component.sidebar.mark_mask_dirty();
-        component.sidebar.selected_enabled = false;
-        component.sidebar.mark_selected_enabled_dirty();
-        model.connection = crate::view_model::ConnectionState::Reconnecting;
-        component.rebase(&model);
-        assert_eq!(component.sidebar.category_draft, "vehicle");
-        assert_eq!(
-            component.sidebar.mask_sup_draft.as_ref().unwrap().center[0],
-            "77"
-        );
-        assert!(!component.sidebar.selected_enabled);
-        model.connection = crate::view_model::ConnectionState::Connected;
-        component.rebase(&model);
-        let next = pointer_outcome(&mut component, &mut model, &mut settings);
-        assert_eq!(first.phase, crate::generated::AnnotationPointerPhase::Begin);
-        assert_eq!(next.phase, crate::generated::AnnotationPointerPhase::Begin);
-        assert_ne!(next.interactionid, first.interactionid);
-    }
-
-    #[test]
     fn absent_snapshot_rebase_resets_the_complete_inspector_projection() {
         let mut component = Component::default();
         component.sidebar.stage_component_reset_fixture();
@@ -1001,36 +556,6 @@ mod tests {
         let model = ready_model();
         component.rebase(&model);
         assert!(!component.sidebar.has_component_reset_fixture());
-    }
-
-    #[test]
-    fn unavailable_raw_gesture_clears_an_active_pointer_before_suppression() {
-        let mut model = ready_model();
-        let mut component = Component::default();
-        let mut settings = crate::view::settings::SettingsModel::default();
-        component.rebase(&model);
-        let first = pointer_outcome(&mut component, &mut model, &mut settings);
-        let correlation = model
-            .begin_intent(crate::view_model::ApplicationIntentEndpoint::AnnotationEdit)
-            .unwrap();
-        assert!(
-            component
-                .update(
-                    &mut model,
-                    &mut settings,
-                    Message::Workspace(workspace::Message::Gesture(gesture(
-                        crate::presentation_surface::SurfaceGestureKind::Pointer,
-                    ))),
-                )
-                .unwrap()
-                .is_none()
-        );
-        model.abandon_intent(correlation);
-        let next = pointer_outcome(&mut component, &mut model, &mut settings);
-        assert_eq!(first.phase, crate::generated::AnnotationPointerPhase::Begin);
-        assert_eq!(next.phase, crate::generated::AnnotationPointerPhase::Begin);
-        assert_eq!(next.sequence, 1);
-        assert_ne!(next.interactionid, first.interactionid);
     }
 }
 

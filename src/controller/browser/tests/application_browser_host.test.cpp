@@ -113,7 +113,7 @@ enum class OpenPressure : std::uint8_t {
     Transient,
     Critical,
     LatestState,
-    Progress,
+    Activation,
 };
 
 struct HostCallbackContext final {
@@ -130,7 +130,7 @@ struct HostCallbackContext final {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         ++self.epoch;
         self.host.opened(self.host.context.get());
-        if (self.pressure == OpenPressure::None || self.pressure == OpenPressure::Progress) return;
+        if (self.pressure == OpenPressure::None || self.pressure == OpenPressure::Activation) return;
         const auto delivery = self.pressure == OpenPressure::LatestState ? contracts::reflection::EventDelivery::LatestState
                               : self.pressure == OpenPressure::Critical  ? contracts::reflection::EventDelivery::Critical
                                                                          : contracts::reflection::EventDelivery::Transient;
@@ -148,13 +148,13 @@ struct HostCallbackContext final {
     static void Activated(void* opaque) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         if (self.host.activated) self.host.activated(self.host.context.get());
-        if (self.pressure != OpenPressure::Progress) return;
+        if (self.pressure != OpenPressure::Activation) return;
         wire::ByteBuffer bytes;
-        if (!encode_server_record(ServerRecord{InputProgress{.progress = {.epoch = self.epoch, .consumed_sequence = 0U}}}, bytes)) {
+        if (!encode_server_record(ServerRecord{InteractionRejected{.endpoint_id = self.epoch, .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}}, bytes)) {
             self.server->close_peer();
             return;
         }
-        static_cast<void>(self.server->publish({.bytes = std::move(bytes), .priority = transport::BrowserRecordPriority::Progress}));
+        static_cast<void>(self.server->publish({.bytes = std::move(bytes), .priority = transport::BrowserRecordPriority::Critical}));
     }
 
     static bool Record(void* opaque, const std::span<const std::byte> bytes) noexcept {
@@ -293,7 +293,7 @@ class ReadyHostAnnotation final {
                       ++events_;
                   }
                   changed_.notify_all();
-              }) {
+              }, mmltk::testsupport::annotation_render_evidence()) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
         const bool ready =
@@ -474,7 +474,7 @@ class LoopbackWebSocket final {
 }
 
 TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
-    RunningHost server{OpenPressure::Progress};
+    RunningHost server{OpenPressure::Activation};
     REQUIRE_FALSE(server.websocket().empty());
     LoopbackWebSocket peer{server.websocket()};
     auto first = peer.receive();
@@ -485,8 +485,8 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     const auto progress_frame = peer.receive();
     REQUIRE(progress_frame);
     const auto progress = decode(*progress_frame);
-    REQUIRE(std::holds_alternative<InputProgress>(progress));
-    CHECK(std::get<InputProgress>(progress).progress.epoch == std::get<Bootstrap>(decode(*first)).input_epoch);
+    REQUIRE(std::holds_alternative<InteractionRejected>(progress));
+    CHECK(std::get<InteractionRejected>(progress).endpoint_id == std::get<Bootstrap>(decode(*first)).input_epoch);
 
     const auto endpoint = settings_reset_endpoint();
     REQUIRE(endpoint != 0U);
@@ -512,8 +512,8 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     CHECK(std::get<Bootstrap>(bootstrap).input_epoch > std::get<Bootstrap>(decode(*first)).input_epoch);
     const auto replacement_progress = replacement.receive();
     REQUIRE(replacement_progress);
-    REQUIRE(std::holds_alternative<InputProgress>(decode(*replacement_progress)));
-    CHECK(std::get<InputProgress>(decode(*replacement_progress)).progress.epoch == std::get<Bootstrap>(bootstrap).input_epoch);
+    REQUIRE(std::holds_alternative<InteractionRejected>(decode(*replacement_progress)));
+    CHECK(std::get<InteractionRejected>(decode(*replacement_progress)).endpoint_id == std::get<Bootstrap>(bootstrap).input_epoch);
 }
 
 TEST_CASE("direct host closes a real peer on malformed Protocol-17 input") {
@@ -628,26 +628,23 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     mmltk::testsupport::await_annotation_command(annotation, ready, edit.revision);
     mmltk::testsupport::await_annotation_render(annotation, ready);
     const auto epoch = annotation.snapshot().input_document_epoch;
-    annotation.SetInputPeer(1U, {});
-    const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t batch, std::uint64_t sequence) {
-        annotation.Input(
-            {.document_epoch = epoch,
-             .sequence = batch,
-             .samples = {AnnotationPointer{
-                 .phase = phase, .interaction_id = peer, .sequence = sequence, .point = {float(sequence + 1U), float(sequence + 2U)}}}});
+    annotation.SetInputPeer(1U);
+    const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t, std::uint64_t sequence) {
+        const auto kind = phase == contracts::AnnotationPointerPhase::Begin ? WorkspaceMouseKind::Press : WorkspaceMouseKind::Release;
+        annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, kind, {float(sequence + 1U), float(sequence + 2U)}));
     };
-    auto rendered = annotation.snapshot().rendered.generation;
+    auto rendered = annotation.snapshot().frame.revision;
     gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
-    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
-    rendered = annotation.snapshot().rendered.generation;
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
+    rendered = annotation.snapshot().frame.revision;
     callbacks.closed(callbacks.context.get());
-    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
     CHECK(annotation.snapshot().ui.scene.objects.empty());
 
-    annotation.SetInputPeer(1U, {});
-    rendered = annotation.snapshot().rendered.generation;
+    annotation.SetInputPeer(1U);
+    rendered = annotation.snapshot().frame.revision;
     gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
-    REQUIRE(ready.Wait([&] { return annotation.snapshot().rendered.generation > rendered; }));
+    REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
     host.close_admission();
     callbacks.closed(callbacks.context.get());
     gesture(1U, contracts::AnnotationPointerPhase::End, 2U, 2U);

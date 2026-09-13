@@ -40,6 +40,79 @@ void apply_gesture(subsystems::annotation::AnnotationDocument& editor, Annotatio
     REQUIRE(editor.Pointer(pointer).outcome == subsystems::annotation::DocumentOutcome::Applied);
 }
 
+TEST_CASE("Native Annotation hit testing owns tool targets and selected handle precedence") {
+    namespace document = subsystems::annotation;
+    using Tool = contracts::AnnotationTool;
+    using Shape = contracts::AnnotationShape;
+    using Role = contracts::AnnotationHandleRole;
+    document::AnnotationDocument editor;
+    auto scene = test_scene("direct://native-mouse-targets");
+    scene.objects = {
+        {.name = contracts::AnnotationText::From("point"), .shape = Shape::Point, .point = {12, 14}},
+        {.name = contracts::AnnotationText::From("box"), .shape = Shape::Box, .box = {{10, 10}, {30, 30}}},
+        {.name = contracts::AnnotationText::From("mask"), .shape = Shape::Mask, .box = {{3, 12}, {6, 13}},
+         .mask = {.runs = {{12, 3, 5}}, .present = true}},
+        {.name = contracts::AnnotationText::From("spline"), .shape = Shape::Spline,
+         .spline_knots = {{{20, 20}, {{10, 20}, true}, {{30, 20}, true}}}},
+        {.name = contracts::AnnotationText::From("skeleton"), .shape = Shape::Skeleton,
+         .skeleton_nodes = {{.key = contracts::AnnotationText::From("visible"), .point = {40, 40}},
+                            {.key = contracts::AnnotationText::From("hidden"), .point = {55, 55}, .visible = false}}},
+    };
+    REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
+    const auto select = [&](std::uint16_t object) {
+        REQUIRE(editor.Edit({.value = AnnotationObjectEdit{object}}).outcome == document::DocumentOutcome::Applied);
+    };
+    const auto hit = [&](contracts::AnnotationPoint point) {
+        AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = point};
+        REQUIRE(editor.ResolveTarget(pointer));
+        return pointer.target;
+    };
+    select(0U);
+    CHECK(hit({12, 14}) == contracts::AnnotationPointerTarget{0U, 0U, Role::Point});
+    select(1U);
+    CHECK(hit({5, 5}) == contracts::AnnotationPointerTarget{1U, 0U, Role::BoxCorner});
+    CHECK(hit({34, 34}) == contracts::AnnotationPointerTarget{1U, 2U, Role::BoxCorner});
+    select(3U);
+    CHECK(hit({20, 20}) == contracts::AnnotationPointerTarget{3U, 0U, Role::SplineKnot});
+    CHECK(hit({10, 20}) == contracts::AnnotationPointerTarget{3U, 0U, Role::SplineInHandle});
+    CHECK(hit({30, 20}) == contracts::AnnotationPointerTarget{3U, 0U, Role::SplineOutHandle});
+    select(4U);
+    CHECK(hit({40, 40}) == contracts::AnnotationPointerTarget{4U, 0U, Role::SkeletonNode});
+    CHECK_FALSE(hit({55, 55}).object);
+    CHECK(hit({3.125F, 12.75F}).object == 2U);
+    CHECK_FALSE(hit({6.0F, 12.75F}).object);
+    for (const auto entry : mmltk::frameworks::reflection::enum_entries<Tool>()) {
+        if (entry.value == Tool::Select) continue;
+        const auto object = entry.value == Tool::Spline ? 3U : entry.value == Tool::Skeleton ? 4U : 2U;
+        select(static_cast<std::uint16_t>(object));
+        REQUIRE(editor.Edit({.value = AnnotationToolEdit{entry.value}}).outcome == document::DocumentOutcome::Applied);
+        const auto target = hit({20.25F, 21.5F});
+        if (entry.value == Tool::Box || entry.value == Tool::Point) CHECK_FALSE(target.object);
+        else CHECK(target.object == object);
+        CHECK_FALSE(target.element);
+        CHECK_FALSE(target.role);
+    }
+}
+
+TEST_CASE("Native Annotation body hits use reverse enabled-object order and exact point tolerance") {
+    namespace document = subsystems::annotation;
+    document::AnnotationDocument editor;
+    auto scene = test_scene("direct://native-body-hits");
+    scene.objects = {
+        {.name = contracts::AnnotationText::From("lower"), .shape = contracts::AnnotationShape::Point, .point = {20, 20}},
+        {.name = contracts::AnnotationText::From("upper"), .shape = contracts::AnnotationShape::Point, .point = {20, 20}},
+        {.name = contracts::AnnotationText::From("disabled"), .shape = contracts::AnnotationShape::Point,
+         .point = {20, 20}, .enabled = false},
+    };
+    REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
+    AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {26, 20}};
+    REQUIRE(editor.ResolveTarget(pointer));
+    CHECK(pointer.target.object == 1U);
+    pointer.point.x = 26.125F;
+    REQUIRE(editor.ResolveTarget(pointer));
+    CHECK_FALSE(pointer.target.object);
+}
+
 TEST_CASE("Annotation private document owns pointer history and peer cancellation") {
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
@@ -104,7 +177,7 @@ TEST_CASE("Annotation private document enforces the canonical fixed text policy"
     CHECK(apply(contracts::AnnotationText::From("category")) == document::DocumentOutcome::Applied);
 }
 
-TEST_CASE("Displayed annotation targets survive index shifts and journal reversal without retargeting") {
+TEST_CASE("Native annotation target identities survive index shifts and journal reversal") {
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
     auto scene = test_scene("direct://displayed-identities");
@@ -116,6 +189,7 @@ TEST_CASE("Displayed annotation targets survive index shifts and journal reversa
     editor.CaptureRender(displayed);
     REQUIRE(displayed.identities->size() == 2U);
     AnnotationPointer target{
+        .phase = contracts::AnnotationPointerPhase::Update,
         .interaction_id = 1U,
         .sequence = 1U,
         .target = {.object = 1U, .element = 0U, .role = contracts::AnnotationHandleRole::Point},
@@ -151,7 +225,7 @@ TEST_CASE("Displayed annotation targets survive index shifts and journal reversa
     CHECK(displayed.scene->objects == scene.objects);
 }
 
-TEST_CASE("Displayed spline knot identities retain surviving elements across delete undo and redo") {
+TEST_CASE("Native spline knot identities retain surviving elements across delete undo and redo") {
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
     auto scene = test_scene("direct://displayed-elements");
@@ -163,6 +237,7 @@ TEST_CASE("Displayed spline knot identities retain surviving elements across del
     editor.CaptureRender(displayed);
     const auto& identity = displayed.identities->front();
     AnnotationPointer survivor{
+        .phase = contracts::AnnotationPointerPhase::Update,
         .interaction_id = 1U,
         .sequence = 1U,
         .target = {.object = 0U, .element = 2U, .role = contracts::AnnotationHandleRole::SplineKnot},
@@ -190,7 +265,7 @@ TEST_CASE("Displayed spline knot identities retain surviving elements across del
     CHECK_FALSE(editor.ResolveTarget(removed));
 }
 
-TEST_CASE("A completed creation preview keeps its target identity after commit while rendering lags") {
+TEST_CASE("Creation preview identities become document identities at commit") {
     namespace document = subsystems::annotation;
     document::AnnotationDocument editor;
     REQUIRE(editor.Open(test_scene("direct://creation-preview")).outcome == document::DocumentOutcome::Applied);
@@ -205,6 +280,7 @@ TEST_CASE("A completed creation preview keeps its target identity after commit w
     editor.CaptureRender(preview);
     REQUIRE(preview.preview_identity != 0U);
     AnnotationPointer displayed{
+        .phase = contracts::AnnotationPointerPhase::Update,
         .interaction_id = 2U,
         .sequence = 1U,
         .target = {.object = 0U},
@@ -250,6 +326,7 @@ TEST_CASE("New indexed Annotation objects keep initial element identities throug
         REQUIRE(identity.elements.size() == 1U);
         REQUIRE(identity.elements.front() != 0U);
         AnnotationPointer handle{
+        .phase = contracts::AnnotationPointerPhase::Update,
             .interaction_id = 2U,
             .sequence = 1U,
             .target = {.object = 0U,

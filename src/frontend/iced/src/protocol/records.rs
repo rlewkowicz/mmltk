@@ -34,7 +34,6 @@ pub enum ServerRecord {
     IntentReply(IntentReply),
     SystemEvent(SystemEvent),
     InteractionRejected(crate::generated::InteractionRejected),
-    InputProgress(crate::generated::InputProgress),
     IntegrationControl(crate::generated::IntegrationControl),
 }
 
@@ -275,14 +274,6 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
                 return Err(ProtocolError("invalid rejected endpoint".into()));
             }
             Ok(ServerRecord::InteractionRejected(record))
-        }
-        ServerRecordKind::InputProgress => {
-            let record = crate::generated::InputProgress::from_application_value(envelope.payload)
-                .map_err(ProtocolError)?;
-            if record.progress.epoch == 0 {
-                return Err(ProtocolError("invalid progress epoch".into()));
-            }
-            Ok(ServerRecord::InputProgress(record))
         }
         ServerRecordKind::IntegrationControl => {
             let record =
@@ -678,74 +669,21 @@ mod tests {
             crate::generated::SCHEMA_FINGERPRINT
         );
         assert_eq!(bootstrap.input_epoch, 1);
-        assert!(
-            matches!(decode_server(native[4]).unwrap(), ServerRecord::InputProgress(crate::generated::InputProgress { progress, error: None , .. })
-            if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none())
-        );
-        assert!(
-            matches!(decode_server(native[5]).unwrap(), ServerRecord::InteractionRejected(record)
-            if record.endpointid == crate::generated::ENDPOINT_Explore_UpdateViewport && record.error.category == crate::generated::ApplicationErrorCategory::Unavailable && record.error.detail == "fixture unavailable")
-        );
-        let limit = crate::generated::ReflectedRecordPath::AnnotationInputProgress
-            .map_child(b"rejection")
-            .max_leaf_bytes();
-        let ServerRecord::InputProgress(present) = decode_server(native[6]).unwrap() else {
-            panic!("native optional progress")
-        };
-        assert_eq!(present.progress.rejection.as_ref().unwrap().len(), limit);
-        assert_eq!(
-            present.error.as_ref().unwrap().category,
-            crate::generated::ApplicationErrorCategory::Busy
-        );
-        let mut excessive = decode_envelope(native[6]).unwrap().payload;
-        let Value::Object(fields) = &mut excessive else {
-            panic!("progress envelope")
-        };
-        let Value::Object(progress) = &mut fields
-            .iter_mut()
-            .find(|(name, _)| name == "progress")
-            .unwrap()
-            .1
-        else {
-            panic!("progress")
-        };
-        progress
-            .iter_mut()
-            .find(|(name, _)| name == "rejection")
-            .unwrap()
-            .1 = Value::Text("r".repeat(limit + 1));
-        assert!(
-            crate::generated::InputProgress::from_application_value(excessive.clone()).is_err()
-        );
-        assert!(decode_server(&encode_envelope("InputProgress", &excessive).unwrap()).is_err());
-        for kind in ["InputProgress", "InteractionRejected"] {
-            let index = if kind == "InputProgress" { 4 } else { 5 };
-            let original = decode_envelope(native[index]).unwrap().payload;
-            let Value::Object(original_fields) = original else {
-                panic!("reflected record")
-            };
-            for mutation in 0..3 {
-                let mut fields = original_fields.clone();
-                match mutation {
-                    0 => {
-                        fields.pop();
-                    }
-                    1 => {
-                        fields[0].0 = "unknown".into();
-                    }
-                    _ => {
-                        fields[0].0 = fields[1].0.clone();
-                    }
-                }
-                let payload = Value::Object(fields);
-                let decoded = if kind == "InputProgress" {
-                    crate::generated::InputProgress::from_application_value(payload).map(|_| ())
-                } else {
-                    crate::generated::InteractionRejected::from_application_value(payload)
-                        .map(|_| ())
-                };
-                assert!(decoded.is_err());
+        assert!(matches!(decode_server(native[4]).unwrap(), ServerRecord::InteractionRejected(record)
+            if record.endpointid == crate::generated::ENDPOINT_Annotation_Input));
+        let limit = crate::generated::ReflectedRecordPath::ApplicationErrorRecord.map_child(b"detail").max_leaf_bytes();
+        let ServerRecord::InteractionRejected(present) = decode_server(native[6]).unwrap() else { panic!("native rejection") };
+        assert_eq!(present.error.detail.len(), limit);
+        let original = decode_envelope(native[5]).unwrap().payload;
+        let Value::Object(original_fields) = original else { panic!("reflected record") };
+        for mutation in 0..3 {
+            let mut fields = original_fields.clone();
+            match mutation {
+                0 => { fields.pop(); }
+                1 => { fields[0].0 = "unknown".into(); }
+                _ => { fields[0].0 = fields[1].0.clone(); }
             }
+            assert!(crate::generated::InteractionRejected::from_application_value(Value::Object(fields)).is_err());
         }
         let mut zero_epoch = decode_envelope(native[0]).unwrap().payload;
         if let Value::Object(fields) = &mut zero_epoch {

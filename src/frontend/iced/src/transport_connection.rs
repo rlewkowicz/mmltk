@@ -10,25 +10,31 @@ const OUTBOUND_CAPACITY: usize = 64;
 #[derive(Debug)]
 struct Outbound {
     records: VecDeque<OutboundRecord>,
-    input: crate::annotation_input::AnnotationInput,
+    closed: bool,
+    epoch: u64,
     writable: Option<std::task::Waker>,
     adjacent_record: bool,
-    pressure_observation: Option<(u64, bool)>,
+    pressure_observation: Option<(u64, usize, bool)>,
+    scratch: Vec<u8>,
+    encoded: Vec<u8>,
 }
 impl Default for Outbound {
     fn default() -> Self {
         Self {
             records: VecDeque::with_capacity(OUTBOUND_CAPACITY),
-            input: Default::default(),
+            closed: false,
+            epoch: 0,
             writable: None,
             adjacent_record: false,
             pressure_observation: None,
+            scratch: Vec::new(),
+            encoded: Vec::new(),
         }
     }
 }
 impl Outbound {
     fn record_count(&self) -> usize {
-        self.records.len() + self.input.command_count()
+        self.records.len()
     }
 }
 
@@ -37,6 +43,7 @@ pub(crate) enum OutboundRecord {
     Wake,
     Intent(Intent),
     Interaction(Interaction),
+    Mouse(crate::generated::WorkspaceMouse),
     IntegrationControl(crate::generated::IntegrationControl),
 }
 
@@ -46,6 +53,7 @@ impl OutboundRecord {
             Self::Wake => Err(ProtocolError("input wake is not a wire record".into())),
             Self::Intent(value) => value.encode(),
             Self::Interaction(value) => value.encode(),
+            Self::Mouse(value) => crate::generated::encode_workspace_mouse(value)?.encode(),
             Self::IntegrationControl(value) => value.encode(),
         }
     }
@@ -80,7 +88,6 @@ impl std::error::Error for OutboundSendError {}
 pub struct Connection {
     outbound: mpsc::Sender<OutboundRecord>,
     retained: Arc<Mutex<Outbound>>,
-    integration: bool,
 }
 
 impl Connection {
@@ -88,35 +95,29 @@ impl Connection {
         self.retained
             .lock()
             .expect("connection output")
-            .pressure_observation = Some((sequence, false));
+            .pressure_observation = Some((sequence, 0, false));
     }
     pub(crate) fn integration_pressure_settled(&self) -> bool {
         let retained = self.retained.lock().expect("connection output");
         retained
             .pressure_observation
-            .is_some_and(|(_, entered)| entered)
-            && retained.input.settled()
+            .is_some_and(|(_, _, entered)| entered)
+            && retained.records.is_empty()
     }
     pub(crate) fn new(outbound: mpsc::Sender<OutboundRecord>) -> Self {
         Self {
             outbound,
-            integration: false,
             retained: Arc::new(Mutex::new(Outbound::default())),
         }
     }
 
-    #[cfg(any(target_arch = "wasm32", test))]
-    pub(crate) fn enable_integration(&mut self, enabled: bool) {
-        self.integration = enabled && crate::integration_control::reporting_enabled();
-    }
     pub(crate) fn is_closed(&self) -> bool {
         self.outbound.is_closed()
             || self
                 .retained
                 .lock()
                 .expect("connection output")
-                .input
-                .is_closed()
+                .closed
     }
     fn require_open(&self) -> Result<(), OutboundSendError> {
         if self.is_closed() {
@@ -136,39 +137,24 @@ impl Connection {
         self.send(OutboundRecord::Interaction(interaction), true)
     }
 
-    pub fn send_annotation_pointer(
+    pub fn send_workspace_mouse(
         &mut self,
-        pointer: crate::generated::AnnotationPointer,
-        document_epoch: u64,
+        mut mouse: crate::generated::WorkspaceMouse,
     ) -> Result<SendDisposition, OutboundSendError> {
         self.require_open()?;
-        if self.integration {
-            crate::integration_control::report_annotation_gesture(
-                "sending",
-                [
-                    pointer.interactionid as f64,
-                    pointer.sequence as f64,
-                    match pointer.phase {
-                        crate::generated::AnnotationPointerPhase::Begin => 1.0,
-                        crate::generated::AnnotationPointerPhase::Update => 2.0,
-                        crate::generated::AnnotationPointerPhase::End => 3.0,
-                        crate::generated::AnnotationPointerPhase::Cancel => 4.0,
-                    },
-                    0.0,
-                ],
-            );
-        }
-        let accepted = {
+        mouse.peerepoch = self.retained.lock().expect("connection output").epoch;
+        {
             let mut retained = self.retained.lock().expect("connection output");
-            let accepted = retained.input.pointer(pointer, document_epoch);
-            if accepted.is_ok() {
-                retained.adjacent_record = false;
+            if retained.records.try_reserve(1).is_err() {
+                drop(retained);
+                self.close();
+                return Err(OutboundSendError::Allocation);
             }
-            accepted
-        };
-        if accepted.is_err() {
-            self.close();
-            return Err(OutboundSendError::Allocation);
+            retained.records.push_back(OutboundRecord::Mouse(mouse));
+            if let Some((_, admitted, _)) = retained.pressure_observation.as_mut() {
+                *admitted = admitted.saturating_add(1);
+            }
+            retained.adjacent_record = false;
         }
         self.wake()?;
         Ok(SendDisposition::Queued)
@@ -191,7 +177,7 @@ impl Connection {
         self.require_open()?;
         iced::futures::future::poll_fn(|context| {
             let mut retained = self.retained.lock().expect("connection output");
-            if self.outbound.is_closed() || retained.input.is_closed() {
+            if self.outbound.is_closed() || retained.closed {
                 return std::task::Poll::Ready(Err(OutboundSendError::Closed));
             }
             if retained.record_count() < OUTBOUND_CAPACITY {
@@ -203,11 +189,12 @@ impl Connection {
         .await
     }
     pub(crate) fn observe(&self, record: &crate::protocol::ServerRecord) -> Result<(), String> {
-        self.retained
-            .lock()
-            .expect("connection output")
-            .input
-            .observe(record)
+        let mut retained = self.retained.lock().expect("connection output");
+        if let crate::protocol::ServerRecord::Bootstrap(bootstrap) = record {
+            if bootstrap.input_epoch == 0 { return Err("workspace input peer is unavailable".into()); }
+            retained.epoch = bootstrap.input_epoch;
+        }
+        Ok(())
     }
     pub(crate) fn flush(
         &self,
@@ -216,12 +203,18 @@ impl Connection {
         let mut retained = self.retained.lock().expect("connection output");
         let before = retained.record_count();
         let result = (|| {
-            retained.input.flush(&mut send)?;
             while let Some(record) = retained.records.pop_front() {
-                send(&record.encode().map_err(|error| error.to_string())?)?;
+                if let OutboundRecord::Mouse(mouse) = record {
+                    let Outbound { scratch, encoded, .. } = &mut *retained;
+                    crate::generated::encode_workspace_mouse_into(&mouse, scratch, encoded)
+                        .map_err(|error| error.to_string())?;
+                    send(encoded)?;
+                } else {
+                    send(&record.encode().map_err(|error| error.to_string())?)?;
+                }
             }
-            if let Some((sequence, false)) = retained.pressure_observation
-                && retained.input.pressure_entered()
+            if let Some((sequence, admitted, false)) = retained.pressure_observation
+                && admitted > OUTBOUND_CAPACITY
             {
                 let record = crate::generated::IntegrationControl {
                     protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
@@ -235,7 +228,7 @@ impl Connection {
                     },
                 };
                 send(&record.encode().map_err(|error| error.to_string())?)?;
-                retained.pressure_observation = Some((sequence, true));
+                retained.pressure_observation = Some((sequence, admitted, true));
             }
             Ok(())
         })();
@@ -249,7 +242,7 @@ impl Connection {
     pub(crate) fn close(&self) {
         {
             let mut retained = self.retained.lock().expect("connection output");
-            retained.input.close();
+            retained.closed = true;
             retained.records.clear();
             if let Some(waker) = retained.writable.take() {
                 waker.wake();
@@ -279,27 +272,24 @@ impl Connection {
             if replace {
                 *retained.records.back_mut().expect("adjacent record") = record;
             } else {
-                if retained.record_count() == OUTBOUND_CAPACITY {
+                let ordered_document = matches!(&record, OutboundRecord::Intent(intent)
+                    if crate::generated::decode_application_intent_endpoint(intent.endpoint_id)
+                        .is_some_and(|endpoint| crate::generated::application_intent_system(endpoint)
+                            == crate::generated::ApplicationSystem::Annotation));
+                if !ordered_document && retained.record_count() >= OUTBOUND_CAPACITY {
                     return if transient {
                         Ok(SendDisposition::Dropped)
                     } else {
                         Err(OutboundSendError::Capacity)
                     };
                 }
-                match record {
-                    OutboundRecord::Intent(intent)
-                        if crate::annotation_input::AnnotationInput::owns_command(
-                            intent.endpoint_id,
-                        ) =>
-                    {
-                        retained.input.command(intent);
-                        retained.adjacent_record = false;
-                    }
-                    record => {
-                        retained.records.push_back(record);
-                        retained.adjacent_record = true;
-                    }
+                if retained.records.try_reserve(1).is_err() {
+                    drop(retained);
+                    if ordered_document { self.close(); }
+                    return Err(OutboundSendError::Allocation);
                 }
+                retained.records.push_back(record);
+                retained.adjacent_record = true;
             }
         }
         self.wake()?;
@@ -330,19 +320,6 @@ impl Connection {
                     schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
                     input_epoch: 1,
                     snapshots: Vec::new(),
-                },
-            ))
-            .unwrap();
-        connection
-            .observe(&crate::protocol::ServerRecord::InputProgress(
-                crate::generated::InputProgress {
-                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                    progress: crate::generated::AnnotationInputProgress {
-                        epoch: 1,
-                        consumedsequence: 0,
-                        rejection: None,
-                    },
-                    error: None,
                 },
             ))
             .unwrap();
@@ -391,727 +368,37 @@ impl Capture {
 mod tests {
     use super::*;
 
-    struct PointerTransport {
-        connection: Connection,
-        _capture: Capture,
-        wire: Vec<Vec<u8>>,
-    }
-
-    impl PointerTransport {
-        fn new() -> Self {
-            let (connection, capture) = Connection::test_channel();
-            Self {
-                connection,
-                _capture: capture,
-                wire: Vec::new(),
+    #[test]
+    fn mouse_pressure_keeps_every_record_and_document_command_in_order() {
+        let (mut connection, _capture) = Connection::test_channel();
+        let mut expected = Vec::new();
+        for index in 0..1024 {
+            let mut mouse = crate::workspace_input::record(crate::generated::WorkspaceMouseKind::Motion,
+                Some(crate::generated::WorkspacePoint { x: index as f32 + 0.25, y: 0.125 }));
+            mouse.source = crate::generated::PresentationSourceKind::Annotation;
+            mouse.documentepoch = 2;
+            connection.send_workspace_mouse(mouse.clone()).unwrap();
+            mouse.peerepoch = 1;
+            expected.push(crate::generated::encode_workspace_mouse(mouse).unwrap().encode().unwrap());
+            if index == 500 {
+                let command = crate::generated::encode_annotation_Stop(1).record;
+                expected.push(command.clone().encode().unwrap());
+                connection.send_intent(command).unwrap();
             }
         }
-
-        fn credit(&self, sequence: u64) {
-            self.connection.observe(&Self::progress(sequence)).unwrap();
-        }
-
-        fn progress(sequence: u64) -> crate::protocol::ServerRecord {
-            crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
-                protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                progress: crate::generated::AnnotationInputProgress {
-                    epoch: 1,
-                    consumedsequence: sequence,
-                    rejection: None,
-                },
-                error: None,
-            })
-        }
-
-        fn flush(&mut self) {
-            self.connection
-                .flush(|bytes| {
-                    self.wire.push(bytes.to_vec());
-                    Ok(())
-                })
-                .unwrap();
-        }
-
-        fn decoded(&self) -> Vec<crate::protocol::Envelope> {
-            self.wire
-                .iter()
-                .map(|bytes| crate::protocol::decode_envelope(bytes).unwrap())
-                .collect()
-        }
-
-        fn assert_samples(
-            &self,
-            samples: &[crate::generated::AnnotationPointer],
-            first_sequence: u64,
-        ) {
-            let input: Vec<_> = self
-                .wire
-                .iter()
-                .filter(|bytes| {
-                    let record = crate::protocol::decode_envelope(bytes).unwrap();
-                    record.kind == "Interaction"
-                        && record.payload.field("endpoint_id").unwrap().integer_u64()
-                            == Some(crate::generated::ENDPOINT_Annotation_Input)
-                })
-                .collect();
-            assert_eq!(
-                input.len(),
-                samples
-                    .len()
-                    .div_ceil(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
-            );
-            let mut prior = None;
-            for (index, batch) in samples
-                .chunks(crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY)
-                .enumerate()
-            {
-                let expected = crate::generated::encode_annotation_Input(
-                    crate::generated::AnnotationInputBatch {
-                        documentepoch: 1,
-                        sequence: first_sequence + index as u64,
-                        samples: batch
-                            .iter()
-                            .map(|pointer| {
-                                let sample = crate::annotation_input::compact_sample(
-                                    pointer,
-                                    prior.as_ref(),
-                                );
-                                prior = if matches!(
-                                    pointer.phase,
-                                    crate::generated::AnnotationPointerPhase::End
-                                        | crate::generated::AnnotationPointerPhase::Cancel
-                                ) {
-                                    None
-                                } else {
-                                    Some(pointer.clone())
-                                };
-                                sample
-                            })
-                            .collect(),
-                    },
-                )
-                .unwrap()
-                .encode()
-                .unwrap();
-                assert_eq!(
-                    *input[index], expected,
-                    "every accepted sample remains ordered"
-                );
-            }
-        }
-
-        fn annotation_snapshot() -> crate::generated::AnnotationSnapshot {
-            crate::generated::application_snapshot_defaults()
-                .unwrap()
-                .into_iter()
-                .find_map(|fact| {
-                    if let crate::generated::ApplicationSnapshot::Annotation(value) = fact.value {
-                        Some(value)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap()
-        }
+        let mut actual = Vec::new();
+        connection.flush(|bytes| { actual.push(bytes.to_vec()); Ok(()) }).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]
-    fn every_outbound_record_uses_the_canonical_encoder() {
-        let records = [
-            OutboundRecord::Intent(Intent {
-                correlation: 1,
-                endpoint_id: 2,
-                fields: Vec::new(),
-            }),
-            OutboundRecord::Interaction(Interaction {
-                replaceable: false,
-                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                value: Vec::new(),
-            }),
-                    ];
-        for record in records {
-            assert!(!record.encode().expect("outbound record").is_empty());
+    fn ordinary_capacity_and_connection_closure_are_explicit() {
+        let (mut connection, _capture) = Connection::test_channel();
+        for correlation in 1..=OUTBOUND_CAPACITY as u64 {
+            connection.send_intent(Intent { correlation, endpoint_id: 1, fields: Vec::new() }).unwrap();
         }
-    }
-
-    #[test]
-    fn direct_connection_keeps_transient_pressure_local() {
-        let (sender, _receiver) = mpsc::channel(0);
-        let mut connection = Connection::new(sender);
-        assert_eq!(
-            connection
-                .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
-                .expect("first observation"),
-            SendDisposition::Queued
-        );
-        assert_eq!(
-            connection
-                .send_interaction(Interaction {
-                    replaceable: false,
-                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                    value: Vec::new(),
-                })
-                .expect("transient pressure"),
-            SendDisposition::Queued
-        );
-        for correlation in 1..=62 {
-            assert_eq!(
-                connection.send_intent(Intent {
-                    correlation,
-                    endpoint_id: 1,
-                    fields: Vec::new()
-                }),
-                Ok(SendDisposition::Queued)
-            );
-        }
-        assert_eq!(
-            connection.send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() }),
-            Ok(SendDisposition::Dropped)
-        );
-        assert_eq!(
-            connection.send_intent(Intent {
-                correlation: 63,
-                endpoint_id: 1,
-                fields: Vec::new()
-            }),
-            Err(OutboundSendError::Capacity)
-        );
-        let (mut viewport, _capture) = Connection::test_channel();
-        for value in 0..128_u8 {
-            assert_eq!(
-                viewport.send_interaction(Interaction {
-                    replaceable: true,
-                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                    value: vec![value]
-                }),
-                Ok(SendDisposition::Queued)
-            );
-        }
-        let mut sent = Vec::new();
-        viewport
-            .flush(|bytes| {
-                sent.push(crate::protocol::decode_envelope(bytes).unwrap());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(
-            sent[0].payload.field("value"),
-            Some(&crate::application_codec::Value::Bytes(vec![127]))
-        );
-    }
-
-    #[test]
-    fn annotation_pointer_boundaries_are_not_droppable() {
-        crate::integration_control::initialize_reporting(false, false);
-        let pointer = |phase| crate::generated::AnnotationPointer {
-            phase,
-            interactionid: 1,
-            sequence: 1,
-            identity: crate::generated::AnnotationTargetIdentity {
-                object: 0,
-                element: 0,
-            },
-            target: crate::generated::AnnotationPointerTarget {
-                object: None,
-                element: None,
-                role: None,
-            },
-            point: crate::generated::AnnotationPoint { x: 1.0, y: 1.0 },
-            brushradius: crate::generated::default_uiannotationbrushradius().unwrap() as u16,
-        };
-        for phase in [
-            crate::generated::AnnotationPointerPhase::Begin,
-            crate::generated::AnnotationPointerPhase::End,
-            crate::generated::AnnotationPointerPhase::Cancel,
-        ] {
-            let (sender, _receiver) = mpsc::channel(0);
-            let mut connection = Connection::new(sender);
-            connection
-                .send_annotation_pointer(pointer(phase), 1)
-                .unwrap();
-            assert_eq!(
-                connection.send_annotation_pointer(pointer(phase), 1),
-                Ok(SendDisposition::Queued)
-            );
-        }
-        let (sender, _receiver) = mpsc::channel(0);
-        let connection = Connection::new(sender);
-        assert!(
-            connection
-                .observe(&crate::protocol::ServerRecord::InputProgress(
-                    crate::generated::InputProgress {
-                        protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                        progress: crate::generated::AnnotationInputProgress {
-                            epoch: 1,
-                            consumedsequence: 0,
-                            rejection: None
-                        },
-                        error: None,
-                    }
-                ))
-                .is_err(),
-            "Bootstrap must precede all progress"
-        );
-        let consumed = PointerTransport::progress;
-        let samples: Vec<_> = (0..130)
-            .map(|index| {
-                let mut sample = pointer(if index == 0 {
-                    crate::generated::AnnotationPointerPhase::Begin
-                } else if index == 129 {
-                    crate::generated::AnnotationPointerPhase::End
-                } else {
-                    crate::generated::AnnotationPointerPhase::Update
-                });
-                sample.sequence = index + 1;
-                sample.point.x = index as f32;
-                sample
-            })
-            .collect();
-        for terminal in [
-            crate::generated::AnnotationPointerPhase::End,
-            crate::generated::AnnotationPointerPhase::Cancel,
-        ] {
-            let mut fixture = PointerTransport::new();
-            fixture.connection.enable_integration(true);
-            assert!(
-                !fixture.connection.integration,
-                "quiet driver constructs no gesture diagnostics"
-            );
-            let mut accepted = samples.clone();
-            accepted.last_mut().unwrap().phase = terminal;
-            // Exhaust both credits before accepting the terminal edge and tail.
-            for sample in &accepted[..64] {
-                fixture
-                    .connection
-                    .send_annotation_pointer(sample.clone(), 1)
-                    .unwrap();
-            }
-            fixture.flush();
-            assert_eq!(fixture.wire.len(), 2);
-            assert!(
-                !fixture
-                    .connection
-                    .retained
-                    .lock()
-                    .unwrap()
-                    .input
-                    .pressure_entered()
-            );
-            for sample in &accepted[64..] {
-                fixture
-                    .connection
-                    .send_annotation_pointer(sample.clone(), 1)
-                    .unwrap();
-            }
-            fixture.flush();
-            assert_eq!(
-                fixture.wire.len(),
-                2,
-                "terminal input remains retained under exhausted credits"
-            );
-            assert!(
-                fixture
-                    .connection
-                    .retained
-                    .lock()
-                    .unwrap()
-                    .input
-                    .pressure_entered()
-            );
-            assert!(!fixture.connection.retained.lock().unwrap().input.settled());
-            fixture
-                .connection
-                .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
-                .unwrap();
-            fixture
-                .connection
-                .send_intent(Intent {
-                    correlation: 90,
-                    endpoint_id: crate::generated::ENDPOINT_Settings_Update,
-                    fields: Vec::new(),
-                })
-                .unwrap();
-            fixture
-                .connection
-                .send_interaction(Interaction {
-                    replaceable: false,
-                    endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                    value: vec![7],
-                })
-                .unwrap();
-            fixture.flush();
-            let ordinary: Vec<_> = fixture
-                .decoded()
-                .into_iter()
-                .skip(2)
-                .map(|record| record.kind)
-                .collect();
-            assert_eq!(ordinary, ["Interaction", "Intent", "Interaction"]);
-            fixture.credit(1);
-            fixture.flush();
-            assert_eq!(fixture.wire.len(), 6);
-            fixture.credit(3);
-            fixture.flush();
-            assert_eq!(
-                fixture.wire.len(),
-                8,
-                "partial final batch sends immediately"
-            );
-            fixture.assert_samples(&accepted, 1);
-            fixture.credit(5);
-            fixture.flush();
-            assert!(fixture.connection.retained.lock().unwrap().input.settled());
-            assert_eq!(fixture.wire.len(), 8);
-            assert!(fixture.connection.observe(&consumed(6)).is_err());
-            fixture.credit(5); // Duplicate cumulative progress consumes no second prefix.
-            let stale =
-                crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
-                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                    progress: crate::generated::AnnotationInputProgress {
-                        epoch: 99,
-                        consumedsequence: u64::MAX,
-                        rejection: Some("old peer failure".into()),
-                    },
-                    error: Some(crate::protocol::ApplicationError {
-                        category: crate::generated::ApplicationErrorCategory::Busy,
-                        detail: "old rejection".into(),
-                    }),
-                });
-            fixture.connection.observe(&stale).unwrap();
-            let rejected =
-                crate::protocol::ServerRecord::InputProgress(crate::generated::InputProgress {
-                    protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                    progress: crate::generated::AnnotationInputProgress {
-                        epoch: 1,
-                        consumedsequence: 5,
-                        rejection: None,
-                    },
-                    error: Some(crate::protocol::ApplicationError {
-                        category: crate::generated::ApplicationErrorCategory::Busy,
-                        detail: "invalid admission".into(),
-                    }),
-                });
-            assert!(
-                fixture.connection.observe(&rejected).is_err(),
-                "unidentified rejection is terminal, never a rewind"
-            );
-            fixture.connection.close();
-            assert_eq!(
-                fixture
-                    .connection
-                    .send_annotation_pointer(accepted[0].clone(), 1),
-                Err(OutboundSendError::Closed)
-            );
-        }
-        let annotation_snapshot = PointerTransport::annotation_snapshot;
-        for endpoint in [
-            crate::generated::ENDPOINT_Annotation_Open,
-            crate::generated::ENDPOINT_Annotation_Edit,
-            crate::generated::ENDPOINT_Annotation_Save,
-            crate::generated::ENDPOINT_Annotation_Stop,
-        ] {
-            for event_first in [false, true] {
-                for failed in [false, true] {
-                    use crate::application_codec::IntoApplicationValue;
-                    let mut fixture = PointerTransport::new();
-                    fixture
-                        .connection
-                        .send_annotation_pointer(samples[0].clone(), 1)
-                        .unwrap();
-                    fixture
-                        .connection
-                        .send_intent(Intent {
-                            correlation: 17,
-                            endpoint_id: endpoint,
-                            fields: Vec::new(),
-                        })
-                        .unwrap();
-                    fixture
-                        .connection
-                        .send_annotation_pointer(samples[0].clone(), 1)
-                        .unwrap();
-                    fixture.flush();
-                    assert_eq!(fixture.wire.len(), 1);
-                    assert_eq!(
-                        crate::protocol::decode_envelope(&fixture.wire[0])
-                            .unwrap()
-                            .kind,
-                        "Interaction"
-                    );
-                    fixture.assert_samples(&samples[..1], 1);
-                    fixture.credit(1);
-                    fixture.wire.clear();
-                    fixture.flush();
-                    assert_eq!(
-                        fixture.wire.len(),
-                        1,
-                        "document command follows consumption of every earlier sample"
-                    );
-
-                    let command = crate::protocol::decode_envelope(&fixture.wire[0]).unwrap();
-                    assert_eq!(command.kind, "Intent");
-                    assert_eq!(
-                        command.payload.field("endpoint_id").unwrap().integer_u64(),
-                        Some(endpoint)
-                    );
-                    assert_eq!(
-                        command.payload.field("correlation").unwrap().integer_u64(),
-                        Some(17)
-                    );
-
-                    let mut snapshot = annotation_snapshot();
-                    snapshot.revision = 10;
-                    snapshot.busy = true;
-                    let reply =
-                        crate::protocol::ServerRecord::IntentReply(crate::protocol::IntentReply {
-                            correlation: 17,
-                            result: Ok(snapshot.clone().into_application_transport_value()),
-                        });
-                    let settled = |revision| {
-                        let mut snapshot = snapshot.clone();
-                        snapshot.busy = false;
-                        snapshot.revision = revision;
-                        crate::protocol::ServerRecord::SystemEvent(crate::protocol::SystemEvent {
-                            delivery: if failed {
-                                crate::generated::EventDelivery::Critical
-                            } else {
-                                crate::generated::EventDelivery::LatestState
-                            },
-                            state_revision: if failed { 0 } else { snapshot.revision },
-                            event: if failed {
-                                crate::generated::ApplicationEvent::AnnotationAnnotationFailed(
-                                    crate::generated::AnnotationFailed {
-                                        snapshot,
-                                        detail: "settled failure".into(),
-                                    },
-                                )
-                            } else {
-                                crate::generated::ApplicationEvent::AnnotationAnnotationChanged(
-                                    crate::generated::AnnotationChanged { snapshot },
-                                )
-                            },
-                        })
-                    };
-                    fixture.connection.observe(&settled(9)).unwrap();
-                    if event_first {
-                        fixture.connection.observe(&settled(11)).unwrap();
-                    }
-                    fixture.flush();
-                    assert_eq!(
-                        fixture.wire.len(),
-                        1,
-                        "settlement cannot bypass its correlated reply"
-                    );
-                    fixture.connection.observe(&reply).unwrap();
-                    if !event_first {
-                        fixture
-                            .connection
-                            .send_annotation_pointer(samples[1].clone(), 1)
-                            .unwrap();
-                        fixture
-                            .connection
-                            .send_intent(Intent {
-                                correlation: 18,
-                                endpoint_id: crate::generated::ENDPOINT_Annotation_Stop,
-                                fields: Vec::new(),
-                            })
-                            .unwrap();
-                        fixture
-                            .connection
-                            .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
-                            .unwrap();
-                        fixture
-                            .connection
-                            .send_intent(Intent {
-                                correlation: 19,
-                                endpoint_id: crate::generated::ENDPOINT_Settings_Update,
-                                fields: Vec::new(),
-                            })
-                            .unwrap();
-                        fixture
-                            .connection
-                            .send_interaction(Interaction {
-                                replaceable: false,
-                                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                                value: vec![8],
-                            })
-                            .unwrap();
-                        fixture.flush();
-                        assert_eq!(
-                            fixture.wire.len(),
-                            5,
-                            "Stop and ordinary traffic pass the active document barrier"
-                        );
-                        let stop = fixture
-                            .wire
-                            .iter()
-                            .map(|bytes| crate::protocol::decode_envelope(bytes).unwrap())
-                            .find(|record| {
-                                record.kind == "Intent"
-                                    && record.payload.field("correlation").unwrap().integer_u64()
-                                        == Some(18)
-                            })
-                            .expect("Stop bypasses the unsettled command");
-                        assert_eq!(
-                            stop.payload.field("correlation").unwrap().integer_u64(),
-                            Some(18)
-                        );
-                        fixture.wire.truncate(1);
-                        fixture
-                            .connection
-                            .observe(&crate::protocol::ServerRecord::IntentReply(
-                                crate::protocol::IntentReply {
-                                    correlation: 18,
-                                    result: Ok(
-                                        annotation_snapshot().into_application_transport_value()
-                                    ),
-                                },
-                            ))
-                            .unwrap();
-                        fixture.flush();
-                        assert_eq!(
-                            fixture.wire.len(),
-                            1,
-                            "Stop reply never releases the active command's later input"
-                        );
-                    }
-
-                    fixture.connection.observe(&settled(9)).unwrap();
-                    fixture.flush();
-                    assert_eq!(fixture.wire.len(), if event_first { 2 } else { 1 });
-                    if !event_first {
-                        fixture.connection.observe(&settled(11)).unwrap();
-                    }
-                    fixture.flush();
-                    assert_eq!(
-                        fixture.wire.len(),
-                        2,
-                        "only a newer settled revision releases following input"
-                    );
-                    fixture.assert_samples(&samples[..if event_first { 1 } else { 2 }], 2);
-                }
-            }
-        }
-        for successful in [false, true] {
-            use crate::application_codec::IntoApplicationValue;
-            let (mut owner, mut capture) = Connection::test_channel();
-            owner
-                .send_intent(Intent {
-                    correlation: 1,
-                    endpoint_id: crate::generated::ENDPOINT_Annotation_Stop,
-                    fields: Vec::new(),
-                })
-                .unwrap();
-            owner
-                .send_annotation_pointer(samples[0].clone(), 1)
-                .unwrap();
-            assert!(matches!(capture.try_recv(), Ok(CapturedRecord::Intent(_))));
-            assert!(capture.try_recv().is_err());
-            owner
-                .observe(&crate::protocol::ServerRecord::IntentReply(
-                    crate::protocol::IntentReply {
-                        correlation: 1,
-                        result: if successful {
-                            Ok(annotation_snapshot().into_application_transport_value())
-                        } else {
-                            Err(crate::protocol::ApplicationError {
-                                category: crate::generated::ApplicationErrorCategory::Unavailable,
-                                detail: "command rejected".into(),
-                            })
-                        },
-                    },
-                ))
-                .unwrap();
-            assert!(
-                matches!(capture.try_recv(), Ok(CapturedRecord::Other(envelope)) if envelope.kind == "Interaction")
-            );
-        }
-        // Separate queues retain the same discrete capacity and replacement
-        // adjacency, even when a sample sits between absolute observations.
-        let (mut owner, _capture) = Connection::test_channel();
-        for index in 0..64 {
-            let endpoint = if index % 2 == 0 {
-                crate::generated::ENDPOINT_Annotation_Edit
-            } else {
-                1
-            };
-            owner
-                .send_intent(Intent {
-                    correlation: index + 1,
-                    endpoint_id: endpoint,
-                    fields: Vec::new(),
-                })
-                .unwrap();
-        }
-        assert_eq!(
-            owner.send_intent(Intent {
-                correlation: 65,
-                endpoint_id: 1,
-                fields: Vec::new()
-            }),
-            Err(OutboundSendError::Capacity)
-        );
-        let mut writable = Box::pin(owner.clone().writable());
-        let waker = iced::futures::task::noop_waker();
-        let mut context = std::task::Context::from_waker(&waker);
-        assert!(std::future::Future::poll(writable.as_mut(), &mut context).is_pending());
-        owner.flush(|_| Ok(())).unwrap();
-        assert!(matches!(
-            std::future::Future::poll(writable.as_mut(), &mut context),
-            std::task::Poll::Ready(Ok(()))
-        ));
-        let (mut owner, _capture) = Connection::test_channel();
-        owner
-            .send_interaction(Interaction {
-                replaceable: true,
-                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                value: vec![1],
-            })
-            .unwrap();
-        owner
-            .send_annotation_pointer(samples[0].clone(), 1)
-            .unwrap();
-        owner
-            .send_interaction(Interaction {
-                replaceable: true,
-                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                value: vec![2],
-            })
-            .unwrap();
-        let mut wire = Vec::new();
-        owner
-            .flush(|bytes| {
-                wire.push(crate::protocol::decode_envelope(bytes).unwrap());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            wire.len(),
-            3,
-            "separately stored samples still break replacement adjacency"
-        );
-        assert_eq!(
-            wire[1].payload.field("value"),
-            Some(&crate::application_codec::Value::Bytes(vec![1]))
-        );
-        assert_eq!(
-            wire[2].payload.field("value"),
-            Some(&crate::application_codec::Value::Bytes(vec![2]))
-        );
-        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let (mut owner, _capture) = Connection::test_channel();
-            let mut sample = samples[0].clone();
-            sample.point.x = invalid;
-            owner.send_annotation_pointer(sample, 1).unwrap();
-            for _ in 0..2 {
-                assert!(
-                    owner
-                        .flush(|_| panic!("malformed input reached the socket"))
-                        .is_err()
-                );
-            }
-            owner.close();
-        }
+        assert_eq!(connection.send_intent(Intent { correlation: 65, endpoint_id: 1, fields: Vec::new() }), Err(OutboundSendError::Capacity));
+        connection.close();
+        assert_eq!(connection.send_intent(Intent { correlation: 66, endpoint_id: 1, fields: Vec::new() }), Err(OutboundSendError::Closed));
     }
 }

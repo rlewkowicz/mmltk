@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/controller/contracts/workspace_input.h"
+
 #include "src/controller/presentation/visual_source_projection.h"
 
 #include <algorithm>
@@ -347,6 +349,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 
 class ExploreSystem final {
    public:
+    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+    void SetInputPeer(std::uint64_t);
+
     using visual_source = VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
                                                  mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
                                                  mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "src/controller/presentation/visual_source_projection.h"
+#include "src/controller/contracts/workspace_input.h"
 
 #include <memory>
 #include <optional>
@@ -40,24 +41,6 @@ struct AnnotationPointer final {
                point.finite() && brush_radius >= contracts::kMinAnnotationBrushRadius &&
                brush_radius <= contracts::kMaxAnnotationBrushRadius;
     }
-};
-// Alternative ordinal is the generated compact opcode: a complete pointer
-// establishes/updates gesture metadata; a point advances it by an exact delta.
-using AnnotationInputSample = std::variant<AnnotationPointer, contracts::AnnotationPoint>;
-inline constexpr std::size_t kAnnotationInputBatchCapacity = 32U;
-inline constexpr std::size_t kAnnotationInputAdmissionSlots = 2U;
-struct AnnotationInputBatch final {
-    std::uint64_t document_epoch = 0U;
-    std::uint64_t sequence = 0U;
-    [[= mmltk::frameworks::reflection::MaxItems{
-        kAnnotationInputBatchCapacity}]] std::inplace_vector<AnnotationInputSample, kAnnotationInputBatchCapacity>
-        samples{};
-};
-struct AnnotationInputProgress final {
-    bool operator==(const AnnotationInputProgress&) const = default;
-    std::uint64_t epoch = 0U;
-    std::uint64_t consumed_sequence = 0U;
-    [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::optional<std::string> rejection{};
 };
 struct AnnotationOpen final {
     VisualFrame source{};
@@ -142,23 +125,11 @@ struct AnnotationRenderedFacts final {
     std::uint64_t document_epoch = 0U;
     std::uint64_t scene_revision = 0U;
     contracts::AnnotationEditorFacts editor{};
-    std::optional<contracts::AnnotationSelectedGeometry> selected{};
-    std::optional<contracts::AnnotationObjectIdentity> selected_identity{};
-    std::optional<contracts::AnnotationObjectGeometry> preview{};
-    std::optional<std::uint16_t> preview_object{};
-    std::uint64_t preview_identity = 0U;
-};
-struct AnnotationRenderedScene final {
-    bool operator==(const AnnotationRenderedScene&) const = default;
-    std::uint64_t document_epoch = 0U;
-    std::uint64_t scene_revision = 0U;
-    contracts::AnnotationSceneGeometry geometry{};
-    [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<std::uint64_t> identities{};
-};
+ };
 struct AnnotationImageMetadata final {
-    AnnotationRenderedScene rendered_scene{};
-    AnnotationRenderedFacts rendered{};
     VisualFrame frame{};
+    // Opt-in evidence for the exact rendered image; never authorizes input.
+    std::optional<AnnotationRenderedFacts> diagnostics{};
 };
 
 struct AnnotationSnapshot final {
@@ -170,8 +141,6 @@ struct AnnotationSnapshot final {
     // CLEANUP-IGNORE: Annotation readiness begins a domain-specific reflected snapshot tail, not shared state.
     bool ready = false;
     contracts::AnnotationUiState ui{};
-    AnnotationRenderedScene rendered_scene{};
-    AnnotationRenderedFacts rendered{};
     VisualFrame frame{};
     // CLEANUP-IGNORE: The Annotation snapshot terminator precedes domain-specific transient and critical events.
 };
@@ -185,7 +154,6 @@ struct AnnotationFrameState final {
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
     VisualFrame frame{};
-    AnnotationRenderedFacts rendered{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationFrameChanged final {
     AnnotationFrameState snapshot{};
@@ -207,10 +175,8 @@ class AnnotationSystem final {
     ~AnnotationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
-    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(AnnotationInputBatch);
-    void SetInputPeer(
-        std::uint64_t,
-        SystemEventSink<AnnotationInputProgress>);  // CLEANUP-IGNORE: Annotation input ownership is not an Explore intent sequence.
+    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+    void SetInputPeer(std::uint64_t);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
     // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Save(AnnotationSave);
@@ -235,8 +201,6 @@ class AnnotationSystem final {
 [[nodiscard]] VisualRuntimeFactory make_native_annotation_runtime_factory(VisualDeviceSettings);
 // CLEANUP-IGNORE: Annotation's canonical field registrations are distinct stable schema identities.
 MMLTK_REFLECT_FIELDS(AnnotationPointer)
-MMLTK_REFLECT_FIELDS(AnnotationInputBatch)
-MMLTK_REFLECT_FIELDS(AnnotationInputProgress)
 MMLTK_REFLECT_FIELDS(AnnotationOpen)
 MMLTK_REFLECT_FIELDS(AnnotationSave)
 MMLTK_REFLECT_FIELDS(AnnotationToolEdit)
@@ -261,7 +225,6 @@ MMLTK_REFLECT_FIELDS(AnnotationRedoEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEditRequest)
 MMLTK_REFLECT_FIELDS(AnnotationRenderedFacts)
-MMLTK_REFLECT_FIELDS(AnnotationRenderedScene)
 MMLTK_REFLECT_FIELDS(AnnotationImageMetadata)
 MMLTK_REFLECT_FIELDS(AnnotationSnapshot)
 MMLTK_REFLECT_FIELDS(AnnotationChanged)

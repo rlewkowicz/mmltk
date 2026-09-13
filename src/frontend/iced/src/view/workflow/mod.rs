@@ -175,6 +175,7 @@ pub fn workspace<'a, Message: 'a>(
     page: crate::generated::FeatureId,
     page_width: f32,
     map: impl Fn(crate::view::workspace::Message) -> Message + 'a,
+    input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let aspect = settings.draft.as_ref().map_or(
         crate::generated::WorkspaceAspectRatio::Widescreen,
@@ -185,6 +186,7 @@ pub fn workspace<'a, Message: 'a>(
         aspect,
         settings_enabled,
         Composition::new(page, page_width).center_width(),
+        input,
     )
     .map(map)
 }

@@ -55,8 +55,7 @@ namespace {
                        (value.result.has_value() != value.error.has_value());
             } else if constexpr (std::same_as<T, InteractionRejected>) {
                 return value.protocol_version == kBrowserProtocolVersion && value.endpoint_id != 0U;
-            } else if constexpr (std::same_as<T, InputProgress>) {
-                return value.protocol_version == kBrowserProtocolVersion && value.progress.epoch != 0U;
+
             } else if constexpr (std::same_as<T, IntegrationControl>) {
                 return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
                        contracts::integration_server_command(value.receipt.kind);

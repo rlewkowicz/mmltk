@@ -5,6 +5,7 @@
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/presentation/presentation_system.h"
+#include "src/controller/presentation/workspace_input.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 
@@ -1298,6 +1299,7 @@ struct AnnotationRenderProbe final {
     std::mutex mutex;
     std::shared_ptr<MutationCommitProbe> hold;
     std::shared_ptr<MutationCommitProbe> sample_hold;
+    std::shared_ptr<MutationCommitProbe> open_hold;
 
     void Wait(std::shared_ptr<MutationCommitProbe>& pending) {
         std::shared_ptr<MutationCommitProbe> gate;
@@ -1316,6 +1318,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
     explicit TestAnnotationAlgorithm(std::shared_ptr<AnnotationRenderProbe> probe = {}) : probe_(std::move(probe)) {}
     void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {
+        if (probe_) probe_->Wait(probe_->open_hold);
         if (probe_ && probe_->fail_open.exchange(false)) throw std::runtime_error("deterministic source preparation failure");
     }
     contracts::AnnotationColor Sample(contracts::AnnotationPoint) override {
@@ -2698,7 +2701,8 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
     return AnnotationSystem{kDevice,
                             RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                            [] { return std::make_unique<TestAnnotationAlgorithm>(); }),
-                            borrow_exactly_from(source), [&events](AnnotationSystem::event_type) { events.Advance(); }};
+                            borrow_exactly_from(source), [&events](AnnotationSystem::event_type) { events.Advance(); },
+                            mmltk::testsupport::annotation_render_evidence()};
 }
 
 [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView hold_annotation_frame(AnnotationSystem& annotation, EventGate& events,
@@ -2709,6 +2713,22 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
     auto retained = annotation.BorrowFrame();
     REQUIRE(retained.valid());
     return retained;
+}
+
+void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& events, std::uint64_t peer) {
+    const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
+    mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
+    const auto before = annotation.snapshot().ui;
+    annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, WorkspaceMouseKind::Press, {1.25F, 2.5F}));
+    annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, WorkspaceMouseKind::Motion, {10.75F, 12.125F}));
+    auto release = mmltk::testsupport::annotation_mouse(annotation, peer, WorkspaceMouseKind::Release, {});
+    release.point.reset();  // An outside release commits the last accepted motion.
+    annotation.Input(release);
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ui.document_revision > before.document_revision; }));
+    const auto after = annotation.snapshot().ui;
+    REQUIRE(after.scene.objects.size() == before.scene.objects.size() + 1U);
+    CHECK(after.scene.objects.back().box == contracts::AnnotationBox{{1.25F, 2.5F}, {10.75F, 12.125F}});
+    CHECK(after.can_undo);
 }
 
 template <class System>
@@ -3756,7 +3776,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(diagnostics.last_system.load(std::memory_order_acquire) == contracts::DiagnosticOwner::Explore);
 
     EventGate annotation_events;
-    std::atomic_uint64_t consumed{0U}, failures{0U};
+    std::atomic_uint64_t failures{0U};
     auto probe = std::make_shared<AnnotationRenderProbe>();
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
@@ -3764,47 +3784,24 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
                                 borrow_exactly_from(explore), [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U);
                                     annotation_events.Advance();
-                                }};
+                                }, mmltk::testsupport::annotation_render_evidence()};
     CHECK_FALSE(annotation.BorrowFrame().valid());
     const auto admitted = annotation.Open({.source = explore.snapshot().frame});
     CHECK(admitted.busy);
     REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().ready && annotation.snapshot().frame.valid(); }));
-    annotation.SetInputPeer(7U, [&](AnnotationInputProgress progress) {
-        consumed.store(progress.consumed_sequence, std::memory_order_release);
-        annotation_events.Advance();
-    });
+    annotation.SetInputPeer(7U);
     auto retained = hold_annotation_frame(annotation, annotation_events, contracts::AnnotationTool::Box);
     const auto initial = annotation.snapshot();
-    const auto input = [&](std::uint64_t batch, contracts::AnnotationPointerPhase phase, std::uint64_t sequence, float x) {
-        return AnnotationInputBatch{
-            .document_epoch = initial.input_document_epoch,
-            .sequence = batch,
-            .samples = {AnnotationPointer{.phase = phase, .interaction_id = 1U, .sequence = sequence, .point = {x, 3.0F + x}}}};
+    const auto mouse = [&](WorkspaceMouseKind kind, float x) {
+        return mmltk::testsupport::annotation_mouse(annotation, 7U, kind, {x, 3.0F + x});
     };
-    auto invalid = input(1U, contracts::AnnotationPointerPhase::Begin, 1U, 2.0F);
-    std::get<AnnotationPointer>(invalid.samples.front()).target = {.object = 0U, .element = 0U};
+    auto invalid = mouse(WorkspaceMouseKind::Motion, std::numeric_limits<float>::infinity());
     CHECK_THROWS_AS(annotation.Input(invalid), contracts::InvalidIntentError);
-    invalid.samples = {contracts::AnnotationPoint{1.0F, 1.0F}};
-    CHECK_THROWS_AS(annotation.Input(invalid), contracts::InvalidIntentError);
-    annotation.Input(input(1U, contracts::AnnotationPointerPhase::Begin, 1U, 2.0F));
-    REQUIRE(annotation_events.Wait([&] { return consumed.load() == 1U; }));
-    auto movement = input(2U, contracts::AnnotationPointerPhase::Update, 2U, 7.0F);
-    // A malformed suffix must roll back the entire admission's retained codec
-    // state; the retry still reconstructs from the accepted Begin.
-    movement.samples = {contracts::AnnotationPoint{1.25F, 0.5F}, contracts::AnnotationPoint{std::numeric_limits<float>::infinity(), 0.0F}};
-    CHECK_THROWS_AS(annotation.Input(movement), contracts::InvalidIntentError);
-    movement.samples = {contracts::AnnotationPoint{5.0F, 5.0F}};
-    annotation.Input(movement);
-    REQUIRE(annotation_events.Wait([&] { return consumed.load() == 2U; }));
-    CHECK(annotation.snapshot().ui.document_revision == initial.ui.document_revision);
-    annotation.Input(input(3U, contracts::AnnotationPointerPhase::End, 3U, 9.0F));
-    REQUIRE(annotation_events.Wait(
-        [&] { return consumed.load() == 3U && annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
-    CHECK(annotation.snapshot().frame == initial.frame);
-    CHECK(annotation.snapshot().rendered == initial.rendered);
-    CHECK_THROWS_AS(annotation.Input(input(3U, contracts::AnnotationPointerPhase::End, 3U, 9.0F)), contracts::InvalidIntentError);
-    movement.sequence = 4U;
-    CHECK_THROWS_AS(annotation.Input(movement), contracts::InvalidIntentError);  // End retired the delta predecessor.
+    annotation.Input(mouse(WorkspaceMouseKind::Press, 2.0F));
+    annotation.Input(mouse(WorkspaceMouseKind::Motion, 7.0F));
+    annotation.Input(mouse(WorkspaceMouseKind::Release, 9.0F));
+    REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
+    CHECK(annotation.snapshot().ui.scene.objects.back().box == contracts::AnnotationBox{{2, 5}, {9, 12}});
 
     // Save and undo settle without waiting for the held output, and preserve the
     // ordered box commit in the real reducer/history rather than a mock journal.
@@ -3822,7 +3819,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     retained = {};
     REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().frame.revision > initial.frame.revision; }));
     CHECK(annotation.snapshot().frame.clean_revision == initial.frame.clean_revision);
-    CHECK(annotation.snapshot().rendered.scene_revision == annotation.snapshot().ui.scene_revision);
+    mmltk::testsupport::await_annotation_render(annotation, annotation_events);
     const auto refused = annotation.Save({.destination = "/missing-annotation-directory/file.cbor"});
     mmltk::testsupport::await_annotation_command(annotation, annotation_events, refused.revision);
     CHECK(failures.load() == 1U);
@@ -4550,35 +4547,19 @@ TEST_CASE("Annotation peer closure orders accepted input before replacement gest
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     auto edited = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
     mmltk::testsupport::await_annotation_command(annotation, events, edited.revision);
-    std::atomic_uint64_t consumed{0U}, ready{0U};
-    annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
-        consumed = progress.consumed_sequence;
-        events.Advance();
-    });
-    const auto epoch = annotation.snapshot().input_document_epoch;
+    annotation.SetInputPeer(1U);
     const auto before = annotation.snapshot().ui.scene.objects.size();
-    annotation.Input(
-        {.document_epoch = epoch,
-         .sequence = 1U,
-         .samples = {
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2, 3}},
-             AnnotationPointer{
-                 .phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4, 5}}}});
+    const auto mouse = [&](std::uint64_t peer, WorkspaceMouseKind kind, WorkspacePoint point) {
+        annotation.Input(mmltk::testsupport::annotation_mouse(annotation, peer, kind, point));
+    };
+    mouse(1U, WorkspaceMouseKind::Press, {2, 3});
+    mouse(1U, WorkspaceMouseKind::Motion, {4, 5});
     annotation.PeerClosed();
-    annotation.SetInputPeer(2U, [&](AnnotationInputProgress progress) {
-        ready = progress.epoch;
-        consumed = progress.consumed_sequence;
-        events.Advance();
-    });
-    REQUIRE(events.Wait([&] { return ready.load() == 2U; }));
-    CHECK(annotation.snapshot().ui.scene.objects.size() == before);
-    annotation.Input(
-        {.document_epoch = epoch,
-         .sequence = 1U,
-         .samples = {
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 2U, .sequence = 1U, .point = {6, 7}},
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 2U, .sequence = 2U, .point = {8, 9}}}});
-    REQUIRE(events.Wait([&] { return consumed.load() == 1U && annotation.snapshot().ui.scene.objects.size() == before + 1U; }));
+    annotation.SetInputPeer(2U);
+    mouse(2U, WorkspaceMouseKind::Press, {6, 7});
+    mouse(2U, WorkspaceMouseKind::Release, {8, 9});
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ui.scene.objects.size() == before + 1U; }));
+    CHECK(annotation.snapshot().ui.scene.objects.back().box == contracts::AnnotationBox{{6, 7}, {8, 9}});
     CHECK(annotation.snapshot().ready);
 }
 
@@ -5202,7 +5183,7 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
                                 borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
                                     events.Advance();
-                                }};
+                                }, mmltk::testsupport::annotation_render_evidence()};
     probe->fail_open = true;
     static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
     REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
@@ -5210,6 +5191,10 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     CHECK_FALSE(annotation.BorrowFrame().valid());
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     const auto committed = annotation.snapshot().ui;
+    annotation.SetInputPeer(1U);
+    auto right = mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {3, 4});
+    right.button = WorkspaceMouseButton::Right;
+    annotation.Input(right);
     probe->fail_render = true;
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
     REQUIRE(events.Wait([&] { return failures.load() == 2U; }));
@@ -5217,6 +5202,8 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     CHECK_FALSE(annotation.BorrowFrame().valid());
     CHECK(annotation.snapshot().ui.document_revision >= committed.document_revision);
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
+    complete_annotation_box_drag(annotation, events, 1U);
+    CHECK(failures.load() == 2U);
 }
 
 TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {
@@ -5241,7 +5228,8 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
                                     if (reject_incoming) borrowed.document = rejected_document;
                                     return borrowed;
                                 },
-                                [&events](AnnotationSystem::event_type) { events.Advance(); }};
+                                [&events](AnnotationSystem::event_type) { events.Advance(); },
+                                mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::open_annotation(annotation, events, source.frame());
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("kept category")}}}));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
@@ -5280,14 +5268,8 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                                [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
                                 borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
-                                    if (const auto* full = std::get_if<AnnotationChanged>(&event)) {
-                                        const auto& snapshot = full->snapshot;
-                                        if (held_scene.load() != 0U && snapshot.rendered.scene_revision == held_scene.load() &&
-                                            snapshot.ui.scene_revision > snapshot.rendered.scene_revision && snapshot.frame.valid())
-                                            older_completed = true;
-                                    }
                                     events.Advance();
-                                }};
+                                }, mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(hold->release);
         annotation.Shutdown();
@@ -5301,20 +5283,12 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     held_scene = annotation.snapshot().ui.scene_revision;
-    std::atomic_uint64_t consumed{0U};
-    annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
-        consumed = progress.consumed_sequence;
-        events.Advance();
-    });
-    annotation.Input(
-        {.document_epoch = initial.input_document_epoch,
-         .sequence = 1U,
-         .samples = {
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin, .interaction_id = 1U, .sequence = 1U, .point = {2, 3}},
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Update, .interaction_id = 1U, .sequence = 2U, .point = {4, 5}},
-             AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End, .interaction_id = 1U, .sequence = 3U, .point = {6, 7}}}});
-    REQUIRE(
-        events.Wait([&] { return consumed.load() == 1U && annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
+    annotation.SetInputPeer(1U);
+    for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Motion, WorkspaceMouseKind::Release}) {
+        const float coordinate = kind == WorkspaceMouseKind::Press ? 2.0F : kind == WorkspaceMouseKind::Motion ? 4.0F : 6.0F;
+        annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, kind, {coordinate, coordinate + 1.0F}));
+    }
+    REQUIRE(events.Wait([&] { return annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
     CHECK(annotation.snapshot().frame == initial.frame);
     const auto committed = annotation.snapshot().ui.document_revision;
     const auto command = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
@@ -5325,70 +5299,113 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     CHECK(annotation.Stop().cancellation_requested);
     hold->release.set_value();
     REQUIRE(events.Wait([&] {
-        return !annotation.snapshot().busy && annotation.snapshot().rendered.scene_revision == annotation.snapshot().ui.scene_revision;
+        return !annotation.snapshot().busy;
     }));
     CHECK(annotation.snapshot().input_document_epoch == document_epoch);
     CHECK(annotation.snapshot().frame.revision > initial.frame.revision);
-    CHECK(older_completed.load());
+    mmltk::testsupport::await_annotation_render(annotation, events);
     CHECK(probe->exact_content.load());
 }
 
-TEST_CASE("Annotation admission reuses both credits without consuming rejected batch sequences") {
+TEST_CASE("Annotation Open consumes retained prior-document input and accepts the replacement gesture") {
+    const auto terminal = GENERATE(WorkspaceMouseKind::Release, WorkspaceMouseKind::Cancel);
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};
+    auto probe = std::make_shared<AnnotationRenderProbe>();
+    auto hold = std::make_shared<MutationCommitProbe>();
+    auto entered = hold->committed.get_future();
     EventGate events;
-    auto pause = std::make_shared<MutationCommitProbe>();
-    auto entered = pause->committed.get_future();
-    std::atomic_uint64_t consumed{0U};
-    std::atomic_bool ordered{true};
-    std::atomic_bool peer_ready{false};
-    auto annotation = make_test_annotation(backend, source.system(), events);
+    std::atomic_uint64_t failures{0U};
+    std::mutex observations_mutex;
+    std::vector<AnnotationSnapshot> replacements;
+    AnnotationSystem annotation{kDevice,
+                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
+                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
+                                    if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
+                                    if (const auto* changed = std::get_if<AnnotationChanged>(&event);
+                                        changed && changed->snapshot.input_document_epoch == 2U) {
+                                        std::scoped_lock lock(observations_mutex);
+                                        replacements.push_back(changed->snapshot);
+                                    }
+                                    events.Advance();
+                                }};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
-        mmltk::testsupport::release_test_promise(pause->release);
+        mmltk::testsupport::release_test_promise(hold->release);
         annotation.Shutdown();
     }};
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
-    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
-    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
-    const auto epoch = annotation.snapshot().input_document_epoch;
-    annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
-        if (!progress.consumed_sequence) {
-            peer_ready = true;
-            events.Advance();
-            return;
-        }
-        if (progress.consumed_sequence != consumed.load() + 1U) ordered = false;
-        consumed = progress.consumed_sequence;
-        if (progress.consumed_sequence == 1U) {
-            pause->committed.set_value();
-            pause->released.wait();
-        }
-        events.Advance();
-    });
-    REQUIRE(events.Wait([&] { return peer_ready.load(); }));
-    const auto batch = [epoch](std::uint64_t sequence, contracts::AnnotationPointerPhase phase) {
-        return AnnotationInputBatch{
-            .document_epoch = epoch,
-            .sequence = sequence,
-            .samples = {AnnotationPointer{.phase = phase,
-                                          .interaction_id = 1U,
-                                          .sequence = sequence,
-                                          .point = {static_cast<float>(sequence * 2U), static_cast<float>(sequence * 3U)}}}};
-    };
-    annotation.Input(batch(1U, contracts::AnnotationPointerPhase::Begin));
+    annotation.SetInputPeer(1U);
+    auto right = mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {3, 4});
+    right.button = WorkspaceMouseButton::Right;
+    annotation.Input(right);
+    {
+        std::scoped_lock lock(probe->mutex);
+        probe->open_hold = hold;
+    }
+    static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
-    // The sink pauses after freeing the consumed slot, outside the admission
-    // lock. Both accepted batches remain queued while the third is rejected.
-    annotation.Input(batch(2U, contracts::AnnotationPointerPhase::Update));
-    annotation.Input(batch(3U, contracts::AnnotationPointerPhase::Update));
-    CHECK_THROWS_AS(annotation.Input(batch(4U, contracts::AnnotationPointerPhase::End)), contracts::InvalidIntentError);
-    CHECK(consumed.load() == 1U);
-    pause->release.set_value();
-    REQUIRE(events.Wait([&] { return consumed.load() == 3U; }));
-    annotation.Input(batch(4U, contracts::AnnotationPointerPhase::End));
-    REQUIRE(events.Wait([&] { return consumed.load() == 4U && annotation.snapshot().ui.scene.objects.size() == 1U; }));
-    CHECK(ordered.load());
-    CHECK(annotation.snapshot().ui.scene.objects.front().box == contracts::AnnotationBox{{2, 3}, {8, 12}});
+    for (std::size_t index = 0U; index != 128U; ++index) {
+        auto motion = right;
+        motion.kind = WorkspaceMouseKind::Motion;
+        motion.point = WorkspacePoint{static_cast<float>(index % 16U) + 0.25F, 5.125F};
+        annotation.Input(motion);
+    }
+    right.kind = terminal;
+    annotation.Input(right);
+    // This no-op tool command is an ordinary FIFO settlement boundary after
+    // every old-document record, with no input acknowledgement or test hook.
+    static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Select}}}));
+    hold->release.set_value();
+    REQUIRE(events.Wait([&] {
+        std::scoped_lock lock(observations_mutex);
+        return replacements.size() >= 2U && !replacements.back().busy;
+    }));
+    {
+        std::scoped_lock lock(observations_mutex);
+        REQUIRE(replacements.size() == 2U);
+        CHECK(replacements.front().ui == replacements.back().ui);
+        CHECK(annotation.snapshot().ui == replacements.front().ui);
+    }
+    CHECK(failures.load() == 0U);
+    CHECK(annotation.snapshot().input_document_epoch == 2U);
+    complete_annotation_box_drag(annotation, events, 1U);
+    CHECK(failures.load() == 0U);
+}
+
+TEST_CASE("Workspace input retains ordered high-water records for independent native owners") {
+    WorkspaceInputQueue<WorkspaceMouse> queue;
+    for (std::size_t index = 0U; index != 1024U; ++index)
+        queue.Push({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .kind = WorkspaceMouseKind::Motion,
+                    .point = WorkspacePoint{static_cast<float>(index) + 0.25F, 0.125F}});
+    const auto capacity = queue.capacity();
+    for (std::size_t index = 0U; index != 1024U; ++index) {
+        const auto mouse = queue.Pop();
+        REQUIRE(mouse);
+        REQUIRE(mouse->point);
+        CHECK(mouse->point->x == static_cast<float>(index) + 0.25F);
+    }
+    CHECK(queue.empty());
+    CHECK(queue.capacity() == capacity);
+    for (const auto source : presentation_source_metadata) {
+        if (source.kind == PresentationSourceKind::None) continue;
+        WorkspaceInput owner;
+        owner.SetPeer(2U);
+        for (const auto entry : mmltk::frameworks::reflection::enum_entries<WorkspaceMouseKind>()) {
+            WorkspaceMouse mouse{.source = source.kind, .peer_epoch = 2U, .kind = entry.value,
+                                 .button = WorkspaceMouseButton::Other, .other_button = 65535U,
+                                 .click_count = 2U, .modifiers = 15U, .wheel_unit = WorkspaceWheelUnit::Pixels,
+                                 .wheel = {-0.125F, 0.25F}};
+            owner.Accept(mouse, source.kind);
+            REQUIRE(owner.latest());
+            CHECK(owner.latest()->kind == mouse.kind);
+            CHECK(owner.latest()->other_button == 65535U);
+            CHECK_FALSE(owner.latest()->point);
+            CHECK(owner.latest()->wheel == mouse.wheel);
+        }
+        owner.SetPeer(3U);
+        CHECK_FALSE(owner.latest());
+    }
 }
 
 TEST_CASE("Annotation color sampling completes before following document commands under output pressure") {
@@ -5403,7 +5420,6 @@ TEST_CASE("Annotation color sampling completes before following document command
     auto sample = std::make_shared<MutationCommitProbe>();
     auto entered = sample->committed.get_future();
     EventGate events;
-    std::atomic_uint64_t consumed{0U};
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                                [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
@@ -5412,7 +5428,8 @@ TEST_CASE("Annotation color sampling completes before following document command
                                     read.document = semantic;
                                     return read;
                                 },
-                                [&](AnnotationSystem::event_type) { events.Advance(); }};
+                                [&](AnnotationSystem::event_type) { events.Advance(); },
+                                mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(sample->release);
         annotation.Shutdown();
@@ -5425,35 +5442,37 @@ TEST_CASE("Annotation color sampling completes before following document command
         std::scoped_lock lock(probe->mutex);
         probe->sample_hold = sample;
     }
-    annotation.SetInputPeer(1U, [&](AnnotationInputProgress progress) {
-        consumed = progress.consumed_sequence;
-        events.Advance();
-    });
-    annotation.Input({.document_epoch = annotation.snapshot().input_document_epoch,
-                      .sequence = 1U,
-                      .samples = {AnnotationPointer{.phase = contracts::AnnotationPointerPhase::Begin,
-                                                    .interaction_id = 1U,
-                                                    .sequence = 1U,
-                                                    .target = {.object = 0U},
-                                                    .identity = {.object = annotation.snapshot().rendered_scene.identities.at(0)},
-                                                    .point = {4, 5}},
-                                  AnnotationPointer{.phase = contracts::AnnotationPointerPhase::End,
-                                                    .interaction_id = 1U,
-                                                    .sequence = 2U,
-                                                    .target = {.object = 0U},
-                                                    .identity = {.object = annotation.snapshot().rendered_scene.identities.at(0)},
-                                                    .point = {4, 5}}}});
+    annotation.SetInputPeer(1U);
+    annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {4, 5}));
+    annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Release, {4, 5}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
-    CHECK(consumed.load() == 1U);
-    const auto undo = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
-    CHECK(undo.busy);
-    sample->release.set_value();
-    mmltk::testsupport::await_annotation_command(annotation, events, undo.revision);
-    CHECK_FALSE(annotation.snapshot().ui.scene.objects[0].sup.sampling);
-    edit = annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}});
-    mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
-    CHECK(annotation.snapshot().ui.scene.objects[0].sup.sampling);
-    CHECK(annotation.snapshot().ui.scene.objects[0].sup.center.hue == 120.0F);
+    SECTION("ordered document backlog") {
+        for (std::size_t index = 0U; index != 64U; ++index) {
+            annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Motion,
+                                                                 {static_cast<float>(index) + 0.25F, 5.125F}));
+            CHECK(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}).busy);
+            CHECK(annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}}).busy);
+        }
+        const auto undo = annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}});
+        CHECK(undo.busy);
+        sample->release.set_value();
+        mmltk::testsupport::await_annotation_command(annotation, events, undo.revision);
+        CHECK_FALSE(annotation.snapshot().ui.scene.objects[0].sup.sampling);
+        edit = annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}});
+        mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
+        CHECK(annotation.snapshot().ui.scene.objects[0].sup.sampling);
+        CHECK(annotation.snapshot().ui.scene.objects[0].sup.center.hue == 120.0F);
+    }
+    SECTION("Stop cancels sampling while later document work remains admissible") {
+        CHECK(annotation.Stop().cancellation_requested);
+        const auto categories = annotation.snapshot().ui.scene.categories.size();
+        edit = annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("after sample")}}});
+        CHECK(edit.busy);
+        sample->release.set_value();
+        mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
+        CHECK_FALSE(annotation.snapshot().ui.scene.objects[0].sup.sampling);
+        CHECK(annotation.snapshot().ui.scene.categories.size() == categories + 1U);
+    }
     held = {};
 }
 

@@ -401,22 +401,15 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         generated::ServerRecordKind::parse(b"UnknownServerRecord").is_none(),
         "unknown server discriminator accepted",
     )?;
-    require(
-        matches!(&records[4], ServerRecord::InputProgress(mmltk_browser_app::generated::InputProgress { progress, error: None , .. })
-        if progress.epoch == 1 && progress.consumedsequence == 2 && progress.rejection.is_none()),
-        "native cumulative progress fixture changed",
-    )?;
-    require(
-        matches!(&records[5], ServerRecord::InteractionRejected(record)
-        if record.endpointid == generated::ENDPOINT_Explore_UpdateViewport && record.error.category == generated::ApplicationErrorCategory::Unavailable && record.error.detail == "fixture unavailable"),
-        "native interaction rejection fixture changed",
-    )?;
-    require(
-        matches!(&records[6], ServerRecord::InputProgress(record)
-        if record.progress.rejection.as_ref().is_some_and(|detail| detail.len() == generated::ReflectedRecordPath::AnnotationInputProgress.map_child(b"rejection").max_leaf_bytes())
-            && record.error.as_ref().is_some_and(|error| error.category == generated::ApplicationErrorCategory::Busy && error.detail == "fixture busy")),
-        "native optional rejection bounds changed",
-    )?;
+    require(matches!(&records[4], ServerRecord::InteractionRejected(record)
+        if record.endpointid == generated::ENDPOINT_Annotation_Input && record.error.detail == "fixture input unavailable"),
+        "native input rejection fixture changed")?;
+    require(matches!(&records[5], ServerRecord::InteractionRejected(record)
+        if record.endpointid == generated::ENDPOINT_Explore_UpdateViewport && record.error.detail == "fixture unavailable"),
+        "native interaction rejection fixture changed")?;
+    require(matches!(&records[6], ServerRecord::InteractionRejected(record)
+        if record.error.detail.len() == generated::ReflectedRecordPath::ApplicationErrorRecord.map_child(b"detail").max_leaf_bytes()),
+        "native rejection bounds changed")?;
     let Some(ServerRecord::Bootstrap(bootstrap)) = records
         .iter()
         .find(|record| matches!(record, ServerRecord::Bootstrap(_)))
@@ -746,81 +739,14 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
         .ok_or_else(|| io::Error::other("fixture requires a reflected model artifact dialog"))?;
     let settings_update =
         generated::update_currentview(generated::default_currentview().map_err(io::Error::other)?);
-    let batch = generated::AnnotationInputBatch {
-        documentepoch: 1,
-        sequence: 1,
-        samples: (0..generated::ANNOTATION_INPUT_BATCH_CAPACITY)
-            .map(|index| generated::AnnotationPointer {
-                phase: if index == 0 {
-                    generated::AnnotationPointerPhase::Begin
-                } else if index + 1 == generated::ANNOTATION_INPUT_BATCH_CAPACITY {
-                    generated::AnnotationPointerPhase::End
-                } else {
-                    generated::AnnotationPointerPhase::Update
-                },
-                interactionid: 1,
-                sequence: index as u64 + 1,
-                identity: generated::AnnotationTargetIdentity {
-                    object: 0,
-                    element: 0,
-                },
-                target: generated::AnnotationPointerTarget {
-                    object: Some(1),
-                    element: Some(2),
-                    role: Some(generated::AnnotationHandleRole::BoxCorner),
-                },
-                point: generated::AnnotationPoint {
-                    x: index as f32,
-                    y: 1.0,
-                },
-                brushradius: generated::default_uiannotationbrushradius().unwrap() as u16,
-            })
-            .enumerate()
-            .map(|(index, mut pointer)| {
-                use generated::AnnotationPointerOrAnnotationPointVariant as Sample;
-                if index == generated::ANNOTATION_INPUT_BATCH_CAPACITY / 2 {
-                    pointer.brushradius += 1;
-                    Sample::AnnotationPointer(pointer)
-                } else if index != 0 && index + 1 != generated::ANNOTATION_INPUT_BATCH_CAPACITY {
-                    Sample::AnnotationPoint(generated::AnnotationPoint { x: 1.0, y: 0.0 })
-                } else {
-                    Sample::AnnotationPointer(pointer)
-                }
-            })
-            .collect(),
+    let mouse = generated::WorkspaceMouse {
+        source: generated::PresentationSourceKind::Annotation, peerepoch: 1, documentepoch: 1,
+        kind: generated::WorkspaceMouseKind::Motion, point: Some(generated::WorkspacePoint { x: 1.25, y: 2.5 }),
+        button: generated::WorkspaceMouseButton::Left, otherbutton: 0, clickcount: 0, modifiers: 0,
+        wheelunit: generated::WorkspaceWheelUnit::Pixels, wheel: generated::WorkspacePoint { x: 0.125, y: -0.25 },
+        brushradius: 12,
     };
-    let ordinary = generated::encode_annotation_Input(batch.clone())?.encode()?;
-    let mut scratch = Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY);
-    let mut batch_encoded = Vec::with_capacity(generated::ANNOTATION_INPUT_ENCODED_CAPACITY);
-    let retained = (
-        scratch.as_ptr(),
-        scratch.capacity(),
-        batch_encoded.as_ptr(),
-        batch_encoded.capacity(),
-    );
-    for _ in 0..2 {
-        generated::encode_annotation_Input_into(&batch, &mut scratch, &mut batch_encoded)?;
-        require(
-            batch_encoded == ordinary,
-            "retained and owned compact encoders disagree",
-        )?;
-        require(
-            retained
-                == (
-                    scratch.as_ptr(),
-                    scratch.capacity(),
-                    batch_encoded.as_ptr(),
-                    batch_encoded.capacity(),
-                ),
-            "32-sample encoding grew retained storage",
-        )?;
-    }
-    let mut oversized = batch;
-    oversized.samples.push(oversized.samples[0].clone());
-    require(
-        generated::encode_annotation_Input(oversized).is_err(),
-        "compact sample bound was not enforced",
-    )?;
+    let batch_encoded = generated::encode_workspace_mouse(mouse)?.encode()?;
     Ok(vec![
         (
             "Intent:settings.Update",

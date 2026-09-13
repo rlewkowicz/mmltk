@@ -189,6 +189,7 @@ pub(super) fn view<'a>(
     settings: &'a SettingsModel,
     paired: Option<(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>)>,
     width: f32,
+    input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
     let presentation_title = model.explore.presentation_title();
@@ -300,8 +301,12 @@ pub(super) fn view<'a>(
     .height(Length::Fixed(TOOLBAR_HEIGHT))
     .style(crate::fluent_theme::container_header);
 
+    let empty_source = model.foreground_visual()
+        .filter(|source| matches!(source, crate::generated::PresentationSourceKind::Explore | crate::generated::PresentationSourceKind::Upscale))
+        .unwrap_or(crate::generated::PresentationSourceKind::Explore);
+    let input = input.for_source(empty_source, 0, 12);
     let gallery = responsive(move |size| {
-        gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns)
+        gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns, input.clone())
     })
     .width(Fill)
     .height(Fill);
@@ -349,6 +354,7 @@ fn gallery_viewport<'a>(
     displayed: Option<(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>)>,
     size: Size,
     columns: u32,
+    input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let width = size.width.max(1.0);
     let height = size.height.max(1.0);
@@ -372,27 +378,21 @@ fn gallery_viewport<'a>(
     let virtual_height = logical_geometry.virtual_height();
     let surface: Element<'a, Message> = displayed.as_ref().map_or_else(
         || {
-            container(
-                column![
-                    space::vertical(),
-                    text(presentation_title).size(22),
-                    text(snapshot.map_or("", |value| value.failure.as_str()))
-                        .size(12)
-                        .style(crate::fluent_theme::text_secondary),
-                    space::vertical(),
-                ]
-                .align_x(Center),
-            )
-            .id(super::GALLERY_EMPTY_ID)
-            .center(Fill)
-            .width(Fill)
-            .height(Fill)
-            .style(crate::fluent_theme::container_workspace)
-            .into()
+            let input_layer = iced::widget::shader(crate::presentation_surface::Program {
+                input: Some(input.clone()),
+                local: None, publish: None, surface: Surface::empty(),
+                placement: crate::presentation_surface::Placement::Contain,
+                control_id: super::GALLERY_WORKSPACE_ID,
+            }).width(Fill).height(Fill);
+            stack![input_layer, container(column![space::vertical(), text(presentation_title).size(22),
+                text(snapshot.map_or("", |value| value.failure.as_str())).size(12)
+                    .style(crate::fluent_theme::text_secondary), space::vertical()].align_x(Center))
+                .id(super::GALLERY_EMPTY_ID).center(Fill).width(Fill).height(Fill)].into()
         },
         |(surface, metadata)| {
             let image = crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
+                input: Some(input.for_source(crate::generated::PresentationSourceKind::Explore, 0, 12)),
                     local: Some(local_gestures(state, snapshot, columns)),
                     surface: *surface,
                     publish: None,

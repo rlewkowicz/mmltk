@@ -26,12 +26,14 @@ pub enum Outcome {
 }
 
 pub struct Component {
+    pub(crate) input: crate::workspace_input::Binding,
     model_card: crate::view::workflow::model_card::Component,
 }
 
 impl Default for Component {
     fn default() -> Self {
         Self {
+            input: Default::default(),
             model_card: crate::view::workflow::model_card::Component::new(
                 // CLEANUP-IGNORE: Predict binds the child owner to its generated feature.
                 crate::generated::FeatureId::Predict,
@@ -127,6 +129,7 @@ impl Component {
             crate::generated::FeatureId::Predict,
             width,
             Message::Workspace,
+            self.input.for_source(crate::generated::PresentationSourceKind::Predict, 0, 12),
         );
         let advanced = crate::view::shared::card(
             "Advanced",

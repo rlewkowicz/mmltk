@@ -788,7 +788,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
 
 TEST_CASE("protocol-17 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
     namespace cbor = mmltk::frameworks::serialization;
-    STATIC_REQUIRE(cbor::compact_shape<AnnotationInputBatch> == cbor::CompactShape::Object);
+    STATIC_REQUIRE(cbor::compact_shape<WorkspaceMouse> == cbor::CompactShape::Object);
     STATIC_REQUIRE(cbor::compact_shape<ExploreViewportUpdate> == cbor::CompactShape::Object);
     STATIC_REQUIRE(cbor::compact_shape<std::array<std::uint16_t, 2U>> == cbor::CompactShape::Sequence);
     STATIC_REQUIRE(cbor::compact_shape<std::vector<AnnotationPointer>> == cbor::CompactShape::Unsupported);
@@ -796,8 +796,8 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
     STATIC_REQUIRE(cbor::compact_shape<wire::Value> == cbor::CompactShape::Unsupported);
     STATIC_REQUIRE(cbor::compact_shape<std::variant<AnnotationPointer>> == cbor::CompactShape::Variant);
     STATIC_REQUIRE(cbor::compact_shape<long double> == cbor::CompactShape::Unsupported);
-    STATIC_REQUIRE(kAnnotationInputBatchCapacity == 32U);
-    STATIC_REQUIRE(cbor::compact_maximum_cbor_bytes<AnnotationInputBatch>() <= kMaxIntentValueBytes);
+    STATIC_REQUIRE(kWorkspaceMouseCapacity == 32U);
+    STATIC_REQUIRE(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>() <= kMaxIntentValueBytes);
     const auto structural = []<class T>() {
         application_schema_detail::FingerprintSink sink;
         application_schema_detail::append_type<T>(sink);
@@ -1383,7 +1383,7 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("application_bindings") == std::string::npos);
 }
 
-TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the existing wire budgets", "[browser][annotation][capacity]") {
+TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the existing wire budgets", "[browser][annotation][capacity]") {
     using namespace mmltk::controller;
     namespace c = contracts;
     AnnotationSnapshot snapshot;
@@ -1419,32 +1419,6 @@ TEST_CASE("Maximum Annotation logical and distinct displayed facts retain the ex
             knot.in.point.x += 0.23456F;
     }
     displayed.objects.front().shape = c::AnnotationShape::Mask;
-    snapshot.rendered_scene.document_epoch = 2U;
-    snapshot.rendered_scene.scene_revision = 3U;
-    c::project_annotation_geometry(snapshot.rendered_scene.geometry, displayed);
-    snapshot.rendered_scene.identities.resize(c::kAnnotationObjectCapacity, std::numeric_limits<std::uint64_t>::max());
-    snapshot.rendered.document_epoch = 2U;
-    snapshot.rendered.scene_revision = 3U;
-    snapshot.rendered.editor = ui.editor;
-    snapshot.rendered.selected.emplace();
-    snapshot.rendered.selected_identity = c::AnnotationObjectIdentity{
-        .object = std::numeric_limits<std::uint64_t>::max(),
-        .elements = std::vector<std::uint64_t>(c::kAnnotationGeometryCapacity, std::numeric_limits<std::uint64_t>::max())};
-    c::project_annotation_geometry(*snapshot.rendered.selected, displayed.objects.front());
-    snapshot.rendered.preview.emplace();
-    c::project_annotation_geometry(*snapshot.rendered.preview, displayed.objects.front());
-    snapshot.rendered.preview_object = 0U;
-    REQUIRE(snapshot.rendered_scene.geometry.objects.front().mask.has_value());
-    CHECK(snapshot.rendered_scene.geometry.objects.front().mask->runs == displayed.objects.front().mask.runs);
-    CHECK(snapshot.rendered.selected->spline_knots == displayed.objects.front().spline_knots);
-    CHECK(snapshot.rendered_scene.geometry.objects.back().skeleton_nodes.back().point ==
-          displayed.objects.back().skeleton_nodes.back().point);
-    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().box.has_value());
-    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().point.has_value());
-    CHECK_FALSE(snapshot.rendered_scene.geometry.objects.back().mask.has_value());
-    CHECK(snapshot.rendered_scene.geometry.objects.back().spline_knots.empty());
-    CHECK_FALSE(ui.scene.objects.back().spline_knots.empty());
-
     auto value = browser::application_materializer_detail::reflected_value(snapshot);
     REQUIRE(value.has_value());
     browser::wire::CountingEncoder measure{

@@ -51,29 +51,21 @@ pub fn view(
     selected: crate::generated::WorkspaceAspectRatio,
     settings_edit_available: bool,
     center_width: f32,
+    input: crate::workspace_input::Binding,
 ) -> Element<'static, Message> {
     let (surface_width, surface_height) = surface_extent(center_width, selected);
-    let content: Element<'static, Message> = surface.map_or_else(
-        || {
-            container(text("Waiting for a completed native frame"))
-                .center(Fill)
-                .width(Fill)
-                .height(Fill)
-                .into()
-        },
-        |surface| {
-            shader(crate::presentation_surface::Program {
-                local: None,
-                surface,
-                publish: Some(Message::Gesture),
-                placement: crate::presentation_surface::Placement::Contain,
-                control_id: STABLE_ID,
-            })
-            .width(Fill)
-            .height(Fill)
-            .into()
-        },
-    );
+    let content: Element<'static, Message> = shader(crate::presentation_surface::Program {
+        input: Some(input),
+        local: None,
+        surface: surface.unwrap_or_else(Surface::empty),
+        publish: Some(Message::Gesture),
+        placement: crate::presentation_surface::Placement::Contain,
+        control_id: STABLE_ID,
+    }).width(Fill).height(Fill).into();
+    let content = if surface.is_none() {
+        iced::widget::stack![content, container(text("Waiting for a completed native frame"))
+            .center(Fill).width(Fill).height(Fill)].into()
+    } else { content };
     iced::widget::column![
         container(crate::view::aspect_ratio::selector(
             selected,

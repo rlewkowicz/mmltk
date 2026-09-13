@@ -1,3 +1,4 @@
+#include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -12,6 +13,7 @@
 
 namespace mmltk::controller {
 class LiveSystem::Impl final {
+    WorkspaceInput input_;
    public:
     Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events,
          VisualDiagnosticSink diagnostics)
@@ -236,3 +238,15 @@ mmltk::frameworks::gpu::ImageWorkspaceObservation LiveSystem::ObserveWorkspace()
 void LiveSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 
 }  // namespace mmltk::controller
+
+namespace mmltk::controller {
+void LiveSystem::Input(WorkspaceMouse mouse) {
+    std::scoped_lock lock(impl_->mutex_);
+    if (impl_->worker_.stopped()) throw contracts::UnavailableError("Live input is unavailable");
+    impl_->input_.Accept(std::move(mouse), PresentationSourceKind::Live);
+}
+void LiveSystem::SetInputPeer(std::uint64_t epoch) {
+    std::scoped_lock lock(impl_->mutex_);
+    impl_->input_.SetPeer(epoch);
+}
+}

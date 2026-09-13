@@ -1,3 +1,4 @@
+#include "src/controller/presentation/workspace_input.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/system/compute_systems.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -442,6 +443,7 @@ void publish_prediction_product(mmltk::frameworks::gpu::SystemImageRuntime& runt
 class PredictSystem::Impl final {
     friend class PredictSystem;
 
+    WorkspaceInput input_;
    public:
     Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual,
          PredictRuntimeFactory factory, SystemEventSink<event_type> events)
@@ -647,3 +649,15 @@ mmltk::frameworks::gpu::ImageWorkspaceObservation PredictSystem::ObserveWorkspac
 void PredictSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 
 }  // namespace mmltk::controller
+
+namespace mmltk::controller {
+void PredictSystem::Input(WorkspaceMouse mouse) {
+    std::scoped_lock lock(impl_->mutex_);
+    if (impl_->worker_.stopped()) throw contracts::UnavailableError("Predict input is unavailable");
+    impl_->input_.Accept(std::move(mouse), PresentationSourceKind::Predict);
+}
+void PredictSystem::SetInputPeer(std::uint64_t epoch) {
+    std::scoped_lock lock(impl_->mutex_);
+    impl_->input_.SetPeer(epoch);
+}
+}

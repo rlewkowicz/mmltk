@@ -347,8 +347,7 @@ impl ApplicationModel {
                 .annotation
                 .snapshot
                 .as_ref()
-                .is_some_and(|snapshot| !snapshot.busy && !snapshot.cancellationrequested)
-            && !self.has_annotation_pending()
+                .is_some()
     }
 
     pub fn annotation_open_available(&self) -> bool {
@@ -382,22 +381,16 @@ impl ApplicationModel {
             })
             && self.annotation.snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.ready
-                    && !snapshot.busy
-                    && !snapshot.cancellationrequested
                     && snapshot.ui.documentrevision != 0
             })
-            && !self.has_annotation_pending()
     }
 
     pub fn annotation_edit_available(&self) -> bool {
         self.connection == ConnectionState::Connected
             && self.annotation.snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.ready
-                    && !snapshot.busy
-                    && !snapshot.cancellationrequested
                     && snapshot.ui.documentrevision != 0
             })
-            && !self.has_annotation_pending()
     }
 
     pub fn annotation_stop_available(&self) -> bool {
@@ -407,7 +400,6 @@ impl ApplicationModel {
                 .snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.busy && !snapshot.cancellationrequested)
-            && !self.has_annotation_pending()
     }
 
     pub fn model_request_pending(&self) -> bool {

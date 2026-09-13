@@ -73,23 +73,6 @@ int main(const int argument_count, char* const* const arguments) {
             object.mask = {.runs = {{1U, 2U, 3U}}, .cleanup_radius = 17U, .present = true};
             scene.objects = {object};
             snapshot.ui.editor.selected_object = 0U;
-            auto displayed = scene;
-            displayed.objects.front().shape = contracts::AnnotationShape::Skeleton;
-            displayed.objects.front().skeleton_nodes.back().point.x += 0.12345F;
-            snapshot.rendered_scene.document_epoch = 2U;
-            snapshot.rendered_scene.scene_revision = 3U;
-            contracts::project_annotation_geometry(snapshot.rendered_scene.geometry, displayed);
-            snapshot.rendered_scene.identities = {47U};
-            snapshot.rendered.document_epoch = 2U;
-            snapshot.rendered.scene_revision = 3U;
-            snapshot.rendered.editor = snapshot.ui.editor;
-            snapshot.rendered.selected_identity = contracts::AnnotationObjectIdentity{
-                .object = 47U, .elements = std::vector<std::uint64_t>(contracts::kAnnotationGeometryCapacity, 59U)};
-            snapshot.rendered.selected.emplace();
-            contracts::project_annotation_geometry(*snapshot.rendered.selected, displayed.objects.front());
-            snapshot.rendered.preview.emplace();
-            contracts::project_annotation_geometry(*snapshot.rendered.preview, object);
-            snapshot.rendered.preview_object = 0U;
             auto reference = mmltk::frameworks::serialization::reflected_value(snapshot);
             if (!reference) {
                 snapshots_valid = false;
@@ -151,11 +134,12 @@ int main(const int argument_count, char* const* const arguments) {
             .delivery = contracts::reflection::EventDelivery::Critical,
             .value = std::move(*event),
         },
-        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U}},
+        InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
+                            .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture input unavailable"}},
         InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
-        InputProgress{.progress = {.epoch = 1U, .consumed_sequence = 2U, .rejection = std::string(kVisualFailureByteCapacity, 'r')},
-                      .error = ApplicationErrorRecord{.category = contracts::ApplicationErrorCategory::Busy, .detail = "fixture busy"}},
+        InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
+                            .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
     // An independent named persistence projection is test data, carried as a

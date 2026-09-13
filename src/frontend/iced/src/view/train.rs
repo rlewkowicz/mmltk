@@ -202,6 +202,7 @@ impl Component {
             crate::generated::FeatureId::Train,
             width,
             Message::Workspace,
+            crate::workspace_input::Binding::default(),
         );
         let advanced = crate::view::shared::identified(
             "train.card.advanced",

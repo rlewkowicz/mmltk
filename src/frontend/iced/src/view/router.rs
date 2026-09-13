@@ -47,7 +47,7 @@ impl Default for Router {
             train: train::Component::default(),
             validate: validate::Component::default(),
             predict: predict::Component::default(),
-            live: live::Component,
+            live: live::Component::default(),
             export: export::Component::default(),
             explore: explore::Component::default(),
             annotation: annotation::Component::default(),
@@ -56,12 +56,6 @@ impl Default for Router {
 }
 
 impl Router {
-    #[cfg(test)]
-    pub(crate) fn test_install_annotation_displayed(&self, model: &ApplicationModel) {
-        self.annotation
-            .test_install_displayed(model.annotation.snapshot.as_ref().unwrap());
-    }
-
     pub const fn active(&self) -> FeatureId {
         self.active
     }
@@ -80,11 +74,14 @@ impl Router {
         self.annotation.rebase(model);
     }
 
-    pub fn set_annotation_connection(
+    pub fn set_workspace_connection(
         &self,
         connection: Option<crate::transport_connection::Connection>,
     ) {
-        self.annotation.set_connection(connection);
+        self.annotation.set_connection(connection.clone());
+        self.explore.input.set_connection(connection.clone());
+        self.predict.input.set_connection(connection.clone());
+        self.live.input.set_connection(connection);
     }
 
     pub fn rebase_annotation(&mut self, model: &ApplicationModel) {

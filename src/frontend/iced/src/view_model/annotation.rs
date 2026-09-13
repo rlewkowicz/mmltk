@@ -4,24 +4,9 @@ use super::UiError;
 pub struct AnnotationModel {
     pub snapshot: Option<crate::generated::AnnotationSnapshot>,
     pending_frame: Option<crate::generated::AnnotationFrameState>,
-    rendered_scene: Option<std::sync::Arc<crate::generated::AnnotationRenderedScene>>,
 }
 
 impl AnnotationModel {
-    fn scene_matches(
-        snapshot: &crate::generated::AnnotationSnapshot,
-        rendered: &crate::generated::AnnotationRenderedFacts,
-    ) -> bool {
-        snapshot.renderedscene.documentepoch == rendered.documentepoch
-            && snapshot.renderedscene.scenerevision == rendered.scenerevision
-    }
-
-    pub(crate) fn rendered_scene(
-        &self,
-    ) -> Option<std::sync::Arc<crate::generated::AnnotationRenderedScene>> {
-        self.rendered_scene.clone()
-    }
-
     pub(super) fn install_snapshot(
         &mut self,
         mut incoming: crate::generated::AnnotationSnapshot,
@@ -42,20 +27,16 @@ impl AnnotationModel {
         if let Some(frame) = self.pending_frame.as_ref() {
             if frame.revision == incoming.revision
                 && (frame.uirevision != incoming.uirevision
-                    || frame.frame != incoming.frame
-                    || frame.rendered != incoming.rendered)
+                    || frame.frame != incoming.frame)
             {
                 return Err(UiError::protocol(
                     "inconsistent Annotation frame and full-state revision",
                 ));
             }
             if frame.revision > incoming.revision {
-                if frame.uirevision == incoming.uirevision
-                    && Self::scene_matches(&incoming, &frame.rendered)
-                {
+                if frame.uirevision == incoming.uirevision {
                     incoming.frame = frame.frame.clone();
                     incoming.revision = frame.revision;
-                    incoming.rendered = frame.rendered.clone();
                 } else {
                     keep_pending = frame.uirevision >= incoming.uirevision;
                 }
@@ -74,13 +55,6 @@ impl AnnotationModel {
             }
             Some(installed) if incoming == *installed => Observation::Current,
             _ => {
-                if self
-                    .rendered_scene
-                    .as_ref()
-                    .is_none_or(|scene| **scene != incoming.renderedscene)
-                {
-                    self.rendered_scene = Some(std::sync::Arc::new(incoming.renderedscene.clone()));
-                }
                 self.snapshot = Some(incoming);
                 Observation::Installed
             }
@@ -109,7 +83,6 @@ impl AnnotationModel {
             if incoming.revision == installed.revision {
                 return if incoming.uirevision == installed.uirevision
                     && incoming.frame == installed.frame
-                    && incoming.rendered == installed.rendered
                 {
                     Ok(Observation::Current)
                 } else {
@@ -120,9 +93,7 @@ impl AnnotationModel {
             {
                 return Ok(Observation::Stale);
             }
-            if incoming.uirevision == installed.uirevision
-                && Self::scene_matches(installed, &incoming.rendered)
-            {
+            if incoming.uirevision == installed.uirevision {
                 if self
                     .pending_frame
                     .as_ref()
@@ -132,7 +103,6 @@ impl AnnotationModel {
                 }
                 installed.revision = incoming.revision;
                 installed.frame = incoming.frame;
-                installed.rendered = incoming.rendered;
                 return Ok(Observation::Installed);
             }
         }
@@ -208,191 +178,16 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn full_state() -> crate::generated::AnnotationSnapshot {
-        let mut full = super::super::test_support::bootstrapped()
-            .annotation
-            .snapshot
-            .unwrap();
-        full.revision = 5;
-        full.uirevision = 3;
-        full.inputdocumentepoch = 2;
-        full.ui.documentrevision = 9;
-        full.ui.scenerevision = 10;
-        full.frame = super::super::test_support::visual_frame(
-            crate::generated::PresentationSourceKind::Annotation,
-            12,
-        );
-        full.rendered = crate::generated::AnnotationRenderedFacts {
-            generation: 7,
-            documentepoch: 1,
-            scenerevision: 6,
-            editor: full.ui.editor.clone(),
-            selected: full
-                .ui
-                .editor
-                .selectedobject
-                .and_then(|index| full.ui.scene.objects.get(index as usize))
-                .map(From::from),
-            selectedidentity: None,
-            preview: None,
-            previewobject: None,
-            previewidentity: 0,
-        };
-        full.renderedscene.documentepoch = 1;
-        full.renderedscene.scenerevision = 6;
-        full.renderedscene.geometry = (&full.ui.scene).into();
-        full
-    }
-
-    fn compact(
-        full: &crate::generated::AnnotationSnapshot,
-    ) -> crate::generated::AnnotationFrameState {
-        crate::generated::AnnotationFrameState {
-            revision: full.revision,
-            uirevision: full.uirevision,
-            frame: full.frame.clone(),
-            rendered: full.rendered.clone(),
-        }
-    }
-
     #[test]
-    fn reopen_and_dropped_scene_events_preserve_both_logical_and_retained_drawable_geometry() {
-        let mut first = full_state();
-        first.renderedscene.geometry.framewidth = 640;
-        first.renderedscene.geometry.frameheight = 480;
-        let mut model = AnnotationModel::default();
-        model.install_snapshot(first.clone()).unwrap();
-        let retained = model.rendered_scene().unwrap();
-
-        let mut reopened = first;
-        reopened.revision = 6;
-        reopened.uirevision = 6;
-        reopened.inputdocumentepoch = 3;
-        reopened.ui.scenerevision = 11;
-        reopened.ui.scene.framewidth = 320;
-        reopened.ui.scene.frameheight = 240;
-        model.install_snapshot(reopened.clone()).unwrap();
-        assert!(std::sync::Arc::ptr_eq(
-            &retained,
-            &model.rendered_scene().unwrap()
-        ));
-        assert_eq!(model.snapshot.as_ref().unwrap().ui.scene.framewidth, 320);
-        assert_eq!(retained.geometry.framewidth, 640);
-
-        // Intermediate full scenes may be coalesced. The newest full snapshot
-        // owns its actual body data and resolves a newer compact preview.
-        reopened.revision = 8;
-        reopened.uirevision = 8;
-        reopened.renderedscene.documentepoch = 3;
-        reopened.renderedscene.scenerevision = 11;
-        reopened.renderedscene.geometry = (&reopened.ui.scene).into();
-        reopened.rendered.documentepoch = 3;
-        reopened.rendered.scenerevision = 11;
-        let mut preview = compact(&reopened);
-        preview.revision = 9;
-        preview.rendered.generation += 1;
-        model.install_frame(preview.clone()).unwrap();
-        model.install_snapshot(reopened).unwrap();
-        assert_eq!(model.snapshot.as_ref().unwrap().rendered, preview.rendered);
-        assert_eq!(model.snapshot.as_ref().unwrap().revision, 9);
-        let current = model.rendered_scene().unwrap();
-        assert_eq!(current.documentepoch, 3);
-        assert_eq!(
-            (current.geometry.framewidth, current.geometry.frameheight),
-            (320, 240)
-        );
-        assert!(!std::sync::Arc::ptr_eq(&retained, &current));
-        assert_eq!(
-            (retained.geometry.framewidth, retained.geometry.frameheight),
-            (640, 480)
-        );
-    }
-
-    #[test]
-    fn equal_revision_requires_every_rendered_identity_field_in_both_arrival_orders() {
-        for compact_first in [false, true] {
-            for field in 0..3 {
-                let full = full_state();
-                let mut frame = compact(&full);
-                match field {
-                    0 => frame.rendered.generation += 1,
-                    1 => frame.rendered.documentepoch += 1,
-                    _ => frame.rendered.scenerevision += 1,
-                }
-                let mut model = AnnotationModel::default();
-                if compact_first {
-                    model.install_frame(frame).unwrap();
-                    assert!(model.install_snapshot(full).is_err());
-                    assert!(model.snapshot.is_none());
-                } else {
-                    model.install_snapshot(full.clone()).unwrap();
-                    assert!(model.install_frame(frame).is_err());
-                    assert_eq!(model.snapshot.as_ref(), Some(&full));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn complete_render_facts_merge_in_both_orders_without_rolling_back_logical_ui() {
-        for compact_first in [false, true] {
-            let full = full_state();
-            let mut preview = compact(&full);
-            preview.revision += 2;
-            preview.frame.revision += 1;
-            preview.rendered.generation += 1;
-            let mut model = AnnotationModel::default();
-            if compact_first {
-                model.install_frame(preview.clone()).unwrap();
-                let mut earlier = full.clone();
-                earlier.revision = 2;
-                earlier.uirevision = 2;
-                model.install_snapshot(earlier).unwrap();
-            }
-            model.install_snapshot(full.clone()).unwrap();
-            if !compact_first {
-                model.install_frame(preview.clone()).unwrap();
-            }
-            let installed = model.snapshot.as_ref().unwrap().clone();
-            assert_eq!(installed.frame, preview.frame);
-            assert_eq!(installed.rendered, preview.rendered);
-            assert_eq!(installed.ui, full.ui);
-            assert_ne!(
-                installed.rendered.documentepoch,
-                installed.inputdocumentepoch
-            );
-            assert!(model.install_frame(preview.clone()).is_ok());
-            assert!(model.install_snapshot(full.clone()).is_ok());
-            assert_eq!(model.snapshot.as_ref(), Some(&installed));
-
-            let mut future = compact(&installed);
-            future.revision += 2;
-            future.uirevision = future.revision;
-            future.rendered.generation += 1;
-            model.install_frame(future).unwrap();
-            let mut overtaking = installed.clone();
-            overtaking.revision += 3;
-            overtaking.uirevision = overtaking.revision;
-            overtaking.ui.documentrevision += 1;
-            model.install_snapshot(overtaking.clone()).unwrap();
-            assert_eq!(model.snapshot.as_ref(), Some(&overtaking));
-            assert!(model.pending_frame.is_none());
-        }
-    }
-
-    #[test]
-    fn matching_full_and_compact_revision_is_current_in_both_arrival_orders() {
-        for compact_first in [false, true] {
-            let full = full_state();
-            let frame = compact(&full);
-            let mut model = AnnotationModel::default();
-            if compact_first {
-                model.install_frame(frame.clone()).unwrap();
-            }
-            model.install_snapshot(full.clone()).unwrap();
-            assert!(model.install_frame(frame).is_ok());
-            assert_eq!(model.snapshot.as_ref(), Some(&full));
-        }
+    fn logical_ui_and_frame_observations_keep_revision_order() {
+        let mut model = super::super::test_support::bootstrapped().annotation;
+        let mut snapshot = model.snapshot.clone().unwrap();
+        snapshot.revision = 4;
+        snapshot.uirevision = 3;
+        model.install_snapshot(snapshot.clone()).unwrap();
+        let newer = crate::generated::AnnotationFrameState { revision: 5, uirevision: 3, frame: snapshot.frame.clone() };
+        model.install_frame(newer).unwrap();
+        assert_eq!(model.snapshot.as_ref().unwrap().revision, 5);
+        assert_eq!(model.install_snapshot(snapshot).unwrap(), Observation::Stale);
     }
 }

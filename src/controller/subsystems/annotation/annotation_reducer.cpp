@@ -1266,7 +1266,88 @@ class AnnotationDocument::Impl final {
         return {.outcome = DocumentOutcome::Applied, .detail = {}};
     }
     [[nodiscard]] const domain::AnnotationUiState& ui() const noexcept { return state_.ui; }
+    [[nodiscard]] domain::AnnotationPointerTarget HitTarget(domain::AnnotationPoint point) const noexcept {
+        using Tool = domain::AnnotationTool;
+        using Shape = domain::AnnotationShape;
+        using Role = domain::AnnotationHandleRole;
+        const auto& scene = state_.ui.scene;
+        const auto selected = state_.ui.editor.selected_object;
+        const auto tool = state_.ui.editor.tool;
+        if (tool == Tool::Box || tool == Tool::Point) return {};
+        if (tool != Tool::Select) {
+            if (!selected || *selected >= scene.objects.size()) return {};
+            const auto shape = scene.objects[*selected].shape;
+            if (((tool == Tool::MaskPaint || tool == Tool::MaskErase || tool == Tool::MaskFill || tool == Tool::ColorSample) && shape == Shape::Mask) ||
+                (tool == Tool::Spline && shape == Shape::Spline) || (tool == Tool::Skeleton && shape == Shape::Skeleton))
+                return {.object = selected};
+            return {};
+        }
+        const auto near = [point](domain::AnnotationPoint other) { return std::hypot(point.x - other.x, point.y - other.y) <= 6.0F; };
+        if (selected && *selected < scene.objects.size()) {
+            const auto& object = scene.objects[*selected];
+            const auto handle = [selected](std::size_t element, Role role) {
+                return domain::AnnotationPointerTarget{selected, static_cast<std::uint16_t>(element), role};
+            };
+            if (object.shape == Shape::Box || object.shape == Shape::Mask) {
+                const auto& box = object.box;
+                const std::array<domain::AnnotationPoint, 4U> corners{{
+                    {box.first.x - 5.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.first.y - 5.0F},
+                    {box.second.x + 4.0F, box.second.y + 4.0F}, {box.first.x - 5.0F, box.second.y + 4.0F}}};
+                for (std::size_t index = 0U; index != corners.size(); ++index)
+                    if (near(corners[index])) return handle(index, Role::BoxCorner);
+            }
+            if (object.shape == Shape::Point && near(object.point)) return handle(0U, Role::Point);
+            for (std::size_t index = 0U; index != object.spline_knots.size(); ++index) {
+                const auto& knot = object.spline_knots[index];
+                if (near(knot.point)) return handle(index, Role::SplineKnot);
+                if (knot.in.enabled && near(knot.in.point)) return handle(index, Role::SplineInHandle);
+                if (knot.out.enabled && near(knot.out.point)) return handle(index, Role::SplineOutHandle);
+            }
+            for (std::size_t index = 0U; index != object.skeleton_nodes.size(); ++index)
+                if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point)) return handle(index, Role::SkeletonNode);
+        }
+        for (std::size_t index = scene.objects.size(); index-- != 0U;) {
+            const auto& object = scene.objects[index];
+            if (!object.enabled) continue;
+            bool hit = false;
+            switch (object.shape) {
+                case Shape::Box:
+                    hit = point.x >= object.box.first.x - 3.0F && point.x <= object.box.second.x + 3.0F &&
+                          point.y >= object.box.first.y - 3.0F && point.y <= object.box.second.y + 3.0F;
+                    break;
+                case Shape::Mask:
+                    hit = std::ranges::any_of(object.mask.runs, [point](const auto& run) {
+                        return run.row == static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F)) && point.x >= run.first && point.x < run.last + 1.0F;
+                    });
+                    break;
+                case Shape::Point: hit = near(object.point); break;
+                case Shape::Spline: hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); }); break;
+                case Shape::Skeleton: hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible && near(node.point); }); break;
+            }
+            if (hit) {
+                domain::AnnotationPointerTarget target{.object = static_cast<std::uint16_t>(index)};
+                if (object.shape == Shape::Point) { target.element = 0U; target.role = Role::Point; }
+                return target;
+            }
+        }
+        return {};
+    }
     [[nodiscard]] bool ResolveTarget(mmltk::controller::AnnotationPointer& pointer) const noexcept {
+        if (pointer.phase == domain::AnnotationPointerPhase::Begin) {
+            pointer.target = HitTarget(pointer.point);
+            if (!target_valid(state_.ui.scene, state_.ui.editor, pointer.target)) return false;
+            pointer.identity = {};
+            if (pointer.target.object) {
+                const auto& identity = state_.identities[*pointer.target.object];
+                pointer.identity.object = identity.object;
+                if (pointer.target.element) {
+                    const auto role = *pointer.target.role;
+                    pointer.identity.element = role == domain::AnnotationHandleRole::BoxCorner || role == domain::AnnotationHandleRole::Point
+                        ? static_cast<std::uint64_t>(*pointer.target.element) + 1U : identity.elements[*pointer.target.element];
+                }
+            }
+            return true;
+        }
         if (!pointer.target.valid()) return false;
         if (!pointer.target.object) return pointer.identity.object == 0U && pointer.identity.element == 0U;
         if (!pointer.identity.object) return false;

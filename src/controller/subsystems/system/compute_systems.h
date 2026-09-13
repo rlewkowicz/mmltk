@@ -1,5 +1,7 @@
 #pragma once
 
+#include "src/controller/contracts/workspace_input.h"
+
 #include "src/controller/presentation/visual_source_projection.h"
 
 #include <functional>
@@ -162,6 +164,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 class PredictSystem final {
    public:
+    [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+    void SetInputPeer(std::uint64_t);
+
     using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict,
                                                  mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
                                                  mmltk::frameworks::reflection::member_path<&PredictSnapshot::revision>>;

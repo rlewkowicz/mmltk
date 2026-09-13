@@ -123,6 +123,7 @@ struct InteractionDispatchResult final {
     std::uint64_t endpoint_id = 0U;
     std::string_view endpoint_name{};
     std::uint64_t generation = 0U;
+    bool essential_input = false;
     std::optional<ApplicationErrorRecord> error{};
 };
 
@@ -136,6 +137,7 @@ template <class Composition>
                 if (found || interaction.Get<&Interaction::endpoint_id>() != Endpoint::stable_id) return;
                 found = true;
                 result.endpoint_name = Endpoint::name;
+                result.essential_input = std::same_as<typename Endpoint::request_type, WorkspaceMouse>;
                 typename Endpoint::request_type request{};
                 if (!mmltk::frameworks::serialization::decode_compact_into(
                         request, interaction.Get<&Interaction::value>(),

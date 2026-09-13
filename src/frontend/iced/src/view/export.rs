@@ -174,6 +174,7 @@ impl Component {
             crate::generated::FeatureId::Export,
             width,
             Message::Workspace,
+            crate::workspace_input::Binding::default(),
         );
         let branch_advanced: Element<'a, Message> = if build_tensorrt {
             crate::view::workflow::fields::toggle(

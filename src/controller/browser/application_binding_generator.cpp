@@ -342,16 +342,7 @@ class BindingEmitter final {
         EmitImageMetadata();
         output_ << "pub const WORKSPACE_METADATA_BYTE_CAPACITY: usize = "
                 << mmltk::controller::presentation::detail::kWorkspaceMetadataByteCapacity << ";\n";
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSkeletonGeometry,
-                               mmltk::controller::contracts::AnnotationSkeletonNode>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSplineBody, mmltk::controller::contracts::AnnotationSplineKnot>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectGeometry, mmltk::controller::contracts::AnnotationObject>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSelectedGeometry, mmltk::controller::contracts::AnnotationObject>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody, mmltk::controller::contracts::AnnotationObject>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationObjectBody,
-                               mmltk::controller::contracts::AnnotationObjectGeometry>();
-        EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSceneGeometry,
-                               mmltk::controller::contracts::AnnotationSceneContent>();
+        EmitType<mmltk::controller::contracts::AnnotationPointerTarget>();
         EmitRecordPreflight();
         EmitMetadata();
         EmitIdentitiesAndApplicationEnums();
@@ -359,18 +350,26 @@ class BindingEmitter final {
         Schema::VisitEndpoints([&]<class Endpoint>() {
             if constexpr (Endpoint::interaction) EmitCompactType<typename Endpoint::request_type>();
         });
-        symbols_.Reserve("module", "ANNOTATION_INPUT_BATCH_CAPACITY", "native annotation batch capacity");
-        symbols_.Reserve("module", "ANNOTATION_INPUT_ADMISSION_SLOTS", "native annotation admission slots");
-        output_ << "pub const ANNOTATION_INPUT_BATCH_CAPACITY: usize = " << mmltk::controller::kAnnotationInputBatchCapacity
-                << ";\npub const ANNOTATION_INPUT_ADMISSION_SLOTS: usize = " << mmltk::controller::kAnnotationInputAdmissionSlots << ";\n";
-        symbols_.Reserve("module", "ANNOTATION_INPUT_ENCODED_CAPACITY", "native annotation input wire bound");
-        constexpr auto input_wire_bound = cbor::compact_maximum_cbor_bytes<mmltk::controller::AnnotationInputBatch>();
-        constexpr auto encoded_capacity =
-            cbor::BorrowedByteRecord<CompactInteraction, &CompactInteraction::value>::EncodedCapacity(input_wire_bound);
-        static_assert(input_wire_bound <= kMaxIntentValueBytes);
-        output_ << "pub const ANNOTATION_INPUT_ENCODED_CAPACITY: usize = " << encoded_capacity << ";\n";
         EmitInteractionEnvelope();
         EmitEndpoints();
+        for (const bool retained : {false, true}) {
+            output_ << "pub fn encode_workspace_mouse" << (retained ? "_into(mouse: &WorkspaceMouse, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), " : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::Interaction, ")
+                    << "crate::protocol::ProtocolError> { match mouse.source {\n";
+            Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+                std::size_t count = 0U;
+                Schema::VisitEndpoints([&]<class Endpoint>() {
+                    if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> &&
+                                  std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
+                        ++count;
+                        output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true)
+                                << " => encode_" << rust_identifier(Cell::name, false) << "_" << rust_identifier(Endpoint::name, false)
+                                << (retained ? "_into(mouse, scratch, output),\n" : "(mouse),\n");
+                    }
+                });
+                if (count != 1U) throw std::logic_error("Each workspace source must declare exactly one canonical mouse endpoint");
+            });
+            output_ << "_ => Err(crate::protocol::ProtocolError(\"Workspace source is unavailable\".into())), } }\n";
+        }
         EmitRequestDefaults();
         EmitDefaults();
         EmitSettingsHelpers();
@@ -379,35 +378,6 @@ class BindingEmitter final {
     }
 
    private:
-    template <class Destination, class Source>
-    void EmitAnnotationGeometry() {
-        output_ << "impl From<&" << rust_type<Source>() << "> for " << rust_type<Destination>() << " { fn from(source: &"
-                << rust_type<Source>() << ") -> Self { Self {\n";
-        template for (constexpr auto target : std::define_static_array(
-                          std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::unchecked()))) {
-            constexpr auto source = mmltk::controller::contracts::annotation_geometry_member<Source, target>();
-            constexpr auto shape = mmltk::controller::contracts::annotation_geometry_shape<target>();
-            using Member = typename[:std::meta::type_of(target):];
-            using SourceMember = typename[:std::meta::type_of(source):];
-            constexpr bool optional = requires(Member value) { value.has_value(); };
-            const auto name = rust_identifier(std::meta::identifier_of(target), false);
-            output_ << name << ": ";
-            if constexpr (shape.has_value())
-                output_ << "if source.shape == AnnotationShape::" << rust_identifier(mmltk::frameworks::reflection::enum_name(*shape), true)
-                        << " { ";
-            if constexpr (optional) output_ << "Some(";
-            output_ << "source." << name;
-            if constexpr (std::is_assignable_v<Member&, const SourceMember&>)
-                output_ << ".clone()";
-            else
-                output_ << ".iter().map(From::from).collect()";
-            if constexpr (optional) output_ << ")";
-            if constexpr (shape.has_value()) output_ << " } else { Default::default() }";
-            output_ << ",\n";
-        }
-        output_ << "} } }\n";
-    }
-
     template <class Value>
     void EmitType() {
         using Type = std::remove_cvref_t<Value>;
@@ -1159,8 +1129,17 @@ class BindingEmitter final {
     std::set<std::string> compact_types_;
 
     void EmitImageMetadata() {
-        Schema::VisitVisualSources([&]<class, std::meta::info, class Projection>() {
+        Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
             EmitType<typename Projection::image_type>();
+            bool projectable = true;
+            VisitRustFields<typename Projection::image_type>([&]<class Target, class>(const auto&, const std::string& target) {
+                bool found = false;
+                VisitRustFields<typename Projection::snapshot_type>([&]<class Source, class>(const auto&, const std::string& source) {
+                    if constexpr (std::same_as<Target, Source>) found = found || source == target;
+                });
+                projectable = projectable && found;
+            });
+            if (projectable) {
             output_ << "impl From<&" << rust_type<typename Projection::snapshot_type>() << "> for "
                     << rust_type<typename Projection::image_type>() << " { fn from(source: &"
                     << rust_type<typename Projection::snapshot_type>() << ") -> Self { Self {\n";
@@ -1168,6 +1147,7 @@ class BindingEmitter final {
                 output_ << member << ": source." << member << ".clone(),\n";
             });
             output_ << "} } }\n";
+            }
         });
         symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
         symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");

@@ -1238,79 +1238,18 @@ mod tests {
             .unwrap();
         assert_eq!(wire, vec![expected(IntegrationControlKind::Progress, 5, 0)]);
         wire.clear();
-        let sample_count = crate::generated::ANNOTATION_INPUT_BATCH_CAPACITY
-            * crate::generated::ANNOTATION_INPUT_ADMISSION_SLOTS
-            + 1;
+        let sample_count = 129;
         for index in 0..sample_count {
-            connection
-                .send_annotation_pointer(
-                    crate::generated::AnnotationPointer {
-                        phase: if index == 0 {
-                            crate::generated::AnnotationPointerPhase::Begin
-                        } else if index + 1 == sample_count {
-                            crate::generated::AnnotationPointerPhase::End
-                        } else {
-                            crate::generated::AnnotationPointerPhase::Update
-                        },
-                        interactionid: 1,
-                        sequence: index as u64 + 1,
-                        identity: crate::generated::AnnotationTargetIdentity {
-                            object: 0,
-                            element: 0,
-                        },
-                        target: crate::generated::AnnotationPointerTarget {
-                            object: None,
-                            element: None,
-                            role: None,
-                        },
-                        point: crate::generated::AnnotationPoint {
-                            x: index as f32,
-                            y: 1.0,
-                        },
-                        brushradius: crate::generated::default_uiannotationbrushradius().unwrap()
-                            as u16,
-                    },
-                    1,
-                )
-                .unwrap();
+            let mut mouse = crate::workspace_input::record(crate::generated::WorkspaceMouseKind::Motion,
+                Some(crate::generated::WorkspacePoint { x: index as f32, y: 1.0 }));
+            mouse.source = crate::generated::PresentationSourceKind::Annotation;
+            mouse.documentepoch = 1;
+            connection.send_workspace_mouse(mouse).unwrap();
         }
-        connection
-            .flush(|bytes| {
-                wire.push(bytes.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            wire.len(),
-            crate::generated::ANNOTATION_INPUT_ADMISSION_SLOTS + 1
-        );
-        assert_eq!(
-            wire.last().unwrap(),
-            &expected(IntegrationControlKind::PressureEntered, 0, 0)
-        );
+        connection.flush(|bytes| { wire.push(bytes.to_vec()); Ok(()) }).unwrap();
+        assert_eq!(wire.len(), sample_count + 1);
+        assert_eq!(wire.last().unwrap(), &expected(IntegrationControlKind::PressureEntered, 0, 0));
         driver.phase = Phase::Complete;
-        driver.publish_control(&mut connection);
-        assert_eq!(driver.control_phase, Some(Phase::AwaitBootstrap));
-        assert!(!connection.integration_pressure_settled());
-        for consumed in [
-            crate::generated::ANNOTATION_INPUT_ADMISSION_SLOTS,
-            crate::generated::ANNOTATION_INPUT_ADMISSION_SLOTS + 1,
-        ] {
-            connection
-                .observe(&crate::protocol::ServerRecord::InputProgress(
-                    crate::generated::InputProgress {
-                        protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
-                        progress: crate::generated::AnnotationInputProgress {
-                            epoch: 1,
-                            consumedsequence: consumed as u64,
-                            rejection: None,
-                        },
-                        error: None,
-                    },
-                ))
-                .unwrap();
-            connection.flush(|_| Ok(())).unwrap();
-        }
         assert!(connection.integration_pressure_settled());
         wire.clear();
         driver.publish_control(&mut connection);

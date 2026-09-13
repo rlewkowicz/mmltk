@@ -313,118 +313,6 @@ struct AnnotationSceneContent final {
     auto operator<=>(const AnnotationSceneContent&) const = default;
 };
 
-// Displayed geometry is a projection of the canonical object. It retains exact
-// mask membership and every selectable handle; editing and persistence-only
-// values remain in AnnotationObject.
-struct AnnotationSkeletonGeometry final {
-    decltype(AnnotationSkeletonNode::point) point{};
-    decltype(AnnotationSkeletonNode::visible) visible = true;
-    auto operator<=>(const AnnotationSkeletonGeometry&) const = default;
-};
-
-struct AnnotationSplineBody final {
-    decltype(AnnotationSplineKnot::point) point{};
-    auto operator<=>(const AnnotationSplineBody&) const = default;
-};
-
-struct AnnotationObjectGeometry final {
-    decltype(AnnotationObject::shape) shape{};
-    // CLEANUP-IGNORE: Full preview geometry and selected-handle geometry are distinct reflected projections of canonical object fields.
-    decltype(AnnotationObject::box) box{};
-    decltype(AnnotationObject::point) point{};
-    decltype(AnnotationObject::mask) mask{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] decltype(AnnotationObject::spline_knots) spline_knots{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
-    decltype(AnnotationObject::enabled) enabled = true;
-    auto operator<=>(const AnnotationObjectGeometry&) const = default;
-};
-
-// Only the selected object exposes spline handles. The scene retains all body
-// hits; compact rendered facts supply the exact selected and preview geometry.
-struct AnnotationGeometryShape final {
-    AnnotationShape shape;
-};
-struct AnnotationObjectBody final {
-    decltype(AnnotationObject::shape) shape{};
-    [[= AnnotationGeometryShape{AnnotationShape::Box}]] std::optional<decltype(AnnotationObject::box)> box{};
-    [[= AnnotationGeometryShape{AnnotationShape::Point}]] std::optional<decltype(AnnotationObject::point)> point{};
-    [[= AnnotationGeometryShape{AnnotationShape::Mask}]] std::optional<decltype(AnnotationObject::mask)> mask{};
-    [[= AnnotationGeometryShape{AnnotationShape::Spline}]]
-        [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSplineBody>
-            spline_knots{};
-    [[= AnnotationGeometryShape{AnnotationShape::Skeleton}]]
-        [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry>
-            skeleton_nodes{};
-    decltype(AnnotationObject::enabled) enabled = true;
-    auto operator<=>(const AnnotationObjectBody&) const = default;
-};
-
-struct AnnotationSelectedGeometry final {
-    decltype(AnnotationObject::shape) shape{};
-    decltype(AnnotationObject::box) box{};
-    decltype(AnnotationObject::point) point{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] decltype(AnnotationObject::spline_knots) spline_knots{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationGeometryCapacity}]] std::vector<AnnotationSkeletonGeometry> skeleton_nodes{};
-    auto operator<=>(const AnnotationSelectedGeometry&) const = default;
-};
-
-struct AnnotationSceneGeometry final {
-    decltype(AnnotationSceneContent::document) document{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationObjectCapacity}]] std::vector<AnnotationObjectBody> objects{};
-    decltype(AnnotationSceneContent::frame_width) frame_width = 0U;
-    decltype(AnnotationSceneContent::frame_height) frame_height = 0U;
-    auto operator<=>(const AnnotationSceneGeometry&) const = default;
-};
-
-// Project matching canonical members, including nested object sequences, without
-// a second member-wise copy inventory. The target declarations define the facts
-// this consumer requires; source types and stable names remain authoritative.
-template <class Source, std::meta::info Target>
-consteval std::meta::info annotation_geometry_member() {
-    for (const auto candidate : std::meta::nonstatic_data_members_of(^^Source, std::meta::access_context::unchecked()))
-        if (std::meta::identifier_of(candidate) == std::meta::identifier_of(Target)) return candidate;
-    throw "displayed Annotation geometry has no canonical source member";
-}
-
-template <class Destination, class Source>
-void project_annotation_geometry(Destination&, const Source&);
-
-template <std::meta::info Target>
-consteval std::optional<AnnotationShape> annotation_geometry_shape() {
-    template for (constexpr auto annotation : mmltk::frameworks::reflection::reflected_annotations<Target>()) {
-        if constexpr (std::same_as<std::remove_cvref_t<typename[:std::meta::type_of(annotation):]>, AnnotationGeometryShape>)
-            return std::meta::extract<AnnotationGeometryShape>(annotation).shape;
-    }
-    return std::nullopt;
-}
-
-template <class Destination, class Source>
-void project_annotation_geometry(Destination& destination, const Source& source) {
-    template for (constexpr auto target :
-                  std::define_static_array(std::meta::nonstatic_data_members_of(^^Destination, std::meta::access_context::unchecked()))) {
-        constexpr auto member = annotation_geometry_member<Source, target>();
-        constexpr auto shape = annotation_geometry_shape<target>();
-        auto& output = destination.[:target:];
-        const auto& input = source.[:member:];
-        const auto assign = [&] {
-            if constexpr (std::is_assignable_v<decltype(output), decltype(input)>) {
-                output = input;
-            } else {
-                output.resize(input.size());
-                for (std::size_t index = 0U; index != input.size(); ++index)
-                    project_annotation_geometry(output[index], input[index]);
-            }
-        };
-        if constexpr (shape.has_value()) {
-            if (source.shape == *shape)
-                assign();
-            else
-                output = {};
-        } else
-            assign();
-    }
-}
-
 // The sole public and persisted Annotation state. ApplicationUiState, the
 // reflected schema, UI projection, and persistence all use
 // this exact type. Private editor work remains inside AnnotationSystem.
@@ -481,17 +369,11 @@ MMLTK_REFLECT_FIELDS(AnnotationEdge)
 MMLTK_REFLECT_FIELDS(AnnotationMaskRun)
 MMLTK_REFLECT_FIELDS(AnnotationMask)
 MMLTK_REFLECT_FIELDS(AnnotationObject)
-MMLTK_REFLECT_FIELDS(AnnotationSkeletonGeometry)
-MMLTK_REFLECT_FIELDS(AnnotationSplineBody)
-MMLTK_REFLECT_FIELDS(AnnotationObjectBody)
-MMLTK_REFLECT_FIELDS(AnnotationSelectedGeometry)
 MMLTK_REFLECT_FIELDS(AnnotationPointerTarget)
 MMLTK_REFLECT_FIELDS(AnnotationTargetIdentity)
 MMLTK_REFLECT_FIELDS(AnnotationObjectIdentity)
 MMLTK_REFLECT_FIELDS(AnnotationEditorFacts)
 MMLTK_REFLECT_FIELDS(AnnotationSceneContent)
-MMLTK_REFLECT_FIELDS(AnnotationObjectGeometry)
-MMLTK_REFLECT_FIELDS(AnnotationSceneGeometry)
 MMLTK_REFLECT_FIELDS(AnnotationToolCapability)
 MMLTK_REFLECT_FIELDS(AnnotationUiState)
 // The annotation vocabulary owns its persistent representation. Keeping the

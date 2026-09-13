@@ -962,6 +962,11 @@ pub struct Surface {
 }
 
 impl Surface {
+    pub(crate) fn empty() -> Self {
+        Self { high: 0, low: 0, generation: 0, width: 0, height: 0, timeline_ready: 0,
+            frame: None, integration: false, crop: None, viewer_identity: None, fit_revision: 0 }
+    }
+
     pub(crate) fn content_region(self) -> [u32; 4] {
         let (width, height) = self.frame.map_or((self.width, self.height), |frame| {
             (frame.content_width, frame.content_height)
@@ -1023,6 +1028,7 @@ impl Placement {
 
 #[derive(Clone)]
 pub(crate) struct Program<Message> {
+    pub input: Option<crate::workspace_input::Binding>,
     pub surface: Surface,
     pub publish: Option<fn(SurfaceGesture) -> Message>,
     pub local: Option<std::sync::Arc<dyn Fn(SurfaceGesture) -> Option<Message> + Send + Sync>>,
@@ -1056,7 +1062,7 @@ pub enum SurfaceGestureKind {
 }
 
 impl<Message> shader::Program<Message> for Program<Message> {
-    type State = ViewportOwner;
+    type State = WorkspaceViewport;
     type Primitive = Primitive;
 
     fn draw(
@@ -1067,7 +1073,7 @@ impl<Message> shader::Program<Message> for Program<Message> {
     ) -> Self::Primitive {
         Primitive {
             surface: self.surface,
-            transform: state.transform_for(self.surface),
+            transform: state.viewport.transform_for(self.surface),
             placement: self.placement,
             control_id: self.control_id,
         }
@@ -1092,7 +1098,12 @@ impl<Message> shader::Program<Message> for Program<Message> {
         } else {
             self.surface
         };
-        state.update(
+        if let Some(input) = &self.input {
+            let point = state.viewport.sample(bounds, cursor, surface, self.placement, false)
+                .map(|sample| crate::generated::WorkspacePoint { x: sample.content_x, y: sample.content_y });
+            state.input.event(input, event, bounds, cursor, point);
+        }
+        state.viewport.update(
             event,
             bounds,
             cursor,
@@ -1109,7 +1120,7 @@ impl<Message> shader::Program<Message> for Program<Message> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if state.pan_origin.is_some() {
+        if state.viewport.pan_origin.is_some() {
             mouse::Interaction::Grabbing
         } else if cursor.is_over(bounds) {
             mouse::Interaction::Grab
@@ -1117,6 +1128,12 @@ impl<Message> shader::Program<Message> for Program<Message> {
             mouse::Interaction::default()
         }
     }
+}
+
+#[derive(Default)]
+pub(crate) struct WorkspaceViewport {
+    viewport: ViewportOwner,
+    input: crate::workspace_input::Capture,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1370,7 +1387,7 @@ impl ViewportOwner {
             },
             surface.content_extent(),
             placement,
-            self.transform(),
+            self.transform_for(surface),
         )?;
         let (content_x, content_y) = inverse_content_point(
             geometry,
@@ -1757,130 +1774,7 @@ struct ImagePublication {
 
 #[derive(Clone)]
 pub(crate) struct AnnotationContent {
-    pub(crate) scene: std::sync::Arc<crate::generated::AnnotationRenderedScene>,
-    pub(crate) rendered: std::sync::Arc<crate::generated::AnnotationRenderedFacts>,
-    preview_body: Option<std::sync::Arc<crate::generated::AnnotationObjectBody>>,
-}
-
-impl AnnotationContent {
-    #[cfg(test)]
-    pub(crate) fn test_displayed(snapshot: &crate::generated::AnnotationSnapshot) -> Self {
-        let scene = crate::generated::AnnotationRenderedScene {
-            documentepoch: snapshot.inputdocumentepoch,
-            scenerevision: snapshot.ui.scenerevision,
-            geometry: (&snapshot.ui.scene).into(),
-            identities: (0..snapshot.ui.scene.objects.len())
-                .map(|index| index as u64 + 1)
-                .collect(),
-        };
-        let mut rendered = snapshot.rendered.clone();
-        rendered.documentepoch = scene.documentepoch;
-        rendered.scenerevision = scene.scenerevision;
-        rendered.editor = snapshot.ui.editor.clone();
-        rendered.selected = rendered
-            .editor
-            .selectedobject
-            .and_then(|index| snapshot.ui.scene.objects.get(index as usize))
-            .map(From::from);
-        rendered.selectedidentity = rendered.editor.selectedobject.and_then(|index| {
-            let object = snapshot.ui.scene.objects.get(index as usize)?;
-            let count = match object.shape {
-                crate::generated::AnnotationShape::Spline => object.splineknots.len(),
-                crate::generated::AnnotationShape::Skeleton => object.skeletonnodes.len(),
-                _ => 0,
-            };
-            Some(crate::generated::AnnotationObjectIdentity {
-                object: u64::from(index) + 1,
-                elements: (0..count).map(|element| element as u64 + 1).collect(),
-            })
-        });
-        rendered.preview = None;
-        rendered.previewobject = None;
-        rendered.previewidentity = 0;
-        Self {
-            scene: std::sync::Arc::new(scene),
-            rendered: std::sync::Arc::new(rendered),
-            preview_body: None,
-        }
-    }
-
-    fn from_model(model: &crate::view_model::ApplicationModel, frame: FrameReady) -> Option<Self> {
-        let snapshot = model.annotation.snapshot.as_ref()?;
-        let scene = model.annotation.rendered_scene()?;
-        (frame.matches_content(&snapshot.frame)
-            && scene.documentepoch == snapshot.rendered.documentepoch
-            && scene.scenerevision == snapshot.rendered.scenerevision
-            && u32::from(scene.geometry.framewidth) == frame.content_width
-            && u32::from(scene.geometry.frameheight) == frame.content_height)
-            .then(|| Self {
-                scene,
-                preview_body: snapshot.rendered.preview.as_ref().map(|preview| {
-                    std::sync::Arc::new(crate::generated::AnnotationObjectBody::from(preview))
-                }),
-                rendered: std::sync::Arc::new(snapshot.rendered.clone()),
-            })
-    }
-
-    pub(crate) fn object(&self, index: usize) -> Option<&crate::generated::AnnotationObjectBody> {
-        if self.rendered.previewobject.map(usize::from) == Some(index) {
-            self.preview_body.as_deref()
-        } else {
-            self.scene.geometry.objects.get(index)
-        }
-    }
-
-    pub(crate) fn selected(&self) -> Option<(u16, &crate::generated::AnnotationSelectedGeometry)> {
-        let index = self.rendered.editor.selectedobject?;
-        let object = self.rendered.selected.as_ref()?;
-        Some((index, object))
-    }
-
-    pub(crate) fn target_identity(
-        &self,
-        target: &crate::generated::AnnotationPointerTarget,
-    ) -> Option<crate::generated::AnnotationTargetIdentity> {
-        let Some(index) = target.object else {
-            return Some(crate::generated::AnnotationTargetIdentity {
-                object: 0,
-                element: 0,
-            });
-        };
-        let identity = self.scene.identities.get(index as usize);
-        let object = if let Some(identity) = identity {
-            *identity
-        } else if self.rendered.previewobject == Some(index) && self.rendered.previewidentity != 0 {
-            self.rendered.previewidentity
-        } else {
-            return None;
-        };
-        let element = match (target.element, target.role) {
-            (None, None) => 0,
-            (
-                Some(element),
-                Some(
-                    crate::generated::AnnotationHandleRole::BoxCorner
-                    | crate::generated::AnnotationHandleRole::Point,
-                ),
-            ) => u64::from(element) + 1,
-            (Some(element), Some(_)) => *self
-                .rendered
-                .selectedidentity
-                .as_ref()
-                .filter(|identity| identity.object == object)?
-                .elements
-                .get(element as usize)?,
-            _ => return None,
-        };
-        Some(crate::generated::AnnotationTargetIdentity { object, element })
-    }
-
-    pub(crate) fn object_count(&self) -> usize {
-        self.scene.geometry.objects.len()
-            + usize::from(
-                self.rendered.previewobject.map(usize::from)
-                    == Some(self.scene.geometry.objects.len()),
-            )
-    }
+    pub(crate) diagnostics: Option<std::sync::Arc<crate::generated::AnnotationRenderedFacts>>,
 }
 
 #[derive(Clone)]

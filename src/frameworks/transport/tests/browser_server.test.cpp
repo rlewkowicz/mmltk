@@ -83,7 +83,7 @@ TEST_CASE("browser output epochs keep Bootstrap first on attach and reconnect", 
                                  const std::byte diagnostic, const std::byte worker) {
         epoch.finish_open(generation);
         require_markers({accepted});
-        REQUIRE(ring.push({.bytes = {progress}, .priority = BrowserRecordPriority::Progress}) == BrowserRecordPush::Enqueued);
+        REQUIRE(ring.push({.bytes = {progress}, .priority = BrowserRecordPriority::Critical}) == BrowserRecordPush::Enqueued);
         REQUIRE(publish_diagnostic(diagnostic) == BrowserRecordPush::Enqueued);
         REQUIRE(publish_worker(worker) == BrowserRecordPush::Enqueued);
         require_markers({progress, diagnostic, worker});

@@ -70,17 +70,8 @@ pub(crate) fn install(
             }
         }
         WorkspaceImageProduct::Annotation(snapshot) if snapshot.frame == metadata.frame => {
-            if snapshot.renderedscene.documentepoch != snapshot.rendered.documentepoch
-                || snapshot.renderedscene.scenerevision != snapshot.rendered.scenerevision
-                || u32::from(snapshot.renderedscene.geometry.framewidth) != frame.content_width
-                || u32::from(snapshot.renderedscene.geometry.frameheight) != frame.content_height {
-                return Err("invalid graphics annotation metadata".into());
-            }
             annotation = Some(AnnotationContent {
-                scene: Arc::new(snapshot.renderedscene),
-                preview_body: snapshot.rendered.preview.as_ref().map(|preview|
-                    Arc::new(generated::AnnotationObjectBody::from(preview))),
-                rendered: Arc::new(snapshot.rendered),
+                diagnostics: snapshot.diagnostics.map(Arc::new),
             });
         }
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {

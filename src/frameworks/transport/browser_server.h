@@ -72,7 +72,6 @@ class BrowserServer final {
     // May be called by system workers. Transient records are best effort.
     // Critical capacity failure schedules closure of the current peer.
     [[nodiscard]] BrowserRecordPush publish(BrowserOutputRecord record) noexcept;
-    [[nodiscard]] mmltk::frameworks::serialization::wire::ByteBuffer acquire_progress_storage();
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] bool connected() const noexcept;

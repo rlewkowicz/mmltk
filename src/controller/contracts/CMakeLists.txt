@@ -67,7 +67,8 @@ mmltk_register_public_headers(
         terminal_presentation.h
         view_state.h
         workflows.h
-        workspace.h)
+        workspace.h
+        workspace_input.h)
 
 mmltk_register_ordinary_sources(
     mmltk_controller_contracts

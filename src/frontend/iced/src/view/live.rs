@@ -18,9 +18,9 @@ pub enum Outcome {
 }
 
 #[derive(Default)]
-pub struct Component;
+pub struct Component { pub(crate) input: crate::workspace_input::Binding }
 
-// CLEANUP-IGNORE: Live's stateless local component owns a direct page view; Export owns model-card state.
+// CLEANUP-IGNORE: Live owns its direct page view and input binding; Export owns model-card state.
 impl Component {
     pub fn view<'a>(
         &'a self,
@@ -84,6 +84,7 @@ impl Component {
             crate::generated::FeatureId::Live,
             width,
             Message::Workspace,
+            self.input.for_source(crate::generated::PresentationSourceKind::Live, 0, 12),
         );
         let advanced = crate::view::shared::card(
             "Advanced",
@@ -154,14 +155,14 @@ mod tests {
     #[test]
     fn live_lifecycle_messages_are_distinct() {
         assert!(matches!(
-            Component.update(
+            Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
                 Message::StartRequested
             ),
             Ok(Some(Outcome::StartRequested))
         ));
         assert!(matches!(
-            Component.update(
+            Component::default().update(
                 &mut crate::view::settings::SettingsModel::default(),
                 Message::StopRequested
             ),

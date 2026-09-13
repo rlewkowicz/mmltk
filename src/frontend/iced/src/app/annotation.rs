@@ -6,9 +6,6 @@ impl App {
         outcome: crate::view::annotation::Outcome,
     ) -> Task<Message> {
         match outcome {
-            crate::view::annotation::Outcome::InputFailed(error) => {
-                self.retire_peer(UiError::transport(error.to_string()));
-            }
             crate::view::annotation::Outcome::ShortcutRequested(shortcut) => {
                 return iced::widget::operation::is_focused(
                     crate::generated::constraint_uiannotationbrushradius()
@@ -94,9 +91,6 @@ impl App {
                     ));
                 }
             }
-            crate::view::annotation::Outcome::Pointer(pointer) => {
-                self.submit_annotation_pointer(pointer);
-            }
             crate::view::annotation::Outcome::SettingsEdited(schedule) => {
                 return self.handle_settings_schedule(schedule);
             }
@@ -132,26 +126,4 @@ impl App {
         )
     }
 
-    pub(super) fn submit_annotation_pointer(
-        &mut self,
-        pointer: crate::generated::AnnotationPointer,
-    ) {
-        let Some(connection) = self.connection.as_mut() else {
-            self.retire_peer(UiError::transport(
-                "annotation pointer transport is unavailable",
-            ));
-            return;
-        };
-        let result = connection.send_annotation_pointer(
-            pointer,
-            self.model
-                .annotation
-                .snapshot
-                .as_ref()
-                .map_or(0, |snapshot| snapshot.inputdocumentepoch),
-        );
-        if let Err(error) = result {
-            self.retire_peer(UiError::transport(error.to_string()));
-        }
-    }
 }

@@ -107,6 +107,7 @@ pub enum Outcome {
 
 #[derive(Default)]
 pub struct Component {
+    pub(crate) input: crate::workspace_input::Binding,
     state: state::State,
 }
 
@@ -270,7 +271,7 @@ impl Component {
         surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
-        view(&self.state, model, settings, surface, width)
+        view(&self.state, model, settings, surface, width, self.input.clone())
     }
 }
 
@@ -323,6 +324,7 @@ pub fn view<'a>(
     settings: &'a SettingsModel,
     surface: Option<Surface>,
     width: f32,
+    input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let layout = pane_layout(width);
     let center_width = layout.center;
@@ -336,7 +338,7 @@ pub fn view<'a>(
             .id(DATASET_PANE_ID)
             .width(Length::Fixed(layout.dataset))
             .height(Fill),
-        gallery::view(state, model, settings, gallery, center_width).map(Message::Gallery),
+        gallery::view(state, model, settings, gallery, center_width, input.clone()).map(Message::Gallery),
         container(details::view(state, model, settings).map(Message::Details))
             .id(DETAILS_PANE_ID)
             .width(Length::Fixed(layout.details))
@@ -348,7 +350,7 @@ pub fn view<'a>(
 
     let detail = match paired {
         Some(crate::presentation_surface::ExploreDisplay::Detail(surface, content)) =>
-            Some(detail::view(state, model, settings, surface, content).map(Message::Detail)),
+            Some(detail::view(state, model, settings, surface, content, input.clone()).map(Message::Detail)),
         _ => None,
     };
     let mut layers: Vec<Element<'a, Message>> = Vec::with_capacity(2);
@@ -397,7 +399,7 @@ mod tests {
             let state = state::State::default();
             assert_eq!(state.detail_original(&content), expected.detail.showoriginaldimensions);
             let settings = SettingsModel::default();
-            drop(view(&state, &model, &settings, Some(surface), 1200.0));
+            drop(view(&state, &model, &settings, Some(surface), 1200.0, crate::workspace_input::Binding::default()));
             crate::presentation_surface::retire_publication(frame);
             assert_eq!(crate::presentation_surface::test_releases(), vec![frame]);
         }

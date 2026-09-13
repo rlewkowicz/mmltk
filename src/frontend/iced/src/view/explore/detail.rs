@@ -62,6 +62,7 @@ pub(super) fn view<'a>(
     settings: &'a crate::view::settings::SettingsModel,
     surface: Surface,
     content: crate::presentation_surface::DetailContent,
+    input: crate::workspace_input::Binding,
 ) -> Element<'a, Message> {
     let available = !settings.has_local_edits() && model.explore_mutation_available();
     let original = state.detail_original(&content);
@@ -69,6 +70,7 @@ pub(super) fn view<'a>(
     let overlay = content.overlay().clone();
     let image = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {
+                input: Some(input.for_source(content.frame().source.kind, 0, 12)),
             local: None,
             surface: content.configure_surface(surface, original, state.fit_revision),
             publish: None,

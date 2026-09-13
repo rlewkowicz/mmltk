@@ -1,3 +1,4 @@
+#include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
@@ -27,14 +28,9 @@ using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
 
 class AnnotationSystem::Impl final {
     friend class AnnotationSystem;
-    struct InputSlot final {
-        std::uint64_t epoch = 0U;
-        std::uint64_t sequence = 0U;
-        std::inplace_vector<AnnotationPointer, kAnnotationInputBatchCapacity> samples;
-        std::size_t next = 0U;
-        bool occupied = false;
-    };
     using Command = std::variant<AnnotationOpen, AnnotationEditRequest, AnnotationSave>;
+    struct PeerBoundary final {};
+    using InputRecord = std::variant<WorkspaceMouse, Command, PeerBoundary>;
     using Completion = std::move_only_function<void()>;
 
    public:
@@ -64,85 +60,41 @@ class AnnotationSystem::Impl final {
 
     [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen request) {
         if (!request.source.valid()) throw contracts::InvalidIntentError("Annotation source image is unavailable");
-        return Admit(Command{std::move(request)}, false);
+        return Admit(Command{std::move(request)});
     }
-    [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest request) { return Admit(Command{std::move(request)}, true); }
+    [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest request) { return Admit(Command{std::move(request)}); }
     [[nodiscard]] AnnotationSnapshot Save(AnnotationSave request) {
         if (request.destination.empty()) throw contracts::InvalidIntentError("Annotation save destination is unavailable");
-        return Admit(Command{std::move(request)}, true);
+        return Admit(Command{std::move(request)});
     }
-    void SetInputPeer(std::uint64_t epoch, SystemEventSink<AnnotationInputProgress> progress) {
+    void SetInputPeer(std::uint64_t epoch) {
         {
             std::scoped_lock lock(mutex_);
-            if (input_epoch_ && input_epoch_ != epoch && !terminal_barrier_) {
-                terminal_barrier_ = true;
-                command_before_terminal_ = command_.has_value();
-            }
-            admitted_pointer_.reset();
-            admitted_document_epoch_ = 0U;
+            if (input_epoch_ != epoch) input_.Push(PeerBoundary{});
             input_epoch_ = epoch;
-            admitted_sequence_ = consumed_sequence_ = 0U;
-            input_progress_ = std::move(progress);
-            peer_ready_pending_ = true;
         }
         input_worker_.Wake();
     }
-    void Input(AnnotationInputBatch batch) {
+    void Input(WorkspaceMouse mouse) {
         {
             std::scoped_lock lock(mutex_);
-            RequireReady();
-            if (state_.busy) throw contracts::InvalidIntentError("Annotation command barrier is unsettled");
-            if (terminal_barrier_) throw contracts::UnavailableError("Annotation input is resetting");
-            if (!input_epoch_ || batch.document_epoch != state_.input_document_epoch || !batch.sequence ||
-                batch.sequence != admitted_sequence_ + 1U || batch.samples.empty())
-                throw contracts::InvalidIntentError("Annotation input epoch or sequence is invalid");
-            auto slot = std::ranges::find(input_slots_, false, &InputSlot::occupied);
-            if (slot == input_slots_.end()) throw contracts::InvalidIntentError("Annotation input exceeded its two consumption credits");
-            auto prior = admitted_document_epoch_ == batch.document_epoch ? admitted_pointer_ : std::nullopt;
-            slot->samples.clear();
-            for (const auto& sample : batch.samples) {
-                AnnotationPointer pointer;
-                if (const auto* absolute = std::get_if<AnnotationPointer>(&sample)) {
-                    pointer = *absolute;
-                } else {
-                    const auto delta = std::get<contracts::AnnotationPoint>(sample);
-                    if (!prior || !delta.finite() || prior->sequence == std::numeric_limits<std::uint64_t>::max())
-                        throw contracts::InvalidIntentError("Annotation delta has no valid gesture predecessor");
-                    pointer = *prior;
-                    pointer.phase = contracts::AnnotationPointerPhase::Update;
-                    ++pointer.sequence;
-                    pointer.point.x += delta.x;
-                    pointer.point.y += delta.y;
-                }
-                if (!pointer.valid() || pointer.point.x < 0 || pointer.point.y < 0 || pointer.point.x > state_.ui.scene.frame_width ||
-                    pointer.point.y > state_.ui.scene.frame_height)
-                    throw contracts::InvalidIntentError("Annotation batch contains invalid pointer input");
-                slot->samples.push_back(pointer);
-                prior =
-                    pointer.phase == contracts::AnnotationPointerPhase::End || pointer.phase == contracts::AnnotationPointerPhase::Cancel
-                        ? std::nullopt
-                        : std::optional{pointer};
-            }
-            admitted_pointer_ = prior;
-            admitted_document_epoch_ = batch.document_epoch;
-            admitted_sequence_ = batch.sequence;
-            slot->epoch = input_epoch_;
-            slot->sequence = batch.sequence;
-            slot->next = 0U;
-            slot->occupied = true;
+            if (stopping_) throw contracts::UnavailableError("Annotation input worker is unavailable");
+            if (!mouse.valid() || mouse.source != PresentationSourceKind::Annotation || mouse.peer_epoch != input_epoch_)
+                throw contracts::InvalidIntentError("Annotation mouse ownership is invalid");
+            input_.Push(std::move(mouse));
         }
         input_worker_.Wake();
     }
     void PeerClosed() noexcept {
-        {
-            std::scoped_lock lock(mutex_);
-            if (!terminal_barrier_) {
-                terminal_barrier_ = true;
-                command_before_terminal_ = command_.has_value();
+        try { SetInputPeer(0U); }
+        catch (...) {
+            {
+                std::scoped_lock lock(mutex_);
+                stopping_ = true;
             }
-            input_progress_ = {};
+            input_worker_.RequestStop();
+            renderer_.RequestStop();
         }
-        input_worker_.Wake();
     }
     [[nodiscard]] AnnotationSnapshot Stop() noexcept {
         AnnotationSnapshot snapshot;
@@ -173,7 +125,7 @@ class AnnotationSystem::Impl final {
     [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
         std::scoped_lock lock(mutex_);
         if (state_.frame != frame) return std::nullopt;
-        return AnnotationSystem::visual_source::ImageOf(state_);
+        return image_;
     }
     [[nodiscard]] AnnotationSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
@@ -193,25 +145,20 @@ class AnnotationSystem::Impl final {
     }
 
    private:
-    [[nodiscard]] AnnotationSnapshot Admit(Command command, bool needs_document) {
+    [[nodiscard]] AnnotationSnapshot Admit(Command command) {
         AnnotationSnapshot admitted;
         {
             std::scoped_lock lock(mutex_);
             if (stopping_) throw contracts::UnavailableError("Annotation input worker is unavailable");
-            if (state_.busy) throw contracts::BusyError("Annotation is busy");
-            if (needs_document) RequireReady();
-            command_ = std::move(command);
+            input_.Push(std::move(command));
+            ++pending_commands_;
+            if (!state_.busy) state_.cancellation_requested = false;
             state_.busy = true;
-            state_.cancellation_requested = false;
             AdvanceUi();
             admitted = state_;
         }
         input_worker_.Wake();
         return admitted;
-    }
-    void RequireReady() const {
-        if (stopping_) throw contracts::UnavailableError("Annotation input worker is unavailable");
-        if (!state_.ready) throw contracts::UnavailableError("Annotation document is unavailable");
     }
     void AdvanceUi() {
         state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision);
@@ -227,113 +174,93 @@ class AnnotationSystem::Impl final {
     void Reduce(std::stop_token stop) {
         while (!stop.stop_requested()) {
             Completion completion;
-            std::optional<Command> command;
-            InputSlot* slot = nullptr;
-            bool close = false;
+            std::optional<InputRecord> record;
             {
                 std::scoped_lock lock(mutex_);
                 if (stopping_) return;
-                if (completion_)
-                    completion = std::move(completion_);
-                else if (gpu_continuation_)
-                    return;
+                if (completion_) completion = std::move(completion_);
+                else if (gpu_continuation_) return;
+                else record = input_.Pop();
+            }
+            if (completion) { completion(); continue; }
+            if (!record) return;
+            std::visit([this](auto value) {
+                using Value = decltype(value);
+                if constexpr (std::same_as<Value, WorkspaceMouse>) ReduceMouse(value);
+                else if constexpr (std::same_as<Value, Command>) Execute(std::move(value));
                 else {
-                    // The oldest occupied slot may belong to the peer being
-                    // retired. Finish its accepted samples before gesture cleanup.
-                    for (auto& candidate : input_slots_)
-                        if (candidate.occupied && (!slot || candidate.sequence < slot->sequence)) slot = &candidate;
-                    if (!slot && terminal_barrier_ && !command_before_terminal_)
-                        close = true;
-                    else if (!slot && command_) {
-                        command = std::move(command_);
-                        command_.reset();
-                        command_before_terminal_ = false;
-                    } else if (!slot && terminal_barrier_)
-                        close = true;
+                    const bool preview_changed = CancelGesture();
+                    bool ready;
+                    {
+                        std::scoped_lock lock(mutex_);
+                        ready = state_.ready;
+                    }
+                    if (preview_changed && ready) QueueRender();
                 }
-            }
-            if (completion) {
-                completion();
-                continue;
-            }
-            if (slot) {
-                ReduceBatch(*slot);
-                continue;
-            }
-            if (command) {
-                Execute(std::move(*command));
-                continue;
-            }
-            if (close) {
-                const bool preview = document_.PeerClosed();
-                if (preview) QueueRender();
-                {
-                    std::scoped_lock lock(mutex_);
-                    terminal_barrier_ = false;
-                }
-                continue;
-            }
-            InputReady();
+            }, std::move(*record));
+        }
+    }
+    [[nodiscard]] bool CancelGesture() noexcept {
+        pointer_.reset();
+        right_pressed_ = false;
+        return document_.PeerClosed();
+    }
+    void ReduceMouse(const WorkspaceMouse& mouse) {
+        bool stale, ready;
+        {
+            std::scoped_lock lock(mutex_);
+            stale = mouse.document_epoch != state_.input_document_epoch;
+            ready = state_.ready;
+        }
+        if (stale || mouse.kind == WorkspaceMouseKind::Cancel) {
+            // A retained record can outlive its document while Open completes.
+            // Consume it as cancellation, without changing replacement UI facts.
+            if (CancelGesture() && ready) QueueRender();
             return;
         }
-    }
-    void ReduceBatch(InputSlot& slot) {
-        bool dirty = false;
-        bool ui_changed = false;
-        while (slot.next < slot.samples.size()) {
-            auto pointer = slot.samples[slot.next++];
-            if (!document_.ResolveTarget(pointer)) {
-                Reject("The displayed annotation target no longer exists", false);
-                continue;
-            }
-            const auto prior = document_.ui().scene_revision;
-            auto result = document_.Pointer(pointer);
-            dirty = dirty || result.render_changed;
-            ui_changed = ui_changed || prior != document_.ui().scene_revision;
-            const bool sample = result.outcome == document::DocumentOutcome::Applied &&
-                                pointer.phase == contracts::AnnotationPointerPhase::End &&
-                                document_.ui().editor.tool == contracts::AnnotationTool::ColorSample &&
-                                document_.ToolAvailable(contracts::AnnotationTool::ColorSample, pointer.target.object);
-            if (result.outcome != document::DocumentOutcome::Applied) Reject(std::move(result.detail), false);
-            if (sample) {
-                if (ui_changed) InstallUi(false);
-                if (dirty) QueueRender();
-                if (slot.next == slot.samples.size()) Consumed(slot);
-                Sample(pointer);
+        if (mouse.button == WorkspaceMouseButton::Right) {
+            if (mouse.kind == WorkspaceMouseKind::Press) right_pressed_ = true;
+            if (mouse.kind == WorkspaceMouseKind::Release) right_pressed_ = false;
+        }
+        // Right-button movement belongs to the local viewport pan. Its native
+        // record is consumed without moving an overlapping left-button edit.
+        if (mouse.kind == WorkspaceMouseKind::Motion && right_pressed_) return;
+        const bool begin = mouse.kind == WorkspaceMouseKind::Press && mouse.button == WorkspaceMouseButton::Left;
+        const bool end = mouse.kind == WorkspaceMouseKind::Release && mouse.button == WorkspaceMouseButton::Left;
+        if (!begin && !end && mouse.kind != WorkspaceMouseKind::Motion) return;
+        if (begin) {
+            if (!mouse.point || !document_.ui().scene.frame_ready) {
+                Reject("Annotation image coordinates are unavailable", false);
                 return;
             }
+            if (document_.PeerClosed()) QueueRender();
+            pointer_.emplace();
+            pointer_->interaction_id = next_interaction_ = mmltk::common::types::advance_monotonic_identity(next_interaction_);
+            pointer_->sequence = 1U;
+            pointer_->phase = contracts::AnnotationPointerPhase::Begin;
+        } else {
+            if (!pointer_) return;
+            ++pointer_->sequence;
+            pointer_->phase = end ? contracts::AnnotationPointerPhase::End : contracts::AnnotationPointerPhase::Update;
         }
-        // Credit release is independent of snapshot copying, output admission,
-        // the renderer's stream, and all external consumers.
-        Consumed(slot);
-        if (ui_changed) InstallUi(false);
-        if (dirty) QueueRender();
-    }
-    void Consumed(InputSlot& slot) {
-        AnnotationInputProgress value;
-        SystemEventSink<AnnotationInputProgress> progress;
-        {
-            std::scoped_lock lock(mutex_);
-            value = {slot.epoch, slot.sequence};
-            slot.occupied = false;
-            if (value.epoch == input_epoch_) {
-                consumed_sequence_ = value.consumed_sequence;
-                progress = input_progress_;
-            }
+        if (mouse.point) pointer_->point = {mouse.point->x, mouse.point->y};
+        pointer_->brush_radius = mouse.brush_radius;
+        auto pointer = *pointer_;
+        if (!document_.ResolveTarget(pointer)) {
+            if (CancelGesture() && ready) QueueRender();
+            Reject("Annotation gesture target is unavailable", false);
+            return;
         }
-        if (progress) progress(value);
-    }
-    void InputReady() {
-        AnnotationInputProgress value;
-        SystemEventSink<AnnotationInputProgress> progress;
-        {
-            std::scoped_lock lock(mutex_);
-            if (terminal_barrier_ || stopping_ || !peer_ready_pending_) return;
-            peer_ready_pending_ = false;
-            value = {input_epoch_, consumed_sequence_};
-            progress = input_progress_;
-        }
-        if (progress) progress(value);
+        pointer_ = pointer;
+        const auto prior = document_.ui().scene_revision;
+        auto result = document_.Pointer(pointer);
+        if (end) pointer_.reset();
+        if (result.outcome != document::DocumentOutcome::Applied) Reject(std::move(result.detail), false);
+        if (prior != document_.ui().scene_revision) InstallUi(false);
+        if (result.render_changed) QueueRender();
+        if (result.outcome == document::DocumentOutcome::Applied && end &&
+            document_.ui().editor.tool == contracts::AnnotationTool::ColorSample &&
+            document_.ToolAvailable(contracts::AnnotationTool::ColorSample, pointer.target.object)) Sample(pointer);
     }
     [[nodiscard]] bool CancelRequested() const {
         std::scoped_lock lock(mutex_);
@@ -353,8 +280,10 @@ class AnnotationSystem::Impl final {
                     const auto result = [&] {
                         if constexpr (std::same_as<Request, AnnotationSave>)
                             return document_.Save(request.destination);
-                        else
+                        else {
+                            pointer_.reset();
                             return document_.Edit(request.edit);
+                        }
                     }();
                     if (result.outcome == document::DocumentOutcome::Applied)
                         InstallUi(true);
@@ -421,6 +350,7 @@ class AnnotationSystem::Impl final {
                     return [this, scene = std::move(scene), policy = std::move(policy)]() mutable {
                         Post([this, scene = std::move(scene), policy = std::move(policy)]() mutable {
                             if (policy && !input_policy_) input_policy_.emplace(*policy);
+                            static_cast<void>(CancelGesture());
                             auto result = document_.Open(std::move(scene));
                             if (result.outcome != document::DocumentOutcome::Applied) throw std::runtime_error(result.detail);
                             {
@@ -457,42 +387,42 @@ class AnnotationSystem::Impl final {
         }
         Reject(std::move(detail), true);
     }
+    void FinishSample(AnnotationPointer pointer, std::optional<contracts::AnnotationColor> color) {
+        const bool cancelled = CancelRequested();
+        {
+            std::scoped_lock lock(mutex_);
+            gpu_continuation_ = sampling_ = false;
+            state_.busy = pending_commands_ != 0U || sampling_;
+            state_.cancellation_requested = false;
+        }
+        if (cancelled || !color) { InstallUi(false); return; }
+        if (!document_.ResolveTarget(pointer)) { Reject("The sampled annotation target no longer exists", false); return; }
+        const auto object = document_.ui().scene.objects.at(*pointer.target.object);
+        auto supported = object.sup;
+        supported.center = *color;
+        supported.sampling = true;
+        auto selected = document_.Edit({.value = AnnotationObjectEdit{*pointer.target.object}});
+        const bool selection_changed = selected.render_changed;
+        auto result = selected.outcome == document::DocumentOutcome::Applied
+                          ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}})
+                          : std::move(selected);
+        result.render_changed = result.render_changed || selection_changed;
+        if (result.outcome != document::DocumentOutcome::Applied) Reject(std::move(result.detail), false);
+        else InstallUi(false);
+        if (result.render_changed) QueueRender();
+    }
     void Sample(AnnotationPointer pointer) {
         {
             std::scoped_lock lock(mutex_);
-            gpu_continuation_ = true;
+            gpu_continuation_ = sampling_ = true;
+            state_.busy = true;
         }
-        if (!renderer_.SubmitOrdered([this, pointer](Runtime& runtime, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-                const auto color = annotation_algorithm(runtime).Sample(pointer.point);
-                return [this, pointer, color] {
-                    Post([this, pointer, color]() mutable {
-                        if (!document_.ResolveTarget(pointer)) {
-                            FinishRejected("The sampled annotation target no longer exists");
-                            return;
-                        }
-                        const auto object = document_.ui().scene.objects.at(*pointer.target.object);
-                        auto supported = object.sup;
-                        supported.center = color;
-                        supported.sampling = true;
-                        auto selected = document_.Edit({.value = AnnotationObjectEdit{*pointer.target.object}});
-                        const bool selection_changed = selected.render_changed;
-                        auto result = selected.outcome == document::DocumentOutcome::Applied
-                                          ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}})
-                                          : std::move(selected);
-                        result.render_changed = result.render_changed || selection_changed;
-                        {
-                            std::scoped_lock lock(mutex_);
-                            gpu_continuation_ = false;
-                        }
-                        if (result.outcome != document::DocumentOutcome::Applied)
-                            Reject(std::move(result.detail), false);
-                        else
-                            InstallUi(false);
-                        if (result.render_changed) QueueRender();
-                    });
-                };
-            }))
-            throw contracts::UnavailableError("Annotation color sampling is unavailable");
+        InstallUi(false);
+        if (!renderer_.SubmitOrdered([this, pointer](Runtime& runtime, std::stop_token stop) -> detail::VisualRuntimeOwner::Notification {
+                std::optional<contracts::AnnotationColor> color;
+                if (!stop.stop_requested() && !CancelRequested()) color = annotation_algorithm(runtime).Sample(pointer.point);
+                return [this, pointer, color] { Post([this, pointer, color] { FinishSample(pointer, color); }); };
+            })) throw contracts::UnavailableError("Annotation color sampling is unavailable");
     }
     void InstallUi(bool settle) {
         AnnotationSnapshot installed;
@@ -500,7 +430,8 @@ class AnnotationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             state_.ui = document_.ui();
             if (settle) {
-                state_.busy = false;
+                if (pending_commands_) --pending_commands_;
+                state_.busy = pending_commands_ != 0U || sampling_;
                 state_.cancellation_requested = false;
             }
             AdvanceUi();
@@ -588,57 +519,19 @@ class AnnotationSystem::Impl final {
         }
         auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
         frame.clean_revision = clean_revision_;
-        AnnotationRenderedFacts facts{description.generation, description.document_epoch, description.scene_revision, description.editor};
-        if (description.editor.selected_object && (description.preview_object == description.editor.selected_object ||
-                                                   *description.editor.selected_object < description.scene->objects.size())) {
-            facts.selected.emplace();
-            const auto& selected = description.preview_object == description.editor.selected_object
-                                       ? description.preview
-                                       : description.scene->objects[*description.editor.selected_object];
-            contracts::project_annotation_geometry(*facts.selected, selected);
-            if (*description.editor.selected_object < description.identities->size())
-                facts.selected_identity = description.identities->at(*description.editor.selected_object);
-        }
-        if (description.preview_object) {
-            facts.preview.emplace();
-            contracts::project_annotation_geometry(*facts.preview, description.preview);
-            facts.preview_object = static_cast<std::uint16_t>(*description.preview_object);
-            facts.preview_identity = description.preview_identity;
-        }
-        bool geometry_changed = false;
-        {
-            std::scoped_lock lock(mutex_);
-            if (state_.rendered.scene_revision != facts.scene_revision || state_.rendered.document_epoch != facts.document_epoch)
-                geometry_changed = true;
-        }
-        if (geometry_changed) {
-            contracts::project_annotation_geometry(geometry_scratch_, *description.scene);
-            identity_scratch_.resize(description.identities->size());
-            for (std::size_t index = 0U; index != identity_scratch_.size(); ++index)
-                identity_scratch_[index] = description.identities->at(index).object;
-        }
-        std::optional<AnnotationSnapshot> changed;
+        std::optional<AnnotationRenderedFacts> evidence;
+        if (diagnostics_.valid())
+            evidence = AnnotationRenderedFacts{description.generation, description.document_epoch,
+                                               description.scene_revision, description.editor};
         AnnotationFrameState rendered;
         {
             std::scoped_lock lock(mutex_);
-            // A completed older render remains publishable; logical UI stays at
-            // the latest reduction while rendered facts identify these exact pixels.
             if (!state_.ready) return;
             state_.frame = frame;
-            if (geometry_changed) {
-                state_.rendered_scene.document_epoch = description.document_epoch;
-                state_.rendered_scene.scene_revision = description.scene_revision;
-                std::swap(state_.rendered_scene.geometry, geometry_scratch_);
-                std::swap(state_.rendered_scene.identities, identity_scratch_);
-            }
-            state_.rendered = std::move(facts);
+            image_ = {frame, std::move(evidence)};
             state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision);
-            // UI facts are already present for preview-only frames. Preserve
-            // the compact progress path instead of resending masks per motion.
-            if (geometry_changed) changed = state_;
-            rendered = {state_.revision, state_.ui_revision, frame, state_.rendered};
+            rendered = {state_.revision, state_.ui_revision, frame};
         }
-        if (changed) Publish(AnnotationChanged{std::move(*changed)});
         Publish(AnnotationFrameChanged{rendered});
         DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, description, &pending_baseline_, frame.revision);
     }
@@ -648,7 +541,8 @@ class AnnotationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             state_.ui = document_.ui();
             if (settle) {
-                state_.busy = false;
+                if (pending_commands_) --pending_commands_;
+                state_.busy = pending_commands_ != 0U || sampling_;
                 state_.cancellation_requested = false;
             }
             AdvanceUi();
@@ -670,29 +564,21 @@ class AnnotationSystem::Impl final {
     void Failed(std::exception_ptr failure) noexcept {
         auto detail = visual_failure_detail(failure, "Annotation worker failed");
         AnnotationSnapshot failed;
-        SystemEventSink<AnnotationInputProgress> progress;
-        AnnotationInputProgress rejected;
-        document_.PeerClosed();
+        static_cast<void>(CancelGesture());
         {
             std::scoped_lock lock(mutex_);
-            if (std::ranges::any_of(input_slots_, [this](const auto& slot) { return slot.occupied && slot.epoch == input_epoch_; }))
-                progress = input_progress_;
-            rejected = {input_epoch_, consumed_sequence_, detail};
-            for (auto& slot : input_slots_)
-                slot.occupied = false;
-            command_.reset();
-            gpu_continuation_ = false;
-            terminal_barrier_ = false;
+            input_.Clear();
+            pending_commands_ = 0U;
+            gpu_continuation_ = sampling_ = false;
             state_.ready = false;
             state_.frame = {};
-            state_.rendered = {};
+            image_.diagnostics.reset();
             state_.busy = state_.cancellation_requested = false;
             state_.ui = document_.ui();
             AdvanceUi();
             failed = state_;
         }
         report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Annotation, settings_.device, detail);
-        if (progress) progress(std::move(rejected));
         Publish(AnnotationFailed{std::move(failed), std::move(detail)});
     }
     template <class Event>
@@ -706,23 +592,19 @@ class AnnotationSystem::Impl final {
     VisualDiagnosticSink diagnostics_;
     mutable std::mutex mutex_;
     AnnotationSnapshot state_;
-    std::array<InputSlot, kAnnotationInputAdmissionSlots> input_slots_{};
-    std::optional<Command> command_;
+    AnnotationImageMetadata image_;
+    WorkspaceInputQueue<InputRecord> input_;
     Completion completion_;
-    std::uint64_t input_epoch_ = 0U, admitted_sequence_ = 0U, consumed_sequence_ = 0U;
-    std::optional<AnnotationPointer> admitted_pointer_;
-    std::uint64_t admitted_document_epoch_ = 0U;
-    SystemEventSink<AnnotationInputProgress> input_progress_;
-    bool terminal_barrier_ = false, gpu_continuation_ = false, stopping_ = false, peer_ready_pending_ = false;
-    bool command_before_terminal_ = false;
+    std::uint64_t input_epoch_ = 0U;
+    std::uint64_t next_interaction_ = 0U;
+    std::size_t pending_commands_ = 0U;
+    std::optional<AnnotationPointer> pointer_;
+    bool right_pressed_ = false;
+    bool gpu_continuation_ = false, sampling_ = false, stopping_ = false;
     document::AnnotationDocument document_;
     std::optional<mmltk::common::system::ScopedExecutionPolicy> input_policy_;
     std::uint64_t render_generation_ = 0U;
     AnnotationRenderState scratch_render_, pending_description_, active_description_;
-    // Two reusable projected body values (published state and renderer scratch)
-    // add no full editable-scene custody to the document's four scene backings.
-    contracts::AnnotationSceneGeometry geometry_scratch_;
-    std::vector<std::uint64_t> identity_scratch_;
     std::mutex render_mutex_;
     bool pending_render_ = false;
     Runtime::CompletedOutput pending_baseline_;
@@ -736,10 +618,8 @@ AnnotationSystem::AnnotationSystem(VisualDeviceSettings settings, VisualRuntimeF
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(borrow_source), std::move(events), diagnostics)) {}
 AnnotationSystem::~AnnotationSystem() = default;
 AnnotationSnapshot AnnotationSystem::Open(AnnotationOpen request) { return impl_->Open(std::move(request)); }
-void AnnotationSystem::Input(AnnotationInputBatch batch) { impl_->Input(std::move(batch)); }
-void AnnotationSystem::SetInputPeer(std::uint64_t epoch, SystemEventSink<AnnotationInputProgress> progress) {
-    impl_->SetInputPeer(epoch, std::move(progress));
-}
+void AnnotationSystem::Input(WorkspaceMouse mouse) { impl_->Input(std::move(mouse)); }
+void AnnotationSystem::SetInputPeer(std::uint64_t epoch) { impl_->SetInputPeer(epoch); }
 AnnotationSnapshot AnnotationSystem::Edit(AnnotationEditRequest request) { return impl_->Edit(std::move(request)); }
 AnnotationSnapshot AnnotationSystem::Save(AnnotationSave request) { return impl_->Save(std::move(request)); }
 AnnotationSnapshot AnnotationSystem::Stop() noexcept { return impl_->Stop(); }

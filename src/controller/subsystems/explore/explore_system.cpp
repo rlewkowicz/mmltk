@@ -1,3 +1,4 @@
+#include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -161,6 +162,7 @@ std::size_t normalize_explore_parallelism(const std::size_t requested, const mml
 class ExploreSystem::Impl final {
     friend class ExploreSystem;
 
+    WorkspaceInput input_;
    public:
     Impl(SettingsSystem& settings_system, const VisualDeviceSettings settings, const std::size_t nproc, VisualRuntimeFactory factory,
          SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
@@ -1809,3 +1811,15 @@ void ExploreSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->wo
 VisualDocumentRead ExploreSystem::BorrowDocument(const VisualFrame& frame) const { return impl_->BorrowDocument(frame); }
 
 }  // namespace mmltk::controller
+
+namespace mmltk::controller {
+void ExploreSystem::Input(WorkspaceMouse mouse) {
+    std::scoped_lock lock(impl_->mutex_);
+    if (impl_->worker_.stopped()) throw contracts::UnavailableError("Explore input is unavailable");
+    impl_->input_.Accept(std::move(mouse), PresentationSourceKind::Explore);
+}
+void ExploreSystem::SetInputPeer(std::uint64_t epoch) {
+    std::scoped_lock lock(impl_->mutex_);
+    impl_->input_.SetPeer(epoch);
+}
+}

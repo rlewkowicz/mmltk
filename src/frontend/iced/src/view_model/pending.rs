@@ -46,7 +46,10 @@ impl ApplicationModel {
                 "The application is not ready to accept requests.",
             ));
         }
-        let correlation = self.next_correlation.max(1);
+        let mut correlation = self.next_correlation.max(1);
+        while self.pending.contains_key(&correlation) {
+            correlation = correlation.wrapping_add(1).max(1);
+        }
         let encoded = encode(correlation);
         if encoded.record.correlation != correlation || encoded.record.endpoint_id == 0 {
             return Err(UiError::protocol(
@@ -109,7 +112,7 @@ impl ApplicationModel {
             });
         }
         let owner = crate::generated::application_intent_system(expected);
-        if self
+        if owner != crate::generated::ApplicationSystem::Annotation && self
             .pending
             .values()
             .any(|pending| crate::generated::application_intent_system(pending.endpoint) == owner)
@@ -126,7 +129,7 @@ impl ApplicationModel {
             };
             return Err(UiError::busy(detail));
         }
-        self.next_correlation = self.next_correlation.wrapping_add(1).max(1);
+        self.next_correlation = correlation.wrapping_add(1).max(1);
         self.pending.insert(
             correlation,
             PendingRequest {
@@ -208,10 +211,6 @@ impl ApplicationModel {
 
     pub(crate) fn has_upscale_pending(&self) -> bool {
         self.has_system_pending(crate::generated::ApplicationSystem::Upscale)
-    }
-
-    pub(super) fn has_annotation_pending(&self) -> bool {
-        self.has_system_pending(crate::generated::ApplicationSystem::Annotation)
     }
 
     pub fn register_dialog(
@@ -319,6 +318,22 @@ impl ApplicationModel {
 mod tests {
     use super::*;
     use crate::view_model::test_support::*;
+    #[test]
+    fn annotation_commands_and_stop_retain_distinct_pending_replies() {
+        let mut model = bootstrapped();
+        let edit = model.begin_intent(ApplicationIntentEndpoint::AnnotationEdit).unwrap();
+        model.next_correlation = edit;
+        let stop = model.begin_intent(ApplicationIntentEndpoint::AnnotationStop).unwrap();
+        let next = model.begin_intent(ApplicationIntentEndpoint::AnnotationEdit).unwrap();
+        assert_ne!(edit, stop);
+        assert_ne!(stop, next);
+        model.abandon_intent(stop);
+        assert_eq!(model.pending_endpoint(edit), Some(ApplicationIntentEndpoint::AnnotationEdit));
+        assert_eq!(model.pending_endpoint(next), Some(ApplicationIntentEndpoint::AnnotationEdit));
+        model.peer_disconnected(UiError::transport("closed"));
+        assert!(model.pending.is_empty());
+    }
+
     #[test]
     fn pending_admission_is_bounded_exclusive_and_cleared_on_disconnect() {
         let mut model = bootstrapped();

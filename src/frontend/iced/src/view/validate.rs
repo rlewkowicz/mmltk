@@ -143,6 +143,7 @@ impl Component {
             crate::generated::FeatureId::Validate,
             width,
             Message::Workspace,
+            crate::workspace_input::Binding::default(),
         );
         let advanced = crate::view::shared::card(
             "Advanced",
