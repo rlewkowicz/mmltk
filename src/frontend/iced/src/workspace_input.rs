@@ -214,6 +214,20 @@ fn button_value(button: mouse::Button) -> (WorkspaceMouseButton, u16) {
 mod tests {
     use super::*;
 
+    fn assert_output(
+        connection: &crate::transport_connection::Connection,
+        expected: Vec<Vec<u8>>,
+    ) {
+        let mut actual = Vec::new();
+        connection
+            .flush(|bytes| {
+                actual.push(bytes.to_vec());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn native_defaults_and_annotation_radius_overrides_use_both_encoders() {
         let (connection, _capture) = crate::transport_connection::Connection::test_channel();
@@ -248,14 +262,7 @@ mod tests {
                 expected.push(owned);
             }
         }
-        let mut actual = Vec::new();
-        connection
-            .flush(|bytes| {
-                actual.push(bytes.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(actual, expected);
+        assert_output(&connection, expected);
     }
 
     #[test]
@@ -287,14 +294,7 @@ mod tests {
                         .unwrap(),
                 );
             }
-            let mut actual = Vec::new();
-            connection
-                .flush(|bytes| {
-                    actual.push(bytes.to_vec());
-                    Ok(())
-                })
-                .unwrap();
-            assert_eq!(actual, expected);
+            assert_output(&connection, expected);
         }
     }
 
@@ -403,14 +403,7 @@ mod tests {
                 .unwrap()
         })
         .collect::<Vec<_>>();
-        let mut actual = Vec::new();
-        connection
-            .flush(|bytes| {
-                actual.push(bytes.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(actual, expected);
+        assert_output(&connection, expected);
     }
 
     #[test]
@@ -485,13 +478,6 @@ mod tests {
                     .unwrap(),
             );
         }
-        let mut actual = Vec::new();
-        connection
-            .flush(|bytes| {
-                actual.push(bytes.to_vec());
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(actual, expected);
+        assert_output(&connection, expected);
     }
 }

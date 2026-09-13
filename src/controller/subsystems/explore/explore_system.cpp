@@ -477,21 +477,8 @@ class ExploreSystem::Impl final {
             return QueueDesired([&](ExploreSnapshot& desired) { desired.overlay = request; }, 0, true);
         }
         auto refreshed = settings_system_.persist_explore_product(settings_system_.explore_settings_candidate(), *label_only, augmentation);
-        ExploreSnapshot changed;
-        {
-            std::scoped_lock lock(mutex_);
-            RefreshRetainedMetadata([&](ExploreImageMetadata& metadata) { metadata.overlay.show_labels = request.show_labels; });
-            installed_settings_ = std::move(refreshed);
-            if (desired_ && desired_->settings) desired_->settings = installed_settings_;
-            state_.overlay.show_labels = request.show_labels;
-            if (desired_) desired_->snapshot.overlay.show_labels = request.show_labels;
-            AdvanceRevision();
-            changed = state_;
-        }
-        transaction.unlock();
-        Publish(ExploreChanged{changed});
-        ExecutionSettingsChanged();
-        return changed;
+        return InstallRetainedSetting(transaction, std::move(refreshed),
+                                      [&](auto& target) { target.overlay.show_labels = request.show_labels; });
     }
 
     [[nodiscard]] ExploreSnapshot RerollAugmentation() {
@@ -507,22 +494,8 @@ class ExploreSystem::Impl final {
         std::unique_lock transaction(desired_admission_mutex_);
         auto refreshed =
             settings_system_.persist_explore_detail(settings_system_.explore_settings_candidate(), request.show_original_dimensions);
-        ExploreSnapshot changed;
-        {
-            std::scoped_lock lock(mutex_);
-            RefreshRetainedMetadata(
-                [&](ExploreImageMetadata& metadata) { metadata.detail.show_original_dimensions = request.show_original_dimensions; });
-            installed_settings_ = std::move(refreshed);
-            if (desired_ && desired_->settings) desired_->settings = installed_settings_;
-            state_.detail.show_original_dimensions = request.show_original_dimensions;
-            if (desired_) desired_->snapshot.detail = state_.detail;
-            AdvanceRevision();
-            changed = state_;
-        }
-        transaction.unlock();
-        Publish(ExploreChanged{changed});
-        ExecutionSettingsChanged();
-        return changed;
+        return InstallRetainedSetting(transaction, std::move(refreshed),
+                                      [&](auto& target) { target.detail.show_original_dimensions = request.show_original_dimensions; });
     }
 
     [[nodiscard]] ExploreSnapshot Select(const ExploreSelect request) {
@@ -653,6 +626,25 @@ class ExploreSystem::Impl final {
     }
 
    private:
+    template <class Update>
+    ExploreSnapshot InstallRetainedSetting(std::unique_lock<std::mutex>& transaction, ExploreSettingsCandidate refreshed, Update update) {
+        ExploreSnapshot changed;
+        {
+            std::scoped_lock lock(mutex_);
+            RefreshRetainedMetadata(update);
+            installed_settings_ = std::move(refreshed);
+            if (desired_ && desired_->settings) desired_->settings = installed_settings_;
+            update(state_);
+            if (desired_) update(desired_->snapshot);
+            AdvanceRevision();
+            changed = state_;
+        }
+        transaction.unlock();
+        Publish(ExploreChanged{changed});
+        ExecutionSettingsChanged();
+        return changed;
+    }
+
     template <class Update>
     void RefreshRetainedMetadata(Update update) {
         const std::array retained{&retained_gallery_, &retained_detail_};
@@ -1764,6 +1756,7 @@ void ExploreSystem::Shutdown() noexcept { impl_->Shutdown(); }
 // CLEANUP-IGNORE: Explore exposes its independent ordinary facade; shared workspace execution already belongs to VisualRuntimeOwner.
 bool ExploreSystem::stopped() const noexcept { return impl_->stopped(); }
 ExploreSnapshot ExploreSystem::snapshot() const { return impl_->snapshot(); }
+// CLEANUP-IGNORE: Explore forwards its sealed source API to its own owner and the existing shared renderer.
 std::optional<ExploreImageMetadata> ExploreSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView ExploreSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace ExploreSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }

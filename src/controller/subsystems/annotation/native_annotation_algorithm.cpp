@@ -128,6 +128,16 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
         return bounds;
     }
+    template <class Visit>
+    static void VisitSplineHandles(const AnnotationRenderState& description, std::size_t index, Visit visit) {
+        const auto& knots = description.DrawingObjectAt(index).spline_knots;
+        for (std::size_t item = 0; item < knots.size(); ++item) {
+            const auto knot = description.DrawingKnot(index, item);
+            visit(knot.point);
+            if (knot.in.enabled) visit(knot.in.point);
+            if (knot.out.enabled) visit(knot.out.point);
+        }
+    }
     static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index, raster::IntRect runs, int width,
                                   int height) {
         const auto& object = description.DrawingObjectAt(index);
@@ -142,12 +152,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             x2 = std::max(x2, value.x);
             y2 = std::max(y2, value.y);
         };
-        for (std::size_t item = 0; item < object.spline_knots.size(); ++item) {
-            const auto knot = description.DrawingKnot(index, item);
-            point(knot.point);
-            if (knot.in.enabled) point(knot.in.point);
-            if (knot.out.enabled) point(knot.out.point);
-        }
+        VisitSplineHandles(description, index, point);
         for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
             if (object.skeleton_nodes[node].visible) point(description.DrawingNode(index, node));
         // Geometry includes the existing outline thickness and selection/vertex
@@ -216,6 +221,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};
         const auto damage = [&](raster::IntRect bounds) {
             if (bounds.x1 >= bounds.x2 || bounds.y1 >= bounds.y2) return;
+            // CLEANUP-IGNORE: Raster clipping expands an image-sized sentinel; workspace damage separately adopts its first valid region
+            // and has a different coordinate type.
             clip.x1 = std::min(clip.x1, bounds.x1);
             clip.y1 = std::min(clip.y1, bounds.y1);
             clip.x2 = std::max(clip.x2, bounds.x2);
@@ -322,13 +329,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 if (object.shape == domain::AnnotationShape::Skeleton)
                     for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
                         if (object.skeleton_nodes[node].visible) handle(description.DrawingNode(index, node));
-                if (object.shape == domain::AnnotationShape::Spline)
-                    for (std::size_t item = 0; item < object.spline_knots.size(); ++item) {
-                        const auto knot = description.DrawingKnot(index, item);
-                        handle(knot.point);
-                        if (knot.in.enabled) handle(knot.in.point);
-                        if (knot.out.enabled) handle(knot.out.point);
-                    }
+                if (object.shape == domain::AnnotationShape::Spline) VisitSplineHandles(description, index, handle);
                 if (!geometry.source) geometry.source.emplace();
                 geometry.source->shape = object.shape;
                 geometry.source->point = object.point;

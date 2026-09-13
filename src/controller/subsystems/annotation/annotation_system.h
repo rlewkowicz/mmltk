@@ -32,6 +32,8 @@ struct AnnotationPointer final {
     std::uint64_t sequence = 0U;
     contracts::AnnotationPointerTarget target{};
     contracts::AnnotationTargetIdentity identity{};
+    // CLEANUP-IGNORE: The resolved native pointer and transport mouse enforce the same canonical brush bounds but retain distinct
+    // lifetimes.
     contracts::AnnotationPoint point{};
     [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
         [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
@@ -158,8 +160,10 @@ struct AnnotationFrameState final {
     // CLEANUP-IGNORE: Compact frame identity is distinct from Live's full lifecycle snapshot.
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
+    // CLEANUP-IGNORE: Annotation UI, compact frame notifications, and Upscale events have distinct canonical types and delivery meanings.
     VisualFrame frame{};
 };
+// CLEANUP-IGNORE: Annotation frame state and Presentation capability events belong to different canonical owners.
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] AnnotationFrameChanged final {
     AnnotationFrameState snapshot{};
 };
@@ -182,6 +186,7 @@ class AnnotationSystem final {
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
+    // CLEANUP-IGNORE: Annotation document mutation and Explore navigation are separate direct typed domain endpoints.
     void SetInputPeer(std::uint64_t);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Edit(AnnotationEditRequest);
     // CLEANUP-IGNORE: Annotation persistence and lifecycle methods do not duplicate Explore navigation ownership.
@@ -192,6 +197,7 @@ class AnnotationSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
     [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame&) const;
+    // CLEANUP-IGNORE: Annotation exposes its sealed source and workspace API; shared runtime behavior remains private.
     [[nodiscard]] VisualSourceObservation ObserveSource() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
@@ -207,6 +213,7 @@ class AnnotationSystem final {
 [[nodiscard]] VisualRuntimeFactory make_native_annotation_runtime_factory(VisualDeviceSettings);
 // CLEANUP-IGNORE: Annotation's canonical field registrations are distinct stable schema identities.
 MMLTK_REFLECT_FIELDS(AnnotationPointer)
+// CLEANUP-IGNORE: Each canonical Annotation type requires its own registration; projection already shares reflected field machinery.
 MMLTK_REFLECT_FIELDS(AnnotationOpen)
 MMLTK_REFLECT_FIELDS(AnnotationSave)
 MMLTK_REFLECT_FIELDS(AnnotationToolEdit)

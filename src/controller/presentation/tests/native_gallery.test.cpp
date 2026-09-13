@@ -205,6 +205,16 @@ struct GalleryEvidence final {
     }
 };
 
+class NativeGalleryArtifact final {
+    mmltk::testsupport::ScopedTempDir directory_;
+
+   public:
+    const std::filesystem::path path;
+    explicit NativeGalleryArtifact(const char* name) : directory_(name), path(directory_.path() / "compiled.bin") {
+        write_gallery_artifact(path, 0.25F, 9U);
+    }
+};
+
 class GalleryReadPause final {
    public:
     explicit GalleryReadPause(const std::uint32_t image, const bool fail = false) : image_(image), fail_(fail) {}
@@ -1251,31 +1261,30 @@ TEST_CASE("Native viewport restoration publishes cached rows from either side be
     CHECK(mixed.reused_tiles == 2U);
     CHECK(mixed.remaining_tiles == 2U);
     CHECK(gallery.evidence.ReadAdmissions(gallery.plan.generation).empty());
-    constexpr std::size_t row_bytes = 16U * 8U * 4U;
-    const auto initial_clean = gallery.Pixels(0U), initial_semantic = gallery.Pixels(1U);
-    CHECK(std::ranges::equal(std::span{initial_clean}.subspan(row_bytes), std::span{cached_clean}.first(row_bytes)));
-    CHECK(std::ranges::equal(std::span{initial_semantic}.subspan(row_bytes), std::span{cached_semantic}.first(row_bytes)));
+    const auto check_cached_row = [&] {
+        constexpr std::size_t row_bytes = 16U * 8U * 4U;
+        const auto clean = gallery.Pixels(0U), semantic = gallery.Pixels(1U);
+        CHECK(std::ranges::equal(std::span{clean}.subspan(row_bytes), std::span{cached_clean}.first(row_bytes)));
+        CHECK(std::ranges::equal(std::span{semantic}.subspan(row_bytes), std::span{cached_semantic}.first(row_bytes)));
+    };
+    check_cached_row();
     gallery.Drain();
     const auto admissions = gallery.evidence.ReadAdmissions(gallery.plan.generation);
     REQUIRE(admissions.size() >= 2U);
     CHECK(admissions[0U] == 2U);
     CHECK(admissions[1U] == 3U);
-    const auto completed_clean = gallery.Pixels(0U), completed_semantic = gallery.Pixels(1U);
-    CHECK(std::ranges::equal(std::span{completed_clean}.subspan(row_bytes), std::span{cached_clean}.first(row_bytes)));
-    CHECK(std::ranges::equal(std::span{completed_semantic}.subspan(row_bytes), std::span{cached_semantic}.first(row_bytes)));
+    check_cached_row();
 }
 
 TEST_CASE("Native cold visible admission proceeds while obsolete speculation holds its physical lane", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
-    mmltk::testsupport::ScopedTempDir directory{"native-gallery-visible-admission"};
-    const auto path = directory.path() / "compiled.bin";
-    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGalleryArtifact artifact{"native-gallery-visible-admission"};
     GalleryReadPause held{4U};
     NativeGallery gallery{2U, false, true};
     GalleryReadPause::ReleaseGuard release{held};
     held.Bind(*gallery.gate);
-    gallery.Open(path);
+    gallery.Open(artifact.path);
     for (;;) {
         const auto observed = gallery.evidence.Epoch();
         static_cast<void>(gallery.Step());
@@ -1315,15 +1324,13 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
 TEST_CASE("Native scroll reversal retains a useful pending read and cached visible tiles", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
-    mmltk::testsupport::ScopedTempDir directory{"native-gallery-reversal"};
-    const auto path = directory.path() / "compiled.bin";
-    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGalleryArtifact artifact{"native-gallery-reversal"};
     GalleryReadPause held{22U};
     NativeGallery gallery{2U, false, true};
     GalleryReadPause::ReleaseGuard release{held};
     held.Bind(*gallery.gate);
     gallery.plan.viewport.first_row = 10U;
-    gallery.Open(path);
+    gallery.Open(artifact.path);
     for (;;) {
         const auto observed = gallery.evidence.Epoch();
         const auto progress = gallery.Step();

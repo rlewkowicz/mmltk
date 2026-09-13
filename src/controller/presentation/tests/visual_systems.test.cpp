@@ -1311,8 +1311,19 @@ struct AnnotationRenderProbe final {
     }
 };
 
+struct AnnotationRenderHold final {
+    std::shared_ptr<AnnotationRenderProbe> probe = std::make_shared<AnnotationRenderProbe>();
+    std::shared_ptr<MutationCommitProbe> hold = std::make_shared<MutationCommitProbe>();
+    std::future<void> entered = hold->committed.get_future();
+};
+
 class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
+    static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend,
+                                              std::shared_ptr<AnnotationRenderProbe> probe = {}) {
+        return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                              [probe = std::move(probe)] { return std::make_unique<TestAnnotationAlgorithm>(probe); });
+    }
     explicit TestAnnotationAlgorithm(std::shared_ptr<AnnotationRenderProbe> probe = {}) : probe_(std::move(probe)) {}
     void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {
         if (probe_) probe_->Wait(probe_->open_hold);
@@ -1626,6 +1637,31 @@ void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std:
         REQUIRE(owner.SubmitDiscrete(std::move(work), {}, true));
     else
         REQUIRE(owner.SubmitOrdered(std::move(work)));
+}
+
+mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate enqueue_test_output(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
+                                                                                std::uintptr_t& stream) {
+    auto candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(
+        candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
+    return candidate;
+}
+
+auto first_visual_failure(std::atomic_uint& count, std::promise<std::exception_ptr>& first) {
+    return [&count, &first](std::exception_ptr failure) {
+        if (count.fetch_add(1U) == 0U) first.set_value(failure);
+    };
+}
+
+void submit_visual_workspace(detail::VisualRuntimeOwner& owner, const std::shared_ptr<FakeImageBackend>& backend,
+                             std::promise<mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput>& created) {
+    const bool submitted = owner.SubmitOrdered([&backend, &created](auto& runtime, std::stop_token) {
+        auto [workspace, prepared] = mmltk::frameworks::gpu::test_support::PublishTestWorkspace(runtime, backend);
+        REQUIRE(prepared);
+        return detail::VisualRuntimeOwner::Notification{
+            [&created, product = runtime.Completed()]() mutable { created.set_value(std::move(product)); }};
+    });
+    REQUIRE(submitted);
 }
 
 void submit_visual_completion(detail::VisualRuntimeOwner& owner, std::promise<void>& completed) {
@@ -2689,10 +2725,8 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
 
 [[nodiscard]] AnnotationSystem make_test_annotation(const std::shared_ptr<FakeImageBackend>& backend, ExploreSystem& source,
                                                     EventGate& events) {
-    return AnnotationSystem{kDevice,
-                            RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                           [] { return std::make_unique<TestAnnotationAlgorithm>(); }),
-                            borrow_exactly_from(source), [&events](AnnotationSystem::event_type) { events.Advance(); },
+    return AnnotationSystem{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend), borrow_exactly_from(source),
+                            [&events](AnnotationSystem::event_type) { events.Advance(); },
                             mmltk::testsupport::annotation_render_evidence()};
 }
 
@@ -2704,6 +2738,13 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
     auto retained = annotation.BorrowFrame();
     REQUIRE(retained.valid());
     return retained;
+}
+
+auto settle_annotation_on_exit(AnnotationSystem& annotation, std::promise<void>& release) {
+    return mmltk::testsupport::ScopedTestCleanup{[&annotation, &release] {
+        mmltk::testsupport::release_test_promise(release);
+        annotation.Shutdown();
+    }};
 }
 
 void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& events, std::uint64_t peer) {
@@ -2740,6 +2781,15 @@ void present_and_wait(PresentationSystem& presentation, TestPresentationWriterSt
     static_cast<void>(presentation.Select(source.source));
     writer.SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == revision; }));
+}
+
+std::shared_ptr<VisualDocument> annotation_mask_document(std::string_view resource) {
+    auto document = std::make_shared<VisualDocument>();
+    document->scene.document = contracts::WorkspaceResource::From(resource, 1U);
+    document->scene.categories = {{.value = "object"}};
+    document->scene.objects = {
+        {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
+    return document;
 }
 
 class MutableVisualSource final {
@@ -2782,6 +2832,13 @@ class MutableVisualSource final {
     [[nodiscard]] VisualDocumentRead BorrowExact(const VisualFrame& frame) const {
         if (frame.source != identity_) return {};
         return test_document(borrow_matching_visual_product(frame, runtime_.Borrow()));
+    }
+    [[nodiscard]] ExactVisualDocumentBorrower WithDocument(std::shared_ptr<const VisualDocument> document) {
+        return [this, document = std::move(document)](const VisualFrame& frame) {
+            auto read = BorrowExact(frame);
+            read.document = document;
+            return read;
+        };
     }
     [[nodiscard]] VisualSourceReader reader() {
         return {
@@ -3849,10 +3906,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     EventGate annotation_events;
     std::atomic_uint64_t failures{0U};
     auto probe = std::make_shared<AnnotationRenderProbe>();
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                borrow_exactly_from(explore),
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), borrow_exactly_from(explore),
                                 [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U);
                                     annotation_events.Advance();
@@ -5032,29 +5086,16 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
     auto failure_result = failed.get_future();
     std::atomic<std::size_t> failures{0U};
     mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
-    detail::VisualRuntimeOwner owner{
-        [&](auto revisions) {
-            ++constructions;
-            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0,
-                .backend = backend,
-                .workspace_finalize = [](auto clean, auto, auto destination, auto,
-                                         auto) { mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean); },
-                .product_revisions = std::move(revisions)});
-            return runtime;
-        },
-        [&](std::exception_ptr failure) {
-            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-        }};
-    const bool initialized = owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
-        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
-        REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
-        return detail::VisualRuntimeOwner::Notification{
-            [&, product = runtime.Completed()]() mutable { created_workspace.set_value(std::move(product)); }};
-    });
-    REQUIRE(initialized);
+    detail::VisualRuntimeOwner owner{[&](auto revisions) {
+                                         ++constructions;
+                                         auto runtime = std::make_unique<SystemImageRuntime>(
+                                             mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+                                         return runtime;
+                                     },
+                                     [&](std::exception_ptr failure) {
+                                         if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+                                     }};
+    submit_visual_workspace(owner, backend, created_workspace);
     auto workspace = mmltk::testsupport::await_test_future(workspace_result, "external workspace creation");
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
@@ -5101,24 +5142,12 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
     auto ready = created.get_future();
     auto owner = std::make_unique<detail::VisualRuntimeOwner>(
         [&](auto revisions) {
-            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0,
-                .backend = backend,
-                .workspace_finalize = [](auto clean, auto, auto destination, auto,
-                                         auto) { mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean); },
-                .product_revisions = std::move(revisions)});
+            auto runtime = std::make_unique<SystemImageRuntime>(
+                mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
             return runtime;
         },
         [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
-    const bool initialized = owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
-        auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
-        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
-        REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
-        return detail::VisualRuntimeOwner::Notification{
-            [&, product = runtime.Completed()]() mutable { created.set_value(std::move(product)); }};
-    });
-    REQUIRE(initialized);
+    submit_visual_workspace(*owner, backend, created);
     auto workspace = mmltk::testsupport::await_test_future(ready, "workspace before visual owner destruction");
     owner.reset();
     CHECK(backend->contexts_destroyed == 0U);
@@ -5260,10 +5289,7 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     auto probe = std::make_shared<AnnotationRenderProbe>();
     EventGate events;
     std::atomic_uint64_t failures{0U};
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                borrow_exactly_from(source.system()),
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), borrow_exactly_from(source.system()),
                                 [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
                                     events.Advance();
@@ -5296,39 +5322,23 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
     const bool request_stop = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {32U, 32U}};
-    auto semantic = std::make_shared<VisualDocument>();
-    semantic->scene.document = contracts::WorkspaceResource::From("test://unavailable-source", 1U);
-    semantic->scene.categories = {{.value = "object"}};
-    semantic->scene.objects = {
-        {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
-    auto probe = std::make_shared<AnnotationRenderProbe>();
-    auto hold = std::make_shared<MutationCommitProbe>();
-    auto entered = hold->committed.get_future();
+    auto semantic = annotation_mask_document("test://unavailable-source");
+    AnnotationRenderHold render;
     EventGate events;
     std::mutex observations_mutex;
     std::vector<AnnotationFailed> failures;
     std::vector<std::uint64_t> failure_render_counts;
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                [&](const VisualFrame& frame) {
-                                    auto read = source.BorrowExact(frame);
-                                    read.document = semantic;
-                                    return read;
-                                },
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), source.WithDocument(semantic),
                                 [&](AnnotationSystem::event_type event) {
                                     if (const auto* failure = std::get_if<AnnotationFailed>(&event)) {
                                         std::scoped_lock lock(observations_mutex);
                                         failures.push_back(*failure);
-                                        failure_render_counts.push_back(probe->calls.load());
+                                        failure_render_counts.push_back(render.probe->calls.load());
                                     }
                                     events.Advance();
                                 },
                                 mmltk::testsupport::annotation_render_evidence()};
-    mmltk::testsupport::ScopedTestCleanup release{[&] {
-        mmltk::testsupport::release_test_promise(hold->release);
-        annotation.Shutdown();
-    }};
+    auto release = settle_annotation_on_exit(annotation, render.hold->release);
     mmltk::testsupport::open_annotation(annotation, events, source.frame());
     annotation.SetInputPeer(1U);
     auto command = annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("retained history")}}});
@@ -5338,14 +5348,14 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
     auto retained = hold_annotation_frame(annotation, events, tool);
     const auto prior = annotation.snapshot();
     REQUIRE(prior.ui.can_undo);
-    const auto rendered = probe->calls.load();
+    const auto rendered = render.probe->calls.load();
     {
-        std::scoped_lock lock(probe->mutex);
-        probe->open_hold = hold;
+        std::scoped_lock lock(render.probe->mutex);
+        render.probe->open_hold = render.hold;
     }
-    probe->fail_open = true;
+    render.probe->fail_open = true;
     static_cast<void>(annotation.Open({.source = source.frame()}));
-    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    REQUIRE(render.entered.wait_for(2s) == std::future_status::ready);
     for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Motion, WorkspaceMouseKind::Release})
         annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, kind, {4.25F, 5.125F}));
     // Empty and passive captures share admission without manufacturing edits.
@@ -5361,7 +5371,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
     CHECK(annotation.Save({.destination = destination.string()}).busy);
     CHECK(annotation.Open({.source = source.frame()}).busy);
     if (request_stop) CHECK(annotation.Stop().cancellation_requested);
-    hold->release.set_value();
+    render.hold->release.set_value();
     REQUIRE(events.Wait([&] {
         const auto state = annotation.snapshot();
         return state.ready && !state.busy && state.input_document_epoch == prior.input_document_epoch + 1U;
@@ -5378,7 +5388,7 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
         }
     }
     CHECK_FALSE(std::filesystem::exists(destination));
-    CHECK(probe->samples.load() == 0U);
+    CHECK(render.probe->samples.load() == 0U);
     REQUIRE(retained.valid());
     retained = {};
     complete_annotation_box_drag(annotation, events, 1U);
@@ -5402,9 +5412,7 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
     }
     bool reject_incoming = false;
     EventGate events;
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [] { return std::make_unique<TestAnnotationAlgorithm>(); }),
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend),
                                 [&](const VisualFrame& frame) {
                                     auto borrowed = source.BorrowExact(frame);
                                     if (reject_incoming) borrowed.document = rejected_document;
@@ -5440,29 +5448,22 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
 TEST_CASE("Annotation reduces input and settles commands while rendering is held") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};
-    auto probe = std::make_shared<AnnotationRenderProbe>();
-    auto hold = std::make_shared<MutationCommitProbe>();
-    auto entered = hold->committed.get_future();
+    AnnotationRenderHold render;
     EventGate events;
     std::atomic_uint64_t held_scene{0U};
     std::atomic_bool older_completed{false};
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe),
                                 borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) { events.Advance(); },
                                 mmltk::testsupport::annotation_render_evidence()};
-    mmltk::testsupport::ScopedTestCleanup release{[&] {
-        mmltk::testsupport::release_test_promise(hold->release);
-        annotation.Shutdown();
-    }};
+    auto release = settle_annotation_on_exit(annotation, render.hold->release);
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     const auto initial = annotation.snapshot();
     {
-        std::scoped_lock lock(probe->mutex);
-        probe->hold = hold;
+        std::scoped_lock lock(render.probe->mutex);
+        render.probe->hold = render.hold;
     }
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}}));
-    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    REQUIRE(render.entered.wait_for(2s) == std::future_status::ready);
     held_scene = annotation.snapshot().ui.scene_revision;
     annotation.SetInputPeer(1U);
     for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Motion, WorkspaceMouseKind::Release}) {
@@ -5478,28 +5479,24 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     const auto document_epoch = annotation.snapshot().input_document_epoch;
     static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
     CHECK(annotation.Stop().cancellation_requested);
-    hold->release.set_value();
+    render.hold->release.set_value();
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     CHECK(annotation.snapshot().input_document_epoch == document_epoch);
     CHECK(annotation.snapshot().frame.revision > initial.frame.revision);
     mmltk::testsupport::await_annotation_render(annotation, events);
-    CHECK(probe->exact_content.load());
+    CHECK(render.probe->exact_content.load());
 }
 
 TEST_CASE("Annotation Open consumes retained prior-document input and accepts the replacement gesture") {
     const auto terminal = GENERATE(WorkspaceMouseKind::Release, WorkspaceMouseKind::Cancel);
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};
-    auto probe = std::make_shared<AnnotationRenderProbe>();
-    auto hold = std::make_shared<MutationCommitProbe>();
-    auto entered = hold->committed.get_future();
+    AnnotationRenderHold render;
     EventGate events;
     std::atomic_uint64_t failures{0U};
     std::mutex observations_mutex;
     std::vector<AnnotationSnapshot> replacements;
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe),
                                 borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
                                     if (const auto* changed = std::get_if<AnnotationChanged>(&event);
@@ -5509,21 +5506,18 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
                                     }
                                     events.Advance();
                                 }};
-    mmltk::testsupport::ScopedTestCleanup release{[&] {
-        mmltk::testsupport::release_test_promise(hold->release);
-        annotation.Shutdown();
-    }};
+    auto release = settle_annotation_on_exit(annotation, render.hold->release);
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     annotation.SetInputPeer(1U);
     auto right = mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Press, {3, 4});
     right.button = WorkspaceMouseButton::Right;
     annotation.Input(right);
     {
-        std::scoped_lock lock(probe->mutex);
-        probe->open_hold = hold;
+        std::scoped_lock lock(render.probe->mutex);
+        render.probe->open_hold = render.hold;
     }
     static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
-    REQUIRE(entered.wait_for(2s) == std::future_status::ready);
+    REQUIRE(render.entered.wait_for(2s) == std::future_status::ready);
     for (std::size_t index = 0U; index != 128U; ++index) {
         auto motion = right;
         motion.kind = WorkspaceMouseKind::Motion;
@@ -5535,7 +5529,7 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
     // This no-op tool command is an ordinary FIFO settlement boundary after
     // every old-document record, with no input acknowledgement or test hook.
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Select}}}));
-    hold->release.set_value();
+    render.hold->release.set_value();
     REQUIRE(events.Wait([&] {
         std::scoped_lock lock(observations_mutex);
         return replacements.size() >= 2U && !replacements.back().busy;
@@ -5597,28 +5591,14 @@ TEST_CASE("Workspace input retains ordered high-water records for independent na
 TEST_CASE("Annotation color sampling completes before following document commands under output pressure") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {32U, 32U}};
-    auto semantic = std::make_shared<VisualDocument>();
-    semantic->scene.document = contracts::WorkspaceResource::From("test://sample-mask", 1U);
-    semantic->scene.categories = {{.value = "object"}};
-    semantic->scene.objects = {
-        {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
+    auto semantic = annotation_mask_document("test://sample-mask");
     auto probe = std::make_shared<AnnotationRenderProbe>();
     auto sample = std::make_shared<MutationCommitProbe>();
     auto entered = sample->committed.get_future();
     EventGate events;
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                               [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                [&](const VisualFrame& frame) {
-                                    auto read = source.BorrowExact(frame);
-                                    read.document = semantic;
-                                    return read;
-                                },
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, probe), source.WithDocument(semantic),
                                 [&](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
-    mmltk::testsupport::ScopedTestCleanup release{[&] {
-        mmltk::testsupport::release_test_promise(sample->release);
-        annotation.Shutdown();
-    }};
+    auto release = settle_annotation_on_exit(annotation, sample->release);
     mmltk::testsupport::open_annotation(annotation, events, source.frame());
     auto edit = annotation.Edit({.edit = {.value = AnnotationObjectEdit{0U}}});
     mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
@@ -7413,6 +7393,17 @@ class WorkspaceChannelFixture final {
         return acquired;
     }
 
+    void ReleaseRead(Record acquired) {
+        acquired.opcode = Opcode::ReleaseSubmitted;
+        REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), acquired));
+        channel.pump();
+        REQUIRE(channel.take_source_transition());
+        REQUIRE(channel.read_settled({acquired.id_high, acquired.id_low}, {7U, 8U}, 9U, 1U));
+        Record settled{};
+        static_cast<void>(mmltk::testsupport::receive_workspace_record(peer.get(), settled));
+        CHECK(settled.opcode == Opcode::ReadSettled);
+    }
+
     Record AdmitArena(const Id id, const std::uint64_t generation, const bool direct = false) {
         auto layout = Layout(id);
         layout.direct_sampling = direct ? 1U : 0U;
@@ -7545,6 +7536,8 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     CHECK_FALSE(channel.terminal_error());
 }
 
+// CLEANUP-IGNORE: Binding replacement and mailbox-independent completion use the same fixture for different channel identities and
+// transition sequences.
 TEST_CASE("Scoped binding retirement preserves a replacement while an old physical read settles", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7567,14 +7560,7 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
     CHECK(fixture.channel.claimable(new_arena));
     fixture.Withdraw(old_arena);
     CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
-    acquired.opcode = abi::Opcode::ReleaseSubmitted;
-    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
-    fixture.channel.pump();
-    REQUIRE(fixture.channel.take_source_transition());
-    REQUIRE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
-    abi::Record settled{};
-    static_cast<void>(receive_workspace_record(fixture.peer.get(), settled));
-    CHECK(settled.opcode == abi::Opcode::ReadSettled);
+    fixture.ReleaseRead(acquired);
     fixture.Withdraw(source);
     fixture.Retire(source, 2U);
     fixture.Retire(old_arena, 1U);
@@ -7597,14 +7583,7 @@ TEST_CASE("A completed source can acquire and settle without any presented mailb
         fixture.channel.pump();
         REQUIRE(fixture.channel.take_source_transition());
         CHECK_FALSE(fixture.channel.read_settled(id, {7U, 8U}, 9U, 1U));
-        acquired.opcode = abi::Opcode::ReleaseSubmitted;
-        REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
-        fixture.channel.pump();
-        REQUIRE(fixture.channel.take_source_transition());
-        REQUIRE(fixture.channel.read_settled(id, {7U, 8U}, 9U, 1U));
-        abi::Record settled{};
-        static_cast<void>(receive_workspace_record(fixture.peer.get(), settled));
-        CHECK(settled.opcode == abi::Opcode::ReadSettled);
+        fixture.ReleaseRead(acquired);
     }
     REQUIRE(send_workspace_record(fixture.peer.get(), WorkspaceChannelFixture::Sample(arena)));
     fixture.channel.pump();
@@ -8188,6 +8167,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
 TEST_CASE("Presentation republishes an unchanged completed product after scoped binding retirement") {
     PresentationSourceFixture source;
     EventGate events;
+    // CLEANUP-IGNORE: This publication case starts admitted; the metadata case deliberately blocks publication before selecting its source.
     auto writer = std::make_shared<TestPresentationWriterState>();
     PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
                                     [&events](PresentationSystem::event_type) { events.Advance(); }};
@@ -9457,23 +9437,19 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     const bool fail_release = GENERATE(false, true);
     fixture::ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout(0));
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
+        backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
     auto observation = workspace->ObserveRetirement();
     std::exception_ptr producer_failure;
     unsigned failure_reports = 0U;
-    detail::VisualRuntimeOwner owner{
-        [backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-                .device = 0,
-                .backend = backend,
-                .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { fixture::CopyImagePlane(destination, clean); },
-                .product_revisions = std::move(revisions)});
-        },
-        [&](std::exception_ptr failure) {
-            producer_failure = failure;
-            ++failure_reports;
-        }};
+    detail::VisualRuntimeOwner owner{[backend](auto revisions) {
+                                         return std::make_unique<gpu::SystemImageRuntime>(
+                                             mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+                                     },
+                                     [&](std::exception_ptr failure) {
+                                         producer_failure = failure;
+                                         ++failure_reports;
+                                     }};
     std::promise<void> initialized;
     bool prepared = false;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -9584,8 +9560,8 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
     const bool producer_attached = GENERATE(false, true);
     fixture::ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout(1));
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
+        backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(1));
     auto observation = workspace->ObserveRetirement();
     std::unique_ptr<gpu::SystemImageRuntime> producer;
     if (producer_attached) {
@@ -9656,16 +9632,11 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
     using Access = test_support::NativePresentationWriterTestAccess;
     const bool terminal = GENERATE(false, true);
     const bool fail_release = GENERATE(false, true);
-    fixture::ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    gpu::SystemImageRuntime producer(
-        {.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-             fixture::CopyImagePlane(destination, clean);
-         }});
-    auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-    producer.Publish(4U, 3U, [](auto, auto, auto) {});
-    REQUIRE(producer.PrepareDisplay(producer.Completed().revision(), workspace));
+    mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources{true};
+    REQUIRE(resources.prepared);
+    auto& backend = resources.backend;
+    auto& producer = *resources.runtime;
+    auto& workspace = resources.workspace;
     REQUIRE(producer.DetachDisplay(workspace));
     REQUIRE(producer.Retire().safe_to_destroy);
     auto observation = workspace->ObserveRetirement();
@@ -9712,16 +9683,11 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
     const bool fail_release = GENERATE(false, true);
-    fixture::ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    gpu::SystemImageRuntime producer(
-        {.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-             fixture::CopyImagePlane(destination, clean);
-         }});
-    auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-    producer.Publish(4U, 3U, [](auto, auto, auto) {});
-    REQUIRE(producer.PrepareDisplay(producer.Completed().revision(), workspace));
+    mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources{true};
+    REQUIRE(resources.prepared);
+    auto& backend = resources.backend;
+    auto& producer = *resources.runtime;
+    auto& workspace = resources.workspace;
     auto completion = std::move(producer.BorrowWorkspace()).TakeCompletion();
     auto observation = workspace->ObserveRetirement();
     auto retirement = producer.Retire();
@@ -9752,10 +9718,9 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
 TEST_CASE("Native pending allocation release wakes retirement without treating a wake as completion", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
-    fixture::ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    auto attempt = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
-    attempt->Admit(attempt->identity(), attempt->layout().device_incarnation);
+    mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources;
+    auto& backend = resources.backend;
+    auto& attempt = resources.workspace;
     auto observation = attempt->ObserveRetirement();
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-pending-retirement"};
     auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend),
@@ -9780,10 +9745,9 @@ TEST_CASE("Native pending allocation release wakes retirement without treating a
 TEST_CASE("Native terminal retirement observes independently completing detached allocation cleanup", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
-    fixture::ImageWorkspaceTestAccess::Reset();
-    auto backend = std::make_shared<FakeImageBackend>();
-    auto attempt = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
-    attempt->Admit(attempt->identity(), attempt->layout().device_incarnation);
+    mmltk::frameworks::gpu::test_support::WorkspaceTestFixture resources;
+    auto& backend = resources.backend;
+    auto& attempt = resources.workspace;
     auto observation = attempt->ObserveRetirement();
     std::promise<void> releasing;
     VisualDiagnosticSink diagnostics{.context = &releasing, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
@@ -9869,8 +9833,8 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
         return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
     }));
     mmltk::testsupport::await_test_promise(published, "workspace source publication");
-    auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
-    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
+        backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout());
     auto observation = workspace->ObserveRetirement();
     auto raw = outcome == 2U ? gpu::BorrowedImageProductReadView{} : owner.Borrow();
     const auto source = owner.ObserveWorkspace();
@@ -10110,18 +10074,14 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
     namespace gpu = mmltk::frameworks::gpu;
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_notifications = true;
-    const auto factory = [backend](auto revisions) {
-        return std::make_unique<gpu::SystemImageRuntime>(
-            gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-    };
+    const auto factory = RuntimeFactory(0, backend);
     std::promise<void> failure, submitted, completed, following, independent, second_submitted;
     std::uintptr_t first_stream = 0U, second_stream = 0U;
     std::atomic<unsigned> order{0U};
     detail::VisualRuntimeOwner first(factory, [&](auto) { failure.set_value(); });
     detail::VisualRuntimeOwner second(factory, [&](auto) { failure.set_value(); });
     const bool submitted_first = first.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        auto candidate = runtime.AcquireOutput();
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { first_stream = stream; }, gpu::ImageSubmission::Enqueue);
+        auto candidate = enqueue_test_output(runtime, first_stream);
         first.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
             runtime.CommitOutput(std::move(candidate));
             CHECK(order.fetch_add(1U) == 0U);
@@ -10138,8 +10098,7 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
     });
     REQUIRE(submitted_following);
     REQUIRE(second.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        auto candidate = runtime.AcquireOutput();
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { second_stream = stream; }, gpu::ImageSubmission::Enqueue);
+        auto candidate = enqueue_test_output(runtime, second_stream);
         second.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
             runtime.CommitOutput(std::move(candidate));
             independent.set_value();
@@ -10172,19 +10131,11 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
     std::promise<std::exception_ptr> failed;
     std::promise<void> submitted;
     std::atomic_uint failures{0U}, completions{0U};
-    detail::VisualRuntimeOwner owner(
-        [backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(
-                gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-        },
-        [&](auto error) {
-            if (failures.fetch_add(1U) == 0U) failed.set_value(error);
-        });
+    detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), first_visual_failure(failures, failed));
     auto admitted = backend->ObserveNextNotificationStream();
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        auto candidate = runtime.AcquireOutput();
         std::uintptr_t stream = 0U;
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, gpu::ImageSubmission::Enqueue);
+        auto candidate = enqueue_test_output(runtime, stream);
         if (registration_failure)
             backend->FailAfter(FakeImageBackend::FailurePoint::NotifyStream, 0U, expected);
         else
@@ -10214,12 +10165,7 @@ TEST_CASE("Stopping a deferred product settles pending notification before candi
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_notifications = true;
     std::atomic_uint completions{0U}, failures{0U};
-    detail::VisualRuntimeOwner owner(
-        [backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(
-                gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-        },
-        [&](auto) { ++failures; });
+    detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), [&](auto) { ++failures; });
     auto admitted = backend->ObserveNextNotification();
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
@@ -10253,20 +10199,11 @@ TEST_CASE("Terminal product notification reports unproved settlement with physic
     std::promise<std::exception_ptr> failed;
     std::atomic_uint failures{0U}, completions{0U};
     {
-        detail::VisualRuntimeOwner owner(
-            [backend](auto revisions) {
-                return std::make_unique<gpu::SystemImageRuntime>(
-                    gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-            },
-            [&](auto failure) {
-                if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-            });
+        detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend), first_visual_failure(failures, failed));
         auto admitted = backend->ObserveNextNotificationStream();
         REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-            auto candidate = runtime.AcquireOutput();
             std::uintptr_t stream = 0U;
-            runtime.PublishRetained(
-                candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, gpu::ImageSubmission::Enqueue);
+            auto candidate = enqueue_test_output(runtime, stream);
             backend->SetStreamSettlement(stream, {.failure = expected});
             owner.DeferCompletion(runtime, [candidate = std::move(candidate), &completions] { ++completions; });
             return detail::VisualRuntimeOwner::Notification{};
@@ -10334,9 +10271,7 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
                                               .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend),
                                               .product_revisions = std::move(revisions)});
         },
-        [&](auto failure) {
-            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-        });
+        first_visual_failure(failures, failed));
     std::promise<void> published;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
@@ -10346,8 +10281,8 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     }));
     mmltk::testsupport::await_test_promise(published, "initial display product");
     auto make_workspace = [&] {
-        auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout(0));
-        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
+            backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
         return workspace;
     };
     ProducerWorkspaceRequest previous{.workspace = make_workspace()};

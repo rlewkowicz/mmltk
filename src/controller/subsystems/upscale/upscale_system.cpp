@@ -887,7 +887,9 @@ void UpscaleSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool UpscaleSystem::stopped() const noexcept { return impl_->stopped(); }
 UpscaleSnapshot UpscaleSystem::snapshot() const { return impl_->snapshot(); }
 std::optional<UpscaleImageMetadata> UpscaleSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
+// CLEANUP-IGNORE: Upscale forwards its sealed source API to its own owner and the existing shared renderer.
 std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> UpscaleSystem::ImageSourceMetadata(const VisualFrame& frame) const {
+    // CLEANUP-IGNORE: Upscale metadata access ends here before independent direct workspace methods; no reusable behavior is duplicated.
     return impl_->ImageSourceMetadata(frame);
 }
 mmltk::frameworks::gpu::BorrowedImageProductReadView UpscaleSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

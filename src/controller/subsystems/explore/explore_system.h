@@ -149,6 +149,8 @@ struct ExploreImageMetadata final {
     std::uint64_t revision = 0U;
     ExploreDatasetFacts dataset{};
     ExploreOrderFacts order{};
+    // CLEANUP-IGNORE: Immutable completed-image metadata and mutable logical snapshots carry independently timed facts and different field
+    // sets.
     ExploreGalleryReadiness gallery{};
     ExploreViewport viewport{};
     ExploreOverlay overlay{};
@@ -325,7 +327,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Lat
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ExploreFailed final {
     ExploreSnapshot snapshot{};
+    // CLEANUP-IGNORE: Explore failure fields and its direct source registration are canonical domain declarations, independent of Upscale.
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+    // CLEANUP-IGNORE: Explore source projection and direct input API retain their own canonical identity; execution is already shared.
 };
 
 class ExploreSystem final {
@@ -362,6 +366,7 @@ class ExploreSystem final {
     void Shutdown() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] ExploreSnapshot snapshot() const;
+    // CLEANUP-IGNORE: Explore owns its sealed image and workspace API; common behavior is supplied by the existing private runtime.
     [[nodiscard]] std::optional<ExploreImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;

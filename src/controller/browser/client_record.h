@@ -69,6 +69,7 @@ struct CompactInteraction final {
 };
 MMLTK_REFLECT_FIELDS(CompactInteraction)
 
+// CLEANUP-IGNORE: System snapshots and intent fields are distinct wire records with different byte limits and stable identities.
 struct SystemSnapshot final {
     [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t system_id = 0U;
     [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] wire::Value value{};

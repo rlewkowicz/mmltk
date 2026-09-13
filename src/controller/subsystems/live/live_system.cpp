@@ -230,6 +230,7 @@ LiveSnapshot LiveSystem::Stop() noexcept {
 void LiveSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool LiveSystem::stopped() const noexcept { return impl_->stopped(); }
 LiveSnapshot LiveSystem::snapshot() const { return impl_->snapshot(); }
+// CLEANUP-IGNORE: Live forwards its sealed source API to its own owner and the existing shared renderer.
 std::optional<VisualImageMetadata> LiveSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView LiveSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace LiveSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }

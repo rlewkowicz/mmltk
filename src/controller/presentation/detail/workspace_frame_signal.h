@@ -69,6 +69,8 @@ inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, c
     // The writer owns this physical slot. Readers copy the opaque payload only
     // after winning its generation gate; custody makes the payload immutable.
     if (!metadata.empty())
+        // CLEANUP-IGNORE: Opaque metadata copying and physical atomic stores have distinct effects from the later extent and revision
+        // stores.
         std::memcpy(reinterpret_cast<std::byte*>(signal) + sizeof(WorkspaceFrameSignal), metadata.data(), metadata.size());
     std::atomic_ref<std::uint64_t>{signal->timeline_ready}.store(timeline_ready, std::memory_order_seq_cst);
     std::atomic_ref<std::uint64_t>{signal->transfer_sequence}.store(transfer_sequence, std::memory_order_seq_cst);

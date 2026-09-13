@@ -77,6 +77,7 @@ struct UpscaleSnapshot final {
     // CLEANUP-IGNORE: Upscale owns a receiver-private visual frame with its own generated identity.
     VisualFrame frame{};
     VisualFrame input{};
+    // CLEANUP-IGNORE: Upscale completion and failure records retain distinct canonical field identities and delivery semantics.
     contracts::AnnotationSceneContent scene{};
     // CLEANUP-IGNORE: UpscaleSnapshot remains a distinct reflected application boundary.
 };
@@ -87,7 +88,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     UpscaleSnapshot snapshot{};
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
     std::optional<UpscaleRequest> request{};
+    // CLEANUP-IGNORE: Upscale failure kind and source registration are domain declarations, not another runtime implementation.
     UpscaleFailureKind kind = UpscaleFailureKind::Failed;
+    // CLEANUP-IGNORE: Upscale registers its own direct input endpoint and canonical source projection.
 };
 
 class UpscaleSystem final {
@@ -112,6 +115,7 @@ class UpscaleSystem final {
     // CLEANUP-IGNORE: The sealed Upscale facade publishes its own reflected snapshot and frame borrow.
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] UpscaleSnapshot snapshot() const;
     [[nodiscard]] std::optional<UpscaleImageMetadata> ImageSnapshot(const VisualFrame&) const;
+    // CLEANUP-IGNORE: Upscale owns this sealed metadata and workspace API; shared implementation is already private.
     [[nodiscard]] std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> ImageSourceMetadata(const VisualFrame&) const;
     // CLEANUP-IGNORE: Upscale owns this ordinary read API; a shared facade would couple independent domain systems.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;

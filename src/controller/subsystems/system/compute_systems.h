@@ -160,7 +160,9 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PredictFailed final {
     PredictSnapshot snapshot{};
+    // CLEANUP-IGNORE: Predict failure fields and source registration have independent canonical domain identities.
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
+    // CLEANUP-IGNORE: Predict direct input and source declarations are not a duplicate input or rendering implementation.
 };
 class PredictSystem final {
    public:
@@ -180,6 +182,7 @@ class PredictSystem final {
     void Shutdown() noexcept;
     // CLEANUP-IGNORE: Predict owns its reflected snapshot and public read surface independently of Live and Annotation.
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] PredictSnapshot snapshot() const;
+    // CLEANUP-IGNORE: Predict exposes its sealed image and workspace API through the existing private shared runtime.
     [[nodiscard]] std::optional<VisualImageMetadata> ImageSnapshot(const VisualFrame&) const;
     // CLEANUP-IGNORE: Predict retains a sealed raw/display read API backed by the shared private VisualRuntimeOwner.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;

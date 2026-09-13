@@ -472,22 +472,19 @@ class AnnotationSystem::Impl final {
             }))
             throw contracts::UnavailableError("Annotation color sampling is unavailable");
     }
-    void InstallUi(bool settle) {
-        AnnotationSnapshot installed;
-        {
-            std::scoped_lock lock(mutex_);
-            state_.ui = document_.ui();
-            if (settle) {
-                active_command_ = false;
-                if (pending_commands_) --pending_commands_;
-                state_.busy = pending_commands_ != 0U || sampling_;
-                state_.cancellation_requested = false;
-            }
-            AdvanceUi();
-            installed = state_;
+    AnnotationSnapshot CaptureUi(bool settle) {
+        std::scoped_lock lock(mutex_);
+        state_.ui = document_.ui();
+        if (settle) {
+            active_command_ = false;
+            if (pending_commands_) --pending_commands_;
+            state_.busy = pending_commands_ != 0U || sampling_;
+            state_.cancellation_requested = false;
         }
-        Publish(AnnotationChanged{std::move(installed)});
+        AdvanceUi();
+        return state_;
     }
+    void InstallUi(bool settle) { Publish(AnnotationChanged{CaptureUi(settle)}); }
     void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description,
                         const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
         diagnostics_.Emit([&] {
@@ -590,22 +587,7 @@ class AnnotationSystem::Impl final {
             DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, completed_description, &pending_baseline_, frame.revision);
         });
     }
-    void Reject(std::string detail, bool settle) {
-        AnnotationSnapshot failed;
-        {
-            std::scoped_lock lock(mutex_);
-            state_.ui = document_.ui();
-            if (settle) {
-                active_command_ = false;
-                if (pending_commands_) --pending_commands_;
-                state_.busy = pending_commands_ != 0U || sampling_;
-                state_.cancellation_requested = false;
-            }
-            AdvanceUi();
-            failed = state_;
-        }
-        Publish(AnnotationFailed{std::move(failed), std::move(detail)});
-    }
+    void Reject(std::string detail, bool settle) { Publish(AnnotationFailed{CaptureUi(settle), std::move(detail)}); }
     void RendererFailed(std::exception_ptr failure) noexcept {
         pending_baseline_ = {};
         clean_epoch_ = clean_revision_ = 0U;
@@ -692,6 +674,7 @@ AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot()
 std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const {
     return impl_->ImageSnapshot(frame);
 }
+// CLEANUP-IGNORE: Annotation forwards its sealed source API to its own owner and the existing shared renderer.
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace AnnotationSystem::BorrowWorkspace() const { return impl_->renderer_.BorrowWorkspace(); }

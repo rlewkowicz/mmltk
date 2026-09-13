@@ -109,6 +109,11 @@ struct ImageWorkspaceTestAccess final {
     static std::shared_ptr<ImageWorkspace> Create(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
         return Create(DeviceContext(layout.device, std::move(backend)), std::move(layout));
     }
+    static std::shared_ptr<ImageWorkspace> CreateAdmitted(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
+        auto workspace = Create(std::move(backend), std::move(layout));
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+        return workspace;
+    }
     static void Reset() noexcept {
         initialize_failure = {};
         alias_failure = {};
@@ -155,6 +160,23 @@ inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneVie
         std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes,
                     reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
     }
+}
+
+[[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(std::shared_ptr<ImageCopyBackend> backend,
+                                                                     std::shared_ptr<ImageProductRevisionSequence> revisions = {}) {
+    return {.device = 0,
+            .backend = std::move(backend),
+            .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },
+            .product_revisions = std::move(revisions)};
+}
+
+[[nodiscard]] inline std::pair<std::shared_ptr<ImageWorkspace>, bool> PublishTestWorkspace(SystemImageRuntime& runtime,
+                                                                                           std::shared_ptr<ImageCopyBackend> backend,
+                                                                                           const int device = 1) {
+    auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(std::move(backend), ImageWorkspaceTestAccess::Layout(device));
+    runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+    const bool prepared = runtime.PrepareDisplay(runtime.Completed().revision(), workspace);
+    return {std::move(workspace), prepared};
 }
 
 class FakeImageBackend final : public ImageCopyBackend {
@@ -508,6 +530,26 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::exception_ptr injected_failure_;
     int failed_binding_device_ = -1;
     std::exception_ptr device_binding_failure_;
+};
+
+struct WorkspaceTestFixture final {
+    std::shared_ptr<FakeImageBackend> backend;
+    std::unique_ptr<SystemImageRuntime> runtime;
+    std::shared_ptr<ImageWorkspace> workspace;
+    bool prepared = false;
+
+    explicit WorkspaceTestFixture(const bool publish_product = false) {
+        ImageWorkspaceTestAccess::Reset();
+        backend = std::make_shared<FakeImageBackend>();
+        if (publish_product) {
+            runtime = std::make_unique<SystemImageRuntime>(WorkspaceRuntimeConfig(backend));
+            auto publication = PublishTestWorkspace(*runtime, backend);
+            workspace = std::move(publication.first);
+            prepared = publication.second;
+        } else {
+            workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout());
+        }
+    }
 };
 
 [[nodiscard]] inline ImageWorkspaceFinalize FakeWorkspaceFinalizer(std::shared_ptr<FakeImageBackend> backend) {

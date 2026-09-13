@@ -904,30 +904,21 @@ mod tests {
             kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
             sample: gallery_sample(150, 150),
         };
-        assert!(
-            state
-                .gallery_hover
-                .capture(
-                    source.as_ref(),
-                    Some(&ExploreImageMetadata::from(&changed)),
-                    gesture,
-                    true
-                )
-                .is_none()
-        );
-        changed = snapshot.clone();
-        changed.dataset.identity += 1;
-        assert!(
-            state
-                .gallery_hover
-                .capture(
-                    source.as_ref(),
-                    Some(&ExploreImageMetadata::from(&changed)),
-                    gesture,
-                    true
-                )
-                .is_none()
-        );
+        let mut other_dataset = snapshot.clone();
+        other_dataset.dataset.identity += 1;
+        for mismatch in [&changed, &other_dataset] {
+            assert!(
+                state
+                    .gallery_hover
+                    .capture(
+                        source.as_ref(),
+                        Some(&ExploreImageMetadata::from(mismatch)),
+                        gesture,
+                        true
+                    )
+                    .is_none()
+            );
+        }
         assert!(
             state
                 .gallery_hover
