@@ -52,6 +52,7 @@ class GalleryAtlas final {
         std::uint32_t columns = 0U;
         std::uint32_t rows = 0U;
         std::uint64_t layout_generation = 0U;
+        std::uint64_t revision = 0U;
         std::vector<Cell> cells;
     };
     struct Write final {
@@ -60,6 +61,7 @@ class GalleryAtlas final {
     };
     std::array<Allocation, 3U> allocations_{};
     Allocation* active_ = nullptr;
+    std::uint64_t pending_revision_ = 0U;
     ExploreAtlasLayout layout_{};
     std::vector<Write> writes_;
     std::vector<mmltk::frameworks::gpu::ImageWorkspaceRegion> coverage_;

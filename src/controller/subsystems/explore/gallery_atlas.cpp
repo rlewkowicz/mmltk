@@ -32,6 +32,7 @@ ExploreAtlasLayout GalleryAtlas::Begin(const mmltk::frameworks::gpu::ImagePlaneV
         found->columns = viewport.columns;
         found->rows = rows;
         found->layout_generation = mmltk::common::types::advance_monotonic_identity(found->layout_generation);
+        found->revision = 0U;
     }
     writes_.reserve(2U * found->cells.size());
     active_ = &*found;
@@ -61,7 +62,9 @@ void GalleryAtlas::Stage(const std::size_t physical, std::shared_ptr<const Galle
 }
 mmltk::frameworks::gpu::ImageWorkspaceCoverage GalleryAtlas::WorkspaceCoverage(
     const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) {
-    if (!active_ || !output.workspace || active_->clean.owner != output.product_owner) return {};
+    if (!active_ || active_->clean.owner != output.product_owner) return {};
+    pending_revision_ = output.product_revision;
+    if (!output.workspace) return {};
     coverage_.clear();
     coverage_.reserve(active_->cells.size());
     for (const auto& write : writes_) {
@@ -70,9 +73,10 @@ mmltk::frameworks::gpu::ImageWorkspaceCoverage GalleryAtlas::WorkspaceCoverage(
         const auto extent = static_cast<std::int32_t>(layout_.card_extent);
         coverage_.push_back({x, y, x + extent, y + extent});
     }
-    return {output.workspace->identity(), coverage_, false};
+    return {output.workspace->identity(), coverage_, false, {output.product_owner, active_->revision}};
 }
 void GalleryAtlas::Commit() noexcept {
+    if (active_) active_->revision = pending_revision_;
     if (active_)
         for (auto& write : writes_)
             active_->cells[write.physical] = std::move(write.cell);
@@ -82,6 +86,7 @@ void GalleryAtlas::Rollback() noexcept {
     writes_.clear();
     coverage_.clear();
     active_ = nullptr;
+    pending_revision_ = 0U;
 }
 void GalleryAtlas::Invalidate(const mmltk::frameworks::gpu::ImageAllocation facts) noexcept {
     if (facts.owner == 0U || facts.identity == 0U) return;

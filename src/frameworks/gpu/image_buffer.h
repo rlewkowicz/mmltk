@@ -9,11 +9,13 @@
 #include <functional>
 #include <exception>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 
 #include "src/frameworks/gpu/image_geometry.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/image_types.h"
+#include "src/frameworks/gpu/image_product_retirement.h"
 #include "src/frameworks/gpu/image_workspace.h"
 
 namespace mmltk::frameworks::gpu {
@@ -122,6 +124,7 @@ class BorrowedImageReadView final {
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] int device() const noexcept;
     [[nodiscard]] bool UsesContext(const DeviceContext&) const noexcept;
+    [[nodiscard]] DeviceContext context() const;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] ImagePlaneView plane() const noexcept;
     // Terminal receiver custody: retain physical storage, reject future source
@@ -215,7 +218,7 @@ class ImageProductReadCompletion final {
 
 class ImageProductBuffer final {
    public:
-    ImageProductBuffer(DeviceContext, ImageProductLayout);
+    ImageProductBuffer(DeviceContext, ImageProductLayout, std::shared_ptr<ImageProductRetirement> = {});
     ~ImageProductBuffer();
     ImageProductBuffer(const ImageProductBuffer&) = delete;
     ImageProductBuffer& operator=(const ImageProductBuffer&) = delete;
@@ -229,9 +232,6 @@ class ImageProductBuffer final {
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {},
                                                          bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
-    [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
-    [[nodiscard]] bool DetachWorkspace(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
-    void FinalizeWorkspace(ImageWorkspaceCoverage = {});
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
     [[nodiscard]] ImageStreamSettlement SettleWorkspace() noexcept;
@@ -248,6 +248,9 @@ class ImageProductBuffer final {
     friend class ImageWorkspace;
     void AdoptExternalPlane(std::shared_ptr<void> custody, std::size_t bytes, ImagePlaneView);
     friend class ImageProductPool;
+    [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool DetachWorkspace(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
+    void FinalizeWorkspace(ImageWorkspaceCoverage = {});
     friend class BorrowedImageProductReadView;
     friend class ImageStream;
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);

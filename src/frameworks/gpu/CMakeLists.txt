@@ -15,6 +15,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         image_buffer.h
         image_failure.h
         image_product_pool.h
+        image_product_retirement.h
         image_types.h
         image_workspace.h
         imported_image_buffer.h

@@ -61,6 +61,7 @@ mmltk_register_retained_module_importers(
     workspace_surface_import_channel.cpp)
 mmltk_register_private_headers(
     mmltk_controller_presentation_system
+    detail/native_presentation_writer_test_access.h
     detail/workspace_frame_signal.h
     detail/workspace_surface_import_abi.h
     detail/workspace_surface_import_channel.h

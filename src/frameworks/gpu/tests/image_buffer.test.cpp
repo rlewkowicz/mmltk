@@ -1440,70 +1440,50 @@ TEST_CASE("Display context rebinding shares same-device custody and cleans parti
     CHECK(backend->streams_destroyed == 1U);
 }
 
-TEST_CASE("Failed workspace import closes its runtime family only when cleanup is unsafe", "[gpu][workspace]") {
+TEST_CASE("Display import failure retains independent backing and reports cleanup failure", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     using test_support::ImportedImageBufferTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
-    ImageWorkspaceTestAccess::Install(*runtime);
+    SystemImageRuntime runtime({.device = 0, .backend = backend});
     const auto initiating = std::make_exception_ptr(std::invalid_argument("rejected workspace initialization"));
     ImageWorkspaceTestAccess::initialize_failure = initiating;
     ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
     std::exception_ptr failure;
-    try {
-        auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-    } catch (...) { failure = std::current_exception(); }
+    try { workspace->Admit(workspace->identity(), workspace->layout().device_incarnation); }
+    catch (...) { failure = std::current_exception(); }
     REQUIRE(failure);
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(is_image_execution_failure(failure));
+    CHECK(workspace->retired());
+    CHECK_THROWS(workspace->Admit(workspace->identity(), workspace->layout().device_incarnation));
+    workspace.reset();
     CHECK(ImportedImageBufferTestAccess::unmaps == 1U);
     CHECK(backend->contexts_destroyed == 0U);
-    CHECK(backend->streams_destroyed == 0U);
-    ImageWorkspaceTestAccess::initialize_failure = {};
-    CHECK_THROWS(runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
-    CHECK(ImageWorkspaceTestAccess::initialized == 1U);
-    // The independently healthy source context cannot erase the display failure.
-    runtime->BindContext();
-    auto retirement = runtime->Retire();
-    CHECK_FALSE(retirement.safe_to_destroy);
-    REQUIRE(retirement.custody.valid());
-    CHECK_FALSE(retirement.custody.deferred());
-    CHECK(test_support::ContainsImageFailure(retirement.failure, initiating));
-    CHECK(test_support::ContainsImageFailure(retirement.custody.failure(), initiating));
-    CHECK_FALSE(runtime->Retire().safe_to_destroy);
-    runtime.reset();
-    CHECK(backend->contexts_destroyed == 0U);
-    CHECK(backend->streams_destroyed == 0U);
+    CHECK(runtime.Retire().safe_to_destroy);
     ImageWorkspaceTestAccess::Reset();
 }
 
-TEST_CASE("Partial workspace stream construction retains display context and both failures", "[gpu][workspace]") {
+TEST_CASE("Partial display stream construction retains its context and both failures", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime runtime({.device = 0, .backend = backend});
-    ImageWorkspaceTestAccess::Install(runtime);
     const auto initiating = std::make_exception_ptr(std::runtime_error("display stream creation failed"));
     const auto cleanup = std::make_exception_ptr(std::runtime_error("display context unavailable during cleanup"));
     backend->FailAfter(FakeImageBackend::FailurePoint::CreateStream, 0U, initiating);
     backend->FailDeviceBinding(1, cleanup);
     std::exception_ptr failure;
-    try {
-        static_cast<void>(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
-    } catch (...) { failure = std::current_exception(); }
+    try { static_cast<void>(ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout())); }
+    catch (...) { failure = std::current_exception(); }
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(test_support::ContainsImageFailure(failure, cleanup));
     CHECK(backend->contexts_created == 2U);
     CHECK(backend->contexts_destroyed == 0U);
     CHECK(ImageWorkspaceTestAccess::initialized == 0U);
     runtime.BindContext();
-    const auto retirement = runtime.Retire();
-    CHECK_FALSE(retirement.safe_to_destroy);
-    CHECK(test_support::ContainsImageFailure(retirement.failure, initiating));
-    CHECK(test_support::ContainsImageFailure(retirement.failure, cleanup));
-    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    CHECK(runtime.Retire().safe_to_destroy);
 }
 
 TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admission", "[gpu][workspace]") {
@@ -1511,25 +1491,24 @@ TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admi
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime runtime({.device = 0, .backend = backend});
-    ImageWorkspaceTestAccess::Install(runtime);
     auto layout = ImageWorkspaceTestAccess::Layout();
     layout.pitch_bytes = 1U;
-    CHECK_THROWS_AS(runtime.CreateWorkspace(layout), std::invalid_argument);
-    CHECK(backend->contexts_created == 1U);
+    CHECK_THROWS_AS(test_support::ImageWorkspaceTestAccess::Create(backend, layout), std::invalid_argument);
+    CHECK(backend->contexts_created == 2U);
     ImageWorkspaceTestAccess::initialize_failure = std::make_exception_ptr(std::invalid_argument("rejected UUID"));
     {
-        auto rejected = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        auto rejected = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
         CHECK_THROWS_AS(rejected->Admit(rejected->identity(), rejected->layout().device_incarnation), std::invalid_argument);
     }
-    CHECK(backend->contexts_destroyed == 1U);
+    CHECK(backend->contexts_destroyed == 2U);
     CHECK(backend->streams_destroyed == 1U);
     CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
     ImageWorkspaceTestAccess::initialize_failure = {};
-    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    auto workspace = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
     CHECK_THROWS_AS(workspace->Admit(workspace->identity(), 99U), std::invalid_argument);
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     workspace.reset();
-    auto retry = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    auto retry = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
     mmltk::common::io::ScopedFd queued(::memfd_create("pending-backing", MFD_CLOEXEC));
     const int descriptor = queued.get();
     REQUIRE(descriptor >= 0);
@@ -1546,20 +1525,26 @@ TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admi
 
 struct WorkspaceRuntimeFixture final {
     std::shared_ptr<FakeImageBackend> backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime{{.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}}};
+    DeviceContext display{0, backend};
+    SystemImageRuntime runtime{{.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+        test_support::CopyImagePlane(destination, clean);
+    }}};
 
-    WorkspaceRuntimeFixture() {
-        test_support::ImageWorkspaceTestAccess::Reset();
-        test_support::ImageWorkspaceTestAccess::Install(runtime);
-    }
+    WorkspaceRuntimeFixture() { test_support::ImageWorkspaceTestAccess::Reset(); }
 
     auto PublishWorkspace(const int device) {
-        auto workspace = runtime.CreateWorkspace(test_support::ImageWorkspaceTestAccess::Layout(device));
+        auto workspace = test_support::ImageWorkspaceTestAccess::Create(display.OnDevice(device),
+                                                                         test_support::ImageWorkspaceTestAccess::Layout(device));
         workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        auto output = runtime.AcquireOutput();
-        REQUIRE(runtime.ConfigureWorkspace(output, workspace));
-        runtime.Publish(output, 4U, 3U, [](auto, auto, auto) {});
-        return std::pair{std::move(workspace), runtime.CommitOutput(std::move(output))};
+        runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        });
+        REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
+        // The next clean publication exercises the production direct-alias path.
+        runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+            std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height);
+        });
+        return std::pair{std::move(workspace), runtime.Completed()};
     }
 };
 
@@ -1656,7 +1641,8 @@ TEST_CASE("Shared display custody detaches raw aliases and never overwrites an u
 TEST_CASE("Two completed display offers settle independently without mailbox custody", "[gpu][workspace][display]") {
     WorkspaceRuntimeFixture fixture;
     auto [older, older_product] = fixture.PublishWorkspace(0);
-    auto [newer, newer_product] = fixture.PublishWorkspace(0);
+    WorkspaceRuntimeFixture other;
+    auto [newer, newer_product] = other.PublishWorkspace(0);
     REQUIRE(older->ReserveDisplayWrite());
     REQUIRE(newer->ReserveDisplayWrite());
     older->CancelWrite();
@@ -1726,9 +1712,8 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime runtime(
         {.device = 0, .backend = backend, .output_buffer_count = 2U, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
-    ImageWorkspaceTestAccess::Install(runtime);
     const auto workspace = [&] {
-        auto result = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+        auto result = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
         result->Admit(result->identity(), result->layout().device_incarnation);
         return result;
     };
@@ -1742,9 +1727,9 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     WorkspaceAccessPeer current_peer(current);
     WorkspaceAccessPeer overflow_peer(overflow);
     auto candidate = runtime.AcquireOutput();
-    REQUIRE(runtime.ConfigureWorkspace(candidate, current));
     runtime.Publish(candidate, 4U, 3U, fill(11U));
     auto baseline = runtime.CommitOutput(std::move(candidate));
+    REQUIRE(runtime.PrepareDisplay(baseline.revision(), current));
     const auto held_revision = current->revision();
     auto current_read = baseline.BorrowWorkspace();
     REQUIRE(current_read.valid());
@@ -1754,24 +1739,30 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     CHECK_FALSE(current->ReserveWrite());
     candidate = runtime.TryAcquireOutput(baseline);
     REQUIRE(candidate.valid());
-    REQUIRE(runtime.ConfigureWorkspace(candidate, overflow));
     runtime.Publish(candidate, 4U, 3U, fill(22U));
     baseline = runtime.CommitOutput(std::move(candidate));
+    REQUIRE(runtime.PrepareDisplay(baseline.revision(), overflow));
 
     const auto old_access = overflow_peer.Access();
     const auto old_revision = overflow->revision();
     const auto copies = backend->same_copies.load();
+    REQUIRE(overflow->ReserveDisplayWrite());
+    overflow->InvalidateWrite();
     candidate = runtime.TryAcquireOutput(baseline);
     REQUIRE(candidate.valid());
     CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
     runtime.Publish(candidate, 4U, 3U, fill(33U));
     baseline = runtime.CommitOutput(std::move(candidate));
+    REQUIRE(runtime.PrepareDisplay(baseline.revision(), overflow));
+    overflow->CancelDisplayWrite();
     CHECK(backend->same_copies == copies);
     CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
     CHECK(current->revision() == held_revision);
     CHECK(*reinterpret_cast<const std::uint8_t*>(current_pointer) == 11U);
     REQUIRE(overflow_peer.Acquire(overflow_peer.Access(), overflow->revision()));
-    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    auto raw_progress = runtime.TryAcquireOutput(baseline);
+    REQUIRE(raw_progress.valid());
+    raw_progress = {};
     CHECK_FALSE(overflow->ReserveWrite());
     current_peer.Release();
     candidate = runtime.TryAcquireOutput(baseline);
@@ -1894,36 +1885,104 @@ TEST_CASE("Lost acquisition notification requires the exact terminal completion 
     CHECK_FALSE(peer.Acquire(peer.Access(), revision));
 }
 
-TEST_CASE("Replacing a workspace reports last-owner cleanup failure through the runtime", "[gpu][workspace]") {
-    using test_support::ImageWorkspaceTestAccess;
-    WorkspaceRuntimeFixture fixture;
-    auto& runtime = fixture.runtime;
-    auto candidate = runtime.AcquireOutput();
-    auto first = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-    first->Admit(first->identity(), first->layout().device_incarnation);
-    REQUIRE(runtime.ConfigureWorkspace(candidate, std::move(first)));
-    auto replacement = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-    replacement->Admit(replacement->identity(), replacement->layout().device_incarnation);
-    auto not_admitted = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
-    test_support::ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
-    CHECK_THROWS(runtime.ConfigureWorkspace(candidate, std::move(replacement)));
-    CHECK_THROWS(not_admitted->Admit(not_admitted->identity(), not_admitted->layout().device_incarnation));
-    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
-    const auto retirement = runtime.Retire();
-    CHECK_FALSE(retirement.safe_to_destroy);
-    CHECK(retirement.failure);
-    CHECK(retirement.custody.valid());
-    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
-    ImageWorkspaceTestAccess::Reset();
-}
-
-TEST_CASE("Delayed workspace release reports physical failure through retained runtime custody", "[gpu][workspace]") {
+TEST_CASE("Completed producer alias failure clears the old mapping and permits a fresh context retry", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
-    ImageWorkspaceTestAccess::Install(*runtime);
-    auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    const auto finalize = [](auto clean, auto, auto destination, auto, auto) {
+        test_support::CopyImagePlane(destination, clean);
+    };
+    auto first = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend, .workspace_finalize = finalize});
+    auto second = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend, .workspace_finalize = finalize});
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    first->Publish(4U, 3U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 17, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    REQUIRE(first->PrepareDisplay(first->Completed().revision(), workspace));
+    const auto failure = std::make_exception_ptr(std::runtime_error("completed prior alias execution"));
+    // Workspace settlement visits the display stream, then its distinct
+    // producer-context alias stream.
+    backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 1U, failure);
+    const auto prior = workspace->Settle();
+    REQUIRE(prior.completion_reached);
+    CHECK(test_support::ContainsImageFailure(prior.failure, failure));
+    REQUIRE(first->DetachDisplay(workspace));
+    REQUIRE(first->Retire().safe_to_destroy);
+    first.reset();
+    second->Publish(4U, 3U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 63, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    const auto observed = second->ObserveWorkspace();
+    std::exception_ptr rotated;
+    try { static_cast<void>(second->PrepareDisplay(observed.product_revision, workspace)); }
+    catch (...) { rotated = std::current_exception(); }
+    CHECK(test_support::ContainsImageFailure(rotated, failure));
+    CHECK_FALSE(workspace->retired());
+    CHECK_FALSE(workspace->Contains({observed.product_owner, observed.product_revision}));
+    CHECK(workspace->revision() == 0U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+    REQUIRE(second->PrepareDisplay(observed.product_revision, workspace));
+    CHECK(workspace->Contains({observed.product_owner, observed.product_revision}));
+    CHECK(*reinterpret_cast<const std::byte*>(workspace->plane(4U, 3U).data) == std::byte{63});
+    REQUIRE(second->DetachDisplay(workspace));
+    const auto retired = second->Retire();
+    CHECK(retired.safe_to_destroy);
+    CHECK_FALSE(retired.failure);
+    CHECK_FALSE(retired.custody.valid());
+    second.reset();
+    const auto observation = workspace->ObserveRetirement();
+    workspace.reset();
+    const auto released = observation.TakeResult();
+    CHECK(released.complete);
+    CHECK(released.settlement.completion_reached);
+    CHECK_FALSE(released.settlement.failure);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 3U);
+    CHECK(test_support::ImportedImageBufferTestAccess::allocation_releases == 3U);
+    CHECK(backend->streams_destroyed == 5U);
+    CHECK(backend->events_created == backend->events_destroyed);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Producer mapping replacement reports release failure and retains backing", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    WorkspaceRuntimeFixture first;
+    auto [workspace, product] = first.PublishWorkspace(0);
+    REQUIRE(first.runtime.DetachDisplay(workspace));
+    SystemImageRuntime second({.device = 0, .backend = first.backend,
+        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+            test_support::CopyImagePlane(destination, clean);
+        }});
+    second.Publish(4U, 3U, [](auto, auto, auto) {});
+    const auto unmaps = test_support::ImportedImageBufferTestAccess::unmaps;
+    test_support::ImportedImageBufferTestAccess::unmap_result = CUDA_ERROR_UNKNOWN;
+    CHECK_THROWS(second.PrepareDisplay(second.Completed().revision(), workspace));
+    CHECK(workspace->retired());
+    CHECK_FALSE(workspace->Contains({product.Borrow().plane(0U).plane().allocation.owner, product.revision()}));
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == unmaps + 1U);
+    const auto retirement = second.Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    CHECK(retirement.failure);
+    CHECK(retirement.custody.valid());
+    ImageWorkspaceTestAccess::Reset();
+}
+
+TEST_CASE("Delayed attached product release reports physical failure through producer custody", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend,
+        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { test_support::CopyImagePlane(destination, clean); }});
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    runtime->Publish(4U, 3U, [](auto, auto, auto) {});
+    REQUIRE(runtime->PrepareDisplay(runtime->Completed().revision(), workspace));
+    auto product = runtime->Completed();
+    workspace.reset();
     auto retirement = runtime->Retire();
     REQUIRE_FALSE(retirement.safe_to_destroy);
     REQUIRE(retirement.custody.deferred());
@@ -1934,16 +1993,148 @@ TEST_CASE("Delayed workspace release reports physical failure through retained r
     retirement.custody.SetRetirementSink(std::make_shared<const std::function<void()>>([&] { ++notifications; }));
     const auto cleanup = std::make_exception_ptr(std::runtime_error("late display context failure"));
     backend->FailDeviceBinding(1, cleanup);
-    workspace.reset();
+    product = {};
     CHECK(notifications.load() != 0U);
-    CHECK(backend->contexts_destroyed == 0U);
-    CHECK(backend->streams_destroyed == 0U);
     const auto settled = retirement.custody.FinishRetirement();
     CHECK_FALSE(settled.completion_reached);
     CHECK(test_support::ContainsImageFailure(settled.failure, cleanup));
     CHECK_FALSE(retirement.custody.deferred());
     CHECK(retirement.custody.valid());
     retirement.custody.SetRetirementSink({});
+}
+
+TEST_CASE("Allocation responsibility transfer is durable across detachment in either order", "[gpu][workspace]") {
+    const bool transfer_first = GENERATE(false, true);
+    const bool fail_release = GENERATE(false, true);
+    WorkspaceRuntimeFixture fixture;
+    auto [workspace, product] = fixture.PublishWorkspace(1);
+    product = {};
+    auto observation = workspace->ObserveRetirement();
+    if (transfer_first) {
+        REQUIRE(observation.TransferToProducer());
+        CHECK(observation.TransferToProducer());  // One accepted allocation, not two counts.
+    }
+    REQUIRE(fixture.runtime.DetachDisplay(workspace));
+    CHECK(workspace->product_owner() == 0U);
+    CHECK(observation.TransferToProducer() == transfer_first);
+    auto retirement = fixture.runtime.Retire();
+    CHECK(retirement.safe_to_destroy == !transfer_first);
+    CHECK(retirement.custody.deferred() == transfer_first);
+    std::atomic<unsigned> notifications{0U};
+    if (transfer_first)
+        retirement.custody.SetRetirementSink(std::make_shared<const std::function<void()>>([&] { ++notifications; }));
+    const auto failure = std::make_exception_ptr(std::runtime_error("detached allocation cleanup"));
+    if (fail_release) fixture.backend->FailDeviceBinding(1, failure);
+    workspace.reset();
+    const auto result = observation.TakeResult();
+    REQUIRE(result.complete);
+    CHECK(result.claimed == !transfer_first);
+    CHECK(test_support::ContainsImageFailure(result.settlement.failure, failure) == fail_release);
+    CHECK_FALSE(observation.TakeResult().claimed);
+    if (!fail_release) {
+        CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+        CHECK(test_support::ImportedImageBufferTestAccess::allocation_releases == 1U);
+    }
+    if (transfer_first) {
+        CHECK(notifications.load() == 1U);
+        const auto settled = retirement.custody.FinishRetirement();
+        CHECK(settled.completion_reached == !fail_release);
+        CHECK(test_support::ContainsImageFailure(settled.failure, failure) == fail_release);
+        CHECK_FALSE(retirement.custody.deferred());
+        retirement.custody.SetRetirementSink({});
+    }
+}
+
+TEST_CASE("Completed transferred allocation failure permits ordinary producer retirement", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0, .backend = backend,
+        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+            test_support::CopyImagePlane(destination, clean);
+        }});
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(1));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    runtime->Publish(4U, 3U, [](auto, auto, auto) {});
+    REQUIRE(runtime->PrepareDisplay(runtime->Completed().revision(), workspace));
+    auto observation = workspace->ObserveRetirement();
+    REQUIRE(observation.TransferToProducer());
+    REQUIRE(runtime->DetachDisplay(workspace));
+    const auto failure = std::make_exception_ptr(std::runtime_error("completed display stream failure"));
+    backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, failure);
+    workspace.reset();
+    const auto released = observation.TakeResult();
+    REQUIRE(released.complete);
+    CHECK_FALSE(released.claimed);
+    REQUIRE(released.settlement.completion_reached);
+    CHECK(test_support::ContainsImageFailure(released.settlement.failure, failure));
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::allocation_releases == 1U);
+
+    // The transferred failure is already in the tracker before runtime
+    // retirement. The producer's own stream and physical storage are healthy.
+    const auto retirement = runtime->Retire();
+    CHECK(retirement.safe_to_destroy);
+    CHECK(test_support::ContainsImageFailure(retirement.failure, failure));
+    CHECK_FALSE(retirement.custody.valid());
+    CHECK_FALSE(retirement.custody.deferred());
+    runtime.reset();
+    CHECK(backend->planes_freed == backend->planes_allocated);
+    CHECK(backend->streams_destroyed == 2U);
+    CHECK(backend->events_destroyed == backend->events_created);
+    CHECK(backend->contexts_destroyed == backend->contexts_created);
+}
+
+TEST_CASE("Replaced display attachment cannot accept responsibility from an already retired producer", "[gpu][workspace]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [prior, product] = fixture.PublishWorkspace(1);
+    product = {};
+    auto observation = prior->ObserveRetirement();
+    auto next = test_support::ImageWorkspaceTestAccess::Create(fixture.backend, test_support::ImageWorkspaceTestAccess::Layout(1));
+    next->Admit(next->identity(), next->layout().device_incarnation);
+    REQUIRE(fixture.runtime.PrepareDisplay(fixture.runtime.Completed().revision(), next));
+    CHECK(prior->product_owner() == 0U);
+    REQUIRE(fixture.runtime.DetachDisplay(next));
+    REQUIRE(fixture.runtime.Retire().safe_to_destroy);
+    CHECK_FALSE(observation.TransferToProducer());
+    prior.reset();
+    CHECK(observation.TakeResult().claimed);
+}
+
+TEST_CASE("Allocation retirement publishes cleanup before waking and closes late registration", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    const bool register_late = GENERATE(false, true);
+    const bool fail_release = GENERATE(false, true);
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto observation = workspace->ObserveRetirement();
+    const auto cleanup = std::make_exception_ptr(std::runtime_error("allocation release binding"));
+    std::size_t notifications = 0U;
+    auto wake = std::make_shared<const std::function<void()>>([&] { ++notifications; });
+    if (!register_late) observation.SetWake(wake);
+    CHECK(notifications == 0U);
+    CHECK_FALSE(observation.TakeResult().complete);
+    if (fail_release) backend->FailDeviceBinding(1, cleanup);
+    workspace.reset();
+    if (register_late) {
+        CHECK(notifications == 0U);
+        observation.SetWake(wake);
+    }
+    REQUIRE(notifications == 1U);
+    const auto released = observation.TakeResult();
+    REQUIRE(released.complete);
+    CHECK(released.claimed);
+    CHECK(released.settlement.completion_reached == !fail_release);
+    CHECK(test_support::ContainsImageFailure(released.settlement.failure, cleanup) == fail_release);
+    CHECK_FALSE(observation.TakeResult().claimed);
+    if (!fail_release) {
+        CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+        CHECK(test_support::ImportedImageBufferTestAccess::allocation_releases == 1U);
+    }
+    observation.SetWake({});
 }
 
 TEST_CASE("Late workspace preparation stays pending through raw and counted access", "[gpu][workspace]") {
@@ -1953,23 +2144,23 @@ TEST_CASE("Late workspace preparation stays pending through raw and counted acce
     runtime.Publish(4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
     auto observed = runtime.ObserveWorkspace();
     REQUIRE(observed.product_revision != 0U);
-    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+    auto workspace = test_support::ImageWorkspaceTestAccess::Create(fixture.display, ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto raw = runtime.Borrow();
     const auto address = raw.plane(0U).plane().data;
-    CHECK_FALSE(runtime.PrepareWorkspace(observed, workspace));
+    CHECK_FALSE(runtime.PrepareDisplay(observed.product_revision, workspace));
     CHECK_FALSE(runtime.BorrowWorkspace().valid());
     CHECK(raw.plane(0U).plane().data == address);
     raw = {};
-    REQUIRE(runtime.PrepareWorkspace(observed, workspace));
+    REQUIRE(runtime.PrepareDisplay(observed.product_revision, workspace));
     auto borrowed = runtime.BorrowWorkspace();
     REQUIRE(borrowed.valid());
     CHECK(borrowed.revision() == observed.product_revision);
     auto completion = std::move(borrowed).TakeCompletion();
-    CHECK_FALSE(runtime.PrepareWorkspace(observed, workspace));
+    CHECK_FALSE(runtime.PrepareDisplay(observed.product_revision, workspace));
     completion->Complete();
     completion.reset();
-    REQUIRE(runtime.PrepareWorkspace(observed, workspace));
+    REQUIRE(runtime.PrepareDisplay(observed.product_revision, workspace));
     CHECK(runtime.ObserveWorkspace().product_revision == observed.product_revision);
 }
 
@@ -1997,13 +2188,15 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
     auto backend = std::make_shared<FakeImageBackend>();
     auto runtime = std::make_unique<SystemImageRuntime>(
         SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
-    ImageWorkspaceTestAccess::Install(*runtime);
-    auto workspace = runtime->CreateWorkspace(ImageWorkspaceTestAccess::Layout(0));
+    auto workspace = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     auto candidate = runtime->AcquireOutput();
-    REQUIRE(runtime->ConfigureWorkspace(candidate, workspace));
     runtime->Publish(candidate, 4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
-    auto product = runtime->CommitOutput(std::move(candidate));
+    auto initial = runtime->CommitOutput(std::move(candidate));
+    REQUIRE(runtime->PrepareDisplay(initial.revision(), workspace));
+    initial = {};
+    runtime->Publish(4U, 3U, [](auto clean, auto, auto) { *reinterpret_cast<std::byte*>(clean.data) = std::byte{73}; });
+    auto product = runtime->Completed();
     const auto revision = product.revision();
     const auto address = product.BorrowWorkspace().plane().data;
     workspace.reset();
@@ -2020,8 +2213,8 @@ TEST_CASE("Healthy external workspace products retain exact raw aliases through 
     CHECK(settled.completion_reached);
     CHECK_FALSE(settled.failure);
     CHECK_FALSE(retirement.custody.valid());
-    CHECK(backend->contexts_destroyed == 1U);
-    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(backend->contexts_destroyed == 2U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 2U);
 }
 
 TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA in the callback", "[gpu][workspace]") {
@@ -2045,7 +2238,7 @@ TEST_CASE("Workspace counted completion wakes retirement without destroying CUDA
     completion.reset();
     CHECK(notifications.load() > before);
     CHECK(retirement.custody.FinishRetirement().completion_reached);
-    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 1U);
+    CHECK(test_support::ImportedImageBufferTestAccess::unmaps == 2U);
 }
 
 TEST_CASE("Failed display finalization closes admission and retains complete transfer custody", "[gpu][workspace]") {
@@ -2061,19 +2254,18 @@ TEST_CASE("Failed display finalization closes admission and retains complete tra
                                     backend->FailDeviceBinding(1, cleanup);
                                     std::rethrow_exception(initiating);
                                 }});
-    ImageWorkspaceTestAccess::Install(runtime);
     runtime.Publish(4U, 3U, [](auto, auto, auto) {});
     auto completed = runtime.Completed();
     const auto raw = completed.Borrow().plane(0U).plane().data;
-    auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+    auto workspace = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     std::exception_ptr failure;
     try {
-        static_cast<void>(runtime.PrepareWorkspace(completed, workspace));
+        static_cast<void>(runtime.PrepareDisplay(completed.revision(), workspace));
     } catch (...) { failure = std::current_exception(); }
     CHECK(test_support::ContainsImageFailure(failure, initiating));
     CHECK(test_support::ContainsImageFailure(failure, cleanup));
-    CHECK_THROWS(runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout()));
+    CHECK(workspace->retired());
     CHECK(completed.Borrow().plane(0U).plane().data == raw);
     auto retirement = runtime.Retire();
     CHECK_FALSE(retirement.safe_to_destroy);
@@ -2101,7 +2293,6 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
                                         CHECK(*reinterpret_cast<const std::byte*>(semantic.data) == std::byte{91});
                                         test_support::CopyImagePlane(destination, clean);
                                     }});
-        ImageWorkspaceTestAccess::Install(runtime);
         runtime.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
             for (const auto plane : {clean, semantic})
                 std::memset(reinterpret_cast<void*>(plane.data), plane.descriptor.kind == ImagePlaneKind::Clean ? 37 : 91,
@@ -2110,9 +2301,9 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
         auto completed = runtime.Completed();
         const auto revision = completed.revision();
         const auto raw = completed.Borrow().plane(0U).plane().data;
-        auto workspace = runtime.CreateWorkspace(ImageWorkspaceTestAccess::Layout());
+        auto workspace = test_support::ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
         workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
-        REQUIRE(runtime.PrepareWorkspace(completed, workspace));
+        REQUIRE(runtime.PrepareDisplay(completed.revision(), workspace));
         CHECK(completed.revision() == revision);
         CHECK(completed.Borrow().plane(0U).plane().data == raw);
         CHECK(completed.BorrowWorkspace().revision() == revision);
@@ -2128,6 +2319,249 @@ TEST_CASE("Workspace retirement retains cross-device transfer and raw custody th
         CHECK(retirement.custody.FinishRetirement().completion_reached);
         CHECK(backend->planes_freed == 4U);
         CHECK(backend->contexts_destroyed == 2U);
+    }
+}
+
+TEST_CASE("Shared display content rotates independent producer owners and layouts with bounded transfers", "[gpu][workspace][display]") {
+    using test_support::ImageWorkspaceTestAccess;
+    for (const int display_device : {0, 1}) {
+        for (const bool peer : {false, true}) {
+            for (const bool semantic_first : {false, true}) {
+                CAPTURE(display_device, peer, semantic_first);
+                ImageWorkspaceTestAccess::Reset();
+                auto backend = std::make_shared<FakeImageBackend>();
+                backend->peer_access = peer;
+                DeviceContext display(display_device, backend);
+                auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(display_device));
+                workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+                std::array<std::uintptr_t, 2U> producer_contexts{};
+                std::array<std::unique_ptr<SystemImageRuntime>, 2U> producers;
+                std::array<ImageWorkspaceContent, 2U> contents{};
+                for (std::size_t index = 0U; index != producers.size(); ++index) {
+                    const bool semantic = (index == 0U) == semantic_first;
+                    producers[index] = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+                        .device = 0, .backend = backend,
+                        .output_layout = semantic ? ImageProductLayout::CleanAndSemantic : ImageProductLayout::Clean,
+                        .workspace_finalize = [&, index, semantic](auto clean, auto semantics, auto destination, auto coverage, auto) {
+                            CHECK(coverage.full_image);
+                            CHECK(semantics.valid() == semantic);
+                            if (display_device == 0) CHECK(backend->last_bound_context == producer_contexts[index]);
+                            if (semantic) CHECK(*reinterpret_cast<const std::byte*>(semantics.data) == std::byte{91});
+                            test_support::CopyImagePlane(destination, clean);
+                        }});
+                    auto& runtime = *producers[index];
+                    runtime.BindContext();
+                    producer_contexts[index] = backend->last_bound_context.load();
+                    runtime.Publish(4U, 3U, [index](auto clean, auto semantics, auto) {
+                        std::memset(reinterpret_cast<void*>(clean.data), index == 0U ? 37 : 73,
+                                    clean.descriptor.pitch_bytes * clean.descriptor.height);
+                        if (semantics.valid()) std::memset(reinterpret_cast<void*>(semantics.data), 91,
+                                                          semantics.descriptor.pitch_bytes * semantics.descriptor.height);
+                    });
+                    const auto observed = runtime.ObserveWorkspace();
+                    contents[index] = {observed.product_owner, observed.product_revision};
+                }
+                REQUIRE(producer_contexts[0U] != producer_contexts[1U]);
+                REQUIRE(contents[0U].owner != contents[1U].owner);
+                REQUIRE(contents[0U].revision == contents[1U].revision);
+                const auto raw_allocations = backend->planes_allocated.load();
+                std::size_t warm_allocations = 0U, warm_pinned = 0U;
+                for (std::size_t turn = 0U; turn != 8U; ++turn) {
+                    const auto index = turn % 2U;
+                    if (turn != 0U) {
+                        REQUIRE(producers[1U - index]->DetachDisplay(workspace));
+                        CHECK(workspace->Contains(contents[1U - index]));
+                    }
+                    REQUIRE(workspace->ReserveDisplayWrite());
+                    workspace->InvalidateWrite();
+                    CHECK_FALSE(workspace->Contains(contents[index]));
+                    REQUIRE(producers[index]->PrepareDisplay(contents[index].revision, workspace));
+                    REQUIRE(workspace->Contains(contents[index]));
+                    CHECK_FALSE(workspace->Contains(contents[1U - index]));
+                    const auto output = workspace->plane(4U, 3U);
+                    for (std::uint32_t row = 0U; row != 3U; ++row) {
+                        const auto* bytes = reinterpret_cast<const std::byte*>(output.data) + row * output.descriptor.pitch_bytes;
+                        CHECK(std::ranges::all_of(std::span{bytes, output.descriptor.row_bytes()}, [index](auto byte) {
+                            return byte == (index == 0U ? std::byte{37} : std::byte{73});
+                        }));
+                    }
+                    workspace->CancelDisplayWrite();
+                    if (turn == 1U) {
+                        warm_allocations = backend->planes_allocated;
+                        warm_pinned = backend->pinned_allocated;
+                    } else if (turn > 1U) {
+                        CHECK(backend->planes_allocated == warm_allocations);
+                        CHECK(backend->pinned_allocated == warm_pinned);
+                    }
+                }
+                CHECK(backend->same_copies == 0U);
+                if (display_device == 0) {
+                    CHECK(backend->planes_allocated == raw_allocations);
+                    CHECK(backend->peer_copies == 0U);
+                    CHECK(backend->staged_downloads == 0U);
+                    CHECK(backend->staged_uploads == 0U);
+                } else {
+                    CHECK(backend->peer_copies == (peer ? 12U : 0U));
+                    CHECK(backend->staged_downloads == (peer ? 0U : 12U));
+                    CHECK(backend->staged_uploads == (peer ? 0U : 12U));
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("Display partial coverage requires exact initialized prior content and recovers after failure", "[gpu][workspace][display]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    DeviceContext display(0, backend);
+    auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    bool expected_full = true;
+    bool fail = false;
+    const auto finalize = [&](auto clean, auto, auto destination, auto coverage, auto) {
+        CHECK(coverage.full_image == expected_full);
+        if (coverage.full_image) test_support::CopyImagePlane(destination, clean);
+        else for (const auto& region : coverage.regions) {
+            for (auto row = region.y1; row != region.y2; ++row)
+                std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes + region.x1 * 4U,
+                            reinterpret_cast<const std::byte*>(clean.data) + row * clean.descriptor.pitch_bytes + region.x1 * 4U,
+                            static_cast<std::size_t>(region.x2 - region.x1) * 4U);
+        }
+        if (fail) throw std::runtime_error("partial display submission failed");
+    };
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+                                .workspace_finalize = finalize});
+    const auto fill = [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    };
+    runtime.Publish(2U, 2U, fill);
+    REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
+    auto previous = runtime.ObserveWorkspace();
+    const std::array<ImageWorkspaceRegion, 1U> regions{{{0, 0, 1, 1}}};
+    auto candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, 2U, 2U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 73, 4U);
+    });
+    CHECK_FALSE(workspace->Contains({previous.product_owner, previous.product_revision}));
+    expected_full = false;
+    runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
+    auto completed = runtime.CommitOutput(std::move(candidate));
+    auto pixels = workspace->plane(2U, 2U);
+    CHECK(*reinterpret_cast<const std::byte*>(pixels.data) == std::byte{73});
+    CHECK(*(reinterpret_cast<const std::byte*>(pixels.data) + 4U) == std::byte{37});
+    previous = runtime.ObserveWorkspace();
+    completed = {};
+    candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, 2U, 2U, fill);
+    fail = true;
+    CHECK_THROWS(runtime.FinalizeWorkspace(candidate,
+        {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}}));
+    CHECK_FALSE(workspace->Contains({previous.product_owner, candidate.revision()}));
+    fail = false;
+    expected_full = true;
+    runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
+    completed = runtime.CommitOutput(std::move(candidate));
+    previous = runtime.ObserveWorkspace();
+    completed = {};
+    candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, 4U, 3U, fill);
+    runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
+    completed = runtime.CommitOutput(std::move(candidate));
+    CHECK(workspace->Contains({previous.product_owner, completed.revision()}));
+    previous = runtime.ObserveWorkspace();
+    completed = {};
+    candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, 4U, 3U, fill);
+    candidate = {};
+    CHECK_FALSE(workspace->Contains({previous.product_owner, previous.product_revision}));
+    candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, 4U, 3U, fill);
+    runtime.FinalizeWorkspace(candidate, {workspace->identity(), regions, false, {previous.product_owner, previous.product_revision}});
+    completed = runtime.CommitOutput(std::move(candidate));
+    REQUIRE(runtime.DetachDisplay(workspace));
+    SystemImageRuntime replacement({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+                                    .workspace_finalize = finalize});
+    replacement.Publish(4U, 3U, fill);
+    REQUIRE(workspace->ReserveDisplayWrite());
+    workspace->InvalidateWrite();
+    REQUIRE(replacement.PrepareDisplay(replacement.Completed().revision(), workspace));
+    workspace->CancelDisplayWrite();
+}
+
+TEST_CASE("Display remapping retries preserve raw products through partial construction and cancellation", "[gpu][workspace][display]") {
+    using test_support::ImageWorkspaceTestAccess;
+    for (const auto point : {FakeImageBackend::FailurePoint::None, FakeImageBackend::FailurePoint::CreateStream,
+                             FakeImageBackend::FailurePoint::CreateEvent}) {
+        CAPTURE(point);
+        ImageWorkspaceTestAccess::Reset();
+        auto backend = std::make_shared<FakeImageBackend>();
+        {
+            DeviceContext display(0, backend);
+            auto workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout(0));
+            workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+            SystemImageRuntime runtime({.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto coverage, auto) {
+                CHECK(coverage.full_image);
+                test_support::CopyImagePlane(destination, clean);
+            }});
+            runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+                std::memset(reinterpret_cast<void*>(clean.data), 73, clean.descriptor.pitch_bytes * clean.descriptor.height);
+            });
+            const auto observed = runtime.ObserveWorkspace();
+            const ImageWorkspaceContent content{observed.product_owner, observed.product_revision};
+            const auto raw = runtime.Borrow().plane(0U).plane().data;
+            REQUIRE(workspace->ReserveDisplayWrite());
+            workspace->InvalidateWrite();
+            if (point == FakeImageBackend::FailurePoint::None)
+                ImageWorkspaceTestAccess::alias_failure = std::make_exception_ptr(std::runtime_error("alias import failed"));
+            else backend->FailAfter(point);
+            CHECK_THROWS(runtime.PrepareDisplay(content.revision, workspace));
+            CHECK_FALSE(workspace->Contains(content));
+            CHECK(runtime.Borrow().plane(0U).plane().data == raw);
+            CHECK(*reinterpret_cast<const std::byte*>(raw) == std::byte{73});
+            workspace->CancelDisplayWrite();
+            ImageWorkspaceTestAccess::alias_failure = {};
+            REQUIRE(workspace->ReserveDisplayWrite());
+            workspace->InvalidateWrite();
+            REQUIRE(runtime.PrepareDisplay(content.revision, workspace));
+            CHECK(workspace->Contains(content));
+            workspace->CancelDisplayWrite();
+            const auto maps = ImageWorkspaceTestAccess::initialized;
+            const auto events = backend->events_created.load();
+            REQUIRE(workspace->ReserveDisplayWrite());
+            workspace->CancelDisplayWrite();
+            REQUIRE(workspace->Contains(content));
+            REQUIRE(runtime.PrepareDisplay(content.revision, workspace));
+            CHECK(ImageWorkspaceTestAccess::initialized == maps);
+            CHECK(backend->events_created == events);
+        }
+        CHECK(backend->contexts_destroyed == backend->contexts_created);
+        CHECK(backend->events_destroyed == backend->events_created);
+        CHECK(backend->planes_freed == backend->planes_allocated);
+    }
+}
+
+TEST_CASE("Repeated direct display handoffs reuse private high-water storage and preserve raw pixels", "[gpu][workspace][display]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [workspace, product] = fixture.PublishWorkspace(0);
+    std::size_t warm_allocations = 0U;
+    for (unsigned turn = 0U; turn != 5U; ++turn) {
+        const auto revision = product.revision();
+        auto raw = product.Borrow();
+        const auto owner = raw.plane(0U).plane().allocation.owner;
+        CHECK_FALSE(fixture.runtime.DetachDisplay(workspace));
+        raw = {};
+        REQUIRE(fixture.runtime.DetachDisplay(workspace));
+        CHECK(workspace->Contains({owner, revision}));
+        CHECK(*reinterpret_cast<const std::byte*>(product.Borrow().plane(0U).plane().data) == std::byte{37});
+        REQUIRE(fixture.runtime.PrepareDisplay(revision, workspace));
+        auto candidate = fixture.runtime.TryAcquireOutput(product);
+        REQUIRE(candidate.valid());
+        fixture.runtime.PublishRetained(candidate, 4U, 3U, [](auto, auto, auto) {});
+        product = fixture.runtime.CommitOutput(std::move(candidate));
+        CHECK(*reinterpret_cast<const std::byte*>(product.Borrow().plane(0U).plane().data) == std::byte{37});
+        if (turn == 0U) warm_allocations = fixture.backend->planes_allocated;
+        else CHECK(fixture.backend->planes_allocated == warm_allocations);
     }
 }
 
@@ -2228,6 +2662,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         if (fail_finalization) throw std::runtime_error("injected finalization failure after submission");
     };
     SystemImageRuntime runtime(std::move(config));
+    DeviceContext display(0, cuda_image_copy_backend());
     const auto fill = [](ImagePlaneView clean, ImagePlaneView, std::uintptr_t stream) {
         REQUIRE(cuMemsetD2D8Async(clean.data, clean.descriptor.pitch_bytes, 37U, clean.descriptor.row_bytes(), clean.descriptor.height,
                                   reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
@@ -2235,7 +2670,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     runtime.Publish(4U, 3U, fill);
     auto completed = runtime.Completed();
     const auto raw = runtime.Borrow().plane(0U).plane().data;
-    auto workspace = runtime.CreateWorkspace(layout);
+    auto workspace = ImageWorkspace::Create(display, layout);
     CHECK_THROWS(workspace->Admit(workspace->identity(), 8U));
     auto descriptor = allocation->Export();
     REQUIRE(descriptor.get() >= 0);
@@ -2244,7 +2679,8 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     REQUIRE(workspace->QueueAllocation(std::move(transferred)));
     workspace->Admit(workspace->identity(), layout.device_incarnation);
     allocation.reset();  // Native backing remains valid after all Vulkan owners retire.
-    const auto check_pixels = [](ImagePlaneView plane) {
+    const auto check_pixels = [](ImagePlaneView plane, DeviceContext context) {
+        context.Bind();
         std::vector<std::byte> pixels(plane.descriptor.row_bytes() * plane.descriptor.height);
         CUDA_MEMCPY2D copy{};
         copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
@@ -2258,16 +2694,16 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
         CHECK(std::ranges::all_of(pixels, [](auto byte) { return byte == std::byte{37U}; }));
     };
-    REQUIRE(runtime.PrepareWorkspace(completed, workspace));
+    REQUIRE(runtime.PrepareDisplay(completed.revision(), workspace));
     CHECK(runtime.Borrow().plane(0U).plane().data == raw);
     CHECK(runtime.BorrowWorkspace().plane().data != raw);
     CHECK(finalizations == 1U);
-    check_pixels(runtime.BorrowWorkspace().plane());
+    check_pixels(runtime.BorrowWorkspace().plane(), display);
     completed = {};
     runtime.Publish(4U, 3U, fill);
-    CHECK(runtime.Borrow().plane(0U).plane().data == runtime.BorrowWorkspace().plane().data);
+    CHECK(runtime.Borrow().plane(0U).plane().allocation.identity == workspace->identity());
     CHECK(finalizations == 1U);
-    check_pixels(runtime.Borrow().plane(0U).plane());
+    check_pixels(runtime.Borrow().plane(0U).plane(), runtime.Borrow().plane(0U).context());
     auto borrowed = runtime.BorrowWorkspace();
     REQUIRE(borrowed.valid());
     CHECK(borrowed.layout().offset_bytes == layout.offset_bytes);
@@ -2286,31 +2722,31 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     layout = allocation->layout();
     auto wrong_device = layout;
     wrong_device.device_uuid[0U] ^= 1U;
-    auto rejected = runtime.CreateWorkspace(wrong_device);
+    auto rejected = ImageWorkspace::Create(display, wrong_device);
     REQUIRE(rejected->QueueAllocation(allocation->Export()));
     CHECK_THROWS(rejected->Admit(rejected->identity(), wrong_device.device_incarnation));
     rejected.reset();
-    auto replacement = runtime.CreateWorkspace(layout);
+    auto replacement = ImageWorkspace::Create(display, layout);
     CHECK(replacement->identity() != workspace->identity());
     REQUIRE(replacement->QueueAllocation(allocation->Export()));
     replacement->Admit(replacement->identity(), layout.device_incarnation);
     fail_finalization = true;
-    CHECK_THROWS(runtime.PrepareWorkspace(runtime.Completed(), replacement));
+    CHECK_THROWS(runtime.PrepareDisplay(runtime.Completed().revision(), replacement));
     CHECK_FALSE(runtime.BorrowWorkspace().valid());
     CHECK(runtime.OutputFacts().revision == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     fail_finalization = false;
-    REQUIRE(runtime.PrepareWorkspace(runtime.Completed(), replacement));
+    REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), replacement));
     CHECK(runtime.BorrowWorkspace().revision() == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     CHECK(finalizations == 3U);
     if (mmltk::testsupport::checked_cuda_device_count() > 1) {
         test_support::VulkanWorkspaceFixture remote_allocation(1, 8U, 3U);
         const auto remote_layout = remote_allocation.layout();
-        auto remote = runtime.CreateWorkspace(remote_layout);
+        auto remote = ImageWorkspace::Create(DeviceContext(1, cuda_image_copy_backend()), remote_layout);
         REQUIRE(remote->QueueAllocation(remote_allocation.Export()));
         remote->Admit(remote->identity(), remote_layout.device_incarnation);
-        REQUIRE(runtime.PrepareWorkspace(runtime.Completed(), remote));
+        REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), remote));
         CHECK(runtime.BorrowWorkspace().layout().device == 1);
         CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
         CHECK(finalizations == 3U);

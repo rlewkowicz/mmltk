@@ -35,10 +35,9 @@ struct VisualWorkspaceRequest final {
     std::uint64_t product_owner = 0U;
     std::uint64_t product_revision = 0U;
     bool detach_only = false;
-    mmltk::frameworks::gpu::ImageWorkspaceLayout layout{};
-    mmltk::frameworks::gpu::DeviceExecution display_execution{};
-    std::uint64_t admitted_allocation = 0U;
-    std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace> destination;
+    // Presentation owns parked destinations. Only an executing attempt retains
+    // the allocation, through synchronous GPU completion and its ready response.
+    std::weak_ptr<mmltk::frameworks::gpu::ImageWorkspace> destination;
     // Wake-only response; no producer or graphics work executes in the sink.
     std::function<void()> ready;
     std::shared_ptr<const VisualWorkspaceDiagnostics> diagnostics{};

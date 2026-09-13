@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <utility>
 
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/image_types.h"
@@ -21,9 +22,9 @@ namespace mmltk::frameworks::gpu {
 class DeviceContext;
 class ImageStream;
 class ImageProductBuffer;
+class ImageProductRetirement;
 class BorrowedImageProductReadView;
 class ImageProductReadCompletion;
-class SystemImageRuntime;
 class ImportedImageBuffer;
 namespace test_support {
 struct ImageWorkspaceTestAccess;
@@ -73,20 +74,50 @@ struct ImageWorkspaceRegion final {
     std::int32_t x2 = 0;
     std::int32_t y2 = 0;
 };
+struct ImageWorkspaceContent final {
+    std::uint64_t owner = 0U;
+    std::uint64_t revision = 0U;
+    constexpr bool operator==(const ImageWorkspaceContent&) const noexcept = default;
+    [[nodiscard]] constexpr bool valid() const noexcept { return owner != 0U && revision != 0U; }
+};
 struct ImageWorkspaceCoverage final {
     // Partial coverage belongs to this exact physical allocation's contents.
     std::uint64_t allocation_identity = 0U;
     std::span<const ImageWorkspaceRegion> regions{};
     bool full_image = true;
+    ImageWorkspaceContent baseline{};
 };
 using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
                                                   ImageWorkspaceCoverage, std::uintptr_t stream)>;
 
-// One physical Vulkan opaque-FD allocation imported into CUDA and its display-device execution.
+// One physical Vulkan opaque-FD allocation, producer-context mappings, and
+// display-device transfer storage when the producer resides on another GPU.
 // Admission precedes writes; raw products and browser imports have their own
 // custody. No import registry or scheduling policy lives in this owner.
 class ImageWorkspace final {
+    class Owner;
    public:
+    class Retirement final {
+       public:
+        struct Result final {
+            // Release has either freed storage or installed terminal custody.
+            bool complete = false;
+            // Only the observer that claims the result reports an operation failure.
+            bool claimed = false;
+            ImageStreamSettlement settlement{};
+        };
+        Retirement() noexcept = default;
+        [[nodiscard]] Result TakeResult() const noexcept;
+        // Atomically assigns the eventual result to the attached producer's
+        // counted retirement owner. Acceptance survives subsequent detachment.
+        // On rejection the display must retain this observation until release.
+        [[nodiscard]] bool TransferToProducer() const noexcept;
+        void SetWake(std::shared_ptr<const std::function<void()>>) const noexcept;
+       private:
+        explicit Retirement(std::shared_ptr<Owner> owner) noexcept : owner_(std::move(owner)) {}
+        std::shared_ptr<Owner> owner_;
+        friend class ImageWorkspace;
+    };
     [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout,
                                                                 std::optional<DeviceExecution> = {});
     ~ImageWorkspace() noexcept;
@@ -94,12 +125,12 @@ class ImageWorkspace final {
     ImageWorkspace& operator=(const ImageWorkspace&) = delete;
     [[nodiscard]] const ImageWorkspaceLayout& layout() const noexcept;
     [[nodiscard]] std::uint64_t identity() const noexcept;
+    [[nodiscard]] Retirement ObserveRetirement() const noexcept;
     [[nodiscard]] std::size_t allocation_bytes() const noexcept;
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] mmltk::common::io::ScopedFd ExportAccessDescriptor() const;
     [[nodiscard]] bool WriteAvailable() const noexcept;
     [[nodiscard]] bool ReserveWrite();
-    [[nodiscard]] bool display_owned() const noexcept;
     [[nodiscard]] bool ReserveDisplayWrite();
     void CancelDisplayWrite() noexcept;
     void Detach(std::uint64_t product_owner);
@@ -118,48 +149,56 @@ class ImageWorkspace final {
     [[nodiscard]] bool retired() const noexcept;
     void Withdraw() noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
+    [[nodiscard]] bool Contains(ImageWorkspaceContent) const noexcept;
     [[nodiscard]] ImageStreamSettlement Settle() noexcept;
     [[nodiscard]] ImagePlaneView plane(std::uint32_t width, std::uint32_t height) const;
     void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
 
    private:
-    // Shared by every candidate in one runtime, including candidates that
-    // never reach a product slot and owners released after replacement.
+    // Failure latch belongs only to this independent physical allocation.
     class Owner final {
        public:
         void Check() const;
         void Failed(std::exception_ptr) noexcept;
         [[nodiscard]] std::exception_ptr failure() const noexcept;
-        [[nodiscard]] ImageStreamSettlement Retire() noexcept;
-        [[nodiscard]] bool has_live_workspaces() const noexcept;
-        void SetRetirementSink(std::shared_ptr<const std::function<void()>>) noexcept;
+        void Released(ImageStreamSettlement) noexcept;
+        [[nodiscard]] Retirement::Result TakeResult() noexcept;
+        [[nodiscard]] bool TransferToProducer() noexcept;
+        void SetWake(std::shared_ptr<const std::function<void()>>) noexcept;
+        std::atomic<std::uint64_t> product_owner{0U};
 
        private:
         mutable std::mutex mutex_;
         std::exception_ptr failure_;
-        std::size_t live_ = 0U;
         bool closed_ = false;
-        std::shared_ptr<const std::function<void()>> retirement_sink_;
-        void Notify() const noexcept;
+        bool release_complete_ = false;
+        bool release_claimed_ = false;
+        ImageStreamSettlement release_result_;
+        std::shared_ptr<ImageProductRetirement> attached_producer_;
+        std::shared_ptr<ImageProductRetirement> responsible_producer_;
+        std::shared_ptr<const std::function<void()>> wake_;
+        void Wake() const noexcept;
         friend class ImageWorkspace;
     };
     struct Operations final {
         void (*initialize)(ImportedImageBuffer&, DeviceContext, const ImageWorkspaceLayout&, mmltk::common::io::ScopedFd, std::uint64_t);
         cudaError_t (*release)(ImportedImageBuffer&) noexcept;
+        std::shared_ptr<ImportedImageBuffer> (*alias)(const ImportedImageBuffer&, DeviceContext);
     };
     struct State;
     std::shared_ptr<State> state_;
-    ImageWorkspace(std::shared_ptr<Owner>, DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>,
-                   const Operations* = nullptr);
+    ImageWorkspace(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>, const Operations*);
+    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout,
+                                                               std::optional<DeviceExecution>, const Operations*);
     [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
-    void CheckOwner(const std::shared_ptr<Owner>& = {}) const;
-    void Attach(std::uint64_t product_owner);
+    void CheckOwner() const;
+    void Attach(std::uint64_t product_owner, std::shared_ptr<ImageProductRetirement>);
     [[nodiscard]] ImagePlaneView ProducerPlane(const DeviceContext&, std::uint32_t width, std::uint32_t height);
+    [[nodiscard]] ImagePlaneView ProducerPlaneLocked(const DeviceContext&, std::uint32_t width, std::uint32_t height);
     void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>) noexcept;
     friend class ImageProductBuffer;
     friend class BorrowedImageWorkspace;
     friend class ImageStream;
-    friend class SystemImageRuntime;
     friend struct test_support::ImageWorkspaceTestAccess;
 };
 

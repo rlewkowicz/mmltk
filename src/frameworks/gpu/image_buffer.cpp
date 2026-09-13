@@ -381,6 +381,7 @@ struct ImageBuffer::State final {
     ~State() {
         std::unique_lock lock(access);
         if (plane.data != 0U && !external_storage) context.state_->backend->FreePlane(context.state_->context, plane.data);
+        if (reusable_plane.data != 0U) context.state_->backend->FreePlane(context.state_->context, reusable_plane.data);
         staging_owner.reset();
         context.state_->backend->DestroyEvent(context.state_->context, completion);
     }
@@ -429,6 +430,7 @@ struct ImageBuffer::State final {
     mutable std::shared_mutex access;
     std::atomic_bool unavailable{false};
     ImagePlaneView plane{};
+    ImagePlaneView reusable_plane{};
     std::shared_ptr<void> external_storage;
     std::shared_ptr<void> unsettled_external_storage;
     std::size_t external_bytes = 0U;
@@ -485,6 +487,10 @@ bool BorrowedImageReadView::valid() const noexcept {
 int BorrowedImageReadView::device() const noexcept { return valid() ? lease_->state->context.device() : -1; }
 bool BorrowedImageReadView::UsesContext(const DeviceContext& context) const noexcept {
     return valid() && lease_->state->context == context;
+}
+DeviceContext BorrowedImageReadView::context() const {
+    if (!valid()) throw std::invalid_argument("image read context is unavailable");
+    return lease_->state->context;
 }
 std::uint64_t BorrowedImageReadView::revision() const noexcept { return valid() ? lease_->revision : 0U; }
 ImagePlaneView BorrowedImageReadView::plane() const noexcept { return valid() ? lease_->state->plane : ImagePlaneView{}; }
@@ -613,35 +619,110 @@ std::uint64_t ImageBuffer::revision() const noexcept {
     return state_->revision;
 }
 
+void ImageProductRetirement::Acquire() noexcept {
+    std::scoped_lock lock(mutex_);
+    ++live_;
+}
+ImageStreamSettlement ImageProductRetirement::Retire() noexcept {
+    std::scoped_lock lock(mutex_);
+    retired_ = true;
+    return {.completion_reached = live_ == 0U && !unsafe_, .failure = failure_};
+}
+std::exception_ptr ImageProductRetirement::failure() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return failure_;
+}
+bool ImageProductRetirement::unsafe() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return unsafe_;
+}
+void ImageProductRetirement::SetRetirementSink(std::shared_ptr<const std::function<void()>> sink) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        sink_ = std::move(sink);
+    }
+    Notify();
+}
+void ImageProductRetirement::Released(ImageStreamSettlement settled) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        --live_;
+        failure_ = combine_image_failures(failure_, std::move(settled.failure));
+        unsafe_ = unsafe_ || !settled.completion_reached;
+    }
+    Notify();
+}
+void ImageProductRetirement::Notify() const noexcept {
+    std::shared_ptr<const std::function<void()>> sink;
+    {
+        std::scoped_lock lock(mutex_);
+        if (retired_ && (live_ == 0U || unsafe_)) sink = sink_;
+    }
+    if (sink) {
+        try { (*sink)(); } catch (...) {}
+    }
+}
+
 struct ImageProductBuffer::State final {
-    State(DeviceContext selected, const ImageProductLayout selected_layout)
+    State(DeviceContext selected, const ImageProductLayout selected_layout, std::shared_ptr<ImageProductRetirement> retirement)
         : context_(std::move(selected)),
           layout_(selected_layout),
-          plane_count_(selected_layout == ImageProductLayout::CleanAndSemantic ? 2U : 1U) {
+          plane_count_(selected_layout == ImageProductLayout::CleanAndSemantic ? 2U : 1U),
+          retirement_(std::move(retirement)) {
         planes_[0U] = std::make_unique<ImageBuffer>(context_);
         if (plane_count_ == 2U) planes_[1U] = std::make_unique<ImageBuffer>(context_);
         completion_ = context_.state_->backend->CreateEvent(context_.state_->context);
         if (completion_ == 0U) throw std::runtime_error("image product completion event creation returned no event");
+        if (retirement_) retirement_->Acquire();
     }
     ~State() {
+        ImageStreamSettlement settled{.completion_reached = true};
+        std::array workspaces{std::move(workspace_), std::move(raw_workspace_), std::move(workspace_reserved_)};
+        std::array<ImageWorkspace::Retirement, 3U> observations;
         const auto owner = planes_[0U]->state_->allocation_owner;
-        if (workspace_ && workspace_->display_owned()) workspace_->Detach(owner);
-        if (raw_workspace_ && raw_workspace_ != workspace_ && raw_workspace_->display_owned()) raw_workspace_->Detach(owner);
+        for (std::size_t index = 0U; index < workspaces.size(); ++index) {
+            auto& workspace = workspaces[index];
+            if (!workspace) continue;
+            for (std::size_t next = index + 1U; next < workspaces.size(); ++next)
+                if (workspaces[next] == workspace) workspaces[next].reset();
+            observations[index] = workspace->ObserveRetirement();
+            const auto result = workspace->Settle();
+            settled.completion_reached = settled.completion_reached && result.completion_reached;
+            settled.failure = combine_image_failures(settled.failure, result.failure);
+            workspace->Detach(owner);
+        }
         for (auto& plane : planes_)
             plane.reset();
         context_.state_->backend->DestroyEvent(context_.state_->context, completion_);
+        for (auto& workspace : workspaces) workspace.reset();
+        for (const auto& observation : observations) {
+            const auto result = observation.TakeResult();
+            if (!result.complete || !result.claimed) continue;
+            settled.completion_reached = settled.completion_reached && result.settlement.completion_reached;
+            settled.failure = combine_image_failures(settled.failure, result.settlement.failure);
+        }
+        if (retirement_) retirement_->Released(settled);
+    }
+    void ReplaceWorkspace(std::shared_ptr<ImageWorkspace>& slot, std::shared_ptr<ImageWorkspace> replacement = {}) {
+        auto prior = std::exchange(slot, std::move(replacement));
+        if (prior && prior != workspace_ && prior != raw_workspace_ && prior != workspace_reserved_)
+            prior->Detach(planes_[0U]->state_->allocation_owner);
     }
     void DetachDisplay(ImageStream& stream, const std::shared_ptr<ImageWorkspace>& workspace) {
         const auto locks = LockPlanes();
         auto& raw = *planes_[0U]->state_;
         if (raw.external_storage == workspace) {
             const auto prior = raw.plane;
-            auto next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind,
-                                                                raw.capacity_width, raw.capacity_height);
+            auto next = raw.reusable_plane;
+            const bool reused = next.valid() && next.allocation.width >= raw.capacity_width &&
+                                next.allocation.height >= raw.capacity_height;
+            if (!reused)
+                next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind,
+                                                              raw.capacity_width, raw.capacity_height);
             if (!next.valid()) throw std::runtime_error("detached raw product allocation is invalid");
             next.descriptor.width = prior.descriptor.width;
             next.descriptor.height = prior.descriptor.height;
-            next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
+            if (!reused) next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
             try {
                 context_.state_->backend->CopySameDevice(context_.state_->context, stream.native_handle(), next,
                                                          context_.state_->context, prior);
@@ -652,14 +733,20 @@ struct ImageProductBuffer::State final {
                 if (!settled.completion_reached) {
                     raw.unsettled_external_storage = std::move(raw.external_storage);
                     raw.plane = next;
+                    if (reused) raw.reusable_plane = {};
                     raw.external_bytes = 0U;
                     raw.unavailable.store(true, std::memory_order_release);
-                } else {
+                } else if (!reused) {
                     context_.state_->backend->FreePlane(context_.state_->context, next.data);
                 }
                 stream.RethrowAfterSettlement(failure);
             }
             raw.plane = next;
+            if (!reused && raw.reusable_plane.data != 0U)
+                context_.state_->backend->FreePlane(context_.state_->context, raw.reusable_plane.data);
+            raw.reusable_plane = {};
+            raw.capacity_width = next.allocation.width;
+            raw.capacity_height = next.allocation.height;
             raw.external_storage.reset();
             raw.external_bytes = 0U;
         }
@@ -669,11 +756,11 @@ struct ImageProductBuffer::State final {
     }
     [[nodiscard]] std::uint64_t BeginWrite(ImageStream& stream) {
         AwaitReceiverReads();
-        if (!workspace_reserved_ && raw_workspace_ && raw_workspace_->display_owned() && !raw_workspace_->WriteAvailable()) {
+        if (!workspace_reserved_ && raw_workspace_ && !raw_workspace_->WriteAvailable()) {
             const auto workspace = raw_workspace_;
             DetachDisplay(stream, workspace);
         }
-        if (!workspace_reserved_ && workspace_ && workspace_->display_owned() && !workspace_->WriteAvailable()) {
+        if (!workspace_reserved_ && workspace_ && !workspace_->WriteAvailable()) {
             const auto workspace = workspace_;
             DetachDisplay(stream, workspace);
         }
@@ -697,7 +784,7 @@ struct ImageProductBuffer::State final {
     }
     bool ReservePhysicalWork() {
         if (workspace_reserved_) return true;
-        if (raw_workspace_ && planes_[0U]->state_->external_storage != raw_workspace_) raw_workspace_.reset();
+        if (raw_workspace_ && planes_[0U]->state_->external_storage != raw_workspace_) ReplaceWorkspace(raw_workspace_);
         const auto first = raw_workspace_ ? raw_workspace_ : workspace_;
         if (!first) return true;
         if (!first->ReserveWrite()) return false;
@@ -725,6 +812,7 @@ struct ImageProductBuffer::State final {
     ImageProductLayout layout_;
     std::array<std::unique_ptr<ImageBuffer>, 2U> planes_{};
     std::size_t plane_count_;
+    std::shared_ptr<ImageProductRetirement> retirement_;
     std::uintptr_t completion_ = 0U;
     mutable std::shared_mutex transaction_;
     std::atomic<std::uint32_t> receiver_reads_{0U};
@@ -832,8 +920,8 @@ void ImageProductReadCompletion::Quarantine() noexcept {
     ReleaseAccess();
 }
 
-ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout)
-    : state_(std::make_shared<State>(std::move(context), layout)) {}
+ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout, std::shared_ptr<ImageProductRetirement> retirement)
+    : state_(std::make_shared<State>(std::move(context), layout, std::move(retirement))) {}
 ImageProductBuffer::~ImageProductBuffer() {
     if (deferred_release_) return;
     std::unique_lock transaction(state_->transaction_);
@@ -880,10 +968,13 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
                                                                  state_->context_.state_->context, raw.plane);
                 stream.Synchronize();
             }
-            if (raw.plane.data != 0U && !raw.external_storage)
-                state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.plane.data);
+            if (raw.plane.data != 0U && !raw.external_storage) {
+                if (raw.reusable_plane.data != 0U)
+                    state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.reusable_plane.data);
+                raw.reusable_plane = raw.plane;
+            }
             raw.external_storage = state_->workspace_;
-            state_->raw_workspace_ = state_->workspace_;
+            state_->ReplaceWorkspace(state_->raw_workspace_, state_->workspace_);
             raw.external_bytes = state_->workspace_->allocation_bytes();
             destination.allocation.owner = raw.allocation_owner;
             raw.plane = destination;
@@ -1046,15 +1137,14 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
         if (!workspace->ReserveWrite()) return false;
     }
     try {
-        workspace->Attach(state_->planes_[0U]->state_->allocation_owner);
+        workspace->Attach(state_->planes_[0U]->state_->allocation_owner, state_->retirement_);
     } catch (...) {
         if (reserved_replacement) workspace->CancelWrite();
         throw;
     }
     if (reserved_replacement && state_->workspace_ != state_->workspace_reserved_ && state_->workspace_) state_->workspace_->CancelWrite();
     // Retained raw plane custody is unchanged until the next exclusive write.
-    if (state_->workspace_ && state_->workspace_ != workspace && !state_->workspace_->display_owned()) state_->workspace_->Withdraw();
-    state_->workspace_ = std::move(workspace);
+    state_->ReplaceWorkspace(state_->workspace_, std::move(workspace));
     state_->workspace_->SetAvailabilitySink(state_->availability_sink_);
     state_->finalize_ = std::move(finalize);
     // Dropping the replaced owner can reveal failed physical cleanup even
@@ -1065,10 +1155,11 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
 void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     {
         std::shared_lock transaction(state_->transaction_);
-        if (!state_->workspace_ || state_->workspace_->revision() == state_->generation_) return;
+        if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_})) return;
     }
     auto source = Borrow();
-    if (!source.valid() || !state_->workspace_ || state_->workspace_->revision() == source.plane(0U).revision()) return;
+    if (!source.valid() || !state_->workspace_ ||
+        state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()})) return;
     const auto extent = source.plane(0U).plane().descriptor;
     if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
@@ -1077,7 +1168,7 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
 BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
     std::shared_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock() || state_->generation_ == 0U || !state_->workspace_ ||
-        state_->workspace_->revision() != state_->generation_)
+        !state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_}))
         return {};
     BorrowedImageProductReadView source{std::make_shared<BorrowedImageProductReadView::Lease>(state_, std::move(transaction))};
     source.count_ = state_->plane_count_;
@@ -1117,6 +1208,8 @@ ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
         } else if (plane.plane.data != 0U)
             result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
         result.pinned_bytes += plane.staging_bytes;
+        if (plane.reusable_plane.data != 0U)
+            result.device_bytes += plane.reusable_plane.descriptor.pitch_bytes * plane.reusable_plane.allocation.height;
     }
     if (state_->workspace_) {
         const auto workspace = state_->workspace_->StorageFootprint();
@@ -1135,8 +1228,6 @@ bool ImageProductBuffer::writable() const {
     if (!transaction.owns_lock()) return false;
     if (state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
     if (state_->unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
-    if (state_->workspace_ && !state_->workspace_->display_owned() && !state_->workspace_reserved_ && !state_->workspace_->WriteAvailable()) return false;
-    if (state_->raw_workspace_ && !state_->raw_workspace_->display_owned() && !state_->workspace_reserved_ && !state_->raw_workspace_->WriteAvailable()) return false;
     std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
         locks[index] = std::unique_lock{state_->planes_[index]->state_->access, std::try_to_lock};
@@ -1150,8 +1241,8 @@ bool ImageProductBuffer::ReserveWorkspaceWrite() {
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock()) return false;
     if (state_->workspace_reserved_) return false;
-    if (state_->workspace_ && state_->workspace_->display_owned() && !state_->workspace_->WriteAvailable()) return true;
-    if (state_->raw_workspace_ && state_->raw_workspace_->display_owned() && !state_->raw_workspace_->WriteAvailable()) return true;
+    if (state_->workspace_ && !state_->workspace_->WriteAvailable()) return true;
+    if (state_->raw_workspace_ && !state_->raw_workspace_->WriteAvailable()) return true;
     return state_->ReservePhysicalWork();
 }
 void ImageProductBuffer::CancelWorkspaceWrite() noexcept {
@@ -1159,7 +1250,7 @@ void ImageProductBuffer::CancelWorkspaceWrite() noexcept {
     if (!state_->workspace_reserved_) return;
     state_->workspace_reserved_->CancelWrite();
     if (state_->workspace_ != state_->workspace_reserved_ && state_->workspace_) state_->workspace_->CancelWrite();
-    state_->workspace_reserved_.reset();
+    state_->ReplaceWorkspace(state_->workspace_reserved_);
 }
 bool ImageProductBuffer::terminal() const noexcept {
     for (std::size_t index = 0U; index != state_->plane_count_; ++index)

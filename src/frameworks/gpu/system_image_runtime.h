@@ -44,7 +44,7 @@ class SystemImageRuntime final {
         UnsafeCustody& operator=(UnsafeCustody&&) noexcept = default;
         [[nodiscard]] bool valid() const noexcept;
         [[nodiscard]] std::exception_ptr failure() const noexcept;
-        // A healthy external workspace may defer retirement. Consume completion
+        // Retained raw products and receiver leases may defer retirement. Consume completion
         // on the owner thread; the sink only wakes that owner.
         [[nodiscard]] bool deferred() const noexcept;
         [[nodiscard]] ImageStreamSettlement FinishRetirement() noexcept;
@@ -87,11 +87,6 @@ class SystemImageRuntime final {
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
     CompletedOutput CommitOutput(OutputCandidate&&);
-    [[nodiscard]] std::shared_ptr<ImageWorkspace> CreateWorkspace(ImageWorkspaceLayout,
-                                                                  std::optional<DeviceExecution> display_execution = {});
-    [[nodiscard]] bool ConfigureWorkspace(OutputCandidate&, std::shared_ptr<ImageWorkspace>);
-    [[nodiscard]] bool PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
-    [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>);
     void FinalizeWorkspace(OutputCandidate&, ImageWorkspaceCoverage = {});
     [[nodiscard]] bool PrepareDisplay(std::uint64_t revision, const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] bool DetachDisplay(const std::shared_ptr<ImageWorkspace>&);
@@ -115,13 +110,10 @@ class SystemImageRuntime final {
     [[nodiscard]] UnsafeCustody Retain(std::exception_ptr, bool deferred = false) noexcept;
     [[nodiscard]] State& ActiveState();
     [[nodiscard]] const State& ActiveState() const;
-    [[nodiscard]] State& WorkspaceState(const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] std::uint64_t TakeProductRevision();
     std::shared_ptr<State> state_;
     std::shared_ptr<RetentionControl> retention_;
     const std::shared_ptr<ImageProductRevisionSequence> product_revision_sequence_;
-    const ImageWorkspace::Operations* workspace_operations_ = nullptr;
-    friend struct test_support::ImageWorkspaceTestAccess;
 };
 
 }  // namespace mmltk::frameworks::gpu

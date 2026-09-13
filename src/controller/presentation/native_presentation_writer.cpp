@@ -1,6 +1,7 @@
 #include "src/controller/presentation/presentation_system.h"
 
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <unistd.h>
 #include <cuda_runtime_api.h>
 
@@ -22,6 +23,7 @@
 #include "src/common/types/generation.h"
 #include <charconv>
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
+#include "src/controller/presentation/detail/native_presentation_writer_test_access.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
@@ -150,13 +152,32 @@ struct AdmittedSource final {
         : description(imported), context(std::move(shared_context)), stream(context), diagnostics(diagnostic_sink) {
         completion.fd = wake;
     }
+    void AdoptWorkspace(std::shared_ptr<gpu::ImageWorkspace> allocation, std::weak_ptr<ScopedFd> wake) {
+        workspace = std::move(allocation);
+        workspace_retirement = workspace->ObserveRetirement();
+        workspace_release_wake = std::make_shared<const std::function<void()>>([wake] {
+            if (const auto descriptor = wake.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(descriptor->get()));
+        });
+        workspace->SetDisplayAvailabilitySink(workspace_release_wake);
+    }
     ~AdmittedSource() noexcept {
         // The callback's wake can precede its return. Keep its source-owned
         // storage alive until this native completion owner settles the stream.
+        gpu::ImageStreamSettlement settled;
         Cleanup(VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted,
                 VisualDiagnosticOperation::PresentationSourceStreamSettlementCompleted, [&] {
-                    if (!stream.Settle().completion_reached) std::terminate();
+                    settled = stream.Settle();
+                    if (!settled.completion_reached) std::terminate();
                 });
+        if (workspace || workspace_release_span) {
+            // Admission rollback has no queued request. Explicit retirement
+            // retains pending sources in the writer until this step can finish.
+            try {
+                if (!ReleaseWorkspace(settled)) std::terminate();
+                // Display cleanup may have bound another device's context.
+                context.Bind();
+            } catch (...) { std::terminate(); }
+        }
         Cleanup(VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted,
                 VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseCompleted, [&] { pixel_device.reset(); });
         Cleanup(VisualDiagnosticOperation::PresentationSourceProbeHostReleaseStarted,
@@ -172,10 +193,44 @@ struct AdmittedSource final {
                 });
         Cleanup(VisualDiagnosticOperation::PresentationSourceTimelineDestructionStarted,
                 VisualDiagnosticOperation::PresentationSourceTimelineDestructionCompleted, [&] { timeline.reset(); });
-        Cleanup(VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
-                VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted, [&] { workspace.reset(); });
     }
 
+    [[nodiscard]] std::optional<std::exception_ptr> ReleaseWorkspace(std::optional<gpu::ImageStreamSettlement> completed = {}) {
+        if (!workspace_release_started) {
+            const auto settled = completed ? *completed : stream.Settle();
+            if (!settled.completion_reached) {
+                if (settled.failure) std::rethrow_exception(settled.failure);
+                throw std::runtime_error("native source stream retirement is unsettled");
+            }
+            retirement_failure = gpu::combine_image_failures(retirement_failure, settled.failure);
+            if (timeline && timeline->Release() != cudaSuccess)
+                retirement_failure = gpu::combine_image_failures(
+                    retirement_failure, std::make_exception_ptr(std::runtime_error("native source timeline retirement failed")));
+            workspace_release_started = true;
+            workspace_retirement.SetWake(workspace_release_wake);
+            workspace_release_span.emplace(diagnostics, [&] {
+                return visual_diagnostic_boundary(
+                    VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+                        .operation = VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted,
+                        .device = context.device(), .generation = generation,
+                        .context = {.surface_high = description.id_high, .surface_low = description.id_low,
+                                    .workspace = native::workspace_source_diagnostic(description)}},
+                    VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted);
+            });
+            workspace.reset();
+        }
+        const auto result = workspace_retirement.TakeResult();
+        if (!result.complete && !workspace_retirement.TransferToProducer()) return std::nullopt;
+        // Outcome 2 is a custody handoff, not successful physical release.
+        const auto failure = gpu::combine_image_failures(
+            retirement_failure, result.claimed ? result.settlement.failure : std::exception_ptr{});
+        const auto outcome = failure ? 0U : !result.complete ? 2U : 1U;
+        if (workspace_release_span)
+            workspace_release_span->FinishWith([&](auto& fact) { fact.context.outcome = outcome; });
+        workspace_release_span.reset();
+        workspace_retirement.SetWake({});
+        return failure;
+    }
     [[nodiscard]] native::WorkspaceSurfaceImportId id() const noexcept { return {description.id_high, description.id_low}; }
     [[nodiscard]] native::WorkspaceSurfaceImportId arena() const noexcept { return {description.arena_high, description.arena_low}; }
 
@@ -184,6 +239,12 @@ struct AdmittedSource final {
     // CUDA resource destruction. Physical source turnover creates no context.
     gpu::DeviceContext context;
     std::shared_ptr<gpu::ImageWorkspace> workspace;
+    gpu::ImageWorkspace::Retirement workspace_retirement;
+    std::shared_ptr<const std::function<void()>> workspace_release_wake;
+    bool workspace_release_started = false;
+    bool retirement_requested = false;
+    std::exception_ptr retirement_failure;
+    std::optional<services::RuntimeDiagnosticSpan<VisualDiagnosticSink, VisualDiagnosticFact>> workspace_release_span;
     std::uint64_t generation = 0U;
     std::optional<gpu::ExternalGraphicsTimeline> timeline;
     ScopedFd edge;
@@ -232,12 +293,17 @@ class NativePresentationWriter final : public PresentationNativeWriter {
    public:
     NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
                              gpu::DeviceExecution execution)
+        : NativePresentationWriter(settings, std::move(configuration), diagnostics, execution,
+                                   gpu::DeviceContext(settings.device, gpu::cuda_image_copy_backend(),
+                                                      gpu::DeviceContextMode::Isolated, settings.numa_node, execution)) {}
+    NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
+                             gpu::DeviceExecution execution, gpu::DeviceContext context)
         : settings_(settings),
           configuration_(std::move(configuration)),
           diagnostics_(diagnostics),
           execution_(std::move(execution)),
           channel_(configuration_.import_socket, diagnostics_),
-          context_(settings.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, settings.numa_node, execution_),
+          context_(std::move(context)),
           wake_(std::make_shared<ScopedFd>(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK))) {
         if (wake_->get() < 0) throw std::runtime_error("presentation completion eventfd creation failed");
         completion_.fd = wake_->get();
@@ -284,21 +350,16 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
         if (const auto error = channel_.terminal_error()) throw std::runtime_error(*error);
         while (auto retired = channel_.take_retirement()) {
-            std::erase_if(sources_, [&](auto& source) {
-                if (source->id() != retired->id || source->generation != retired->generation) return false;
-                source->context.Bind();
-                DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirementStarted, *source, 0U);
-                if (source->timeline && source->timeline->Release() != cudaSuccess)
-                    throw std::runtime_error("native source timeline retirement failed");
-                DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirement, *source, 1U);
-                return true;
-            });
+            for (auto& source : sources_)
+                if (source->id() == retired->id && source->generation == retired->generation)
+                    source->retirement_requested = true;
             for (auto& arena : retiring_)
                 if (arena && arena->id == retired->id) {
                     DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *arena, 1U);
                     arena.reset();
                 }
         }
+        FinishSourceRetirements();
         while (auto transition = channel_.take_source_transition())
             ObserveSourceTransition(*transition);
         while (auto outcome = channel_.take_outcome())
@@ -335,18 +396,30 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         static_cast<void>(channel_.consume_peer_loss());
         channel_.reset_peer();
         for (auto& source : sources_)
-            source->workspace->Withdraw();
+            if (source->workspace) source->workspace->Withdraw();
         const auto settlement = SettlePhysicalWork(true);
         if (settlement != Retirement::Released) return settlement;
         bool released = true;
         try {
             for (auto& source : sources_) {
-                source->context.Bind();
-                const bool source_released = !source->timeline || source->timeline->Release() == cudaSuccess;
-                released = released && source_released;
-                DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirement, *source, source_released ? 1U : 0U);
+                source->retirement_requested = true;
             }
-            sources_.clear();
+            while (!sources_.empty()) {
+                released = !FinishSourceRetirements(false) && released;
+                if (sources_.empty()) break;
+                // Queued requests are weak. Only an executing synchronous attempt
+                // can retain a detached allocation here; attached raw custody is
+                // handed to its producer without waiting.
+                pollfd wake{wake_->get(), POLLIN, 0};
+                int status;
+                do { status = ::poll(&wake, 1, -1); } while (status < 0 && errno == EINTR);
+                if (status < 0 || (wake.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                    return Retirement::UnsafeFailure;
+                std::uint64_t value;
+                ssize_t read;
+                do { read = ::read(wake_->get(), &value, sizeof(value)); } while (read < 0 && errno == EINTR);
+                if (read < 0 && errno != EAGAIN) return Retirement::UnsafeFailure;
+            }
             for (const auto* arena : {active_.get(), candidate_.get(), retiring_[0].get(), retiring_[1].get()})
                 if (arena) DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *arena, released ? 1U : 0U);
             active_.reset();
@@ -393,6 +466,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         ReleaseRead();
         auto result = Retirement::Released;
         for (auto& source : sources_) {
+            if (!source->workspace) continue;
             try {
                 source->context.Bind();
             } catch (...) { return Retirement::UnsafeFailure; }
@@ -403,7 +477,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             const bool terminal_complete =
                 browser_terminal && acquired && source->workspace->TerminalReadComplete(source->transfer->physical_revision);
             if (source->release_submitted && !acquired && !source->release_complete) return Retirement::UnsafeFailure;
-            const auto status = cudaStreamQuery(reinterpret_cast<cudaStream_t>(source->stream.native_handle()));
+            const auto status = source->transfer
+                ? cudaStreamQuery(reinterpret_cast<cudaStream_t>(source->stream.native_handle())) : cudaSuccess;
             if (status != cudaSuccess && status != cudaErrorNotReady) return Retirement::UnsafeFailure;
             if (source->completion.ready.load(std::memory_order_acquire) && source->completion.status != cudaSuccess)
                 return Retirement::UnsafeFailure;
@@ -552,15 +627,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (!layout.valid()) throw std::runtime_error("Firefox returned an invalid workspace layout");
         return layout;
     }
-    void Request(const VisualSourceReader& reader, const gpu::ImageWorkspaceObservation& observed, const SampleArena& arena,
+    void Request(const VisualSourceReader& reader, const gpu::ImageWorkspaceObservation& observed,
                  AdmittedSource& source, bool detach_only = false) {
         source.preparing->store(true, std::memory_order_release);
         VisualWorkspaceRequest request{.product_owner = observed.product_owner,
                                        .product_revision = observed.product_revision,
                                        .detach_only = detach_only,
-                                       .layout = Layout(arena),
-                                       .display_execution = execution_,
-                                       .admitted_allocation = source.workspace->identity(),
                                        .destination = source.workspace,
                                        .ready = [completion = source.preparing, weak = std::weak_ptr{wake_}] {
                                            completion->store(false, std::memory_order_release);
@@ -629,9 +701,27 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     }
     void RetireSources() {
         for (auto& source : sources_)
-            if (source->workspace->retired() ||
-                std::ranges::any_of(retiring_, [&](const auto& arena) { return arena && source->arena() == arena->id; }))
+            if (source->workspace &&
+                (source->workspace->retired() ||
+                 std::ranges::any_of(retiring_, [&](const auto& arena) { return arena && source->arena() == arena->id; })))
                 Withdraw(*source);
+    }
+    std::exception_ptr FinishSourceRetirements(bool propagate = true) {
+        std::exception_ptr failure;
+        std::erase_if(sources_, [&](auto& source) {
+            if (!source->retirement_requested) return false;
+            if (!source->workspace_release_started) {
+                source->context.Bind();
+                DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirementStarted, *source, 0U);
+            }
+            const auto released = source->ReleaseWorkspace();
+            if (!released) return false;
+            failure = gpu::combine_image_failures(failure, *released);
+            DiagnoseSource(VisualDiagnosticOperation::PresentationSourceRetirement, *source, *released ? 0U : 1U);
+            return true;
+        });
+        if (failure && propagate) std::rethrow_exception(failure);
+        return failure;
     }
     PresentationNativeOutcome Supersede() {
         const auto submitted = pending_->submitted;
@@ -726,10 +816,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 packet.allocation_identity = workspace->identity();
                 packet.size = workspace->allocation_bytes();
                 auto source = std::make_unique<AdmittedSource>(packet, context_, wake_->get(), diagnostics_);
-                source->workspace = std::move(workspace);
-                source->workspace->SetDisplayAvailabilitySink(std::make_shared<const std::function<void()>>([weak = std::weak_ptr{wake_}] {
-                    if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
-                }));
+                source->AdoptWorkspace(std::move(workspace), wake_);
                 source->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
                 source->edge.reset(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
                 if (source->edge.get() < 0) throw std::runtime_error("native source eventfd creation failed");
@@ -747,14 +834,15 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         if (admitted->producer && admitted->producer != pending_->reader && admitted->workspace->product_owner() != 0U) {
             if (!admitted->detaching) {
                 admitted->detaching = true;
-                Request(*admitted->producer, {}, *arena, *admitted, true);
+                Request(*admitted->producer, {}, *admitted, true);
             }
             return wait("previous_raw_product_detachment", arena, &observed, admitted);
         }
         admitted->detaching = false;
         admitted->producer = pending_->reader;
         if (pending_->requested_owner == 0U) {
-            const bool direct = observed.workspace == admitted->workspace && admitted->workspace->revision() == frame.revision;
+            const bool direct = observed.workspace == admitted->workspace &&
+                                admitted->workspace->Contains({observed.product_owner, frame.revision});
             auto raw = direct ? pending_->reader->borrow() : gpu::BorrowedImageProductReadView{};
             if (direct && (!raw.valid() || raw.plane(0U).revision() != frame.revision)) return Supersede();
             if (!admitted->workspace->ReserveDisplayWrite()) return wait("shared_back_slot_unavailable", arena, &observed, admitted);
@@ -763,11 +851,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 source_read_ = std::make_unique<gpu::ImageProductReadCompletion>(std::move(raw));
             } else {
                 admitted->workspace->InvalidateWrite();
-                Request(*pending_->reader, observed, *arena, *admitted);
+                Request(*pending_->reader, observed, *admitted);
                 return wait("producer_finalization_pending", arena, &observed, admitted);
             }
         }
-        if (admitted->workspace->revision() != frame.revision) {
+        if (!admitted->workspace->Contains({pending_->requested_owner, frame.revision})) {
             admitted->workspace->CancelDisplayWrite();
             return Supersede();
         }
@@ -1028,8 +1116,28 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::unique_ptr<gpu::ImageProductReadCompletion> source_read_;
     std::uint64_t next_generation_ = 1U, next_publication_ = 1U;
     Stage stage_ = Stage::Idle;
+    friend struct test_support::NativePresentationWriterTestAccess;
 };
 }  // namespace
+
+std::unique_ptr<PresentationNativeWriter> test_support::NativePresentationWriterTestAccess::Create(
+    gpu::DeviceContext context, PresentationNativeConfiguration configuration, std::shared_ptr<gpu::ImageWorkspace> workspace,
+    VisualDiagnosticSink diagnostics) {
+    const VisualDeviceSettings settings{context.device(), workspace->layout().width, workspace->layout().height};
+    auto result = std::make_unique<NativePresentationWriter>(
+        settings, std::move(configuration), diagnostics, gpu::DeviceExecution{}, std::move(context));
+    abi::Record description{};
+    description.id_low = workspace->identity();
+    auto source = std::make_unique<AdmittedSource>(description, result->context_, result->wake_->get(), diagnostics);
+    source->AdoptWorkspace(std::move(workspace), result->wake_);
+    result->sources_.push_back(std::move(source));
+    return result;
+}
+void test_support::NativePresentationWriterTestAccess::RetireSource(PresentationNativeWriter& writer) {
+    auto& native = dynamic_cast<NativePresentationWriter&>(writer);
+    for (auto& source : native.sources_) source->retirement_requested = true;
+    static_cast<void>(native.Pump(0U));
+}
 
 PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings settings,
                                                                         PresentationNativeConfiguration configuration,

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/frameworks/gpu/image_product_retirement.h"
 
 #include <array>
 #include <cstddef>
@@ -85,7 +86,7 @@ class ImageProductPool final {
         friend class ImageProductPool;
     };
     // CLEANUP-ON
-    ImageProductPool(DeviceContext, ImageProductLayout, std::size_t);
+    ImageProductPool(DeviceContext, ImageProductLayout, std::size_t, std::shared_ptr<ImageProductRetirement> = {});
     ~ImageProductPool();
     ImageProductPool(const ImageProductPool&) = delete;
     ImageProductPool& operator=(const ImageProductPool&) = delete;
@@ -103,13 +104,10 @@ class ImageProductPool final {
     void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
-    [[nodiscard]] bool ConfigureWorkspace(Candidate&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     [[nodiscard]] bool PrepareDisplay(ImageStream&, std::uint64_t, const std::shared_ptr<ImageWorkspace>&, ImageWorkspaceFinalize);
     [[nodiscard]] bool DetachDisplay(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
     // Late admission fills an unpublished display allocation from retained raw
     // pixels; the completed product revision and raw plane addresses stay intact.
-    [[nodiscard]] bool PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
-    [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     void FinalizeWorkspace(Candidate&, ImageWorkspaceCoverage);
     [[nodiscard]] ImageStreamSettlement SettleWorkspaces() noexcept;
@@ -128,6 +126,7 @@ class ImageProductPool final {
     [[nodiscard]] std::size_t size() const noexcept;
 
    private:
+    [[nodiscard]] bool PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     void ValidateBaseline(const Product&) const;
     std::shared_ptr<Admission> admission_;
     std::vector<std::shared_ptr<Slot>> slots_;

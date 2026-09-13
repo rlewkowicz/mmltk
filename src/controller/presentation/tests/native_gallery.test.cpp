@@ -552,6 +552,81 @@ TEST_CASE("Atlas directories reconcile exact allocations and invalidate only tou
     CHECK_FALSE(directory.Contains(first_cell, first, 7U));
 }
 
+TEST_CASE("Atlas display coverage retains its exact prior content across write admission", "[explore][atlas][workspace]") {
+    using namespace explore_detail;
+    using namespace mmltk::frameworks::gpu;
+    test_support::ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<test_support::FakeImageBackend>();
+    DeviceContext display(0, backend);
+    auto layout = test_support::ImageWorkspaceTestAccess::Layout(0);
+    layout.width = layout.height = 16U;
+    auto workspace = test_support::ImageWorkspaceTestAccess::Create(display, layout);
+    workspace->Admit(workspace->identity(), layout.device_incarnation);
+    bool full = true;
+    const auto finalize = [&](auto clean, auto, auto destination, auto coverage, auto) {
+        CHECK(coverage.full_image == full);
+        if (coverage.full_image) test_support::CopyImagePlane(destination, clean);
+        else {
+            REQUIRE(coverage.regions.size() == 1U);
+            for (const auto& region : coverage.regions)
+                for (auto row = region.y1; row != region.y2; ++row)
+                    std::memcpy(reinterpret_cast<void*>(destination.data + row * destination.descriptor.pitch_bytes + region.x1 * 4U),
+                                reinterpret_cast<const void*>(clean.data + row * clean.descriptor.pitch_bytes + region.x1 * 4U),
+                                static_cast<std::size_t>(region.x2 - region.x1) * 4U);
+        }
+    };
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+                                .workspace_finalize = finalize});
+    GalleryAtlas atlas;
+    const ExploreViewport viewport{.extent = {16U, 16U}, .row_count = 2U, .columns = 2U};
+    const GalleryThumbnailCache::Identity identity{.dataset = 1U, .extent = 8U};
+    auto publish = [&](bool initial) {
+        auto candidate = runtime.AcquireOutput();
+        runtime.PublishRetained(candidate, 16U, 16U, [&](auto clean, auto semantic, auto) {
+            static_cast<void>(atlas.Begin(clean, semantic, viewport, identity));
+            if (initial) {
+                for (auto plane : {clean, semantic})
+                    std::memset(reinterpret_cast<void*>(plane.data), 37, plane.descriptor.pitch_bytes * plane.descriptor.height);
+                for (std::size_t cell = 0U; cell != 4U; ++cell) atlas.Stage(cell);
+            } else {
+                atlas.Touch(0U);
+                for (std::uint32_t row = 0U; row != 8U; ++row)
+                    std::memset(reinterpret_cast<void*>(clean.data + row * clean.descriptor.pitch_bytes), 73, 32U);
+                atlas.Stage(0U);
+            }
+        });
+        const auto coverage = atlas.WorkspaceCoverage(candidate.ObserveWorkspace());
+        if (!initial) {
+            CHECK(coverage.baseline.valid());
+            CHECK_FALSE(workspace->Contains(coverage.baseline));
+            CHECK_FALSE(coverage.full_image);
+        }
+        runtime.FinalizeWorkspace(candidate, coverage);
+        auto result = runtime.CommitOutput(std::move(candidate));
+        atlas.Commit();
+        return result;
+    };
+    auto first = publish(true);
+    REQUIRE(runtime.PrepareDisplay(first.revision(), workspace));
+    first = {};
+    full = false;
+    auto second = publish(false);
+    const auto output = workspace->plane(16U, 16U);
+    CHECK(*reinterpret_cast<const std::byte*>(output.data) == std::byte{73});
+    CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 32U) == std::byte{37});
+    CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 8U * output.descriptor.pitch_bytes) == std::byte{37});
+    REQUIRE(runtime.DetachDisplay(workspace));
+    full = true;
+    SystemImageRuntime replacement({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
+                                    .workspace_finalize = finalize});
+    replacement.Publish(16U, 16U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 91, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    REQUIRE(replacement.PrepareDisplay(replacement.Completed().revision(), workspace));
+    CHECK(*reinterpret_cast<const std::byte*>(output.data) == std::byte{91});
+    CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 32U) == std::byte{91});
+}
+
 TEST_CASE("Detail framework prewrite failure invalidates its atlas before entering the renderer", "[explore][atlas]") {
     using namespace explore_detail;
     using namespace mmltk::frameworks::gpu;

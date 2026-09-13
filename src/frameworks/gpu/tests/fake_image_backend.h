@@ -33,6 +33,7 @@ struct ImportedImageBufferTestAccess final {
     static inline std::size_t unmaps = 0U;
     static inline std::size_t allocation_releases = 0U;
     static inline CUdeviceptr last_freed_base = 0U;
+    static inline std::unordered_map<CUdeviceptr, std::size_t> workspace_storage;
     static void Reset() noexcept {
         unmap_result = allocation_result = CUDA_SUCCESS;
         unmaps = allocation_releases = 0U;
@@ -56,11 +57,29 @@ struct ImportedImageBufferTestAccess final {
         resource.mapped_base = reinterpret_cast<CUdeviceptr>(storage);
         resource.data = resource.mapped_base + layout.offset_bytes;
         resource.layout = layout;
+        workspace_storage[resource.mapped_base] = 1U;
+    }
+    static std::shared_ptr<ImportedImageBuffer> AliasWorkspace(const ImportedImageBuffer& source, DeviceContext context) {
+        auto result = std::make_shared<ImportedImageBuffer>();
+        Adopt(*result);
+        auto& resource = *result->resources_;
+        resource.context.emplace(std::move(context));
+        resource.mapped_base = source.resources_->mapped_base;
+        resource.data = source.resources_->data;
+        resource.layout = source.resources_->layout;
+        ++workspace_storage.at(resource.mapped_base);
+        return result;
     }
     static cudaError_t ReleaseWorkspace(ImportedImageBuffer& buffer) noexcept {
         auto* storage = buffer.resources_ ? reinterpret_cast<std::byte*>(buffer.resources_->mapped_base) : nullptr;
         const auto released = Release(buffer);
-        if (released == cudaSuccess) delete[] storage;
+        if (released == cudaSuccess && storage) {
+            const auto found = workspace_storage.find(reinterpret_cast<CUdeviceptr>(storage));
+            if (found != workspace_storage.end() && --found->second == 0U) {
+                workspace_storage.erase(found);
+                delete[] storage;
+            }
+        }
         return released;
     }
 
@@ -78,11 +97,18 @@ struct ImportedImageBufferTestAccess final {
 
 struct ImageWorkspaceTestAccess final {
     static inline std::exception_ptr initialize_failure;
+    static inline std::exception_ptr alias_failure;
     static inline std::size_t initialized = 0U;
 
-    static void Install(SystemImageRuntime& runtime) noexcept { runtime.workspace_operations_ = &operations; }
+    static std::shared_ptr<ImageWorkspace> Create(DeviceContext display, ImageWorkspaceLayout layout) {
+        return ImageWorkspace::Create(std::move(display), std::move(layout), {}, &operations);
+    }
+    static std::shared_ptr<ImageWorkspace> Create(std::shared_ptr<ImageCopyBackend> backend, ImageWorkspaceLayout layout) {
+        return Create(DeviceContext(layout.device, std::move(backend)), std::move(layout));
+    }
     static void Reset() noexcept {
         initialize_failure = {};
+        alias_failure = {};
         initialized = 0U;
         ImportedImageBufferTestAccess::Reset();
     }
@@ -98,13 +124,18 @@ struct ImageWorkspaceTestAccess final {
     }
 
    private:
+    static std::shared_ptr<ImportedImageBuffer> Alias(const ImportedImageBuffer& buffer, DeviceContext context) {
+        if (alias_failure) std::rethrow_exception(alias_failure);
+        return ImportedImageBufferTestAccess::AliasWorkspace(buffer, std::move(context));
+    }
     static void Initialize(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout,
                            mmltk::common::io::ScopedFd, std::uint64_t) {
         ++initialized;
         ImportedImageBufferTestAccess::AdoptWorkspace(buffer, std::move(context), layout);
         if (initialize_failure) std::rethrow_exception(initialize_failure);
     }
-    static inline const ImageWorkspace::Operations operations{&Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace};
+    static inline const ImageWorkspace::Operations operations{
+        &Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace, &Alias};
 };
 
 inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {

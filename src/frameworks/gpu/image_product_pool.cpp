@@ -26,8 +26,9 @@ struct ImageProductPool::Admission final {
     std::atomic<std::shared_ptr<const std::function<void()>>> sink;
 };
 struct ImageProductPool::Slot final {
-    Slot(std::shared_ptr<Admission> gate, DeviceContext context, ImageProductLayout layout)
-        : admission(std::move(gate)), buffer(std::move(context), layout) {}
+    Slot(std::shared_ptr<Admission> gate, DeviceContext context, ImageProductLayout layout,
+         std::shared_ptr<ImageProductRetirement> retirement)
+        : admission(std::move(gate)), buffer(std::move(context), layout, std::move(retirement)) {}
     [[nodiscard]] bool Readable() const noexcept { return facts.revision != 0U && !buffer.terminal(); }
     [[nodiscard]] bool SelectedReadable() const noexcept { return selected && !reserved && Readable(); }
     std::shared_ptr<Admission> admission;
@@ -169,7 +170,8 @@ void ImageProductPool::Candidate::Release() noexcept {
     revision_ = 0U;
     slot->admission->Available();
 }
-ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout layout, std::size_t count)
+ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout layout, std::size_t count,
+                                 std::shared_ptr<ImageProductRetirement> retirement)
     : admission_(std::make_shared<Admission>()) {
     if (count == 0U) throw std::invalid_argument("image product pool is empty");
     slots_.reserve(count);
@@ -177,7 +179,7 @@ ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout lay
         if (const auto retained = gate.lock()) retained->Available();
     });
     for (std::size_t index = 0U; index != count; ++index) {
-        auto slot = std::make_shared<Slot>(admission_, context, layout);
+        auto slot = std::make_shared<Slot>(admission_, context, layout, retirement);
         slot->buffer.SetAvailabilitySink(wake);
         slots_.push_back(std::move(slot));
     }
@@ -306,12 +308,6 @@ bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revisio
         if (!product.slot_->buffer.DetachWorkspace(stream, prior)) return false;
     return PrepareWorkspace(product, workspace, std::move(finalize));
 }
-bool ImageProductPool::ConfigureWorkspace(Candidate& candidate, std::shared_ptr<ImageWorkspace> workspace,
-                                          ImageWorkspaceFinalize finalize) {
-    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
-        throw std::invalid_argument("workspace candidate is invalid");
-    return candidate.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize));
-}
 bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace,
                                         ImageWorkspaceFinalize finalize) {
     ValidateBaseline(product);
@@ -319,17 +315,6 @@ bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<
     if (!product.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize))) return false;
     product.slot_->buffer.FinalizeWorkspace();
     return true;
-}
-bool ImageProductPool::PrepareWorkspace(const ImageWorkspaceObservation& observation, std::shared_ptr<ImageWorkspace> workspace,
-                                        ImageWorkspaceFinalize finalize) {
-    for (const auto& slot : slots_) {
-        const auto current = slot->buffer.ObserveWorkspace();
-        if (current.product_owner != observation.product_owner || current.product_revision != observation.product_revision) continue;
-        if (!slot->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize))) return false;
-        slot->buffer.FinalizeWorkspace();
-        return true;
-    }
-    return false;
 }
 BorrowedImageWorkspace ImageProductPool::BorrowWorkspace() const {
     std::unique_lock lock(admission_->mutex, std::try_to_lock);
