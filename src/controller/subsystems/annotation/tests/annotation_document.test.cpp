@@ -58,11 +58,15 @@ TEST_CASE("Native Annotation hit testing owns tool targets and selected handle p
     scene.objects = {
         {.name = contracts::AnnotationText::From("point"), .shape = Shape::Point, .point = {12, 14}},
         {.name = contracts::AnnotationText::From("box"), .shape = Shape::Box, .box = {{10, 10}, {30, 30}}},
-        {.name = contracts::AnnotationText::From("mask"), .shape = Shape::Mask, .box = {{3, 12}, {6, 13}},
+        {.name = contracts::AnnotationText::From("mask"),
+         .shape = Shape::Mask,
+         .box = {{3, 12}, {6, 13}},
          .mask = {.runs = {{12, 3, 5}}, .present = true}},
-        {.name = contracts::AnnotationText::From("spline"), .shape = Shape::Spline,
+        {.name = contracts::AnnotationText::From("spline"),
+         .shape = Shape::Spline,
          .spline_knots = {{{20, 20}, {{10, 20}, true}, {{30, 20}, true}}}},
-        {.name = contracts::AnnotationText::From("skeleton"), .shape = Shape::Skeleton,
+        {.name = contracts::AnnotationText::From("skeleton"),
+         .shape = Shape::Skeleton,
          .skeleton_nodes = {{.key = contracts::AnnotationText::From("visible"), .point = {40, 40}},
                             {.key = contracts::AnnotationText::From("hidden"), .point = {55, 55}, .visible = false}}},
     };
@@ -95,8 +99,10 @@ TEST_CASE("Native Annotation hit testing owns tool targets and selected handle p
         select(static_cast<std::uint16_t>(object));
         REQUIRE(editor.Edit({.value = AnnotationToolEdit{entry.value}}).outcome == document::DocumentOutcome::Applied);
         const auto target = hit({20.25F, 21.5F});
-        if (entry.value == Tool::Box || entry.value == Tool::Point) CHECK_FALSE(target.object);
-        else CHECK(target.object == object);
+        if (entry.value == Tool::Box || entry.value == Tool::Point)
+            CHECK_FALSE(target.object);
+        else
+            CHECK(target.object == object);
         CHECK_FALSE(target.element);
         CHECK_FALSE(target.role);
     }
@@ -109,8 +115,10 @@ TEST_CASE("Native Annotation body hits use reverse enabled-object order and exac
     scene.objects = {
         {.name = contracts::AnnotationText::From("lower"), .shape = contracts::AnnotationShape::Point, .point = {20, 20}},
         {.name = contracts::AnnotationText::From("upper"), .shape = contracts::AnnotationShape::Point, .point = {20, 20}},
-        {.name = contracts::AnnotationText::From("disabled"), .shape = contracts::AnnotationShape::Point,
-         .point = {20, 20}, .enabled = false},
+        {.name = contracts::AnnotationText::From("disabled"),
+         .shape = contracts::AnnotationShape::Point,
+         .point = {20, 20},
+         .enabled = false},
     };
     REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
     AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {26, 20}};
@@ -334,7 +342,7 @@ TEST_CASE("New indexed Annotation objects keep initial element identities throug
         REQUIRE(identity.elements.size() == 1U);
         REQUIRE(identity.elements.front() != 0U);
         AnnotationPointer handle{
-        .phase = contracts::AnnotationPointerPhase::Update,
+            .phase = contracts::AnnotationPointerPhase::Update,
             .interaction_id = 2U,
             .sequence = 1U,
             .target = {.object = 0U,
@@ -964,7 +972,8 @@ TEST_CASE("Indexed mask rows preserve fractional brush coverage and immutable st
     const auto pixels = [](const c::AnnotationObject& object) {
         std::array<bool, 96U * 96U> result{};
         for (const auto run : object.mask.runs)
-            for (unsigned x = run.first; x <= run.last; ++x) result[run.row * 96U + x] = true;
+            for (unsigned x = run.first; x <= run.last; ++x)
+                result[run.row * 96U + x] = true;
         return result;
     };
     CHECK(pixels(mask) == expected);
@@ -991,8 +1000,10 @@ TEST_CASE("Mask drag descriptions retain base intervals and commit exact transfo
     namespace d = c::subsystems::annotation;
     d::AnnotationDocument editor;
     auto scene = c::test_scene("test://mask-transform");
-    scene.objects.push_back({.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask,
-                             .box = {{10, 10}, {14, 12}}, .mask = {.runs = {{10, 10, 13}, {11, 11, 12}}, .present = true}});
+    scene.objects.push_back({.name = c::contracts::AnnotationText::From("mask"),
+                             .shape = c::contracts::AnnotationShape::Mask,
+                             .box = {{10, 10}, {14, 12}},
+                             .mask = {.runs = {{10, 10, 13}, {11, 11, 12}}, .present = true}});
     REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
     c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .target = {.object = 0U}, .point = {11.25F, 10.5F}};
     REQUIRE(editor.Pointer(pointer).outcome == d::DocumentOutcome::Applied);
@@ -1023,16 +1034,16 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
     namespace gpu = mmltk::frameworks::gpu;
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     std::promise<std::exception_ptr> done;
-    c::detail::VisualRuntimeOwner owner(c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U,
-                                                                                   .maximum_height = 64U}),
-                                       [&](auto failure) { done.set_value(failure); });
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+    c::detail::VisualRuntimeOwner owner(
+        c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U, .maximum_height = 64U}),
+        [&](auto failure) { done.set_value(failure); });
+    const bool submitted = owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto& algorithm = dynamic_cast<c::AnnotationAlgorithm&>(*runtime.model());
         const auto open = [&](unsigned char value) {
             runtime.PublishInput(64U, 64U, [value](auto clean, auto, auto stream) {
                 REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value,
-                                           clean.descriptor.row_bytes(), clean.descriptor.height,
-                                           reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
+                                          clean.descriptor.row_bytes(), clean.descriptor.height,
+                                          reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
             });
             const auto input = runtime.BorrowInput();
             algorithm.Open(input.plane(0U).plane(), {});
@@ -1041,12 +1052,11 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         auto scene = std::make_shared<c::contracts::AnnotationSceneContent>(c::test_scene("test://native-raster"));
         scene->categories.push_back({.value = "second"});
         scene->palette = {{0, 1, 1}, {120, 1, 1}};
-        scene->objects = {
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{10, 4}, {26, 20}}, .category = 1U},
-            {.shape = c::contracts::AnnotationShape::Mask, .box = {{6, 10}, {15, 16}}, .mask = {.present = true}}
-        };
-        for (std::uint16_t row = 10U; row != 16U; ++row) scene->objects.back().mask.runs.push_back({row, 6U, 14U});
+        scene->objects = {{.shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
+                          {.shape = c::contracts::AnnotationShape::Box, .box = {{10, 4}, {26, 20}}, .category = 1U},
+                          {.shape = c::contracts::AnnotationShape::Mask, .box = {{6, 10}, {15, 16}}, .mask = {.present = true}}};
+        for (std::uint16_t row = 10U; row != 16U; ++row)
+            scene->objects.back().mask.runs.push_back({row, 6U, 14U});
         c::AnnotationRenderState description;
         description.scene = scene;
         description.scene_revision = 1U;
@@ -1103,8 +1113,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         CHECK(render(82U) == preview);
         auto mixed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
         mixed->objects = {
-            {.shape = c::contracts::AnnotationShape::Point, .point = {20, 8},
-             .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
+            {.shape = c::contracts::AnnotationShape::Point, .point = {20, 8}, .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
             {.shape = c::contracts::AnnotationShape::Spline,
              .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
              .spline_knots = {{{3, 20}}, {{12, 20}}}},
@@ -1113,10 +1122,8 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
              .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
                                 {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
              .skeleton_edges = {{0U, 1U}}},
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{2, 2}, {10, 10}},
-             .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{40, 41}, {55, 54}}, .category = 1U}
-        };
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{2, 2}, {10, 10}}, .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{40, 41}, {55, 54}}, .category = 1U}};
         REQUIRE(mixed->valid());
         description.scene = mixed;
         description.editor.selected_object = 3U;
@@ -1142,8 +1149,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         const auto exposed = compare_fresh();
         for (const unsigned row : {44U, 46U, 48U, 50U})
             CHECK(pixel(exposed, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
-        for (const auto point : std::array<std::array<unsigned, 2U>, 5U>{{{20U, 8U}, {8U, 20U}, {8U, 12U},
-                                                                       {2U, 6U}, {15U, 15U}}}) {
+        for (const auto point : std::array<std::array<unsigned, 2U>, 5U>{{{20U, 8U}, {8U, 20U}, {8U, 12U}, {2U, 6U}, {15U, 15U}}}) {
             CHECK(pixel(exposed, point[0], point[1]) == pixel(covered, point[0], point[1]));
             CHECK(pixel(exposed, point[0], point[1])[3] == 255U);
         }
@@ -1156,7 +1162,8 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         for (const unsigned row : {44U, 46U, 48U, 50U})
             CHECK(pixel(remaining, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
         return c::detail::VisualRuntimeOwner::Notification{[&] { done.set_value({}); }};
-    }));
+    });
+    REQUIRE(submitted);
     auto result = done.get_future();
     const auto failure = mmltk::testsupport::await_test_future(result, "native retained annotation raster");
     if (failure) std::rethrow_exception(failure);

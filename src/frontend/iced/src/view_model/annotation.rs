@@ -26,8 +26,7 @@ impl AnnotationModel {
         let mut keep_pending = false;
         if let Some(frame) = self.pending_frame.as_ref() {
             if frame.revision == incoming.revision
-                && (frame.uirevision != incoming.uirevision
-                    || frame.frame != incoming.frame)
+                && (frame.uirevision != incoming.uirevision || frame.frame != incoming.frame)
             {
                 return Err(UiError::protocol(
                     "inconsistent Annotation frame and full-state revision",
@@ -185,9 +184,16 @@ mod tests {
         snapshot.revision = 4;
         snapshot.uirevision = 3;
         model.install_snapshot(snapshot.clone()).unwrap();
-        let newer = crate::generated::AnnotationFrameState { revision: 5, uirevision: 3, frame: snapshot.frame.clone() };
+        let newer = crate::generated::AnnotationFrameState {
+            revision: 5,
+            uirevision: 3,
+            frame: snapshot.frame.clone(),
+        };
         model.install_frame(newer).unwrap();
         assert_eq!(model.snapshot.as_ref().unwrap().revision, 5);
-        assert_eq!(model.install_snapshot(snapshot).unwrap(), Observation::Stale);
+        assert_eq!(
+            model.install_snapshot(snapshot).unwrap(),
+            Observation::Stale
+        );
     }
 }

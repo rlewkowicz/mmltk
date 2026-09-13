@@ -17,6 +17,7 @@ namespace mmltk::controller {
 template <class Record>
 class WorkspaceInputQueue final {
     static_assert(std::is_nothrow_move_constructible_v<Record> && std::is_nothrow_move_assignable_v<Record>);
+
    public:
     void Push(Record record) {
         if (size_ == storage_.size()) {

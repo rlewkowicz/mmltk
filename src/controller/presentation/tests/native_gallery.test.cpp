@@ -565,7 +565,8 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
     bool full = true;
     const auto finalize = [&](auto clean, auto, auto destination, auto coverage, auto) {
         CHECK(coverage.full_image == full);
-        if (coverage.full_image) test_support::CopyImagePlane(destination, clean);
+        if (coverage.full_image)
+            test_support::CopyImagePlane(destination, clean);
         else {
             REQUIRE(coverage.regions.size() == 1U);
             for (const auto& region : coverage.regions)
@@ -575,8 +576,8 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
                                 static_cast<std::size_t>(region.x2 - region.x1) * 4U);
         }
     };
-    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
-                                .workspace_finalize = finalize});
+    SystemImageRuntime runtime(
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
     GalleryAtlas atlas;
     const ExploreViewport viewport{.extent = {16U, 16U}, .row_count = 2U, .columns = 2U};
     const GalleryThumbnailCache::Identity identity{.dataset = 1U, .extent = 8U};
@@ -587,7 +588,8 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
             if (initial) {
                 for (auto plane : {clean, semantic})
                     std::memset(reinterpret_cast<void*>(plane.data), 37, plane.descriptor.pitch_bytes * plane.descriptor.height);
-                for (std::size_t cell = 0U; cell != 4U; ++cell) atlas.Stage(cell);
+                for (std::size_t cell = 0U; cell != 4U; ++cell)
+                    atlas.Stage(cell);
             } else {
                 atlas.Touch(0U);
                 for (std::uint32_t row = 0U; row != 8U; ++row)
@@ -617,8 +619,8 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
     CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 8U * output.descriptor.pitch_bytes) == std::byte{37});
     REQUIRE(runtime.DetachDisplay(workspace));
     full = true;
-    SystemImageRuntime replacement({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic,
-                                    .workspace_finalize = finalize});
+    SystemImageRuntime replacement(
+        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
     replacement.Publish(16U, 16U, [](auto clean, auto, auto) {
         std::memset(reinterpret_cast<void*>(clean.data), 91, clean.descriptor.pitch_bytes * clean.descriptor.height);
     });
@@ -1185,7 +1187,8 @@ TEST_CASE("Native disk admission follows visible leading and prior rows in both 
     }
     std::vector<std::uint32_t> expected;
     const auto visible_end = std::min(203U, (first_row + 2U) * 2U);
-    for (auto image = first_row * 2U; image < visible_end; ++image) expected.push_back(image);
+    for (auto image = first_row * 2U; image < visible_end; ++image)
+        expected.push_back(image);
     const auto ahead = [&] {
         for (auto image = visible_end; image < std::min(203U, (first_row + 6U) * 2U); ++image)
             expected.push_back(image);
@@ -1220,8 +1223,8 @@ TEST_CASE("Native viewport restoration publishes cached rows from either side be
     gallery.Drain();
     const auto move = [&](std::uint32_t row) {
         if (row != gallery.plan.viewport.first_row)
-            gallery.plan.scroll_direction = row > gallery.plan.viewport.first_row ?
-                ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
+            gallery.plan.scroll_direction =
+                row > gallery.plan.viewport.first_row ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
         gallery.plan.viewport.first_row = row;
         ++gallery.plan.generation;
         gallery.demand->store(gallery.plan.generation);

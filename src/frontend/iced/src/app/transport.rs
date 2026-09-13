@@ -19,28 +19,6 @@ impl App {
         self.workspace.reset_transport(&self.model);
     }
 
-    pub(super) fn retire_if_closed(
-        &mut self,
-        result: Result<
-            crate::transport_connection::SendDisposition,
-            crate::transport_connection::OutboundSendError,
-        >,
-    ) -> bool {
-        match result {
-            Ok(_) | Err(crate::transport_connection::OutboundSendError::Capacity) => false,
-            Err(crate::transport_connection::OutboundSendError::Allocation) => {
-                self.retire_peer(UiError::transport("retained input allocation failed"));
-                true
-            }
-            Err(crate::transport_connection::OutboundSendError::Closed) => {
-                self.retire_peer(UiError::transport(
-                    crate::transport_connection::OutboundSendError::Closed.to_string(),
-                ));
-                true
-            }
-        }
-    }
-
     pub(super) fn on_transport(&mut self, event: TransportEvent) -> Task<Message> {
         if self.connection.is_none()
             && self.model.connection == crate::view_model::ConnectionState::Reconnecting
@@ -57,7 +35,7 @@ impl App {
             return Task::none();
         }
         match event {
-            TransportEvent::Connected(mut connection) => {
+            TransportEvent::Connected(connection) => {
                 if self.config.integration && self.config.integration_viewer_scenario == "quiet" {
                     connection.observe_integration_pressure(1);
                 }

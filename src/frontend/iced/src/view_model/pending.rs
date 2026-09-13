@@ -112,10 +112,10 @@ impl ApplicationModel {
             });
         }
         let owner = crate::generated::application_intent_system(expected);
-        if owner != crate::generated::ApplicationSystem::Annotation && self
-            .pending
-            .values()
-            .any(|pending| crate::generated::application_intent_system(pending.endpoint) == owner)
+        if owner != crate::generated::ApplicationSystem::Annotation
+            && self.pending.values().any(|pending| {
+                crate::generated::application_intent_system(pending.endpoint) == owner
+            })
         {
             let detail = match owner {
                 crate::generated::ApplicationSystem::Explore => {
@@ -321,15 +321,27 @@ mod tests {
     #[test]
     fn annotation_commands_and_stop_retain_distinct_pending_replies() {
         let mut model = bootstrapped();
-        let edit = model.begin_intent(ApplicationIntentEndpoint::AnnotationEdit).unwrap();
+        let edit = model
+            .begin_intent(ApplicationIntentEndpoint::AnnotationEdit)
+            .unwrap();
         model.next_correlation = edit;
-        let stop = model.begin_intent(ApplicationIntentEndpoint::AnnotationStop).unwrap();
-        let next = model.begin_intent(ApplicationIntentEndpoint::AnnotationEdit).unwrap();
+        let stop = model
+            .begin_intent(ApplicationIntentEndpoint::AnnotationStop)
+            .unwrap();
+        let next = model
+            .begin_intent(ApplicationIntentEndpoint::AnnotationEdit)
+            .unwrap();
         assert_ne!(edit, stop);
         assert_ne!(stop, next);
         model.abandon_intent(stop);
-        assert_eq!(model.pending_endpoint(edit), Some(ApplicationIntentEndpoint::AnnotationEdit));
-        assert_eq!(model.pending_endpoint(next), Some(ApplicationIntentEndpoint::AnnotationEdit));
+        assert_eq!(
+            model.pending_intent(edit),
+            Some(ApplicationIntentEndpoint::AnnotationEdit)
+        );
+        assert_eq!(
+            model.pending_intent(next),
+            Some(ApplicationIntentEndpoint::AnnotationEdit)
+        );
         model.peer_disconnected(UiError::transport("closed"));
         assert!(model.pending.is_empty());
     }

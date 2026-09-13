@@ -271,7 +271,14 @@ impl Component {
         surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
-        view(&self.state, model, settings, surface, width, self.input.clone())
+        view(
+            &self.state,
+            model,
+            settings,
+            surface,
+            width,
+            self.input.clone(),
+        )
     }
 }
 
@@ -330,7 +337,9 @@ pub fn view<'a>(
     let center_width = layout.center;
     let paired = crate::presentation_surface::explore_display(surface);
     let gallery = match &paired {
-        Some(crate::presentation_surface::ExploreDisplay::Gallery(surface, metadata)) => Some((*surface, metadata.clone())),
+        Some(crate::presentation_surface::ExploreDisplay::Gallery(surface, metadata)) => {
+            Some((*surface, metadata.clone()))
+        }
         _ => None,
     };
     let content = row![
@@ -338,7 +347,8 @@ pub fn view<'a>(
             .id(DATASET_PANE_ID)
             .width(Length::Fixed(layout.dataset))
             .height(Fill),
-        gallery::view(state, model, settings, gallery, center_width, input.clone()).map(Message::Gallery),
+        gallery::view(state, model, settings, gallery, center_width, input.clone())
+            .map(Message::Gallery),
         container(details::view(state, model, settings).map(Message::Details))
             .id(DETAILS_PANE_ID)
             .width(Length::Fixed(layout.details))
@@ -349,8 +359,10 @@ pub fn view<'a>(
     .height(Fill);
 
     let detail = match paired {
-        Some(crate::presentation_surface::ExploreDisplay::Detail(surface, content)) =>
-            Some(detail::view(state, model, settings, surface, content, input.clone()).map(Message::Detail)),
+        Some(crate::presentation_surface::ExploreDisplay::Detail(surface, content)) => Some(
+            detail::view(state, model, settings, surface, content, input.clone())
+                .map(Message::Detail),
+        ),
         _ => None,
     };
     let mut layers: Vec<Element<'a, Message>> = Vec::with_capacity(2);
@@ -381,7 +393,10 @@ mod tests {
             let surface = crate::presentation_surface::metadata::surface(frame).unwrap();
             match logical {
                 0 => model.explore.snapshot = None,
-                1 => model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Gallery,
+                1 => {
+                    model.explore.snapshot.as_mut().unwrap().mode =
+                        crate::generated::ExploreMode::Gallery
+                }
                 _ => {
                     let changed = model.explore.snapshot.as_mut().unwrap();
                     changed.selectedimage = Some(99);
@@ -391,15 +406,32 @@ mod tests {
             }
             let Some(crate::presentation_surface::ExploreDisplay::Detail(shown, content)) =
                 crate::presentation_surface::explore_display(Some(surface))
-                else { panic!("accepted detail selects its physical composition"); };
+            else {
+                panic!("accepted detail selects its physical composition");
+            };
             assert_eq!(shown.frame, Some(frame));
-            assert_eq!(content.viewer_identity(), expected.selectedimage.map(|image| (expected.dataset.identity, image)));
+            assert_eq!(
+                content.viewer_identity(),
+                expected
+                    .selectedimage
+                    .map(|image| (expected.dataset.identity, image))
+            );
             assert_eq!(content.overlay(), &expected.overlay);
             assert_eq!(content.frame(), &expected.frame);
             let state = state::State::default();
-            assert_eq!(state.detail_original(&content), expected.detail.showoriginaldimensions);
+            assert_eq!(
+                state.detail_original(&content),
+                expected.detail.showoriginaldimensions
+            );
             let settings = SettingsModel::default();
-            drop(view(&state, &model, &settings, Some(surface), 1200.0, crate::workspace_input::Binding::default()));
+            drop(view(
+                &state,
+                &model,
+                &settings,
+                Some(surface),
+                1200.0,
+                crate::workspace_input::Binding::default(),
+            ));
             crate::presentation_surface::retire_publication(frame);
             assert_eq!(crate::presentation_surface::test_releases(), vec![frame]);
         }

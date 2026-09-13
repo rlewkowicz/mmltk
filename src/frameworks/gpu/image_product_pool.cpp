@@ -171,7 +171,7 @@ void ImageProductPool::Candidate::Release() noexcept {
     slot->admission->Available();
 }
 ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout layout, std::size_t count,
-                                 std::shared_ptr<ImageProductRetirement> retirement)
+                                   std::shared_ptr<ImageProductRetirement> retirement)
     : admission_(std::make_shared<Admission>()) {
     if (count == 0U) throw std::invalid_argument("image product pool is empty");
     slots_.reserve(count);
@@ -299,8 +299,8 @@ bool ImageProductPool::DetachDisplay(ImageStream& stream, const std::shared_ptr<
         if (!slot->buffer.DetachWorkspace(stream, workspace)) return false;
     return true;
 }
-bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revision,
-                                      const std::shared_ptr<ImageWorkspace>& workspace, ImageWorkspaceFinalize finalize) {
+bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revision, const std::shared_ptr<ImageWorkspace>& workspace,
+                                      ImageWorkspaceFinalize finalize) {
     const auto product = Selected();
     if (!product.valid() || product.revision() != revision) return false;
     for (const auto& slot : slots_) {
@@ -341,8 +341,9 @@ void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCov
 void ImageProductPool::CompleteWorkspaces() {
     std::exception_ptr failure;
     for (const auto& slot : slots_) {
-        try { slot->buffer.CompleteWorkspace(); }
-        catch (...) { failure = combine_image_failures(failure, std::current_exception()); }
+        try {
+            slot->buffer.CompleteWorkspace();
+        } catch (...) { failure = combine_image_failures(failure, std::current_exception()); }
     }
     if (failure) std::rethrow_exception(failure);
 }

@@ -86,8 +86,9 @@ class AnnotationSystem::Impl final {
         input_worker_.Wake();
     }
     void PeerClosed() noexcept {
-        try { SetInputPeer(0U); }
-        catch (...) {
+        try {
+            SetInputPeer(0U);
+        } catch (...) {
             {
                 std::scoped_lock lock(mutex_);
                 stopping_ = true;
@@ -178,26 +179,36 @@ class AnnotationSystem::Impl final {
             {
                 std::scoped_lock lock(mutex_);
                 if (stopping_) return;
-                if (completion_) completion = std::move(completion_);
-                else if (gpu_continuation_) return;
-                else record = input_.Pop();
+                if (completion_)
+                    completion = std::move(completion_);
+                else if (gpu_continuation_)
+                    return;
+                else
+                    record = input_.Pop();
             }
-            if (completion) { completion(); continue; }
+            if (completion) {
+                completion();
+                continue;
+            }
             if (!record) return;
-            std::visit([this](auto value) {
-                using Value = decltype(value);
-                if constexpr (std::same_as<Value, WorkspaceMouse>) ReduceMouse(value);
-                else if constexpr (std::same_as<Value, Command>) Execute(std::move(value));
-                else {
-                    const bool preview_changed = CancelGesture();
-                    bool ready;
-                    {
-                        std::scoped_lock lock(mutex_);
-                        ready = state_.ready;
+            std::visit(
+                [this](auto value) {
+                    using Value = decltype(value);
+                    if constexpr (std::same_as<Value, WorkspaceMouse>)
+                        ReduceMouse(value);
+                    else if constexpr (std::same_as<Value, Command>)
+                        Execute(std::move(value));
+                    else {
+                        const bool preview_changed = CancelGesture();
+                        bool ready;
+                        {
+                            std::scoped_lock lock(mutex_);
+                            ready = state_.ready;
+                        }
+                        if (preview_changed && ready) QueueRender();
                     }
-                    if (preview_changed && ready) QueueRender();
-                }
-            }, std::move(*record));
+                },
+                std::move(*record));
         }
     }
     [[nodiscard]] bool CancelGesture() noexcept {
@@ -267,7 +278,8 @@ class AnnotationSystem::Impl final {
         if (result.render_changed) QueueRender();
         if (result.outcome == document::DocumentOutcome::Applied && end &&
             document_.ui().editor.tool == contracts::AnnotationTool::ColorSample &&
-            document_.ToolAvailable(contracts::AnnotationTool::ColorSample, pointer.target.object)) Sample(pointer);
+            document_.ToolAvailable(contracts::AnnotationTool::ColorSample, pointer.target.object))
+            Sample(pointer);
     }
     [[nodiscard]] bool CancelRequested() const {
         std::scoped_lock lock(mutex_);
@@ -365,9 +377,7 @@ class AnnotationSystem::Impl final {
                     std::exception_ptr preparation_failure;
                     try {
                         algorithm.Open(plane, crop);
-                    } catch (...) {
-                        preparation_failure = std::current_exception();
-                    }
+                    } catch (...) { preparation_failure = std::current_exception(); }
                     if (preparation_failure)
                         return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
                     std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;
@@ -424,8 +434,14 @@ class AnnotationSystem::Impl final {
             state_.busy = pending_commands_ != 0U || sampling_;
             state_.cancellation_requested = false;
         }
-        if (cancelled || !color) { InstallUi(false); return; }
-        if (!document_.ResolveTarget(pointer)) { Reject("The sampled annotation target no longer exists", false); return; }
+        if (cancelled || !color) {
+            InstallUi(false);
+            return;
+        }
+        if (!document_.ResolveTarget(pointer)) {
+            Reject("The sampled annotation target no longer exists", false);
+            return;
+        }
         const auto object = document_.ui().scene.objects.at(*pointer.target.object);
         auto supported = object.sup;
         supported.center = *color;
@@ -436,8 +452,10 @@ class AnnotationSystem::Impl final {
                           ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}})
                           : std::move(selected);
         result.render_changed = result.render_changed || selection_changed;
-        if (result.outcome != document::DocumentOutcome::Applied) Reject(std::move(result.detail), false);
-        else InstallUi(false);
+        if (result.outcome != document::DocumentOutcome::Applied)
+            Reject(std::move(result.detail), false);
+        else
+            InstallUi(false);
         if (result.render_changed) QueueRender();
     }
     void Sample(AnnotationPointer pointer) {
@@ -451,7 +469,8 @@ class AnnotationSystem::Impl final {
                 std::optional<contracts::AnnotationColor> color;
                 if (!stop.stop_requested() && !CancelRequested()) color = annotation_algorithm(runtime).Sample(pointer.point);
                 return [this, pointer, color] { Post([this, pointer, color] { FinishSample(pointer, color); }); };
-            })) throw contracts::UnavailableError("Annotation color sampling is unavailable");
+            }))
+            throw contracts::UnavailableError("Annotation color sampling is unavailable");
     }
     void InstallUi(bool settle) {
         AnnotationSnapshot installed;
@@ -538,23 +557,26 @@ class AnnotationSystem::Impl final {
         const bool fresh_source = clean_epoch_ != description.document_epoch;
         const auto input = runtime.BorrowInput();
         const auto baseline = output.ObserveWorkspace();
-        runtime.PublishRetained(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
-            annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream);
-        }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
+        runtime.PublishRetained(
+            output, extent.width, extent.height,
+            [&](auto clean, auto semantic, auto stream) {
+                annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream);
+            },
+            mmltk::frameworks::gpu::ImageSubmission::Enqueue);
         runtime.FinalizeWorkspace(output, annotation_algorithm(runtime).WorkspaceCoverage(baseline));
         renderer_.DeferCompletion(runtime, [this, &runtime, output = std::move(output), fresh_source, extent]() mutable {
-            const auto& description = active_description_;
+            const auto& completed_description = active_description_;
             runtime.CommitOutput(std::move(output));
             if (fresh_source) {
-                clean_epoch_ = description.document_epoch;
+                clean_epoch_ = completed_description.document_epoch;
                 clean_revision_ = runtime.OutputFacts().revision;
             }
             auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
             frame.clean_revision = clean_revision_;
             std::optional<AnnotationRenderedFacts> evidence;
             if (diagnostics_.valid())
-                evidence = AnnotationRenderedFacts{description.generation, description.document_epoch,
-                                                   description.scene_revision, description.editor};
+                evidence = AnnotationRenderedFacts{completed_description.generation, completed_description.document_epoch,
+                                                   completed_description.scene_revision, completed_description.editor};
             AnnotationFrameState rendered;
             {
                 std::scoped_lock lock(mutex_);
@@ -565,7 +587,7 @@ class AnnotationSystem::Impl final {
                 rendered = {state_.revision, state_.ui_revision, frame};
             }
             Publish(AnnotationFrameChanged{rendered});
-            DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, description, &pending_baseline_, frame.revision);
+            DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, completed_description, &pending_baseline_, frame.revision);
         });
     }
     void Reject(std::string detail, bool settle) {
@@ -667,7 +689,9 @@ void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
 // CLEANUP-IGNORE: These direct methods expose Annotation's sealed owner; Live and Upscale retain independent system ownership.
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
-std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
+std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const {
+    return impl_->ImageSnapshot(frame);
+}
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace AnnotationSystem::BorrowWorkspace() const { return impl_->renderer_.BorrowWorkspace(); }

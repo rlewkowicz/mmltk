@@ -669,21 +669,40 @@ mod tests {
             crate::generated::SCHEMA_FINGERPRINT
         );
         assert_eq!(bootstrap.input_epoch, 1);
-        assert!(matches!(decode_server(native[4]).unwrap(), ServerRecord::InteractionRejected(record)
-            if record.endpointid == crate::generated::ENDPOINT_Annotation_Input));
-        let limit = crate::generated::ReflectedRecordPath::ApplicationErrorRecord.map_child(b"detail").max_leaf_bytes();
-        let ServerRecord::InteractionRejected(present) = decode_server(native[6]).unwrap() else { panic!("native rejection") };
+        assert!(
+            matches!(decode_server(native[4]).unwrap(), ServerRecord::InteractionRejected(record)
+            if record.endpointid == crate::generated::ENDPOINT_Annotation_Input)
+        );
+        let limit = crate::generated::ReflectedRecordPath::ApplicationErrorRecord
+            .map_child(b"detail")
+            .max_leaf_bytes();
+        let ServerRecord::InteractionRejected(present) = decode_server(native[6]).unwrap() else {
+            panic!("native rejection")
+        };
         assert_eq!(present.error.detail.len(), limit);
         let original = decode_envelope(native[5]).unwrap().payload;
-        let Value::Object(original_fields) = original else { panic!("reflected record") };
+        let Value::Object(original_fields) = original else {
+            panic!("reflected record")
+        };
         for mutation in 0..3 {
             let mut fields = original_fields.clone();
             match mutation {
-                0 => { fields.pop(); }
-                1 => { fields[0].0 = "unknown".into(); }
-                _ => { fields[0].0 = fields[1].0.clone(); }
+                0 => {
+                    fields.pop();
+                }
+                1 => {
+                    fields[0].0 = "unknown".into();
+                }
+                _ => {
+                    fields[0].0 = fields[1].0.clone();
+                }
             }
-            assert!(crate::generated::InteractionRejected::from_application_value(Value::Object(fields)).is_err());
+            assert!(
+                crate::generated::InteractionRejected::from_application_value(Value::Object(
+                    fields
+                ))
+                .is_err()
+            );
         }
         let mut zero_epoch = decode_envelope(native[0]).unwrap().payload;
         if let Value::Object(fields) = &mut zero_epoch {

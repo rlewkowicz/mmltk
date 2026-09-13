@@ -31,6 +31,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/frameworks/reflection/field_policy.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 
 namespace mmltk::controller::browser::relation_audit_test {
 
@@ -367,6 +368,7 @@ struct SyntheticVisualComposition final {
 struct ExtendedVisualComposition final {
     SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
     SyntheticVisualSystem<PresentationSourceKind::Explore>* additional = nullptr;
+    TestSettingsSystem* settings = nullptr;
 };
 struct DuplicateVisualComposition final {
     SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
@@ -649,7 +651,9 @@ TEST_CASE("visual producer projections derive nested observations and compositio
 
     SyntheticVisualSystem<PresentationSourceKind::Predict> producer;
     SyntheticVisualSystem<PresentationSourceKind::Explore> additional;
-    auto readers = materialize_visual_source_readers(ExtendedVisualComposition{&producer, &additional});
+    TestSettingsSystem settings;
+    auto readers = materialize_visual_source_readers(
+        ExtendedVisualComposition{.producer = &producer, .additional = &additional, .settings = &settings});
     for (const auto& reader : readers) {
         const auto observation = reader.observe();
         CHECK(observation.snapshot_revision == 91U);
@@ -663,12 +667,24 @@ TEST_CASE("visual producer projections derive nested observations and compositio
         const auto bytes = reader.image_metadata(frame);
         REQUIRE(bytes.has_value());
         CHECK(bytes->size() < 1024U);
-        WorkspaceImageMetadata image;
-        REQUIRE(mmltk::frameworks::serialization::decode_compact_into(image, {.first = *bytes},
-            {.max_bytes = 1024U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth}));
-        CHECK(image.frame == frame);
-        CHECK_FALSE(image.source.has_value());
-        CHECK(image.schema_fingerprint == application_schema_fingerprint<ExtendedVisualComposition>().words);
+        const auto image =
+            wire::decode({.first = *bytes}, {.max_bytes = 1024U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth});
+        REQUIRE(image.has_value());
+        std::uint64_t system_id = 0U;
+        ApplicationSchema<ExtendedVisualComposition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+            if (Projection::kind == frame.source.kind) system_id = Cell::stable_id;
+        });
+        REQUIRE(system_id != 0U);
+        auto product = mmltk::frameworks::serialization::reflected_transport_value(VisualImageMetadata{.frame = frame});
+        REQUIRE(product.has_value());
+        const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{
+            .schema_fingerprint = application_schema_fingerprint<ExtendedVisualComposition>().words,
+            .frame = frame,
+            .product = {.system_id = system_id, .value = std::move(*product)},
+            .source = std::nullopt,
+        });
+        REQUIRE(expected.has_value());
+        CHECK(*image == *expected);
         auto mismatched = frame;
         ++mismatched.revision;
         CHECK_FALSE(reader.image_metadata(mismatched).has_value());
@@ -707,7 +723,7 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     SystemEvent published;
     std::function<void(SystemEvent)> latest_sink = [&](SystemEvent event) { published = std::move(event); };
     ApplicationEventPublisher<&ApplicationSystems::presentation> latest(latest_sink, [&] { ++lost; });
-    latest(PresentationSystem::event_type{PresentationFailed{.snapshot = {.revision = 73U}}});
+    latest(PresentationSystem::event_type{PresentationFailed{.snapshot = {.revision = 73U}, .detail = "presentation failed"}});
     CHECK(published.delivery == contracts::reflection::EventDelivery::Critical);
     CHECK(published.state_revision == 73U);
     CHECK(published.event_id ==
@@ -873,7 +889,8 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
         using Underlying = std::underlying_type_t<mmltk::controller::contracts::reflection::EventDelivery>;
         expected_enum.append_number(sizeof(Underlying));
         expected_enum.append_number(std::is_signed_v<Underlying>);
-        expected_enum.append_number(mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>().size());
+        expected_enum.append_number(
+            mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>().size());
         for (const auto entry : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>()) {
             expected_enum.append(entry.name);
             expected_enum.append_number(static_cast<Underlying>(static_cast<Underlying>(entry.value) + (reassign ? 1U : 0U)));

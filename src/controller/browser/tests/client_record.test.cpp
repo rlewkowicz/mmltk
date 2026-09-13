@@ -102,8 +102,7 @@ class FixtureAnnotationSystem final {
                                                            1024U}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot snapshot() const {
         return {};
     }
-    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void Input(
-        mmltk::controller::WorkspaceMouse batch) {
+    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void Input(mmltk::controller::WorkspaceMouse batch) {
         input = std::move(batch);
     }
     mmltk::controller::WorkspaceMouse input;
@@ -369,7 +368,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
         // CLEANUP-IGNORE: Exhaustive annotation alternatives and renderer observations are independent protocol
         // evidence.
         CHECK(annotation.alternatives[alternative] == alternative);
-
 }
 
 TEST_CASE("browser server records preserve reply and event error vocabulary", "[controller][browser][protocol]") {
@@ -720,10 +718,17 @@ TEST_CASE("compact workspace mouse records preserve fractional coordinates and w
     using namespace mmltk::controller::browser;
     namespace cbor = mmltk::frameworks::serialization;
     constexpr wire::Limits limits{.max_bytes = kMaxIntentValueBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth};
-    const WorkspaceMouse source{.source = PresentationSourceKind::Annotation, .peer_epoch = 9U, .document_epoch = 3U,
-                                .kind = WorkspaceMouseKind::Wheel, .point = WorkspacePoint{1.25F, 2.5F},
-                                .button = WorkspaceMouseButton::Other, .other_button = 127U, .click_count = 2U,
-                                .modifiers = 15U, .wheel_unit = WorkspaceWheelUnit::Pixels, .wheel = {0.125F, -0.25F}};
+    const WorkspaceMouse source{.source = PresentationSourceKind::Annotation,
+                                .peer_epoch = 9U,
+                                .document_epoch = 3U,
+                                .kind = WorkspaceMouseKind::Wheel,
+                                .point = WorkspacePoint{1.25F, 2.5F},
+                                .button = WorkspaceMouseButton::Other,
+                                .other_button = 127U,
+                                .click_count = 2U,
+                                .modifiers = 15U,
+                                .wheel_unit = WorkspaceWheelUnit::Pixels,
+                                .wheel = {0.125F, -0.25F}};
     wire::ByteBuffer bytes(cbor::compact_maximum_cbor_bytes<WorkspaceMouse>());
     cbor::FixedCborEncoder encoder(bytes);
     REQUIRE(cbor::encode_compact(encoder, source));

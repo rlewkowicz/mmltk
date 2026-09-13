@@ -66,12 +66,15 @@ pub(super) fn view<'a>(
 ) -> Element<'a, Message> {
     let available = !settings.has_local_edits() && model.explore_mutation_available();
     let original = state.detail_original(&content);
-    let selected = content.viewer_identity().expect("validated detail viewer").1;
+    let selected = content
+        .viewer_identity()
+        .expect("validated detail viewer")
+        .1;
     let overlay = content.overlay().clone();
     let image = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {
             show_fps: crate::workspace_fps::enabled(settings),
-                input: Some(input.for_source(content.frame().source.kind, 0, None)),
+            input: Some(input.for_source(content.frame().source.kind, 0, None)),
             local: None,
             surface: content.configure_surface(surface, original, state.fit_revision),
             publish: None,
@@ -136,11 +139,7 @@ pub(super) fn view<'a>(
     let panel = container(
         column![
             row![
-                text(format!(
-                    "Sample #{}",
-                    selected
-                ))
-                .size(20),
+                text(format!("Sample #{}", selected)).size(20),
                 space::horizontal(),
                 container(
                     button("Previous")

@@ -137,8 +137,7 @@ struct ImageWorkspaceTestAccess final {
         ImportedImageBufferTestAccess::AdoptWorkspace(buffer, std::move(context), layout);
         if (initialize_failure) std::rethrow_exception(initialize_failure);
     }
-    static inline const ImageWorkspace::Operations operations{
-        &Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace, &Alias};
+    static inline const ImageWorkspace::Operations operations{&Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace, &Alias};
 };
 
 inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {
@@ -236,7 +235,8 @@ class FakeImageBackend final : public ImageCopyBackend {
                 entry = notifications_.erase(entry);
             }
         }
-        for (auto* notification : completed) notification->Notify(status);
+        for (auto* notification : completed)
+            notification->Notify(status);
     }
     void SetStreamSettlement(std::uintptr_t stream, StreamSettlement result) {
         std::scoped_lock lock(mutex_);
@@ -512,7 +512,7 @@ class FakeImageBackend final : public ImageCopyBackend {
 
 [[nodiscard]] inline ImageWorkspaceFinalize FakeWorkspaceFinalizer(std::shared_ptr<FakeImageBackend> backend) {
     return [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
-                                         ImageWorkspaceCoverage coverage, std::uintptr_t) {
+                                          ImageWorkspaceCoverage coverage, std::uintptr_t) {
         ++backend->workspace_finalizations;
         const auto draw = [&](ImageWorkspaceRegion region) {
             for (auto y = std::max(0, region.y1); y < std::min(static_cast<int>(clean.descriptor.height), region.y2); ++y) {
@@ -521,7 +521,8 @@ class FakeImageBackend final : public ImageCopyBackend {
                     auto* pixel = reinterpret_cast<std::uint8_t*>(destination.data) + y * destination.descriptor.pitch_bytes + x * 4U;
                     std::memcpy(pixel, base, 4U);
                     if (!semantic.valid()) continue;
-                    const auto* overlay = reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
+                    const auto* overlay =
+                        reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
                     if (overlay[3] == 0U) continue;
                     const float alpha = static_cast<float>(overlay[3]) / 255.0F;
                     for (unsigned channel = 0U; channel != 3U; ++channel)
@@ -530,8 +531,11 @@ class FakeImageBackend final : public ImageCopyBackend {
                 }
             }
         };
-        if (coverage.full_image) draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
-        else for (auto region : coverage.regions) draw(region);
+        if (coverage.full_image)
+            draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
+        else
+            for (auto region : coverage.regions)
+                draw(region);
     };
 }
 
@@ -539,20 +543,19 @@ class FakeImageBackend final : public ImageCopyBackend {
     const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
     std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U,
     ImageWorkspaceFinalize finalize = {}) {
-    return
-        [device, backend, layout, model = std::move(model), output_buffer_count,
-         finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
-            return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
-                .device = device,
-                .backend = backend,
-                .model = model ? model() : nullptr,
-                .input_layout = layout,
-                .output_layout = layout,
-                .output_buffer_count = output_buffer_count,
-                .workspace_finalize = finalize,
-                .product_revisions = std::move(revisions),
-            });
-        };
+    return [device, backend, layout, model = std::move(model), output_buffer_count,
+            finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
+        return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+            .device = device,
+            .backend = backend,
+            .model = model ? model() : nullptr,
+            .input_layout = layout,
+            .output_layout = layout,
+            .output_buffer_count = output_buffer_count,
+            .workspace_finalize = finalize,
+            .product_revisions = std::move(revisions),
+        });
+    };
 }
 
 }  // namespace mmltk::frameworks::gpu::test_support

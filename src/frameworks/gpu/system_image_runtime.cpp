@@ -234,8 +234,7 @@ SystemImageRuntime::Retirement SystemImageRuntime::Retire() noexcept {
     }
     const auto products = retention_->products->Retire();
     failure = combine_image_failures(failure, products.failure);
-    if (!products.completion_reached)
-        return {.failure = failure, .custody = Retain(failure, !retention_->products->unsafe())};
+    if (!products.completion_reached) return {.failure = failure, .custody = Retain(failure, !retention_->products->unsafe())};
     state_->retired = true;
     return {.safe_to_destroy = true, .failure = failure};
 }

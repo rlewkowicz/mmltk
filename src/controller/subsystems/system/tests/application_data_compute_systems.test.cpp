@@ -1435,8 +1435,10 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
         const auto request = [&] {
             auto ready = std::make_shared<std::promise<void>>();
             auto result = ready->get_future();
-            predict.RequestWorkspace({.product_owner = expected.owner, .product_revision = expected.revision,
-                                      .destination = workspace, .ready = [ready] { ready->set_value(); }});
+            predict.RequestWorkspace(
+                {.product_owner = expected.owner, .product_revision = expected.revision, .destination = workspace, .ready = [ready] {
+                     ready->set_value();
+                 }});
             return result;
         };
         auto ready = request();
@@ -1477,8 +1479,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
         CHECK(constructions == 2U);
         auto detached = std::make_shared<std::promise<void>>();
         auto released = detached->get_future();
-        predict.RequestWorkspace({.detach_only = true, .destination = workspace,
-                                  .ready = [detached] { detached->set_value(); }});
+        predict.RequestWorkspace({.detach_only = true, .destination = workspace, .ready = [detached] { detached->set_value(); }});
         mmltk::testsupport::await_test_future(released, "Predict workspace detach");
         workspace.reset();
     }

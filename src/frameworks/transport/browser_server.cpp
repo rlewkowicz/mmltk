@@ -599,7 +599,6 @@ void BrowserServer::close_peer() noexcept { impl_->request_peer_close(); }
 
 BrowserRecordPush BrowserServer::publish(BrowserOutputRecord record) noexcept { return impl_->publish(std::move(record)); }
 
-
 bool BrowserServer::running() const noexcept { return impl_->running.load(std::memory_order_acquire); }
 
 bool BrowserServer::connected() const noexcept { return impl_->connected.load(std::memory_order_acquire); }

@@ -418,19 +418,19 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
     if (launch.scale_x != 1 || launch.scale_y != 1 || launch.source_x != launch.target_x || launch.source_y != launch.target_y) {
         if (launch.scale_x <= 0 || launch.scale_y <= 0 || length == 0) return;
         const auto width = static_cast<std::uint64_t>(launch.overlay_region.width);
+        // NOLINTNEXTLINE(bugprone-integer-division): A linear pixel index selects an integer row before geometric projection.
         const float x = static_cast<float>(start % width), y = static_cast<float>(start / width);
         const auto project = [](float value, float source, float target, float scale) {
             // Match the separate float operations used when materializing the
             // saved intervals; contraction can cross a floor/ceil boundary.
             return __fadd_rn(target, __fmul_rn(__fsub_rn(value, source), scale));
         };
-        const int first = max(max(0, launch.clip.x1),
-                              static_cast<int>(floorf(project(x, launch.source_x, launch.target_x, launch.scale_x))));
-        const int last = min(min(launch.overlay_region.width, launch.clip.x2),
-                             static_cast<int>(ceilf(project(x + static_cast<float>(length), launch.source_x,
-                                                           launch.target_x, launch.scale_x))));
-        const int top = max(max(0, launch.clip.y1),
-                            static_cast<int>(floorf(project(y, launch.source_y, launch.target_y, launch.scale_y))));
+        const int first =
+            max(max(0, launch.clip.x1), static_cast<int>(floorf(project(x, launch.source_x, launch.target_x, launch.scale_x))));
+        const int last =
+            min(min(launch.overlay_region.width, launch.clip.x2),
+                static_cast<int>(ceilf(project(x + static_cast<float>(length), launch.source_x, launch.target_x, launch.scale_x))));
+        const int top = max(max(0, launch.clip.y1), static_cast<int>(floorf(project(y, launch.source_y, launch.target_y, launch.scale_y))));
         const int bottom = min(min(launch.overlay_region.height, launch.clip.y2),
                                static_cast<int>(ceilf(project(y + 1, launch.source_y, launch.target_y, launch.scale_y))));
         if (first >= last || top >= bottom) return;
@@ -444,7 +444,8 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
             const auto color = static_cast<unsigned>(launch.color.r) | (static_cast<unsigned>(launch.color.g) << 8U) |
                                (static_cast<unsigned>(launch.color.b) << 16U) | (static_cast<unsigned>(launch.color.a) << 24U);
             auto* destination = reinterpret_cast<unsigned*>(launch.overlay_region.pixels +
-                static_cast<std::size_t>(py) * launch.overlay_region.pitch_bytes + static_cast<std::size_t>(px) * 4U);
+                                                            static_cast<std::size_t>(py) * launch.overlay_region.pitch_bytes +
+                                                            static_cast<std::size_t>(px) * 4U);
             atomicExch(destination, color);
         }
         return;
@@ -497,7 +498,10 @@ __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgb
     const auto& points = launch.points;
     const int x = launch.clip.x1 + global_thread_x();
     const int y = launch.clip.y1 + global_thread_y();
-    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) { return; }
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr ||
+        points.point_count < 2) {
+        return;
+    }
 
     const int segment_count = launch.closed ? points.point_count : points.point_count - 1;
     const float px = static_cast<float>(x) + 0.5f;
@@ -519,7 +523,10 @@ __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPit
     const auto& points = launch.points;
     const int x = launch.clip.x1 + global_thread_x();
     const int y = launch.clip.y1 + global_thread_y();
-    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr ||
+        points.point_count <= 0) {
+        return;
+    }
 
     const float px = static_cast<float>(x) + 0.5f;
     const float py = static_cast<float>(y) + 0.5f;
@@ -541,8 +548,8 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
     const auto& edges = launch.edges;
     const int x = launch.clip.x1 + global_thread_x();
     const int y = launch.clip.y1 + global_thread_y();
-    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr ||
-        points.point_count <= 0 || edges.edge_count <= 0) {
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr ||
+        edges.edge_indices == nullptr || points.point_count <= 0 || edges.edge_count <= 0) {
         return;
     }
 

@@ -99,12 +99,17 @@ impl App {
     }
 
     pub(super) fn open_annotation(&mut self) -> bool {
-        self.submit_annotation_open(self.model.selected_detail_source(), self.model.annotation_open_available())
+        self.submit_annotation_open(
+            self.model.selected_detail_source(),
+            self.model.annotation_open_available(),
+        )
     }
 
     pub(super) fn copy_viewer_to_annotation(&mut self) -> bool {
-        self.submit_annotation_open(crate::presentation_surface::viewer_annotation_request(),
-            self.model.annotation_import_available())
+        self.submit_annotation_open(
+            crate::presentation_surface::viewer_annotation_request(),
+            self.model.annotation_import_available(),
+        )
     }
 
     fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>, available: bool) -> bool {
@@ -125,5 +130,4 @@ impl App {
             move |correlation| crate::generated::encode_annotation_Open(correlation, request),
         )
     }
-
 }

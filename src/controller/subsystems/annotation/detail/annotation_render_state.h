@@ -17,8 +17,8 @@ struct AnnotationDragPreview final {
     contracts::AnnotationPoint point;
     bool operator==(const AnnotationDragPreview&) const = default;
 };
-void materialize_annotation_drag(contracts::AnnotationObject&, const AnnotationDragPreview&,
-                                 const contracts::AnnotationSceneContent&, subsystems::annotation::MaskScratch&);
+void materialize_annotation_drag(contracts::AnnotationObject&, const AnnotationDragPreview&, const contracts::AnnotationSceneContent&,
+                                 subsystems::annotation::MaskScratch&);
 [[nodiscard]] contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSplineKnot, const AnnotationDragPreview&,
                                                                    const contracts::AnnotationSceneContent&);
 // One retained description has exclusive input custody while being filled and
@@ -66,18 +66,20 @@ struct AnnotationRenderState final {
         return bounds.box;
     }
     [[nodiscard]] contracts::AnnotationPoint DrawingPoint(std::size_t index) const {
-        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::Point ?
-            drag->point : DrawingObjectAt(index).point;
+        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::Point
+                   ? drag->point
+                   : DrawingObjectAt(index).point;
     }
     [[nodiscard]] contracts::AnnotationSplineKnot DrawingKnot(std::size_t index, std::size_t knot) const {
         auto result = DrawingObjectAt(index).spline_knots[knot];
-        if (drag && preview_object == index && drag->target.element == knot)
-            result = annotation_drag_knot(result, *drag, *scene);
+        if (drag && preview_object == index && drag->target.element == knot) result = annotation_drag_knot(result, *drag, *scene);
         return result;
     }
     [[nodiscard]] contracts::AnnotationPoint DrawingNode(std::size_t index, std::size_t node) const {
         return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::SkeletonNode &&
-               drag->target.element == node ? drag->point : DrawingObjectAt(index).skeleton_nodes[node].point;
+                       drag->target.element == node
+                   ? drag->point
+                   : DrawingObjectAt(index).skeleton_nodes[node].point;
     }
 };
 

@@ -343,11 +343,7 @@ impl ApplicationModel {
     pub fn annotation_import_available(&self) -> bool {
         self.connection == ConnectionState::Connected
             && !self.native_settings_unsettled()
-            && self
-                .annotation
-                .snapshot
-                .as_ref()
-                .is_some()
+            && self.annotation.snapshot.as_ref().is_some()
     }
 
     pub fn annotation_open_available(&self) -> bool {
@@ -379,18 +375,20 @@ impl ApplicationModel {
                     .outputdir
                     .is_empty()
             })
-            && self.annotation.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.ready
-                    && snapshot.ui.documentrevision != 0
-            })
+            && self
+                .annotation
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.ready && snapshot.ui.documentrevision != 0)
     }
 
     pub fn annotation_edit_available(&self) -> bool {
         self.connection == ConnectionState::Connected
-            && self.annotation.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.ready
-                    && snapshot.ui.documentrevision != 0
-            })
+            && self
+                .annotation
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.ready && snapshot.ui.documentrevision != 0)
     }
 
     pub fn annotation_stop_available(&self) -> bool {

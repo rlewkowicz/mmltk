@@ -17,11 +17,6 @@ pub(crate) fn tool_id(tool: crate::generated::AnnotationTool) -> String {
     sidebar::tool_id(tool)
 }
 
-#[cfg(test)]
-pub(crate) fn undo_requested() -> Message {
-    Message::Sidebar(sidebar::Message::UndoRequested)
-}
-
 #[derive(Debug, Clone)]
 pub enum Shortcut {
     Tool(crate::generated::AnnotationTool),
@@ -174,7 +169,8 @@ impl Component {
             Message::Workspace(message) => match workspace::update(message) {
                 workspace::Outcome::Gesture(gesture) => {
                     if gesture.kind == crate::presentation_surface::SurfaceGestureKind::Pointer {
-                        self.keyboard_canvas.store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.keyboard_canvas
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     return Ok(None);
                 }
@@ -300,9 +296,13 @@ impl Component {
             aspect,
             settings_edit_available,
             canvas_width,
-            self.canvas.binding(model, settings.draft.as_ref().map_or_else(
-                || crate::generated::default_uiannotationbrushradius().unwrap(),
-                |draft| draft.ui.annotationbrushradius) as u16),
+            self.canvas.binding(
+                model,
+                settings.draft.as_ref().map_or_else(
+                    || crate::generated::default_uiannotationbrushradius().unwrap(),
+                    |draft| draft.ui.annotationbrushradius,
+                ) as u16,
+            ),
             self.keyboard_canvas.clone(),
             crate::workspace_fps::enabled(settings),
         ))
@@ -408,48 +408,6 @@ mod tests {
                 content_y: 30.0,
                 pressed: true,
             },
-        }
-    }
-
-    fn color_range() -> crate::generated::AnnotationColorRange {
-        let color = crate::generated::AnnotationColor {
-            hue: 10.0,
-            saturation: 0.5,
-            value: 0.75,
-        };
-        crate::generated::AnnotationColorRange {
-            center: color.clone(),
-            minus: color.clone(),
-            plus: color,
-            sampling: true,
-        }
-    }
-
-    fn mask_object() -> crate::generated::AnnotationObject {
-        let point = crate::generated::AnnotationPoint { x: 1.0, y: 2.0 };
-        crate::generated::AnnotationObject {
-            name: crate::generated::AnnotationText::try_from("mask").unwrap(),
-            shape: crate::generated::AnnotationShape::Mask,
-            box_: crate::generated::AnnotationBox {
-                first: point.clone(),
-                second: point.clone(),
-            },
-            point,
-            mask: crate::generated::AnnotationMask {
-                runs: Vec::new(),
-                cleanupradius: 0,
-                cleanup: crate::generated::AnnotationMaskCleanup::LargestComponent,
-                present: true,
-            },
-            sup: color_range(),
-            nosup: color_range(),
-            maskpoints: Vec::new(),
-            splineknots: Vec::new(),
-            skeletonnodes: Vec::new(),
-            skeletonedges: Vec::new(),
-            category: 0,
-            splineclosed: false,
-            enabled: true,
         }
     }
 

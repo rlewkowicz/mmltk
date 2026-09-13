@@ -333,9 +333,10 @@ class ExploreSystem final {
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
 
-    using visual_source = VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
-                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
+    using visual_source =
+        VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
+                               mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
+                               mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
     using event_type = std::variant<ExploreChanged, ExploreFailed>;
     // CLEANUP-IGNORE: Explore construction retains its own generated system identity and runtime dependencies.
     ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {},

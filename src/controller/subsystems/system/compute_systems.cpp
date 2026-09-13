@@ -444,6 +444,7 @@ class PredictSystem::Impl final {
     friend class PredictSystem;
 
     WorkspaceInput input_;
+
    public:
     Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, const VisualDeviceSettings visual,
          PredictRuntimeFactory factory, SystemEventSink<event_type> events)
@@ -660,4 +661,4 @@ void PredictSystem::SetInputPeer(std::uint64_t epoch) {
     std::scoped_lock lock(impl_->mutex_);
     impl_->input_.SetPeer(epoch);
 }
-}
+}  // namespace mmltk::controller

@@ -1,12 +1,18 @@
 //! Component-local product state; queue submission and GPU settlement are distinct.
-use iced::time::{Duration, Instant};
 use iced::advanced::text::{self, Paragraph as _};
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use iced::time::{Duration, Instant};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 const REFRESH: Duration = Duration::from_millis(500);
 
 pub(crate) fn enabled(settings: &crate::view::settings::SettingsModel) -> bool {
-    settings.draft.as_ref().is_some_and(|draft| draft.ui.showworkspaceperformance)
+    settings
+        .draft
+        .as_ref()
+        .is_some_and(|draft| draft.ui.showworkspaceperformance)
 }
 
 pub(crate) fn draw(
@@ -16,24 +22,50 @@ pub(crate) fn draw(
     clip: iced::Rectangle,
     control: &'static str,
 ) {
-    use iced::advanced::text::Renderer as _;
     use iced::advanced::Renderer as _;
     use iced::advanced::renderer;
-    if clip.width < 80.0 || clip.height < 28.0 { return; }
+    use iced::advanced::text::Renderer as _;
+    if clip.width < 80.0 || clip.height < 28.0 {
+        return;
+    }
     let bounds = iced::Rectangle {
-        x: clip.x + clip.width - 80.0, y: clip.y + 6.0, width: 74.0, height: 22.0,
+        x: clip.x + clip.width - 80.0,
+        y: clip.y + 6.0,
+        width: 74.0,
+        height: 22.0,
     };
     let dark = theme.is_dark();
-    renderer.fill_quad(renderer::Quad { bounds, ..Default::default() },
-        if dark { iced::Color::BLACK } else { iced::Color::WHITE });
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            ..Default::default()
+        },
+        if dark {
+            iced::Color::BLACK
+        } else {
+            iced::Color::WHITE
+        },
+    );
     let text_bounds = iced::Rectangle {
-        x: bounds.x + 4.0, y: bounds.y, width: bounds.width - 8.0, height: bounds.height,
+        x: bounds.x + 4.0,
+        y: bounds.y,
+        width: bounds.width - 8.0,
+        height: bounds.height,
     };
     let minimum = meter.paragraph.min_bounds();
-    renderer.fill_paragraph(&meter.paragraph,
-        iced::Point::new(text_bounds.x + text_bounds.width - minimum.width,
-            text_bounds.y + (text_bounds.height - minimum.height) / 2.0),
-        if dark { iced::Color::WHITE } else { iced::Color::BLACK }, clip);
+    renderer.fill_paragraph(
+        &meter.paragraph,
+        iced::Point::new(
+            text_bounds.x + text_bounds.width - minimum.width,
+            text_bounds.y + (text_bounds.height - minimum.height) / 2.0,
+        ),
+        if dark {
+            iced::Color::WHITE
+        } else {
+            iced::Color::BLACK
+        },
+        clip,
+    );
     crate::integration_control::report_workspace_fps(control, meter, bounds, clip, dark);
 }
 
@@ -69,7 +101,9 @@ impl Meter {
         let submitted = Arc::new(AtomicU64::new(0));
         let counter = submitted.clone();
         Self {
-            observer: Arc::new(move || { counter.fetch_add(1, Ordering::Relaxed); }),
+            observer: Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
             submitted,
             previous: 0,
             since: now,
@@ -126,16 +160,29 @@ mod tests {
         let mut meter = Some(Meter::new(start));
         let observer = meter.as_ref().unwrap().observer();
         let initial_paragraph = meter.as_ref().unwrap().paragraph.clone();
-        for _ in 0..30 { observer(); }
-        let redraw = |milliseconds| iced::Event::Window(
-            iced::window::Event::RedrawRequested(start + Duration::from_millis(milliseconds)));
+        for _ in 0..30 {
+            observer();
+        }
+        let redraw = |milliseconds| {
+            iced::Event::Window(iced::window::Event::RedrawRequested(
+                start + Duration::from_millis(milliseconds),
+            ))
+        };
         Meter::update(&mut meter, true, &redraw(499));
         assert_eq!(meter.as_ref().unwrap().text(), "0 FPS");
-        assert!(std::ptr::eq(meter.as_ref().unwrap().paragraph.buffer(), initial_paragraph.buffer()));
+        assert!(std::ptr::eq(
+            meter.as_ref().unwrap().paragraph.buffer(),
+            initial_paragraph.buffer()
+        ));
         Meter::update(&mut meter, true, &redraw(500));
         assert_eq!(meter.as_ref().unwrap().text(), "60 FPS");
-        assert!(!std::ptr::eq(meter.as_ref().unwrap().paragraph.buffer(), initial_paragraph.buffer()));
-        for _ in 0..20 { observer(); }
+        assert!(!std::ptr::eq(
+            meter.as_ref().unwrap().paragraph.buffer(),
+            initial_paragraph.buffer()
+        ));
+        for _ in 0..20 {
+            observer();
+        }
         Meter::update(&mut meter, true, &redraw(1000));
         assert_eq!(meter.as_ref().unwrap().text(), "40 FPS");
         Meter::update(&mut meter, false, &redraw(1001));

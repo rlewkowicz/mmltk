@@ -8,8 +8,11 @@ struct Image {
     frame: FrameReady,
     product: generated::VisualFrame,
     pending: PendingImage,
+    #[cfg(target_arch = "wasm32")]
     transfer: u64,
+    #[cfg(target_arch = "wasm32")]
     bytes: usize,
+    #[cfg(target_arch = "wasm32")]
     fingerprint: Option<u64>,
 }
 
@@ -19,15 +22,25 @@ thread_local! {
 
 pub(super) fn valid_content(frame: &generated::VisualFrame) -> bool {
     let region = &frame.content;
-    frame.source.instance != 0 && frame.revision != 0
-        && region.width != 0 && region.height != 0
-        && region.x.checked_add(region.width).is_some_and(|end| end <= frame.extent.width)
-        && region.y.checked_add(region.height).is_some_and(|end| end <= frame.extent.height)
+    frame.source.instance != 0
+        && frame.revision != 0
+        && region.width != 0
+        && region.height != 0
+        && region
+            .x
+            .checked_add(region.width)
+            .is_some_and(|end| end <= frame.extent.width)
+        && region
+            .y
+            .checked_add(region.height)
+            .is_some_and(|end| end <= frame.extent.height)
 }
 
 fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
-    source.mode == generated::ExploreMode::Detail && source.dataset.identity != 0
-        && source.selectedimage.is_some() && valid_content(&source.frame)
+    source.mode == generated::ExploreMode::Detail
+        && source.dataset.identity != 0
+        && source.selectedimage.is_some()
+        && valid_content(&source.frame)
 }
 
 pub(crate) fn install(
@@ -40,14 +53,25 @@ pub(crate) fn install(
     if transfer == 0 || width < frame.content_width || height < frame.content_height {
         return Err("invalid graphics image capacity".into());
     }
-    let value = crate::protocol::cbor::decode_graphics_value(bytes, generated::WORKSPACE_METADATA_BYTE_CAPACITY)
-        .map_err(|error| error.0)?;
+    let value = crate::protocol::cbor::decode_graphics_value(
+        bytes,
+        generated::WORKSPACE_METADATA_BYTE_CAPACITY,
+    )
+    .map_err(|error| error.0)?;
     let metadata = generated::WorkspaceImageMetadata::from_application_transport_value(value)?;
-    if metadata.schemafingerprint != generated::SCHEMA_FINGERPRINT || !frame.matches_content(&metadata.frame) {
+    if metadata.schemafingerprint != generated::SCHEMA_FINGERPRINT
+        || !frame.matches_content(&metadata.frame)
+    {
         return Err("graphics image metadata identity mismatch".into());
     }
-    let product = generated::decode_workspace_image_product(metadata.product.systemid, metadata.product.value)?;
-    let source = metadata.source.map(|source| generated::decode_workspace_image_product(source.systemid, source.value)).transpose()?;
+    let product = generated::decode_workspace_image_product(
+        metadata.product.systemid,
+        metadata.product.value,
+    )?;
+    let source = metadata
+        .source
+        .map(|source| generated::decode_workspace_image_product(source.systemid, source.value))
+        .transpose()?;
     if source.is_some() && !matches!(&product, WorkspaceImageProduct::Upscale(_)) {
         return Err("unexpected graphics source metadata".into());
     }
@@ -66,7 +90,10 @@ pub(crate) fn install(
                 if !valid_detail(&snapshot) {
                     return Err("invalid graphics detail metadata".into());
                 }
-                detail = Some(DetailContent { explore: snapshot, upscale: None });
+                detail = Some(DetailContent {
+                    explore: snapshot,
+                    upscale: None,
+                });
             }
         }
         WorkspaceImageProduct::Annotation(snapshot) if snapshot.frame == metadata.frame => {
@@ -78,27 +105,55 @@ pub(crate) fn install(
             let Some(WorkspaceImageProduct::Explore(source)) = source else {
                 return Err("missing graphics detail source metadata".into());
             };
-            if source.frame != snapshot.input || !valid_detail(&source) || !valid_content(&snapshot.frame) {
+            if source.frame != snapshot.input
+                || !valid_detail(&source)
+                || !valid_content(&snapshot.frame)
+            {
                 return Err("graphics detail source identity mismatch".into());
             }
-            detail = Some(DetailContent { explore: Arc::new(source), upscale: Some(Arc::new(snapshot)) });
+            detail = Some(DetailContent {
+                explore: Arc::new(source),
+                upscale: Some(Arc::new(snapshot)),
+            });
         }
         WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame => {}
         WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => {}
         _ => return Err("graphics metadata does not describe this visual product".into()),
     }
     let surface = Surface {
-        high: frame.high, low: frame.low, generation: 1, width, height, timeline_ready: 0,
-        frame: Some(frame), integration: false, crop: None, viewer_identity: None, fit_revision: 0,
+        high: frame.high,
+        low: frame.low,
+        generation: 1,
+        width,
+        height,
+        timeline_ready: 0,
+        frame: Some(frame),
+        integration: false,
+        crop: None,
+        viewer_identity: None,
+        fit_revision: 0,
     };
-    let placement = gallery.as_ref().map_or(Placement::Contain, |snapshot| super::gallery::placement(snapshot));
+    let placement = gallery.as_ref().map_or(Placement::Contain, |snapshot| {
+        super::gallery::placement(snapshot)
+    });
     let image = Image {
-        frame, product: metadata.frame,
+        frame,
+        product: metadata.frame,
         pending: PendingImage {
-            read: None, surface, gallery, detail, annotation, placement,
-            complete: super::copy_completed(frame), view_ready: true,
+            read: None,
+            surface,
+            gallery,
+            detail,
+            annotation,
+            placement,
+            complete: super::copy_completed(frame),
+            view_ready: true,
         },
-        transfer, bytes: bytes.len(),
+        #[cfg(target_arch = "wasm32")]
+        transfer,
+        #[cfg(target_arch = "wasm32")]
+        bytes: bytes.len(),
+        #[cfg(target_arch = "wasm32")]
         fingerprint: super::surface_trace_enabled().then(|| fingerprint(bytes)),
     };
     IMAGES.with(|images| {
@@ -117,23 +172,44 @@ pub(crate) fn install(
     })
 }
 
+#[cfg(target_arch = "wasm32")]
 fn fingerprint(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte|
-        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3))
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
 }
 
 pub(crate) fn surface(frame: FrameReady) -> Option<Surface> {
-    IMAGES.with(|images| images.borrow().iter().find(|image| image.frame == frame).map(|image| image.pending.surface))
+    IMAGES.with(|images| {
+        images
+            .borrow()
+            .iter()
+            .find(|image| image.frame == frame)
+            .map(|image| image.pending.surface)
+    })
 }
 
 pub(super) fn pending(frame: FrameReady) -> Option<PendingImage> {
-    IMAGES.with(|images| images.borrow().iter().find(|image| image.frame == frame).map(|image| image.pending.clone()))
+    IMAGES.with(|images| {
+        images
+            .borrow()
+            .iter()
+            .find(|image| image.frame == frame)
+            .map(|image| image.pending.clone())
+    })
 }
 
 pub(crate) fn product(frame: FrameReady) -> Option<generated::VisualFrame> {
-    IMAGES.with(|images| images.borrow().iter().find(|image| image.frame == frame).map(|image| image.product.clone()))
+    IMAGES.with(|images| {
+        images
+            .borrow()
+            .iter()
+            .find(|image| image.frame == frame)
+            .map(|image| image.product.clone())
+    })
 }
 
+#[cfg(target_arch = "wasm32")]
 pub(super) fn trace_fields(frame: FrameReady) -> String {
     IMAGES.with(|images| images.borrow().iter().find(|image| image.frame == frame)
         .and_then(|image| image.fingerprint.map(|fingerprint|
@@ -170,16 +246,32 @@ pub(crate) fn encode(
     use crate::application_codec::IntoApplicationValue;
     let metadata = generated::WorkspaceImageMetadata {
         schemafingerprint: generated::SCHEMA_FINGERPRINT,
-        frame, product, source,
+        frame,
+        product,
+        source,
     };
     let mut bytes = Vec::new();
-    crate::protocol::cbor::encode_value(&metadata.into_application_transport_value(), &mut bytes).unwrap();
+    crate::protocol::cbor::encode_value(&metadata.into_application_transport_value(), &mut bytes)
+        .unwrap();
     bytes
 }
 
 #[cfg(test)]
 pub(crate) fn install_explore(frame: FrameReady, snapshot: &generated::ExploreSnapshot) {
     retire(frame);
-    install(frame, frame.content_width, frame.content_height, frame.presentation_revision,
-        &encode(snapshot.frame.clone(), encode_product(generated::ApplicationSystem::Explore, generated::ExploreImageMetadata::from(snapshot)), None)).unwrap();
+    install(
+        frame,
+        frame.content_width,
+        frame.content_height,
+        frame.presentation_revision,
+        &encode(
+            snapshot.frame.clone(),
+            encode_product(
+                generated::ApplicationSystem::Explore,
+                generated::ExploreImageMetadata::from(snapshot),
+            ),
+            None,
+        ),
+    )
+    .unwrap();
 }

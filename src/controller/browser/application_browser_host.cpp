@@ -267,7 +267,10 @@ struct ApplicationBrowserHost::Impl final {
             const auto& error = result.error.value();
             (void)publish_record(InteractionRejected{.endpoint_id = result.endpoint_id, .error = error},
                                  transport::BrowserRecordPriority::Critical);
-            if (result.essential_input) { continuity_lost(); return false; }
+            if (result.essential_input) {
+                continuity_lost();
+                return false;
+            }
             diagnostics.Emit([&] {
                 return services::RuntimeDiagnosticFact{
                     .owner = contracts::DiagnosticOwner::BrowserRuntime,
@@ -319,8 +322,10 @@ struct ApplicationBrowserHost::Impl final {
             if (installed->presentation != nullptr) installed->presentation->SetApplicationPeerConnected(false);
             ApplicationSchema<ApplicationSystems>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
                 if (auto* system = installed->*Cell::pointer) {
-                    if constexpr (requires { system->PeerClosed(); }) system->PeerClosed();
-                    else system->SetInputPeer(0U);
+                    if constexpr (requires { system->PeerClosed(); })
+                        system->PeerClosed();
+                    else
+                        system->SetInputPeer(0U);
                 }
             });
         }
@@ -366,7 +371,9 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
         if (!owner || !owner->admission.load(std::memory_order_acquire)) return false;
         const auto installed = owner->systems.load(std::memory_order_acquire);
         if (!installed || !installed->presentation) return false;
-        installed->presentation->Observe({.redraw_requested = true});
+        const auto selected = installed->presentation->selection().selected;
+        if (!selected.valid()) return false;
+        static_cast<void>(installed->presentation->Select(selected));
         return true;
     });
     if (completion) {

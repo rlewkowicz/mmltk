@@ -70,7 +70,8 @@ class VisualRuntimeOwner final {
     void NotifyContinuationAt(std::chrono::steady_clock::time_point) noexcept;
     // Arm before testing output writability; disarm clears only availability retries.
     void SetOutputRetry(bool armed) noexcept;
-    [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(Runtime&, Runtime::CompletedOutput&,
+    [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(
+        Runtime&, Runtime::CompletedOutput&,
         mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
     // Retain the submitted operation and its candidate until owner-thread GPU
     // settlement. Success and execution failure both notify; later GPU work

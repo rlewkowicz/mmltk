@@ -35,7 +35,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
         const mmltk::frameworks::gpu::ImageWorkspaceObservation& baseline) const override {
         return {.allocation_identity = baseline.workspace ? baseline.workspace->identity() : 0U,
-                .regions = {&damage_, 1U}, .full_image = full_damage_,
+                .regions = {&damage_, 1U},
+                .full_image = full_damage_,
                 .baseline = {baseline.product_owner, baseline.product_revision}};
     }
     void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop) override {
@@ -89,28 +90,28 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     struct Allocation final {
         std::uint64_t owner = 0U, identity = 0U, semantic = 0U, epoch = 0U;
         std::uint32_t width = 0U, height = 0U;
-        std::optional<std::uint16_t> selected;
-        std::vector<domain::AnnotationObject> objects;
-        std::vector<Footprint> footprints;
-        std::vector<std::optional<AnnotationDragPreview>> transforms;
-        std::vector<domain::AnnotationColor> palette;
+        std::optional<std::uint16_t> selected{};
+        std::vector<domain::AnnotationObject> objects{};
+        std::vector<Footprint> footprints{};
+        std::vector<std::optional<AnnotationDragPreview>> transforms{};
+        std::vector<domain::AnnotationColor> palette{};
     };
     mutable std::vector<Allocation> allocations_;
     mutable std::vector<Footprint> footprints_;
     mutable mmltk::frameworks::gpu::ImageWorkspaceRegion damage_;
     mutable bool full_damage_ = true;
     static bool SameGeometry(const domain::AnnotationObject& a, const domain::AnnotationObject& b) {
-        return a.shape == b.shape && a.point == b.point && a.spline_knots == b.spline_knots &&
-               a.skeleton_nodes == b.skeleton_nodes && a.skeleton_edges == b.skeleton_edges && a.spline_closed == b.spline_closed;
+        return a.shape == b.shape && a.point == b.point && a.spline_knots == b.spline_knots && a.skeleton_nodes == b.skeleton_nodes &&
+               a.skeleton_edges == b.skeleton_edges && a.spline_closed == b.spline_closed;
     }
     static bool SameDrawing(const domain::AnnotationObject& a, const domain::AnnotationObject& b, bool same_runs) {
-        return SameGeometry(a, b) && a.box == b.box && same_runs &&
-               a.category == b.category && a.enabled == b.enabled;
+        return SameGeometry(a, b) && a.box == b.box && same_runs && a.category == b.category && a.enabled == b.enabled;
     }
     static domain::AnnotationBox DrawingBox(const AnnotationRenderState& description, std::size_t index) {
         const auto& object = description.DrawingObjectAt(index);
         if (!description.drag || description.preview_object != index ||
-            (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask)) return object.box;
+            (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask))
+            return object.box;
         const auto box = description.TargetBox(index);
         if (!description.TransformsMask(index)) return box;
         if (box.first.x >= box.second.x || box.first.y >= box.second.y) return {};
@@ -127,8 +128,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
         return bounds;
     }
-    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index,
-                                  raster::IntRect runs, int width, int height) {
+    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index, raster::IntRect runs, int width,
+                                  int height) {
         const auto& object = description.DrawingObjectAt(index);
         if (!object.enabled) return {};
         const auto box = DrawingBox(description, index);
@@ -136,8 +137,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask)
             x1 = x2 = description.DrawingPoint(index).x, y1 = y2 = description.DrawingPoint(index).y;
         const auto point = [&](domain::AnnotationPoint value) {
-            x1 = std::min(x1, value.x); y1 = std::min(y1, value.y);
-            x2 = std::max(x2, value.x); y2 = std::max(y2, value.y);
+            x1 = std::min(x1, value.x);
+            y1 = std::min(y1, value.y);
+            x2 = std::max(x2, value.x);
+            y2 = std::max(y2, value.y);
         };
         for (std::size_t item = 0; item < object.spline_knots.size(); ++item) {
             const auto knot = description.DrawingKnot(index, item);
@@ -149,24 +152,28 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             if (object.skeleton_nodes[node].visible) point(description.DrawingNode(index, node));
         // Geometry includes the existing outline thickness and selection/vertex
         // handles. Runs are independent drawing primitives for every named shape.
-        x1 = std::floor(x1) - 9; y1 = std::floor(y1) - 9;
-        x2 = std::ceil(x2) + 9; y2 = std::ceil(y2) + 9;
+        x1 = std::floor(x1) - 9;
+        y1 = std::floor(y1) - 9;
+        x2 = std::ceil(x2) + 9;
+        y2 = std::ceil(y2) + 9;
         if (runs.x1 < runs.x2 && runs.y1 < runs.y2) {
             float first = static_cast<float>(runs.x1), top = static_cast<float>(runs.y1);
             float last = static_cast<float>(runs.x2), bottom = static_cast<float>(runs.y2);
             bool visible = true;
             if (description.TransformsMask(index)) {
                 const auto target = description.TargetBox(index);
-                const float sx = object.box.second.x > object.box.first.x ?
-                    (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x) : 1.0F;
-                const float sy = object.box.second.y > object.box.first.y ?
-                    (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y) : 1.0F;
+                const float sx = object.box.second.x > object.box.first.x
+                                     ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x)
+                                     : 1.0F;
+                const float sy = object.box.second.y > object.box.first.y
+                                     ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y)
+                                     : 1.0F;
                 visible = sx > 0 && sy > 0;
-                const auto project = [](float value, float source, float target, float scale) {
+                const auto project = [](float value, float source, float target_coordinate, float scale) {
                     // Keep the same separate float operations as the raster kernel.
                     const volatile float delta = value - source;
                     const volatile float scaled = delta * scale;
-                    return target + scaled;
+                    return target_coordinate + scaled;
                 };
                 first = std::floor(project(first, object.box.first.x, target.first.x, sx));
                 last = std::ceil(project(last, object.box.first.x, target.first.x, sx));
@@ -174,8 +181,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 bottom = std::ceil(project(bottom, object.box.first.y, target.first.y, sy));
             }
             if (visible) {
-                x1 = std::min(x1, first); y1 = std::min(y1, top);
-                x2 = std::max(x2, last); y2 = std::max(y2, bottom);
+                x1 = std::min(x1, first);
+                y1 = std::min(y1, top);
+                x2 = std::max(x2, last);
+                y2 = std::max(y2, bottom);
             }
         }
         return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))),
@@ -193,58 +202,61 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             allocation = std::prev(allocations_.end());
         }
         auto& retained = *allocation;
-        const bool initialize = retained.identity != clean.allocation.identity ||
-                                retained.epoch != description.document_epoch || retained.width != clean.descriptor.width ||
-                                retained.height != clean.descriptor.height || retained.semantic != semantic.allocation.identity;
+        const bool initialize = retained.identity != clean.allocation.identity || retained.epoch != description.document_epoch ||
+                                retained.width != clean.descriptor.width || retained.height != clean.descriptor.height ||
+                                retained.semantic != semantic.allocation.identity;
         if (initialize) {
-            if (!source.valid() || cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
-                    reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
-                    source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
-                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+            if (!source.valid() ||
+                cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
+                                  reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
+                                  source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
+                                  cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
                 throw std::runtime_error("Annotation clean baseline preparation failed");
         }
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};
         const auto damage = [&](raster::IntRect bounds) {
             if (bounds.x1 >= bounds.x2 || bounds.y1 >= bounds.y2) return;
-            clip.x1 = std::min(clip.x1, bounds.x1); clip.y1 = std::min(clip.y1, bounds.y1);
-            clip.x2 = std::max(clip.x2, bounds.x2); clip.y2 = std::max(clip.y2, bounds.y2);
+            clip.x1 = std::min(clip.x1, bounds.x1);
+            clip.y1 = std::min(clip.y1, bounds.y1);
+            clip.x2 = std::max(clip.x2, bounds.x2);
+            clip.y2 = std::max(clip.y2, bounds.y2);
         };
         const bool palette_changed = retained.palette != description.scene->palette;
         footprints_.resize(description.ObjectCount());
         for (std::size_t index = 0; index < std::max(retained.objects.size(), description.ObjectCount()); ++index) {
             const bool previous = index < retained.objects.size();
             const bool current = index < description.ObjectCount();
-            const bool same_runs = previous && current &&
-                retained.objects[index].mask.runs == description.DrawingObjectAt(index).mask.runs;
+            const bool same_runs = previous && current && retained.objects[index].mask.runs == description.DrawingObjectAt(index).mask.runs;
             if (current) {
                 const auto& object = description.DrawingObjectAt(index);
                 auto& footprint = footprints_[index];
                 footprint.runs = same_runs ? retained.footprints[index].runs : RunBounds(object);
-                footprint.bounds = Bounds(description, index, footprint.runs,
-                                          static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height));
+                footprint.bounds = Bounds(description, index, footprint.runs, static_cast<int>(clean.descriptor.width),
+                                          static_cast<int>(clean.descriptor.height));
             }
             const auto bounds = current ? footprints_[index].bounds : raster::IntRect{};
             const bool changed = !previous || !current || palette_changed ||
-                (retained.selected == index) != (description.editor.selected_object == index) ||
-                !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) ||
-                retained.footprints[index].bounds.x1 != bounds.x1 || retained.footprints[index].bounds.y1 != bounds.y1 ||
-                retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
-                retained.transforms[index] != (description.preview_object == index ? description.drag : std::nullopt);
+                                 (retained.selected == index) != (description.editor.selected_object == index) ||
+                                 !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) ||
+                                 retained.footprints[index].bounds.x1 != bounds.x1 || retained.footprints[index].bounds.y1 != bounds.y1 ||
+                                 retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
+                                 retained.transforms[index] != (description.preview_object == index ? description.drag : std::nullopt);
             if (changed) {
                 if (previous) damage(retained.footprints[index].bounds);
                 if (current) damage(bounds);
             }
         }
         if (initialize) clip = {0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)};
-        clip.x1 = std::max(0, clip.x1); clip.y1 = std::max(0, clip.y1);
+        clip.x1 = std::max(0, clip.x1);
+        clip.y1 = std::max(0, clip.y1);
         clip.x2 = std::min(static_cast<int>(clean.descriptor.width), clip.x2);
         clip.y2 = std::min(static_cast<int>(clean.descriptor.height), clip.y2);
         damage_ = {clip.x1, clip.y1, clip.x2, clip.y2};
         full_damage_ = initialize;
         if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2) return;
         if (cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data + clip.y1 * semantic.descriptor.pitch_bytes + clip.x1 * 4U),
-                semantic.descriptor.pitch_bytes, 0, static_cast<std::size_t>(clip.x2 - clip.x1) * 4U,
-                static_cast<std::size_t>(clip.y2 - clip.y1), stream) != cudaSuccess)
+                              semantic.descriptor.pitch_bytes, 0, static_cast<std::size_t>(clip.x2 - clip.x1) * 4U,
+                              static_cast<std::size_t>(clip.y2 - clip.y1), stream) != cudaSuccess)
             throw std::runtime_error("Annotation semantic damage preparation failed");
         const auto& scene = *description.scene;
         // Reuse pinned staging only after its prior transfer has consumed it;
@@ -347,12 +359,14 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             std::size_t first = 0U, last = total_words;
             if (!grew) {
                 const auto common = std::min(uploaded_words_.size(), total_words);
-                while (first < common && uploaded_words_[first] == pairs[first]) ++first;
+                while (first < common && uploaded_words_[first] == pairs[first])
+                    ++first;
                 if (uploaded_words_.size() == total_words)
-                    while (last > first && uploaded_words_[last - 1U] == pairs[last - 1U]) --last;
+                    while (last > first && uploaded_words_[last - 1U] == pairs[last - 1U])
+                        --last;
             }
             if (last > first && cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first,
-                    (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
+                                                (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
                 throw std::runtime_error("Annotation changed geometry upload failed");
             uploaded_words_.assign(pairs, pairs + total_words);
             if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
@@ -387,12 +401,16 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                          .color = {color.r, color.g, color.b, 92U},
                          .stream = {reinterpret_cast<void*>(stream_value)},
                          .clip = clip,
-                         .source_x = object.box.first.x, .source_y = object.box.first.y,
-                         .target_x = target.first.x, .target_y = target.first.y,
-                         .scale_x = object.box.second.x > object.box.first.x ?
-                             (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x) : 1.0F,
-                         .scale_y = object.box.second.y > object.box.first.y ?
-                             (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y) : 1.0F}) != 0)
+                         .source_x = object.box.first.x,
+                         .source_y = object.box.first.y,
+                         .target_x = target.first.x,
+                         .target_y = target.first.y,
+                         .scale_x = object.box.second.x > object.box.first.x
+                                        ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x)
+                                        : 1.0F,
+                         .scale_y = object.box.second.y > object.box.first.y
+                                        ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y)
+                                        : 1.0F}) != 0)
                     throw std::runtime_error("Annotation mask rendering failed");
                 offset += object.mask.runs.size();
             }
@@ -412,22 +430,24 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 draw_status = raster::raster_skeleton_rgba(
                     {overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, clip});
             if (draw_status != 0) throw std::runtime_error("Annotation geometry rendering failed");
-            if (geometry.handles && (object.shape != domain::AnnotationShape::Spline || description.editor.selected_object == index) && raster::raster_points_rgba(
-                                        {overlay,
-                                         {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
-                                         4,
-                                         {color.r, color.g, color.b, 255},
-                                         native_stream, clip}) != 0)
+            if (geometry.handles && (object.shape != domain::AnnotationShape::Spline || description.editor.selected_object == index) &&
+                raster::raster_points_rgba(
+                    {overlay,
+                     {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
+                     4,
+                     {color.r, color.g, color.b, 255},
+                     native_stream,
+                     clip}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
             if (description.editor.selected_object == index &&
-                raster::raster_selection_handles_rgba(
-                    {overlay,
-                     {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5,
-                      static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5},
-                     3,
-                     {255, 255, 255, 255},
-                     native_stream, clip}) != 0)
+                raster::raster_selection_handles_rgba({overlay,
+                                                       {static_cast<int>(box.first.x) - 5, static_cast<int>(box.first.y) - 5,
+                                                        static_cast<int>(box.second.x) + 5, static_cast<int>(box.second.y) + 5},
+                                                       3,
+                                                       {255, 255, 255, 255},
+                                                       native_stream,
+                                                       clip}) != 0)
                 throw std::runtime_error("Annotation selection rendering failed");
             if (box.first.x >= box.second.x || box.first.y >= box.second.y) continue;
             if (raster::raster_box_outline_rgba({
@@ -454,7 +474,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
         retained.epoch = description.document_epoch;
         retained.identity = clean.allocation.identity;
-        retained.width = clean.descriptor.width; retained.height = clean.descriptor.height;
+        retained.width = clean.descriptor.width;
+        retained.height = clean.descriptor.height;
         retained.semantic = semantic.allocation.identity;
         retained.selected = description.editor.selected_object;
         retained.palette = description.scene->palette;
@@ -490,8 +511,9 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     mutable cudaEvent_t mask_upload_ = nullptr;
     void EnsureMasks(const std::size_t bytes) const {
         if (bytes <= mask_capacity_) return;
-        const auto capacity = mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U ?
-            std::max(bytes, mask_capacity_ + mask_capacity_ / 2U) : bytes;
+        const auto capacity = mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U
+                                  ? std::max(bytes, mask_capacity_ + mask_capacity_ / 2U)
+                                  : bytes;
         if (!mask_host_) mask_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         mask_host_->ensure_bytes(capacity);
         if (!mask_device_.AllocateCandidate([capacity](void*& p) { return cudaMalloc(&p, capacity); }).released() ||

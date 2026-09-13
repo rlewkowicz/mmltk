@@ -15,12 +15,13 @@ inline controller::VisualDiagnosticSink annotation_render_evidence() {
     return {.context = &enabled, .write = [](void*, controller::VisualDiagnosticFact) noexcept {}};
 }
 
-
-inline controller::WorkspaceMouse annotation_mouse(
-    controller::AnnotationSystem& annotation, std::uint64_t peer, controller::WorkspaceMouseKind kind,
-    controller::WorkspacePoint point) {
-    return {.source = controller::PresentationSourceKind::Annotation, .peer_epoch = peer,
-            .document_epoch = annotation.snapshot().input_document_epoch, .kind = kind, .point = point,
+inline controller::WorkspaceMouse annotation_mouse(controller::AnnotationSystem& annotation, std::uint64_t peer,
+                                                   controller::WorkspaceMouseKind kind, controller::WorkspacePoint point) {
+    return {.source = controller::PresentationSourceKind::Annotation,
+            .peer_epoch = peer,
+            .document_epoch = annotation.snapshot().input_document_epoch,
+            .kind = kind,
+            .point = point,
             .brush_radius = controller::contracts::kDefaultAnnotationBrushRadius};
 }
 

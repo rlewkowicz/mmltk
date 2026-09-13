@@ -769,17 +769,17 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
                     .context = {.capacity_width = static_cast<std::uint32_t>(State().tile_meanings[slot] != nullptr)}};
             });
         diagnostics_.Emit([&] {
-            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
-                                        .operation = VisualDiagnosticOperation::AcceptancePlaceholderComplete,
-                                        .generation = plan.generation,
-                                        .value = State().visible_indices.size(),
-                                        .detail = explore_visible_indices_digest(State().visible_indices),
-                                        .context = {.capacity_width = State().reused_tiles,
-                                                    .admission = {.admission_first_row = plan.viewport.first_row,
-                                                                  .admission_row_count = plan.viewport.row_count,
-                                                                  .admission_columns = plan.viewport.columns,
-                                                                  .admission_forward =
-                                                                      plan.scroll_direction == ExploreScrollDirection::Forward}}};
+            return VisualDiagnosticFact{
+                .system = contracts::DiagnosticOwner::Explore,
+                .operation = VisualDiagnosticOperation::AcceptancePlaceholderComplete,
+                .generation = plan.generation,
+                .value = State().visible_indices.size(),
+                .detail = explore_visible_indices_digest(State().visible_indices),
+                .context = {.capacity_width = State().reused_tiles,
+                            .admission = {.admission_first_row = plan.viewport.first_row,
+                                          .admission_row_count = plan.viewport.row_count,
+                                          .admission_columns = plan.viewport.columns,
+                                          .admission_forward = plan.scroll_direction == ExploreScrollDirection::Forward}}};
         });
     }
     auto publication = PublicationFacts(stale_discarded_.exchange(0U, std::memory_order_acq_rel));
@@ -2846,9 +2846,8 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
         .content_width = content_width,
         .content_height = content_height,
     };
-    if (sample_card &&
-        explore::sample_explore_rendered_card(checksum_target, count_target, reference, device_facts + kCardSamplesOffset, stream) !=
-            explore::kExploreStorageSuccess)
+    if (sample_card && explore::sample_explore_rendered_card(checksum_target, count_target, reference, device_facts + kCardSamplesOffset,
+                                                             stream) != explore::kExploreStorageSuccess)
         throw std::runtime_error("Explore rendered card diagnostic sampling failed");
     auto rendered_probe = probe;
     if (card && probe_annotation) {
@@ -3045,10 +3044,9 @@ void GalleryStream::Impl::EmitCardSamples(const RenderedProbe& record, const std
            << ",\"augmentation_enabled\":" << (record.augmented ? "true" : "false")
            << ",\"augmentation_config_enabled\":" << (record.augmentation_config_enabled ? "true" : "false")
            << ",\"source_width\":" << record.source_extent[0] << ",\"source_height\":" << record.source_extent[1]
-           << ",\"width\":" << clean.width << ",\"height\":" << clean.height
-           << ",\"reference_width\":" << reference.width << ",\"reference_height\":" << reference.height
-           << ",\"reference_present\":" << (reference.data != nullptr ? "true" : "false") << ",\"checksum\":" << facts[1]
-           << ",\"axis_percent\":[";
+           << ",\"width\":" << clean.width << ",\"height\":" << clean.height << ",\"reference_width\":" << reference.width
+           << ",\"reference_height\":" << reference.height << ",\"reference_present\":" << (reference.data != nullptr ? "true" : "false")
+           << ",\"checksum\":" << facts[1] << ",\"axis_percent\":[";
     for (std::size_t axis = 0U; axis != grid.kAxisCount; ++axis) {
         if (axis != 0U) output << ',';
         output << grid.percent[axis];

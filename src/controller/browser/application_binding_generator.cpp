@@ -358,7 +358,9 @@ class BindingEmitter final {
         emit_catalog_value(output_, mmltk::controller::WorkspaceMouse{});
         output_ << " }\n";
         for (const bool retained : {false, true}) {
-            output_ << "pub fn encode_workspace_mouse" << (retained ? "_into(mouse: &WorkspaceMouse, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), " : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::Interaction, ")
+            output_ << "pub fn encode_workspace_mouse"
+                    << (retained ? "_into(mouse: &WorkspaceMouse, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), "
+                                 : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::Interaction, ")
                     << "crate::protocol::ProtocolError> { match mouse.source {\n";
             Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
                 std::size_t count = 0U;
@@ -366,8 +368,9 @@ class BindingEmitter final {
                     if constexpr (Endpoint::interaction && std::same_as<typename Endpoint::system_cell, Cell> &&
                                   std::same_as<typename Endpoint::request_type, mmltk::controller::WorkspaceMouse>) {
                         ++count;
-                        output_ << "PresentationSourceKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true)
-                                << " => encode_" << rust_identifier(Cell::name, false) << "_" << rust_identifier(Endpoint::name, false)
+                        output_ << "PresentationSourceKind::"
+                                << rust_identifier(mmltk::frameworks::reflection::enum_name(Projection::kind), true) << " => encode_"
+                                << rust_identifier(Cell::name, false) << "_" << rust_identifier(Endpoint::name, false)
                                 << (retained ? "_into(mouse, scratch, output),\n" : "(mouse),\n");
                     }
                 });
@@ -1158,13 +1161,13 @@ class BindingEmitter final {
                 projectable = projectable && found;
             });
             if (projectable) {
-            output_ << "impl From<&" << rust_type<typename Projection::snapshot_type>() << "> for "
-                    << rust_type<typename Projection::image_type>() << " { fn from(source: &"
-                    << rust_type<typename Projection::snapshot_type>() << ") -> Self { Self {\n";
-            VisitRustFields<typename Projection::image_type>([&]<class, class>(const auto&, const std::string& member) {
-                output_ << member << ": source." << member << ".clone(),\n";
-            });
-            output_ << "} } }\n";
+                output_ << "impl From<&" << rust_type<typename Projection::snapshot_type>() << "> for "
+                        << rust_type<typename Projection::image_type>() << " { fn from(source: &"
+                        << rust_type<typename Projection::snapshot_type>() << ") -> Self { Self {\n";
+                VisitRustFields<typename Projection::image_type>([&]<class, class>(const auto&, const std::string& member) {
+                    output_ << member << ": source." << member << ".clone(),\n";
+                });
+                output_ << "} } }\n";
             }
         });
         symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
@@ -1173,7 +1176,8 @@ class BindingEmitter final {
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
             output_ << rust_identifier(Cell::name, true) << '(' << rust_type<typename Projection::image_type>() << "),\n";
         });
-        output_ << "}\npub fn decode_workspace_image_product(system_id: u64, value: Value) -> Result<WorkspaceImageProduct, String> { match system_id {\n";
+        output_ << "}\npub fn decode_workspace_image_product(system_id: u64, value: Value) -> Result<WorkspaceImageProduct, String> { "
+                   "match system_id {\n";
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
             output_ << Cell::stable_id << " => { let image: " << rust_type<typename Projection::image_type>()
                     << " = FromApplicationValue::from_application_transport_value(value)?;\n"

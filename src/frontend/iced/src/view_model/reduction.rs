@@ -598,11 +598,7 @@ pub(super) fn merge_explore_snapshot(
             }
             fields.push_str(field);
         });
-        crate::integration_control::report_snapshot_conflict(
-            "Explore",
-            incoming.revision,
-            &fields,
-        );
+        crate::integration_control::report_snapshot_conflict("Explore", incoming.revision, &fields);
     }
     merge_observation(target, incoming, |value| value.revision, "Explore")
 }

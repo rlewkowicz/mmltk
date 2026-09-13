@@ -640,8 +640,7 @@ void drag_object(domain::AnnotationObject& object, const domain::AnnotationPoint
     } else if (target.role == domain::AnnotationHandleRole::Point)
         object.point = point;
     else if (target.role == domain::AnnotationHandleRole::SplineKnot) {
-        object.spline_knots[*target.element] =
-            annotation_drag_knot(object.spline_knots[*target.element], {target, origin, point}, scene);
+        object.spline_knots[*target.element] = annotation_drag_knot(object.spline_knots[*target.element], {target, origin, point}, scene);
     } else if (target.role == domain::AnnotationHandleRole::SplineInHandle || target.role == domain::AnnotationHandleRole::SplineOutHandle)
         set_spline_handle(object.spline_knots[*target.element], *target.role, point, scene);
     else if (target.role == domain::AnnotationHandleRole::SkeletonNode)
@@ -754,7 +753,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         const bool changed = state.pointer.latest != request.point || state.pointer.brush_radius != brush_radius;
         if (state.pointer.brush && changed)
             state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
-                                   state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+                                    state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
         if (changed) update_drag_preview(state, request.point);
         state.pointer.latest = request.point;
         state.pointer.sequence = request.sequence;
@@ -779,7 +778,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     auto* brush = state.pointer.brush ? &state.brush : nullptr;
     if (brush) {
         state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
-                               tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+                                tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
         state.brush_rows.Materialize(*brush);
     }
     state.pointer = {};
@@ -1277,7 +1276,8 @@ class AnnotationDocument::Impl final {
         if (tool != Tool::Select) {
             if (!selected || *selected >= scene.objects.size()) return {};
             const auto shape = scene.objects[*selected].shape;
-            if (((tool == Tool::MaskPaint || tool == Tool::MaskErase || tool == Tool::MaskFill || tool == Tool::ColorSample) && shape == Shape::Mask) ||
+            if (((tool == Tool::MaskPaint || tool == Tool::MaskErase || tool == Tool::MaskFill || tool == Tool::ColorSample) &&
+                 shape == Shape::Mask) ||
                 (tool == Tool::Spline && shape == Shape::Spline) || (tool == Tool::Skeleton && shape == Shape::Skeleton))
                 return {.object = selected};
             return {};
@@ -1290,9 +1290,10 @@ class AnnotationDocument::Impl final {
             };
             if (object.shape == Shape::Box || object.shape == Shape::Mask) {
                 const auto& box = object.box;
-                const std::array<domain::AnnotationPoint, 4U> corners{{
-                    {box.first.x - 5.0F, box.first.y - 5.0F}, {box.second.x + 4.0F, box.first.y - 5.0F},
-                    {box.second.x + 4.0F, box.second.y + 4.0F}, {box.first.x - 5.0F, box.second.y + 4.0F}}};
+                const std::array<domain::AnnotationPoint, 4U> corners{{{box.first.x - 5.0F, box.first.y - 5.0F},
+                                                                       {box.second.x + 4.0F, box.first.y - 5.0F},
+                                                                       {box.second.x + 4.0F, box.second.y + 4.0F},
+                                                                       {box.first.x - 5.0F, box.second.y + 4.0F}}};
                 for (std::size_t index = 0U; index != corners.size(); ++index)
                     if (near(corners[index])) return handle(index, Role::BoxCorner);
             }
@@ -1304,7 +1305,8 @@ class AnnotationDocument::Impl final {
                 if (knot.out.enabled && near(knot.out.point)) return handle(index, Role::SplineOutHandle);
             }
             for (std::size_t index = 0U; index != object.skeleton_nodes.size(); ++index)
-                if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point)) return handle(index, Role::SkeletonNode);
+                if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point))
+                    return handle(index, Role::SkeletonNode);
         }
         for (std::size_t index = scene.objects.size(); index-- != 0U;) {
             const auto& object = scene.objects[index];
@@ -1317,16 +1319,26 @@ class AnnotationDocument::Impl final {
                     break;
                 case Shape::Mask:
                     hit = std::ranges::any_of(object.mask.runs, [point](const auto& run) {
-                        return run.row == static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F)) && point.x >= run.first && point.x < run.last + 1.0F;
+                        return run.row == static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F)) && point.x >= run.first &&
+                               point.x < run.last + 1.0F;
                     });
                     break;
-                case Shape::Point: hit = near(object.point); break;
-                case Shape::Spline: hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); }); break;
-                case Shape::Skeleton: hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible && near(node.point); }); break;
+                case Shape::Point:
+                    hit = near(object.point);
+                    break;
+                case Shape::Spline:
+                    hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); });
+                    break;
+                case Shape::Skeleton:
+                    hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible && near(node.point); });
+                    break;
             }
             if (hit) {
                 domain::AnnotationPointerTarget target{.object = static_cast<std::uint16_t>(index)};
-                if (object.shape == Shape::Point) { target.element = 0U; target.role = Role::Point; }
+                if (object.shape == Shape::Point) {
+                    target.element = 0U;
+                    target.role = Role::Point;
+                }
                 return target;
             }
         }
@@ -1342,8 +1354,10 @@ class AnnotationDocument::Impl final {
                 pointer.identity.object = identity.object;
                 if (pointer.target.element) {
                     const auto role = *pointer.target.role;
-                    pointer.identity.element = role == domain::AnnotationHandleRole::BoxCorner || role == domain::AnnotationHandleRole::Point
-                        ? static_cast<std::uint64_t>(*pointer.target.element) + 1U : identity.elements[*pointer.target.element];
+                    pointer.identity.element =
+                        role == domain::AnnotationHandleRole::BoxCorner || role == domain::AnnotationHandleRole::Point
+                            ? static_cast<std::uint64_t>(*pointer.target.element) + 1U
+                            : identity.elements[*pointer.target.element];
                 }
             }
             return true;

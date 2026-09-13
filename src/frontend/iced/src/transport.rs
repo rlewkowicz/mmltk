@@ -136,7 +136,7 @@ fn worker(
         }
         loop {
             let (sender, mut outbound) = futures_channel::mpsc::channel(1);
-            let mut connection = Connection::new(sender);
+            let connection = Connection::new(sender);
             let (socket, mut incoming) = match Socket::open(&config.websocket_url) {
                 Ok(value) => value,
                 Err(error) => {

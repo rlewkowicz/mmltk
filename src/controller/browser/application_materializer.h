@@ -220,8 +220,10 @@ template <class Composition>
             .image_metadata = [system](const VisualFrame& frame) -> std::optional<std::vector<std::byte>> {
                 using ProductSnapshot = typename Projection::image_type;
                 const auto retained = [&]() -> std::optional<ProductSnapshot> {
-                    if constexpr (requires { system->ImageSnapshot(frame); }) return system->ImageSnapshot(frame);
-                    else return Projection::ImageOf(std::invoke(&[:Snapshot:], *system));
+                    if constexpr (requires { system->ImageSnapshot(frame); })
+                        return system->ImageSnapshot(frame);
+                    else
+                        return Projection::ImageOf(std::invoke(&[:Snapshot:], *system));
                 }();
                 if (!retained) return std::nullopt;
                 const auto& snapshot = *retained;

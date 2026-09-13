@@ -14,6 +14,7 @@
 namespace mmltk::controller {
 class LiveSystem::Impl final {
     WorkspaceInput input_;
+
    public:
     Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events,
          VisualDiagnosticSink diagnostics)
@@ -247,4 +248,4 @@ void LiveSystem::SetInputPeer(std::uint64_t epoch) {
     std::scoped_lock lock(impl_->mutex_);
     impl_->input_.SetPeer(epoch);
 }
-}
+}  // namespace mmltk::controller

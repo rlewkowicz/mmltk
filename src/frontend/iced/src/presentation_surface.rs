@@ -3,8 +3,8 @@ use iced::{Event, Point, Rectangle, mouse, wgpu};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) mod gallery;
-pub(crate) mod metadata;
 pub(crate) mod labels;
+pub(crate) mod metadata;
 pub(crate) mod pixel_trace;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
@@ -16,14 +16,7 @@ thread_local! {
 }
 
 pub(crate) fn initialize_diagnostics(surface_trace: bool, pixel_trace: bool) {
-    SURFACE_TRACE_ENABLED.with(|flag| {
-        #[cfg(target_arch = "wasm32")]
-        if flag.get() && !surface_trace {
-            LAST_ACQUISITION_AUTHORIZATION.with(|last| *last.borrow_mut() = None);
-            LAST_ACQUISITION_REQUEST.with(|last| last.set(None));
-        }
-        flag.set(surface_trace);
-    });
+    SURFACE_TRACE_ENABLED.with(|flag| flag.set(surface_trace));
     pixel_trace::initialize(surface_trace && pixel_trace);
 }
 
@@ -116,7 +109,9 @@ pub(crate) fn emit_surface_trace(line: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreImageMetadata>) -> String {
+pub(crate) fn gallery_trace_fields(
+    snapshot: Option<&crate::generated::ExploreImageMetadata>,
+) -> String {
     snapshot.map_or_else(String::new, |snapshot| format!(
         ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"source_observation_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?},\"row_capacity\":{},\"row_origin\":{},\"card_extent\":{},\"augmentation_enabled\":{},\"augmentation_seed\":{}",
         crate::generated::presentation_source_session(snapshot.frame.source.kind), snapshot.frame.source.instance, snapshot.frame.revision,
@@ -155,7 +150,9 @@ fn trace_image(
         "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}{}{}{geometry}}}",
         surface_trace_fields(surface, requested),
         gallery_trace_fields(snapshot),
-        surface.frame.map_or_else(String::new, metadata::trace_fields),
+        surface
+            .frame
+            .map_or_else(String::new, metadata::trace_fields),
     ));
 }
 
@@ -171,7 +168,9 @@ fn trace_image(
 }
 
 fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle, clip: Rectangle) {
-    if !surface_trace_enabled() { return; }
+    if !surface_trace_enabled() {
+        return;
+    }
     trace_image(
         event,
         control,
@@ -203,7 +202,9 @@ pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreImageMeta
 pub(super) fn trace_gallery_source(_snapshot: &crate::generated::ExploreImageMetadata) {}
 
 pub(crate) fn trace_atlas_stage(stage: &str, draw: &crate::integration_control::AtlasDraw) {
-    if !surface_trace_enabled() { return; }
+    if !surface_trace_enabled() {
+        return;
+    }
     trace_image(
         "scroll_stage",
         stage,
@@ -549,11 +550,17 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     let paired = metadata::pending(frame)?;
     let detail = paired.detail?;
     let source = detail.frame();
-    if !paired.view_ready || paired.surface.frame != Some(frame)
-        || !same_allocation(surface, paired.surface) || !frame.belongs_to(surface)
-        || source.revision == 0 || !frame.matches_content(source) || metadata::product(frame).as_ref() != Some(source)
+    if !paired.view_ready
+        || paired.surface.frame != Some(frame)
+        || !same_allocation(surface, paired.surface)
+        || !frame.belongs_to(surface)
+        || source.revision == 0
+        || !frame.matches_content(source)
+        || metadata::product(frame).as_ref() != Some(source)
         || detail.explore.mode != crate::generated::ExploreMode::Detail
-        || detail.viewer_identity().is_none() || surface.viewer_identity != detail.viewer_identity() {
+        || detail.viewer_identity().is_none()
+        || surface.viewer_identity != detail.viewer_identity()
+    {
         return None;
     }
     let region = &source.content;
@@ -568,7 +575,10 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
         None if crop == full => false,
         _ => return None,
     };
-    Some(crate::generated::AnnotationOpen { source: source.clone(), originalcontent })
+    Some(crate::generated::AnnotationOpen {
+        source: source.clone(),
+        originalcontent,
+    })
 }
 
 pub(crate) fn same_mailbox_slot(left: FrameReady, right: FrameReady) -> bool {
@@ -595,12 +605,7 @@ const IMPORT_EVENT: &str = "gpuexternaltextureimportready";
 #[cfg(target_arch = "wasm32")]
 const SETTLED_EVENT: &str = "gpuexternaltexturereadsettled";
 #[cfg(target_arch = "wasm32")]
-const SURFACE_EVENTS: [&str; 4] = [
-    FRAME_EVENT,
-    COPY_EVENT,
-    IMPORT_EVENT,
-    SETTLED_EVENT,
-];
+const SURFACE_EVENTS: [&str; 4] = [FRAME_EVENT, COPY_EVENT, IMPORT_EVENT, SETTLED_EVENT];
 #[cfg(target_arch = "wasm32")]
 const RELEASE_EVENT: &str = "gpuexternaltextureslotrelease";
 
@@ -829,10 +834,13 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return;
             }
             let detail = event.detail();
-            let Some(ready) = js_sys::Reflect::get(&detail, &"identity".into()).ok()
-                .and_then(|identity| identity
-                .as_string()
-                .and_then(|value| FrameReady::parse(&value)))
+            let Some(ready) = js_sys::Reflect::get(&detail, &"identity".into())
+                .ok()
+                .and_then(|identity| {
+                    identity
+                        .as_string()
+                        .and_then(|value| FrameReady::parse(&value))
+                })
             else {
                 return;
             };
@@ -858,18 +866,34 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
             if metadata::surface(ready).is_some() {
                 return;
             }
-            let integer = |name: &str| js_sys::Reflect::get(&detail, &name.into()).ok()
-                .and_then(|value| value.as_f64())
-                .filter(|value| value.is_finite() && value.fract() == 0.0 && *value > 0.0 && *value <= u32::MAX as f64)
-                .map(|value| value as u32);
-            let metadata = js_sys::Reflect::get(&detail, &"metadata".into()).ok()
+            let integer = |name: &str| {
+                js_sys::Reflect::get(&detail, &name.into())
+                    .ok()
+                    .and_then(|value| value.as_f64())
+                    .filter(|value| {
+                        value.is_finite()
+                            && value.fract() == 0.0
+                            && *value > 0.0
+                            && *value <= u32::MAX as f64
+                    })
+                    .map(|value| value as u32)
+            };
+            let metadata = js_sys::Reflect::get(&detail, &"metadata".into())
+                .ok()
                 .and_then(|value| value.dyn_into::<js_sys::Uint8Array>().ok());
-            let transfer = js_sys::Reflect::get(&detail, &"transfer".into()).ok()
-                .and_then(|value| value.as_string()).and_then(|value| u64::from_str_radix(&value, 16).ok());
-            let decoded = integer("capacityWidth").zip(integer("capacityHeight")).zip(transfer).zip(metadata)
-                .is_some_and(|(((width, height), transfer), bytes)|
-                    bytes.length() as usize <= crate::generated::WORKSPACE_METADATA_BYTE_CAPACITY &&
-                    metadata::install(ready, width, height, transfer, &bytes.to_vec()).is_ok());
+            let transfer = js_sys::Reflect::get(&detail, &"transfer".into())
+                .ok()
+                .and_then(|value| value.as_string())
+                .and_then(|value| u64::from_str_radix(&value, 16).ok());
+            let decoded = integer("capacityWidth")
+                .zip(integer("capacityHeight"))
+                .zip(transfer)
+                .zip(metadata)
+                .is_some_and(|(((width, height), transfer), bytes)| {
+                    bytes.length() as usize <= crate::generated::WORKSPACE_METADATA_BYTE_CAPACITY
+                        && metadata::install(ready, width, height, transfer, &bytes.to_vec())
+                            .is_ok()
+                });
             if !decoded {
                 release(ready);
                 return;
@@ -895,7 +919,11 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return None;
             }
         }
-        Some(FrameListener { window, callback, stop_binding: bind_workspace() })
+        Some(FrameListener {
+            window,
+            callback,
+            stop_binding: bind_workspace(),
+        })
     });
     unfold(
         (mailbox, wake, listener),
@@ -964,8 +992,19 @@ pub struct Surface {
 
 impl Surface {
     pub(crate) fn empty() -> Self {
-        Self { high: 0, low: 0, generation: 0, width: 0, height: 0, timeline_ready: 0,
-            frame: None, integration: false, crop: None, viewer_identity: None, fit_revision: 0 }
+        Self {
+            high: 0,
+            low: 0,
+            generation: 0,
+            width: 0,
+            height: 0,
+            timeline_ready: 0,
+            frame: None,
+            integration: false,
+            crop: None,
+            viewer_identity: None,
+            fit_revision: 0,
+        }
     }
 
     pub(crate) fn content_region(self) -> [u32; 4] {
@@ -1074,7 +1113,11 @@ impl<Message> shader::Program<Message> for Program<Message> {
         _bounds: Rectangle,
     ) -> Self::Primitive {
         Primitive {
-            submission: state.fps.as_ref().filter(|_| self.show_fps).map(crate::workspace_fps::Meter::observer),
+            submission: state
+                .fps
+                .as_ref()
+                .filter(|_| self.show_fps)
+                .map(crate::workspace_fps::Meter::observer),
             surface: self.surface,
             transform: state.viewport.transform_for(self.surface),
             placement: self.placement,
@@ -1103,8 +1146,13 @@ impl<Message> shader::Program<Message> for Program<Message> {
             self.surface
         };
         if let Some(input) = &self.input {
-            let point = state.viewport.sample(bounds, cursor, surface, self.placement, false)
-                .map(|sample| crate::generated::WorkspacePoint { x: sample.content_x, y: sample.content_y });
+            let point = state
+                .viewport
+                .sample(bounds, cursor, surface, self.placement, false)
+                .map(|sample| crate::generated::WorkspacePoint {
+                    x: sample.content_x,
+                    y: sample.content_y,
+                });
             state.input.event(input, event, bounds, cursor, point);
         }
         state.viewport.update(
@@ -1496,7 +1544,10 @@ pub(crate) struct Primitive {
 
 impl std::fmt::Debug for Primitive {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("WorkspacePrimitive").field("surface", &self.surface).finish_non_exhaustive()
+        formatter
+            .debug_struct("WorkspacePrimitive")
+            .field("surface", &self.surface)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1556,7 +1607,14 @@ impl shader::Primitive for Primitive {
             let Some(renderer) = renderer.as_ref() else {
                 return;
             };
-            renderer.render(encoder, target, *clip_bounds, self.control_id, resources, self.submission.as_ref());
+            renderer.render(
+                encoder,
+                target,
+                *clip_bounds,
+                self.control_id,
+                resources,
+                self.submission.as_ref(),
+            );
         });
     }
 }
@@ -1619,11 +1677,6 @@ pub(crate) fn retire_samples() {
     drop(samples);
 }
 
-pub(crate) fn retire_imports() {
-    authorize_draw(None);
-    RENDERER.with(|renderer| *renderer.borrow_mut() = None);
-}
-
 pub(crate) fn retained_surface() -> Option<Surface> {
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
@@ -1634,32 +1687,62 @@ pub(crate) fn retained_surface() -> Option<Surface> {
 
 #[derive(Clone)]
 pub(crate) enum ExploreDisplay {
-    Gallery(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>),
+    Gallery(
+        Surface,
+        std::sync::Arc<crate::generated::ExploreImageMetadata>,
+    ),
     Detail(Surface, DetailContent),
 }
 
 impl ExploreDisplay {
-    fn paired(surface: Surface, gallery: Option<&std::sync::Arc<crate::generated::ExploreImageMetadata>>,
-        detail: Option<&DetailContent>) -> Option<Self> {
-        if let Some(gallery) = gallery { return Some(Self::Gallery(surface, gallery.clone())); }
+    fn paired(
+        surface: Surface,
+        gallery: Option<&std::sync::Arc<crate::generated::ExploreImageMetadata>>,
+        detail: Option<&DetailContent>,
+    ) -> Option<Self> {
+        if let Some(gallery) = gallery {
+            return Some(Self::Gallery(surface, gallery.clone()));
+        }
         detail.map(|detail| Self::Detail(surface, detail.clone()))
     }
 }
 
 pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDisplay> {
-    if let Some(surface) = requested && let Some(frame) = surface.frame {
-        let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten()
-            .filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
-        let incumbent = RENDERER.with(|renderer| renderer.borrow().as_ref()
-            .and_then(|renderer| renderer.imported.as_ref()).is_some_and(|imported|
-                imported.image.retained().is_some()
-                    && (imported.image.gallery.is_some() || imported.image.detail.is_some())));
+    if let Some(surface) = requested
+        && let Some(frame) = surface.frame
+    {
+        let live = LIVE_READS.with(|reads| {
+            reads
+                .borrow()
+                .iter()
+                .flatten()
+                .filter_map(std::sync::Weak::upgrade)
+                .any(|read| read.0 == frame)
+        });
+        let incumbent = RENDERER.with(|renderer| {
+            renderer
+                .borrow()
+                .as_ref()
+                .and_then(|renderer| renderer.imported.as_ref())
+                .is_some_and(|imported| {
+                    imported.image.retained().is_some()
+                        && (imported.image.gallery.is_some() || imported.image.detail.is_some())
+                })
+        });
         // The initial accepted offer can construct the first shader owner.
         // With an incumbent, reconciliation must acquire the replacement first.
-        let accepted = live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame))));
-        if accepted && let Some(paired) = metadata::pending(frame)
-            && paired.view_ready && same_allocation(surface, paired.surface) {
-            return ExploreDisplay::paired(surface, paired.gallery.as_ref(), paired.detail.as_ref());
+        let accepted =
+            live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame))));
+        if accepted
+            && let Some(paired) = metadata::pending(frame)
+            && paired.view_ready
+            && same_allocation(surface, paired.surface)
+        {
+            return ExploreDisplay::paired(
+                surface,
+                paired.gallery.as_ref(),
+                paired.detail.as_ref(),
+            );
         }
     }
     RENDERER.with(|renderer| {
@@ -1667,8 +1750,13 @@ pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDispl
         let renderer = renderer.as_ref()?;
         for imported in renderer.pending.iter().chain(renderer.imported.iter()) {
             if let Some(pending) = imported.image.pending_sample.as_ref()
-                && imported.image.submitted_draw(pending.surface).is_some() {
-                return ExploreDisplay::paired(pending.surface, pending.gallery.as_ref(), pending.detail.as_ref());
+                && imported.image.submitted_draw(pending.surface).is_some()
+            {
+                return ExploreDisplay::paired(
+                    pending.surface,
+                    pending.gallery.as_ref(),
+                    pending.detail.as_ref(),
+                );
             }
         }
         let image = &renderer.imported.as_ref()?.image;
@@ -1707,16 +1795,6 @@ struct SurfaceRenderer {
     requested: Option<Surface>,
     reconstruction_probe: Option<((u64, u64, u64), (u64, u64, u64))>,
     draws: std::collections::HashMap<&'static str, PreparedDraw>,
-}
-
-
-fn same_publication(left: FrameReady, right: FrameReady) -> bool {
-    left.high == right.high
-        && left.low == right.low
-        && left.layer == right.layer
-        && left.content_session == right.content_session
-        && left.content_sequence == right.content_sequence
-        && left.presentation_revision == right.presentation_revision
 }
 
 struct Imported {
@@ -1758,7 +1836,12 @@ pub(crate) struct DetailContent {
 }
 
 impl DetailContent {
-    pub(crate) fn configure_surface(&self, mut surface: Surface, original: bool, fit_revision: u64) -> Surface {
+    pub(crate) fn configure_surface(
+        &self,
+        mut surface: Surface,
+        original: bool,
+        fit_revision: u64,
+    ) -> Surface {
         surface.viewer_identity = self.viewer_identity();
         surface.fit_revision = fit_revision;
         surface.crop = original.then(|| {
@@ -1769,7 +1852,9 @@ impl DetailContent {
     }
 
     pub(crate) fn viewer_identity(&self) -> Option<(u64, u32)> {
-        self.explore.selectedimage.map(|image| (self.explore.dataset.identity, image))
+        self.explore
+            .selectedimage
+            .map(|image| (self.explore.dataset.identity, image))
     }
 
     pub(crate) fn input_frame(&self) -> &crate::generated::VisualFrame {
@@ -1795,8 +1880,6 @@ impl DetailContent {
     pub(crate) fn overlay(&self) -> &crate::generated::ExploreOverlay {
         &self.explore.overlay
     }
-
-
 }
 
 #[derive(Clone)]
@@ -2251,7 +2334,8 @@ impl SurfaceRenderer {
                 placement,
             },
             views,
-            diagnostics: crate::integration_control::reporting_enabled().then(DrawDiagnostics::default),
+            diagnostics: crate::integration_control::reporting_enabled()
+                .then(DrawDiagnostics::default),
             pixel_trace,
             _arena: textures,
         };
@@ -2439,11 +2523,19 @@ impl SurfaceRenderer {
             record_drawn_detail(draw.surface, draw.surface.content_region());
         }
         if draw.surface.integration {
-            let (redraw, draw_count) = imported.diagnostics.as_ref()
-                .filter(|_| crate::integration_control::reporting_enabled()).map_or((false, 0), |diagnostics| {
-                let previous = diagnostics.drawn_revision.swap(frame.presentation_revision, Ordering::Relaxed);
-                (previous == frame.presentation_revision, diagnostics.draw_count.fetch_add(1, Ordering::Relaxed) + 1)
-            });
+            let (redraw, draw_count) = imported
+                .diagnostics
+                .as_ref()
+                .filter(|_| crate::integration_control::reporting_enabled())
+                .map_or((false, 0), |diagnostics| {
+                    let previous = diagnostics
+                        .drawn_revision
+                        .swap(frame.presentation_revision, Ordering::Relaxed);
+                    (
+                        previous == frame.presentation_revision,
+                        diagnostics.draw_count.fetch_add(1, Ordering::Relaxed) + 1,
+                    )
+                });
             crate::integration_control::report_surface_draw(
                 control_id,
                 frame.presentation_revision,
@@ -2627,8 +2719,16 @@ impl ImagePublication {
         (self.pending_sample.take(), self.retained_read.take())
     }
 
-    fn reconcile_pending(&mut self, frame: FrameReady, _model: &crate::view_model::ApplicationModel) {
-        if let Some(pending) = self.pending_sample.as_mut().filter(|pending| pending.surface.frame == Some(frame)) {
+    fn reconcile_pending(
+        &mut self,
+        frame: FrameReady,
+        _model: &crate::view_model::ApplicationModel,
+    ) {
+        if let Some(pending) = self
+            .pending_sample
+            .as_mut()
+            .filter(|pending| pending.surface.frame == Some(frame))
+        {
             pending.complete |= copy_completed(frame);
         }
     }
@@ -2641,18 +2741,23 @@ impl ImagePublication {
                 && same_allocation(pending.surface, requested)
                 && DRAW_AUTHORIZATION
                     .with(|authorization| authorization.borrow().draw == pending.surface.frame)
-
         })
     }
 
     fn explore_display(&self, requested: Surface) -> Option<ExploreDisplay> {
         if let Some(pending) = self.submitted_draw(requested) {
-            return ExploreDisplay::paired(requested, pending.gallery.as_ref(), pending.detail.as_ref());
+            return ExploreDisplay::paired(
+                requested,
+                pending.gallery.as_ref(),
+                pending.detail.as_ref(),
+            );
         }
         let retained = self.retained()?;
         let surface = if retained.frame == requested.frame && same_allocation(retained, requested) {
             requested
-        } else { retained };
+        } else {
+            retained
+        };
         ExploreDisplay::paired(surface, self.gallery.as_ref(), self.detail.as_ref())
     }
 
@@ -2683,8 +2788,14 @@ impl ImagePublication {
             .pending_sample
             .as_ref()
             .is_some_and(|pending| pending.view_ready);
-        if !authorized || !self.pending_sample.as_ref().is_some_and(|pending|
-            pending.complete && pending.surface.frame == Some(frame)) { return false; }
+        if !authorized
+            || !self
+                .pending_sample
+                .as_ref()
+                .is_some_and(|pending| pending.complete && pending.surface.frame == Some(frame))
+        {
+            return false;
+        }
         let pending = self
             .pending_sample
             .take()
@@ -3175,7 +3286,11 @@ mod tests {
 
     #[test]
     fn workspace_fps_observes_real_iced_gpu_submissions_and_retained_pixels() {
-        use iced::advanced::{Layout, renderer::{Headless, Renderer as _}, widget, layout};
+        use iced::advanced::{
+            Layout, layout,
+            renderer::{Headless, Renderer as _},
+            widget,
+        };
         reset_test_releases();
         initialize_diagnostics(false, false);
         crate::integration_control::initialize_reporting(false, false);
@@ -3184,17 +3299,24 @@ mod tests {
         authorize_draw(Some(frame));
         complete_sample(frame);
         let surface = crate::view_model::test_support::physical_surface(frame);
-        let mut renderer = iced::futures::executor::block_on(
-            <iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))
-        ).expect("workspace FPS functional acceptance requires the container GPU backend");
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
+        .expect("workspace FPS functional acceptance requires the container GPU backend");
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(128.0, 96.0));
         let viewport = Viewport::with_physical_size(iced::Size::new(128, 96), 1.0);
         let program = Program::<()> {
-            show_fps: true, input: None, local: None, publish: None, surface,
-            placement: Placement::Contain, control_id: crate::view::workspace::STABLE_ID,
+            show_fps: true,
+            input: None,
+            local: None,
+            publish: None,
+            surface,
+            placement: Placement::Contain,
+            control_id: crate::view::workspace::STABLE_ID,
         };
-        let mut element: crate::fluent_theme::Element<'_, ()> = iced::widget::shader(program)
-            .width(128).height(96).into();
+        let mut element: crate::fluent_theme::Element<'_, ()> =
+            iced::widget::shader(program).width(128).height(96).into();
         let mut tree = widget::Tree::new(&element);
         tree.diff(element.as_widget_mut());
         let node = layout::Node::new(bounds.size());
@@ -3203,15 +3325,26 @@ mod tests {
         let start = iced::time::Instant::now();
         let sample = |tree: &mut widget::Tree, milliseconds| {
             let state = tree.state.downcast_mut::<WorkspaceViewport>();
-            crate::workspace_fps::Meter::update(&mut state.fps, true,
+            crate::workspace_fps::Meter::update(
+                &mut state.fps,
+                true,
                 &Event::Window(iced::window::Event::RedrawRequested(
-                    start + iced::time::Duration::from_millis(milliseconds))));
+                    start + iced::time::Duration::from_millis(milliseconds),
+                )),
+            );
             state.fps.as_ref().unwrap().frames
         };
         assert_eq!(sample(&mut tree, 0), 0);
         let draw = |renderer: &mut iced::Renderer, node: &layout::Node| {
-            element.as_widget().draw(&tree, renderer, &theme, &style, Layout::new(node),
-                mouse::Cursor::Unavailable, &bounds);
+            element.as_widget().draw(
+                &tree,
+                renderer,
+                &theme,
+                &style,
+                Layout::new(node),
+                mouse::Cursor::Unavailable,
+                &bounds,
+            );
         };
         renderer.reset(bounds);
         draw(&mut renderer, &node);
@@ -3219,7 +3352,10 @@ mod tests {
         let pixels = renderer.screenshot(&viewport, iced::Color::WHITE);
         // Both primitives encoded the same retained workspace; one actual
         // screenshot queue submission counted, and its native test texture drew.
-        assert_eq!(&pixels[(48 * 128 + 64) * 4..(48 * 128 + 64) * 4 + 3], &[0, 0, 0]);
+        assert_eq!(
+            &pixels[(48 * 128 + 64) * 4..(48 * 128 + 64) * 4 + 3],
+            &[0, 0, 0]
+        );
         assert_eq!(sample(&mut tree, 500), 1);
         let (device, format) = RENDERER.with(|owner| {
             let owner = owner.borrow();
@@ -3228,9 +3364,17 @@ mod tests {
         });
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("workspace FPS functional target"),
-            size: wgpu::Extent3d { width: 128, height: 96, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+            size: wgpu::Extent3d {
+                width: 128,
+                height: 96,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
         });
         let target = texture.create_view(&Default::default());
         let _ = renderer.present(Some(iced::Color::WHITE), format, &target, &viewport);
@@ -3240,13 +3384,27 @@ mod tests {
         drop(renderer.draw(Some(iced::Color::WHITE), &target, &viewport));
         renderer.reset(bounds);
         let clipped = layout::Node::new(bounds.size()).move_to(Point::new(300.0, 300.0));
-        element.as_widget().draw(&tree, &mut renderer, &theme, &style, Layout::new(&clipped),
-            mouse::Cursor::Unavailable, &bounds);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &style,
+            Layout::new(&clipped),
+            mouse::Cursor::Unavailable,
+            &bounds,
+        );
         let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
         assert_eq!(sample(&mut tree, 1500), 0);
         renderer.reset(bounds);
-        element.as_widget().draw(&tree, &mut renderer, &theme, &style, Layout::new(&node),
-            mouse::Cursor::Unavailable, &bounds);
+        element.as_widget().draw(
+            &tree,
+            &mut renderer,
+            &theme,
+            &style,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &bounds,
+        );
         let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
         assert_eq!(sample(&mut tree, 2000), 1);
         drop(renderer);
@@ -3265,9 +3423,14 @@ mod tests {
                 let initial = metadata::pending(old).unwrap();
                 let held_encoder = SampleRead::acquire(old).unwrap();
                 let mut image = ImagePublication {
-                    surface: initial.surface, completed: Some(old), pending_sample: None,
-                    retained_read: Some(held_encoder.clone()), gallery: initial.gallery,
-                    detail: initial.detail, annotation: None, placement: initial.placement,
+                    surface: initial.surface,
+                    completed: Some(old),
+                    pending_sample: None,
+                    retained_read: Some(held_encoder.clone()),
+                    gallery: initial.gallery,
+                    detail: initial.detail,
+                    annotation: None,
+                    placement: initial.placement,
                 };
                 let mut empty = model.explore.snapshot.clone().unwrap();
                 empty.mode = crate::generated::ExploreMode::Gallery;
@@ -3280,31 +3443,50 @@ mod tests {
                 empty.viewport.extent = empty.frame.extent.clone();
                 crate::view_model::test_support::gallery_layout(&mut empty);
                 empty.frame.revision += 1;
-                let candidate = FrameReady { content_sequence: empty.frame.revision,
-                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old };
-                if logical_first { model.explore.snapshot = Some(empty.clone()); }
-                assert!(matches!(image.explore_display(image.surface), Some(ExploreDisplay::Detail(..))));
+                let candidate = FrameReady {
+                    content_sequence: empty.frame.revision,
+                    presentation_revision: old.presentation_revision + 1,
+                    slot: 1,
+                    ..old
+                };
+                if logical_first {
+                    model.explore.snapshot = Some(empty.clone());
+                }
+                assert!(matches!(
+                    image.explore_display(image.surface),
+                    Some(ExploreDisplay::Detail(..))
+                ));
                 assert!(test_releases().is_empty());
                 metadata::install_explore(candidate, &empty);
                 assert!(accept_publication(candidate));
                 let requested = metadata::surface(candidate).unwrap();
                 let Some(ExploreDisplay::Gallery(shown, paired)) = explore_display(Some(requested))
-                    else { panic!("accepted empty graphics must select gallery composition"); };
+                else {
+                    panic!("accepted empty graphics must select gallery composition");
+                };
                 assert_eq!(shown.frame, Some(candidate));
                 assert_eq!(paired.order.matchingcount, 0);
-                if !logical_first { model.explore.snapshot = Some(empty); }
+                if !logical_first {
+                    model.explore.snapshot = Some(empty);
+                }
                 let mut pending = metadata::pending(candidate).unwrap();
                 pending.read = SampleRead::acquire(candidate);
                 pending.complete = false;
                 image.pending_sample = Some(pending);
                 authorize_draw(Some(candidate));
-                assert!(matches!(image.explore_display(requested), Some(ExploreDisplay::Gallery(..))));
+                assert!(matches!(
+                    image.explore_display(requested),
+                    Some(ExploreDisplay::Gallery(..))
+                ));
                 image.complete(candidate);
                 assert!(image.promote(candidate, &model));
                 assert!(test_releases().is_empty());
                 drop(held_encoder);
                 assert_eq!(test_releases(), vec![old]);
-                assert!(matches!(image.explore_display(requested), Some(ExploreDisplay::Gallery(..))));
+                assert!(matches!(
+                    image.explore_display(requested),
+                    Some(ExploreDisplay::Gallery(..))
+                ));
                 drop(image.retire());
                 assert_eq!(test_releases(), vec![old, candidate]);
             }
@@ -3320,11 +3502,18 @@ mod tests {
                 assert!(accept_publication(old));
                 let initial = metadata::pending(old).unwrap();
                 let image = ImagePublication {
-                    surface: initial.surface, completed: Some(old), pending_sample: None,
-                    retained_read: SampleRead::acquire(old), gallery: initial.gallery,
-                    detail: initial.detail, annotation: None, placement: initial.placement,
+                    surface: initial.surface,
+                    completed: Some(old),
+                    pending_sample: None,
+                    retained_read: SampleRead::acquire(old),
+                    gallery: initial.gallery,
+                    detail: initial.detail,
+                    annotation: None,
+                    placement: initial.placement,
                 };
-                let mut source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+                let mut source = crate::generated::ExploreImageMetadata::from(
+                    model.explore.snapshot.as_ref().unwrap(),
+                );
                 match invalid {
                     0 => source.dataset.identity = 0,
                     1 => source.selectedimage = None,
@@ -3334,33 +3523,72 @@ mod tests {
                     5 => source.frame.content.y = u32::MAX,
                     6 => source.frame.content.width = u32::MAX,
                     7 => {
-                        if upscale { source.mode = crate::generated::ExploreMode::Gallery; }
-                        else { source.frame.content.y = source.frame.extent.height; }
+                        if upscale {
+                            source.mode = crate::generated::ExploreMode::Gallery;
+                        } else {
+                            source.frame.content.y = source.frame.extent.height;
+                        }
                     }
                     _ => {}
                 }
                 let mut output = source.frame.clone();
-                if invalid == 8 { output.content.width = 0; }
-                if invalid == 9 { output.content.x = u32::MAX; }
+                if invalid == 8 {
+                    output.content.width = 0;
+                }
+                if invalid == 9 {
+                    output.content.x = u32::MAX;
+                }
                 let (product, provenance) = if upscale {
                     output.source.kind = crate::generated::PresentationSourceKind::Upscale;
-                    (metadata::encode_product(crate::generated::ApplicationSystem::Upscale,
-                        crate::generated::UpscaleImageMetadata {
-                            frame: output.clone(), input: source.frame.clone(), scene: source.scene.clone(),
-                        }), Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source)))
+                    (
+                        metadata::encode_product(
+                            crate::generated::ApplicationSystem::Upscale,
+                            crate::generated::UpscaleImageMetadata {
+                                frame: output.clone(),
+                                input: source.frame.clone(),
+                                scene: source.scene.clone(),
+                            },
+                        ),
+                        Some(metadata::encode_product(
+                            crate::generated::ApplicationSystem::Explore,
+                            source,
+                        )),
+                    )
                 } else {
-                    (metadata::encode_product(crate::generated::ApplicationSystem::Explore, source), None)
+                    (
+                        metadata::encode_product(
+                            crate::generated::ApplicationSystem::Explore,
+                            source,
+                        ),
+                        None,
+                    )
                 };
                 let candidate = FrameReady {
-                    content_session: crate::generated::presentation_source_session(output.source.kind),
-                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old
+                    content_session: crate::generated::presentation_source_session(
+                        output.source.kind,
+                    ),
+                    presentation_revision: old.presentation_revision + 1,
+                    slot: 1,
+                    ..old
                 };
                 let bytes = metadata::encode(output, product, provenance);
-                assert!(metadata::install(candidate, candidate.content_width, candidate.content_height, 2, &bytes).is_err());
+                assert!(
+                    metadata::install(
+                        candidate,
+                        candidate.content_width,
+                        candidate.content_height,
+                        2,
+                        &bytes
+                    )
+                    .is_err()
+                );
                 // The native-event decoder takes this exact path before publication acceptance.
                 release(candidate);
                 assert!(metadata::surface(candidate).is_none());
-                assert!(matches!(image.explore_display(image.surface), Some(ExploreDisplay::Detail(..))));
+                assert!(matches!(
+                    image.explore_display(image.surface),
+                    Some(ExploreDisplay::Detail(..))
+                ));
                 assert_eq!(test_releases(), vec![candidate]);
                 drop(image);
                 assert_eq!(test_releases(), vec![candidate, old]);
@@ -3375,26 +3603,43 @@ mod tests {
             let (model, frame) = crate::view_model::test_support::explore_presentation();
             let mut logical = model.explore.snapshot.unwrap();
             logical.detail.showoriginaldimensions = false;
-            let captured = std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical));
-            let old = DetailContent { explore: captured.clone(), upscale: None };
+            let captured =
+                std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical));
+            let old = DetailContent {
+                explore: captured.clone(),
+                upscale: None,
+            };
             let mut state = crate::view::explore::state::State::default();
             assert!(!state.detail_original(&old));
             state.choose_detail_original(true);
             logical.detail.showoriginaldimensions = true;
             let paired = DetailContent {
-                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical)), upscale: None,
+                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                    &logical,
+                )),
+                upscale: None,
             };
-            if logical_first { state.rebase(Some(&logical), false); }
+            if logical_first {
+                state.rebase(Some(&logical), false);
+            }
             assert!(state.detail_original(&old));
             assert!(state.detail_original(&paired));
-            if !logical_first { state.rebase(Some(&logical), false); }
+            if !logical_first {
+                state.rebase(Some(&logical), false);
+            }
             assert!(state.detail_original(&paired));
             let mut output = old.frame().clone();
             output.source.kind = crate::generated::PresentationSourceKind::Upscale;
-            let upscale = DetailContent { explore: captured.clone(),
-                upscale: Some(std::sync::Arc::new(crate::generated::UpscaleImageMetadata {
-                    frame: output, input: old.frame().clone(), scene: captured.scene.clone(),
-                })) };
+            let upscale = DetailContent {
+                explore: captured.clone(),
+                upscale: Some(std::sync::Arc::new(
+                    crate::generated::UpscaleImageMetadata {
+                        frame: output,
+                        input: old.frame().clone(),
+                        scene: captured.scene.clone(),
+                    },
+                )),
+            };
             assert!(!upscale.original_dimensions());
             assert!(state.detail_original(&upscale));
             assert!(!captured.detail.showoriginaldimensions);
@@ -3420,35 +3665,77 @@ mod tests {
             for original in [false, true] {
                 reset_test_releases();
                 let (model, old) = crate::view_model::test_support::explore_presentation();
-                let mut source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+                let mut source = crate::generated::ExploreImageMetadata::from(
+                    model.explore.snapshot.as_ref().unwrap(),
+                );
                 source.detail.showoriginaldimensions = !original;
-                source.frame.content = crate::generated::VisualRegion { x: 8, y: 4, width: 320, height: 240 };
+                source.frame.content = crate::generated::VisualRegion {
+                    x: 8,
+                    y: 4,
+                    width: 320,
+                    height: 240,
+                };
                 let mut product = source.frame.clone();
                 let (encoded, provenance) = if upscale {
                     product.source.kind = crate::generated::PresentationSourceKind::Upscale;
-                    (metadata::encode_product(crate::generated::ApplicationSystem::Upscale,
-                        crate::generated::UpscaleImageMetadata {
-                            frame: product.clone(), input: source.frame.clone(), scene: source.scene.clone(),
-                        }),
-                     Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source.clone())))
+                    (
+                        metadata::encode_product(
+                            crate::generated::ApplicationSystem::Upscale,
+                            crate::generated::UpscaleImageMetadata {
+                                frame: product.clone(),
+                                input: source.frame.clone(),
+                                scene: source.scene.clone(),
+                            },
+                        ),
+                        Some(metadata::encode_product(
+                            crate::generated::ApplicationSystem::Explore,
+                            source.clone(),
+                        )),
+                    )
                 } else {
-                    (metadata::encode_product(crate::generated::ApplicationSystem::Explore, source.clone()), None)
+                    (
+                        metadata::encode_product(
+                            crate::generated::ApplicationSystem::Explore,
+                            source.clone(),
+                        ),
+                        None,
+                    )
                 };
                 let physical = FrameReady {
-                    content_session: crate::generated::presentation_source_session(product.source.kind),
-                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old
+                    content_session: crate::generated::presentation_source_session(
+                        product.source.kind,
+                    ),
+                    presentation_revision: old.presentation_revision + 1,
+                    slot: 1,
+                    ..old
                 };
                 let bytes = metadata::encode(product.clone(), encoded, provenance);
-                metadata::install(physical, physical.content_width, physical.content_height, 2, &bytes).unwrap();
+                metadata::install(
+                    physical,
+                    physical.content_width,
+                    physical.content_height,
+                    2,
+                    &bytes,
+                )
+                .unwrap();
                 let pending = metadata::pending(physical).unwrap();
                 let detail = pending.detail.unwrap();
                 let surface = detail.configure_surface(pending.surface, original, 1);
                 let crop = surface.content_region();
                 record_drawn_detail(surface, crop);
-                let expected = crate::generated::AnnotationOpen { source: product, originalcontent: original };
+                let expected = crate::generated::AnnotationOpen {
+                    source: product,
+                    originalcontent: original,
+                };
                 assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 if !original {
-                    record_drawn_detail(Surface { crop: Some(crop), ..surface }, crop);
+                    record_drawn_detail(
+                        Surface {
+                            crop: Some(crop),
+                            ..surface
+                        },
+                        crop,
+                    );
                     assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 }
                 for invalid in 0..5 {
@@ -3467,8 +3754,16 @@ mod tests {
                 record_drawn_detail(surface, crop);
                 metadata::retire(physical);
                 assert!(viewer_annotation_request().is_none());
-                assert!(metadata::install(physical, physical.content_width, physical.content_height, 2,
-                    &bytes[..bytes.len() - 1]).is_err());
+                assert!(
+                    metadata::install(
+                        physical,
+                        physical.content_width,
+                        physical.content_height,
+                        2,
+                        &bytes[..bytes.len() - 1]
+                    )
+                    .is_err()
+                );
                 assert!(viewer_annotation_request().is_none());
             }
         }
@@ -3489,7 +3784,9 @@ mod tests {
         crate::view_model::test_support::gallery_layout(&mut snapshot);
         metadata::install_explore(frame, &snapshot);
         let surface = Surface {
-            viewer_identity: snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image)),
+            viewer_identity: snapshot
+                .selectedimage
+                .map(|image| (snapshot.dataset.identity, image)),
             ..metadata::surface(frame).unwrap()
         };
         record_drawn_detail(surface, surface.content_region());
@@ -3511,31 +3808,65 @@ mod tests {
                     snapshot.gallery.slots.clear();
                     snapshot.order.visibleindices.clear();
                     crate::view_model::test_support::gallery_layout(&mut snapshot);
-                    snapshot.mode = if from_gallery { crate::generated::ExploreMode::Gallery }
-                        else { crate::generated::ExploreMode::Detail };
+                    snapshot.mode = if from_gallery {
+                        crate::generated::ExploreMode::Gallery
+                    } else {
+                        crate::generated::ExploreMode::Detail
+                    };
                     metadata::install_explore(old, &snapshot);
                     assert!(accept_publication(old));
                     let initial = metadata::pending(old).unwrap();
                     let mut image = ImagePublication {
-                        surface: initial.surface, completed: Some(old), pending_sample: None,
-                        retained_read: SampleRead::acquire(old), gallery: initial.gallery,
-                        detail: initial.detail, annotation: None, placement: initial.placement,
+                        surface: initial.surface,
+                        completed: Some(old),
+                        pending_sample: None,
+                        retained_read: SampleRead::acquire(old),
+                        gallery: initial.gallery,
+                        detail: initial.detail,
+                        annotation: None,
+                        placement: initial.placement,
                     };
-                    snapshot.mode = if from_gallery { crate::generated::ExploreMode::Detail }
-                        else { crate::generated::ExploreMode::Gallery };
+                    snapshot.mode = if from_gallery {
+                        crate::generated::ExploreMode::Detail
+                    } else {
+                        crate::generated::ExploreMode::Gallery
+                    };
                     snapshot.frame.revision += 1;
                     snapshot.frame.content.x = 7;
                     snapshot.frame.content.width -= 7;
-                    let next = FrameReady { content_sequence: snapshot.frame.revision,
-                        presentation_revision: old.presentation_revision + 1, slot: 1, ..old };
-                    let requested = Surface { frame: Some(next), ..image.surface };
-                    if metadata_first { metadata::install_explore(next, &snapshot); }
+                    let next = FrameReady {
+                        content_sequence: snapshot.frame.revision,
+                        presentation_revision: old.presentation_revision + 1,
+                        slot: 1,
+                        ..old
+                    };
+                    let requested = Surface {
+                        frame: Some(next),
+                        ..image.surface
+                    };
+                    if metadata_first {
+                        metadata::install_explore(next, &snapshot);
+                    }
                     // Neither an unclassified image nor metadata alone is a draw.
-                    assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), !from_gallery);
-                    if !metadata_first { metadata::install_explore(next, &snapshot); }
+                    assert_eq!(
+                        matches!(
+                            image.explore_display(requested),
+                            Some(ExploreDisplay::Detail(..))
+                        ),
+                        !from_gallery
+                    );
+                    if !metadata_first {
+                        metadata::install_explore(next, &snapshot);
+                    }
                     if reject {
                         metadata::retire(next);
-                        assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), !from_gallery);
+                        assert_eq!(
+                            matches!(
+                                image.explore_display(requested),
+                                Some(ExploreDisplay::Detail(..))
+                            ),
+                            !from_gallery
+                        );
                         continue;
                     }
                     assert!(accept_publication(next));
@@ -3549,14 +3880,25 @@ mod tests {
                         assert_eq!(shown.frame, Some(next));
                         let original = content.configure_surface(shown, true, 19);
                         let region = &content.frame().content;
-                        assert_eq!(original.crop, Some([region.x, region.y, region.width, region.height]));
+                        assert_eq!(
+                            original.crop,
+                            Some([region.x, region.y, region.width, region.height])
+                        );
                         assert_eq!(original.viewer_identity, content.viewer_identity());
                         assert_eq!(original.fit_revision, 19);
                         assert_eq!(content.configure_surface(shown, false, 20).crop, None);
-                    } else { assert!(!from_gallery); }
+                    } else {
+                        assert!(!from_gallery);
+                    }
                     image.complete(next);
                     assert!(image.promote(next, &model));
-                    assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), from_gallery);
+                    assert_eq!(
+                        matches!(
+                            image.explore_display(requested),
+                            Some(ExploreDisplay::Detail(..))
+                        ),
+                        from_gallery
+                    );
                 }
             }
         }
@@ -3566,23 +3908,47 @@ mod tests {
     fn upscale_detail_crop_and_identity_follow_its_retained_source_projection() {
         reset_test_releases();
         let (model, frame) = crate::view_model::test_support::explore_presentation();
-        let source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        let source =
+            crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
         let mut upscale_frame = source.frame.clone();
         upscale_frame.source.kind = crate::generated::PresentationSourceKind::Upscale;
         upscale_frame.revision += 1;
-        upscale_frame.content = crate::generated::VisualRegion { x: 8, y: 4, width: 32, height: 24 };
+        upscale_frame.content = crate::generated::VisualRegion {
+            x: 8,
+            y: 4,
+            width: 32,
+            height: 24,
+        };
         let upscale = crate::generated::UpscaleImageMetadata {
-            frame: upscale_frame, input: source.frame.clone(), scene: source.scene.clone(),
+            frame: upscale_frame,
+            input: source.frame.clone(),
+            scene: source.scene.clone(),
         };
         let physical = FrameReady {
-            content_session: crate::generated::presentation_source_session(upscale.frame.source.kind),
-            content_sequence: upscale.frame.revision, presentation_revision: frame.presentation_revision + 1,
-            slot: 1, ..frame
+            content_session: crate::generated::presentation_source_session(
+                upscale.frame.source.kind,
+            ),
+            content_sequence: upscale.frame.revision,
+            presentation_revision: frame.presentation_revision + 1,
+            slot: 1,
+            ..frame
         };
-        let bytes = metadata::encode(upscale.frame.clone(),
+        let bytes = metadata::encode(
+            upscale.frame.clone(),
             metadata::encode_product(crate::generated::ApplicationSystem::Upscale, upscale),
-            Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source)));
-        metadata::install(physical, frame.content_width, frame.content_height, 2, &bytes).unwrap();
+            Some(metadata::encode_product(
+                crate::generated::ApplicationSystem::Explore,
+                source,
+            )),
+        );
+        metadata::install(
+            physical,
+            frame.content_width,
+            frame.content_height,
+            2,
+            &bytes,
+        )
+        .unwrap();
         let pending = metadata::pending(physical).unwrap();
         let detail = pending.detail.unwrap();
         let surface = pending.surface;
@@ -3590,7 +3956,10 @@ mod tests {
         let configured = detail.configure_surface(surface, true, 2);
         assert_eq!(configured.crop, Some([8, 4, 32, 24]));
         assert_eq!(configured.viewer_identity, detail.viewer_identity());
-        assert_eq!(detail.frame().source.kind, crate::generated::PresentationSourceKind::Upscale);
+        assert_eq!(
+            detail.frame().source.kind,
+            crate::generated::PresentationSourceKind::Upscale
+        );
     }
 
     use crate::view_model::test_support::physical_frame as frame_ready;
@@ -3600,8 +3969,14 @@ mod tests {
         reset_test_releases();
         let (model, frame) = crate::view_model::test_support::explore_presentation();
         let snapshot = model.explore.snapshot.unwrap();
-        let bytes = metadata::encode(snapshot.frame.clone(),
-            metadata::encode_product(crate::generated::ApplicationSystem::Explore, crate::generated::ExploreImageMetadata::from(&snapshot)), None);
+        let bytes = metadata::encode(
+            snapshot.frame.clone(),
+            metadata::encode_product(
+                crate::generated::ApplicationSystem::Explore,
+                crate::generated::ExploreImageMetadata::from(&snapshot),
+            ),
+            None,
+        );
         for field in 0..4 {
             let mut changed = frame;
             match field {
@@ -3614,7 +3989,7 @@ mod tests {
         }
         assert!(metadata::install(frame, 1, 1, 1, &bytes).is_err());
         assert!(metadata::install(frame, 640, 480, 0, &bytes).is_err());
-        assert!(metadata::install(frame, 640, 480, 1, &bytes[..bytes.len()-1]).is_err());
+        assert!(metadata::install(frame, 640, 480, 1, &bytes[..bytes.len() - 1]).is_err());
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(metadata::install(frame, 640, 480, 1, &trailing).is_err());
@@ -3625,14 +4000,21 @@ mod tests {
     fn completed_predecessor_survives_every_metadata_and_copy_notification_order() {
         use crate::view_model::test_support::{annotation_object, explore_presentation};
         for replacement in [false, true] {
-            for [domain_position, control_position, physical_position, copy_position]
-                in crate::view_model::test_support::presentation_arrival_orders() {
+            for [
+                domain_position,
+                control_position,
+                physical_position,
+                copy_position,
+            ] in crate::view_model::test_support::presentation_arrival_orders()
+            {
                 reset_test_releases();
                 let (mut model, old) = explore_presentation();
                 let previous = model.explore.snapshot.as_mut().unwrap();
                 previous.dataset.identity = 9;
                 previous.overlay.showlabels = true;
-                previous.scene.categories = vec![crate::generated::ArtifactClassName { value: "predecessor".into() }];
+                previous.scene.categories = vec![crate::generated::ArtifactClassName {
+                    value: "predecessor".into(),
+                }];
                 previous.scene.objects = vec![annotation_object(0)];
                 metadata::install_explore(old, previous);
                 let mut successor = previous.clone();
@@ -3640,15 +4022,24 @@ mod tests {
                 successor.frame.revision += 1;
                 successor.scene.categories[0].value = "successor".into();
                 successor.scene.objects[0].box_.first.x += 17.0;
-                let next = FrameReady { content_sequence: successor.frame.revision,
-                    presentation_revision: old.presentation_revision + 1, slot: 1,
-                    low: old.low + u64::from(replacement), ..old };
+                let next = FrameReady {
+                    content_sequence: successor.frame.revision,
+                    presentation_revision: old.presentation_revision + 1,
+                    slot: 1,
+                    low: old.low + u64::from(replacement),
+                    ..old
+                };
                 assert!(accept_publication(old));
                 let previous = metadata::pending(old).unwrap();
                 let mut image = ImagePublication {
-                    surface: previous.surface, completed: Some(old), pending_sample: None,
-                    retained_read: SampleRead::acquire(old), gallery: previous.gallery,
-                    detail: previous.detail, annotation: previous.annotation, placement: previous.placement,
+                    surface: previous.surface,
+                    completed: Some(old),
+                    pending_sample: None,
+                    retained_read: SampleRead::acquire(old),
+                    gallery: previous.gallery,
+                    detail: previous.detail,
+                    annotation: previous.annotation,
+                    placement: previous.placement,
                 };
                 let mut copy_notified = false;
                 for position in 0..4 {
@@ -3657,7 +4048,9 @@ mod tests {
                     } else if position == control_position {
                         // No application observation is needed to consume a graphics receipt.
                         model.presentation = None;
-                        model.peer_disconnected(crate::view_model::UiError::transport("independent FD graphics"));
+                        model.peer_disconnected(crate::view_model::UiError::transport(
+                            "independent FD graphics",
+                        ));
                     } else if position == physical_position {
                         metadata::install_explore(next, &successor);
                         assert!(accept_publication(next));
@@ -3675,10 +4068,14 @@ mod tests {
                     let promoted = copy_notified && position >= physical_position;
                     assert_eq!(image.completed, Some(if promoted { next } else { old }));
                     let meaning = image.detail.as_ref().unwrap();
-                    assert_eq!(meaning.scene().categories[0].value,
-                        if promoted { "successor" } else { "predecessor" });
-                    assert_eq!(meaning.scene().objects[0].box_.first.x,
-                        successor.scene.objects[0].box_.first.x - if promoted { 0.0 } else { 17.0 });
+                    assert_eq!(
+                        meaning.scene().categories[0].value,
+                        if promoted { "successor" } else { "predecessor" }
+                    );
+                    assert_eq!(
+                        meaning.scene().objects[0].box_.first.x,
+                        successor.scene.objects[0].box_.first.x - if promoted { 0.0 } else { 17.0 }
+                    );
                     assert_eq!(test_releases(), if promoted { vec![old] } else { vec![] });
                 }
                 model.explore.snapshot.as_mut().unwrap().overlay.showlabels = false;
@@ -3686,7 +4083,11 @@ mod tests {
                 assert!(image.detail.as_ref().unwrap().overlay().showlabels);
                 image.complete(next);
                 assert!(!image.promote(next, &model));
-                let obsolete = FrameReady { presentation_revision: next.presentation_revision+1, slot: 0, ..next };
+                let obsolete = FrameReady {
+                    presentation_revision: next.presentation_revision + 1,
+                    slot: 0,
+                    ..next
+                };
                 assert!(accept_publication(obsolete));
                 let encoded_reader = SampleRead::acquire(obsolete).unwrap();
                 let mut pending = metadata::pending(next).unwrap();
@@ -3821,7 +4222,7 @@ mod tests {
     fn sample_retirement_invalidates_draws_but_preserves_independent_readers() {
         for direct_sampling in [false, true] {
             reset_test_releases();
-            let (model, mut frame) = crate::view_model::test_support::explore_presentation();
+            let (_, mut frame) = crate::view_model::test_support::explore_presentation();
             frame.direct_sampling = direct_sampling;
             assert!(accept_publication(frame));
             let read = SampleRead::acquire(frame).unwrap();

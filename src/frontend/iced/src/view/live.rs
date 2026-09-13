@@ -18,7 +18,9 @@ pub enum Outcome {
 }
 
 #[derive(Default)]
-pub struct Component { pub(crate) input: crate::workspace_input::Binding }
+pub struct Component {
+    pub(crate) input: crate::workspace_input::Binding,
+}
 
 // CLEANUP-IGNORE: Live owns its direct page view and input binding; Export owns model-card state.
 impl Component {
@@ -84,7 +86,8 @@ impl Component {
             crate::generated::FeatureId::Live,
             width,
             Message::Workspace,
-            self.input.for_source(crate::generated::PresentationSourceKind::Live, 0, None),
+            self.input
+                .for_source(crate::generated::PresentationSourceKind::Live, 0, None),
         );
         let advanced = crate::view::shared::card(
             "Advanced",

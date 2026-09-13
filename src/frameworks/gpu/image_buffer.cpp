@@ -251,10 +251,11 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
     }
     void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification& notification) override {
         BindContext(context);
-        CheckCuda("enqueue image completion notification", cuStreamAddCallback(reinterpret_cast<CUstream>(stream),
-            [](CUstream, CUresult status, void* value) {
-                static_cast<StreamNotification*>(value)->Notify(status);
-            }, &notification, 0U));
+        CheckCuda("enqueue image completion notification",
+                  cuStreamAddCallback(
+                      reinterpret_cast<CUstream>(stream),
+                      [](CUstream, CUresult status, void* value) { static_cast<StreamNotification*>(value)->Notify(status); },
+                      &notification, 0U));
     }
     StreamSettlement SettleStream(const std::uintptr_t context, const std::uintptr_t stream) noexcept override {
         const auto bound = cuCtxSetCurrent(reinterpret_cast<CUcontext>(context));
@@ -342,7 +343,9 @@ void DeviceContext::DestroyEvent(std::uintptr_t event) const noexcept {
 void ImageCopyBackend::StreamNotification::Notify(CUresult status) noexcept {
     std::scoped_lock lock(return_mutex_);
     status_.store(status, std::memory_order_release);
-    try { wake_(); } catch (...) {}
+    try {
+        wake_();
+    } catch (...) {}
     completed_ = true;
     returned_.notify_all();
 }
@@ -384,7 +387,8 @@ void ImageStream::Close() noexcept {
         // The existing stream boundary retains the callback and its context
         // when even terminal CUDA completion cannot establish safe release.
         auto retained = std::move(notification_);
-        std::move(retained->retention).Install(TerminalCudaCustody::Share(retained), cudaErrorUnknown);
+        auto retention = std::move(retained->retention);
+        std::move(retention).Install(TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
         stream_ = 0U;
         return;
     }
@@ -421,8 +425,7 @@ ImageCopyBackend::StreamSettlement ImageStream::Settle() noexcept {
         }
         const auto status = callback.status_.exchange(CUDA_SUCCESS, std::memory_order_acq_rel);
         // Translate on the ordinary owner, never inside the CUDA callback.
-        settled.failure = combine_image_failures(
-            CudaFailure("image stream completion notification", status), settled.failure);
+        settled.failure = combine_image_failures(CudaFailure("image stream completion notification", status), settled.failure);
         if (settled.completion_reached) {
             notification_->armed = false;
             callback.wake_ = {};
@@ -728,7 +731,9 @@ void ImageProductRetirement::Notify() const noexcept {
         if (retired_ && (live_ == 0U || unsafe_)) sink = sink_;
     }
     if (sink) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 
@@ -763,7 +768,8 @@ struct ImageProductBuffer::State final {
         for (auto& plane : planes_)
             plane.reset();
         context_.state_->backend->DestroyEvent(context_.state_->context, completion_);
-        for (auto& workspace : workspaces) workspace.reset();
+        for (auto& workspace : workspaces)
+            workspace.reset();
         for (const auto& observation : observations) {
             const auto result = observation.TakeResult();
             if (!result.complete || !result.claimed) continue;
@@ -783,18 +789,19 @@ struct ImageProductBuffer::State final {
         if (raw.external_storage == workspace) {
             const auto prior = raw.plane;
             auto next = raw.reusable_plane;
-            const bool reused = next.valid() && next.allocation.width >= raw.capacity_width &&
-                                next.allocation.height >= raw.capacity_height;
+            const bool reused =
+                next.valid() && next.allocation.width >= raw.capacity_width && next.allocation.height >= raw.capacity_height;
             if (!reused)
-                next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind,
-                                                              raw.capacity_width, raw.capacity_height);
+                next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind, raw.capacity_width,
+                                                               raw.capacity_height);
             if (!next.valid()) throw std::runtime_error("detached raw product allocation is invalid");
             next.descriptor.width = prior.descriptor.width;
             next.descriptor.height = prior.descriptor.height;
-            if (!reused) next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
+            if (!reused)
+                next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
             try {
-                context_.state_->backend->CopySameDevice(context_.state_->context, stream.native_handle(), next,
-                                                         context_.state_->context, prior);
+                context_.state_->backend->CopySameDevice(context_.state_->context, stream.native_handle(), next, context_.state_->context,
+                                                         prior);
                 stream.Synchronize();
             } catch (...) {
                 const auto failure = std::current_exception();
@@ -821,7 +828,10 @@ struct ImageProductBuffer::State final {
         }
         workspace->Detach(raw.allocation_owner);
         if (raw_workspace_ == workspace) raw_workspace_.reset();
-        if (workspace_ == workspace) { workspace_.reset(); finalize_ = {}; }
+        if (workspace_ == workspace) {
+            workspace_.reset();
+            finalize_ = {};
+        }
     }
     [[nodiscard]] std::uint64_t BeginWrite(ImageStream& stream) {
         AwaitReceiverReads();
@@ -990,7 +1000,8 @@ void ImageProductReadCompletion::Quarantine() noexcept {
     ReleaseAccess();
 }
 
-ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout, std::shared_ptr<ImageProductRetirement> retirement)
+ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout,
+                                       std::shared_ptr<ImageProductRetirement> retirement)
     : state_(std::make_shared<State>(std::move(context), layout, std::move(retirement))) {}
 ImageProductBuffer::~ImageProductBuffer() {
     if (deferred_release_) return;
@@ -1227,15 +1238,18 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     {
         std::shared_lock transaction(state_->transaction_);
         state_->damage_.Record({state_->planes_[0U]->state_->allocation_owner, state_->generation_}, coverage);
-        if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_})) return;
+        if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_}))
+            return;
     }
     auto source = Borrow();
     if (!source.valid() || !state_->workspace_ ||
-        state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()})) return;
+        state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}))
+        return;
     const auto extent = source.plane(0U).plane().descriptor;
     if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
-    coverage = state_->damage_.Since(state_->workspace_->Content(),
-        {source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}, state_->workspace_->identity());
+    coverage =
+        state_->damage_.Since(state_->workspace_->Content(), {source.plane(0U).plane().allocation.owner, source.plane(0U).revision()},
+                              state_->workspace_->identity());
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
     CancelWorkspaceWrite();
 }

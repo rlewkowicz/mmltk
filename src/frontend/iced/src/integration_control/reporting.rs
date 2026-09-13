@@ -17,10 +17,21 @@ pub(super) fn workspace_fps(
     evidence: FpsEvidence,
 ) {
     emit(|sink| {
-        sink.record("integration.workspace_fps", control, meter.text(),
-            [evidence.frames as f64, evidence.seconds,
-                f64::from(evidence.clip.x + evidence.clip.width - evidence.bounds.x - evidence.bounds.width),
-                f64::from(evidence.bounds.y - evidence.clip.y)]);
+        sink.record(
+            "integration.workspace_fps",
+            control,
+            meter.text(),
+            [
+                evidence.frames as f64,
+                evidence.seconds,
+                f64::from(
+                    evidence.clip.x + evidence.clip.width
+                        - evidence.bounds.x
+                        - evidence.bounds.width,
+                ),
+                f64::from(evidence.bounds.y - evidence.clip.y),
+            ],
+        );
     });
 }
 
@@ -28,18 +39,27 @@ pub(super) fn verify_workspace_fps_pixels(
     image: &iced::window::Screenshot,
     evidence: FpsEvidence,
 ) -> bool {
-    if !reporting_enabled() { return false; }
+    if !reporting_enabled() {
+        return false;
+    }
     let scale = image.scale_factor;
     let bounds = evidence.bounds;
     let left = (bounds.x * scale).ceil().max(0.0) as u32;
     let top = (bounds.y * scale).ceil().max(0.0) as u32;
     let right = ((bounds.x + bounds.width) * scale).floor() as u32;
     let bottom = ((bounds.y + bounds.height) * scale).floor() as u32;
-    if !scale.is_finite() || scale <= 0.0 || right > image.size.width
-        || bottom > image.size.height || right <= left + 4 || bottom <= top + 4
+    if !scale.is_finite()
+        || scale <= 0.0
+        || right > image.size.width
+        || bottom > image.size.height
+        || right <= left + 4
+        || bottom <= top + 4
         || image.rgba.len() != image.size.width as usize * image.size.height as usize * 4
-        || evidence.frames == 0 || evidence.seconds < 0.5
-    { return false; }
+        || evidence.frames == 0
+        || evidence.seconds < 0.5
+    {
+        return false;
+    }
     let mut background = 0;
     let mut foreground = 0;
     let mut border = 0;
@@ -51,7 +71,12 @@ pub(super) fn verify_workspace_fps_pixels(
             let low = pixel[..3].iter().copied().min().unwrap();
             let high = pixel[..3].iter().copied().max().unwrap();
             let back = pixel[3] == 255 && if evidence.dark { high <= 8 } else { low >= 247 };
-            let front = pixel[3] == 255 && if evidence.dark { low >= 160 } else { high <= 95 };
+            let front = pixel[3] == 255
+                && if evidence.dark {
+                    low >= 160
+                } else {
+                    high <= 95
+                };
             background += usize::from(back);
             foreground += usize::from(front);
             if x == left || x + 1 == right || y == top || y + 1 == bottom {
@@ -61,9 +86,23 @@ pub(super) fn verify_workspace_fps_pixels(
         }
     }
     let valid = background > foreground && foreground >= 12 && border_background * 10 >= border * 9;
-    emit(|sink| sink.record("integration.workspace_fps_pixels", EXPLORE_GALLERY,
-        if valid { "visible-counter" } else { "invalid-counter" },
-        [evidence.frames as f64, evidence.seconds, foreground as f64, border_background as f64]));
+    emit(|sink| {
+        sink.record(
+            "integration.workspace_fps_pixels",
+            EXPLORE_GALLERY,
+            if valid {
+                "visible-counter"
+            } else {
+                "invalid-counter"
+            },
+            [
+                evidence.frames as f64,
+                evidence.seconds,
+                foreground as f64,
+                border_background as f64,
+            ],
+        )
+    });
     valid
 }
 
@@ -689,7 +728,6 @@ impl State {
     }
     pub(super) fn reopen_wait(
         &mut self,
-        model: &ApplicationModel,
         frame: Option<crate::presentation_surface::FrameReady>,
         snapshot: &crate::generated::ExploreSnapshot,
         revision: u64,
@@ -699,7 +737,6 @@ impl State {
     ) {
         if snapshot.revision > self.reopen_wait_revision {
             let sampleable = sampleable_presentation(
-                model,
                 frame,
                 crate::generated::PresentationSourceKind::Explore,
                 snapshot.frame.revision,
@@ -788,8 +825,13 @@ mod tests {
         for scale in [1.0, 1.5] {
             for dark in [false, true] {
                 let size = iced::Size::new((100.0 * scale) as u32, (60.0 * scale) as u32);
-                let mut pixels = vec![if dark { 0 } else { 255 }; size.width as usize * size.height as usize * 4];
-                for pixel in pixels.chunks_exact_mut(4) { pixel[3] = 255; }
+                let mut pixels = vec![
+                    if dark { 0 } else { 255 };
+                    size.width as usize * size.height as usize * 4
+                ];
+                for pixel in pixels.chunks_exact_mut(4) {
+                    pixel[3] = 255;
+                }
                 // A bounded contrasting text stroke inside the counter's
                 // opaque background; capture geometry comes from the widget.
                 for y in (14.0 * scale) as u32..(24.0 * scale) as u32 {
@@ -799,9 +841,14 @@ mod tests {
                     }
                 }
                 let evidence = FpsEvidence {
-                    bounds: Rectangle::new(iced::Point::new(20.0, 6.0), iced::Size::new(74.0, 22.0)),
+                    bounds: Rectangle::new(
+                        iced::Point::new(20.0, 6.0),
+                        iced::Size::new(74.0, 22.0),
+                    ),
                     clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
-                    dark, frames: 30, seconds: 0.5,
+                    dark,
+                    frames: 30,
+                    seconds: 0.5,
                 };
                 let screenshot = iced::window::Screenshot::new(pixels, size, scale);
                 assert!(verify_workspace_fps_pixels(&screenshot, evidence));
@@ -810,8 +857,11 @@ mod tests {
         let records = capture.records();
         assert_eq!(records.len(), 4);
         assert!(records.iter().all(|(event, control, detail, values)| {
-            event == "integration.workspace_fps_pixels" && control == EXPLORE_GALLERY
-                && detail == "visible-counter" && values[0] == 30.0 && values[1] == 0.5
+            event == "integration.workspace_fps_pixels"
+                && control == EXPLORE_GALLERY
+                && detail == "visible-counter"
+                && values[0] == 30.0
+                && values[1] == 0.5
         }));
     }
 
@@ -1237,8 +1287,8 @@ mod tests {
                 state.scroll_placeholder(snapshot);
                 state.reset_scroll();
                 state.scroll_placeholder(snapshot);
-                state.reopen_wait(&model, Some(frame), snapshot, 0, 0, false, None);
-                state.reopen_wait(&model, Some(frame), snapshot, 0, 0, false, None);
+                state.reopen_wait(Some(frame), snapshot, 0, 0, false, None);
+                state.reopen_wait(Some(frame), snapshot, 0, 0, false, None);
                 state.located(&Phase::AdvancedField(2), "field", Rectangle::default());
             });
             driver.fail_detail(|| {
@@ -1380,15 +1430,28 @@ mod tests {
         wire.clear();
         let sample_count = 129;
         for index in 0..sample_count {
-            let mut mouse = crate::workspace_input::record(crate::generated::WorkspaceMouseKind::Motion,
-                Some(crate::generated::WorkspacePoint { x: index as f32, y: 1.0 }));
+            let mut mouse = crate::workspace_input::record(
+                crate::generated::WorkspaceMouseKind::Motion,
+                Some(crate::generated::WorkspacePoint {
+                    x: index as f32,
+                    y: 1.0,
+                }),
+            );
             mouse.source = crate::generated::PresentationSourceKind::Annotation;
             mouse.documentepoch = 1;
             connection.send_workspace_mouse(mouse).unwrap();
         }
-        connection.flush(|bytes| { wire.push(bytes.to_vec()); Ok(()) }).unwrap();
+        connection
+            .flush(|bytes| {
+                wire.push(bytes.to_vec());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(wire.len(), sample_count + 1);
-        assert_eq!(wire.last().unwrap(), &expected(IntegrationControlKind::PressureEntered, 0, 0));
+        assert_eq!(
+            wire.last().unwrap(),
+            &expected(IntegrationControlKind::PressureEntered, 0, 0)
+        );
         driver.phase = Phase::Complete;
         assert!(connection.integration_pressure_settled());
         wire.clear();

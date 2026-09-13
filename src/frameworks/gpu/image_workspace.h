@@ -94,8 +94,8 @@ struct ImageWorkspaceCoverage final {
 class ImageWorkspaceDamage final {
    public:
     void Record(ImageWorkspaceContent, ImageWorkspaceCoverage) noexcept;
-    [[nodiscard]] ImageWorkspaceCoverage Since(ImageWorkspaceContent, ImageWorkspaceContent,
-                                                std::uint64_t allocation) noexcept;
+    [[nodiscard]] ImageWorkspaceCoverage Since(ImageWorkspaceContent, ImageWorkspaceContent, std::uint64_t allocation) noexcept;
+
    private:
     struct Change final {
         ImageWorkspaceContent before{}, after{};
@@ -116,6 +116,7 @@ using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePla
 // custody. No import registry or scheduling policy lives in this owner.
 class ImageWorkspace final {
     class Owner;
+
    public:
     class Retirement final {
        public:
@@ -133,13 +134,13 @@ class ImageWorkspace final {
         // On rejection the display must retain this observation until release.
         [[nodiscard]] bool TransferToProducer() const noexcept;
         void SetWake(std::shared_ptr<const std::function<void()>>) const noexcept;
+
        private:
         explicit Retirement(std::shared_ptr<Owner> owner) noexcept : owner_(std::move(owner)) {}
         std::shared_ptr<Owner> owner_;
         friend class ImageWorkspace;
     };
-    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout,
-                                                                std::optional<DeviceExecution> = {});
+    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution> = {});
     ~ImageWorkspace() noexcept;
     ImageWorkspace(const ImageWorkspace&) = delete;
     ImageWorkspace& operator=(const ImageWorkspace&) = delete;
@@ -212,8 +213,8 @@ class ImageWorkspace final {
     struct State;
     std::shared_ptr<State> state_;
     ImageWorkspace(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>, const Operations*);
-    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout,
-                                                               std::optional<DeviceExecution>, const Operations*);
+    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>,
+                                                                const Operations*);
     [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
     void CheckOwner() const;
     void Attach(std::uint64_t product_owner, std::shared_ptr<ImageProductRetirement>);

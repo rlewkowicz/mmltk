@@ -112,8 +112,10 @@ void MaskRows::Assign(const c::AnnotationObject& object) {
         if (!block) continue;
         if (!block.unique()) block = std::make_shared<Block>();
         for (auto& row : block->rows) {
-            if (row && row.unique()) row->clear();
-            else row.reset();
+            if (row && row.unique())
+                row->clear();
+            else
+                row.reset();
         }
     }
     index_->run_count = 0U;
@@ -141,8 +143,8 @@ void MaskRows::Materialize(c::AnnotationObject& object) const {
     }
     update_mask_bounds(object);
 }
-void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width,
-                     std::uint16_t height, bool erase, MaskScratch& scratch) {
+void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width, std::uint16_t height,
+                      bool erase, MaskScratch& scratch) {
     auto& stroke = scratch.stroke;
     stroke.clear();
     const float dx = to.x - from.x, dy = to.y - from.y;
@@ -165,19 +167,26 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
     }
     normalize(stroke);
     if (stroke.empty()) return;
-    if (!index_) index_ = std::make_shared<Index>();
-    else if (!index_.unique()) index_ = std::make_shared<Index>(*index_);
+    if (!index_)
+        index_ = std::make_shared<Index>();
+    else if (!index_.unique())
+        index_ = std::make_shared<Index>(*index_);
     for (std::size_t begin = 0U; begin < stroke.size();) {
         auto end = begin + 1U;
-        while (end < stroke.size() && stroke[end].row == stroke[begin].row) ++end;
+        while (end < stroke.size() && stroke[end].row == stroke[begin].row)
+            ++end;
         const auto block_index = stroke[begin].row / kRowsPerBlock;
         if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
         auto& block = index_->blocks[block_index];
-        if (!block) block = std::make_shared<Block>();
-        else if (!block.unique()) block = std::make_shared<Block>(*block);
+        if (!block)
+            block = std::make_shared<Block>();
+        else if (!block.unique())
+            block = std::make_shared<Block>(*block);
         auto& row = block->rows[stroke[begin].row % kRowsPerBlock];
-        if (!row) row = std::make_shared<Runs>();
-        else if (!row.unique()) row = std::make_shared<Runs>(*row);
+        if (!row)
+            row = std::make_shared<Runs>();
+        else if (!row.unique())
+            row = std::make_shared<Runs>(*row);
         const auto old_count = row->size();
         auto& result = scratch.result;
         result.clear();
@@ -185,11 +194,12 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
             auto cut = begin;
             for (const auto run : *row) {
                 unsigned first = run.first;
-                while (cut < end && stroke[cut].last < first) ++cut;
+                while (cut < end && stroke[cut].last < first)
+                    ++cut;
                 for (auto index = cut; index < end && stroke[index].first <= run.last; ++index) {
                     if (stroke[index].first > first)
-                        result.push_back({run.row, static_cast<std::uint16_t>(first),
-                                          static_cast<std::uint16_t>(stroke[index].first - 1U)});
+                        result.push_back(
+                            {run.row, static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(stroke[index].first - 1U)});
                     first = std::max(first, static_cast<unsigned>(stroke[index].last) + 1U);
                     if (first > run.last) break;
                 }
@@ -199,13 +209,16 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
             const auto append = [&](c::AnnotationMaskRun run) {
                 if (!result.empty() && static_cast<unsigned>(result.back().last) + 1U >= run.first)
                     result.back().last = std::max(result.back().last, run.last);
-                else result.push_back(run);
+                else
+                    result.push_back(run);
             };
             auto existing = row->begin();
             auto added = begin;
             while (existing != row->end() || added < end) {
-                if (added == end || (existing != row->end() && existing->first <= stroke[added].first)) append(*existing++);
-                else append(stroke[added++]);
+                if (added == end || (existing != row->end() && existing->first <= stroke[added].first))
+                    append(*existing++);
+                else
+                    append(stroke[added++]);
             }
         }
         const auto count = index_->run_count - old_count + result.size();

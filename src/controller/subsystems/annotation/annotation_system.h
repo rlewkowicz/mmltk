@@ -112,7 +112,9 @@ struct AnnotationEditRequest final {
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const { return {}; }
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
+        return {};
+    }
     ~AnnotationAlgorithm() override = default;
     virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion) = 0;
     [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
@@ -128,7 +130,7 @@ struct AnnotationRenderedFacts final {
     std::uint64_t document_epoch = 0U;
     std::uint64_t scene_revision = 0U;
     contracts::AnnotationEditorFacts editor{};
- };
+};
 struct AnnotationImageMetadata final {
     VisualFrame frame{};
     // Opt-in evidence for the exact rendered image; never authorizes input.
@@ -169,9 +171,10 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
 
 class AnnotationSystem final {
    public:
-    using visual_source = VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
-                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
+    using visual_source =
+        VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
+                               mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
+                               mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
     using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
     AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                      VisualDiagnosticSink = {});

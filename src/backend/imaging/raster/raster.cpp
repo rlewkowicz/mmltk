@@ -236,15 +236,16 @@ std::int32_t raster_mask_runs_rgba(const MaskRunsRgbaWork& work) noexcept {
         work.run_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
         return cudaErrorInvalidValue;
     }
-    if (!std::isfinite(work.source_x) || !std::isfinite(work.source_y) || !std::isfinite(work.target_x) ||
-        !std::isfinite(work.target_y) || !std::isfinite(work.scale_x) || !std::isfinite(work.scale_y) ||
-        work.scale_x < 0 || work.scale_y < 0) return cudaErrorInvalidValue;
+    if (!std::isfinite(work.source_x) || !std::isfinite(work.source_y) || !std::isfinite(work.target_x) || !std::isfinite(work.target_y) ||
+        !std::isfinite(work.scale_x) || !std::isfinite(work.scale_y) || work.scale_x < 0 || work.scale_y < 0)
+        return cudaErrorInvalidValue;
     if ((work.scale_x != 1 || work.scale_y != 1 || work.source_x != work.target_x || work.source_y != work.target_y) &&
         (work.overlay.pitch_bytes % alignof(std::uint32_t) != 0U ||
-         reinterpret_cast<std::uintptr_t>(work.overlay.pixels) % alignof(std::uint32_t) != 0U)) return cudaErrorInvalidValue;
-    return detail::launch_draw_manual_mask_runs_rgba_pitched(
-        {as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color, as_stream(work.stream), work.clip,
-         work.source_x, work.source_y, work.target_x, work.target_y, work.scale_x, work.scale_y});
+         reinterpret_cast<std::uintptr_t>(work.overlay.pixels) % alignof(std::uint32_t) != 0U))
+        return cudaErrorInvalidValue;
+    return detail::launch_draw_manual_mask_runs_rgba_pitched({as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color,
+                                                              as_stream(work.stream), work.clip, work.source_x, work.source_y,
+                                                              work.target_x, work.target_y, work.scale_x, work.scale_y});
 }
 
 std::int32_t raster_box_outline_rgba(const BoxOutlineRgbaWork& work) noexcept {

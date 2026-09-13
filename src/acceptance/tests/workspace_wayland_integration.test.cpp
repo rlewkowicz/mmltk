@@ -496,7 +496,7 @@ struct SurfaceAudit final {
         bool releasing = false;
         bool released = false;
         TerminalRead terminal = TerminalRead::None;
-        std::optional<MetadataReceipt> metadata;
+        std::optional<MetadataReceipt> metadata{};
     };
     struct ReceiverReceipt final {
         std::string source;
@@ -1185,8 +1185,7 @@ struct SurfaceAudit final {
                 if (custody.acquired) reject("Iced acquired the same publication twice");
                 const auto receipt = state.receipts.find(publication);
                 if (receipt == state.receipts.end() || receipt->second.release_only || receipt->second.stage < 2U ||
-                    receipt->second.source != record.value("source", "") ||
-                    receipt->second.transfer != scalar(record, "transfer_sequence"))
+                    receipt->second.source != record.value("source", "") || receipt->second.transfer != scalar(record, "transfer_sequence"))
                     reject("Iced metadata acquisition lacks its exact dispatched physical transfer");
                 custody.metadata = metadata_receipt(record);
                 custody.acquired = true;
@@ -1255,8 +1254,8 @@ struct SurfaceAudit final {
         };
         const auto retained_read = [&](const std::uint64_t publication, const ReceiverReceipt& receipt) {
             const auto custody = state.custody.find(publication);
-            return permit_held && !receipt.release_only && receipt.direct_sampling && receipt.stage == 2U && custody != state.custody.end() &&
-                   custody->second.acquired && !custody->second.released;
+            return permit_held && !receipt.release_only && receipt.direct_sampling && receipt.stage == 2U &&
+                   custody != state.custody.end() && custody->second.acquired && !custody->second.released;
         };
         for (const auto& [publication, receipt] : state.receipts) {
             const auto transfer = state.transfers.find({publication, receipt.transfer});
@@ -2790,8 +2789,7 @@ struct NativeAudit final {
             if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index))
                 reject_causal_evidence("placeholder slot identity");
             if (value < kAcceptanceSlotLimit) slots.insert_or_assign(value, compiled_index);
-            if (value < kAcceptanceSlotLimit && scalar(record, "capacity_width") == 1U)
-                initial_cache[sequence].slots.emplace(value);
+            if (value < kAcceptanceSlotLimit && scalar(record, "capacity_width") == 1U) initial_cache[sequence].slots.emplace(value);
         }
         if (owner == "explore" && event == "acceptance.placeholder.complete") {
             const auto cardinality = static_cast<std::size_t>(value);
@@ -3960,8 +3958,7 @@ struct BrowserAudit final {
             return motion.ordinal > held_visible_ordinal && motion.ordinal < pending_hover_ordinal &&
                    motion.x >= static_cast<double>((slot % columns) * side) &&
                    motion.x < static_cast<double>((slot % columns + 1U) * side) &&
-                   motion.y >= static_cast<double>((slot / columns) * side) &&
-                   motion.y < static_cast<double>((slot / columns + 1U) * side);
+                   motion.y >= static_cast<double>((slot / columns) * side) && motion.y < static_cast<double>((slot / columns + 1U) * side);
         });
     }
 
@@ -4042,8 +4039,8 @@ struct BrowserAudit final {
         }
         ++ordinal;
         const std::string event = record.value("event", "");
-        if (event == "iced.surface.scroll_stage" && record.value("control", "") == "held-visible" &&
-            atlas_draws.valid && atlas_draws.held_stages.contains("held-visible"))
+        if (event == "iced.surface.scroll_stage" && record.value("control", "") == "held-visible" && atlas_draws.valid &&
+            atlas_draws.held_stages.contains("held-visible"))
             held_visible_ordinal = ordinal;
         if (event == "iced.gallery.source") consume_gallery_generation(record);
         if (event == "integration.phase_progress") {
@@ -4260,12 +4257,11 @@ struct BrowserAudit final {
                 const auto parsed = std::from_chars(label.data(), label.data() + label.size(), displayed);
                 valid_text = parsed.ec == std::errc{} && parsed.ptr == label.data() + label.size();
             }
-            workspace_fps_text |= record.value("control", "") == EXPLORE_GALLERY && valid_text &&
-                                  numeric(record, "a") > 0.0 && numeric(record, "b") >= 0.5 &&
-                                  std::abs(displayed - numeric(record, "a") / numeric(record, "b")) <= 0.5 &&
+            workspace_fps_text |= record.value("control", "") == kExploreGalleryControl && valid_text && numeric(record, "a") > 0.0 &&
+                                  numeric(record, "b") >= 0.5 && std::abs(displayed - numeric(record, "a") / numeric(record, "b")) <= 0.5 &&
                                   std::abs(numeric(record, "c") - 6.0) < 0.01 && std::abs(numeric(record, "d") - 6.0) < 0.01;
         } else if (event == "integration.workspace_fps_pixels") {
-            workspace_fps_pixels |= record.value("control", "") == EXPLORE_GALLERY &&
+            workspace_fps_pixels |= record.value("control", "") == kExploreGalleryControl &&
                                     record.value("detail", "") == "visible-counter" && numeric(record, "a") > 0.0 &&
                                     numeric(record, "b") >= 0.5 && numeric(record, "c") >= 12.0 && numeric(record, "d") > 0.0;
         } else if (event == "integration.benchmark_override") {
@@ -4379,7 +4375,8 @@ struct BrowserAudit final {
                 scalar(record, "c") == static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)) {
                 if (shared_explore_motion.size() < kAcceptanceRecordLimit)
                     shared_explore_motion.push_back({numeric(record, "a"), numeric(record, "b"), ordinal});
-                else bounds_valid = false;
+                else
+                    bounds_valid = false;
             }
         } else if (event == "integration.pending_hover") {
             pending_hover_index = scalar(record, "a");
@@ -6287,9 +6284,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     const auto first = state.transfers.find({capacity_held->publication, capacity_held->transfer});
                     const auto retry = state.transfers.find({browser.capacity_retry_publication, copied->second.transfer});
                     exact_retry = copied->second.stage == 3U && !copied->second.release_only && first != state.transfers.end() &&
-                                  retry != state.transfers.end() &&
-                                  first->second.read.source == source && first->second.releasing && first->second.released &&
-                                  retry->second.releasing && retry->second.released &&
+                                  retry != state.transfers.end() && first->second.read.source == source && first->second.releasing &&
+                                  first->second.released && retry->second.releasing && retry->second.released &&
                                   browser.capacity_retry_publication >= capacity_held->publication &&
                                   browser.capacity_retry_frame == copied->second.frame;
                     if (exact_retry) break;
@@ -7704,8 +7700,7 @@ TEST_CASE("Paired empty atlases replace displayed content through an actual acqu
     if (fault == "negative_count") empty["matching_count"] = -1;
     for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
         const std::string_view name{event};
-        if ((fault == "source" && name == "iced.gallery.source") ||
-            (fault == "acquisition" && name == "iced.surface.sample_acquired"))
+        if ((fault == "source" && name == "iced.gallery.source") || (fault == "acquisition" && name == "iced.surface.sample_acquired"))
             continue;
         auto record = empty;
         record["event"] = fault == "unsubmitted" && name == "iced.surface.draw_encoded" ? "iced.surface.sample_draw_selected" : event;
@@ -8224,8 +8219,8 @@ TEST_CASE("Two completed outputs join independent presentation and release-only 
 }
 
 TEST_CASE("Release-only receipts require unique physical identity and completion", "[workspace][audit]") {
-    const std::string fault = GENERATE("missing_submission", "missing_completion", "duplicate_submission", "duplicate_completion",
-                                      "source", "publication", "transfer", "session", "frame", "ready", "release", "slot", "layer");
+    const std::string fault = GENERATE("missing_submission", "missing_completion", "duplicate_submission", "duplicate_completion", "source",
+                                       "publication", "transfer", "session", "frame", "ready", "release", "slot", "layer");
     CAPTURE(fault);
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -8338,9 +8333,11 @@ TEST_CASE("Source admission audit requires canonical allocation provenance", "[w
 TEST_CASE("held placeholder motion evidence uses only the target hover interval", "[workspace][audit]") {
     for (const std::string_view timing : {"earlier", "during", "later"}) {
         BrowserAudit audit;
-        const nlohmann::json motion{
-            {"event", "integration.explore_mouse"}, {"detail", "shared-input-admitted"}, {"a", 150.0}, {"b", 50.0},
-            {"c", static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)}};
+        const nlohmann::json motion{{"event", "integration.explore_mouse"},
+                                    {"detail", "shared-input-admitted"},
+                                    {"a", 150.0},
+                                    {"b", 50.0},
+                                    {"c", static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)}};
         audit.consume(motion);
         auto draw = atlas_draw_record(77U, 10U, 4U, 0.0);
         draw["ready_slots"] = std::vector<bool>{true, false};
@@ -8467,19 +8464,41 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
     for (const bool forward : {false, true}) {
         for (const bool restored_first : {false, true}) {
             NativeAudit audit;
-            audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"},
-                           {"sequence", 7U}, {"value", 0U}, {"detail", 20U}, {"capacity_width", 1U}});
-            audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"},
-                           {"sequence", 7U}, {"value", 1U}, {"detail", 21U}, {"capacity_width", 0U}});
-            const nlohmann::json restored{{"kind", "gui_runtime"}, {"owner", "explore"},
-                                          {"event", "acceptance.placeholder.complete"}, {"sequence", 7U},
-                                          {"value", 2U}, {"capacity_width", 1U}, {"admission_columns", 2U},
-                                          {"admission_first_row", 10U}, {"admission_row_count", 1U},
+            audit.consume({{"kind", "gui_runtime"},
+                           {"owner", "explore"},
+                           {"event", "acceptance.placeholder.slot"},
+                           {"sequence", 7U},
+                           {"value", 0U},
+                           {"detail", 20U},
+                           {"capacity_width", 1U}});
+            audit.consume({{"kind", "gui_runtime"},
+                           {"owner", "explore"},
+                           {"event", "acceptance.placeholder.slot"},
+                           {"sequence", 7U},
+                           {"value", 1U},
+                           {"detail", 21U},
+                           {"capacity_width", 0U}});
+            const nlohmann::json restored{{"kind", "gui_runtime"},
+                                          {"owner", "explore"},
+                                          {"event", "acceptance.placeholder.complete"},
+                                          {"sequence", 7U},
+                                          {"value", 2U},
+                                          {"capacity_width", 1U},
+                                          {"admission_columns", 2U},
+                                          {"admission_first_row", 10U},
+                                          {"admission_row_count", 1U},
                                           {"admission_forward", forward}};
-            const nlohmann::json admission{{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "gallery.read.scheduled"},
-                                           {"sequence", 7U}, {"detail", 21U}, {"admission_position", 21U},
-                                           {"admission_columns", 2U}, {"admission_first_row", 10U},
-                                           {"admission_row_count", 1U}, {"admission_forward", forward}, {"admission_tier", 0U}};
+            const nlohmann::json admission{{"kind", "gui_runtime"},
+                                           {"owner", "explore"},
+                                           {"event", "gallery.read.scheduled"},
+                                           {"sequence", 7U},
+                                           {"detail", 21U},
+                                           {"admission_position", 21U},
+                                           {"admission_columns", 2U},
+                                           {"admission_first_row", 10U},
+                                           {"admission_row_count", 1U},
+                                           {"admission_forward", forward},
+                                           {"admission_tier", 0U}};
             audit.consume(restored_first ? restored : admission);
             audit.consume(restored_first ? admission : restored);
             CHECK(audit.cached_first_valid == restored_first);

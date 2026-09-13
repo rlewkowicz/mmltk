@@ -401,15 +401,21 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         generated::ServerRecordKind::parse(b"UnknownServerRecord").is_none(),
         "unknown server discriminator accepted",
     )?;
-    require(matches!(&records[4], ServerRecord::InteractionRejected(record)
+    require(
+        matches!(&records[4], ServerRecord::InteractionRejected(record)
         if record.endpointid == generated::ENDPOINT_Annotation_Input && record.error.detail == "fixture input unavailable"),
-        "native input rejection fixture changed")?;
-    require(matches!(&records[5], ServerRecord::InteractionRejected(record)
+        "native input rejection fixture changed",
+    )?;
+    require(
+        matches!(&records[5], ServerRecord::InteractionRejected(record)
         if record.endpointid == generated::ENDPOINT_Explore_UpdateViewport && record.error.detail == "fixture unavailable"),
-        "native interaction rejection fixture changed")?;
-    require(matches!(&records[6], ServerRecord::InteractionRejected(record)
+        "native interaction rejection fixture changed",
+    )?;
+    require(
+        matches!(&records[6], ServerRecord::InteractionRejected(record)
         if record.error.detail.len() == generated::ReflectedRecordPath::ApplicationErrorRecord.map_child(b"detail").max_leaf_bytes()),
-        "native rejection bounds changed")?;
+        "native rejection bounds changed",
+    )?;
     let Some(ServerRecord::Bootstrap(bootstrap)) = records
         .iter()
         .find(|record| matches!(record, ServerRecord::Bootstrap(_)))
@@ -740,9 +746,13 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
     let settings_update =
         generated::update_currentview(generated::default_currentview().map_err(io::Error::other)?);
     let mouse = generated::WorkspaceMouse {
-        source: generated::PresentationSourceKind::Annotation, peerepoch: 1, documentepoch: 1,
-        kind: generated::WorkspaceMouseKind::Motion, point: Some(generated::WorkspacePoint { x: 1.25, y: 2.5 }),
-        wheelunit: generated::WorkspaceWheelUnit::Pixels, wheel: generated::WorkspacePoint { x: 0.125, y: -0.25 },
+        source: generated::PresentationSourceKind::Annotation,
+        peerepoch: 1,
+        documentepoch: 1,
+        kind: generated::WorkspaceMouseKind::Motion,
+        point: Some(generated::WorkspacePoint { x: 1.25, y: 2.5 }),
+        wheelunit: generated::WorkspaceWheelUnit::Pixels,
+        wheel: generated::WorkspacePoint { x: 0.125, y: -0.25 },
         ..generated::default_workspace_mouse()
     };
     let batch_encoded = generated::encode_workspace_mouse(mouse)?.encode()?;
@@ -790,8 +800,13 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
             "Interaction:explore.UpdateViewport",
             generated::encode_explore_UpdateViewport(generated::ExploreViewportUpdate {
                 viewport: generated::ExploreViewport {
-                    extent: generated::VisualExtent { width: 64, height: 64 },
-                    firstrow: 0, rowcount: 1, columns: 1,
+                    extent: generated::VisualExtent {
+                        width: 64,
+                        height: 64,
+                    },
+                    firstrow: 0,
+                    rowcount: 1,
+                    columns: 1,
                 },
             })?
             .encode()?,

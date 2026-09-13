@@ -1376,8 +1376,10 @@ struct ApplicationSchema final {
             using SystemCell = ReflectedSystem<Composition, cell>;
             static_assert(application_schema_detail::ReflectedEventVariant<typename SystemCell::type>,
                           "ordinary system event_type must be one reflected std::variant");
+            // clang-format off: the formatter splits the C++26 splice tokens in this template argument.
             application_schema_detail::Variant<typename SystemCell::type::event_type>::Visit(
                 application_schema_detail::EventVisitor<Composition, &[:cell:], std::remove_reference_t<Visitor>>{visitor});
+            // clang-format on
         }
     }
 

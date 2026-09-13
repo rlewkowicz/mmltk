@@ -160,17 +160,6 @@ impl Controller {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn set_test_surface(&mut self, surface: Surface) {
-        self.pending = surface.frame.map(|_| surface);
-        self.pending_rejected = false;
-        self.surface = Some(Surface {
-            frame: None,
-            ..surface
-        });
-        self.incumbent = self.surface;
-    }
-
     fn update(&mut self, message: Message, model: &ApplicationModel) -> Update {
         let mut update = Update {
             native: None,
@@ -467,8 +456,11 @@ impl App {
             self.retire_peer(error);
             return;
         }
-        let refresh = if recovery { self.model.presentation_recovery_refresh() }
-            else { self.model.presentation_refresh() };
+        let refresh = if recovery {
+            self.model.presentation_recovery_refresh()
+        } else {
+            self.model.presentation_refresh()
+        };
         if let Some(frame) = refresh {
             self.select_presentation(frame);
         }
@@ -514,7 +506,10 @@ impl Controller {
             crate::presentation_surface::discard_sample(previous);
         }
         crate::presentation_surface::invalidate_drawn_slot(frame);
-        self.surface = Some(Surface { frame: None, ..surface });
+        self.surface = Some(Surface {
+            frame: None,
+            ..surface
+        });
         self.pending = Some(Surface {
             frame: Some(frame),
             ..surface
@@ -539,6 +534,7 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn discard(&mut self) {
         self.retire_frame();
         self.surface = None;
@@ -552,7 +548,10 @@ impl Controller {
         recovery: bool,
     ) -> Result<(), UiError> {
         crate::presentation_surface::authorize_draw(None);
-        if matches!(feature, FeatureId::Train | FeatureId::Validate | FeatureId::Export) {
+        if matches!(
+            feature,
+            FeatureId::Train | FeatureId::Validate | FeatureId::Export
+        ) {
             self.retire_frame();
             return Ok(());
         }
@@ -563,7 +562,8 @@ impl Controller {
         if let Some(surface) = self.pending {
             crate::presentation_surface::reconcile_completed(surface, model);
             if let Some(retained) = crate::presentation_surface::retained_surface()
-                .filter(|retained| retained.frame == surface.frame) {
+                .filter(|retained| retained.frame == surface.frame)
+            {
                 self.retained = Some(retained);
                 self.incumbent = Some(retained);
                 self.pending = None;
@@ -577,12 +577,19 @@ impl Controller {
     }
 
     fn sync(&mut self, _model: &ApplicationModel, integration: bool) -> Result<(), &'static str> {
-        for surface in [&mut self.surface, &mut self.incumbent, &mut self.pending, &mut self.retained].into_iter().flatten() {
+        for surface in [
+            &mut self.surface,
+            &mut self.incumbent,
+            &mut self.pending,
+            &mut self.retained,
+        ]
+        .into_iter()
+        .flatten()
+        {
             surface.integration = integration;
         }
         Ok(())
     }
-
 }
 
 #[cfg(test)]
@@ -1087,8 +1094,11 @@ mod tests {
         record_drawn_detail(
             Surface {
                 frame: Some(frame),
-                viewer_identity: app.model.explore.snapshot.as_ref().and_then(|snapshot|
-                    snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image))),
+                viewer_identity: app.model.explore.snapshot.as_ref().and_then(|snapshot| {
+                    snapshot
+                        .selectedimage
+                        .map(|image| (snapshot.dataset.identity, image))
+                }),
                 crop: (crop != [0, 0, frame.content_width, frame.content_height]).then_some(crop),
                 ..surface
             },
@@ -1103,8 +1113,11 @@ mod tests {
         let (model, frame) = crate::view_model::test_support::explore_presentation();
         app.model = model;
         app.workspace.select(FeatureId::Explore);
-        app.presentation.surface = crate::presentation_surface::metadata::surface(frame)
-            .map(|surface| Surface { frame: None, ..surface });
+        app.presentation.surface =
+            crate::presentation_surface::metadata::surface(frame).map(|surface| Surface {
+                frame: None,
+                ..surface
+            });
         app.sync_surface();
         (app, frame)
     }
@@ -1159,7 +1172,9 @@ mod tests {
                     _ => app.model.presentation = None,
                 }
                 app.reconcile_viewer();
-                app.presentation.reconcile(&app.model, FeatureId::Explore, false).unwrap();
+                app.presentation
+                    .reconcile(&app.model, FeatureId::Explore, false)
+                    .unwrap();
                 assert_eq!(app.presentation.retained, Some(retained));
                 assert_eq!(app.presentation.pending, Some(retained));
                 assert!(test_releases().is_empty());
@@ -1191,7 +1206,9 @@ mod tests {
             app.model.explore.snapshot = None;
             app.model.presentation = None;
             let update = app.presentation.update(
-                Message::Surface(crate::presentation_surface::Notification::Native(frame)), &app.model);
+                Message::Surface(crate::presentation_surface::Notification::Native(frame)),
+                &app.model,
+            );
             assert!(update.redraw);
             app.reconcile_surface_frame();
             let surface = app.presentation.surface();
@@ -1207,13 +1224,32 @@ mod tests {
                 }
             }
             let state = crate::view::explore::state::State::default();
-            drop(crate::view::explore::view(&state, &app.model, &app.settings, surface, 1200.0));
+            drop(crate::view::explore::view(
+                &state,
+                &app.model,
+                app.settings.state(),
+                surface,
+                1200.0,
+                crate::workspace_input::Binding::default(),
+            ));
             assert!(test_releases().is_empty());
             // Import readiness and copy completion use the same independent wake path.
-            assert!(app.presentation.update(
-                Message::Surface(crate::presentation_surface::Notification::Drawn), &app.model).redraw);
-            assert!(app.presentation.update(
-                Message::Surface(crate::presentation_surface::Notification::Copied(frame)), &app.model).redraw);
+            assert!(
+                app.presentation
+                    .update(
+                        Message::Surface(crate::presentation_surface::Notification::Drawn),
+                        &app.model
+                    )
+                    .redraw
+            );
+            assert!(
+                app.presentation
+                    .update(
+                        Message::Surface(crate::presentation_surface::Notification::Copied(frame)),
+                        &app.model
+                    )
+                    .redraw
+            );
             app.presentation.discard();
             assert_eq!(test_releases(), vec![frame]);
         }
@@ -1258,7 +1294,11 @@ mod tests {
         let (mut app, frame) = viewer_app();
         app.present_native_frame(frame);
         let capture = crate::presentation_surface::test_sample_read(frame);
-        let next = FrameReady { low: frame.low+1, presentation_revision: frame.presentation_revision+1, ..frame };
+        let next = FrameReady {
+            low: frame.low + 1,
+            presentation_revision: frame.presentation_revision + 1,
+            ..frame
+        };
         install_next(&app, next);
         app.present_native_frame(next);
         assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
@@ -1298,10 +1338,19 @@ mod tests {
 
     #[test]
     fn domain_control_publication_and_copy_reconcile_in_every_notification_order() {
-        for [domain_position, control_position, physical_position, copy_position]
-            in crate::view_model::test_support::presentation_arrival_orders() {
+        for [
+            domain_position,
+            control_position,
+            physical_position,
+            copy_position,
+        ] in crate::view_model::test_support::presentation_arrival_orders()
+        {
             let (mut app, frame) = viewer_app();
-            let next = FrameReady { content_sequence: 2, presentation_revision: 6, ..frame };
+            let next = FrameReady {
+                content_sequence: 2,
+                presentation_revision: 6,
+                ..frame
+            };
             install_next(&app, next);
             for position in 0..4 {
                 if position == domain_position {
@@ -1316,10 +1365,14 @@ mod tests {
                     app.present_native_frame(next);
                 } else {
                     assert_eq!(position, copy_position);
-                    drop(app.on_presentation(Message::Surface(crate::presentation_surface::Notification::Copied(next))));
+                    drop(app.on_presentation(Message::Surface(
+                        crate::presentation_surface::Notification::Copied(next),
+                    )));
                 }
-                assert_eq!(app.presentation.surface().unwrap().frame,
-                    (position >= physical_position).then_some(next));
+                assert_eq!(
+                    app.presentation.surface().unwrap().frame,
+                    (position >= physical_position).then_some(next)
+                );
                 assert!(test_releases().is_empty());
             }
             app.presentation.discard();
@@ -1334,11 +1387,18 @@ mod tests {
         let retained = app.presentation.surface().unwrap();
         app.presentation.retained = Some(retained);
         let retained_read = crate::presentation_surface::test_sample_read(frame);
-        let next = FrameReady { presentation_revision: 6, content_sequence: 2, slot: 1, ..frame };
+        let next = FrameReady {
+            presentation_revision: 6,
+            content_sequence: 2,
+            slot: 1,
+            ..frame
+        };
         install_next(&app, next);
         app.present_native_frame(next);
         let read = crate::presentation_surface::test_sample_read(next);
-        drop(app.on_presentation(Message::Surface(crate::presentation_surface::Notification::SampleRejected(next))));
+        drop(app.on_presentation(Message::Surface(
+            crate::presentation_surface::Notification::SampleRejected(next),
+        )));
         assert_eq!(app.presentation.retained, Some(retained));
         assert!(app.presentation.pending.is_none());
         assert!(test_releases().is_empty());
@@ -1355,10 +1415,15 @@ mod tests {
         app.present_native_frame(frame);
         let mut snapshot = app.model.presentation.clone().unwrap();
         snapshot.revision += 1;
-        app.reduce_event(SystemEvent { state_revision: 0,
+        app.reduce_event(SystemEvent {
+            state_revision: 0,
             delivery: crate::generated::EventDelivery::Critical,
             event: crate::generated::ApplicationEvent::PresentationPresentationFailed(
-                crate::generated::PresentationFailed { snapshot, detail: "writer stopped".into() }),
+                crate::generated::PresentationFailed {
+                    snapshot,
+                    detail: "writer stopped".into(),
+                },
+            ),
         });
         assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
         assert!(app.model.error.is_some());
@@ -1578,7 +1643,9 @@ mod tests {
             let at_request = app.model.annotation.snapshot.clone();
             assert!(!app.copy_viewer_to_annotation());
             assert_eq!(app.model.annotation.snapshot, at_request);
-            if condition >= 2 { assert_eq!(app.model.annotation.snapshot, before); }
+            if condition >= 2 {
+                assert_eq!(app.model.annotation.snapshot, before);
+            }
             assert_eq!(app.model.pending_count(), 0);
         }
     }
@@ -1595,15 +1662,37 @@ mod tests {
                 0 => app.model.explore.snapshot = None,
                 1 => app.model.explore.snapshot.as_mut().unwrap().mode = ExploreMode::Gallery,
                 2 => app.model.explore.snapshot.as_mut().unwrap().frame.revision = 0,
-                3 => app.model.explore.snapshot.as_mut().unwrap().detail.showoriginaldimensions = true,
+                3 => {
+                    app.model
+                        .explore
+                        .snapshot
+                        .as_mut()
+                        .unwrap()
+                        .detail
+                        .showoriginaldimensions = true
+                }
                 _ => app.model.presentation = None,
             }
-            if condition <= 2 { assert!(!app.open_annotation()); }
+            if condition <= 2 {
+                assert!(!app.open_annotation());
+            }
             assert!(app.copy_viewer_to_annotation());
-            let crate::transport_connection::CapturedRecord::Intent(intent) = receiver.try_recv().unwrap()
-                else { panic!("expected exact Annotation Open"); };
-            assert_eq!(intent, crate::generated::encode_annotation_Open(intent.correlation,
-                AnnotationOpen { source: expected, originalcontent: false }).record);
+            let crate::transport_connection::CapturedRecord::Intent(intent) =
+                receiver.try_recv().unwrap()
+            else {
+                panic!("expected exact Annotation Open");
+            };
+            assert_eq!(
+                intent,
+                crate::generated::encode_annotation_Open(
+                    intent.correlation,
+                    AnnotationOpen {
+                        source: expected,
+                        originalcontent: false
+                    }
+                )
+                .record
+            );
         }
     }
 
@@ -1645,11 +1734,29 @@ mod tests {
         frame.content_width = expected.extent.width;
         frame.content_height = expected.extent.height;
         use crate::presentation_surface::metadata;
-        let bytes = metadata::encode(expected.clone(), metadata::encode_product(
-            crate::generated::ApplicationSystem::Upscale, crate::generated::UpscaleImageMetadata::from(app.model.upscale_snapshot.as_ref().unwrap())),
-            Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore,
-                crate::generated::ExploreImageMetadata::from(app.model.explore.snapshot.as_ref().unwrap()))));
-        metadata::install(frame, frame.content_width, frame.content_height, frame.presentation_revision, &bytes).unwrap();
+        let bytes = metadata::encode(
+            expected.clone(),
+            metadata::encode_product(
+                crate::generated::ApplicationSystem::Upscale,
+                crate::generated::UpscaleImageMetadata::from(
+                    app.model.upscale_snapshot.as_ref().unwrap(),
+                ),
+            ),
+            Some(metadata::encode_product(
+                crate::generated::ApplicationSystem::Explore,
+                crate::generated::ExploreImageMetadata::from(
+                    app.model.explore.snapshot.as_ref().unwrap(),
+                ),
+            )),
+        );
+        metadata::install(
+            frame,
+            frame.content_width,
+            frame.content_height,
+            frame.presentation_revision,
+            &bytes,
+        )
+        .unwrap();
         app.presentation.surface.as_mut().unwrap().width = frame.content_width;
         app.presentation.surface.as_mut().unwrap().height = frame.content_height;
         app.presentation.pending = Some(Surface {
@@ -1659,7 +1766,13 @@ mod tests {
         let (sender, mut receiver) = Connection::test_channel();
         app.connection = Some(sender);
         // The captured Explore preference is deliberately the opposite of this draw.
-        app.model.explore.snapshot.as_mut().unwrap().detail.showoriginaldimensions = true;
+        app.model
+            .explore
+            .snapshot
+            .as_mut()
+            .unwrap()
+            .detail
+            .showoriginaldimensions = true;
         app.model.explore.snapshot.as_mut().unwrap().frame.revision += 100;
         record_draw(&app, frame, [40, 80, 2000, 1200]);
         assert!(app.copy_viewer_to_annotation());

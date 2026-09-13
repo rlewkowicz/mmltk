@@ -35,13 +35,12 @@ struct WorkspaceMouse final {
     WorkspaceWheelUnit wheel_unit = WorkspaceWheelUnit::Lines;
     WorkspacePoint wheel{};
     [[= mmltk::frameworks::reflection::Minimum<std::uint16_t>{contracts::kMinAnnotationBrushRadius}]]
-    [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]]
-    std::uint16_t brush_radius = contracts::kDefaultAnnotationBrushRadius;
+        [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
+            contracts::kDefaultAnnotationBrushRadius;
     [[nodiscard]] bool valid() const noexcept {
         namespace reflection = mmltk::frameworks::reflection;
-        return presentation_source_session(source) != 0U && peer_epoch != 0U &&
-               reflection::enum_contains(kind) && reflection::enum_contains(button) &&
-               reflection::enum_contains(wheel_unit) && (!point || point->valid()) && wheel.valid() &&
+        return presentation_source_session(source) != 0U && peer_epoch != 0U && reflection::enum_contains(kind) &&
+               reflection::enum_contains(button) && reflection::enum_contains(wheel_unit) && (!point || point->valid()) && wheel.valid() &&
                modifiers <= 15U && brush_radius >= contracts::kMinAnnotationBrushRadius &&
                brush_radius <= contracts::kMaxAnnotationBrushRadius;
     }

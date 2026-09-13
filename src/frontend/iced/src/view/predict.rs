@@ -129,7 +129,8 @@ impl Component {
             crate::generated::FeatureId::Predict,
             width,
             Message::Workspace,
-            self.input.for_source(crate::generated::PresentationSourceKind::Predict, 0, None),
+            self.input
+                .for_source(crate::generated::PresentationSourceKind::Predict, 0, None),
         );
         let advanced = crate::view::shared::card(
             "Advanced",

@@ -95,9 +95,10 @@ class UpscaleSystem final {
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
 
-    using visual_source = VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale,
-                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
+    using visual_source =
+        VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale,
+                               mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
+                               mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
     using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
     UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                   VisualDiagnosticSink = {});

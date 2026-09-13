@@ -90,8 +90,8 @@ TEST_CASE("Graphics signal publishes exact bounded image metadata with its physi
     auto owned = presentation::WorkspaceSurfaceFrameSignal::create();
     auto* signal = owned.mapping();
     const std::array first{std::byte{0x83}, std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
-    graphics::publish_workspace_frame_signal(signal, 1U, 1U, presentation::WorkspacePresentationLayer::Primary,
-        {1U, 7U}, 3U, 640U, 480U, 7U, first);
+    graphics::publish_workspace_frame_signal(signal, 1U, 1U, presentation::WorkspacePresentationLayer::Primary, {1U, 7U}, 3U, 640U, 480U,
+                                             7U, first);
     CHECK(signal->metadata_bytes == first.size());
     CHECK(signal->transfer_sequence == 1U);
     CHECK(signal->physical_revision == 7U);
@@ -100,14 +100,15 @@ TEST_CASE("Graphics signal publishes exact bounded image metadata with its physi
     CHECK(std::equal(first.begin(), first.end(), payload));
     const auto sequence = signal->sequence_lock;
     const std::vector<std::byte> oversized(graphics::kWorkspaceMetadataByteCapacity + 1U);
-    CHECK_THROWS_AS(graphics::publish_workspace_frame_signal(signal, 3U, 2U,
-        presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U, 8U, oversized), std::length_error);
+    CHECK_THROWS_AS(graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U},
+                                                             4U, 640U, 480U, 8U, oversized),
+                    std::length_error);
     CHECK(signal->sequence_lock == sequence);
     CHECK(signal->transfer_sequence == 1U);
     CHECK(std::equal(first.begin(), first.end(), payload));
     const std::array second{std::byte{0x81}, std::byte{0x09}};
-    graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary,
-        {1U, 8U}, 4U, 640U, 480U, 8U, second);
+    graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U,
+                                             8U, second);
     CHECK(signal->metadata_bytes == second.size());
     CHECK(signal->transfer_sequence == 2U);
     CHECK(std::equal(second.begin(), second.end(), payload));
@@ -1854,9 +1855,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
                 .submitted = submitted_,
             };
         }
-        if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) {
-            return {.capability = capability()};
-        }
+        if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) { return {.capability = capability()}; }
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
         if (candidate_target && retiring_) return {.capability = capability()};
         auto source = reader_->borrow();
@@ -3193,9 +3192,9 @@ TEST_CASE("Explore retains content and accepts input through pending image compl
     auto gate = std::make_shared<ExplorePostRenderGate>(1U);
     LoadedSettings settings;
     ExploreScenario scenario{settings, backend, [work, gate] {
-        return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                      nullptr, nullptr, work, gate);
-    }};
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                                               nullptr, nullptr, work, gate);
+                             }};
     auto& explore = scenario.system();
     mmltk::testsupport::ScopedTestCleanup release_gate{[&] { mmltk::testsupport::release_test_promise(gate->release); }};
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
@@ -3235,11 +3234,12 @@ TEST_CASE("Explore owns direction across accepted logical rows and zero-movement
     const auto check = [&](const std::uint32_t row, const ExploreScrollDirection direction) {
         const auto before = explore.snapshot();
         const auto generation = explore.LastInteractionGeneration();
-        explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U,
-                       .point = WorkspacePoint{row % 2U == 0U ? 0.5F : 7.5F, 2.0F}});
+        explore.Input(
+            {.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{row % 2U == 0U ? 0.5F : 7.5F, 2.0F}});
         explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = row, .row_count = 1U, .columns = 2U}});
         if (before.viewport.first_row != row)
-            REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before.revision; }));
+            REQUIRE(scenario.Wait(
+                [&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before.revision; }));
         else
             CHECK(explore.LastInteractionGeneration() == generation);
         std::scoped_lock lock(scenario.probe().mutex);
@@ -3852,10 +3852,12 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                                [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                borrow_exactly_from(explore), [&](AnnotationSystem::event_type event) {
+                                borrow_exactly_from(explore),
+                                [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) failures.fetch_add(1U);
                                     annotation_events.Advance();
-                                }, mmltk::testsupport::annotation_render_evidence()};
+                                },
+                                mmltk::testsupport::annotation_render_evidence()};
     CHECK_FALSE(annotation.BorrowFrame().valid());
     const auto admitted = annotation.Open({.source = explore.snapshot().frame});
     CHECK(admitted.busy);
@@ -3897,8 +3899,9 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Failed);
     explore.Shutdown();
     CHECK(annotation.BorrowFrame().valid());
+    const auto retired_mouse = mouse(WorkspaceMouseKind::Press, 2.0F);
     annotation.Shutdown();
-    CHECK_THROWS_AS(annotation.Input(input(4U, contracts::AnnotationPointerPhase::Begin, 1U, 2.0F)), contracts::UnavailableError);
+    CHECK_THROWS_AS(annotation.Input(retired_mouse), contracts::UnavailableError);
 }
 
 TEST_CASE("Explore installs and atomically persists typed live filter preferences") {
@@ -4560,12 +4563,11 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         auto entered = probe->entered.get_future();
         auto cancelled = probe->cancelled.get_future();
         std::atomic_uint64_t settled_revision{0U};
-        ExploreScenario scenario{
-            settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); },
-            [&](ExploreSystem::event_type event) {
-                if (const auto* changed = std::get_if<ExploreChanged>(&event); changed && !changed->snapshot.busy)
-                    settled_revision.store(changed->snapshot.revision, std::memory_order_release);
-            }};
+        ExploreScenario scenario{settings, backend, [probe] { return std::make_unique<CancellableOpenPreparationAlgorithm>(probe); },
+                                 [&](ExploreSystem::event_type event) {
+                                     if (const auto* changed = std::get_if<ExploreChanged>(&event); changed && !changed->snapshot.busy)
+                                         settled_revision.store(changed->snapshot.revision, std::memory_order_release);
+                                 }};
         auto& explore = scenario.system();
         const auto wait_settled = [&](const ExploreSnapshot& admitted) {
             // The typed completion is delivered after worker admission is released.
@@ -4963,11 +4965,11 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
     CHECK(explore.snapshot().frame == before.frame);
     CHECK(work->renders.load() == renders);
     motion({0.25F, 48.0F});
-    CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U,
-                                  .point = WorkspacePoint{1.0F, 1.0F}}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U, .point = WorkspacePoint{1.0F, 1.0F}}),
+                    contracts::InvalidIntentError);
     CHECK_THROWS_AS(motion({std::numeric_limits<float>::infinity(), 0.0F}), contracts::InvalidIntentError);
-    for (const auto point : {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F},
-                             WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
+    for (const auto point :
+         {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F}, WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
         motion(point);
     }
     for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Release, WorkspaceMouseKind::Wheel}) {
@@ -5030,29 +5032,29 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
     auto failure_result = failed.get_future();
     std::atomic<std::size_t> failures{0U};
     mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
-    detail::VisualRuntimeOwner owner{[&](auto revisions) {
-                                         ++constructions;
-                                         auto runtime =
-                                             std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                                                 .device = 0,
-                                                 .backend = backend,
-                                                 .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-                                                     mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean);
-                                                 },
-                                                 .product_revisions = std::move(revisions)});
-                                         return runtime;
-                                     },
-                                     [&](std::exception_ptr failure) {
-                                         if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-                                     }};
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+    detail::VisualRuntimeOwner owner{
+        [&](auto revisions) {
+            ++constructions;
+            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                .device = 0,
+                .backend = backend,
+                .workspace_finalize = [](auto clean, auto, auto destination, auto,
+                                         auto) { mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean); },
+                .product_revisions = std::move(revisions)});
+            return runtime;
+        },
+        [&](std::exception_ptr failure) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+        }};
+    const bool initialized = owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
         workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
         REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
         return detail::VisualRuntimeOwner::Notification{
             [&, product = runtime.Completed()]() mutable { created_workspace.set_value(std::move(product)); }};
-    }));
+    });
+    REQUIRE(initialized);
     auto workspace = mmltk::testsupport::await_test_future(workspace_result, "external workspace creation");
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
@@ -5100,22 +5102,23 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
     auto owner = std::make_unique<detail::VisualRuntimeOwner>(
         [&](auto revisions) {
             auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend,
-                .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-                    mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean);
-                },
+                .device = 0,
+                .backend = backend,
+                .workspace_finalize = [](auto clean, auto, auto destination, auto,
+                                         auto) { mmltk::frameworks::gpu::test_support::CopyImagePlane(destination, clean); },
                 .product_revisions = std::move(revisions)});
             return runtime;
         },
         [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
-    REQUIRE(owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
+    const bool initialized = owner->SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout());
         workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
         REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
         return detail::VisualRuntimeOwner::Notification{
             [&, product = runtime.Completed()]() mutable { created.set_value(std::move(product)); }};
-    }));
+    });
+    REQUIRE(initialized);
     auto workspace = mmltk::testsupport::await_test_future(ready, "workspace before visual owner destruction");
     owner.reset();
     CHECK(backend->contexts_destroyed == 0U);
@@ -5260,10 +5263,12 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                                [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
+                                borrow_exactly_from(source.system()),
+                                [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
                                     events.Advance();
-                                }, mmltk::testsupport::annotation_render_evidence()};
+                                },
+                                mmltk::testsupport::annotation_render_evidence()};
     probe->fail_open = true;
     static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
     REQUIRE(events.Wait([&] { return failures.load() == 1U; }));
@@ -5318,7 +5323,8 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
                                         failure_render_counts.push_back(probe->calls.load());
                                     }
                                     events.Advance();
-                                }, mmltk::testsupport::annotation_render_evidence()};
+                                },
+                                mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(hold->release);
         annotation.Shutdown();
@@ -5443,9 +5449,8 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     AnnotationSystem annotation{kDevice,
                                 RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                                [probe] { return std::make_unique<TestAnnotationAlgorithm>(probe); }),
-                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
-                                    events.Advance();
-                                }, mmltk::testsupport::annotation_render_evidence()};
+                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) { events.Advance(); },
+                                mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(hold->release);
         annotation.Shutdown();
@@ -5474,9 +5479,7 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     static_cast<void>(annotation.Open({.source = source.system().snapshot().frame}));
     CHECK(annotation.Stop().cancellation_requested);
     hold->release.set_value();
-    REQUIRE(events.Wait([&] {
-        return !annotation.snapshot().busy;
-    }));
+    REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
     CHECK(annotation.snapshot().input_document_epoch == document_epoch);
     CHECK(annotation.snapshot().frame.revision > initial.frame.revision);
     mmltk::testsupport::await_annotation_render(annotation, events);
@@ -5552,7 +5555,9 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
 TEST_CASE("Workspace input retains ordered high-water records for independent native owners") {
     WorkspaceInputQueue<WorkspaceMouse> queue;
     for (std::size_t index = 0U; index != 1024U; ++index)
-        queue.Push({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .kind = WorkspaceMouseKind::Motion,
+        queue.Push({.source = PresentationSourceKind::Explore,
+                    .peer_epoch = 1U,
+                    .kind = WorkspaceMouseKind::Motion,
                     .point = WorkspacePoint{static_cast<float>(index) + 0.25F, 0.125F}});
     const auto capacity = queue.capacity();
     for (std::size_t index = 0U; index != 1024U; ++index) {
@@ -5568,9 +5573,14 @@ TEST_CASE("Workspace input retains ordered high-water records for independent na
         WorkspaceInput owner;
         owner.SetPeer(2U);
         for (const auto entry : mmltk::frameworks::reflection::enum_entries<WorkspaceMouseKind>()) {
-            WorkspaceMouse mouse{.source = source.kind, .peer_epoch = 2U, .kind = entry.value,
-                                 .button = WorkspaceMouseButton::Other, .other_button = 65535U,
-                                 .click_count = 2U, .modifiers = 15U, .wheel_unit = WorkspaceWheelUnit::Pixels,
+            WorkspaceMouse mouse{.source = source.kind,
+                                 .peer_epoch = 2U,
+                                 .kind = entry.value,
+                                 .button = WorkspaceMouseButton::Other,
+                                 .other_button = 65535U,
+                                 .click_count = 2U,
+                                 .modifiers = 15U,
+                                 .wheel_unit = WorkspaceWheelUnit::Pixels,
                                  .wheel = {-0.125F, 0.25F}};
             owner.Accept(mouse, source.kind);
             REQUIRE(owner.latest());
@@ -5604,8 +5614,7 @@ TEST_CASE("Annotation color sampling completes before following document command
                                     read.document = semantic;
                                     return read;
                                 },
-                                [&](AnnotationSystem::event_type) { events.Advance(); },
-                                mmltk::testsupport::annotation_render_evidence()};
+                                [&](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::ScopedTestCleanup release{[&] {
         mmltk::testsupport::release_test_promise(sample->release);
         annotation.Shutdown();
@@ -5625,7 +5634,7 @@ TEST_CASE("Annotation color sampling completes before following document command
     SECTION("ordered document backlog") {
         for (std::size_t index = 0U; index != 64U; ++index) {
             annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Motion,
-                                                                 {static_cast<float>(index) + 0.25F, 5.125F}));
+                                                                  {static_cast<float>(index) + 0.25F, 5.125F}));
             CHECK(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}).busy);
             CHECK(annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}}).busy);
         }
@@ -7538,8 +7547,8 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
 
 TEST_CASE("Scoped binding retirement preserves a replacement while an old physical read settles", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
-    using mmltk::testsupport::send_workspace_record;
     using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
     WorkspaceChannelFixture fixture;
     const presentation::WorkspaceSurfaceImportId old_arena{11U, 12U}, new_arena{21U, 22U}, source{31U, 32U};
     const auto layout = fixture.AdmitArena(old_arena, 1U, GENERATE(false, true));
@@ -7548,8 +7557,8 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
     REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
     fixture.channel.pump();
     REQUIRE(fixture.channel.take_source_transition());
-    REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::BindingRetired,
-                                                       .id_high = old_arena.high, .id_low = old_arena.low}));
+    REQUIRE(send_workspace_record(fixture.peer.get(),
+                                  {.opcode = abi::Opcode::BindingRetired, .id_high = old_arena.high, .id_low = old_arena.low}));
     fixture.channel.pump();
     const auto binding = fixture.channel.take_source_transition();
     REQUIRE(binding);
@@ -7575,8 +7584,8 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
 
 TEST_CASE("A completed source can acquire and settle without any presented mailbox", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
-    using mmltk::testsupport::send_workspace_record;
     using mmltk::testsupport::receive_workspace_record;
+    using mmltk::testsupport::send_workspace_record;
     WorkspaceChannelFixture fixture;
     const presentation::WorkspaceSurfaceImportId arena{41U, 42U}, older{51U, 52U}, newer{61U, 62U};
     const auto layout = fixture.AdmitArena(arena, 1U, GENERATE(false, true));
@@ -8077,16 +8086,16 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     std::atomic<std::uint64_t> last_completed_revision{0U};
     std::atomic<std::uint64_t> last_completed_product{0U};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
-                                    [&events, &completed_events, &last_completed_revision,
-                                     &last_completed_product](PresentationSystem::event_type event) {
-                                        if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
-                                            last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
-                                            completed_events.fetch_add(1U, std::memory_order_acq_rel);
-                                            last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
-                                        }
-                                        events.Advance();
-                                    }};
+    PresentationSystem presentation{
+        kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
+        [&events, &completed_events, &last_completed_revision, &last_completed_product](PresentationSystem::event_type event) {
+            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
+                last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
+                completed_events.fetch_add(1U, std::memory_order_acq_rel);
+                last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
+            }
+            events.Advance();
+        }};
     PresentationScenario scenario{presentation, writer_state};
 
     publish_first_presentation(presentation, source, *writer_state, events);
@@ -9456,13 +9465,15 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     detail::VisualRuntimeOwner owner{
         [backend](auto revisions) {
             return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend,
-                .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-                    fixture::CopyImagePlane(destination, clean);
-                },
+                .device = 0,
+                .backend = backend,
+                .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { fixture::CopyImagePlane(destination, clean); },
                 .product_revisions = std::move(revisions)});
         },
-        [&](std::exception_ptr failure) { producer_failure = failure; ++failure_reports; }};
+        [&](std::exception_ptr failure) {
+            producer_failure = failure;
+            ++failure_reports;
+        }};
     std::promise<void> initialized;
     bool prepared = false;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -9484,19 +9495,25 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     }};
     auto request_diagnostics = std::make_shared<VisualWorkspaceDiagnostics>();
     if (ordering == 2U)
-        request_diagnostics->sink = {.context = &completed_service, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            if (fact.operation == VisualDiagnosticOperation::PresentationWorkspaceService && fact.failure_detail == "prepare_completed")
-                static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait();
-        }};
+        request_diagnostics->sink = {
+            .context = &completed_service, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                if (fact.operation == VisualDiagnosticOperation::PresentationWorkspaceService && fact.failure_detail == "prepare_completed")
+                    static_cast<mmltk::testsupport::TestGate*>(context)->receipt().ArriveAndWait();
+            }};
     std::atomic<unsigned> responses{0U};
     std::promise<void> ready;
-    owner.RequestWorkspace({.detach_only = true, .destination = workspace,
-                            .ready = [&] { ++responses; ready.set_value(); }, .diagnostics = request_diagnostics});
+    owner.RequestWorkspace({.detach_only = true,
+                            .destination = workspace,
+                            .ready =
+                                [&] {
+                                    ++responses;
+                                    ready.set_value();
+                                },
+                            .diagnostics = request_diagnostics});
     if (ordering == 0U) {
         std::promise<void> parked;
-        REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
-            return detail::VisualRuntimeOwner::Notification{[&] { parked.set_value(); }};
-        }));
+        REQUIRE(owner.SubmitOrdered(
+            [&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { parked.set_value(); }}; }));
         mmltk::testsupport::await_test_promise(parked, "detach parked behind raw read");
     } else {
         REQUIRE(copy_gate->WaitEntered(2s));
@@ -9510,15 +9527,15 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     std::promise<void> native_releasing;
     struct NativeFacts {
         std::promise<void>* releasing;
-        unsigned outcome = 9U;
+        std::uint64_t outcome = 9U;
     } facts{&native_releasing};
     VisualDiagnosticSink diagnostics{.context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-        auto& facts = *static_cast<NativeFacts*>(context);
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted)
-            facts.releasing->set_value();
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted)
-            facts.outcome = fact.context.outcome;
-    }};
+                                         auto& observed = *static_cast<NativeFacts*>(context);
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted)
+                                             observed.releasing->set_value();
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted)
+                                             observed.outcome = fact.context.outcome;
+                                     }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-detach-handoff"};
     auto writer = test_support::NativePresentationWriterTestAccess::Create(
         gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
@@ -9546,8 +9563,8 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     mmltk::testsupport::await_test_promise(ready, "detach request ready once");
     if (ordering == 2U) {
         REQUIRE(terminal.wait_for(2s) == std::future_status::ready);
-        CHECK(terminal.get() == (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure
-                                            : PresentationNativeWriter::Retirement::Released));
+        CHECK(terminal.get() ==
+              (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure : PresentationNativeWriter::Retirement::Released));
         CHECK(facts.outcome == (fail_release ? 0U : 1U));
     }
     owner.StopAndWait();
@@ -9557,8 +9574,7 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     CHECK_FALSE(released.claimed);
     CHECK(bool(released.settlement.failure) == fail_release);
     CHECK(failure_reports == (fail_release && ordering != 2U ? 1U : 0U));
-    if (fail_release && ordering != 2U)
-        CHECK(fixture::ContainsImageFailure(producer_failure, released.settlement.failure));
+    if (fail_release && ordering != 2U) CHECK(fixture::ContainsImageFailure(producer_failure, released.settlement.failure));
 }
 
 TEST_CASE("Unretired adopted native sources release before their stream is destroyed", "[presentation][workspace]") {
@@ -9574,8 +9590,7 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
     std::unique_ptr<gpu::SystemImageRuntime> producer;
     if (producer_attached) {
         producer = std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend,
-            .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+            .device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
                 fixture::CopyImagePlane(destination, clean);
             }});
         producer->Publish(4U, 3U, [](auto, auto, auto) {});
@@ -9585,27 +9600,28 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
         FakeImageBackend* backend;
         std::exception_ptr failure;
         unsigned releases = 0U;
-        unsigned outcome = 9U;
+        std::uint64_t outcome = 9U;
         bool released_before_stream = false;
         std::uintptr_t source_context = 0U;
         bool source_context_restored = false;
-    } facts{backend.get(), completed_failure ? std::make_exception_ptr(std::runtime_error("completed source rollback failure"))
-                                            : std::exception_ptr{}};
-    VisualDiagnosticSink diagnostics{.context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-        auto& facts = *static_cast<RollbackFacts*>(context);
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
-            facts.source_context = facts.backend->last_bound_context.load();
-            if (facts.failure) facts.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, facts.failure);
-        }
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
-            ++facts.releases;
-            facts.outcome = fact.context.outcome;
-        }
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted)
-            facts.released_before_stream = facts.releases == 1U;
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
-            facts.source_context_restored = facts.backend->last_bound_context.load() == facts.source_context;
-    }};
+    } facts{backend.get(),
+            completed_failure ? std::make_exception_ptr(std::runtime_error("completed source rollback failure")) : std::exception_ptr{}};
+    VisualDiagnosticSink diagnostics{
+        .context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+            auto& observed = *static_cast<RollbackFacts*>(context);
+            if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
+                observed.source_context = observed.backend->last_bound_context.load();
+                if (observed.failure) observed.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, observed.failure);
+            }
+            if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
+                ++observed.releases;
+                observed.outcome = fact.context.outcome;
+            }
+            if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted)
+                observed.released_before_stream = observed.releases == 1U;
+            if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
+                observed.source_context_restored = observed.backend->last_bound_context.load() == observed.source_context;
+        }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-admission-rollback"};
     auto writer = test_support::NativePresentationWriterTestAccess::Create(
         gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
@@ -9642,10 +9658,10 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
     const bool fail_release = GENERATE(false, true);
     fixture::ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    gpu::SystemImageRuntime producer({.device = 0, .backend = backend,
-        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-            fixture::CopyImagePlane(destination, clean);
-        }});
+    gpu::SystemImageRuntime producer(
+        {.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+             fixture::CopyImagePlane(destination, clean);
+         }});
     auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     producer.Publish(4U, 3U, [](auto, auto, auto) {});
@@ -9654,27 +9670,29 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
     REQUIRE(producer.Retire().safe_to_destroy);
     auto observation = workspace->ObserveRetirement();
     struct Outcomes {
-        unsigned workspace = 9U;
-        unsigned source = 9U;
+        std::uint64_t workspace = 9U;
+        std::uint64_t source = 9U;
     } outcomes;
     VisualDiagnosticSink diagnostics{.context = &outcomes, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-        auto& result = *static_cast<Outcomes*>(context);
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted)
-            result.workspace = fact.context.outcome;
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement)
-            result.source = fact.context.outcome;
-    }};
+                                         auto& result = *static_cast<Outcomes*>(context);
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted)
+                                             result.workspace = fact.context.outcome;
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement)
+                                             result.source = fact.context.outcome;
+                                     }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-display-retirement"};
-    auto writer = Access::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"},
-                                 std::move(workspace), diagnostics);
+    auto writer = Access::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace),
+                                 diagnostics);
     const auto cleanup = std::make_exception_ptr(std::runtime_error("display-last binding failure"));
     if (fail_release) backend->FailDeviceBinding(1, cleanup);
     if (terminal) {
-        CHECK(writer->BrowserPeerLost() == (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure
-                                                       : PresentationNativeWriter::Retirement::Released));
+        CHECK(writer->BrowserPeerLost() ==
+              (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure : PresentationNativeWriter::Retirement::Released));
     } else {
         std::exception_ptr failure;
-        try { Access::RetireSource(*writer); } catch (...) { failure = std::current_exception(); }
+        try {
+            Access::RetireSource(*writer);
+        } catch (...) { failure = std::current_exception(); }
         CHECK(fixture::ContainsImageFailure(failure, cleanup) == fail_release);
         CHECK(writer->BrowserPeerLost() == PresentationNativeWriter::Retirement::Released);
     }
@@ -9696,10 +9714,10 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
     const bool fail_release = GENERATE(false, true);
     fixture::ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    gpu::SystemImageRuntime producer({.device = 0, .backend = backend,
-        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-            fixture::CopyImagePlane(destination, clean);
-        }});
+    gpu::SystemImageRuntime producer(
+        {.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+             fixture::CopyImagePlane(destination, clean);
+         }});
     auto workspace = fixture::ImageWorkspaceTestAccess::Create(backend, fixture::ImageWorkspaceTestAccess::Layout());
     workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
     producer.Publish(4U, 3U, [](auto, auto, auto) {});
@@ -9740,8 +9758,8 @@ TEST_CASE("Native pending allocation release wakes retirement without treating a
     attempt->Admit(attempt->identity(), attempt->layout().device_incarnation);
     auto observation = attempt->ObserveRetirement();
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-pending-retirement"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(
-        gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, attempt);
+    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend),
+                                                                           {.import_socket = temporary.path() / "import.sock"}, attempt);
     test_support::NativePresentationWriterTestAccess::RetireSource(*writer);
     CHECK_FALSE(observation.TakeResult().complete);
     // An unrelated writer wake cannot discharge the executing attempt's custody.
@@ -9751,8 +9769,9 @@ TEST_CASE("Native pending allocation release wakes retirement without treating a
     backend->FailDeviceBinding(1, cleanup);
     attempt.reset();
     std::exception_ptr failure;
-    try { test_support::NativePresentationWriterTestAccess::RetireSource(*writer); }
-    catch (...) { failure = std::current_exception(); }
+    try {
+        test_support::NativePresentationWriterTestAccess::RetireSource(*writer);
+    } catch (...) { failure = std::current_exception(); }
     CHECK(fixture::ContainsImageFailure(failure, cleanup));
     CHECK(observation.TakeResult().complete);
     CHECK(writer->BrowserPeerLost() == PresentationNativeWriter::Retirement::Released);
@@ -9768,9 +9787,9 @@ TEST_CASE("Native terminal retirement observes independently completing detached
     auto observation = attempt->ObserveRetirement();
     std::promise<void> releasing;
     VisualDiagnosticSink diagnostics{.context = &releasing, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-        if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted)
-            static_cast<std::promise<void>*>(context)->set_value();
-    }};
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseStarted)
+                                             static_cast<std::promise<void>*>(context)->set_value();
+                                     }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-terminal-pending"};
     auto writer = test_support::NativePresentationWriterTestAccess::Create(
         gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, attempt, diagnostics);
@@ -9829,17 +9848,21 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
     const auto injected = std::make_exception_ptr(std::runtime_error("workspace finalizer failure"));
     std::promise<void> failed;
     std::exception_ptr failure;
-    detail::VisualRuntimeOwner owner{
-        [=](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend,
-                .workspace_finalize = [=](auto clean, auto, auto destination, auto, auto) {
-                    if (outcome == 2U) std::rethrow_exception(injected);
-                    fixture::CopyImagePlane(destination, clean);
-                },
-                .product_revisions = std::move(revisions)});
-        },
-        [&](std::exception_ptr value) { failure = value; failed.set_value(); }};
+    detail::VisualRuntimeOwner owner{[=](auto revisions) {
+                                         return std::make_unique<gpu::SystemImageRuntime>(
+                                             gpu::SystemImageRuntimeConfig{.device = 0,
+                                                                           .backend = backend,
+                                                                           .workspace_finalize =
+                                                                               [=](auto clean, auto, auto destination, auto, auto) {
+                                                                                   if (outcome == 2U) std::rethrow_exception(injected);
+                                                                                   fixture::CopyImagePlane(destination, clean);
+                                                                               },
+                                                                           .product_revisions = std::move(revisions)});
+                                     },
+                                     [&](std::exception_ptr value) {
+                                         failure = value;
+                                         failed.set_value();
+                                     }};
     std::promise<void> published;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
@@ -9853,13 +9876,15 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
     const auto source = owner.ObserveWorkspace();
     std::atomic<unsigned> responses{0U};
     std::promise<void> ready;
-    owner.RequestWorkspace({.product_owner = source.product_owner, .product_revision = source.product_revision,
-                            .destination = workspace, .ready = [&] { ++responses; ready.set_value(); }});
+    owner.RequestWorkspace(
+        {.product_owner = source.product_owner, .product_revision = source.product_revision, .destination = workspace, .ready = [&] {
+             ++responses;
+             ready.set_value();
+         }});
     if (outcome != 2U) {
         std::promise<void> attempted;
-        REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) {
-            return detail::VisualRuntimeOwner::Notification{[&] { attempted.set_value(); }};
-        }));
+        REQUIRE(owner.SubmitOrdered(
+            [&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { attempted.set_value(); }}; }));
         mmltk::testsupport::await_test_promise(attempted, "workspace retry parked");
         CHECK(responses.load() == 0U);
         workspace.reset();
@@ -10086,35 +10111,35 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_notifications = true;
     const auto factory = [backend](auto revisions) {
-        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+        return std::make_unique<gpu::SystemImageRuntime>(
+            gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
     };
     std::promise<void> failure, submitted, completed, following, independent, second_submitted;
     std::uintptr_t first_stream = 0U, second_stream = 0U;
     std::atomic<unsigned> order{0U};
     detail::VisualRuntimeOwner first(factory, [&](auto) { failure.set_value(); });
     detail::VisualRuntimeOwner second(factory, [&](auto) { failure.set_value(); });
-    REQUIRE(first.SubmitOrdered([&](auto& runtime, std::stop_token) {
+    const bool submitted_first = first.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { first_stream = stream; },
-                                gpu::ImageSubmission::Enqueue);
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { first_stream = stream; }, gpu::ImageSubmission::Enqueue);
         first.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
             runtime.CommitOutput(std::move(candidate));
             CHECK(order.fetch_add(1U) == 0U);
             completed.set_value();
         });
         return detail::VisualRuntimeOwner::Notification{[&] { submitted.set_value(); }};
-    }));
+    });
+    REQUIRE(submitted_first);
     mmltk::testsupport::await_test_promise(submitted, "asynchronous raster submission");
-    REQUIRE(first.SubmitOrdered([&](auto&, std::stop_token) {
+    const bool submitted_following = first.SubmitOrdered([&](auto&, std::stop_token) {
         CHECK(order.fetch_add(1U) == 1U);
         following.set_value();
         return detail::VisualRuntimeOwner::Notification{};
-    }));
+    });
+    REQUIRE(submitted_following);
     REQUIRE(second.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { second_stream = stream; },
-                                gpu::ImageSubmission::Enqueue);
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto stream) { second_stream = stream; }, gpu::ImageSubmission::Enqueue);
         second.DeferCompletion(runtime, [&, candidate = std::move(candidate)]() mutable {
             runtime.CommitOutput(std::move(candidate));
             independent.set_value();
@@ -10147,18 +10172,19 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
     std::promise<std::exception_ptr> failed;
     std::promise<void> submitted;
     std::atomic_uint failures{0U}, completions{0U};
-    detail::VisualRuntimeOwner owner([backend](auto revisions) {
-        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-    }, [&](auto error) {
-        if (failures.fetch_add(1U) == 0U) failed.set_value(error);
-    });
+    detail::VisualRuntimeOwner owner(
+        [backend](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(
+                gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+        },
+        [&](auto error) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(error);
+        });
     auto admitted = backend->ObserveNextNotificationStream();
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
         std::uintptr_t stream = 0U;
-        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; },
-                                gpu::ImageSubmission::Enqueue);
+        runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, gpu::ImageSubmission::Enqueue);
         if (registration_failure)
             backend->FailAfter(FakeImageBackend::FailurePoint::NotifyStream, 0U, expected);
         else
@@ -10188,10 +10214,12 @@ TEST_CASE("Stopping a deferred product settles pending notification before candi
     auto backend = std::make_shared<FakeImageBackend>();
     backend->defer_notifications = true;
     std::atomic_uint completions{0U}, failures{0U};
-    detail::VisualRuntimeOwner owner([backend](auto revisions) {
-        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-    }, [&](auto) { ++failures; });
+    detail::VisualRuntimeOwner owner(
+        [backend](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(
+                gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+        },
+        [&](auto) { ++failures; });
     auto admitted = backend->ObserveNextNotification();
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         auto candidate = runtime.AcquireOutput();
@@ -10225,18 +10253,20 @@ TEST_CASE("Terminal product notification reports unproved settlement with physic
     std::promise<std::exception_ptr> failed;
     std::atomic_uint failures{0U}, completions{0U};
     {
-        detail::VisualRuntimeOwner owner([backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-        }, [&](auto failure) {
-            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-        });
+        detail::VisualRuntimeOwner owner(
+            [backend](auto revisions) {
+                return std::make_unique<gpu::SystemImageRuntime>(
+                    gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+            },
+            [&](auto failure) {
+                if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+            });
         auto admitted = backend->ObserveNextNotificationStream();
         REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
             auto candidate = runtime.AcquireOutput();
             std::uintptr_t stream = 0U;
-            runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; },
-                                    gpu::ImageSubmission::Enqueue);
+            runtime.PublishRetained(
+                candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, gpu::ImageSubmission::Enqueue);
             backend->SetStreamSettlement(stream, {.failure = expected});
             owner.DeferCompletion(runtime, [candidate = std::move(candidate), &completions] { ++completions; });
             return detail::VisualRuntimeOwner::Notification{};
@@ -10255,22 +10285,24 @@ TEST_CASE("Terminal product notification reports unproved settlement with physic
 }
 
 struct ProducerWorkspaceRequest final {
-    std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace> workspace;
-    mmltk::frameworks::gpu::ImageWorkspaceContent content;
-    std::future<void> ready;
+    std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace> workspace{};
+    mmltk::frameworks::gpu::ImageWorkspaceContent content{};
+    std::future<void> ready{};
 
-    template<class Producer>
+    template <class Producer>
     void Request(Producer& producer) {
         const auto observed = producer.ObserveWorkspace();
         content = {observed.product_owner, observed.product_revision};
         REQUIRE(content.valid());
         auto completed = std::make_shared<std::promise<void>>();
         ready = completed->get_future();
-        producer.RequestWorkspace({.product_owner = content.owner, .product_revision = content.revision,
-                                   .destination = workspace, .ready = [completed] { completed->set_value(); }});
+        producer.RequestWorkspace(
+            {.product_owner = content.owner, .product_revision = content.revision, .destination = workspace, .ready = [completed] {
+                 completed->set_value();
+             }});
     }
 
-    template<class Producer>
+    template <class Producer>
     void CheckCompleted(Producer& producer) {
         mmltk::testsupport::await_test_future(ready, "producer workspace completion");
         REQUIRE(workspace->Contains(content));
@@ -10281,8 +10313,7 @@ struct ProducerWorkspaceRequest final {
         REQUIRE(borrowed.valid());
         CHECK(borrowed.identity() == workspace->identity());
         CHECK(borrowed.revision() == content.revision);
-        CHECK(borrowed.plane().data == workspace->plane(borrowed.plane().descriptor.width,
-                                                       borrowed.plane().descriptor.height).data);
+        CHECK(borrowed.plane().data == workspace->plane(borrowed.plane().descriptor.width, borrowed.plane().descriptor.height).data);
     }
 };
 
@@ -10295,13 +10326,17 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     const auto expected = std::make_exception_ptr(std::runtime_error("display terminal failure"));
     std::promise<std::exception_ptr> failed;
     std::atomic_uint failures{0U};
-    detail::VisualRuntimeOwner owner([backend](auto revisions) {
-        return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend, .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend),
-            .product_revisions = std::move(revisions)});
-    }, [&](auto failure) {
-        if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-    });
+    detail::VisualRuntimeOwner owner(
+        [backend](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(
+                gpu::SystemImageRuntimeConfig{.device = 0,
+                                              .backend = backend,
+                                              .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend),
+                                              .product_revisions = std::move(revisions)});
+        },
+        [&](auto failure) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+        });
     std::promise<void> published;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
@@ -10343,7 +10378,7 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
 
-template<class Producer>
+template <class Producer>
 ProducerWorkspaceRequest request_delayed_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend) {
     namespace fixture = mmltk::frameworks::gpu::test_support;
     auto layout = fixture::ImageWorkspaceTestAccess::Layout(0);
@@ -10368,9 +10403,8 @@ ProducerWorkspaceRequest request_delayed_workspace(Producer& producer, const std
     return request;
 }
 
-template<class Producer>
-void complete_producer_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend,
-                                 ProducerWorkspaceRequest& request) {
+template <class Producer>
+void complete_producer_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend, ProducerWorkspaceRequest& request) {
     auto settlement = backend->HoldStreamSettlements("producer workspace physical completion");
     backend->CompleteNotifications();
     REQUIRE(settlement->WaitEntered(2s));
@@ -10398,25 +10432,28 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     auto explore_work = std::make_shared<ExploreWorkProbe>();
     LoadedSettings settings;
     ExploreScenario opened(settings, 2U,
-        RuntimeFactory(0, explore_backend, gpu::ImageProductLayout::CleanAndSemantic,
-                       ExploreScenario::TrackWork(explore_work), 3U, fixture::FakeWorkspaceFinalizer(explore_backend)));
+                           RuntimeFactory(0, explore_backend, gpu::ImageProductLayout::CleanAndSemantic,
+                                          ExploreScenario::TrackWork(explore_work), 3U, fixture::FakeWorkspaceFinalizer(explore_backend)));
     opened.OpenAndWait({.extent = {32U, 32U}, .columns = 1U});
     auto& explore = opened.system();
 
     EventGate annotation_events, live_events, upscale_events;
     auto annotation_work = std::make_shared<AnnotationRenderProbe>();
     AnnotationSystem annotation{kDevice,
-        RuntimeFactory(0, annotation_backend, gpu::ImageProductLayout::CleanAndSemantic,
-            [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U,
-            fixture::FakeWorkspaceFinalizer(annotation_backend)),
-        borrow_exactly_from(explore), [&](AnnotationSystem::event_type) { annotation_events.Advance(); },
-        mmltk::testsupport::annotation_render_evidence()};
+                                RuntimeFactory(
+                                    0, annotation_backend, gpu::ImageProductLayout::CleanAndSemantic,
+                                    [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U,
+                                    fixture::FakeWorkspaceFinalizer(annotation_backend)),
+                                borrow_exactly_from(explore), [&](AnnotationSystem::event_type) { annotation_events.Advance(); },
+                                mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::open_annotation(annotation, annotation_events, explore.snapshot().frame);
 
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
-    LiveSystem live{kDevice,
-        RuntimeFactory(0, live_backend, gpu::ImageProductLayout::Clean,
-            [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U, fixture::FakeWorkspaceFinalizer(live_backend)),
+    LiveSystem live{
+        kDevice,
+        RuntimeFactory(
+            0, live_backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U,
+            fixture::FakeWorkspaceFinalizer(live_backend)),
         [&](LiveSystem::event_type) { live_events.Advance(); }};
     static_cast<void>(live.Start({.extent = {32U, 32U}, .frames_per_second = 120U}));
     REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames != 0U; }));
@@ -10426,10 +10463,11 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto upscale_runs = std::make_shared<std::atomic_uint32_t>(0U);
     UpscaleSystem upscale{kDevice,
-        RuntimeFactory(0, upscale_backend, gpu::ImageProductLayout::CleanAndSemantic,
-            [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U,
-            fixture::FakeWorkspaceFinalizer(upscale_backend)),
-        borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+                          RuntimeFactory(
+                              0, upscale_backend, gpu::ImageProductLayout::CleanAndSemantic,
+                              [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U,
+                              fixture::FakeWorkspaceFinalizer(upscale_backend)),
+                          borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
     static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
     REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
     const auto shutdown = [&] {
@@ -10476,8 +10514,8 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     annotation_work->semantic_value = 0xf0U;
     annotation_backend->defer_notifications = true;
     auto submitted = annotation_backend->ObserveNextNotification();
-    const auto changed = annotation.Edit({.edit = {
-        .value = AnnotationCategoryEdit{contracts::AnnotationText::From("workspace replacement")}}});
+    const auto changed =
+        annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("workspace replacement")}}});
     mmltk::testsupport::await_test_future(submitted, "replacement annotation render submitted");
     CHECK(annotation.ObserveWorkspace().product_revision == previous_content.revision);
     CHECK(annotation.BorrowWorkspace().revision() == previous_content.revision);
@@ -10486,9 +10524,7 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     annotation_backend->defer_notifications = false;
     annotation_backend->CompleteNotifications();
     mmltk::testsupport::await_annotation_command(annotation, annotation_events, changed.revision);
-    REQUIRE(annotation_events.Wait([&] {
-        return annotation.snapshot().frame.revision != previous_content.revision;
-    }));
+    REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().frame.revision != previous_content.revision; }));
     previous = {};
     auto replacement_display = request_delayed_workspace(annotation, annotation_backend);
     CHECK(replacement_display.content != previous_content);

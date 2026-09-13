@@ -538,12 +538,20 @@ pub(crate) fn report_workspace_fps(
     }
     SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
-        if observer.fps_sample == Some(meter.sample_time()) { return; }
+        if observer.fps_sample == Some(meter.sample_time()) {
+            return;
+        }
         let evidence = reporting::FpsEvidence {
-            bounds, clip, dark, frames: meter.frames, seconds: meter.seconds,
+            bounds,
+            clip,
+            dark,
+            frames: meter.frames,
+            seconds: meter.seconds,
         };
         if let Some(output) = observer.output_for(control)
-            && output.try_send(Message::WorkspaceFpsDrawn(evidence)).is_ok()
+            && output
+                .try_send(Message::WorkspaceFpsDrawn(evidence))
+                .is_ok()
         {
             observer.fps_sample = Some(meter.sample_time());
             reporting::workspace_fps(control, meter, evidence);
@@ -1714,34 +1722,6 @@ pub(crate) fn report_surface_draw(
     }
 }
 
-pub(crate) fn report_surface_sync(
-    current: Option<crate::presentation_surface::Surface>,
-    updated: Option<crate::presentation_surface::Surface>,
-) {
-    if !reporting_enabled() {
-        return;
-    }
-    let identity = |surface: Option<crate::presentation_surface::Surface>| {
-        surface.map_or_else(
-            || "none".to_string(),
-            |surface| format!("{:016x}{:016x}", surface.high, surface.low),
-        )
-    };
-    reporting::emit(|sink| {
-        sink.record(
-            "integration.surface_sync",
-            &identity(current),
-            &identity(updated),
-            [
-                current.map_or(0.0, |surface| surface.generation as f64),
-                updated.map_or(0.0, |surface| surface.generation as f64),
-                updated.map_or(0.0, |surface| surface.width as f64),
-                updated.map_or(0.0, |surface| surface.height as f64),
-            ],
-        )
-    });
-}
-
 pub(crate) fn report_surface_geometry(
     control: &'static str,
     revision: u64,
@@ -1820,23 +1800,25 @@ pub(crate) fn report_surface_scale(
     });
 }
 
-pub(crate) fn report_annotation_gesture(detail: &str, values: [f64; 4]) {
-    reporting::emit(|sink| {
-        sink.record(
-            "integration.annotation_gesture",
-            ANNOTATION_SURFACE,
-            detail,
-            values,
-        )
-    });
-}
-
 pub(crate) fn report_workspace_mouse(mouse: &crate::generated::WorkspaceMouse) {
     reporting::emit(|sink| {
-        if mouse.source != crate::generated::PresentationSourceKind::Explore { return; }
-        let Some(point) = &mouse.point else { return; };
-        sink.record("integration.explore_mouse", EXPLORE_GALLERY, "shared-input-admitted",
-            [f64::from(point.x), f64::from(point.y), mouse.kind as u8 as f64, mouse.button as u8 as f64]);
+        if mouse.source != crate::generated::PresentationSourceKind::Explore {
+            return;
+        }
+        let Some(point) = &mouse.point else {
+            return;
+        };
+        sink.record(
+            "integration.explore_mouse",
+            EXPLORE_GALLERY,
+            "shared-input-admitted",
+            [
+                f64::from(point.x),
+                f64::from(point.y),
+                mouse.kind as u8 as f64,
+                mouse.button as u8 as f64,
+            ],
+        );
     });
 }
 
@@ -1870,8 +1852,11 @@ fn sampleable_presentation(
     if let Some(crate::presentation_surface::ExploreDisplay::Detail(retained, content)) =
         crate::presentation_surface::explore_display(None)
         && retained.frame == Some(frame)
-        && ((source == crate::generated::PresentationSourceKind::Explore && content.input_frame().revision == source_revision)
-            || (content.frame().source.kind == source && content.frame().revision == source_revision)) {
+        && ((source == crate::generated::PresentationSourceKind::Explore
+            && content.input_frame().revision == source_revision)
+            || (content.frame().source.kind == source
+                && content.frame().revision == source_revision))
+    {
         return Some(SampleablePresentation {
             source_revision: content.frame().revision,
             presentation_revision: frame.presentation_revision,
@@ -1883,15 +1868,16 @@ fn sampleable_presentation(
     }
     let product = crate::presentation_surface::metadata::product(frame)?;
     let surface = crate::presentation_surface::metadata::surface(frame)?;
-    (product.source.kind == source && product.revision == source_revision)
-        .then_some(SampleablePresentation {
+    (product.source.kind == source && product.revision == source_revision).then_some(
+        SampleablePresentation {
             source_revision,
             presentation_revision: frame.presentation_revision,
             content_width: frame.content_width,
             content_height: frame.content_height,
             capability_width: surface.width,
             capability_height: surface.height,
-        })
+        },
+    )
 }
 
 fn fully_drawn_gallery(
@@ -2744,8 +2730,12 @@ impl Controller {
                     iced::Subscription::none()
                 },
                 iced::event::listen_with(|event, _, _| match event {
-                    iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => Some(Message::NumberWheelDelivered),
-                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => Some(Message::GalleryMouseDelivered),
+                    iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => {
+                        Some(Message::NumberWheelDelivered)
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+                        Some(Message::GalleryMouseDelivered)
+                    }
                     _ => None,
                 })
                 .with(self.generation)
@@ -3459,8 +3449,9 @@ impl Controller {
             return false;
         }
         match message {
-            Message::WorkspaceFpsScreenshot { generation, .. } =>
-                *generation == self.generation && self.phase == Phase::AwaitWorkspaceFpsScreenshot,
+            Message::WorkspaceFpsScreenshot { generation, .. } => {
+                *generation == self.generation && self.phase == Phase::AwaitWorkspaceFpsScreenshot
+            }
             Message::Scoped {
                 generation,
                 receipt,
@@ -3505,7 +3496,10 @@ impl Controller {
                         ),
                     }
             }
-            Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered | Message::GalleryMouseDelivered => true,
+            Message::Advance
+            | Message::Located { .. }
+            | Message::NumberWheelDelivered
+            | Message::GalleryMouseDelivered => true,
             _ => false,
         }
     }
@@ -3532,9 +3526,12 @@ impl Controller {
                 return None;
             }
             Message::WorkspaceFpsScreenshot { image, .. } => {
-                let Some(evidence) = self.workspace_fps_evidence else { return None; };
-                self.workspace_fps_failure = (!reporting::verify_workspace_fps_pixels(&image, evidence))
-                    .then_some(WORKSPACE_FPS_PIXEL_FAILURE);
+                let Some(evidence) = self.workspace_fps_evidence else {
+                    return None;
+                };
+                self.workspace_fps_failure =
+                    (!reporting::verify_workspace_fps_pixels(&image, evidence))
+                        .then_some(WORKSPACE_FPS_PIXEL_FAILURE);
                 self.phase = Phase::RestoreWorkspaceFps;
                 return None;
             }
@@ -4938,21 +4935,29 @@ impl Controller {
                 }
                 self.phase = Phase::AwaitWorkspaceFpsScreenshot;
                 let generation = self.generation;
-                iced::window::latest().and_then(iced::window::screenshot).map(move |image| {
-                    RootMessage::Integration(Message::WorkspaceFpsScreenshot { generation, image })
-                })
+                iced::window::latest()
+                    .and_then(iced::window::screenshot)
+                    .map(move |image| {
+                        RootMessage::Integration(Message::WorkspaceFpsScreenshot {
+                            generation,
+                            image,
+                        })
+                    })
             }
             Phase::RestoreWorkspaceFps => {
                 self.phase = Phase::AwaitWorkspaceFpsRestored;
-                Task::done(RootMessage::Settings(crate::view::settings::Message::PerformanceChanged(
-                    self.workspace_fps_baseline,
-                )))
+                Task::done(RootMessage::Settings(
+                    crate::view::settings::Message::PerformanceChanged(self.workspace_fps_baseline),
+                ))
             }
             Phase::AwaitWorkspaceFpsRestored
-                if !settings.has_local_edits() && !model.native_settings_unsettled()
+                if !settings.has_local_edits()
+                    && !model.native_settings_unsettled()
                     && crate::workspace_fps::enabled(settings) == self.workspace_fps_baseline
-                    && model.settings_snapshot.as_ref().is_some_and(|snapshot|
-                        snapshot.settingsstate.ui.showworkspaceperformance == self.workspace_fps_baseline) =>
+                    && model.settings_snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot.settingsstate.ui.showworkspaceperformance
+                            == self.workspace_fps_baseline
+                    }) =>
             {
                 if let Some(failure) = self.workspace_fps_failure {
                     self.fail(failure);
@@ -6251,10 +6256,12 @@ impl Controller {
                         self.workspace_fps_baseline = crate::workspace_fps::enabled(settings);
                         self.workspace_fps_evidence = None;
                         self.workspace_fps_failure = None;
-                        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().fps_sample = None);
+                        SURFACE_DRAW_OBSERVER
+                            .with(|observer| observer.borrow_mut().fps_sample = None);
                         self.phase = Phase::AwaitWorkspaceFps;
                         return Task::done(RootMessage::Settings(
-                            crate::view::settings::Message::PerformanceChanged(true)));
+                            crate::view::settings::Message::PerformanceChanged(true),
+                        ));
                     }
                     if !self.viewer_scenario.is_empty() {
                         self.selection_grid = Some((
@@ -6299,10 +6306,7 @@ impl Controller {
                             ],
                         )
                     });
-                    self.sweep_baseline = Some((
-                        snapshot.revision,
-                        snapshot.viewport.clone(),
-                    ));
+                    self.sweep_baseline = Some((snapshot.revision, snapshot.viewport.clone()));
                     return self.advance_to(Phase::AwaitExploreInitialPatch {
                         revision: snapshot.revision,
                         frame_revision: snapshot.frame.revision,
@@ -6805,10 +6809,7 @@ impl Controller {
                         ],
                     )
                 });
-                self.sweep_baseline = Some((
-                    snapshot.revision,
-                    snapshot.viewport.clone(),
-                ));
+                self.sweep_baseline = Some((snapshot.revision, snapshot.viewport.clone()));
                 if self.viewer_scenario.is_empty() {
                     self.phase = Phase::GalleryColdRead(
                         snapshot
@@ -6881,10 +6882,7 @@ impl Controller {
                         );
                         return Task::none();
                     }
-                    self.sweep_baseline = Some((
-                        snapshot.revision,
-                        snapshot.viewport.clone(),
-                    ));
+                    self.sweep_baseline = Some((snapshot.revision, snapshot.viewport.clone()));
                     self.phase = Phase::GallerySweep;
                     return self.arm(EXPLORE_GALLERY);
                 }
@@ -7831,14 +7829,30 @@ impl Controller {
                     return Task::none();
                 }
                 crate::presentation_surface::trace_atlas_stage(
-                    ["fractional", "row1", "row2", "row10", "row9", "end", "restored"][stage as usize],
+                    [
+                        "fractional",
+                        "row1",
+                        "row2",
+                        "row10",
+                        "row9",
+                        "end",
+                        "restored",
+                    ][stage as usize],
                     receipt,
                 );
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.atlas_scroll",
                         EXPLORE_GALLERY,
-                        ["fractional", "row1", "row2", "row10", "row9", "end", "restored"][stage as usize],
+                        [
+                            "fractional",
+                            "row1",
+                            "row2",
+                            "row10",
+                            "row9",
+                            "end",
+                            "restored",
+                        ][stage as usize],
                         [
                             snapshot.frame.revision as f64,
                             snapshot.viewport.firstrow as f64,
@@ -8555,7 +8569,9 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                self.annotation_sample_baseline = crate::presentation_surface::retained_surface().and_then(|surface| surface.frame).map_or(0, |frame| frame.presentation_revision);
+                self.annotation_sample_baseline = crate::presentation_surface::retained_surface()
+                    .and_then(|surface| surface.frame)
+                    .map_or(0, |frame| frame.presentation_revision);
                 self.annotation_frame_ready = None;
                 self.phase = Phase::DetailCloseEvidence;
                 self.arm(EXPLORE_DETAIL_CLOSE)
@@ -8584,7 +8600,6 @@ impl Controller {
                 };
                 self.reporting.observe(|reporting| {
                     reporting.reopen_wait(
-                        model,
                         frame,
                         snapshot,
                         revision,
@@ -9285,10 +9300,14 @@ impl Controller {
                         return Task::none();
                     }
                 }
-                let Some((_, image)) = crate::presentation_surface::retained_surface().and_then(crate::presentation_surface::drawable_annotation) else {
+                let Some((_, image)) = crate::presentation_surface::retained_surface()
+                    .and_then(crate::presentation_surface::drawable_annotation)
+                else {
                     return Task::none();
                 };
-                let Some(rendered) = image.diagnostics.as_deref() else { return Task::none(); };
+                let Some(rendered) = image.diagnostics.as_deref() else {
+                    return Task::none();
+                };
 
                 reporting::emit(|sink| {
                     sink.record(
@@ -9331,10 +9350,15 @@ impl Controller {
                     || (self.copy_step != 8 && snapshot.ui.interactionrevision <= revision)
                     || (self.copy_step == 8 && !self.copy_product_settled(snapshot))
                     || sampleable.source_revision != snapshot.frame.revision
-                    || frame.and_then(crate::presentation_surface::metadata::product).is_none_or(|product|
-                        product.source.kind != crate::generated::PresentationSourceKind::Annotation
-                            || product.revision != snapshot.frame.revision)
-                    || frame.is_none_or(|frame| frame.presentation_revision != presentation_revision)
+                    || frame
+                        .and_then(crate::presentation_surface::metadata::product)
+                        .is_none_or(|product| {
+                            product.source.kind
+                                != crate::generated::PresentationSourceKind::Annotation
+                                || product.revision != snapshot.frame.revision
+                        })
+                    || frame
+                        .is_none_or(|frame| frame.presentation_revision != presentation_revision)
                     || self.annotation_drawn
                         != Some((presentation_revision, snapshot.frame.revision))
                 {
@@ -9547,7 +9571,10 @@ impl Controller {
                             snapshot.frame.revision as f64,
                             presentation_revision as f64,
                             presentation_revision as f64,
-                            crate::presentation_surface::retained_surface().and_then(|surface| surface.frame).map_or(0, |frame| frame.presentation_revision) as f64,
+                            crate::presentation_surface::retained_surface()
+                                .and_then(|surface| surface.frame)
+                                .map_or(0, |frame| frame.presentation_revision)
+                                as f64,
                         ],
                     )
                 });
@@ -9613,14 +9640,24 @@ mod tests {
         use iced::futures::StreamExt;
         let mut fixture = ProbeFixture::new("square");
         let mut model = crate::view_model::test_support::bootstrapped();
-        model.settings_snapshot.as_mut().unwrap().settingsstate.ui.showworkspaceperformance = true;
+        model
+            .settings_snapshot
+            .as_mut()
+            .unwrap()
+            .settingsstate
+            .ui
+            .showworkspaceperformance = true;
         let mut settings = crate::view::settings::SettingsModel::default();
         settings.install(model.settings_snapshot.as_ref().unwrap());
         let router = crate::view::router::Router::default();
         let driver = &mut fixture.controller;
         driver.workspace_fps_baseline = false;
         driver.workspace_fps_evidence = Some(reporting::FpsEvidence {
-            bounds: fixture.bounds, clip: fixture.bounds, dark: false, frames: 30, seconds: 0.5,
+            bounds: fixture.bounds,
+            clip: fixture.bounds,
+            dark: false,
+            frames: 30,
+            seconds: 0.5,
         });
         driver.phase = Phase::AwaitWorkspaceFpsScreenshot;
         driver.update(Message::WorkspaceFpsScreenshot {
@@ -9628,7 +9665,10 @@ mod tests {
             image: iced::window::Screenshot::new(vec![0; 4], iced::Size::new(1, 1), 1.0),
         });
         assert_eq!(driver.phase, Phase::RestoreWorkspaceFps);
-        assert_eq!(driver.workspace_fps_failure, Some(WORKSPACE_FPS_PIXEL_FAILURE));
+        assert_eq!(
+            driver.workspace_fps_failure,
+            Some(WORKSPACE_FPS_PIXEL_FAILURE)
+        );
         assert_eq!(driver.failure_line, 0);
         let task = driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None);
         let mut actions = iced_runtime::task::into_stream(task).unwrap();
@@ -9636,13 +9676,22 @@ mod tests {
         let iced_runtime::Action::Output(RootMessage::Settings(message)) = action else {
             panic!("FPS cleanup must use the ordinary settings mutation");
         };
-        assert!(matches!(message, crate::view::settings::Message::PerformanceChanged(false)));
+        assert!(matches!(
+            message,
+            crate::view::settings::Message::PerformanceChanged(false)
+        ));
         let outcome = crate::view::settings::update(&mut settings, message).unwrap();
-        assert!(matches!(outcome, Some(crate::view::settings::Outcome::SettingsEdited(
-            crate::view::settings::EditSchedule::Debounce(_)))));
+        assert!(matches!(
+            outcome,
+            Some(crate::view::settings::Outcome::SettingsEdited(
+                crate::view::settings::EditSchedule::Debounce(_)
+            ))
+        ));
         drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
         assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
-        let request = settings.take_request().expect("canonical restoration request");
+        let request = settings
+            .take_request()
+            .expect("canonical restoration request");
         assert_eq!(request.updates.len(), 1);
         drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
         assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
@@ -9653,24 +9702,44 @@ mod tests {
         settings.settle_success(authoritative);
         drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
         assert!(!crate::workspace_fps::enabled(&settings));
-        assert!(!model.settings_snapshot.as_ref().unwrap().settingsstate.ui.showworkspaceperformance);
+        assert!(
+            !model
+                .settings_snapshot
+                .as_ref()
+                .unwrap()
+                .settingsstate
+                .ui
+                .showworkspaceperformance
+        );
         assert_eq!(driver.phase, Phase::Failed);
-        assert_eq!(driver.workspace_fps_failure, Some(WORKSPACE_FPS_PIXEL_FAILURE));
+        assert_eq!(
+            driver.workspace_fps_failure,
+            Some(WORKSPACE_FPS_PIXEL_FAILURE)
+        );
         assert!(driver.failure_line != 0);
         assert!(!driver.workspace_fps_verified);
     }
 
     #[test]
     fn delivered_gallery_mouse_advances_placeholder_selection_for_the_current_driver() {
-        let mut driver = Controller::new(true, false, String::new(), String::new(), "512".into(), String::new());
+        let mut driver = Controller::new(
+            true,
+            false,
+            String::new(),
+            String::new(),
+            "512".into(),
+            String::new(),
+        );
         driver.phase = Phase::AwaitVisibleReadHover(5, 9);
         driver.update(Message::Scoped {
-            generation: driver.generation.wrapping_add(1), receipt: None,
+            generation: driver.generation.wrapping_add(1),
+            receipt: None,
             message: Box::new(Message::GalleryMouseDelivered),
         });
         assert_eq!(driver.phase, Phase::AwaitVisibleReadHover(5, 9));
         driver.update(Message::Scoped {
-            generation: driver.generation, receipt: None,
+            generation: driver.generation,
+            receipt: None,
             message: Box::new(Message::GalleryMouseDelivered),
         });
         assert_eq!(driver.phase, Phase::VisibleReadSelect(5, 9));
@@ -10209,8 +10278,11 @@ mod tests {
         assert!(driver.reporting.state_is_absent());
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
-        surface.viewer_identity = model.explore.snapshot.as_ref().and_then(|snapshot|
-            snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image)));
+        surface.viewer_identity = model.explore.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .selectedimage
+                .map(|image| (snapshot.dataset.identity, image))
+        });
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         // Even a diagnostic-marked surface cannot activate collection in a quiet driver.
         surface.integration = true;
@@ -10459,7 +10531,9 @@ mod tests {
                 _ => assert_eq!(controller.annotation_drawn.take(), Some((5, 1))),
             }
         }
-        let snapshot = std::sync::Arc::new(crate::view_model::test_support::explore_snapshot());
+        let snapshot = std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+            &crate::view_model::test_support::explore_snapshot(),
+        ));
         let draw = AtlasDraw {
             surface,
             snapshot,
@@ -10566,7 +10640,9 @@ mod tests {
             bounds,
             image: bounds,
             clip: bounds,
-            snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&crate::view_model::test_support::explore_snapshot())),
+            snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                &crate::view_model::test_support::explore_snapshot(),
+            )),
         };
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         report_atlas_draw(draw.clone(), false, 1.0);
@@ -10931,7 +11007,9 @@ mod tests {
                 let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, width));
                 let draw = AtlasDraw {
                     surface,
-                    snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
+                    snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                        &snapshot,
+                    )),
                     bounds,
                     image: bounds,
                     clip: bounds,

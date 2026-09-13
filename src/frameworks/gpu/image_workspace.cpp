@@ -27,18 +27,22 @@ namespace mmltk::frameworks::gpu {
 namespace {
 void merge_workspace_damage(ImageWorkspaceRegion& result, ImageWorkspaceRegion region) noexcept {
     if (region.x1 >= region.x2 || region.y1 >= region.y2) return;
-    if (result.x1 >= result.x2 || result.y1 >= result.y2) { result = region; return; }
+    if (result.x1 >= result.x2 || result.y1 >= result.y2) {
+        result = region;
+        return;
+    }
     result.x1 = std::min(result.x1, region.x1);
     result.y1 = std::min(result.y1, region.y1);
     result.x2 = std::max(result.x2, region.x2);
     result.y2 = std::max(result.y2, region.y2);
 }
-}
+}  // namespace
 void ImageWorkspaceDamage::Record(ImageWorkspaceContent current, ImageWorkspaceCoverage coverage) noexcept {
     if (!current.valid() || current == newest_) return;
     auto& change = changes_[next_];
     change = {.before = coverage.baseline, .after = current, .full = coverage.full_image};
-    for (const auto region : coverage.regions) merge_workspace_damage(change.bounds, region);
+    for (const auto region : coverage.regions)
+        merge_workspace_damage(change.bounds, region);
     next_ = (next_ + 1U) % changes_.size();
     count_ = std::min(count_ + 1U, changes_.size());
     newest_ = current;
@@ -141,14 +145,16 @@ void ImageWorkspace::Owner::Wake() const noexcept {
         std::scoped_lock lock(mutex_);
         if (release_complete_ || product_owner.load(std::memory_order_acquire) != 0U) wake = wake_;
     }
-    if (wake) { try { (*wake)(); } catch (...) {} }
+    if (wake) {
+        try {
+            (*wake)();
+        } catch (...) {}
+    }
 }
 ImageWorkspace::Retirement::Result ImageWorkspace::Retirement::TakeResult() const noexcept {
     return owner_ ? owner_->TakeResult() : Result{.complete = true};
 }
-bool ImageWorkspace::Retirement::TransferToProducer() const noexcept {
-    return owner_ && owner_->TransferToProducer();
-}
+bool ImageWorkspace::Retirement::TransferToProducer() const noexcept { return owner_ && owner_->TransferToProducer(); }
 void ImageWorkspace::Retirement::SetWake(std::shared_ptr<const std::function<void()>> wake) const noexcept {
     if (owner_) owner_->SetWake(std::move(wake));
 }
@@ -156,11 +162,12 @@ struct ImageWorkspace::State final {
     State(std::shared_ptr<Owner> lifetime, ImageWorkspaceLayout requested, const Operations* injected)
         : owner(std::move(lifetime)),
           layout(std::move(requested)),
-          operations(injected ? *injected : Operations{&initialize_workspace_allocation, [](ImportedImageBuffer& buffer) noexcept {
-                                                           return buffer.Release();
-                                                       }, [](const ImportedImageBuffer& buffer, DeviceContext context) {
-                                                           return buffer.ImportAlias(std::move(context));
-                                                       }}) {}
+          operations(injected ? *injected
+                              : Operations{&initialize_workspace_allocation,
+                                           [](ImportedImageBuffer& buffer) noexcept { return buffer.Release(); },
+                                           [](const ImportedImageBuffer& buffer, DeviceContext import_context) {
+                                               return buffer.ImportAlias(std::move(import_context));
+                                           }}) {}
     void Initialize(DeviceContext source, std::optional<DeviceExecution> execution) {
         identity = next_image_allocation_identity();
         if (!layout.valid()) throw std::invalid_argument("workspace layout is invalid");
@@ -283,8 +290,8 @@ struct ImageWorkspace::State final {
     TerminalCudaRetirementLease retention = ReserveTerminalCudaLease(terminal);
 };
 
-ImageWorkspace::ImageWorkspace(DeviceContext source, ImageWorkspaceLayout layout,
-                               std::optional<DeviceExecution> execution, const Operations* operations)
+ImageWorkspace::ImageWorkspace(DeviceContext source, ImageWorkspaceLayout layout, std::optional<DeviceExecution> execution,
+                               const Operations* operations)
     : state_(std::make_shared<State>(std::make_shared<Owner>(), std::move(layout), operations)) {
     try {
         state_->Initialize(std::move(source), std::move(execution));
@@ -297,8 +304,8 @@ std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, Im
 }
 std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, ImageWorkspaceLayout layout,
                                                        std::optional<DeviceExecution> execution, const Operations* operations) {
-    auto result = std::shared_ptr<ImageWorkspace>(
-        new ImageWorkspace(std::move(context), std::move(layout), std::move(execution), operations));
+    auto result =
+        std::shared_ptr<ImageWorkspace>(new ImageWorkspace(std::move(context), std::move(layout), std::move(execution), operations));
     return result;
 }
 std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexcept {
@@ -309,7 +316,8 @@ std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexce
     if (safe) {
         try {
             if (state_->context) state_->context->Bind();
-            for (auto& transfer : state_->transfers) transfer.reset();
+            for (auto& transfer : state_->transfers)
+                transfer.reset();
             if (state_->producer_allocation) {
                 const auto released = state_->operations.release(*state_->producer_allocation);
                 if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess)
@@ -339,9 +347,7 @@ std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexce
     owner->Released({.completion_reached = safe, .failure = failure});
     return failure;
 }
-void ImageWorkspace::CheckOwner() const {
-    state_->owner->Check();
-}
+void ImageWorkspace::CheckOwner() const { state_->owner->Check(); }
 ImageWorkspace::Retirement ImageWorkspace::ObserveRetirement() const noexcept { return Retirement{state_->owner}; }
 const ImageWorkspaceLayout& ImageWorkspace::layout() const noexcept { return state_->layout; }
 std::uint64_t ImageWorkspace::identity() const noexcept { return state_->identity; }
@@ -427,8 +433,8 @@ ImagePlaneView ImageWorkspace::ProducerPlaneLocked(const DeviceContext& context,
             completed_failure = settled.failure;
             const auto released = state_->operations.release(*state_->producer_allocation);
             if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess) {
-                const auto failure = combine_image_failures(
-                    completed_failure, workspace_release_failure("workspace producer mapping release failed"));
+                const auto failure =
+                    combine_image_failures(completed_failure, workspace_release_failure("workspace producer mapping release failed"));
                 state_->owner->Failed(failure);
                 std::rethrow_exception(failure);
             }
@@ -495,7 +501,9 @@ void ImageWorkspace::CancelDisplayWrite() noexcept {
     CancelWrite();
     state_->display_held.store(false, std::memory_order_release);
     if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 std::uint64_t ImageWorkspace::product_owner() const noexcept { return state_->owner->product_owner.load(std::memory_order_acquire); }
@@ -509,11 +517,13 @@ void ImageWorkspace::Detach(std::uint64_t product_owner) {
         if (state_->owner->product_owner == product_owner) {
             state_->owner->product_owner = 0U;
             state_->owner->attached_producer_.reset();
-        }
-        else if (state_->owner->product_owner != 0U) throw std::invalid_argument("workspace detachment owner mismatch");
+        } else if (state_->owner->product_owner != 0U)
+            throw std::invalid_argument("workspace detachment owner mismatch");
     }
     if (const auto sink = state_->display_availability_sink.load(std::memory_order_acquire)) {
-        try { (*sink)(); } catch (...) {}
+        try {
+            (*sink)();
+        } catch (...) {}
     }
 }
 bool ImageWorkspace::Acquired(std::uint64_t generation) const noexcept {
@@ -623,9 +633,9 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
     const ImageWorkspaceContent content{clean.allocation.owner, source.plane(0U).revision()};
     const bool expands_initialized = clean.descriptor.width > state_->width || clean.descriptor.height > state_->height;
     if (!coverage.baseline.valid() || coverage.baseline != state_->content || coverage.baseline.owner != content.owner ||
-        expands_initialized || coverage.allocation_identity != identity()) coverage.full_image = true;
-    if (!state_->write_reserved && !state_->ReservePhysicalWrite())
-        throw std::runtime_error("workspace physical generation is acquired");
+        expands_initialized || coverage.allocation_identity != identity())
+        coverage.full_image = true;
+    if (!state_->write_reserved && !state_->ReservePhysicalWrite()) throw std::runtime_error("workspace physical generation is acquired");
     state_->write_invalidated = true;
     state_->content_valid = false;
     state_->revision = 0U;
@@ -648,8 +658,8 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
             const auto index = source.plane_count() - 1U;
             auto& transfer = state_->transfers[index];
             if (!transfer) {
-                auto storage = std::make_unique<ImageProductBuffer>(*state_->context,
-                    index == 0U ? ImageProductLayout::Clean : ImageProductLayout::CleanAndSemantic);
+                auto storage = std::make_unique<ImageProductBuffer>(
+                    *state_->context, index == 0U ? ImageProductLayout::Clean : ImageProductLayout::CleanAndSemantic);
                 if (index == 0U) storage->AdoptExternalPlane(state_->allocation, allocation_bytes(), destination);
                 transfer = std::move(storage);
             }
@@ -672,7 +682,9 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
         execution->Notify([state = state_.get()] {
             state->completion_notified.store(true, std::memory_order_release);
             if (const auto sink = state->availability_sink.load(std::memory_order_acquire)) {
-                try { (*sink)(); } catch (...) {}
+                try {
+                    (*sink)();
+                } catch (...) {}
             }
         });
         execution->Record(completion);
@@ -710,8 +722,8 @@ BorrowedImageWorkspace::~BorrowedImageWorkspace() = default;
 BorrowedImageWorkspace::BorrowedImageWorkspace(BorrowedImageWorkspace&&) noexcept = default;
 BorrowedImageWorkspace& BorrowedImageWorkspace::operator=(BorrowedImageWorkspace&&) noexcept = default;
 BorrowedImageWorkspace::BorrowedImageWorkspace(BorrowedImageProductReadView source, std::shared_ptr<ImageWorkspace> workspace) {
-    if (!source.valid() || !workspace ||
-        !workspace->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()})) return;
+    if (!source.valid() || !workspace || !workspace->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}))
+        return;
     const auto descriptor = source.plane(0U).plane().descriptor;
     const auto plane = workspace->plane(descriptor.width, descriptor.height);
     const auto revision = workspace->revision();

@@ -39,9 +39,7 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
     if (!factory) return {};
     return [factory = std::move(factory), demand = std::move(demand)](auto revisions) {
         auto runtime = factory(std::move(revisions));
-        if (runtime) {
-            explore_algorithm(*runtime).SetCurrentDemand(demand);
-        }
+        if (runtime) { explore_algorithm(*runtime).SetCurrentDemand(demand); }
         return runtime;
     };
 }
@@ -160,6 +158,7 @@ class ExploreSystem::Impl final {
     friend class ExploreSystem;
 
     WorkspaceInput input_;
+
    public:
     Impl(SettingsSystem& settings_system, const VisualDeviceSettings settings, const std::size_t nproc, VisualRuntimeFactory factory,
          SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
@@ -511,9 +510,8 @@ class ExploreSystem::Impl final {
         ExploreSnapshot changed;
         {
             std::scoped_lock lock(mutex_);
-            RefreshRetainedMetadata([&](ExploreImageMetadata& metadata) {
-                metadata.detail.show_original_dimensions = request.show_original_dimensions;
-            });
+            RefreshRetainedMetadata(
+                [&](ExploreImageMetadata& metadata) { metadata.detail.show_original_dimensions = request.show_original_dimensions; });
             installed_settings_ = std::move(refreshed);
             if (desired_ && desired_->settings) desired_->settings = installed_settings_;
             state_.detail.show_original_dimensions = request.show_original_dimensions;
@@ -1785,4 +1783,4 @@ void ExploreSystem::SetInputPeer(std::uint64_t epoch) {
     std::scoped_lock lock(impl_->mutex_);
     impl_->input_.SetPeer(epoch);
 }
-}
+}  // namespace mmltk::controller

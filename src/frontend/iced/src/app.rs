@@ -3,8 +3,8 @@ use iced::{Subscription, Task};
 use crate::fluent_theme::{Element, Theme};
 use crate::generated::{
     AnnotationOpen, AnnotationSave, ExploreNavigate, ExploreNavigation, ExploreOpen, ExploreSelect,
-    ExploreViewportUpdate, FeatureId, FileDialogOpen, LiveStart,
-    PresentationState, SettingsResetRequest, Train, VisualExtent, VisualFrame,
+    ExploreViewportUpdate, FeatureId, FileDialogOpen, LiveStart, SettingsResetRequest, Train,
+    VisualExtent, VisualFrame,
 };
 use crate::message::Message;
 use crate::presentation_surface::{FrameReady, Surface};
@@ -94,7 +94,8 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         iced::window::events().filter_map(|(_, event)| {
             // Retained workspace cadence stays in the widget/window loop.
             // A browser redraw does not coordinate with native snapshots.
-            (!matches!(event, iced::window::Event::RedrawRequested(_))).then_some(Message::Window(event))
+            (!matches!(event, iced::window::Event::RedrawRequested(_)))
+                .then_some(Message::Window(event))
         }),
         crate::presentation_surface::subscription()
             .map(presentation::Message::Surface)
@@ -450,34 +451,16 @@ mod tests {
         for _ in 0..64 {
             assert_eq!(
                 connection
-                    .send_interaction(crate::protocol::client_records::Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
+                    .send_interaction(crate::protocol::client_records::Interaction {
+                        replaceable: false,
+                        endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
+                        value: Vec::new()
+                    })
                     .unwrap(),
                 crate::transport_connection::SendDisposition::Queued
             );
         }
         (connection, capture)
-    }
-
-    fn stage_annotation_retirement(app: &mut App) {
-        install_default_bootstrap(app);
-        app.workspace.select(FeatureId::Annotate);
-        app.settings
-            .state_mut()
-            .edit(EditCadence::Debounced, |draft| {
-                let darkmode = !draft.ui.darkmode;
-                crate::generated::edit_uidarkmode(draft, darkmode)
-            })
-            .unwrap();
-    }
-
-    fn assert_persistent_owners_retired(app: &App) {
-        assert!(app.connection.is_none());
-        assert!(app.settings.draft().is_none());
-        assert_eq!(app.workspace.active(), FeatureId::Train);
-        assert_eq!(
-            app.model.connection,
-            crate::view_model::ConnectionState::Reconnecting
-        );
     }
 
     fn install_current_model_selection(app: &mut App) {
@@ -614,72 +597,12 @@ mod tests {
     }
 
     #[test]
-    fn ready_surface_presented_intent_and_protocol_terminal_paths_retire_the_peer() {
+    fn intent_and_protocol_terminal_paths_retire_the_peer() {
         let closed_connection = || {
             let (sender, receiver) = Connection::test_channel();
             drop(receiver);
             sender
         };
-
-        let (mut ready, task) = boot();
-        drop(task);
-        drop(ready.on_transport(TransportEvent::Connected(closed_connection())));
-        assert!(ready.connection.is_none());
-        assert_eq!(
-            ready.model.connection,
-            crate::view_model::ConnectionState::Reconnecting
-        );
-
-        let (mut surface, task) = boot();
-        drop(task);
-        install_default_bootstrap(&mut surface);
-        surface.connection = Some(closed_connection());
-        surface.model.window_width = 640;
-        surface.model.window_height = 480;
-        surface.send_surface_observation();
-        assert!(surface.connection.is_none());
-        assert!(surface.settings.draft().is_none());
-
-        let (mut presented, task) = boot();
-        drop(task);
-        install_default_bootstrap(&mut presented);
-        presented.connection = Some(closed_connection());
-        presented.presentation.set_test_surface(Surface {
-            high: 1,
-            low: 2,
-            generation: 3,
-            width: 640,
-            height: 480,
-            timeline_ready: 0,
-            frame: None,
-            integration: false,
-            crop: None,
-            viewer_identity: None,
-            fit_revision: 0,
-        });
-        let retained = FrameReady {
-            source_high: 0,
-            source_low: 0,
-            direct_sampling: false,
-            high: 1,
-            low: 2,
-            layer: 0,
-            slot: 0,
-            content_session: 1,
-            content_sequence: 1,
-            presentation_revision: 4,
-            content_width: 640,
-            content_height: 480,
-        };
-        presented.present_native_frame(retained);
-        assert!(presented.connection.is_none());
-        assert_eq!(
-            presented
-                .presentation
-                .surface()
-                .and_then(|surface| surface.frame),
-            Some(retained)
-        );
 
         let (mut intent, task) = boot();
         drop(task);
@@ -748,7 +671,11 @@ mod tests {
             if failure == "capacity" {
                 for _ in 0..64 {
                     connection
-                        .send_interaction(crate::protocol::client_records::Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
+                        .send_interaction(crate::protocol::client_records::Interaction {
+                            replaceable: false,
+                            endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
+                            value: Vec::new(),
+                        })
                         .unwrap();
                 }
             }
@@ -831,8 +758,13 @@ mod tests {
         explore.busy = false;
         let request = ExploreViewportUpdate {
             viewport: crate::generated::ExploreViewport {
-                extent: crate::generated::VisualExtent { width: 64, height: 64 },
-                firstrow: 0, rowcount: 1, columns: 1,
+                extent: crate::generated::VisualExtent {
+                    width: 64,
+                    height: 64,
+                },
+                firstrow: 0,
+                rowcount: 1,
+                columns: 1,
             },
         };
         send.workspace

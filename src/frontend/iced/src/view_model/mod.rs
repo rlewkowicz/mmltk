@@ -29,9 +29,9 @@ use crate::generated::{
     ApplicationErrorCategory, ApplicationEvent, ApplicationReply, ApplicationSnapshot,
     ComputeOperationOutcome, ComputeUiState, FeatureId, FileDialogFact, FileDialogSnapshot,
     FileDialogTarget, GuiSettingsState, LiveSnapshot, ModelSelection, ModelSelectionOutcome,
-    ModelSelectionSource, ModelUiState, PredictSnapshot, PresentationState,
-    PresentationSourceIdentity, PresentationSourceKind, SettingsUiState, UpscaleSnapshot,
-    VisualExtent, VisualFrame,
+    ModelSelectionSource, ModelUiState, PredictSnapshot, PresentationSourceIdentity,
+    PresentationSourceKind, PresentationState, SettingsUiState, UpscaleSnapshot, VisualExtent,
+    VisualFrame,
 };
 use crate::protocol::ApplicationError;
 

@@ -150,7 +150,10 @@ struct HostCallbackContext final {
         if (self.host.activated) self.host.activated(self.host.context.get());
         if (self.pressure != OpenPressure::Activation) return;
         wire::ByteBuffer bytes;
-        if (!encode_server_record(ServerRecord{InteractionRejected{.endpoint_id = self.epoch, .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}}, bytes)) {
+        if (!encode_server_record(ServerRecord{InteractionRejected{
+                                      .endpoint_id = self.epoch,
+                                      .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}},
+                                  bytes)) {
             self.server->close_peer();
             return;
         }
@@ -293,7 +296,8 @@ class ReadyHostAnnotation final {
                       ++events_;
                   }
                   changed_.notify_all();
-              }, mmltk::testsupport::annotation_render_evidence()) {
+              },
+              mmltk::testsupport::annotation_render_evidence()) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
         const bool ready =
@@ -627,7 +631,6 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
     mmltk::testsupport::await_annotation_command(annotation, ready, edit.revision);
     mmltk::testsupport::await_annotation_render(annotation, ready);
-    const auto epoch = annotation.snapshot().input_document_epoch;
     annotation.SetInputPeer(1U);
     const auto gesture = [&](std::uint64_t peer, contracts::AnnotationPointerPhase phase, std::uint64_t, std::uint64_t sequence) {
         const auto kind = phase == contracts::AnnotationPointerPhase::Begin ? WorkspaceMouseKind::Press : WorkspaceMouseKind::Release;

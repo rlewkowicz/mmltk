@@ -353,10 +353,12 @@ void diagnose_workspace_service(const VisualWorkspaceRequest& request, std::stri
 
 void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
     const auto destination = request.destination.lock();
-    if (!request.ready ||
-        (!request.detach_only && (request.product_owner == 0U || request.product_revision == 0U)))
+    if (!request.ready || (!request.detach_only && (request.product_owner == 0U || request.product_revision == 0U)))
         throw std::invalid_argument("visual workspace request is incomplete");
-    if (!destination) { request.ready(); return; }
+    if (!destination) {
+        request.ready();
+        return;
+    }
     if (!destination->layout().valid()) throw std::invalid_argument("visual workspace destination is invalid");
     std::optional<VisualWorkspaceRequest> displaced;
     {
@@ -386,21 +388,23 @@ void VisualRuntimeOwner::ServiceWorkspace() {
     }
     if (!request) return;
     const auto destination = request->destination.lock();
-    if (!destination) { request->ready(); return; }
+    if (!destination) {
+        request->ready();
+        return;
+    }
     try {
         if (runtime_ && !runtime_retirement_blocked_ && !stopping_ && (request->detach_only || !destination->retired())) {
             runtime_->BeginWork();
             diagnose_workspace_service(*request, "prepare_started");
             workspace_retry_.store(true, std::memory_order_release);
             const auto observed = runtime_->ObserveWorkspace();
-            const bool expected_product = observed.product_owner == request->product_owner &&
-                                          observed.product_revision == request->product_revision;
+            const bool expected_product =
+                observed.product_owner == request->product_owner && observed.product_revision == request->product_revision;
             const bool prepared = request->detach_only
-                ? runtime_->DetachDisplay(destination)
-                : expected_product && runtime_->PrepareDisplay(request->product_revision, destination);
+                                      ? runtime_->DetachDisplay(destination)
+                                      : expected_product && runtime_->PrepareDisplay(request->product_revision, destination);
             if (!prepared) {
-                const bool retry = request->detach_only ||
-                    expected_product;
+                const bool retry = request->detach_only || expected_product;
                 if (retry) {
                     std::scoped_lock lock(mutex_);
                     if (!workspace_request_) {

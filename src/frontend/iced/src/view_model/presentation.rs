@@ -22,10 +22,7 @@ impl PresentationModel {
         }
     }
 
-    fn refresh(
-        &mut self,
-        frame: Option<VisualFrame>,
-    ) -> Option<VisualFrame> {
+    fn refresh(&mut self, frame: Option<VisualFrame>) -> Option<VisualFrame> {
         let Some(frame) = frame else {
             self.clear_sent();
             return None;
@@ -33,15 +30,12 @@ impl PresentationModel {
         if self.sent.as_ref().is_some_and(|sent| sent != &frame.source) {
             self.clear_sent();
         }
-        (self.sent.as_ref() != Some(&frame.source))
-            .then_some(frame)
+        (self.sent.as_ref() != Some(&frame.source)).then_some(frame)
     }
 
     fn sent(&mut self, frame: VisualFrame) {
         self.sent = Some(frame.source);
     }
-
-
 }
 
 impl ApplicationModel {
@@ -242,10 +236,7 @@ impl ApplicationModel {
 }
 
 impl crate::generated::PresentationApplicationProjection<UiError> for ApplicationModel {
-    fn project_presentation_snapshot(
-        &mut self,
-        value: PresentationState,
-    ) -> Result<(), UiError> {
+    fn project_presentation_snapshot(&mut self, value: PresentationState) -> Result<(), UiError> {
         merge_presentation_snapshot(&mut self.presentation, value).map(|_| ())
     }
 

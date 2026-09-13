@@ -40,8 +40,8 @@ pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'
             text(
                 presentation
                     .map(|snapshot| format!(
-                        "{:?} · revision {}",
-                        snapshot.selected.kind, snapshot.completed.revision
+                        "{:?} · selection revision {}",
+                        snapshot.selected.kind, snapshot.revision
                     ))
                     .unwrap_or_else(|| "not installed".into())
             )

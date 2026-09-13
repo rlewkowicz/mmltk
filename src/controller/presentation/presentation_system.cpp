@@ -232,8 +232,8 @@ class PresentationSystem::Impl final {
                 std::scoped_lock lock(mutex_);
                 const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
                                       in_flight_->observation.frame.source == pending->source;
-                if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() &&
-                    frame.source == pending->source && pending->generation == selection_generation_ && state_.selected == pending->source &&
+                if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
+                    pending->generation == selection_generation_ && state_.selected == pending->source &&
                     (pending->force || state_.completed != frame || state_.completed_source_revision != observation.snapshot_revision)) {
                     in_flight_ = submitted;
                     submit = true;

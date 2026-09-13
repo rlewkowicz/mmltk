@@ -1,8 +1,4 @@
 #[cfg(any(target_arch = "wasm32", test))]
-mod workspace_input;
-#[cfg(any(target_arch = "wasm32", test))]
-mod workspace_fps;
-#[cfg(any(target_arch = "wasm32", test))]
 mod app;
 pub mod application_codec;
 #[cfg(any(target_arch = "wasm32", test))]
@@ -24,6 +20,10 @@ mod transport_connection;
 mod view;
 #[cfg(any(target_arch = "wasm32", test))]
 mod view_model;
+#[cfg(any(target_arch = "wasm32", test))]
+mod workspace_fps;
+#[cfg(any(target_arch = "wasm32", test))]
+mod workspace_input;
 
 #[cfg(any(target_arch = "wasm32", test))]
 pub fn run() -> iced::Result {

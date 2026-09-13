@@ -267,6 +267,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
 
 class UpscaleSystem::Impl final {
     WorkspaceInput input_;
+
    public:
     Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
          SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
@@ -938,4 +939,4 @@ void UpscaleSystem::SetInputPeer(std::uint64_t epoch) {
     std::scoped_lock lock(impl_->mutex_);
     impl_->input_.SetPeer(epoch);
 }
-}
+}  // namespace mmltk::controller

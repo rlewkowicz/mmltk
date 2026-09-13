@@ -74,9 +74,9 @@ pub(super) fn row_offset(layout: Placement, snapshot: &ExploreImageMetadata, wid
 
 #[cfg(test)]
 mod tests {
+    use super::super::metadata;
     use super::*;
     use crate::generated::ExploreMode;
-    use super::super::metadata;
 
     fn frame_ready() -> FrameReady {
         FrameReady {
@@ -128,7 +128,11 @@ mod tests {
         snapshot.revision += 1;
         snapshot.overlay.showlabels = !snapshot.overlay.showlabels;
         assert_eq!(matching(Some(frame)).unwrap(), original);
-        let next = FrameReady { slot: 1, presentation_revision: frame.presentation_revision+1, ..frame };
+        let next = FrameReady {
+            slot: 1,
+            presentation_revision: frame.presentation_revision + 1,
+            ..frame
+        };
         metadata::install_explore(next, &snapshot);
         assert_eq!(matching(Some(next)).unwrap().dataset.identity, 12);
         assert_eq!(matching(Some(frame)).unwrap().dataset.identity, 11);
@@ -147,8 +151,14 @@ mod tests {
         pending.read = Some(read.clone());
         let surface = pending.surface;
         let mut image = super::super::ImagePublication {
-            surface, completed: None, retained_read: None, pending_sample: Some(pending),
-            gallery: None, detail: None, annotation: None, placement: placement(&ExploreImageMetadata::from(&snapshot)),
+            surface,
+            completed: None,
+            retained_read: None,
+            pending_sample: Some(pending),
+            gallery: None,
+            detail: None,
+            annotation: None,
+            placement: placement(&ExploreImageMetadata::from(&snapshot)),
         };
         let mut model = crate::view_model::test_support::bootstrapped();
         model.presentation = None;
@@ -166,8 +176,13 @@ mod tests {
         snapshot.viewport.firstrow = 1;
         snapshot.viewport.extent = snapshot.frame.extent.clone();
         crate::view_model::test_support::gallery_layout(&mut snapshot);
-        let next = FrameReady { slot: 1, content_sequence: snapshot.frame.revision,
-            content_height: 500, presentation_revision: frame.presentation_revision+1, ..frame };
+        let next = FrameReady {
+            slot: 1,
+            content_sequence: snapshot.frame.revision,
+            content_height: 500,
+            presentation_revision: frame.presentation_revision + 1,
+            ..frame
+        };
         assert!(matching(Some(next)).is_none());
         metadata::install_explore(next, &snapshot);
         assert_eq!(matching(Some(next)).unwrap().viewport.rowcount, 5);
@@ -193,8 +208,18 @@ mod tests {
             row_origin: 0,
             first_row: 2,
         };
-        assert_eq!(row_offset(newer, &ExploreImageMetadata::from(&retained), 600.0), -150.0);
-        assert_eq!(row_offset(placement(&ExploreImageMetadata::from(&retained)), &ExploreImageMetadata::from(&retained), 600.0), 0.0);
+        assert_eq!(
+            row_offset(newer, &ExploreImageMetadata::from(&retained), 600.0),
+            -150.0
+        );
+        assert_eq!(
+            row_offset(
+                placement(&ExploreImageMetadata::from(&retained)),
+                &ExploreImageMetadata::from(&retained),
+                600.0
+            ),
+            0.0
+        );
         retained.viewport.rowcount = 5;
         retained.viewport.firstrow = 10;
         crate::view_model::test_support::gallery_layout(&mut retained);
@@ -205,12 +230,17 @@ mod tests {
             row_origin: 0,
             first_row: 2,
         };
-        assert_eq!(row_offset(earlier, &ExploreImageMetadata::from(&retained), 600.0), 1200.0);
+        assert_eq!(
+            row_offset(earlier, &ExploreImageMetadata::from(&retained), 600.0),
+            1200.0
+        );
     }
 
     #[test]
     fn detail_return_keeps_independent_retained_gallery_read_custody() {
-        use super::super::{SampleRead, accept_publication, reset_test_releases, retire_publication, test_releases};
+        use super::super::{
+            SampleRead, accept_publication, reset_test_releases, retire_publication, test_releases,
+        };
         reset_test_releases();
         let mut snapshot = gallery_snapshot();
         let original = frame_ready();
@@ -221,7 +251,11 @@ mod tests {
         retire_publication(original);
         assert!(test_releases().is_empty());
         snapshot.revision += 20;
-        let returned = FrameReady { slot: 1, presentation_revision: original.presentation_revision+2, ..original };
+        let returned = FrameReady {
+            slot: 1,
+            presentation_revision: original.presentation_revision + 2,
+            ..original
+        };
         metadata::install_explore(returned, &snapshot);
         let returned_facts = matching(Some(returned)).unwrap();
         assert_eq!(returned_facts.frame, original_facts.frame);

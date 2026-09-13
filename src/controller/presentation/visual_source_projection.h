@@ -10,7 +10,9 @@
 
 namespace mmltk::controller {
 
-struct VisualImageMetadata final { VisualFrame frame{}; };
+struct VisualImageMetadata final {
+    VisualFrame frame{};
+};
 MMLTK_REFLECT_FIELDS(VisualImageMetadata)
 
 template <class Snapshot, PresentationSourceKind Kind, auto Frame, auto Revision, class Image = VisualImageMetadata>
@@ -20,7 +22,8 @@ struct VisualSourceProjection final {
     [[nodiscard]] static Image ImageOf(const Snapshot& snapshot) {
         if constexpr (std::same_as<Image, VisualImageMetadata>)
             return {.frame = mmltk::frameworks::reflection::access<const Snapshot, Frame>(snapshot)};
-        else return mmltk::frameworks::reflection::project_record<Image>(snapshot);
+        else
+            return mmltk::frameworks::reflection::project_record<Image>(snapshot);
     }
     static constexpr auto kind = Kind;
     static constexpr auto frame = Frame;

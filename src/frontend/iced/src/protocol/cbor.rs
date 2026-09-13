@@ -44,6 +44,7 @@ pub fn object<K: Into<String>>(fields: impl IntoIterator<Item = (K, Value)>) -> 
     )
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn decode_graphics_value(bytes: &[u8], maximum: usize) -> Result<Value, ProtocolError> {
     if bytes.is_empty() || bytes.len() > maximum {
         return Err(ProtocolError("invalid graphics metadata extent".into()));
@@ -165,19 +166,20 @@ fn preflight_protocol_record(bytes: &[u8]) -> Result<(), ProtocolError> {
     let kind = bytes
         .get(KIND_PREFIX.len() + 1..KIND_PREFIX.len() + 1 + kind_length)
         .ok_or_else(|| ProtocolError("truncated browser protocol record kind".into()))?;
-    let record = match ServerRecordKind::parse(kind) {
-        Some(kind) => match kind {
-            ServerRecordKind::Bootstrap => RecordKind::Bootstrap,
-            ServerRecordKind::IntentReply => RecordKind::IntentReply,
-            ServerRecordKind::SystemEvent => RecordKind::SystemEvent,
-            ServerRecordKind::InteractionRejected
-            | ServerRecordKind::IntegrationControl => RecordKind::Reflected(
-                kind.reflected_preflight()
-                    .ok_or_else(|| ProtocolError("missing reflected server preflight".into()))?,
-            ),
-        },
-        None => RecordKind::Unknown,
-    };
+    let record =
+        match ServerRecordKind::parse(kind) {
+            Some(kind) => match kind {
+                ServerRecordKind::Bootstrap => RecordKind::Bootstrap,
+                ServerRecordKind::IntentReply => RecordKind::IntentReply,
+                ServerRecordKind::SystemEvent => RecordKind::SystemEvent,
+                ServerRecordKind::InteractionRejected | ServerRecordKind::IntegrationControl => {
+                    RecordKind::Reflected(kind.reflected_preflight().ok_or_else(|| {
+                        ProtocolError("missing reflected server preflight".into())
+                    })?)
+                }
+            },
+            None => RecordKind::Unknown,
+        };
     ciborium_walk_complete_item(bytes, PROTOCOL_ITEM_BUDGET, PreflightPath::Envelope(record))
 }
 

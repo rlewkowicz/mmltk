@@ -159,8 +159,13 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
         );
         // The visible browser window drives retained draws independently of
         // native content, optional FPS, and troubleshooting activation.
-        if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_)))
-            && layout.bounds().intersection(viewport).is_some_and(|clip| clip.width > 0.0 && clip.height > 0.0)
+        if matches!(
+            event,
+            Event::Window(iced::window::Event::RedrawRequested(_))
+        ) && layout
+            .bounds()
+            .intersection(viewport)
+            .is_some_and(|clip| clip.width > 0.0 && clip.height > 0.0)
         {
             shell.request_redraw();
         }
@@ -220,7 +225,9 @@ impl<Message> Labelled<'_, Message> {
         layout: Layout<'_>,
         viewport: &Rectangle,
     ) {
-        if matches!(self.source, Source::Hidden) { return; }
+        if matches!(self.source, Source::Hidden) {
+            return;
+        }
         let mut bounds = layout.bounds();
         let mut placement = self.placement;
         if let Source::Gallery(snapshot) = &self.source {
@@ -334,18 +341,28 @@ mod tests {
         super::super::reset_test_releases();
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         let snapshot = model.explore.snapshot.as_mut().unwrap();
-        snapshot.scene.categories = vec![crate::generated::ArtifactClassName { value: "person".into() }];
+        snapshot.scene.categories = vec![crate::generated::ArtifactClassName {
+            value: "person".into(),
+        }];
         snapshot.scene.palette = vec![crate::generated::AnnotationColor {
-            hue: 120.0, saturation: 1.0, value: 0.8,
+            hue: 120.0,
+            saturation: 1.0,
+            value: 0.8,
         }];
         snapshot.overlay.showlabels = true;
         snapshot.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::All;
-        snapshot.scene.objects = [(100.0, 100.0), (30.0, 45.0)].into_iter().map(|(x, y)| {
-            let mut object = crate::view_model::test_support::annotation_object(0);
-            object.box_.first = crate::generated::AnnotationPoint { x, y };
-            object.box_.second = crate::generated::AnnotationPoint { x: x + 30.0, y: y + 30.0 };
-            object
-        }).collect();
+        snapshot.scene.objects = [(100.0, 100.0), (30.0, 45.0)]
+            .into_iter()
+            .map(|(x, y)| {
+                let mut object = crate::view_model::test_support::annotation_object(0);
+                object.box_.first = crate::generated::AnnotationPoint { x, y };
+                object.box_.second = crate::generated::AnnotationPoint {
+                    x: x + 30.0,
+                    y: y + 30.0,
+                };
+                object
+            })
+            .collect();
         super::super::metadata::install_explore(frame, snapshot);
         assert!(super::super::accept_publication(frame));
         super::super::authorize_draw(Some(frame));
@@ -356,48 +373,109 @@ mod tests {
             upscale: None,
         });
         let program = |show_fps| Program::<()> {
-            show_fps, input: None, local: None, publish: None, surface,
+            show_fps,
+            input: None,
+            local: None,
+            publish: None,
+            surface,
             placement: super::super::Placement::Contain,
             control_id: crate::view::workspace::STABLE_ID,
         };
-        let mut renderer = iced::futures::executor::block_on(
-            <iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))
-        ).expect("label-wrapper acceptance requires the container GPU backend");
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
+        .expect("label-wrapper acceptance requires the container GPU backend");
         let mut element = view(program(true), source.clone());
         let mut tree = widget::Tree::new(&element);
         tree.diff(element.as_widget_mut());
         let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(640.0, 480.0));
-        let node = element.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(bounds.size(), bounds.size())).move_to(bounds.position());
+        let node = element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(bounds.size(), bounds.size()),
+            )
+            .move_to(bounds.position());
         let now = iced::time::Instant::now();
-        let deliver = |element: &mut Element<'_, ()>, tree: &mut widget::Tree,
-            renderer: &iced::Renderer, event: Event, cursor| {
+        let deliver = |element: &mut Element<'_, ()>,
+                       tree: &mut widget::Tree,
+                       renderer: &iced::Renderer,
+                       event: Event,
+                       cursor| {
             let mut messages = Vec::new();
-            let mut shell = Shell::new(&mut messages);
-            element.as_widget_mut().update(tree, &event, Layout::new(&node), cursor, renderer,
-                &mut shell, &bounds);
+            let mut shell = Shell::new(
+                &iced::window::Headless,
+                iced_runtime::core::shell::Waker::new(|| {}),
+                &mut messages,
+            );
+            element.as_widget_mut().update(
+                tree,
+                &event,
+                Layout::new(&node),
+                cursor,
+                renderer,
+                &mut shell,
+                &bounds,
+            );
         };
-        deliver(&mut element, &mut tree, &renderer,
-            Event::Window(iced::window::Event::RedrawRequested(now)), mouse::Cursor::Unavailable);
+        deliver(
+            &mut element,
+            &mut tree,
+            &renderer,
+            Event::Window(iced::window::Event::RedrawRequested(now)),
+            mouse::Cursor::Unavailable,
+        );
         let cursor = mouse::Cursor::Available(Point::new(200.0, 150.0));
-        deliver(&mut element, &mut tree, &renderer, Event::Mouse(mouse::Event::WheelScrolled {
-            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 2.0 },
-        }), cursor);
-        deliver(&mut element, &mut tree, &renderer,
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), cursor);
-        deliver(&mut element, &mut tree, &renderer, Event::Mouse(mouse::Event::CursorMoved {
-            position: Point::new(220.0, 160.0),
-        }), mouse::Cursor::Available(Point::new(220.0, 160.0)));
-        let render = |element: &Element<'_, ()>, tree: &widget::Tree, renderer: &mut iced::Renderer| {
-            let extent = iced::Size::new(680, 540);
-            renderer.reset(Rectangle::with_size(iced::Size::new(680.0, 540.0)));
-            element.as_widget().draw(tree, renderer, &crate::fluent_theme::app_theme(false),
-                &renderer::Style::default(), Layout::new(&node), mouse::Cursor::Unavailable, &bounds);
-            renderer.screenshot(&iced::widget::shader::Viewport::with_physical_size(extent, 1.0), Color::WHITE)
-        };
+        deliver(
+            &mut element,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 2.0 },
+            }),
+            cursor,
+        );
+        deliver(
+            &mut element,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+            cursor,
+        );
+        deliver(
+            &mut element,
+            &mut tree,
+            &renderer,
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(220.0, 160.0),
+            }),
+            mouse::Cursor::Available(Point::new(220.0, 160.0)),
+        );
+        let render =
+            |element: &Element<'_, ()>, tree: &widget::Tree, renderer: &mut iced::Renderer| {
+                let extent = iced::Size::new(680, 540);
+                renderer.reset(Rectangle::with_size(iced::Size::new(680.0, 540.0)));
+                element.as_widget().draw(
+                    tree,
+                    renderer,
+                    &crate::fluent_theme::app_theme(false),
+                    &renderer::Style::default(),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &bounds,
+                );
+                renderer.screenshot(
+                    &iced::widget::shader::Viewport::with_physical_size(extent, 1.0),
+                    Color::WHITE,
+                )
+            };
         let before = render(&element, &tree, &mut renderer);
         let pixel = |image: &[u8], x: usize, y: usize| -> [u8; 3] {
-            image[(y * 680 + x) * 4..(y * 680 + x) * 4 + 3].try_into().unwrap()
+            image[(y * 680 + x) * 4..(y * 680 + x) * 4 + 3]
+                .try_into()
+                .unwrap()
         };
         let green = |color: [u8; 3]| color[0] < 10 && color[1] > 150 && color[2] < 10;
         // Expected transformed positions come from the physical wheel/pan
@@ -407,14 +485,27 @@ mod tests {
         assert_eq!(pixel(&before, 5, 30), [255; 3]); // The second label is clipped.
         assert_eq!(pixel(&before, 111, 122), [0; 3]); // Its original position moved.
         assert_eq!(pixel(&before, 572, 28), [255; 3]); // Enabled FPS background.
-        let glyph_pixels = (29..45).flat_map(|y| (580..632).map(move |x| (x, y)))
-            .filter(|&(x, y)| pixel(&before, x, y).into_iter().all(|channel| channel < 160))
+        let glyph_pixels = (29..45)
+            .flat_map(|y| (580..632).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                pixel(&before, x, y)
+                    .into_iter()
+                    .all(|channel| channel < 160)
+            })
             .count();
-        assert!(glyph_pixels >= 12, "FPS glyphs must occupy the counter interior");
+        assert!(
+            glyph_pixels >= 12,
+            "FPS glyphs must occupy the counter interior"
+        );
         let mut replacement = view(program(false), source);
         tree.diff(replacement.as_widget_mut());
-        deliver(&mut replacement, &mut tree, &renderer,
-            Event::Window(iced::window::Event::RedrawRequested(now)), cursor);
+        deliver(
+            &mut replacement,
+            &mut tree,
+            &renderer,
+            Event::Window(iced::window::Event::RedrawRequested(now)),
+            cursor,
+        );
         let after = render(&replacement, &tree, &mut renderer);
         assert_eq!(pixel(&after, 79, 98), pixel(&before, 79, 98));
         assert_eq!(pixel(&after, 11, 30), pixel(&before, 11, 30));
@@ -511,11 +602,18 @@ mod tests {
             snapshot.scene = scene.clone();
             snapshot.overlay = overlay.clone();
             Source::Detail(super::super::DetailContent {
-                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
+                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                    &snapshot,
+                )),
                 upscale: None,
             })
         };
-        assert!(collect(Source::Gallery(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)))).is_empty());
+        assert!(
+            collect(Source::Gallery(std::sync::Arc::new(
+                crate::generated::ExploreImageMetadata::from(&snapshot)
+            )))
+            .is_empty()
+        );
         let labels = collect(detail(&snapshot.scene, &snapshot.overlay));
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].2, "人");

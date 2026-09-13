@@ -23,11 +23,13 @@ class MaskRows final {
         std::vector<std::shared_ptr<Block>> blocks;
         std::size_t run_count = 0U;
     };
+
    public:
     void Assign(const contracts::AnnotationObject&);
-    void Stroke(contracts::AnnotationPoint, contracts::AnnotationPoint, std::uint16_t radius,
-                std::uint16_t width, std::uint16_t height, bool erase, MaskScratch&);
+    void Stroke(contracts::AnnotationPoint, contracts::AnnotationPoint, std::uint16_t radius, std::uint16_t width, std::uint16_t height,
+                bool erase, MaskScratch&);
     void Materialize(contracts::AnnotationObject&) const;
+
    private:
     std::shared_ptr<Index> index_;
 };

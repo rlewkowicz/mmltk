@@ -55,19 +55,30 @@ pub fn view(
     show_fps: bool,
 ) -> Element<'static, Message> {
     let (surface_width, surface_height) = surface_extent(center_width, selected);
-    let content: Element<'static, Message> = crate::presentation_surface::labels::view(crate::presentation_surface::Program {
-        show_fps,
-        input: Some(input),
-        local: None,
-        surface: surface.unwrap_or_else(Surface::empty),
-        publish: Some(Message::Gesture),
-        placement: crate::presentation_surface::Placement::Contain,
-        control_id: STABLE_ID,
-    }, crate::presentation_surface::labels::Source::Hidden);
+    let content: Element<'static, Message> = crate::presentation_surface::labels::view(
+        crate::presentation_surface::Program {
+            show_fps,
+            input: Some(input),
+            local: None,
+            surface: surface.unwrap_or_else(Surface::empty),
+            publish: Some(Message::Gesture),
+            placement: crate::presentation_surface::Placement::Contain,
+            control_id: STABLE_ID,
+        },
+        crate::presentation_surface::labels::Source::Hidden,
+    );
     let content = if surface.is_none() {
-        iced::widget::stack![content, container(text("Waiting for a completed native frame"))
-            .center(Fill).width(Fill).height(Fill)].into()
-    } else { content };
+        iced::widget::stack![
+            content,
+            container(text("Waiting for a completed native frame"))
+                .center(Fill)
+                .width(Fill)
+                .height(Fill)
+        ]
+        .into()
+    } else {
+        content
+    };
     iced::widget::column![
         container(crate::view::aspect_ratio::selector(
             selected,

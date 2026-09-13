@@ -138,8 +138,9 @@ int main(const int argument_count, char* const* const arguments) {
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture input unavailable"}},
         InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
-        InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
-                            .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
+        InteractionRejected{
+            .endpoint_id = application_stable_id("annotation", "Input"),
+            .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
     // An independent named persistence projection is test data, carried as a
