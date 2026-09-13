@@ -170,6 +170,11 @@ class AnnotationSystem::Impl final {
         input_worker_.WaitStopped();
     }
     [[nodiscard]] bool stopped() const noexcept { return input_worker_.stopped() && renderer_.stopped(); }
+    [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        if (state_.frame != frame) return std::nullopt;
+        return AnnotationSystem::visual_source::ImageOf(state_);
+    }
     [[nodiscard]] AnnotationSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
         return state_;
@@ -743,6 +748,7 @@ void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
 // CLEANUP-IGNORE: These direct methods expose Annotation's sealed owner; Live and Upscale retain independent system ownership.
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
+std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace AnnotationSystem::BorrowWorkspace() const { return impl_->renderer_.BorrowWorkspace(); }

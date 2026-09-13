@@ -1,4 +1,4 @@
-use crate::generated::{ExploreFilterUpdate, ExploreSnapshot, ExploreViewportUpdate, VisualExtent};
+use crate::generated::{ExploreFilterUpdate, ExploreImageMetadata, ExploreSnapshot, ExploreViewportUpdate, VisualExtent};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,10 +19,11 @@ impl GallerySource {
 
     fn hit(
         &self,
-        shown: &ExploreSnapshot,
+        shown: &ExploreImageMetadata,
         sample: crate::presentation_surface::SurfaceSample,
     ) -> Option<Option<u32>> {
-        (Self::current(Some(shown)).as_ref() == Some(self))
+        (shown.mode == crate::generated::ExploreMode::Gallery
+            && shown.dataset.identity == self.dataset && shown.frame == self.frame)
             .then(|| selected_at(Some(shown), sample))
     }
 }
@@ -46,7 +47,7 @@ impl GalleryHover {
     pub(super) fn capture(
         self: &Arc<Self>,
         source: Option<&GallerySource>,
-        shown: Option<&ExploreSnapshot>,
+        shown: Option<&ExploreImageMetadata>,
         gesture: crate::presentation_surface::SurfaceGesture,
         focus_ready: bool,
     ) -> Option<GalleryInput> {
@@ -230,7 +231,7 @@ impl GalleryGeometry {
 pub struct State {
     dataset_identity: u64,
     pub(super) fit_revision: u64,
-    pub(super) desired_original: Option<bool>,
+    detail_view: std::cell::Cell<Option<DetailView>>,
     submitted_filter: Option<SubmittedFilter>,
     sent_viewport: Option<ExploreViewportUpdate>,
     desired_viewport: Option<ExploreViewportUpdate>,
@@ -240,7 +241,35 @@ pub struct State {
     pub(super) gallery_hover: Arc<GalleryHover>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DetailView {
+    identity: Option<(u64, u32)>,
+    original: bool,
+    chosen: bool,
+}
+
 impl State {
+    pub(crate) fn detail_original(&self, content: &crate::presentation_surface::DetailContent) -> bool {
+        let identity = content.viewer_identity();
+        let mut view = self.detail_view.get().filter(|view| view.identity == identity)
+            .unwrap_or(DetailView { identity, original: content.original_dimensions(), chosen: false });
+        if !view.chosen { view.original = content.original_dimensions(); }
+        self.detail_view.set(Some(view));
+        view.original
+    }
+
+    pub(crate) fn choose_detail_original(&mut self, original: bool) {
+        if let Some(mut view) = self.detail_view.get() {
+            view.original = original;
+            view.chosen = true;
+            self.detail_view.set(Some(view));
+        }
+    }
+
+    pub fn abandon_detail(&mut self) {
+        self.detail_view.set(None);
+    }
+
     pub fn rebase(&mut self, snapshot: Option<&ExploreSnapshot>, bootstrap: bool) {
         if let Some(identity) = snapshot
             .map(|snapshot| snapshot.dataset.identity)
@@ -251,7 +280,7 @@ impl State {
             self.clear_viewport_admission();
         }
         if bootstrap {
-            self.desired_original = None;
+            self.abandon_detail();
             self.submitted_filter = None;
             self.clear_viewport_admission();
             if let Some(measured) = self.measured_gallery.as_mut() {
@@ -259,9 +288,6 @@ impl State {
                 measured.row_fraction = 0.0;
             }
         } else if let Some(snapshot) = snapshot {
-            if self.desired_original == Some(snapshot.detail.showoriginaldimensions) {
-                self.desired_original = None;
-            }
             if self.submitted_filter.as_ref().is_some_and(|submitted| {
                 !snapshot.busy
                     && snapshot.filter == submitted.request.filter
@@ -585,7 +611,7 @@ impl State {
         let source = GallerySource::current(snapshot);
         let hit = source
             .as_ref()
-            .and_then(|source| source.hit(displayed_snapshot?, gesture.sample));
+            .and_then(|source| source.hit(&ExploreImageMetadata::from(displayed_snapshot?), gesture.sample));
         self.gallery_input(
             snapshot,
             GalleryInput {
@@ -657,7 +683,7 @@ fn measured_dimension(value: f32) -> f32 {
 }
 
 pub(super) fn selected_at(
-    snapshot: Option<&ExploreSnapshot>,
+    snapshot: Option<&ExploreImageMetadata>,
     sample: crate::presentation_surface::SurfaceSample,
 ) -> Option<u32> {
     let snapshot = snapshot?;
@@ -734,7 +760,7 @@ mod tests {
     fn local_focus(state: &State, snapshot: &ExploreSnapshot) -> Option<GalleryInput> {
         state.gallery_hover.capture(
             GallerySource::current(Some(snapshot)).as_ref(),
-            Some(snapshot),
+            Some(&ExploreImageMetadata::from(snapshot)),
             crate::presentation_surface::SurfaceGesture {
                 kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
                 sample: gallery_sample(150, 150),
@@ -890,7 +916,7 @@ mod tests {
         assert!(
             state
                 .gallery_hover
-                .capture(source.as_ref(), Some(&changed), gesture, true)
+                .capture(source.as_ref(), Some(&ExploreImageMetadata::from(&changed)), gesture, true)
                 .is_none()
         );
         changed = snapshot.clone();
@@ -898,7 +924,7 @@ mod tests {
         assert!(
             state
                 .gallery_hover
-                .capture(source.as_ref(), Some(&changed), gesture, true)
+                .capture(source.as_ref(), Some(&ExploreImageMetadata::from(&changed)), gesture, true)
                 .is_none()
         );
         assert!(
@@ -1436,14 +1462,14 @@ mod tests {
                 (399, 200, None),
                 (u32::MAX, u32::MAX, None),
             ] {
-                assert_eq!(selected_at(Some(&snapshot), gallery_sample(x, y)), expected);
+                assert_eq!(selected_at(Some(&ExploreImageMetadata::from(&snapshot)), gallery_sample(x, y)), expected);
             }
         }
         assert_eq!(selected_at(None, gallery_sample(0, 0)), None);
         let mut empty = snapshot.clone();
         empty.order.visibleindices.clear();
         empty.gallery.slots.clear();
-        assert_eq!(selected_at(Some(&empty), gallery_sample(0, 0)), None);
+        assert_eq!(selected_at(Some(&ExploreImageMetadata::from(&empty)), gallery_sample(0, 0)), None);
         for invalid in 0..4 {
             let mut snapshot = snapshot.clone();
             match invalid {
@@ -1452,7 +1478,7 @@ mod tests {
                 2 => snapshot.gallery.layout.cardextent = 0,
                 _ => snapshot.gallery.layout.rowcount = 0,
             }
-            assert_eq!(selected_at(Some(&snapshot), gallery_sample(0, 0)), None);
+            assert_eq!(selected_at(Some(&ExploreImageMetadata::from(&snapshot)), gallery_sample(0, 0)), None);
         }
     }
 
@@ -1561,7 +1587,7 @@ mod tests {
                     height: 500,
                     ..gallery_sample(x, y)
                 };
-                assert_eq!(selected_at(Some(&snapshot), sample), expected);
+                assert_eq!(selected_at(Some(&ExploreImageMetadata::from(&snapshot)), sample), expected);
                 for kind in [
                     crate::presentation_surface::SurfaceGestureKind::Pointer,
                     crate::presentation_surface::SurfaceGestureKind::Viewport,

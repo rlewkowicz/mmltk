@@ -98,6 +98,11 @@ class LiveSystem::Impl final {
         worker_.StopAndWait();
     }
     bool stopped() const noexcept { return worker_.stopped(); }
+    [[nodiscard]] std::optional<VisualImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        if (state_.frame != frame) return std::nullopt;
+        return LiveSystem::visual_source::ImageOf(state_);
+    }
     LiveSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
         return state_;
@@ -224,6 +229,7 @@ LiveSnapshot LiveSystem::Stop() noexcept {
 void LiveSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool LiveSystem::stopped() const noexcept { return impl_->stopped(); }
 LiveSnapshot LiveSystem::snapshot() const { return impl_->snapshot(); }
+std::optional<VisualImageMetadata> LiveSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView LiveSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace LiveSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation LiveSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

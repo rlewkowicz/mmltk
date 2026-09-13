@@ -6,13 +6,6 @@ use super::{
 use crate::application_codec::{FromApplicationValue, IntoApplicationValue, Value};
 use crate::generated::{EventDelivery, MAX_INTENT_FIELDS, MAX_SNAPSHOT_COUNT, ServerRecordKind};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RendererObservation {
-    Ready,
-    Surface { width: u32, height: u32, scale: f64 },
-    Presented { sample_revision: u64 },
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bootstrap {
     pub schema_fingerprint: [u64; 2],
@@ -130,35 +123,6 @@ impl Interaction {
         let mut bytes = Vec::new();
         super::client_records::encode_interaction_bytes(self.endpoint_id, &self.value, &mut bytes)?;
         Ok(bytes)
-    }
-}
-
-impl RendererObservation {
-    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
-        let (kind, width, height, scale, revision) = match *self {
-            Self::Ready => ("Ready", 0, 0, 1.0, 0),
-            Self::Surface {
-                width,
-                height,
-                scale,
-            } if width != 0 && height != 0 && scale.is_finite() && scale > 0.0 => {
-                ("Surface", width, height, scale, 0)
-            }
-            Self::Presented { sample_revision } if sample_revision != 0 => {
-                ("Presented", 0, 0, 1.0, sample_revision)
-            }
-            _ => return Err(ProtocolError("renderer observation is invalid".into())),
-        };
-        encode_envelope(
-            "RendererObservation",
-            &protocol_payload([
-                ("kind", Value::Text(kind.into())),
-                ("width", Value::Unsigned(u64::from(width))),
-                ("height", Value::Unsigned(u64::from(height))),
-                ("scale", Value::Float(scale)),
-                ("sample_revision", Value::Unsigned(revision)),
-            ]),
-        )
     }
 }
 
@@ -610,7 +574,7 @@ mod tests {
     }
 
     fn client_fixtures() -> Vec<(&'static str, Vec<u8>)> {
-        include_str!(env!("MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH"))
+        include_str!(env!("MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH"))
             .lines()
             .map(|line| {
                 let (kind, hex) = line.split_once(' ').expect("client fixture");
@@ -620,7 +584,7 @@ mod tests {
     }
 
     fn native_server_fixtures() -> Vec<&'static [u8]> {
-        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V16_SERVER_FIXTURE_PATH"));
+        let bytes = include_bytes!(env!("MMLTK_PROTOCOL_V17_SERVER_FIXTURE_PATH"));
         let mut records = Vec::new();
         let mut cursor = 0;
         while cursor < bytes.len() {
@@ -640,19 +604,12 @@ mod tests {
     }
 
     #[test]
-    fn client_records_match_native_protocol_sixteen_fixtures() {
+    fn client_records_match_native_protocol_seventeen_fixtures() {
         let fixtures = client_fixtures();
         // Native interop checks exhaustive coverage against the reflected variant.
         for (kind, bytes) in &fixtures {
             assert!(decode_envelope(bytes).is_ok(), "invalid fixture {kind}");
         }
-        let observation = RendererObservation::Surface {
-            width: 640,
-            height: 480,
-            scale: 1.5,
-        }
-        .encode()
-        .expect("encode renderer observation");
         assert!(
             [
                 "Intent:settings.Update",
@@ -663,7 +620,6 @@ mod tests {
             .into_iter()
             .all(|kind| fixtures.iter().any(|record| record.0 == kind))
         );
-        assert!(fixtures.contains(&("RendererObservation", observation)));
 
         let dialog = fixtures
             .iter()
@@ -826,7 +782,7 @@ mod tests {
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogSelected(value) => {
                         assert!(selected);
-                        assert_eq!(value.path, "/tmp/protocol-v16-fixture");
+                        assert_eq!(value.path, "/tmp/protocol-v17-fixture");
                     }
                 crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::
                     FileDialogCancelled(_) => assert!(!selected),

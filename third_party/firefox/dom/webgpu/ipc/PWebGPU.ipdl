@@ -56,11 +56,8 @@ parent:
                                    uint64_t aContentSession,
                                    uint64_t aContentSequence,
                                    uint64_t aPresentationRevision);
-  async WorkspaceRequest(RawId aDeviceId, uint64_t aSurfaceIdHigh,
-                         uint64_t aSurfaceIdLow, uint32_t aWidth, uint32_t aHeight);
-  async WorkspaceAcquire(RawId aDeviceId, uint64_t aSurfaceIdHigh,
-                         uint64_t aSurfaceIdLow, uint64_t aContentSession,
-                         uint64_t aContentSequence, uint64_t aPublication);
+  async WorkspaceBind(RawId aDeviceId);
+  async WorkspaceUnbind(RawId aDeviceId);
 
 
 child:
@@ -76,7 +73,9 @@ child:
                              uint64_t aContentSession, uint64_t aContentSequence,
                              uint64_t aPresentationRevision,
                              uint32_t aContentWidth, uint32_t aContentHeight, bool aCopyComplete,
-                                  uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling);
+                                  uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling,
+                                  uint32_t aCapacityWidth, uint32_t aCapacityHeight,
+                                  uint64_t aTransferSequence, uint8_t[] aMetadata);
   async __delete__();
 };
 

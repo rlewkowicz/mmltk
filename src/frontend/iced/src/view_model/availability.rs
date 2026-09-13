@@ -340,7 +340,7 @@ impl ApplicationModel {
         self.explore_mutation_available()
     }
 
-    pub fn annotation_open_available(&self) -> bool {
+    pub fn annotation_import_available(&self) -> bool {
         self.connection == ConnectionState::Connected
             && !self.native_settings_unsettled()
             && self
@@ -349,6 +349,10 @@ impl ApplicationModel {
                 .as_ref()
                 .is_some_and(|snapshot| !snapshot.busy && !snapshot.cancellationrequested)
             && !self.has_annotation_pending()
+    }
+
+    pub fn annotation_open_available(&self) -> bool {
+        self.annotation_import_available()
             && (self.explore.snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.mode == crate::generated::ExploreMode::Detail
                     && snapshot.selectedimage.is_some()

@@ -6,12 +6,22 @@
 
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/frameworks/reflection/record_projection.h"
 
 namespace mmltk::controller {
 
-template <class Snapshot, PresentationSourceKind Kind, auto Frame, auto Revision>
+struct VisualImageMetadata final { VisualFrame frame{}; };
+MMLTK_REFLECT_FIELDS(VisualImageMetadata)
+
+template <class Snapshot, PresentationSourceKind Kind, auto Frame, auto Revision, class Image = VisualImageMetadata>
 struct VisualSourceProjection final {
     using snapshot_type = Snapshot;
+    using image_type = Image;
+    [[nodiscard]] static Image ImageOf(const Snapshot& snapshot) {
+        if constexpr (std::same_as<Image, VisualImageMetadata>)
+            return {.frame = mmltk::frameworks::reflection::access<const Snapshot, Frame>(snapshot)};
+        else return mmltk::frameworks::reflection::project_record<Image>(snapshot);
+    }
     static constexpr auto kind = Kind;
     static constexpr auto frame = Frame;
     static constexpr auto revision = Revision;

@@ -13,7 +13,7 @@ set(MMLTK_ICED_TEST_ARGUMENTS "" CACHE STRING
 add_library(mmltk_frontend_iced INTERFACE)
 add_library(mmltk::frontend::iced ALIAS mmltk_frontend_iced)
 target_link_libraries(mmltk_frontend_iced INTERFACE
-    mmltk::controller::browser::protocol_v16
+    mmltk::controller::browser::protocol_v17
 )
 
 set(MMLTK_FRONTEND_ICED_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -102,8 +102,8 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
     set(_mmltk_frontend_build_inputs
         "${MMLTK_APPLICATION_BINDINGS}"
         "${MMLTK_BROWSER_PROTOCOL_MARKER}"
-        "${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}"
-        "${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}"
+        "${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
+        "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}"
         "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
         "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.lock"
         "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/.cargo/config.toml"
@@ -113,28 +113,28 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         ${_mmltk_frontend_source_inputs}
         ${_mmltk_iced_inputs}
     )
-    set(_mmltk_protocol_v16_environment
+    set(_mmltk_protocol_v17_environment
         "MMLTK_APPLICATION_BINDINGS_PATH=${MMLTK_APPLICATION_BINDINGS}"
-        "MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH=${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}"
-        "MMLTK_PROTOCOL_V16_SERVER_FIXTURE_PATH=${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}")
-    set(_mmltk_frontend_environment ${_mmltk_protocol_v16_environment})
+        "MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH=${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
+        "MMLTK_PROTOCOL_V17_SERVER_FIXTURE_PATH=${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}")
+    set(_mmltk_frontend_environment ${_mmltk_protocol_v17_environment})
 
     add_custom_command(
-        OUTPUT "${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}"
+        OUTPUT "${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${CMAKE_BINARY_DIR}/generated/frontend/iced"
         COMMAND "${CMAKE_COMMAND}" -E env
-            ${_mmltk_protocol_v16_environment}
+            ${_mmltk_protocol_v17_environment}
             "${MMLTK_CARGO_EXECUTABLE}" run
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
             --locked
             --frozen
-            --bin protocol_v16_client_fixture
+            --bin protocol_v17_client_fixture
             --
-            "${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}"
+            "${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
         DEPENDS
             "${MMLTK_APPLICATION_BINDINGS}"
-            "${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}"
+            "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}"
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.lock"
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/.cargo/config.toml"
@@ -145,15 +145,15 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/src/protocol/client_records.rs"
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/src/protocol/cbor.rs"
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/src/protocol/records.rs"
-            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/src/bin/protocol_v16_client_fixture.rs"
+            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/src/bin/protocol_v17_client_fixture.rs"
         WORKING_DIRECTORY "${MMLTK_FRONTEND_ICED_SOURCE_DIR}"
         VERBATIM)
-    add_custom_target(mmltk_frontend_iced_protocol_v16_client_fixture
-        DEPENDS "${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}")
-    add_custom_target(mmltk_protocol_v16_generation
+    add_custom_target(mmltk_frontend_iced_protocol_v17_client_fixture
+        DEPENDS "${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}")
+    add_custom_target(mmltk_protocol_v17_generation
         DEPENDS
-            mmltk_controller_browser_protocol_v16_boundary
-            mmltk_frontend_iced_protocol_v16_client_fixture)
+            mmltk_controller_browser_protocol_v17_boundary
+            mmltk_frontend_iced_protocol_v17_client_fixture)
 
     add_custom_target(mmltk_frontend_iced_check
         COMMAND "${CMAKE_COMMAND}" -E env
@@ -181,12 +181,13 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         VERBATIM
     )
     add_dependencies(mmltk_frontend_iced_check
-        mmltk_controller_browser_protocol_v16_boundary
+        mmltk_controller_browser_protocol_v17_boundary
     )
 
     add_custom_target(mmltk_frontend_iced_tests
         COMMAND "${MMLTK_FRONTEND_NODE_EXECUTABLE}" --test
             "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/integration_control.test.mjs"
+            "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/tests/workspace_graphics.test.mjs"
         COMMAND "${CMAKE_COMMAND}" -E env
             ${_mmltk_frontend_environment}
             "${MMLTK_CARGO_EXECUTABLE}" test
@@ -200,7 +201,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         VERBATIM
     )
     add_dependencies(mmltk_frontend_iced_tests
-        mmltk_controller_browser_protocol_v16_boundary
+        mmltk_controller_browser_protocol_v17_boundary
     )
 
     set(_mmltk_frontend_dist_next_dir
@@ -237,7 +238,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         DEPENDS "${_mmltk_frontend_build_stamp}"
     )
     add_dependencies(mmltk_frontend_iced_bundle
-        mmltk_controller_browser_protocol_v16_boundary
+        mmltk_controller_browser_protocol_v17_boundary
     )
     add_dependencies(mmltk_frontend_iced mmltk_frontend_iced_bundle)
 

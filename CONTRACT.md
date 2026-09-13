@@ -53,25 +53,39 @@ bindings project native facts; mutation remains with the owning system.
 | Editable annotation documents and editing history | `AnnotationSystem` |
 | Upscale work and derived image products | `UpscaleSystem` |
 | Live capture, processing, and image products | `LiveSystem` |
-| Foreground source selection, workspace admission, exact publication, and native graphics timelines | `PresentationSystem` |
+| Foreground source routing, workspace admission, and graphics connection lifetime | `PresentationSystem` |
 | Navigation, drafts, modal visibility, scroll, selection, and typed event reduction | Rust presentation model and the component owning each UI fact |
-| Widgets, view transforms, styling, rendering, and retained redraw images | Owning Rust/Iced components |
+| Widgets, view transforms, styling, image metadata interpretation, and retained redraw images | Owning Rust/Iced components |
 | Firefox process lifetime and Linux process registrations | `FirefoxProcessOwner` |
 | Vulkan source images, independent backing allocations, views, external timelines, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
 
-Each domain system also owns its private workers, GPU resources, models,
-reusable staging, and final display workspace demand and reuse. Producers finalize
-display pixels in their own execution boundary. Firefox allocates each physical
-Vulkan workspace and exports its independent memory and timeline resources.
-Presentation coordinates admission; native CUDA imports retain backing and
-context custody through all native writes and raw readers.
+Each domain system also owns its private workers, GPU resources, models, and
+reusable content. All workspace sources use shared input and rendering facilities.
+The common renderer owns autonomous incremental drawing, reusable display storage,
+damage, and asynchronous graphics handoffs. Product systems supply their native
+content and domain drawing operations. Rendering retained content reuses completed
+inference, upscaling, decoding, and capture results.
 
-Annotation owns an independent input executor and its sole mutable document,
-editing history, and gesture reduction. Its renderer receives bounded immutable
-descriptions, retaining the newest unsubmitted work. GPU source preparation and
-color sampling return ordered continuations to the document owner. Accepted
-ordinary input and document commands progress independently of rendering and
-external image readers.
+Firefox allocates the foreground workspace's two physical Vulkan display buffers
+and exports their independent memory and timeline resources. Native rendering
+finalizes display pixels and signals readiness in its GPU execution boundary.
+Presentation coordinates source routing and admission; native CUDA imports retain
+backing and context custody through all native writes and raw readers. The FD
+graphics connection and external GPU semaphores own the complete graphics handoff.
+
+Every workspace tab captures and delivers mouse input through the same immediate
+path and canonical vocabulary. Movement, all button transitions, click semantics,
+wheel input, and cancellation reach the appropriate native owner in order.
+Iced retains local view transforms and component state. Domain owners apply their
+own interaction behavior through the shared input facilities.
+
+Annotation owns its sole mutable document, editing history, hit testing, and
+gestures. Its input executor uses the shared workspace input facilities.
+The shared autonomous renderer consumes coherent native state independently of
+input arrival.
+GPU source preparation and color sampling return ordered continuations to the
+document owner. Accepted ordinary input and document commands progress
+independently of rendering and external image readers.
 
 ## Model, presentation model, and views
 
@@ -108,6 +122,12 @@ snapshots. Input is fully validated before dispatch. Transport queues and
 backpressure remain bounded; loss of essential state continuity closes the
 peer so reconnection can install current snapshots.
 
+The application connection carries input, settings, navigation, document
+commands, and logical UI facts. Graphics allocations, completed images,
+image-dependent metadata, and GPU read/write ownership flow through the separate
+FD graphics connection. A workspace component binds to that graphics source
+independently of application snapshot delivery.
+
 Rust owns presentation state and deliberate Iced views. Typed native replies
 and events update that state; UI actions submit typed operations to the owning
 C++ systems. Component-local interaction stays local, and routing composes
@@ -122,19 +142,19 @@ Progress appears with its owning operation or model. Known totals support
 determinate progress; open-ended work exposes stage, activity, and completed
 work. Completion and failure come from typed native results and events.
 
-Images and their annotation meaning share exact source identity, revision, and
-geometry through preview, augmentation, upscale, and editing. Clean pixels and
-native semantic image planes remain separate until producer-owned final display
-composition.
-Iced draws text labels from matching typed annotation facts. Class colors
-remain deterministic and stable across filtering and transformations.
+Images and their annotation meaning share source identity and geometry through
+preview, augmentation, upscale, and editing. Clean pixels and native semantic
+image planes remain separate until producer-owned final display composition.
+Iced draws text labels from typed facts paired with the displayed image through
+the graphics connection. Class colors remain deterministic and stable across
+filtering and transformations.
 Visibility controls preserve the underlying objects. Annotation imports are
 atomic; editing, undo, redo, and saving preserve operation order and geometry.
 Derived results match the current source and requested processing parameters.
 
-Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of browser-owned
-images authorized by matching native state. Native product dimensions remain
-independent of window size. Images and semantics use the same view geometry.
+Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of completed
+workspace images. Native product dimensions remain independent of window size.
+Images and their attached metadata use the same view geometry.
 Same-image revisions retain viewer identity and transforms; a new image resets
 them. Stable widget identities preserve interaction state through ordinary
 updates.
@@ -142,22 +162,23 @@ updates.
 ## GPU buffer flow
 
 ```text
-Independent producers: raw products + final shared display workspaces
-                      │ completed workspace and exact model facts
+Independent producers: raw products + reusable final display workspaces
+                      │ completed image, attached metadata, ready semaphore
                       ▼
-PresentationSystem: allocation/import coordination + completed offers
-                      │ nonblocking exact read acquisition
+FD graphics connection: Vulkan allocations and CUDA/Vulkan handoffs
+                      │ latest completed image with GPU read custody
                       ▼
-Firefox: directly sampled source, or capability-selected single copy
-                      │ acquired sample + matching model
-                      ▼
-Iced rendering → Firefox swapchain/compositor → Wayland
+Iced workspace drawing → Firefox swapchain/compositor → Wayland
+                      │ final GPU read and reuse semaphore
+                      └──────────────────────→ producer back-buffer reuse
 ```
 
 Producers retain independent, reusable resources while backgrounded. A clean
-single-plane product uses its admitted final storage directly. Products with
-native semantic planes retain those raw planes and perform one fused final
-composition. Algorithm systems continue to borrow raw products for explicit
+single-plane product writes directly into available admitted final storage when
+its raw-reader and graphics lifetimes permit. Otherwise raw production continues
+in retained native storage. Products with native semantic planes retain those
+raw planes and perform one fused final composition. Algorithm systems continue
+to borrow raw products for explicit
 receiver-owned copies; their clean pixels, documents, and semantic meaning
 remain independent of display preparation.
 
@@ -172,38 +193,37 @@ Late admission uses retained raw data without rerunning inference, reapplying
 edits, or requiring another camera frame.
 Logical completion and ordered input consumption never wait for the browser.
 
-Presentation publishes a completed workspace's exact identity on that source's
-native graphics timeline. Availability alone grants no browser read custody.
-Firefox acquires the newest completed publication authorized by available model
-facts during draw preparation. Acquisition and producer reservation share the
-physical allocation's nonblocking gate. A failed acquisition retains the completed
-fallback without waiting for unfinished production. Source observation,
-product revision, physical allocation, source admission, and sample-arena
-identity have separate meanings. Selecting a retained gallery may publish an
-older real product revision under a newer domain observation.
+The foreground workspace has two persistent shared display buffers with front/back
+ownership, independently of retained native image products and document history.
+The producer writes a reusable back buffer, completes its image and attached
+metadata, and signals readiness through the external GPU semaphore.
+The graphics owner selects the latest completed buffer locally during draw
+preparation and retains the previous completed image while newer work is
+unfinished. The browser returns a buffer for reuse after its final GPU read
+and ownership release. External semaphore completion orders actual device access.
+Raw consumers independently retain the products they read.
 
-Each selected producer has reusable current and overflow capacity. Promotion
-exchanges roles without copying pixels. Raw consumers and externally acquired
-readers independently prevent reuse; unacquired overflow remains replaceable.
-Firefox directly samples shared source storage when the actual requesting device
-supports its exact layout and usage. Otherwise, it uses one GPU copy into
-bounded reusable sample storage.
-Direct mode allocates no sample-arena pixel storage and performs no presentation copy.
-Source retirement waits for that source's GPU reads. Copied pixels retain their
-own lifetime for future draws. Capacity growth retains the old completed image
-until replacement is usable. Setup and retirement run through asynchronous
-graphics owners; active, candidate, and retiring storage remain bounded.
+Buffer promotion exchanges roles without copying pixels. Firefox directly samples
+shared source storage when its requesting device supports the layout and usage.
+The capability fallback performs one GPU copy into bounded reusable sample
+storage. Copied pixels retain their own lifetime for future draws. Source
+retirement waits for the source's physical GPU reads. Capacity growth preserves
+the completed image until replacement is usable and retains useful high-water
+capacity. Setup, growth, and retirement remain asynchronous and bounded.
 
-Source acquisition, release submission, physical read settlement, and page
-sample release are separate facts.
-Copy mode additionally proves actual native-to-sample completion. Iced samples
-the exact acquired source or copied slot with its retained model facts. Display
-custody and each encoded draw retain independent references; actual submission
-settlement or unsubmitted abandonment releases draw custody. A completed direct
-acquisition or a completed capability copy promotes the matching fallback.
-Page and device teardown settle terminal resource ownership independently from
-rendering success. The last completed browser image remains drawable through
-newer work, capacity pressure, source changes, or presentation failure.
+Image dimensions, crop, atlas placement, labels, and other image-dependent facts
+travel with the image they describe. Firefox transports application metadata
+opaquely; the owning Rust workspace component interprets the generated native
+types. The graphics handoff makes that image and its metadata available together.
+Application snapshots independently describe logical UI state and operation
+outcomes.
+
+Display custody and each encoded draw retain independent resource references.
+Actual submission settlement or unsubmitted abandonment releases draw custody.
+Direct reads and capability copies preserve their respective physical completion
+requirements. Page and device teardown settle terminal resource ownership
+independently from rendering success. The last completed image remains drawable
+through newer work, capacity pressure, source changes, or presentation failure.
 
 Display-device mismatch uses producer-owned finalization through the existing
 peer or reusable pinned transfer route. Same-GPU display keeps pixels on the
@@ -226,8 +246,9 @@ local pages through every consumer; unavailable required placement or policy
 becomes an operation failure. Independent systems own their worker budgets and
 may overlap eligible CPUs.
 
-Duplicate discrete operations report busy; cancellation requests the owning
-system's stop mechanism. Synchronous exceptions propagate through direct calls
+Duplicate discrete jobs report busy. Ordered document commands retain their
+admitted sequence, and cancellation requests the owning system's stop mechanism.
+Synchronous exceptions propagate through direct calls
 and become typed failures once at the nearest operation, worker, or external
 service boundary. A failed system preserves valid snapshots, reports failure,
 and retires its failed resources safely. Recoverable runtimes reconstruct
@@ -253,26 +274,29 @@ resources safe to destroy and shutdown outcomes observable.
 
 ## Performance and observability
 
-Execution is event-driven, with bounded native admission and outstanding GPU
-work. Independent systems run concurrently; replaceable high-rate work
-coalesces in constant time, while ordered editing preserves every accepted
-path-dependent sample through temporary pressure.
+Execution uses system-owned workers and completion notifications, with bounded
+outstanding GPU work. Independent systems run concurrently. Ordered mouse input
+preserves every accepted event through temporary pressure and reaches the native
+owner immediately. Native event storage retains useful high-water capacity.
 Input consumption, document-command settlement, and image publication progress
-independently while retaining their required order. Long-lived buffers retain
-useful high-water capacity and reuse tightly sized storage. Steady-state
-graphics work avoids allocation and unnecessary CPU/GPU transfers, blocking,
-and memory churn.
+independently while retaining their required order. Long-lived buffers reuse
+tightly sized storage; steady-state graphics reuses geometry, image planes, and
+staging while updating affected content.
 
-Logical annotation UI facts describe the latest committed document. Published
-frames retain their exact rendered geometry while newer input progresses.
-Compact preview updates and reconnect preserve current logical state and
-retained drawable facts within bounded transport. New gestures use displayed
-geometry and the current logical tool. Document/history-owned runtime identities
-keep surviving targets editable while rendering lags, prevent deleted targets
-from silently retargeting reused positions, and survive Undo/Redo without
-changing saved formats. Accepted gestures retain their target independently
-of newer rendering. Input consumption and GPU-dependent command completion
-retain separate settlement ordering.
+Logical annotation UI facts describe the latest committed document. A new gesture
+resolves its target from the current native document and logical tool; accepted
+progress retains that target independently of rendering. Document/history-owned
+identities preserve editing and Undo/Redo without changing saved formats. Input
+consumption and GPU-dependent document commands retain their separate completion
+requirements. The autonomous renderer consumes coherent native state and keeps
+its useful caches while external display storage is occupied.
+
+Explore mouse focus updates loading priority. Viewport changes, newly loaded
+content, and actual product changes update the content used by shared incremental
+rendering. All visual producers use that autonomous rendering path. Browser redraws
+follow the visible window's graphics cadence and can reuse unchanged completed pixels.
+The optional workspace FPS display counts actual browser queue submissions
+containing workspace draws and belongs to the workspace component.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and
 failure context. Disabled diagnostics create no active diagnostic or probe

@@ -700,6 +700,9 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
 
     void SetGalleryReadySink(GalleryReadySink sink) override { gallery_.SetReadySink(std::move(sink)); }
     void SetCurrentDemand(ExploreDemandCheck check) override { gallery_.SetCurrentDemand(std::move(check)); }
+    void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority> priority) override {
+        gallery_.SetLoadingPriority(std::move(priority));
+    }
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate) const override {
         const auto* dataset = candidate != nullptr && open_candidate_ ? open_candidate_.get() : committed_.get();
         const auto& order = CandidateOrder(candidate);

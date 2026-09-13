@@ -516,7 +516,7 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     CHECK(std::get<InputProgress>(decode(*replacement_progress)).progress.epoch == std::get<Bootstrap>(bootstrap).input_epoch);
 }
 
-TEST_CASE("direct host closes a real peer on malformed Protocol-16 input") {
+TEST_CASE("direct host closes a real peer on malformed Protocol-17 input") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());

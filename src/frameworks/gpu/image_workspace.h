@@ -87,6 +87,8 @@ using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePla
 // custody. No import registry or scheduling policy lives in this owner.
 class ImageWorkspace final {
    public:
+    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout,
+                                                                std::optional<DeviceExecution> = {});
     ~ImageWorkspace() noexcept;
     ImageWorkspace(const ImageWorkspace&) = delete;
     ImageWorkspace& operator=(const ImageWorkspace&) = delete;
@@ -97,6 +99,12 @@ class ImageWorkspace final {
     [[nodiscard]] mmltk::common::io::ScopedFd ExportAccessDescriptor() const;
     [[nodiscard]] bool WriteAvailable() const noexcept;
     [[nodiscard]] bool ReserveWrite();
+    [[nodiscard]] bool display_owned() const noexcept;
+    [[nodiscard]] bool ReserveDisplayWrite();
+    void CancelDisplayWrite() noexcept;
+    void Detach(std::uint64_t product_owner);
+    [[nodiscard]] std::uint64_t product_owner() const noexcept;
+    void SetDisplayAvailabilitySink(std::shared_ptr<const std::function<void()>>) noexcept;
     void InvalidateWrite() noexcept;
     void CancelWrite() noexcept;
     [[nodiscard]] bool Acquired(std::uint64_t generation) const noexcept;
@@ -111,6 +119,8 @@ class ImageWorkspace final {
     void Withdraw() noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] ImageStreamSettlement Settle() noexcept;
+    [[nodiscard]] ImagePlaneView plane(std::uint32_t width, std::uint32_t height) const;
+    void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
 
    private:
     // Shared by every candidate in one runtime, including candidates that
@@ -141,12 +151,11 @@ class ImageWorkspace final {
     std::shared_ptr<State> state_;
     ImageWorkspace(std::shared_ptr<Owner>, DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>,
                    const Operations* = nullptr);
-    [[nodiscard]] ImagePlaneView plane(std::uint32_t width, std::uint32_t height) const;
     [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
     void CheckOwner(const std::shared_ptr<Owner>& = {}) const;
     void Attach(std::uint64_t product_owner);
+    [[nodiscard]] ImagePlaneView ProducerPlane(const DeviceContext&, std::uint32_t width, std::uint32_t height);
     void SetAvailabilitySink(std::shared_ptr<const std::function<void()>>) noexcept;
-    void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
     friend class ImageProductBuffer;
     friend class BorrowedImageWorkspace;
     friend class ImageStream;

@@ -44,6 +44,10 @@ impl App {
     }
 
     pub(super) fn abandon_explore_edit(&mut self, context: ApplicationIntentEndpoint) {
+        if context == ApplicationIntentEndpoint::ExploreUpdateDetail {
+            self.workspace.explore_abandon_detail();
+            self.model.explore.desired_detail = None;
+        }
         if matches!(
             context,
             ApplicationIntentEndpoint::ExploreUpdateFilter

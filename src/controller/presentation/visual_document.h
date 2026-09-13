@@ -8,6 +8,10 @@
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/frameworks/gpu/image_buffer.h"
 
+namespace mmltk::frameworks::serialization::wire {
+class Value;
+}
+
 namespace mmltk::controller {
 
 struct VisualDocumentFacts final {
@@ -35,6 +39,9 @@ struct VisualDocument final {
 struct VisualDocumentRead final {
     mmltk::frameworks::gpu::BorrowedImageProductReadView pixels{};
     std::shared_ptr<const VisualDocument> document{};
+    // Source-owned reflected image meaning retained with the exact borrowed
+    // product. Receiver products carry it without consulting mutable UI state.
+    std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> image_metadata{};
     [[nodiscard]] bool valid() const noexcept { return pixels.valid() && document != nullptr; }
 };
 using ExactVisualDocumentBorrower = std::function<VisualDocumentRead(const VisualFrame&)>;

@@ -144,6 +144,23 @@ struct ExploreGalleryReadiness final {
     ExploreAtlasLayout layout{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreVisibleItemCapacity}]] std::vector<bool> slots{};
 };
+struct ExploreImageMetadata final {
+    std::uint64_t revision = 0U;
+    ExploreDatasetFacts dataset{};
+    ExploreOrderFacts order{};
+    ExploreGalleryReadiness gallery{};
+    ExploreViewport viewport{};
+    ExploreOverlay overlay{};
+    ExploreDetailView detail{};
+    ExploreAugmentationPreview augmentation{};
+    ExploreMode mode = ExploreMode::Gallery;
+    std::optional<std::uint32_t> selected_image{};
+    VisualFrame frame{};
+    VisualDocumentFacts document{};
+    contracts::AnnotationSceneContent scene{};
+    [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
+};
+
 struct ExploreSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
@@ -225,6 +242,21 @@ class ExploreDemandCheck final {
     std::shared_ptr<const std::atomic<std::uint64_t>> generation_;
 };
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+// Input updates this bounded scalar; the loader reads it at its next scheduling
+// opportunity. It neither invalidates demand nor requests image production.
+class ExploreLoadingPriority final {
+   public:
+    void Focus(const std::optional<std::uint32_t> index) noexcept {
+        focused_.store(index ? static_cast<std::uint64_t>(*index) + 1U : 0U, std::memory_order_release);
+    }
+    [[nodiscard]] std::optional<std::uint32_t> focused() const noexcept {
+        const auto value = focused_.load(std::memory_order_acquire);
+        return value == 0U ? std::nullopt : std::optional{static_cast<std::uint32_t>(value - 1U)};
+    }
+
+   private:
+    std::atomic<std::uint64_t> focused_{0U};
+};
 enum class ExploreOutputChange : std::uint8_t { Initialize, Semantic, Unchanged };
 // Renderer-owned physical high-water capacities. Host bytes cover retained
 // cache meaning and render/scheduler metadata, not the compiled dataset, order,
@@ -279,6 +311,7 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
     // Bind once during runtime construction, before any image ingress.
     virtual void SetCurrentDemand(ExploreDemandCheck) = 0;
+    virtual void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority>) {}
     [[nodiscard]] virtual ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const = 0;
     [[nodiscard]] virtual ExploreStorageFootprint StorageFootprint() const { return {}; }
     // Logical candidate meaning follows the prepared GPU output. Commit this
@@ -316,7 +349,7 @@ class ExploreSystem final {
    public:
     using visual_source = VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
                                                  mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
     using event_type = std::variant<ExploreChanged, ExploreFailed>;
     // CLEANUP-IGNORE: Explore construction retains its own generated system identity and runtime dependencies.
     ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {},
@@ -342,6 +375,7 @@ class ExploreSystem final {
     void Shutdown() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] ExploreSnapshot snapshot() const;
+    [[nodiscard]] std::optional<ExploreImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
@@ -482,6 +516,7 @@ MMLTK_REFLECT_FIELDS(ExploreAugmentationUpdate)
 MMLTK_REFLECT_FIELDS(ExploreDetailUpdate)
 MMLTK_REFLECT_FIELDS(ExploreAtlasLayout)
 MMLTK_REFLECT_FIELDS(ExploreGalleryReadiness)
+MMLTK_REFLECT_FIELDS(ExploreImageMetadata)
 MMLTK_REFLECT_FIELDS(ExploreSnapshot)
 MMLTK_REFLECT_FIELDS(ExploreChanged)
 MMLTK_REFLECT_FIELDS(ExploreFailed)

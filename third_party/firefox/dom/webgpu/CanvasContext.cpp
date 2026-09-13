@@ -9,6 +9,7 @@
 #include "gfxUtils.h"
 #include "ipc/WebGPUChild.h"
 #include "mozilla/SVGObserverUtils.h"
+#include "mozilla/AsyncEventDispatcher.h"
 #include "mozilla/StaticPrefs_privacy.h"
 #include "mozilla/dom/HTMLCanvasElement.h"
 #include "mozilla/dom/WebGPUBinding.h"
@@ -148,9 +149,15 @@ void CanvasContext::Configure(const dom::GPUCanvasConfiguration& aConfig,
   }
 
   ForceNewFrame();
+  if (mCanvasElement) {
+    RefPtr<AsyncEventDispatcher> event = new AsyncEventDispatcher(
+        mCanvasElement, u"mmltk-workspace-configuration"_ns, CanBubble::eYes);
+    event->PostDOMEvent();
+  }
 }
 
 void CanvasContext::Unconfigure() {
+  const bool configured = bool(mConfiguration);
   if (mChild && mChild->CanSend() && mRemoteTextureOwnerId) {
     auto txn_type = layers::ToRemoteTextureTxnType(mFwdTransactionTracker);
     auto txn_id = layers::ToRemoteTextureTxnId(mFwdTransactionTracker);
@@ -163,6 +170,11 @@ void CanvasContext::Unconfigure() {
   mConfiguration = nullptr;
   mCurrentTexture = nullptr;
   mGfxFormat = gfx::SurfaceFormat::UNKNOWN;
+  if (configured && mCanvasElement) {
+    RefPtr<AsyncEventDispatcher> event = new AsyncEventDispatcher(
+        mCanvasElement, u"mmltk-workspace-configuration"_ns, CanBubble::eYes);
+    event->PostDOMEvent();
+  }
 }
 
 NS_IMETHODIMP CanvasContext::SetDimensions(int32_t aWidth, int32_t aHeight) {

@@ -17,7 +17,6 @@ pub use crate::generated::ApplicationIntentEndpoint;
 pub use annotation::AnnotationModel;
 pub use explore::{ExploreModel, ExplorePresentationState};
 pub(crate) use model_selection::{ModelSettingsProjection, model_settings_projection};
-pub(crate) use presentation::Reconciliation as PresentationReconciliation;
 use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,
@@ -30,7 +29,7 @@ use crate::generated::{
     ApplicationErrorCategory, ApplicationEvent, ApplicationReply, ApplicationSnapshot,
     ComputeOperationOutcome, ComputeUiState, FeatureId, FileDialogFact, FileDialogSnapshot,
     FileDialogTarget, GuiSettingsState, LiveSnapshot, ModelSelection, ModelSelectionOutcome,
-    ModelSelectionSource, ModelUiState, PredictSnapshot, PresentationSnapshot,
+    ModelSelectionSource, ModelUiState, PredictSnapshot, PresentationState,
     PresentationSourceIdentity, PresentationSourceKind, SettingsUiState, UpscaleSnapshot,
     VisualExtent, VisualFrame,
 };
@@ -164,7 +163,7 @@ pub struct ApplicationModel {
     pub connection: ConnectionState,
     pub settings_snapshot: Option<SettingsUiState>,
     pub file_dialog: Option<FileDialogSnapshot>,
-    pub presentation: Option<PresentationSnapshot>,
+    pub presentation: Option<PresentationState>,
     pub model_snapshot: Option<ModelUiState>,
     pub live_snapshot: Option<LiveSnapshot>,
     pub predict_snapshot: Option<PredictSnapshot>,

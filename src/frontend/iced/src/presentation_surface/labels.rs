@@ -21,7 +21,7 @@ fn label_bounds(
 
 #[derive(Clone)]
 pub(crate) enum Source {
-    Gallery(std::sync::Arc<crate::generated::ExploreSnapshot>),
+    Gallery(std::sync::Arc<crate::generated::ExploreImageMetadata>),
     Detail(super::DetailContent),
     Hidden,
 }
@@ -92,23 +92,7 @@ pub(crate) fn view<'a, Message: 'a>(
     program: Program<Message>,
     source: Source,
 ) -> Element<'a, Message> {
-    let surface = match &source {
-        Source::Gallery(_) => {
-            super::gallery::displayed().map_or(program.surface, |(surface, _)| surface)
-        }
-        Source::Detail(_) => {
-            super::drawable_detail(program.surface).map_or(program.surface, |(retained, _)| {
-                if program.surface.frame == retained.frame
-                    && super::same_allocation(program.surface, retained)
-                {
-                    program.surface
-                } else {
-                    retained
-                }
-            })
-        }
-        Source::Hidden => program.surface,
-    };
+    let surface = program.surface;
     let placement = program.placement;
     let transform_surface = program.surface;
     Element::new(Labelled {
@@ -399,11 +383,11 @@ mod tests {
             snapshot.scene = scene.clone();
             snapshot.overlay = overlay.clone();
             Source::Detail(super::super::DetailContent {
-                explore: std::sync::Arc::new(snapshot),
+                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
                 upscale: None,
             })
         };
-        assert!(collect(Source::Gallery(std::sync::Arc::new(snapshot.clone()))).is_empty());
+        assert!(collect(Source::Gallery(std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)))).is_empty());
         let labels = collect(detail(&snapshot.scene, &snapshot.overlay));
         assert_eq!(labels.len(), 1);
         assert_eq!(labels[0].2, "人");

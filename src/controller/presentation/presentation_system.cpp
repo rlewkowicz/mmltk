@@ -97,7 +97,7 @@ class PresentationSystem::Impl final {
         bool wake = false;
         {
             std::scoped_lock lock(mutex_);
-            if (!stopping_ && application_peer_connected_ && state_.selected == source) {
+            if (!stopping_ && state_.selected == source) {
                 wake = true;
                 // Coalesce demand without suppressing the producer's readiness
                 // edge: an in-flight publication may still await an older frame.
@@ -113,41 +113,13 @@ class PresentationSystem::Impl final {
             std::scoped_lock lock(mutex_);
             if (stopping_ || application_peer_connected_ == connected) return;
             application_peer_connected_ = connected;
-            writer_->SetApplicationPeerConnected(connected);
-            if (!connected) {
-                pending_.reset();
-            } else {
+            if (connected) {
                 if (state_.selected.valid() && !pending_)
                     pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = false};
                 wake = true;
             }
         }
         if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation peer notification failed")));
-    }
-
-    void Observe(const RendererObservation observation) {
-        PresentationSnapshot completed;
-        bool publish = false;
-        bool redraw_enqueued = false;
-        {
-            std::scoped_lock lock(mutex_);
-            const auto completed_sample = std::max(state_.browser_completed_sample, observation.completed_sample);
-            if (state_.browser_completed_sample != completed_sample) {
-                state_.browser_completed_sample = completed_sample;
-                AdvanceRevision();
-                completed = state_;
-                publish = true;
-            }
-            if (observation.redraw_requested && state_.selected.valid() && !stopping_ && application_peer_connected_ && !pending_) {
-                pending_ = Pending{
-                    .source = state_.selected,
-                    .generation = selection_generation_,
-                };
-                redraw_enqueued = true;
-            }
-        }
-        if (publish) Publish(event_type{PresentationCompleted{completed}});
-        if (redraw_enqueued && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation control notification failed")));
     }
 
     void SetExpectedBrowserProcessGroup(const pid_t process_group) {
@@ -260,9 +232,9 @@ class PresentationSystem::Impl final {
                 std::scoped_lock lock(mutex_);
                 const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
                                       in_flight_->observation.frame.source == pending->source;
-                if (reserved && !stopping_ && application_peer_connected_ && !stop.stop_requested() && observation.valid() &&
+                if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() &&
                     frame.source == pending->source && pending->generation == selection_generation_ && state_.selected == pending->source &&
-                    (pending->force || state_.completed != frame)) {
+                    (pending->force || state_.completed != frame || state_.completed_source_revision != observation.snapshot_revision)) {
                     in_flight_ = submitted;
                     submit = true;
                 } else if (reserved) {
@@ -318,6 +290,11 @@ class PresentationSystem::Impl final {
                 publish_capability = true;
             }
             switch (outcome.progress) {
+                case PresentationNativeProgress::BindingRetired:
+                    in_flight_.reset();
+                    pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = true};
+                    wake_again = true;
+                    break;
                 case PresentationNativeProgress::Waiting:
                     break;
                 case PresentationNativeProgress::Superseded:
@@ -448,7 +425,7 @@ class PresentationSystem::Impl final {
         if (!publish) return;
         report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail,
                                      failed_selection_generation);
-        Publish(event_type{PresentationFailed{std::move(failed), std::move(detail)}});
+        Publish(event_type{PresentationFailed{{failed.revision, failed.selected}, std::move(detail)}});
     }
 
     void RetireWriter() noexcept {
@@ -508,8 +485,14 @@ PresentationSystem::PresentationSystem(const VisualDeviceSettings settings, Pres
 PresentationSystem::~PresentationSystem() {
     if (!impl_->stopped()) std::terminate();
 }
-PresentationSnapshot PresentationSystem::Select(const PresentationSourceIdentity source) { return impl_->Select(source); }
-void PresentationSystem::Observe(const RendererObservation observation) { impl_->Observe(observation); }
+PresentationState PresentationSystem::Select(const PresentationSourceIdentity source) {
+    const auto snapshot = impl_->Select(source);
+    return {snapshot.revision, snapshot.selected};
+}
+PresentationState PresentationSystem::selection() const {
+    const auto snapshot = impl_->snapshot();
+    return {snapshot.revision, snapshot.selected};
+}
 void PresentationSystem::SourceChanged(const PresentationSourceIdentity source) noexcept { impl_->SourceChanged(source); }
 void PresentationSystem::SetApplicationPeerConnected(const bool connected) noexcept { impl_->SetApplicationPeerConnected(connected); }
 void PresentationSystem::SetExpectedBrowserProcessGroup(const pid_t process_group) { impl_->SetExpectedBrowserProcessGroup(process_group); }

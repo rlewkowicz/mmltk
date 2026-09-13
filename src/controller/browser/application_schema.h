@@ -1109,6 +1109,21 @@ struct ApplicationEventDescriptor final {
     }
 };
 
+namespace application_schema_detail {
+template <class Composition, auto Member, class Visitor>
+struct EventVisitor final {
+    Visitor& visitor;
+    template <class Event>
+    constexpr void operator()() const {
+        constexpr bool published = annotation_count<^^Event, contracts::reflection::Event>() != 0U;
+        if constexpr (published) {
+            using Identity = ApplicationEventDescriptor<Composition, Member, Event>;
+            visitor.template operator()<Identity, Event>(Identity::metadata);
+        }
+    }
+};
+}  // namespace application_schema_detail
+
 template <class SystemCell, std::meta::info Method>
 struct ReflectedEndpoint final {
     static_assert(application_schema_detail::SupportedEndpointMethod<Method>,
@@ -1361,10 +1376,8 @@ struct ApplicationSchema final {
             using SystemCell = ReflectedSystem<Composition, cell>;
             static_assert(application_schema_detail::ReflectedEventVariant<typename SystemCell::type>,
                           "ordinary system event_type must be one reflected std::variant");
-            application_schema_detail::Variant<typename SystemCell::type::event_type>::Visit([&]<class Event>() {
-                using Identity = ApplicationEventDescriptor<Composition, &[:cell:], Event>;
-                visitor.template operator()<Identity, Event>(Identity::metadata);
-            });
+            application_schema_detail::Variant<typename SystemCell::type::event_type>::Visit(
+                application_schema_detail::EventVisitor<Composition, &[:cell:], std::remove_reference_t<Visitor>>{visitor});
         }
     }
 
@@ -1576,6 +1589,7 @@ template <class Composition>
     });
     application_schema_detail::append_type<ClientRecord>(sink);
     application_schema_detail::append_type<ServerRecord>(sink);
+    application_schema_detail::append_type<WorkspaceImageMetadata>(sink);
     sink.append_number(mmltk::controller::kAnnotationInputBatchCapacity);
     sink.append_number(mmltk::controller::kAnnotationInputAdmissionSlots);
     sink.append("visual-source-projections");
@@ -1587,6 +1601,7 @@ template <class Composition>
         sink.append_number(metadata.session);
     }
     ApplicationSchema<Composition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+        application_schema_detail::append_type<typename Projection::image_type>(sink);
         sink.append_number(Cell::stable_id);
         sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
         Projection::relation::VisitMembers([&]<class Entry>() {

@@ -39,7 +39,7 @@ pub(super) fn update(
         Message::OpenAnnotationRequested => Outcome::OpenAnnotationRequested,
         Message::UpscaleRequested(kernel) => Outcome::UpscaleRequested(kernel),
         Message::DetailSourceSelected(showoriginaldimensions) => {
-            state.desired_original = Some(showoriginaldimensions);
+            state.choose_detail_original(showoriginaldimensions);
             Outcome::DetailUpdated(crate::generated::ExploreDetailUpdate {
                 showoriginaldimensions,
             })
@@ -60,86 +60,22 @@ pub(super) fn view<'a>(
     state: &'a super::state::State,
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
-    snapshot: &'a crate::generated::ExploreSnapshot,
-    surface: Option<Surface>,
+    surface: Surface,
+    content: crate::presentation_surface::DetailContent,
 ) -> Element<'a, Message> {
     let available = !settings.has_local_edits() && model.explore_mutation_available();
-    let shown = model.viewed_explore_frame();
-    let original = state
-        .desired_original
-        .unwrap_or(snapshot.detail.showoriginaldimensions);
-    let retained = shown
-        .as_ref()
-        .and_then(|shown| crate::presentation_surface::retained_detail_for(model, shown));
-    let surface = surface
-        .map(|surface| {
-            if surface.frame.is_some_and(|frame| {
-                shown
-                    .as_ref()
-                    .is_some_and(|shown| frame.matches_content(shown))
-                    && model
-                        .presentation
-                        .as_ref()
-                        .is_some_and(|snapshot| frame.matches_completed(snapshot))
-            }) {
-                surface
-            } else {
-                retained.unwrap_or(surface)
-            }
-        })
-        .or(retained)
-        .map(|mut surface| {
-            if !shown.as_ref().is_some_and(|shown| {
-                surface.frame.is_some_and(|frame| {
-                    (model
-                        .presentation
-                        .as_ref()
-                        .is_some_and(|presentation| frame.matches_completed(presentation))
-                        || retained.is_some_and(|retained| retained.frame == Some(frame)))
-                        && frame.matches_content(shown)
-                })
-            }) {
-                surface.frame = None;
-            }
-            surface.viewer_identity = snapshot
-                .selectedimage
-                .map(|image| (snapshot.dataset.identity, image));
-            surface.fit_revision = state.fit_revision;
-            surface.crop = shown.as_ref().filter(|_| original).map(|frame| {
-                [
-                    frame.content.x,
-                    frame.content.y,
-                    frame.content.width,
-                    frame.content.height,
-                ]
-            });
-            surface
-        });
-    let image: Element<'a, Message> = surface.map_or_else(
-        || {
-            container(text("Preparing selected GPU detail"))
-                .center(Fill)
-                .width(Fill)
-                .height(Fill)
-                .into()
+    let original = state.detail_original(&content);
+    let selected = content.viewer_identity().expect("validated detail viewer").1;
+    let overlay = content.overlay().clone();
+    let image = crate::presentation_surface::labels::view(
+        crate::presentation_surface::Program {
+            local: None,
+            surface: content.configure_surface(surface, original, state.fit_revision),
+            publish: None,
+            placement: crate::presentation_surface::Placement::Contain,
+            control_id: super::DETAIL_WORKSPACE_ID,
         },
-        |surface| {
-            crate::presentation_surface::labels::view(
-                crate::presentation_surface::Program {
-                    local: None,
-                    surface,
-                    publish: None,
-                    placement: crate::presentation_surface::Placement::Contain,
-                    control_id: super::DETAIL_WORKSPACE_ID,
-                },
-                crate::presentation_surface::drawable_detail(surface)
-                    .filter(|(retained, _)| retained.viewer_identity == surface.viewer_identity)
-                    .map_or(
-                        crate::presentation_surface::labels::Source::Hidden,
-                        |(_, content)| crate::presentation_surface::labels::Source::Detail(content),
-                    ),
-            )
-        },
+        crate::presentation_surface::labels::Source::Detail(content),
     );
     let active = model.displayed_upscale_kernel();
     let pending = model
@@ -181,10 +117,6 @@ pub(super) fn view<'a>(
                 .id(upscale_id(kernel)),
             )
         });
-    let overlay = state
-        .presented_filter(Some(snapshot))
-        .map(|request| request.overlay)
-        .unwrap_or_else(|| snapshot.overlay.clone());
     let source = row![
         container(button("Fit").on_press(Message::FitRequested)).id(super::DETAIL_FIT_ID),
         container(
@@ -203,7 +135,7 @@ pub(super) fn view<'a>(
             row![
                 text(format!(
                     "Sample #{}",
-                    snapshot.selectedimage.unwrap_or_default()
+                    selected
                 ))
                 .size(20),
                 space::horizontal(),
@@ -244,7 +176,7 @@ pub(super) fn view<'a>(
             container(
                 button("Open in Annotation")
                     .on_press_maybe(
-                        (model.annotation_open_available() && !settings.has_local_edits())
+                        (model.annotation_import_available() && !settings.has_local_edits())
                             .then_some(Message::OpenAnnotationRequested),
                     )
                     .style(crate::fluent_theme::button_primary)

@@ -1364,7 +1364,7 @@ pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str
 #[derive(Debug, Clone, PartialEq)]
 pub struct AtlasDraw {
     pub surface: crate::presentation_surface::Surface,
-    pub snapshot: std::sync::Arc<crate::generated::ExploreSnapshot>,
+    pub snapshot: std::sync::Arc<crate::generated::ExploreImageMetadata>,
     pub bounds: Rectangle,
     pub image: Rectangle,
     pub clip: Rectangle,
@@ -1823,30 +1823,18 @@ struct SampleablePresentation {
 }
 
 fn sampleable_presentation(
-    model: &ApplicationModel,
     frame: Option<crate::presentation_surface::FrameReady>,
     source: crate::generated::PresentationSourceKind,
     source_revision: u64,
 ) -> Option<SampleablePresentation> {
-    let viewed = (source == crate::generated::PresentationSourceKind::Explore
-        && model.explore.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.mode == crate::generated::ExploreMode::Detail
-                && snapshot.frame.revision == source_revision
-        }))
-    .then(|| model.viewed_explore_frame())
-    .flatten();
-    let (source, source_revision) = viewed.as_ref().map_or((source, source_revision), |viewed| {
-        (viewed.source.kind, viewed.revision)
-    });
     let frame = frame?;
-    if let Some(viewed) = model
-        .viewed_explore_frame()
-        .filter(|viewed| viewed.source.kind == source && viewed.revision == source_revision)
-        && let Some(retained) = crate::presentation_surface::retained_detail_for(model, &viewed)
+    if let Some(crate::presentation_surface::ExploreDisplay::Detail(retained, content)) =
+        crate::presentation_surface::explore_display(None)
         && retained.frame == Some(frame)
-    {
+        && ((source == crate::generated::PresentationSourceKind::Explore && content.input_frame().revision == source_revision)
+            || (content.frame().source.kind == source && content.frame().revision == source_revision)) {
         return Some(SampleablePresentation {
-            source_revision,
+            source_revision: content.frame().revision,
             presentation_revision: frame.presentation_revision,
             content_width: frame.content_width,
             content_height: frame.content_height,
@@ -1854,24 +1842,20 @@ fn sampleable_presentation(
             capability_height: retained.height,
         });
     }
-    let presentation = model.presentation.as_ref()?;
-    (presentation.completed.source.kind == source
-        && presentation.completed.revision == source_revision
-        && frame.content_sequence == source_revision
-        && presentation.timelineready != 0
-        && presentation.presentationrevision == frame.presentation_revision)
+    let product = crate::presentation_surface::metadata::product(frame)?;
+    let surface = crate::presentation_surface::metadata::surface(frame)?;
+    (product.source.kind == source && product.revision == source_revision)
         .then_some(SampleablePresentation {
             source_revision,
             presentation_revision: frame.presentation_revision,
             content_width: frame.content_width,
             content_height: frame.content_height,
-            capability_width: presentation.capability.extent.width,
-            capability_height: presentation.capability.extent.height,
+            capability_width: surface.width,
+            capability_height: surface.height,
         })
 }
 
 fn fully_drawn_gallery(
-    model: &ApplicationModel,
     frame: Option<crate::presentation_surface::FrameReady>,
     snapshot: &crate::generated::ExploreSnapshot,
     drawn: Option<(u64, u64)>,
@@ -1887,7 +1871,6 @@ fn fully_drawn_gallery(
         return None;
     }
     let sampleable = sampleable_presentation(
-        model,
         frame,
         crate::generated::PresentationSourceKind::Explore,
         snapshot.frame.revision,
@@ -3100,7 +3083,6 @@ impl Controller {
             return;
         };
         let Some(sampleable) = sampleable_presentation(
-            model,
             frame,
             crate::generated::PresentationSourceKind::Annotation,
             annotation.frame.revision,
@@ -3188,10 +3170,9 @@ impl Controller {
                 .upscale_snapshot
                 .as_ref()
                 .map_or(0, |value| value.frame.revision),
-            presentation_revision: model
-                .presentation
-                .as_ref()
-                .map_or(0, |value| value.presentationrevision),
+            presentation_revision: crate::presentation_surface::retained_surface()
+                .and_then(|surface| surface.frame)
+                .map_or(0, |frame| frame.presentation_revision),
         };
         self.arm(EXPLORE_UPSCALE_ACTIONS[0])
     }
@@ -3405,13 +3386,11 @@ impl Controller {
 
     fn detail_drawn(
         &self,
-        model: &ApplicationModel,
         frame: Option<crate::presentation_surface::FrameReady>,
         snapshot: &crate::generated::ExploreSnapshot,
     ) -> bool {
         snapshot.mode == crate::generated::ExploreMode::Detail
             && sampleable_presentation(
-                model,
                 frame,
                 crate::generated::PresentationSourceKind::Explore,
                 snapshot.frame.revision,
@@ -5126,7 +5105,6 @@ impl Controller {
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Upscale,
                     upscale.frame.revision,
@@ -5218,7 +5196,6 @@ impl Controller {
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Upscale,
                     source,
@@ -6246,7 +6223,6 @@ impl Controller {
                             != Some(true)
                     });
                 let sampleable = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -6560,7 +6536,7 @@ impl Controller {
                     return Task::none();
                 }
                 if snapshot.frame.revision <= frame_revision
-                    || fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none()
+                    || fully_drawn_gallery(frame, snapshot, self.gallery_drawn).is_none()
                 {
                     return Task::none();
                 }
@@ -6595,7 +6571,7 @@ impl Controller {
                     return Task::none();
                 }
                 if snapshot.frame.revision <= frame_revision
-                    || fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none()
+                    || fully_drawn_gallery(frame, snapshot, self.gallery_drawn).is_none()
                 {
                     return Task::none();
                 }
@@ -6693,7 +6669,6 @@ impl Controller {
                     || snapshot.frame.revision < frame_revision
                     || snapshot.busy
                     || sampleable_presentation(
-                        model,
                         frame,
                         crate::generated::PresentationSourceKind::Explore,
                         snapshot.frame.revision,
@@ -6756,7 +6731,7 @@ impl Controller {
                 // A disjoint jump hides the incumbent atlas. First draw its
                 // completed publication so the retained fallback can advance
                 // and release the previous physical slot.
-                if fully_drawn_gallery(model, frame, snapshot, self.gallery_drawn).is_none() {
+                if fully_drawn_gallery(frame, snapshot, self.gallery_drawn).is_none() {
                     return Task::none();
                 }
                 self.phase = Phase::AwaitGalleryColdRead(row, snapshot.gallery.generation);
@@ -6874,7 +6849,6 @@ impl Controller {
                 self.reporting
                     .observe(|reporting| reporting.scroll_placeholder(snapshot));
                 if sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -6980,7 +6954,6 @@ impl Controller {
                     return Task::none();
                 }
                 if sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -6990,9 +6963,7 @@ impl Controller {
                     return Task::none();
                 }
                 if self.viewer_scenario == "quiet" {
-                    if !model.viewed_explore_frame().is_some_and(|source| {
-                        crate::presentation_surface::viewer_copy_matches(model, &source)
-                    }) {
+                    if crate::presentation_surface::viewer_annotation_request().is_none() {
                         return Task::none();
                     }
                     self.phase = Phase::OpenAnnotation;
@@ -7031,7 +7002,6 @@ impl Controller {
                 }
                 // CLEANUP-IGNORE: Original-detail and dataset-reopen evidence call the shared presentation join for distinct completion contracts.
                 if sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -7322,7 +7292,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if !self.detail_drawn(model, frame, snapshot)
+                if !self.detail_drawn(frame, snapshot)
                     || snapshot.selectedimage != Some(index)
                     || snapshot.busy
                 {
@@ -7483,7 +7453,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if !self.detail_drawn(model, frame, snapshot)
+                if !self.detail_drawn(frame, snapshot)
                     || snapshot.busy
                     || settings.has_local_edits()
                     || model.has_explore_pending()
@@ -7652,7 +7622,7 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.busy || !self.detail_drawn(model, frame, snapshot) {
+                if snapshot.busy || !self.detail_drawn(frame, snapshot) {
                     return Task::none();
                 }
                 self.phase = Phase::AwaitAtlasOscillation(0);
@@ -7895,7 +7865,6 @@ impl Controller {
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Upscale,
                     upscale.frame.revision,
@@ -8078,7 +8047,6 @@ impl Controller {
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Upscale,
                     upscale.frame.revision,
@@ -8436,7 +8404,6 @@ impl Controller {
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -8474,10 +8441,7 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                self.annotation_sample_baseline = model
-                    .presentation
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.browsercompletedsample);
+                self.annotation_sample_baseline = crate::presentation_surface::retained_surface().and_then(|surface| surface.frame).map_or(0, |frame| frame.presentation_revision);
                 self.annotation_frame_ready = None;
                 self.phase = Phase::DetailCloseEvidence;
                 self.arm(EXPLORE_DETAIL_CLOSE)
@@ -8533,7 +8497,6 @@ impl Controller {
                     return Task::none();
                 }
                 if sampleable_presentation(
-                    model,
                     frame,
                     crate::generated::PresentationSourceKind::Explore,
                     snapshot.frame.revision,
@@ -8544,10 +8507,7 @@ impl Controller {
                 }
                 if self.gallery_drawn.is_none_or(|(presentation, source)| {
                     source != snapshot.frame.revision
-                        || model
-                            .presentation
-                            .as_ref()
-                            .is_none_or(|current| current.presentationrevision != presentation)
+                        || frame.is_none_or(|frame| frame.presentation_revision != presentation)
                 }) {
                     return Task::none();
                 }
@@ -8607,10 +8567,7 @@ impl Controller {
                     model
                         .viewed_explore_frame()
                         .is_none_or(|viewed| source != viewed.revision)
-                        || model
-                            .presentation
-                            .as_ref()
-                            .is_none_or(|value| value.presentationrevision != presentation)
+                        || frame.is_none_or(|frame| frame.presentation_revision != presentation)
                 }) {
                     return Task::none();
                 }
@@ -9233,13 +9190,8 @@ impl Controller {
                             snapshot.rendered.scenerevision,
                             snapshot.ui.editor == snapshot.rendered.editor,
                             self.annotation_frame_ready,
-                            model.presentation.as_ref().map(|state| (
-                                state.completed.source.kind,
-                                state.completed.revision,
-                                state.presentationrevision,
-                                state.browsercompletedsample,
-                                state.timelineready,
-                            )),
+                            frame.and_then(|frame| crate::presentation_surface::metadata::product(frame)
+                                .map(|product| (product.source.kind, product.revision, frame.presentation_revision))),
                             self.annotation_drawn,
                             self.location_pending,
                             self.annotation_pixels_pending.is_some(),
@@ -9252,9 +9204,6 @@ impl Controller {
                         ],
                     )
                 });
-                let Some(presentation) = model.presentation.as_ref() else {
-                    return Task::none();
-                };
                 let Some(sampleable) = self.annotation_frame_ready else {
                     return Task::none();
                 };
@@ -9263,12 +9212,10 @@ impl Controller {
                     || (self.copy_step != 8 && snapshot.ui.interactionrevision <= revision)
                     || (self.copy_step == 8 && !self.copy_product_settled(snapshot))
                     || sampleable.source_revision != snapshot.frame.revision
-                    || presentation.completed.source.kind
-                        != crate::generated::PresentationSourceKind::Annotation
-                    || presentation.completed.revision != snapshot.frame.revision
-                    || presentation.timelineready == 0
-                    || presentation.presentationrevision != presentation_revision
-                    || presentation.browsercompletedsample != presentation_revision
+                    || frame.and_then(crate::presentation_surface::metadata::product).is_none_or(|product|
+                        product.source.kind != crate::generated::PresentationSourceKind::Annotation
+                            || product.revision != snapshot.frame.revision)
+                    || frame.is_none_or(|frame| frame.presentation_revision != presentation_revision)
                     || self.annotation_drawn
                         != Some((presentation_revision, snapshot.frame.revision))
                 {
@@ -9481,7 +9428,7 @@ impl Controller {
                             snapshot.frame.revision as f64,
                             presentation_revision as f64,
                             presentation_revision as f64,
-                            presentation.browsercompletedsample as f64,
+                            crate::presentation_surface::retained_surface().and_then(|surface| surface.frame).map_or(0, |frame| frame.presentation_revision) as f64,
                         ],
                     )
                 });
@@ -9587,7 +9534,6 @@ mod tests {
         );
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         model.connection = ConnectionState::Connected;
-        model.presentation.as_mut().unwrap().timelineready = 1;
         let settings = crate::view::settings::SettingsModel::default();
         let router = crate::view::router::Router::default();
         let drive = |driver: &mut Controller, model: &ApplicationModel| {
@@ -9950,7 +9896,17 @@ mod tests {
             let snapshot = model.explore.snapshot.as_mut().unwrap();
             snapshot.order.visibleindices = indices;
             snapshot.gallery.slots = slots;
-            model.presentation.as_mut().unwrap().timelineready = timeline;
+            crate::presentation_surface::metadata::retire(frame);
+            if timeline != 0 {
+                let mut product = snapshot.clone();
+                product.mode = crate::generated::ExploreMode::Gallery;
+                product.viewport.columns = 4;
+                product.viewport.rowcount = 3;
+                product.viewport.firstrow = 0;
+                product.viewport.extent = product.frame.extent.clone();
+                crate::view_model::test_support::gallery_layout(&mut product);
+                crate::presentation_surface::metadata::install_explore(frame, &product);
+            }
             driver.phase = Phase::AwaitExploreInitialPatch {
                 revision,
                 frame_revision: source,
@@ -10066,6 +10022,8 @@ mod tests {
         assert!(driver.reporting.state_is_absent());
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         let mut surface = crate::view_model::test_support::physical_surface(frame);
+        surface.viewer_identity = model.explore.snapshot.as_ref().and_then(|snapshot|
+            snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image)));
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         // Even a diagnostic-marked surface cannot activate collection in a quiet driver.
         surface.integration = true;
@@ -10077,7 +10035,6 @@ mod tests {
             assert!(observer.subscription.is_none());
             assert_eq!(observer.identity, (0, 0));
         });
-        model.presentation.as_mut().unwrap().timelineready = 1;
         let snapshot = model.explore.snapshot.as_mut().unwrap();
         snapshot.dataset.imagewidth = frame.content_width;
         snapshot.dataset.imageheight = frame.content_height;
@@ -10088,7 +10045,6 @@ mod tests {
         let router = crate::view::router::Router::default();
         assert!(
             sampleable_presentation(
-                &model,
                 Some(frame),
                 crate::generated::PresentationSourceKind::Explore,
                 frame.content_sequence,
@@ -10423,7 +10379,7 @@ mod tests {
             bounds,
             image: bounds,
             clip: bounds,
-            snapshot: std::sync::Arc::new(crate::view_model::test_support::explore_snapshot()),
+            snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&crate::view_model::test_support::explore_snapshot())),
         };
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         report_atlas_draw(draw.clone(), false, 1.0);
@@ -10788,7 +10744,7 @@ mod tests {
                 let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(width, width));
                 let draw = AtlasDraw {
                     surface,
-                    snapshot: std::sync::Arc::new(snapshot),
+                    snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
                     bounds,
                     image: bounds,
                     clip: bounds,
@@ -10920,7 +10876,7 @@ mod tests {
                 viewer_identity: None,
                 fit_revision: 0,
             },
-            snapshot: std::sync::Arc::new(snapshot),
+            snapshot: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
             bounds: Rectangle {
                 x: 10.0,
                 y: 20.0,

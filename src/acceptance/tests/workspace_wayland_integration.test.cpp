@@ -485,11 +485,17 @@ struct SurfaceAudit final {
         bool operator==(const SourceRead&) const = default;
     };
     enum class TerminalRead { None, Completed, Retained };
+    struct MetadataReceipt final {
+        std::uint64_t bytes = 0U;
+        std::string fingerprint;
+        bool operator==(const MetadataReceipt&) const = default;
+    };
     struct TransferReceipt final {
         SourceRead read;
         bool releasing = false;
         bool released = false;
         TerminalRead terminal = TerminalRead::None;
+        std::optional<MetadataReceipt> metadata;
     };
     struct ReceiverReceipt final {
         std::string source;
@@ -502,6 +508,7 @@ struct SurfaceAudit final {
         std::uint64_t height = 0U;
         unsigned stage = 0U;
         bool direct_sampling = false;
+        bool release_only = false;
     };
     struct SampleCustody final {
         std::uint64_t selected = 0U;
@@ -510,6 +517,7 @@ struct SurfaceAudit final {
         std::uint64_t abandoned = 0U;
         bool acquired = false;
         bool released = false;
+        std::optional<MetadataReceipt> metadata;
     };
     struct SurfaceState final {
         std::uint64_t generation = 0U;
@@ -695,6 +703,23 @@ struct SurfaceAudit final {
     static bool valid_identity(const std::string_view id) {
         return id.size() == 32U && id != std::string(32U, '0') &&
                std::ranges::all_of(id, [](const char value) { return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'); });
+    }
+
+    [[nodiscard]] std::optional<MetadataReceipt> metadata_receipt(const nlohmann::json& record) {
+        const auto bytes = scalar(record, "metadata_bytes");
+        const std::string fingerprint = record.value("metadata_fingerprint", "");
+        if (bytes == 0U || fingerprint.size() != 16U || !std::ranges::all_of(fingerprint, [](const char digit) {
+                return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
+            })) {
+            reject("image metadata receipt lacks its byte extent or fingerprint");
+            return {};
+        }
+        return MetadataReceipt{bytes, fingerprint};
+    }
+
+    [[nodiscard]] static bool valid_transfer_timeline(const nlohmann::json& record, const std::uint64_t transfer) {
+        return transfer != 0U && transfer <= std::numeric_limits<std::uint64_t>::max() / 2U &&
+               scalar(record, "timeline_ready") == transfer * 2U - 1U && scalar(record, "timeline_release") == transfer * 2U;
     }
 
     void native(const nlohmann::json& record) {
@@ -897,7 +922,9 @@ struct SurfaceAudit final {
                                           scalar(record, "source_width"),   scalar(record, "source_height")};
                 if (receipt == state.transfers.end() || receipt->second.read != observed)
                     reject("physical publication changed source read provenance");
-                else if (event == "presentation.release_wait.started") {
+                else if (event == "presentation.frame.edge") {
+                    receipt->second.metadata = metadata_receipt(record);
+                } else if (event == "presentation.release_wait.started") {
                     if (receipt->second.releasing || receipt->second.terminal == TerminalRead::Retained ||
                         state.publication_steps.at(publication_key) != 3U)
                         reject("source release wait lacks its unique published transfer");
@@ -1001,6 +1028,39 @@ struct SurfaceAudit final {
             state.firefox_retired = true;
         }
         if (event == "firefox.workspace.frame_released") { reject("obsolete offer-driven release has no acquired physical read"); }
+        if (event == "firefox.workspace.release_only_submitted" || event == "firefox.workspace.release_only_completed") {
+            const auto publication = scalar(record, "presentation_revision");
+            const auto transfer = scalar(record, "transfer_sequence");
+            const auto session = scalar(record, "content_session");
+            const auto frame = scalar(record, "content_sequence");
+            const std::string source_id = record.value("source", "");
+            const auto source = sources.find(source_id);
+            if (publication == 0U || session == 0U || frame == 0U || !valid_transfer_timeline(record, transfer) ||
+                record.contains("layer") || record.contains("slot") || source == sources.end() || source->second.arena != id) {
+                reject("release-only settlement lacks its exact physical source and timeline");
+                return;
+            }
+            auto& receipt = state.receipts[publication];
+            if (event == "firefox.workspace.release_only_submitted") {
+                if (receipt.stage != 0U || !source->second.browser.live()) {
+                    reject("release-only submission duplicates or replaces an existing physical transfer");
+                    return;
+                }
+                receipt = {.source = source_id,
+                           .transfer = transfer,
+                           .session = session,
+                           .frame = frame,
+                           .stage = 2U,
+                           .direct_sampling = source->second.browser_direct_sampling,
+                           .release_only = true};
+            } else if (!receipt.release_only || receipt.stage != 2U || receipt.source != source_id || receipt.transfer != transfer ||
+                       receipt.session != session || receipt.frame != frame) {
+                reject("release-only completion lacks its unique submitted physical transfer");
+            } else {
+                receipt.stage = 3U;
+            }
+            return;
+        }
         if (event == "firefox.workspace.frame_forwarded" || event == "firefox.workspace.frame_dispatched" ||
             event == "firefox.workspace.copy_completed" || event == "firefox.workspace.read_settled") {
             const auto publication = scalar(record, "presentation_revision");
@@ -1023,16 +1083,15 @@ struct SurfaceAudit final {
                 if (receipt.stage != 0U || observed.transfer == 0U || source == sources.end() || !source->second.browser.live() ||
                     source->second.arena != id || observed.width > source->second.browser_width ||
                     observed.direct_sampling != source->second.browser_direct_sampling || observed.height > source->second.browser_height ||
-                    scalar(record, "timeline_ready") != observed.transfer * 2U - 1U ||
-                    scalar(record, "timeline_release") != observed.transfer * 2U)
+                    !valid_transfer_timeline(record, observed.transfer))
                     reject("Firefox forwarding lacks its exact admitted source transfer");
                 receipt = observed;
                 receipt.stage = 1U;
             } else {
                 const unsigned required = event == "firefox.workspace.frame_dispatched" ? 1U : 2U;
-                if (receipt.stage != required || receipt.layer != observed.layer || receipt.slot != observed.slot ||
+                if (receipt.release_only || receipt.stage != required || receipt.layer != observed.layer || receipt.slot != observed.slot ||
                     receipt.session != observed.session || receipt.frame != observed.frame || receipt.width != observed.width ||
-                    receipt.height != observed.height || receipt.source != observed.source ||
+                    receipt.height != observed.height || receipt.source != observed.source || receipt.transfer != observed.transfer ||
                     receipt.direct_sampling != observed.direct_sampling ||
                     (event == "firefox.workspace.copy_completed" && receipt.direct_sampling) ||
                     (event == "firefox.workspace.read_settled" && !receipt.direct_sampling))
@@ -1045,7 +1104,7 @@ struct SurfaceAudit final {
             event == "iced.frame.sample_released") {
             const auto publication = scalar(record, "presentation_revision");
             const auto receipt = state.receipts.find(publication);
-            if (receipt == state.receipts.end() || receipt->second.stage < 2U ||
+            if (receipt == state.receipts.end() || receipt->second.release_only || receipt->second.stage < 2U ||
                 scalar(record, "frame_revision") != receipt->second.frame || scalar(record, "content_session") != receipt->second.session ||
                 !record.contains("slot") || scalar(record, "slot") != receipt->second.slot || !record.contains("layer") ||
                 scalar(record, "layer") != receipt->second.layer || scalar(record, "content_width") != receipt->second.width ||
@@ -1058,7 +1117,7 @@ struct SurfaceAudit final {
                 reject("Iced reader used or released an already retired sample");
             } else if (event == "iced.surface.draw_encoded") {
                 if (!custody.acquired || custody.encoded >= custody.selected)
-                    reject("Iced encoding lacks exact model-authorized selection");
+                    reject("Iced encoding lacks selection of its acquired image");
                 else
                     ++custody.encoded;
             } else if (event == "iced.frame.sample_released") {
@@ -1123,6 +1182,12 @@ struct SurfaceAudit final {
             if (custody.released) reject("Iced reacquired a released sample");
             if (event == "iced.surface.sample_acquired") {
                 if (custody.acquired) reject("Iced acquired the same publication twice");
+                const auto receipt = state.receipts.find(publication);
+                if (receipt == state.receipts.end() || receipt->second.release_only || receipt->second.stage < 2U ||
+                    receipt->second.source != record.value("source", "") ||
+                    receipt->second.transfer != scalar(record, "transfer_sequence"))
+                    reject("Iced metadata acquisition lacks its exact dispatched physical transfer");
+                custody.metadata = metadata_receipt(record);
                 custody.acquired = true;
                 state.acquired = browser_ordinal;
             } else {
@@ -1189,7 +1254,7 @@ struct SurfaceAudit final {
         };
         const auto retained_read = [&](const std::uint64_t publication, const ReceiverReceipt& receipt) {
             const auto custody = state.custody.find(publication);
-            return permit_held && receipt.direct_sampling && receipt.stage == 2U && custody != state.custody.end() &&
+            return permit_held && !receipt.release_only && receipt.direct_sampling && receipt.stage == 2U && custody != state.custody.end() &&
                    custody->second.acquired && !custody->second.released;
         };
         for (const auto& [publication, receipt] : state.receipts) {
@@ -1203,7 +1268,7 @@ struct SurfaceAudit final {
                 return false;
             const auto& read = transfer->second.read;
             if (read.source != receipt.source || read.allocation != source->second.allocation || read.session != receipt.session ||
-                read.frame != receipt.frame || read.width != receipt.width || read.height != receipt.height)
+                read.frame != receipt.frame || (!receipt.release_only && (read.width != receipt.width || read.height != receipt.height)))
                 return false;
         }
         for (const auto& [key, transfer] : state.transfers) {
@@ -1235,10 +1300,14 @@ struct SurfaceAudit final {
             const auto transfer =
                 receipt != state.receipts.end() ? state.transfers.find({publication, receipt->second.transfer}) : state.transfers.end();
             const bool terminal = transfer != state.transfers.end() && terminal_read(transfer->second);
-            if (receipt == state.receipts.end() ||
+            if (receipt == state.receipts.end() || receipt->second.release_only ||
                 (receipt->second.stage != 3U && !terminal &&
                  !(permit_held && receipt->second.direct_sampling && receipt->second.stage == 2U)) ||
                 receipt->second.frame != frame)
+                return false;
+            const auto custody = state.custody.find(publication);
+            if (transfer == state.transfers.end() || custody == state.custody.end() || !transfer->second.metadata ||
+                !custody->second.metadata || transfer->second.metadata != custody->second.metadata)
                 return false;
         }
         return true;
@@ -1253,7 +1322,8 @@ struct SurfaceAudit final {
     }
 
     [[nodiscard]] std::string joined_surface_failure(const std::string& id, const SurfaceState& state) const {
-        if (!receipts_joined(id, state)) return "surface " + id + " lacks exact source, dispatch, or physical copy completion evidence";
+        if (!receipts_joined(id, state))
+            return "surface " + id + " lacks exact source, paired metadata, dispatch, or physical completion evidence";
         if (state.created == 0U && state.samples.empty() && state.requested != 0U && state.candidate_withdrawn) {
             if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || state.replaced == 0U)
                 return "unsampled candidate " + id + " lacks capability replacement and physical retirement";
@@ -1311,7 +1381,7 @@ struct SurfaceAudit final {
         }
         for (const auto& [id, state] : surfaces) {
             if (state.native_stage != 4U) return incomplete(id, "native arena admission");
-            if (!receipts_joined(id, state, true)) return incomplete(id, "source receipt or draw custody");
+            if (!receipts_joined(id, state, true)) return incomplete(id, "source receipt, paired image metadata, or draw custody");
             if (state.native_retired && !joined_surface_failure(id, state).empty()) return incomplete(id, "retired arena settlement");
             for (const auto& [publication, frame] : state.samples) {
                 const auto produced = state.publications.find(publication);
@@ -3193,12 +3263,27 @@ struct AtlasDrawAudit final {
     std::optional<nlohmann::json> pixel_meaning;
     std::map<std::string, nlohmann::json> held_stages;
     bool seen = false;
+    bool empty_seen = false;
     bool valid = true;
     FirstAuditFailure failure;
 
     [[nodiscard]] const nlohmann::json* acquisition_for(const SampleKey& key) const {
         const auto found = acquisitions.find(key);
         return found != acquisitions.end() ? &found->second : nullptr;
+    }
+
+    [[nodiscard]] bool empty_draw_submitted(const SurfaceAudit& physical) const {
+        if (!valid || !empty_seen) return false;
+        return std::ranges::any_of(acquisitions, [&](const auto& entry) {
+            const auto& [key, record] = entry;
+            const auto count = record.find("matching_count");
+            if (count == record.end() || !count->is_number_unsigned() || *count != 0U) return false;
+            const auto& [identity, generation, publication] = key;
+            const auto surface = physical.surfaces.find(identity);
+            if (surface == physical.surfaces.end() || surface->second.iced_generation != generation) return false;
+            const auto draw = surface->second.custody.find(publication);
+            return draw != surface->second.custody.end() && draw->second.acquired && draw->second.settled != 0U;
+        });
     }
 
     [[nodiscard]] bool check(const bool passed, const std::string_view reason, const nlohmann::json& record,
@@ -3551,6 +3636,12 @@ struct AtlasDrawAudit final {
                                  record["ready_slots"].is_array() && record["ready_slots"].size() == record["visible_indices"].size(),
                              "draw_readiness_cardinality_mismatch", record);
         }
+        if (matching) {
+            const auto count = record.find("matching_count");
+            matching = check(count != record.end() && count->is_number_unsigned(), "draw_matching_count_invalid", record) &&
+                       check(scalar(record, "matching_count") != 0U || record["visible_indices"].empty(),
+                             "draw_empty_gallery_has_visible_cells", record);
+        }
         if (matching && overlap_draw &&
             !same_fields(record, *overlap_draw, {"dataset_identity", "card_extent", "augmentation_enabled", "augmentation_seed"}))
             retained_ready.clear();
@@ -3585,6 +3676,7 @@ struct AtlasDrawAudit final {
         if (matching) {
             overlap_draw = record;
             seen = true;
+            empty_seen = empty_seen || scalar(record, "matching_count") == 0U;
             if (staged_allocation) observe_staged_rows(allocation_key(record), rows);
             last_draw = record;
             last_draw_reset.reset();
@@ -3881,14 +3973,7 @@ struct BrowserAudit final {
         const auto surface_event = record.value("event", "");
         if (surface_event == "iced.surface.renderer_reconstructed")
             ++renderer_reconstructions[record.value("requested_surface", "")];
-        else if (surface_event == "iced.presentation.empty_gallery_retired") {
-            const auto count = record.find("matching_count");
-            const bool empty_retirement = record.value("control", "") == kExploreGalleryControl && record.value("ready", false) &&
-                                          record.value("mode", "") == "Gallery" && count != record.end() && count->is_number_unsigned() &&
-                                          *count == 0U;
-            bounds_valid = bounds_valid && empty_retirement;
-            if (empty_retirement) owned_atlas_current = false;
-        } else if (surface_event == "iced.surface.draw_encoded") {
+        else if (surface_event == "iced.surface.draw_encoded") {
             owned_atlas_seen = atlas_draws.seen;
             const auto control = record.value("control", "");
             if (control == kExploreGalleryControl && atlas_draws.last_draw)
@@ -6100,7 +6185,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     if (copied == state.receipts.end()) continue;
                     const auto first = state.transfers.find({capacity_held->publication, capacity_held->transfer});
                     const auto retry = state.transfers.find({browser.capacity_retry_publication, copied->second.transfer});
-                    exact_retry = copied->second.stage == 3U && first != state.transfers.end() && retry != state.transfers.end() &&
+                    exact_retry = copied->second.stage == 3U && !copied->second.release_only && first != state.transfers.end() &&
+                                  retry != state.transfers.end() &&
                                   first->second.read.source == source && first->second.releasing && first->second.released &&
                                   retry->second.releasing && retry->second.released &&
                                   browser.capacity_retry_publication >= capacity_held->publication &&
@@ -6110,6 +6196,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 CHECK(exact_retry);
                 if (logging) {
                     std::uint64_t workspace_bytes = 0U, workspaces = 0U, arenas = 0U, copies = 0U, direct_reads = 0U, offers = 0U;
+                    std::uint64_t release_only_reads = 0U;
                     std::uint64_t encodings = 0U, settlements = 0U, abandonments = 0U, reader_releases = 0U;
                     for (const auto& [id, allocation] : surface_audit.sources) {
                         if (!allocation.native.retired()) {
@@ -6121,7 +6208,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                         if (allocation.created != 0U && allocation.retired == 0U && allocation.source_textures.empty()) ++arenas;
                         for (const auto& [_, receipt] : allocation.receipts) {
                             if (receipt.stage != 3U) continue;
-                            if (receipt.direct_sampling)
+                            if (receipt.release_only)
+                                ++release_only_reads;
+                            else if (receipt.direct_sampling)
                                 ++direct_reads;
                             else
                                 ++copies;
@@ -6142,6 +6231,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                                                               {"live_sample_slots", arenas * 2U},
                                                               {"completed_browser_copies", copies},
                                                               {"settled_direct_reads", direct_reads},
+                                                              {"settled_release_only_reads", release_only_reads},
                                                               {"unacquired_offers", offers},
                                                               {"encoded_draws", encodings},
                                                               {"settled_draws", settlements},
@@ -6151,6 +6241,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 }
             }
             CHECK((browser.atlas_notices == std::set<std::string>{"explore.gallery.capacity", "explore.gallery.empty"}));
+            CHECK(browser.atlas_draws.empty_draw_submitted(surface_audit));
             CHECK((browser.atlas_window_draws == std::set<std::string>{"fullscreen", "restored"}));
             CHECK(browser.atlas_themes.contains(dark ? "dark" : "light"));
             CHECK(browser.atlas_device_scales.contains(high_dpi ? 1.5 : 1.0));
@@ -6657,6 +6748,8 @@ namespace {
             {"allocation_generation", 7U},
             {"presentation_revision", copying ? 0U : 1U},
             {"transfer_sequence", copying ? 0U : 1U},
+            {"metadata_bytes", 128U},
+            {"metadata_fingerprint", "819de48387b34f29"},
             {"timeline_ready", copying ? 0U : 1U},
             {"trace_id", 31U},
             {"span_id", 31U},
@@ -6681,6 +6774,8 @@ namespace {
             {"content_width", 64U},
             {"content_height", 32U},
             {"transfer_sequence", 1U},
+            {"metadata_bytes", 128U},
+            {"metadata_fingerprint", "819de48387b34f29"},
             {"timeline_ready", 1U},
             {"timeline_release", 2U},
             {"requested_surface", SurfaceAudit::native_identity(native_surface_record("", low))},
@@ -6690,6 +6785,13 @@ namespace {
             {"frame_revision", 23U},
             {"presentation_revision", 1U},
             {"outcome", "claimed"}};
+}
+
+[[nodiscard]] nlohmann::json release_only_record(const char* event) {
+    auto record = browser_surface_record(event);
+    record.erase("layer");
+    record.erase("slot");
+    return record;
 }
 
 constexpr std::array native_surface_events{"presentation.arena.advertised",
@@ -6761,6 +6863,42 @@ void record_receiver_withdrawal(SurfaceAudit& audit) {
     audit.browser(browser_surface_record("iced.surface.import_dropped"));
     audit.browser(browser_surface_record("iced.surface.texture_destroyed"));
     audit.browser(browser_surface_record("firefox.workspace.retired"));
+}
+
+TEST_CASE("Image metadata stays paired with its acquired pixels through retained draws", "[workspace][audit]") {
+    SurfaceAudit audit;
+    record_source_transfer(audit);
+    for (std::size_t stage = 9U; stage < browser_live_stages; ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    REQUIRE(audit.evidence_settled());
+    audit.SettleScenario();
+    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.frame.draw_settled"})
+        audit.browser(browser_surface_record(event));
+    REQUIRE(audit.evidence_settled());
+    const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
+    REQUIRE(surface.custody.at(1U).metadata.has_value());
+    CHECK(surface.custody.at(1U).metadata == surface.transfers.at({1U, 1U}).metadata);
+    CHECK(surface.custody.at(1U).settled == 2U);
+}
+
+TEST_CASE("Image metadata acceptance validates payload and physical transfer identity", "[workspace][audit]") {
+    const std::string fault = GENERATE("bytes", "fingerprint", "empty", "malformed", "source", "transfer");
+    CAPTURE(fault);
+    SurfaceAudit audit;
+    record_source_transfer(audit);
+    for (std::size_t stage = 9U; stage < browser_live_stages; ++stage) {
+        auto record = browser_surface_record(browser_surface_events[stage]);
+        if (std::string_view{browser_surface_events[stage]} == "iced.surface.sample_acquired") {
+            if (fault == "bytes") record["metadata_bytes"] = 129U;
+            if (fault == "fingerprint") record["metadata_fingerprint"] = "819de48387b34f28";
+            if (fault == "empty") record["metadata_bytes"] = 0U;
+            if (fault == "malformed") record["metadata_fingerprint"] = "not-hex";
+            if (fault == "source") record["source"] = SurfaceAudit::native_identity(native_surface_record("", 13U));
+            if (fault == "transfer") record["transfer_sequence"] = 2U;
+        }
+        audit.browser(record);
+    }
+    CHECK_FALSE(audit.evidence_settled());
 }
 
 TEST_CASE("scenario settlement retains physical reuse and waits for independent native delivery", "[workspace][audit]") {
@@ -7441,6 +7579,48 @@ TEST_CASE("annotation canvas palette evidence preserves class hue contrast and s
     }
 }
 
+TEST_CASE("Paired empty atlases replace displayed content through an actual acquired draw", "[workspace][audit]") {
+    const std::string fault = GENERATE("none", "source", "acquisition", "unsubmitted", "visible_cells", "negative_count");
+    CAPTURE(fault);
+    BrowserAudit audit;
+    const auto prior = atlas_draw_record(23U, 0U, 4U, 0.0);
+    for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
+        auto record = prior;
+        record["event"] = event;
+        audit.consume(record);
+    }
+    REQUIRE(audit.atlas_draws.valid);
+    REQUIRE(audit.owned_atlas_current);
+    REQUIRE_FALSE(audit.atlas_draws.empty_seen);
+    auto empty = atlas_draw_record(24U, 0U, 4U, 0.0);
+    empty["matching_count"] = 0U;
+    empty["visible_indices"] = nlohmann::json::array();
+    empty["ready_slots"] = nlohmann::json::array();
+    if (fault == "visible_cells") {
+        empty["visible_indices"] = std::vector<std::uint64_t>{0U};
+        empty["ready_slots"] = std::vector<bool>{true};
+    }
+    if (fault == "negative_count") empty["matching_count"] = -1;
+    for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
+        const std::string_view name{event};
+        if ((fault == "source" && name == "iced.gallery.source") ||
+            (fault == "acquisition" && name == "iced.surface.sample_acquired"))
+            continue;
+        auto record = empty;
+        record["event"] = fault == "unsubmitted" && name == "iced.surface.draw_encoded" ? "iced.surface.sample_draw_selected" : event;
+        audit.consume(record);
+        CHECK(audit.owned_atlas_current);
+        if (name != "iced.surface.draw_encoded") CHECK_FALSE(audit.atlas_draws.empty_seen);
+    }
+    CHECK(audit.atlas_draws.empty_seen == (fault == "none"));
+    if (fault == "none") {
+        REQUIRE(audit.atlas_draws.valid);
+        REQUIRE(audit.atlas_draws.last_draw.has_value());
+        CHECK(scalar(*audit.atlas_draws.last_draw, "source_revision") == 24U);
+        CHECK(scalar(*audit.atlas_draws.last_draw, "matching_count") == 0U);
+    }
+}
+
 TEST_CASE("atlas visibility requires an encoded intersecting draw with exact source rows", "[workspace][audit]") {
     const auto draw = atlas_draw_record(23U, 2U, 5U, -37.25);
     auto source = draw;
@@ -7855,6 +8035,133 @@ TEST_CASE("Direct fallback custody requires positive source read settlement with
         INFO(audit.joined_failure());
         CHECK(audit.joined_failure().empty() == (fault == "none"));
     }
+}
+
+TEST_CASE("Release-only custody settles exact GPU work without creating a page sample", "[workspace][audit]") {
+    const bool direct = GENERATE(false, true);
+    const bool receiver_first = GENERATE(false, true);
+    SurfaceAudit audit;
+    const auto native = [&](const char* event) {
+        auto record = native_surface_record(event);
+        record["direct_sampling"] = direct;
+        audit.native(record);
+    };
+    for (std::size_t stage = 0U; stage < 13U; ++stage)
+        native(native_surface_events[stage]);
+    for (std::size_t stage = 0U; stage < 9U; ++stage) {
+        auto record = browser_surface_record(browser_surface_events[stage]);
+        record["direct_sampling"] = direct;
+        audit.browser(record);
+    }
+    audit.browser(release_only_record("firefox.workspace.release_only_submitted"));
+    REQUIRE(audit.failure.empty());
+    CHECK_FALSE(audit.evidence_settled());
+    native("presentation.release_wait.started");
+    CHECK_FALSE(audit.evidence_settled());
+    if (receiver_first) {
+        audit.browser(release_only_record("firefox.workspace.release_only_completed"));
+        CHECK_FALSE(audit.evidence_settled());
+    }
+    native("presentation.release_wait.completed");
+    if (!receiver_first) {
+        CHECK_FALSE(audit.evidence_settled());
+        audit.browser(release_only_record("firefox.workspace.release_only_completed"));
+    }
+    REQUIRE(audit.evidence_settled());
+    const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
+    CHECK(state.receipts.at(1U).release_only);
+    CHECK(state.receipts.at(1U).direct_sampling == direct);
+    CHECK(state.transfers.at({1U, 1U}).released);
+    CHECK(state.samples.empty());
+    CHECK(state.custody.empty());
+    CHECK(audit.draws.empty());
+}
+
+TEST_CASE("Two completed outputs join independent presentation and release-only custody", "[workspace][audit]") {
+    SurfaceAudit audit;
+    record_source_transfer(audit);
+    for (std::size_t stage = 4U; stage < 15U; ++stage) {
+        auto record = native_surface_record(native_surface_events[stage]);
+        if (stage < 7U) record["surface_low"] = 1013U;
+        record["workspace_source_low"] = 1013U;
+        record["workspace_allocation"] = 2013U;
+        record["trace_id"] = 32U;
+        record["span_id"] = 32U;
+        record["frame_revision"] = 24U;
+        record["source_revision"] = 24U;
+        if (stage >= 10U) {
+            record["value"] = 2U;
+            record["presentation_revision"] = 2U;
+        }
+        audit.native(record);
+    }
+    for (std::size_t stage = 6U; stage < browser_live_stages; ++stage) {
+        auto record = browser_surface_record(browser_surface_events[stage]);
+        const auto source = SurfaceAudit::native_identity(native_surface_record("", 1013U));
+        if (stage < 9U) record["surface"] = source;
+        record["source"] = source;
+        record["workspace_allocation"] = 2013U;
+        record["content_sequence"] = 24U;
+        record["frame_revision"] = 24U;
+        record["presentation_revision"] = 2U;
+        audit.browser(record);
+    }
+    audit.browser(release_only_record("firefox.workspace.release_only_submitted"));
+    audit.browser(release_only_record("firefox.workspace.release_only_completed"));
+    REQUIRE(audit.failure.empty());
+    REQUIRE(audit.evidence_settled());
+    const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
+    CHECK(state.receipts.size() == 2U);
+    CHECK(state.receipts.at(1U).release_only);
+    CHECK_FALSE(state.receipts.at(2U).release_only);
+    CHECK(state.transfers.at({1U, 1U}).released);
+    CHECK(state.transfers.at({2U, 1U}).released);
+    REQUIRE(state.samples.size() == 1U);
+    CHECK(state.samples.at(2U) == 24U);
+    REQUIRE(audit.draws.size() == 1U);
+    CHECK(state.custody.at(2U).selected == 1U);
+}
+
+TEST_CASE("Release-only receipts require unique physical identity and completion", "[workspace][audit]") {
+    const std::string fault = GENERATE("missing_submission", "missing_completion", "duplicate_submission", "duplicate_completion",
+                                      "source", "publication", "transfer", "session", "frame", "ready", "release", "slot", "layer");
+    CAPTURE(fault);
+    SurfaceAudit audit;
+    record_source_transfer(audit);
+    auto submitted = release_only_record("firefox.workspace.release_only_submitted");
+    auto completed = release_only_record("firefox.workspace.release_only_completed");
+    if (fault == "source") completed["source"] = SurfaceAudit::native_identity(native_surface_record("", 13U));
+    if (fault == "publication") completed["presentation_revision"] = 2U;
+    if (fault == "transfer") completed["transfer_sequence"] = 2U;
+    if (fault == "session") completed["content_session"] = 2U;
+    if (fault == "frame") completed["content_sequence"] = 24U;
+    if (fault == "ready") completed["timeline_ready"] = 3U;
+    if (fault == "release") completed["timeline_release"] = 4U;
+    if (fault == "slot" || fault == "layer") submitted[fault] = 0U;
+    if (fault != "missing_submission") audit.browser(submitted);
+    if (fault == "duplicate_submission") audit.browser(submitted);
+    if (fault != "missing_completion") audit.browser(completed);
+    if (fault == "duplicate_completion") audit.browser(completed);
+    CHECK_FALSE(audit.evidence_settled());
+}
+
+TEST_CASE("Release-only terminal custody requires positive native completion or retained ownership", "[workspace][audit]") {
+    const bool retained = GENERATE(false, true);
+    SurfaceAudit audit;
+    record_source_transfer(audit, false);
+    audit.browser(release_only_record("firefox.workspace.release_only_submitted"));
+    audit.native({{"event", "shutdown.requested"}});
+    audit.native({{"event", "shutdown.firefox_terminal"}});
+    REQUIRE(audit.failure.empty());
+    CHECK_FALSE(audit.evidence_settled());
+    audit.native(native_surface_record(retained ? "presentation.terminal_read.retained" : "presentation.terminal_read.completed"));
+    if (!retained) audit.native(native_surface_record("presentation.retirement"));
+    REQUIRE(audit.evidence_settled());
+    CHECK(audit.joined_failure().empty());
+    const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
+    CHECK(state.receipts.at(1U).stage == 2U);
+    CHECK(state.transfers.at({1U, 1U}).terminal ==
+          (retained ? SurfaceAudit::TerminalRead::Retained : SurfaceAudit::TerminalRead::Completed));
 }
 
 TEST_CASE("Capacity retry preserves logical publication with a new physical source transfer", "[workspace][audit]") {

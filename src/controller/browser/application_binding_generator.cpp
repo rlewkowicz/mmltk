@@ -338,6 +338,10 @@ class BindingEmitter final {
         EmitType<mmltk::controller::contracts::ApplicationErrorCategory>();
         EmitType<mmltk::controller::contracts::reflection::EventDelivery>();
         VisitBoundaryTypes();
+        EmitType<mmltk::controller::browser::WorkspaceImageMetadata>();
+        EmitImageMetadata();
+        output_ << "pub const WORKSPACE_METADATA_BYTE_CAPACITY: usize = "
+                << mmltk::controller::presentation::detail::kWorkspaceMetadataByteCapacity << ";\n";
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSkeletonGeometry,
                                mmltk::controller::contracts::AnnotationSkeletonNode>();
         EmitAnnotationGeometry<mmltk::controller::contracts::AnnotationSplineBody, mmltk::controller::contracts::AnnotationSplineKnot>();
@@ -1153,6 +1157,35 @@ class BindingEmitter final {
         }
     }
     std::set<std::string> compact_types_;
+
+    void EmitImageMetadata() {
+        Schema::VisitVisualSources([&]<class, std::meta::info, class Projection>() {
+            EmitType<typename Projection::image_type>();
+            output_ << "impl From<&" << rust_type<typename Projection::snapshot_type>() << "> for "
+                    << rust_type<typename Projection::image_type>() << " { fn from(source: &"
+                    << rust_type<typename Projection::snapshot_type>() << ") -> Self { Self {\n";
+            VisitRustFields<typename Projection::image_type>([&]<class, class>(const auto&, const std::string& member) {
+                output_ << member << ": source." << member << ".clone(),\n";
+            });
+            output_ << "} } }\n";
+        });
+        symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");
+        symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");
+        output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum WorkspaceImageProduct {\n";
+        Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+            output_ << rust_identifier(Cell::name, true) << '(' << rust_type<typename Projection::image_type>() << "),\n";
+        });
+        output_ << "}\npub fn decode_workspace_image_product(system_id: u64, value: Value) -> Result<WorkspaceImageProduct, String> { match system_id {\n";
+        Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+            output_ << Cell::stable_id << " => { let image: " << rust_type<typename Projection::image_type>()
+                    << " = FromApplicationValue::from_application_transport_value(value)?;\n"
+                    << "if presentation_source_session(image.frame.source.kind) != "
+                    << mmltk::controller::presentation_source_session(Projection::kind)
+                    << " { return Err(\"workspace image product kind mismatch\".into()); }\n"
+                    << "Ok(WorkspaceImageProduct::" << rust_identifier(Cell::name, true) << "(image)) },\n";
+        });
+        output_ << "_ => Err(\"unknown workspace image product\".into()), } }\n";
+    }
 
     void EmitSnapshotDefaults() {
         ReserveGeneratedStruct("SnapshotDefaultFact", "canonical snapshot defaults", {"system_id", "value"});

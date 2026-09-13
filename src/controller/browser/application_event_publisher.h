@@ -24,6 +24,7 @@ class ApplicationEventPublisher final {
     void operator()(const Variant& event) const noexcept {
         std::visit(
             [this]<class Event>(const Event& value) noexcept {
+                if constexpr (application_schema_detail::annotation_count<^^Event, contracts::reflection::Event>() != 0U) {
                 using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
                 try {
                     using System = std::remove_pointer_t<std::remove_cvref_t<decltype(std::declval<Composition>().*Member)>>;
@@ -38,6 +39,7 @@ class ApplicationEventPublisher final {
                             if (continuity_) continuity_();
                         } catch (...) {}
                     }
+                }
                 }
             },
             event);

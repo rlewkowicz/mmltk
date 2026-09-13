@@ -35,6 +35,7 @@ class ImportedImageBuffer final {
     [[nodiscard]] bool empty() const noexcept { return data() == 0U; }
     [[nodiscard]] std::size_t allocation_size() const noexcept;
     [[nodiscard]] bool owns_resources() const noexcept;
+    [[nodiscard]] std::shared_ptr<ImportedImageBuffer> ImportAlias(DeviceContext) const;
 
    private:
     struct Resources final {

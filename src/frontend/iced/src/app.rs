@@ -3,13 +3,13 @@ use iced::{Subscription, Task};
 use crate::fluent_theme::{Element, Theme};
 use crate::generated::{
     AnnotationOpen, AnnotationSave, ExploreNavigate, ExploreNavigation, ExploreOpen, ExploreSelect,
-    ExploreViewportUpdate, FeatureId, FileDialogOpen, LiveStart, PresentationCapabilityCondition,
-    PresentationSnapshot, SettingsResetRequest, Train, VisualExtent, VisualFrame,
+    ExploreViewportUpdate, FeatureId, FileDialogOpen, LiveStart,
+    PresentationState, SettingsResetRequest, Train, VisualExtent, VisualFrame,
 };
 use crate::message::Message;
 use crate::presentation_surface::{FrameReady, Surface};
 use crate::protocol::client_records::Intent;
-use crate::protocol::{Bootstrap, IntentReply, RendererObservation, SystemEvent};
+use crate::protocol::{Bootstrap, IntentReply, SystemEvent};
 use crate::transport::{TransportConfig, TransportEvent};
 use crate::transport_connection::Connection;
 use crate::view::settings::{EditCadence, EditSchedule};
@@ -488,7 +488,7 @@ mod tests {
         for _ in 0..64 {
             assert_eq!(
                 connection
-                    .send_renderer_observation(RendererObservation::Ready)
+                    .send_interaction(crate::protocol::client_records::Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
                     .unwrap(),
                 crate::transport_connection::SendDisposition::Queued
             );
@@ -808,7 +808,7 @@ mod tests {
             if failure == "capacity" {
                 for _ in 0..64 {
                     connection
-                        .send_renderer_observation(RendererObservation::Ready)
+                        .send_interaction(crate::protocol::client_records::Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
                         .unwrap();
                 }
             }

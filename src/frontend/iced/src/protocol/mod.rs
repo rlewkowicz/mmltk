@@ -14,6 +14,6 @@ pub use cbor::{
 };
 pub(crate) use cbor::{validate_client_dynamic_value, validate_server_dynamic_value};
 pub use records::{
-    ApplicationError, Bootstrap, IntentReply, RendererObservation, ServerRecord, SystemEvent,
+    ApplicationError, Bootstrap, IntentReply, ServerRecord, SystemEvent,
     decode_server,
 };

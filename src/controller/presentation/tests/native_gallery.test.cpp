@@ -1055,6 +1055,43 @@ TEST_CASE("Native five six five row demand immediately retains pixel identity th
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled) == reads);
 }
 
+TEST_CASE("Native loading focus schedules outstanding cards and retains completed gallery pixels", "[explore][native][priority]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-focus"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGallery gallery{4U};
+    auto priority = std::make_shared<ExploreLoadingPriority>();
+    gallery.algorithm->SetLoadingPriority(priority);
+    gallery.Open(path);
+    priority->Focus(7U);
+    static_cast<void>(gallery.algorithm->AdvanceGallery());
+    {
+        const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
+        REQUIRE(admitted.size() == 2U);
+        CHECK(admitted.front() == 7U);
+    }
+    priority->Focus(6U);
+    gallery.Drain();
+    const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
+    REQUIRE(admitted.size() >= 3U);
+    CHECK(admitted[2U] == 6U);
+    const auto completed = gallery.algorithm->AdvanceGallery();
+    CHECK(completed.cumulative_tiles == 8U);
+    const auto pixels = gallery.Pixels(0U);
+    gallery.plan.mode = ExploreMode::Detail;
+    gallery.plan.selected_image = 7U;
+    ++gallery.plan.generation;
+    gallery.demand->store(gallery.plan.generation);
+    gallery.Begin();
+    gallery.plan.mode = ExploreMode::Gallery;
+    ++gallery.plan.generation;
+    gallery.demand->store(gallery.plan.generation);
+    CHECK(gallery.Begin().cumulative_tiles == 8U);
+    CHECK(gallery.Pixels(0U) == pixels);
+}
+
 TEST_CASE("Native disk admission follows immediate forward four then backward four", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");

@@ -142,6 +142,8 @@ struct DiagnosticContext final {
     std::uint64_t staging_bytes = 0U;
     std::uint64_t cache_bytes = 0U;
     std::uint64_t descriptor_bytes = 0U;
+    std::uint64_t metadata_bytes = 0U;
+    std::string_view metadata_fingerprint{};
     std::uint64_t gpu_bytes = 0U;
     // CLEANUP-IGNORE: Augmentation capacity and source selection are diagnostic facts, not a physical source admission record.
     std::uint64_t augmentation_device_bytes = 0U;

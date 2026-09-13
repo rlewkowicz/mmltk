@@ -1186,6 +1186,14 @@ pub fn arena_admitted(id: SurfaceId) -> bool {
         .unwrap_or(false)
 }
 
+pub fn admitted_arenas() -> Vec<(SurfaceId, u32, u32)> {
+    channel().and_then(|channel| channel.lock().ok().map(|channel|
+        channel.admitted.iter().filter_map(|(id, admission)|
+            (admission.layout.opcode == OPCODE_ARENA)
+                .then_some((*id, admission.width, admission.height))).collect()))
+        .unwrap_or_default()
+}
+
 pub fn withdrawn_arenas() -> Vec<SurfaceId> {
     channel().and_then(|channel| channel.lock().ok().map(|channel|
         channel.withdrawn.iter().filter(|id| !channel.sources.contains_key(id) && channel.live.contains(id))
@@ -1384,6 +1392,14 @@ pub fn reserve_acquisition(id: SurfaceId, session: u64, sequence: u64, publicati
         release: ReleaseState::Unsubmitted,
     });
     true
+}
+
+pub fn retire_binding(id: SurfaceId) {
+    let Some(channel) = channel() else { return; };
+    let Ok(mut channel) = channel.lock() else { return; };
+    if channel.terminal == ChannelTerminal::Open && channel.seen.contains(&id) && !channel.withdrawn.contains(&id) {
+        channel.send(OPCODE_BINDING_RETIRED, id, 0, 0, 0, 0, None);
+    }
 }
 
 pub fn submit_acquisition(id: SurfaceId) -> bool {

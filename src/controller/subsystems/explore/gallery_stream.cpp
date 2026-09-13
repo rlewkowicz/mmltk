@@ -238,6 +238,10 @@ class GalleryStream::Impl final {
         current_demand_ = std::move(check);
         demand_bound_ = true;
     }
+    void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority> priority) {
+        if (loading_priority_) throw std::logic_error("Explore gallery loading priority is already bound");
+        loading_priority_ = std::move(priority);
+    }
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                    const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
@@ -393,6 +397,8 @@ class GalleryStream::Impl final {
         return (bank * State().cache.size() + State().cache.Slot(position)) * State().cache.identity().extent;
     }
     void Prioritize(std::optional<std::uint32_t>);
+    std::shared_ptr<const ExploreLoadingPriority> loading_priority_;
+    std::optional<std::uint32_t> scheduled_focus_;
     void PlaceTile(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uint32_t, std::uintptr_t,
                    bool semantic_only = false);
     [[nodiscard]] std::uint32_t AtlasY(const std::size_t logical) const noexcept {
@@ -1544,7 +1550,9 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
             .cache_cards = std::max(State().cache.size(), retained_.cache.size())};
 }
 
-void GalleryStream::Impl::Prioritize(const std::optional<std::uint32_t> focused_image) {
+void GalleryStream::Impl::Prioritize(std::optional<std::uint32_t> focused_image) {
+    if (loading_priority_) focused_image = loading_priority_->focused();
+    scheduled_focus_ = focused_image;
     next_priority_ = 0U;
     State().priority_slots.clear();
     if (State().window_indices.empty()) return;
@@ -1673,6 +1681,7 @@ void GalleryStream::Impl::RebindInput(Lane& lane) {
 void GalleryStream::Impl::StartIdleLanes() {
     const auto generation = desired_generation_.load(std::memory_order_acquire);
     if (!Current(generation)) return;
+    if (loading_priority_ && loading_priority_->focused() != scheduled_focus_) Prioritize(loading_priority_->focused());
     // Rebind the acceptance gate to restored demand. In-flight reads keep
     // their physical lanes through cancellation and view changes.
     if (acceptance_) acceptance_->AdvanceGeneration(generation);
@@ -3407,6 +3416,9 @@ GalleryStream::~GalleryStream() {
 mmltk::common::concurrency::WorkerPool& GalleryStream::workers() noexcept { return impl_->workers(); }
 void GalleryStream::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) { impl_->SetReadySink(std::move(sink)); }
 void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { impl_->SetCurrentDemand(std::move(check)); }
+void GalleryStream::SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority> priority) {
+    impl_->SetLoadingPriority(std::move(priority));
+}
 ExploreOutputChange GalleryStream::OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                 const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
     return impl_->OutputChange(plan, visible, store, window);

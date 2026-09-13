@@ -576,8 +576,8 @@ pub(super) fn merge_model_snapshot(
 }
 
 pub(super) fn merge_presentation_snapshot(
-    target: &mut Option<PresentationSnapshot>,
-    incoming: PresentationSnapshot,
+    target: &mut Option<PresentationState>,
+    incoming: PresentationState,
 ) -> Result<Observation, UiError> {
     merge_observation(target, incoming, |value| value.revision, "Presentation")
 }

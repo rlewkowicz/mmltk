@@ -187,7 +187,7 @@ pub(super) fn view<'a>(
     state: &'a super::state::State,
     model: &'a ApplicationModel,
     settings: &'a SettingsModel,
-    surface: Option<Surface>,
+    paired: Option<(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>)>,
     width: f32,
 ) -> Element<'a, Message> {
     let snapshot = model.explore.snapshot.as_ref();
@@ -301,7 +301,7 @@ pub(super) fn view<'a>(
     .style(crate::fluent_theme::container_header);
 
     let gallery = responsive(move |size| {
-        gallery_viewport(state, snapshot, presentation_title, surface, size, columns)
+        gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns)
     })
     .width(Fill)
     .height(Fill);
@@ -346,22 +346,16 @@ fn gallery_viewport<'a>(
     state: &'a super::state::State,
     snapshot: Option<&'a crate::generated::ExploreSnapshot>,
     presentation_title: &'static str,
-    surface: Option<Surface>,
+    displayed: Option<(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>)>,
     size: Size,
     columns: u32,
 ) -> Element<'a, Message> {
     let width = size.width.max(1.0);
     let height = size.height.max(1.0);
-    let surface = snapshot
-        .is_some_and(|value| {
-            value.ready
-                && value.order.matchingcount != 0
-                && value.mode == crate::generated::ExploreMode::Gallery
-        })
-        .then_some(surface)
-        .flatten();
-    let matching = snapshot.map_or(0, |value| value.order.matchingcount);
-    let first_row = snapshot.map_or(0, |value| value.viewport.firstrow);
+    let presented = displayed.as_ref().map(|(_, snapshot)| snapshot.as_ref());
+    let matching = presented.map_or(0, |value| value.order.matchingcount);
+    let first_row = presented.map_or(0, |value| value.viewport.firstrow);
+    let display_columns = presented.map_or(columns, |value| value.viewport.columns);
     let maximum_extent = snapshot.map_or(
         crate::generated::VisualExtent {
             width: 0,
@@ -370,15 +364,13 @@ fn gallery_viewport<'a>(
         |value| value.maximumatlasextent.clone(),
     );
     let logical_geometry =
-        super::state::logical_gallery_geometry(width, height, columns, matching, first_row);
+        super::state::logical_gallery_geometry(width, height, display_columns, matching, first_row);
     crate::presentation_surface::gallery::observe(snapshot, false);
-    let displayed = surface.and_then(|_| crate::presentation_surface::gallery::displayed());
-    let presented = displayed.as_ref().map(|(_, snapshot)| snapshot.as_ref());
     let presented_grid = presented.map_or((columns, logical_geometry.row_count()), |snapshot| {
         (snapshot.viewport.columns, snapshot.viewport.rowcount)
     });
     let virtual_height = logical_geometry.virtual_height();
-    let surface: Element<'a, Message> = surface.map_or_else(
+    let surface: Element<'a, Message> = displayed.as_ref().map_or_else(
         || {
             container(
                 column![
@@ -398,28 +390,27 @@ fn gallery_viewport<'a>(
             .style(crate::fluent_theme::container_workspace)
             .into()
         },
-        |surface| {
-            crate::presentation_surface::labels::view(
+        |(surface, metadata)| {
+            let image = crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
                     local: Some(local_gestures(state, snapshot, columns)),
-                    surface,
+                    surface: *surface,
                     publish: None,
                     placement: crate::presentation_surface::Placement::GalleryGrid {
                         first_row,
                         columns: presented_grid.0,
                         rows: presented_grid.1,
-                        row_capacity: presented_grid.1,
-                        row_origin: 0,
+                        row_capacity: presented.map_or(presented_grid.1, |snapshot| snapshot.gallery.layout.rowcapacity),
+                        row_origin: presented.map_or(0, |snapshot| snapshot.gallery.layout.roworigin),
                     },
                     control_id: super::GALLERY_WORKSPACE_ID,
                 },
-                displayed.as_ref().map_or(
-                    crate::presentation_surface::labels::Source::Hidden,
-                    |(_, snapshot)| {
-                        crate::presentation_surface::labels::Source::Gallery(snapshot.clone())
-                    },
-                ),
-            )
+                crate::presentation_surface::labels::Source::Gallery(metadata.clone()),
+            );
+            if metadata.order.matchingcount == 0 {
+                stack![image, container(text("No samples match the filters").size(22))
+                    .id(super::GALLERY_EMPTY_ID).center(Fill).width(Fill).height(Fill)].into()
+            } else { image }
         },
     );
     // The scrollable owns the transform of images, labels, and hit testing.

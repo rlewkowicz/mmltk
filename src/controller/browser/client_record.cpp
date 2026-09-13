@@ -33,11 +33,6 @@ namespace {
             } else if constexpr (std::same_as<T, IntegrationControl>) {
                 return value.protocol_version == kBrowserProtocolVersion && contracts::integration_receipt_valid(value.receipt) &&
                        !contracts::integration_server_command(value.receipt.kind);
-            } else {
-                return value.protocol_version == kBrowserProtocolVersion && std::isfinite(value.scale) && value.scale > 0.0 &&
-                       (value.kind == RendererObservationKind::Ready ||
-                        (value.kind == RendererObservationKind::Surface && value.width != 0U && value.height != 0U) ||
-                        (value.kind == RendererObservationKind::Presented && value.sample_revision != 0U));
             }
         },
         record);

@@ -658,6 +658,21 @@ TEST_CASE("visual producer projections derive nested observations and compositio
     }
     CHECK(producer.samples == 1U);
     CHECK(additional.samples == 1U);
+    for (const auto& reader : readers) {
+        const auto frame = reader.observe().frame;
+        const auto bytes = reader.image_metadata(frame);
+        REQUIRE(bytes.has_value());
+        CHECK(bytes->size() < 1024U);
+        WorkspaceImageMetadata image;
+        REQUIRE(mmltk::frameworks::serialization::decode_compact_into(image, {.first = *bytes},
+            {.max_bytes = 1024U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth}));
+        CHECK(image.frame == frame);
+        CHECK_FALSE(image.source.has_value());
+        CHECK(image.schema_fingerprint == application_schema_fingerprint<ExtendedVisualComposition>().words);
+        auto mismatched = frame;
+        ++mismatched.revision;
+        CHECK_FALSE(reader.image_metadata(mismatched).has_value());
+    }
     std::ostringstream output;
     RoutingTextWriter writer(output);
     emit_application_visual_projection<ExtendedVisualComposition>(writer);
@@ -692,11 +707,11 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     SystemEvent published;
     std::function<void(SystemEvent)> latest_sink = [&](SystemEvent event) { published = std::move(event); };
     ApplicationEventPublisher<&ApplicationSystems::presentation> latest(latest_sink, [&] { ++lost; });
-    latest(PresentationSystem::event_type{PresentationCompleted{.snapshot = {.revision = 73U}}});
-    CHECK(published.delivery == contracts::reflection::EventDelivery::LatestState);
+    latest(PresentationSystem::event_type{PresentationFailed{.snapshot = {.revision = 73U}}});
+    CHECK(published.delivery == contracts::reflection::EventDelivery::Critical);
     CHECK(published.state_revision == 73U);
     CHECK(published.event_id ==
-          ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationCompleted>::event_id);
+          ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationFailed>::event_id);
     CHECK(lost == 2U);
     std::optional<PresentationSourceIdentity> notified;
     std::function<void(SystemEvent)> absent;
@@ -771,7 +786,7 @@ TEST_CASE("closed application categories discover nested reflected declarations 
     STATIC_REQUIRE(application_schema_detail::annotation_count<^^CounterChanged, contracts::reflection::Event>() == 1U);
 }
 
-TEST_CASE("protocol-16 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
+TEST_CASE("protocol-17 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
     namespace cbor = mmltk::frameworks::serialization;
     STATIC_REQUIRE(cbor::compact_shape<AnnotationInputBatch> == cbor::CompactShape::Object);
     STATIC_REQUIRE(cbor::compact_shape<ExploreViewportUpdate> == cbor::CompactShape::Object);
@@ -851,16 +866,16 @@ TEST_CASE("protocol-16 fingerprint is deterministic and covers stable compositio
     verify_variant.template operator()<ClientRecord>();
     verify_variant.template operator()<ServerRecord>();
     application_schema_detail::FingerprintSink actual_enum;
-    application_schema_detail::append_type<RendererObservationKind>(actual_enum);
+    application_schema_detail::append_type<mmltk::controller::contracts::reflection::EventDelivery>(actual_enum);
     for (const bool reassign : {false, true}) {
         application_schema_detail::FingerprintSink expected_enum;
         expected_enum.append("type");
         expected_enum.append("enum");  // CLEANUP-IGNORE: This altered-enum oracle independently verifies the production fingerprint.
-        using Underlying = std::underlying_type_t<RendererObservationKind>;
+        using Underlying = std::underlying_type_t<mmltk::controller::contracts::reflection::EventDelivery>;
         expected_enum.append_number(sizeof(Underlying));
         expected_enum.append_number(std::is_signed_v<Underlying>);
-        expected_enum.append_number(mmltk::frameworks::reflection::enum_entries<RendererObservationKind>().size());
-        for (const auto entry : mmltk::frameworks::reflection::enum_entries<RendererObservationKind>()) {
+        expected_enum.append_number(mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>().size());
+        for (const auto entry : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>()) {
             expected_enum.append(entry.name);
             expected_enum.append_number(static_cast<Underlying>(static_cast<Underlying>(entry.value) + (reassign ? 1U : 0U)));
         }
@@ -1326,11 +1341,11 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
     }
 }
 
-TEST_CASE("protocol-16 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
+TEST_CASE("protocol-17 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
     CounterSystem counter;
     TestSettingsSystem settings;
     const auto bootstrap = materialize_bootstrap(TestSettingsSystems{.settings = &settings, .counter = &counter});
-    CHECK(bootstrap.protocol_version == 16U);
+    CHECK(bootstrap.protocol_version == 17U);
     CHECK(bootstrap.input_epoch == 0U);  // The physical host installs the peer identity before encoding.
     CHECK(bootstrap.schema_fingerprint == application_schema_fingerprint<TestSettingsSystems>().words);
     REQUIRE(bootstrap.snapshots.size() == 2U);
@@ -1359,6 +1374,8 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
                              mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) +
                          ";") != std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
+    CHECK(generated.find("pub metadata_bytes: u32") != std::string::npos);
+    CHECK(generated.find("WORKSPACE_FRAME_MAPPING_BYTES") != std::string::npos);
     CHECK(generated.find("offset_of!(WorkspaceFrameSignal, content_height) == 60") != std::string::npos);
     CHECK(generated.find("offset_of!(Record, presentation_revision) == 64") != std::string::npos);
     CHECK(generated.find("Atomic") == std::string::npos);

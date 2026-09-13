@@ -65,6 +65,7 @@ class DeviceContext final {
     DeviceContext(DeviceContext&&) noexcept = default;
     DeviceContext& operator=(DeviceContext&&) noexcept = default;
     [[nodiscard]] int device() const noexcept;
+    [[nodiscard]] bool operator==(const DeviceContext&) const noexcept = default;
     [[nodiscard]] const DeviceExecution* execution() const noexcept;
     void Bind() const;
     [[nodiscard]] DeviceContext OnDevice(int device, std::optional<DeviceExecution> execution = {}) const;
@@ -120,6 +121,7 @@ class BorrowedImageReadView final {
     BorrowedImageReadView& operator=(BorrowedImageReadView&&) noexcept;
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] int device() const noexcept;
+    [[nodiscard]] bool UsesContext(const DeviceContext&) const noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] ImagePlaneView plane() const noexcept;
     // Terminal receiver custody: retain physical storage, reject future source
@@ -228,6 +230,7 @@ class ImageProductBuffer final {
                                                          bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool DetachWorkspace(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
     void FinalizeWorkspace(ImageWorkspaceCoverage = {});
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;

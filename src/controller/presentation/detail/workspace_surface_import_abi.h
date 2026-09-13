@@ -11,7 +11,7 @@
 // kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
 
-inline constexpr std::uint32_t kAbiVersion = 13U;
+inline constexpr std::uint32_t kAbiVersion = 14U;
 
 // The underlying type is the wire type: the Rust half of this record declares
 // `u32` fields, and the static assertions below are what keep the two frozen
@@ -55,6 +55,9 @@ enum class Opcode : std::uint32_t {
     // Shell submitted the exact read's final Vulkan ownership release and
     // matching even timeline signal. This grants no completion or reuse.
     ReleaseSubmitted = 13U,
+    // Shell detached this device's arena. Existing reads settle normally;
+    // native withdraws the arena and advertises a replacement independently.
+    BindingRetired = 14U,
 };
 
 // Why the shell produced no texture. These describe what happened in the shell,
@@ -175,7 +178,7 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
                        record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
                        record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
-                       record.opcode == Opcode::ReleaseSubmitted;
+                       record.opcode == Opcode::ReleaseSubmitted || record.opcode == Opcode::BindingRetired;
     if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
         record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
         return false;
@@ -216,6 +219,7 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
                    (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Drop:
         case Opcode::Retired:
+        case Opcode::BindingRetired:
             return empty_extent && record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
         case Opcode::Available:
         case Opcode::Presented:

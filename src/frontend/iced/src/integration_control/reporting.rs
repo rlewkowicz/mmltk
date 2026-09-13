@@ -74,12 +74,8 @@ pub(super) fn upscale_settlement(
                     state.kernel,
                     &state.frame,
                 )),
-                model.presentation.as_ref().map(|state| (
-                    &state.completed,
-                    state.presentationrevision,
-                    state.timelineready,
-                    state.browsercompletedsample,
-                )),
+                frame.and_then(|frame| crate::presentation_surface::metadata::product(frame)
+                    .map(|product| (product, frame.presentation_revision))),
                 model.displayed_upscale_kernel(),
                 controller.viewer_drawn,
                 current_receipt(explore::DETAIL_WORKSPACE_ID),
@@ -105,10 +101,8 @@ pub(super) fn upscale_settlement(
             [
                 native.map_or(0.0, |state| state.revision as f64),
                 native.map_or(0.0, |state| state.frame.revision as f64),
-                model
-                    .presentation
-                    .as_ref()
-                    .map_or(0.0, |state| state.presentationrevision as f64),
+                crate::presentation_surface::retained_surface().and_then(|surface| surface.frame)
+                    .map_or(0.0, |frame| frame.presentation_revision as f64),
                 frame.map_or(0.0, |value| value.presentation_revision as f64),
             ],
         );
@@ -671,10 +665,7 @@ impl State {
                 "sampleable-presentation"
             } else if gallery_drawn.is_none_or(|(presentation, source)| {
                 source != snapshot.frame.revision
-                    || model
-                        .presentation
-                        .as_ref()
-                        .is_none_or(|current| current.presentationrevision != presentation)
+                    || frame.is_none_or(|frame| frame.presentation_revision != presentation)
             }) {
                 "physical-gallery-draw"
             } else {

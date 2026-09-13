@@ -1,12 +1,12 @@
 include(MmltkComponent)
 
-add_library(mmltk_controller_browser_protocol_v16 STATIC)
-add_library(mmltk::controller::browser::protocol_v16 ALIAS
-    mmltk_controller_browser_protocol_v16)
+add_library(mmltk_controller_browser_protocol_v17 STATIC)
+add_library(mmltk::controller::browser::protocol_v17 ALIAS
+    mmltk_controller_browser_protocol_v17)
 mmltk_configure_component(
-    mmltk_controller_browser_protocol_v16 PUBLIC_DECLARATIONS)
+    mmltk_controller_browser_protocol_v17 PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(
-    mmltk_controller_browser_protocol_v16
+    mmltk_controller_browser_protocol_v17
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         application_stable_identity.h
@@ -15,19 +15,19 @@ mmltk_register_public_headers(
         application_event_publisher.h
         client_record.h)
 mmltk_register_ordinary_sources(
-    mmltk_controller_browser_protocol_v16
+    mmltk_controller_browser_protocol_v17
     client_record.cpp)
-target_include_directories(mmltk_controller_browser_protocol_v16 PRIVATE
+target_include_directories(mmltk_controller_browser_protocol_v17 PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(mmltk_controller_browser_protocol_v16
+target_link_libraries(mmltk_controller_browser_protocol_v17
     PUBLIC
         mmltk::common::types
         mmltk::controller::application_systems_projection
         mmltk::frameworks::reflection
         mmltk::frameworks::serialization)
-mmltk_register_header_isolation(mmltk_controller_browser_protocol_v16)
-mmltk_register_header_include_orders(mmltk_controller_browser_protocol_v16
+mmltk_register_header_isolation(mmltk_controller_browser_protocol_v17)
+mmltk_register_header_include_orders(mmltk_controller_browser_protocol_v17
     src/controller/presentation/visual_system_types.h
     src/controller/browser/application_schema.h
     [=[static_assert(mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget() > 0U);]=])
@@ -48,7 +48,7 @@ target_include_directories(mmltk_controller_browser_direct PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(mmltk_controller_browser_direct
     PUBLIC
-        mmltk::controller::browser::protocol_v16
+        mmltk::controller::browser::protocol_v17
         mmltk::controller::direct_services
         mmltk::frameworks::transport
     PRIVATE
@@ -64,12 +64,12 @@ set(MMLTK_APPLICATION_BINDINGS
 set(MMLTK_BROWSER_PROTOCOL_MARKER
     "${CMAKE_BINARY_DIR}/generated/frontend/iced/browser_protocol.marker"
     CACHE INTERNAL "Canonical compiled native browser protocol marker")
-set(MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE
-    "${CMAKE_BINARY_DIR}/generated/frontend/iced/protocol_v16_client_records.hex"
-    CACHE INTERNAL "Protocol-16 Rust/native client record fixtures")
-set(MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE
-    "${CMAKE_BINARY_DIR}/generated/frontend/iced/protocol_v16_server_records.cbor"
-    CACHE INTERNAL "Native protocol-16 server record fixture")
+set(MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE
+    "${CMAKE_BINARY_DIR}/generated/frontend/iced/protocol_v17_client_records.hex"
+    CACHE INTERNAL "Protocol-17 Rust/native client record fixtures")
+set(MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE
+    "${CMAKE_BINARY_DIR}/generated/frontend/iced/protocol_v17_server_records.cbor"
+    CACHE INTERNAL "Native protocol-17 server record fixture")
 
 add_executable(mmltk_application_binding_generator EXCLUDE_FROM_ALL)
 mmltk_register_ordinary_sources(
@@ -114,35 +114,35 @@ add_custom_target(mmltk_generate_application_bindings
         "${MMLTK_BROWSER_PROTOCOL_MARKER}"
         "${MMLTK_WORKSPACE_GRAPHICS_ABI}")
 
-add_executable(mmltk_controller_browser_protocol_v16_fixture EXCLUDE_FROM_ALL)
+add_executable(mmltk_controller_browser_protocol_v17_fixture EXCLUDE_FROM_ALL)
 mmltk_register_ordinary_sources(
-    mmltk_controller_browser_protocol_v16_fixture
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_v16_server_fixture.cpp)
+    mmltk_controller_browser_protocol_v17_fixture
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/protocol_v17_server_fixture.cpp)
 mmltk_configure_component(
-    mmltk_controller_browser_protocol_v16_fixture PRIVATE_DECLARATIONS)
+    mmltk_controller_browser_protocol_v17_fixture PRIVATE_DECLARATIONS)
 mmltk_register_private_headers(
-    mmltk_controller_browser_protocol_v16_fixture
+    mmltk_controller_browser_protocol_v17_fixture
     tests/annotation_wire_fixture.h)
 target_link_libraries(
-    mmltk_controller_browser_protocol_v16_fixture
+    mmltk_controller_browser_protocol_v17_fixture
     PRIVATE
         mmltk::controller::application_systems_projection
-        mmltk::controller::browser::protocol_v16
+        mmltk::controller::browser::protocol_v17
         mmltk::frameworks::serialization)
 add_custom_command(
-    OUTPUT "${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}"
+    OUTPUT "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${CMAKE_BINARY_DIR}/generated/frontend/iced"
-    COMMAND "$<TARGET_FILE:mmltk_controller_browser_protocol_v16_fixture>"
-            "${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}"
+    COMMAND "$<TARGET_FILE:mmltk_controller_browser_protocol_v17_fixture>"
+            "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}"
     DEPENDS
-        mmltk_controller_browser_protocol_v16_fixture
+        mmltk_controller_browser_protocol_v17_fixture
         "${MMLTK_APPLICATION_BINDINGS}"
     VERBATIM)
-add_custom_target(mmltk_controller_browser_protocol_v16_boundary
+add_custom_target(mmltk_controller_browser_protocol_v17_boundary
     DEPENDS
         "${MMLTK_APPLICATION_BINDINGS}"
-        "${MMLTK_BROWSER_PROTOCOL_V16_SERVER_FIXTURE}")
+        "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}")
 
 function(mmltk_add_controller_browser_tests)
     add_executable(mmltk_controller_browser_tests EXCLUDE_FROM_ALL)
@@ -165,23 +165,23 @@ function(mmltk_add_controller_browser_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests
     )
     target_compile_definitions(mmltk_controller_browser_tests PRIVATE
-        MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH="${MMLTK_BROWSER_PROTOCOL_V16_CLIENT_FIXTURE}"
+        MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH="${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
     )
     target_link_libraries(mmltk_controller_browser_tests PRIVATE
         mmltk_acceptance_support
         mmltk::controller::browser::direct
-        mmltk::controller::browser::protocol_v16
+        mmltk::controller::browser::protocol_v17
         mmltk::controller::presentation_system
         mmltk::frameworks::reflection
         mmltk::frameworks::serialization
     )
     add_dependencies(
         mmltk_controller_browser_tests
-        mmltk_controller_browser_protocol_v16_boundary)
-    if(TARGET mmltk_frontend_iced_protocol_v16_client_fixture)
+        mmltk_controller_browser_protocol_v17_boundary)
+    if(TARGET mmltk_frontend_iced_protocol_v17_client_fixture)
         add_dependencies(
             mmltk_controller_browser_tests
-            mmltk_frontend_iced_protocol_v16_client_fixture)
+            mmltk_frontend_iced_protocol_v17_client_fixture)
     endif()
     catch_discover_tests(
         mmltk_controller_browser_tests

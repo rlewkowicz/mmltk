@@ -155,6 +155,12 @@ struct AnnotationRenderedScene final {
     contracts::AnnotationSceneGeometry geometry{};
     [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<std::uint64_t> identities{};
 };
+struct AnnotationImageMetadata final {
+    AnnotationRenderedScene rendered_scene{};
+    AnnotationRenderedFacts rendered{};
+    VisualFrame frame{};
+};
+
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
@@ -194,7 +200,7 @@ class AnnotationSystem final {
    public:
     using visual_source = VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
                                                  mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
     using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
     AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                      VisualDiagnosticSink = {});
@@ -213,6 +219,7 @@ class AnnotationSystem final {
     void Shutdown() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] AnnotationSnapshot snapshot() const;
+    [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] VisualSourceObservation ObserveSource() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
@@ -255,6 +262,7 @@ MMLTK_REFLECT_FIELDS(AnnotationEdit)
 MMLTK_REFLECT_FIELDS(AnnotationEditRequest)
 MMLTK_REFLECT_FIELDS(AnnotationRenderedFacts)
 MMLTK_REFLECT_FIELDS(AnnotationRenderedScene)
+MMLTK_REFLECT_FIELDS(AnnotationImageMetadata)
 MMLTK_REFLECT_FIELDS(AnnotationSnapshot)
 MMLTK_REFLECT_FIELDS(AnnotationChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFrameState)

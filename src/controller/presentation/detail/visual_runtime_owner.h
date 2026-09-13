@@ -143,7 +143,6 @@ class VisualRuntimeOwner final {
     std::atomic<std::uint8_t> continuation_state_{0U};
     std::optional<std::chrono::steady_clock::time_point> continuation_deadline_;
     std::optional<VisualWorkspaceRequest> workspace_request_;
-    mmltk::frameworks::gpu::ImageWorkspaceObservation workspace_candidate_;
     std::atomic_bool workspace_pending_{false};
     std::atomic_bool workspace_retry_{false};
     std::unique_ptr<Runtime> runtime_;

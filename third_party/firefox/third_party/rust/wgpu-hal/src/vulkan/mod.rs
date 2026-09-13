@@ -623,13 +623,11 @@ impl ExternalTimelineSubmittedFrame {
     }
 }
 
-#[cfg(test)]
 fn reconcile_external_timeline_edges(preconsumed: u64, edges: u64) -> (u64, u64) {
     let consumed = preconsumed.min(edges);
     (preconsumed - consumed, edges - consumed)
 }
 
-#[cfg(test)]
 fn plan_external_timeline_edge(
     submitted_release: u64,
     preconsumed_edges: u64,
@@ -686,13 +684,12 @@ impl ExternalTimelineQueueSubmission {
     }
 
     fn submit_acquired_locked(
-        &self, ready: u64, command: vk::CommandBuffer, release: bool,
+        &self, ready: u64, commands: &[vk::CommandBuffer], release: bool,
     ) -> Result<(), vk::Result> {
         if !self.active.load(Ordering::Acquire) || ready == 0 || ready & 1 == 0
-            || command == vk::CommandBuffer::null() {
+            || commands.is_empty() || commands.contains(&vk::CommandBuffer::null()) {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-        let commands = [command];
         let signals = [self.timeline];
         let waits = [self.timeline];
         let wait_values = [ready];
@@ -700,7 +697,7 @@ impl ExternalTimelineQueueSubmission {
         let values = [ready.checked_add(1).ok_or(vk::Result::ERROR_UNKNOWN)?];
         let mut timeline = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values);
         if release { timeline = timeline.signal_semaphore_values(&values); }
-        let mut submit = vk::SubmitInfo::default().command_buffers(&commands)
+        let mut submit = vk::SubmitInfo::default().command_buffers(commands)
             .wait_semaphores(&waits).wait_dst_stage_mask(&wait_stages).push_next(&mut timeline);
         if release { submit = submit.signal_semaphores(&signals); }
         // The shared CPU gate already grants exclusive read custody and the
@@ -728,7 +725,7 @@ impl ExternalTimelineQueueSubmission {
             || copied_slot.is_some_and(|slot| slot >= self.copy_slot_count) {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-        self.submit_acquired_locked(ready, command, copied_slot.is_some())?;
+        self.submit_acquired_locked(ready, &[command], copied_slot.is_some())?;
         Ok(ExternalTimelineSubmittedFrame { ready, copied_slot })
     }
 
@@ -738,7 +735,24 @@ impl ExternalTimelineQueueSubmission {
         if ready == 0 || self.acquired_ready.load(Ordering::Acquire) != ready {
             return Err(vk::Result::ERROR_UNKNOWN);
         }
-        self.submit_acquired_locked(ready, self.release_command_buffer, true)
+        self.submit_acquired_locked(ready, &[self.release_command_buffer], true)
+    }
+
+    pub fn release_completed(&self, ready: u64, acquire: Option<vk::CommandBuffer>) -> Result<ExternalTimelineSubmittedFrame, vk::Result> {
+        let _queue_operation = self.device.queue_operation_gate.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.acquired_ready.load(Ordering::Acquire) != 0 || self.timeline_value()? < ready {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
+        let (_, planned) = plan_external_timeline_edge(
+            self.submitted_release.load(Ordering::Acquire), 0, 1, Some(ready), None,
+            self.destination_attached.load(Ordering::Acquire), Some(ready))?;
+        if planned != Some((ready, None)) {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
+        let commands = [acquire.unwrap_or(self.release_command_buffer), self.release_command_buffer];
+        self.submit_acquired_locked(ready, &commands[..if acquire.is_some() { 2 } else { 1 }], true)?;
+        Ok(ExternalTimelineSubmittedFrame { ready, copied_slot: None })
     }
 
     /// A single nonblocking observation for effect-only receiver diagnostics.
@@ -782,7 +796,7 @@ impl ExternalTimelineQueueSubmission {
             if !self.active.load(Ordering::Acquire) { return Ok(()); }
             self.destination_attached.store(false, Ordering::Release);
             let ready = self.acquired_ready.load(Ordering::Acquire);
-            if ready != 0 { self.submit_acquired_locked(ready, self.release_command_buffer, true)?; }
+            if ready != 0 { self.submit_acquired_locked(ready, &[self.release_command_buffer], true)?; }
             self.active.store(false, Ordering::Release);
         }
         self.wait_for_submitted_release(timeout_ns)

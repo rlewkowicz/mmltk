@@ -41,6 +41,8 @@ class ApplicationWorkspaceAbiEmitter final {
         Record<abi::LayoutPacket>();
         Record<presentation::WorkspaceContentIdentity>();
         Record<presentation::detail::WorkspaceFrameSignal>();
+        Constant("WORKSPACE_METADATA_BYTE_CAPACITY", "usize", presentation::detail::kWorkspaceMetadataByteCapacity);
+        Constant("WORKSPACE_FRAME_MAPPING_BYTES", "usize", presentation::detail::kWorkspaceFrameMappingBytes);
         namespace gpu = frameworks::gpu;
         Constant("WORKSPACE_ACCESS_EMPTY", "u64", gpu::kWorkspaceAccessEmpty);
         Constant("WORKSPACE_ACCESS_WRITING", "u64", gpu::kWorkspaceAccessWriting);

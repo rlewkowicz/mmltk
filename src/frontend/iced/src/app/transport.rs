@@ -69,20 +69,9 @@ impl App {
                 self.model.peer_connected();
                 self.settings.reset_transport();
                 self.workspace.reset_transport(&self.model);
-                self.presentation.reset_failure();
-                if matches!(
-                    connection.send_renderer_observation(RendererObservation::Ready),
-                    Err(crate::transport_connection::OutboundSendError::Closed)
-                ) {
-                    self.retire_peer(UiError::transport(
-                        crate::transport_connection::OutboundSendError::Closed.to_string(),
-                    ));
-                    return Task::none();
-                }
                 self.workspace
                     .set_annotation_connection(Some(connection.clone()));
                 self.connection = Some(connection);
-                self.send_surface_observation();
             }
             TransportEvent::Bootstrap(bootstrap) => self.install_bootstrap(bootstrap),
             TransportEvent::IntentReply(reply) => self.reduce_reply(reply),
@@ -125,7 +114,6 @@ impl App {
                 .observe(&crate::protocol::ServerRecord::Bootstrap(bootstrap.clone()))
                 .expect("test transport observation");
         }
-        self.presentation.reset_failure();
         if let Err(error) = self
             .model
             .install_bootstrap(bootstrap.schema_fingerprint, bootstrap.snapshots)
@@ -177,6 +165,9 @@ impl App {
         }) && decoded.is_ok();
         let (filter_admission_revision, filter_failed) =
             Self::classify_explore_reply(context, &decoded);
+        if context == Some(ApplicationIntentEndpoint::ExploreUpdateDetail) && decoded.is_err() {
+            self.abandon_explore_edit(ApplicationIntentEndpoint::ExploreUpdateDetail);
+        }
         let _ = self.model.reduce_reply(reply.correlation, decoded);
         let installed_settings = self
             .model
@@ -215,12 +206,6 @@ impl App {
                 .observe(&crate::protocol::ServerRecord::SystemEvent(event.clone()))
                 .expect("test transport observation");
         }
-        let failure_snapshot = match &event.event {
-            crate::generated::ApplicationEvent::PresentationPresentationFailed(failure) => {
-                Some(failure.snapshot.clone())
-            }
-            _ => None,
-        };
         let system = crate::generated::application_event_system(&event.event);
         let settings_revision_before = self
             .model
@@ -238,12 +223,6 @@ impl App {
         let reconcile_explore = system == crate::generated::ApplicationSystem::Explore;
         let explore_failed = Self::explore_event_failed(&event.event);
         let _ = self.model.reduce_event(event.event);
-        if failure_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| self.model.presentation.as_ref() == Some(snapshot))
-        {
-            self.presentation.failed();
-        }
         if install_component_snapshots {
             self.workspace.install_authoritative_components(&self.model);
         }

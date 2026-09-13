@@ -25,7 +25,7 @@ namespace mmltk::controller::browser {
 
 namespace field_policy = mmltk::frameworks::reflection;
 namespace wire = mmltk::frameworks::serialization::wire;
-inline constexpr std::uint64_t kBrowserProtocolVersion = 16U;
+inline constexpr std::uint64_t kBrowserProtocolVersion = 17U;
 // Aggregate output admission ceilings. Dynamic values remain actual-sized;
 // individual input fields retain the independent intent limits below.
 inline constexpr std::size_t kMaxOutputValueBytes = 8U * 1024U * 1024U;
@@ -69,26 +69,20 @@ struct CompactInteraction final {
 };
 MMLTK_REFLECT_FIELDS(CompactInteraction)
 
-enum class RendererObservationKind : std::uint8_t {
-    Ready,
-    Surface,
-    Presented,
-};
-
-struct RendererObservation final {
-    std::uint64_t protocol_version = kBrowserProtocolVersion;
-    RendererObservationKind kind = RendererObservationKind::Ready;
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
-    [[= field_policy::Finite{}]][[= field_policy::Minimum{0.0}]] double scale = 1.0;
-    std::uint64_t sample_revision = 0U;
-    bool operator==(const RendererObservation&) const = default;
-};  // CLEANUP-IGNORE: Renderer observations and bootstrap records are separate canonical wire envelopes.
-
 struct SystemSnapshot final {
     [[= field_policy::Minimum{std::uint64_t{1U}}]] std::uint64_t system_id = 0U;
     [[= field_policy::MaxBytes{kMaxOutputValueBytes}]][[= field_policy::MaxItems{kMaxOutputValueItems}]] wire::Value value{};
     bool operator==(const SystemSnapshot&) const = default;
+};
+
+// Opaque to Firefox. The source projection captures this value against the
+// retained product before display finalization; browser UI snapshots are
+// neither the source of these facts nor a condition for drawing them.
+struct WorkspaceImageMetadata final {
+    std::array<std::uint64_t, 2U> schema_fingerprint{};
+    VisualFrame frame{};
+    SystemSnapshot product{};
+    std::optional<SystemSnapshot> source{};
 };
 
 struct Bootstrap final {
@@ -148,15 +142,14 @@ struct IntegrationControl final {
 };
 MMLTK_REFLECT_FIELDS(IntegrationControl)
 
-using ClientRecord = std::variant<Intent, Interaction, RendererObservation, IntegrationControl>;
+using ClientRecord = std::variant<Intent, Interaction, IntegrationControl>;
 using ServerRecord = std::variant<Bootstrap, IntentReply, SystemEvent, InputProgress, InteractionRejected, IntegrationControl>;
 
-MMLTK_REFLECT_ENUM(RendererObservationKind)
 MMLTK_REFLECT_FIELDS(IntentField)
 MMLTK_REFLECT_FIELDS(Intent)
 MMLTK_REFLECT_FIELDS(Interaction)
-MMLTK_REFLECT_FIELDS(RendererObservation)
 MMLTK_REFLECT_FIELDS(SystemSnapshot)
+MMLTK_REFLECT_FIELDS(WorkspaceImageMetadata)
 MMLTK_REFLECT_FIELDS(Bootstrap)
 MMLTK_REFLECT_FIELDS(ApplicationErrorRecord)
 MMLTK_REFLECT_FIELDS(IntentReply)

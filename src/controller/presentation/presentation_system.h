@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <vector>
 
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
@@ -28,10 +29,7 @@ struct VisualSourceReader final {
     std::function<mmltk::frameworks::gpu::ImageWorkspaceObservation()> observe_workspace{};
     std::function<mmltk::frameworks::gpu::BorrowedImageWorkspace()> borrow_workspace{};
     std::function<void(VisualWorkspaceRequest)> request_workspace{};
-};
-struct RendererObservation final {
-    std::uint64_t completed_sample = 0U;
-    bool redraw_requested = false;
+    std::function<std::optional<std::vector<std::byte>>(const VisualFrame&)> image_metadata{};
 };
 enum class PresentationCapabilityCondition : std::uint8_t {
     Unavailable,
@@ -60,7 +58,11 @@ struct PresentationSnapshot final {
     std::uint64_t timeline_ready = 0U;
     std::uint64_t presentation_revision = 0U;
     PresentationCapability capability{};
-    std::uint64_t browser_completed_sample = 0U;
+};
+struct PresentationState final {
+    std::uint64_t revision = 0U;
+    PresentationSourceIdentity selected{};
+    bool operator==(const PresentationState&) const = default;
 };
 struct PresentationPublication final {
     PresentationCapability capability{};
@@ -93,6 +95,7 @@ enum class PresentationNativeProgress : std::uint8_t {
     Waiting,
     Superseded,
     Published,
+    BindingRetired,
 };
 struct PresentationNativeOutcome final {
     PresentationNativeProgress progress = PresentationNativeProgress::Waiting;
@@ -119,7 +122,6 @@ class PresentationNativeWriter {
     [[nodiscard]] virtual int poll_fd() const noexcept = 0;
     [[nodiscard]] virtual int completion_fd() const noexcept = 0;
     [[nodiscard]] virtual bool wants_write() const noexcept = 0;
-    virtual void SetApplicationPeerConnected(bool) noexcept = 0;
     virtual void SetExpectedBrowserProcessGroup(pid_t) = 0;
     [[nodiscard]] virtual Retirement BrowserPeerLost() noexcept = 0;
     virtual void TerminalCustodyInstalled() noexcept {}
@@ -162,15 +164,15 @@ struct PresentationNativeConfiguration final {
 };
 [[nodiscard]] PresentationNativeWriterFactory make_native_presentation_writer_factory(VisualDeviceSettings, PresentationNativeConfiguration,
                                                                                       VisualDiagnosticSink = {});
-struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::LatestState}]] PresentationCompleted final {
+struct PresentationCompleted final {
     // CLEANUP-IGNORE: Presentation completion has its own reflected identity and durable state-delivery contract.
     PresentationSnapshot snapshot{};
 };  // CLEANUP-IGNORE: Presentation event identities are distinct from Annotation's frame and failure events.
-struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PresentationCapabilityChanged final {
+struct PresentationCapabilityChanged final {
     PresentationSnapshot snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PresentationFailed final {
-    PresentationSnapshot snapshot{};
+    PresentationState snapshot{};
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
 
@@ -180,8 +182,7 @@ class PresentationSystem final {
     PresentationSystem(VisualDeviceSettings, PresentationNativeWriterFactory, std::span<const VisualSourceReader>,
                        SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~PresentationSystem();
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationSnapshot Select(PresentationSourceIdentity);
-    void Observe(RendererObservation);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationState Select(PresentationSourceIdentity);
     void SourceChanged(PresentationSourceIdentity) noexcept;
     void SetApplicationPeerConnected(bool) noexcept;
     void SetExpectedBrowserProcessGroup(pid_t);
@@ -190,18 +191,16 @@ class PresentationSystem final {
     [[nodiscard]] PresentationShutdownResult Stop() noexcept;
     [[nodiscard]] PresentationShutdownResult Shutdown() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
-    [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] PresentationSnapshot snapshot() const;
+    [[nodiscard]] PresentationSnapshot snapshot() const;
+    [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] PresentationState selection() const;
 
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-MMLTK_REFLECT_FIELDS(RendererObservation)
 MMLTK_REFLECT_FIELDS(PresentationCapability)
-MMLTK_REFLECT_FIELDS(PresentationSnapshot)
-MMLTK_REFLECT_FIELDS(PresentationCompleted)
-MMLTK_REFLECT_FIELDS(PresentationCapabilityChanged)
+MMLTK_REFLECT_FIELDS(PresentationState)
 MMLTK_REFLECT_FIELDS(PresentationFailed)
 
 }  // namespace mmltk::controller

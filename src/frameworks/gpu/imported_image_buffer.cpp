@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <stdexcept>
 #include <string_view>
 #include <sys/types.h>
 #include <cerrno>
@@ -186,6 +187,22 @@ bool ImportedImageBuffer::Import(DeviceContext context, mmltk::common::io::Scope
     return true;
 }
 cudaError_t ImportedImageBuffer::Release() noexcept { return Release({&cuMemFree, &cuDestroyExternalMemory}); }
+std::shared_ptr<ImportedImageBuffer> ImportedImageBuffer::ImportAlias(DeviceContext context) const {
+    if (!resources_ || resources_->backing.get() < 0 || empty())
+        throw std::runtime_error("workspace alias has no imported backing");
+    int duplicate;
+    do {
+        duplicate = ::fcntl(resources_->backing.get(), F_DUPFD_CLOEXEC, 0);
+    } while (duplicate < 0 && errno == EINTR);
+    if (duplicate < 0) throw std::runtime_error("workspace alias descriptor duplication failed");
+    mmltk::common::io::ScopedFd backing(duplicate);
+    auto alias = std::make_shared<ImportedImageBuffer>();
+    std::string error;
+    if (!alias->Import(std::move(context), std::move(backing),
+                       resources_->layout, resources_->identity, &error))
+        throw std::runtime_error(error);
+    return alias;
+}
 cudaError_t ImportedImageBuffer::Release(const ReleaseOperations& operations) noexcept {
     if (!resources_) return cudaSuccess;
     if (!owns_resources()) {

@@ -304,6 +304,16 @@ bool SystemImageRuntime::PrepareWorkspace(const CompletedOutput& product, std::s
 void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
     ActiveState().output->FinalizeWorkspace(candidate, coverage);
 }
+bool SystemImageRuntime::DetachDisplay(const std::shared_ptr<ImageWorkspace>& workspace) {
+    auto& state = ActiveState();
+    return state.output->DetachDisplay(*state.stream, workspace);
+}
+bool SystemImageRuntime::PrepareDisplay(std::uint64_t revision, const std::shared_ptr<ImageWorkspace>& workspace) {
+    auto& state = ActiveState();
+    if (!workspace || !workspace->admitted() || workspace->retired())
+        throw std::invalid_argument("shared display workspace is unavailable");
+    return state.output->PrepareDisplay(*state.stream, revision, workspace, state.workspace_finalize);
+}
 bool SystemImageRuntime::PrepareWorkspace(const ImageWorkspaceObservation& observation, std::shared_ptr<ImageWorkspace> workspace) {
     auto& state = WorkspaceState(workspace);
     return state.output->PrepareWorkspace(observation, std::move(workspace), state.workspace_finalize);

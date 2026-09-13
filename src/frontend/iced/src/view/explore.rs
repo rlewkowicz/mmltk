@@ -131,6 +131,10 @@ impl Component {
         self.state.abandon_submission();
     }
 
+    pub fn abandon_detail(&mut self) {
+        self.state.abandon_detail();
+    }
+
     pub fn request_viewport(
         &mut self,
         snapshot: Option<&crate::generated::ExploreSnapshot>,
@@ -322,12 +326,17 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let layout = pane_layout(width);
     let center_width = layout.center;
+    let paired = crate::presentation_surface::explore_display(surface);
+    let gallery = match &paired {
+        Some(crate::presentation_surface::ExploreDisplay::Gallery(surface, metadata)) => Some((*surface, metadata.clone())),
+        _ => None,
+    };
     let content = row![
         container(dataset::view(state, model, settings).map(Message::Dataset))
             .id(DATASET_PANE_ID)
             .width(Length::Fixed(layout.dataset))
             .height(Fill),
-        gallery::view(state, model, settings, surface, center_width).map(Message::Gallery),
+        gallery::view(state, model, settings, gallery, center_width).map(Message::Gallery),
         container(details::view(state, model, settings).map(Message::Details))
             .id(DETAILS_PANE_ID)
             .width(Length::Fixed(layout.details))
@@ -337,14 +346,11 @@ pub fn view<'a>(
     .width(Length::Fixed(width))
     .height(Fill);
 
-    let detail = model
-        .explore
-        .snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.mode == crate::generated::ExploreMode::Detail)
-        .map(|snapshot| {
-            detail::view(state, model, settings, snapshot, surface).map(Message::Detail)
-        });
+    let detail = match paired {
+        Some(crate::presentation_surface::ExploreDisplay::Detail(surface, content)) =>
+            Some(detail::view(state, model, settings, surface, content).map(Message::Detail)),
+        _ => None,
+    };
     let mut layers: Vec<Element<'a, Message>> = Vec::with_capacity(2);
     layers.push(
         container(content)
@@ -362,6 +368,40 @@ pub fn view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_first_detail_composes_with_its_paired_identity_without_logical_detail() {
+        for logical in 0..3 {
+            crate::presentation_surface::reset_test_releases();
+            let (mut model, frame) = crate::view_model::test_support::explore_presentation();
+            let expected = model.explore.snapshot.clone().unwrap();
+            assert!(crate::presentation_surface::accept_publication(frame));
+            let surface = crate::presentation_surface::metadata::surface(frame).unwrap();
+            match logical {
+                0 => model.explore.snapshot = None,
+                1 => model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Gallery,
+                _ => {
+                    let changed = model.explore.snapshot.as_mut().unwrap();
+                    changed.selectedimage = Some(99);
+                    changed.detail.showoriginaldimensions = !expected.detail.showoriginaldimensions;
+                    changed.overlay.showlabels = !expected.overlay.showlabels;
+                }
+            }
+            let Some(crate::presentation_surface::ExploreDisplay::Detail(shown, content)) =
+                crate::presentation_surface::explore_display(Some(surface))
+                else { panic!("accepted detail selects its physical composition"); };
+            assert_eq!(shown.frame, Some(frame));
+            assert_eq!(content.viewer_identity(), expected.selectedimage.map(|image| (expected.dataset.identity, image)));
+            assert_eq!(content.overlay(), &expected.overlay);
+            assert_eq!(content.frame(), &expected.frame);
+            let state = state::State::default();
+            assert_eq!(state.detail_original(&content), expected.detail.showoriginaldimensions);
+            let settings = SettingsModel::default();
+            drop(view(&state, &model, &settings, Some(surface), 1200.0));
+            crate::presentation_surface::retire_publication(frame);
+            assert_eq!(crate::presentation_surface::test_releases(), vec![frame]);
+        }
+    }
 
     #[test]
     fn specialized_explore_regions_keep_fixed_sidebars() {

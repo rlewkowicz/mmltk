@@ -162,6 +162,8 @@ struct ImageWorkspace::State final {
     const Operations operations;
     std::optional<ImageStream> stream;
     std::shared_ptr<ImportedImageBuffer> allocation = std::make_shared<ImportedImageBuffer>();
+    std::optional<DeviceContext> producer_context;
+    std::shared_ptr<ImportedImageBuffer> producer_allocation;
     std::unique_ptr<ImageProductBuffer> transfer;
     std::optional<BorrowedImageProductReadView> unsettled_source;
     std::uintptr_t completion = 0U;
@@ -169,12 +171,15 @@ struct ImageWorkspace::State final {
     mmltk::common::io::ScopedFd access_descriptor;
     mmltk::common::io::ScopedFd pending_memory;
     ImageWorkspaceAccessSignal* access_signal = nullptr;
+    std::atomic_bool display_owned{false};
+    std::atomic_bool display_held{false};
     bool write_reserved = false;
     bool write_invalidated = false;
     std::atomic<std::shared_ptr<const std::function<void()>>> availability_sink;
+    std::atomic<std::shared_ptr<const std::function<void()>>> display_availability_sink;
     std::atomic<std::uint64_t> revision{0U};
     mutable std::mutex access;
-    std::uint64_t product_owner = 0U;
+    std::atomic<std::uint64_t> product_owner{0U};
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
     std::atomic_bool admitted{false};
@@ -200,6 +205,13 @@ ImageWorkspace::ImageWorkspace(std::shared_ptr<Owner> owner, DeviceContext sourc
     } catch (...) { std::rethrow_exception(Release(std::current_exception())); }
 }
 ImageWorkspace::~ImageWorkspace() noexcept { static_cast<void>(Release()); }
+std::shared_ptr<ImageWorkspace> ImageWorkspace::Create(DeviceContext context, ImageWorkspaceLayout layout,
+                                                       std::optional<DeviceExecution> execution) {
+    auto result = std::shared_ptr<ImageWorkspace>(
+        new ImageWorkspace(std::make_shared<Owner>(), std::move(context), std::move(layout), std::move(execution)));
+    result->state_->display_owned = true;
+    return result;
+}
 std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexcept {
     if (!state_) return initiating;
     auto settled = Settle();
@@ -209,6 +221,12 @@ std::exception_ptr ImageWorkspace::Release(std::exception_ptr initiating) noexce
         try {
             if (state_->context) state_->context->Bind();
             state_->transfer.reset();
+            if (state_->producer_allocation) {
+                const auto released = state_->producer_allocation->Release();
+                if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess)
+                    throw std::runtime_error("workspace producer mapping release failed");
+                state_->producer_allocation.reset();
+            }
             const auto released = state_->allocation.use_count() == 1U ? state_->operations.release(*state_->allocation) : cudaSuccess;
             safe = released == cudaSuccess && state_->allocation->release_failure() == cudaSuccess;
             if (!safe) failure = combine_image_failures(failure, workspace_release_failure("workspace allocation release failed"));
@@ -283,15 +301,36 @@ mmltk::common::io::ScopedFd ImageWorkspace::ExportAccessDescriptor() const {
     if (descriptor.get() < 0) throw std::runtime_error("workspace access descriptor duplication failed");
     return descriptor;
 }
+ImagePlaneView ImageWorkspace::ProducerPlane(const DeviceContext& context, std::uint32_t width, std::uint32_t height) {
+    std::scoped_lock lock(state_->access);
+    auto result = plane(width, height);
+    if (context == *state_->context) return result;
+    if (context.device() != layout().device) throw std::invalid_argument("workspace producer belongs to another device");
+    if (!state_->producer_context || *state_->producer_context != context) {
+        if (state_->producer_allocation) {
+            const auto released = state_->producer_allocation->Release();
+            if (released != cudaSuccess || state_->producer_allocation->release_failure() != cudaSuccess) {
+                const auto failure = workspace_release_failure("workspace producer mapping release failed");
+                state_->owner->Failed(failure);
+                std::rethrow_exception(failure);
+            }
+        }
+        state_->producer_context.reset();
+        state_->producer_allocation = state_->allocation->ImportAlias(context);
+        state_->producer_context = context;
+    }
+    result.data = state_->producer_allocation->data();
+    return result;
+}
 bool ImageWorkspace::WriteAvailable() const noexcept {
-    if (!admitted()) return false;
+    if (!admitted() || state_->display_held.load(std::memory_order_acquire)) return false;
     const auto access = std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
     return (access & kWorkspaceAccessMask) == kWorkspaceAccessEmpty || (access & kWorkspaceAccessMask) == kWorkspaceAccessAvailable;
 }
 bool ImageWorkspace::ReserveWrite() {
     if (!admitted()) return false;
     std::unique_lock lock(state_->access, std::try_to_lock);
-    if (!lock.owns_lock()) return false;
+    if (!lock.owns_lock() || state_->display_held.load(std::memory_order_acquire)) return false;
     return state_->ReservePhysicalWrite();
 }
 void ImageWorkspace::InvalidateWrite() noexcept {
@@ -312,6 +351,36 @@ void ImageWorkspace::CancelWrite() noexcept {
         try {
             (*sink)();
         } catch (...) {}
+    }
+}
+bool ImageWorkspace::display_owned() const noexcept { return state_->display_owned.load(std::memory_order_acquire); }
+bool ImageWorkspace::ReserveDisplayWrite() {
+    std::scoped_lock lock(state_->access);
+    if (!admitted() || state_->display_held.load(std::memory_order_acquire)) return false;
+    if (!state_->ReservePhysicalWrite()) return false;
+    state_->display_owned = true;
+    state_->display_held.store(true, std::memory_order_release);
+    return true;
+}
+void ImageWorkspace::CancelDisplayWrite() noexcept {
+    CancelWrite();
+    state_->display_held.store(false, std::memory_order_release);
+    if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
+        try { (*sink)(); } catch (...) {}
+    }
+}
+std::uint64_t ImageWorkspace::product_owner() const noexcept { return state_->product_owner.load(std::memory_order_acquire); }
+void ImageWorkspace::SetDisplayAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
+    state_->display_availability_sink.store(std::move(sink), std::memory_order_release);
+}
+void ImageWorkspace::Detach(std::uint64_t product_owner) {
+    {
+        std::scoped_lock lock(state_->access);
+        if (state_->product_owner == product_owner) state_->product_owner = 0U;
+        else if (state_->product_owner != 0U) throw std::invalid_argument("workspace detachment owner mismatch");
+    }
+    if (const auto sink = state_->display_availability_sink.load(std::memory_order_acquire)) {
+        try { (*sink)(); } catch (...) {}
     }
 }
 bool ImageWorkspace::Acquired(std::uint64_t generation) const noexcept {
@@ -335,6 +404,7 @@ void ImageWorkspace::CompleteRead(std::uint64_t generation) {
         if ((expected & kWorkspaceAccessMask) != kWorkspaceAccessReading ||
             !access.compare_exchange_strong(expected, (expected & ~kWorkspaceAccessMask) | role, std::memory_order_release))
             throw std::runtime_error("workspace read settlement lost physical custody");
+        state_->display_held.store(false, std::memory_order_release);
     }
     if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
         try {
@@ -409,7 +479,8 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
     state_->revision = 0U;
     std::atomic_ref{state_->access_signal->generation}.store(0U, std::memory_order_relaxed);
     try {
-        if (source.plane(0U).device() != layout().device) {
+        const bool aliases_destination = source.plane_count() == 1U && clean.allocation.identity == identity();
+        if (!aliases_destination && !source.plane(0U).UsesContext(*state_->context)) {
             const auto product_layout = source.plane_count() == 1U ? ImageProductLayout::Clean : ImageProductLayout::CleanAndSemantic;
             if (!state_->transfer) {
                 auto transfer = std::make_unique<ImageProductBuffer>(*state_->context, product_layout);
@@ -425,7 +496,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
             state_->stream->Await(source);
         }
         const auto input = source.plane(0U).plane();
-        if (input.data != destination.data)
+        if (!aliases_destination && input.data != destination.data)
             finalize(input, source.plane_count() == 2U ? source.plane(1U).plane() : ImagePlaneView{}, destination, coverage,
                      state_->stream->native_handle());
         state_->stream->Record(state_->completion);

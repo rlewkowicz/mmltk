@@ -4,12 +4,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <span>
+#include <cstring>
 #include <stdexcept>
 #include <type_traits>
 
 #include "src/controller/presentation/workspace_presentation_types.h"
 
 namespace mmltk::controller::presentation::detail {
+
+inline constexpr std::size_t kWorkspaceMetadataByteCapacity = 16U * 1024U * 1024U + 4096U;
 
 // CLEANUP-IGNORE: This cache-line signal is a fixed shared-memory protocol, not an application layout abstraction.
 struct alignas(64) WorkspaceFrameSignal final {
@@ -25,7 +29,10 @@ struct alignas(64) WorkspaceFrameSignal final {
     std::uint32_t content_width = 0U;
     std::uint32_t content_height = 0U;
     std::uint64_t physical_revision = 0U;
+    std::uint32_t metadata_bytes = 0U;
 };
+
+inline constexpr std::size_t kWorkspaceFrameMappingBytes = sizeof(WorkspaceFrameSignal) + kWorkspaceMetadataByteCapacity;
 
 static_assert(std::is_standard_layout_v<WorkspaceFrameSignal>);
 static_assert(std::is_trivially_copyable_v<WorkspaceFrameSignal>);
@@ -54,10 +61,16 @@ inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, c
                                            const std::uint64_t transfer_sequence, const WorkspacePresentationLayer layer,
                                            const WorkspaceContentIdentity logical_content, const std::uint64_t presentation_revision,
                                            const std::uint32_t content_width, const std::uint32_t content_height,
-                                           const std::uint64_t physical_revision) noexcept {
+                                           const std::uint64_t physical_revision,
+                                           const std::span<const std::byte> metadata = {}) {
     if (signal == nullptr) return;
+    if (metadata.size() > kWorkspaceMetadataByteCapacity)
+        throw std::length_error("workspace image metadata exceeds its graphics envelope");
     std::atomic_ref<std::uint64_t> sequence{signal->sequence_lock};
     static_cast<void>(sequence.fetch_add(1U, std::memory_order_seq_cst));
+    // The writer owns this physical slot. Readers copy the opaque payload only
+    // after winning its generation gate; custody makes the payload immutable.
+    if (!metadata.empty()) std::memcpy(reinterpret_cast<std::byte*>(signal) + sizeof(WorkspaceFrameSignal), metadata.data(), metadata.size());
     std::atomic_ref<std::uint64_t>{signal->timeline_ready}.store(timeline_ready, std::memory_order_seq_cst);
     std::atomic_ref<std::uint64_t>{signal->transfer_sequence}.store(transfer_sequence, std::memory_order_seq_cst);
     std::atomic_ref<std::uint64_t>{signal->layer}.store(static_cast<std::uint64_t>(layer), std::memory_order_seq_cst);
@@ -67,6 +80,7 @@ inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, c
     std::atomic_ref<std::uint32_t>{signal->content_width}.store(content_width, std::memory_order_seq_cst);
     std::atomic_ref<std::uint32_t>{signal->content_height}.store(content_height, std::memory_order_seq_cst);
     std::atomic_ref<std::uint64_t>{signal->physical_revision}.store(physical_revision, std::memory_order_seq_cst);
+    std::atomic_ref<std::uint32_t>{signal->metadata_bytes}.store(static_cast<std::uint32_t>(metadata.size()), std::memory_order_seq_cst);
     static_cast<void>(sequence.fetch_add(1U, std::memory_order_seq_cst));
 }
 

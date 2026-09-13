@@ -119,7 +119,7 @@ int main(const int argument_count, char* const* const arguments) {
         .target = services::FileDialogTarget{services::SettingsFieldTarget{dialog_id}},
         .result =
             services::FileDialogSelected{
-                .path = "/tmp/protocol-v16-fixture",
+                .path = "/tmp/protocol-v17-fixture",
             },
     };
     auto cancelled_reply = mmltk::frameworks::serialization::reflected_transport_value(FileDialogSnapshot{

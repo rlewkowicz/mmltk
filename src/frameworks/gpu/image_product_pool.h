@@ -104,6 +104,8 @@ class ImageProductPool final {
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
     [[nodiscard]] bool ConfigureWorkspace(Candidate&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
+    [[nodiscard]] bool PrepareDisplay(ImageStream&, std::uint64_t, const std::shared_ptr<ImageWorkspace>&, ImageWorkspaceFinalize);
+    [[nodiscard]] bool DetachDisplay(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
     // Late admission fills an unpublished display allocation from retained raw
     // pixels; the completed product revision and raw plane addresses stay intact.
     [[nodiscard]] bool PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);

@@ -253,33 +253,6 @@ struct ApplicationBrowserHost::Impl final {
                         return interaction(*installed, InteractionView{value});
                     } else if constexpr (std::same_as<Type, IntegrationControl>) {
                         return integration && integration->ObserveFrontend(value.receipt);
-                    } else {
-                        auto* presentation = installed->presentation;
-                        if (presentation == nullptr) {
-                            diagnostics.Emit([&] {
-                                return services::RuntimeDiagnosticFact{
-                                    .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                    .event = "browser.renderer_observation.unavailable",
-                                    .sequence = value.sample_revision,
-                                    .value = static_cast<std::uint64_t>(value.kind),
-                                };
-                            });
-                            return false;
-                        }
-                        presentation->Observe({
-                            .completed_sample = value.kind == RendererObservationKind::Presented ? value.sample_revision : 0U,
-                            .redraw_requested = value.kind != RendererObservationKind::Presented,
-                        });
-                        diagnostics.Emit([&] {
-                            return services::RuntimeDiagnosticFact{
-                                .owner = contracts::DiagnosticOwner::BrowserRuntime,
-                                .event = "browser.renderer_observation.accepted",
-                                .sequence = value.sample_revision,
-                                .value = static_cast<std::uint64_t>(value.kind),
-                                .context = {.capacity_width = value.width, .capacity_height = value.height},
-                            };
-                        });
-                        return true;
                     }
                 },
                 std::move(*decoded));

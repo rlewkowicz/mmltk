@@ -16,7 +16,6 @@ pub(super) struct Controller {
     pending: Option<Surface>,
     pending_rejected: bool,
     retained: Option<Surface>,
-    failed: bool,
     viewer: Option<(u64, u32)>,
     suspended: Option<SuspendedViewer>,
     pub(super) stop_requested: bool,
@@ -35,7 +34,6 @@ enum ViewerOutcome {
 
 struct Update {
     native: Option<(FrameReady, Option<Surface>)>,
-    observation: Option<RendererObservation>,
     redraw: bool,
 }
 
@@ -173,29 +171,15 @@ impl Controller {
         self.incumbent = self.surface;
     }
 
-    pub(super) fn reset_failure(&mut self) {
-        crate::presentation_surface::authorize_draw(None);
-        self.failed = false;
-    }
-
-    pub(super) fn failed(&mut self) {
-        self.failed = true;
-    }
-
     fn update(&mut self, message: Message, model: &ApplicationModel) -> Update {
         let mut update = Update {
             native: None,
-            observation: None,
             redraw: false,
         };
         match message {
             Message::Surface(crate::presentation_surface::Notification::Native(frame)) => {
                 update.native = Some((frame, self.surface()));
-                if self.present(frame, model) {
-                    update.observation = Some(RendererObservation::Presented {
-                        sample_revision: frame.presentation_revision,
-                    });
-                }
+                update.redraw = self.present(frame, model);
             }
             Message::Surface(crate::presentation_surface::Notification::Copied(frame)) => {
                 crate::presentation_surface::complete_sample(frame);
@@ -211,6 +195,7 @@ impl Controller {
                         self.pending.expect("matching rejected publication"),
                     );
                     self.pending_rejected = true;
+                    update.redraw = true;
                 }
             }
             Message::Surface(crate::presentation_surface::Notification::Drawn) => {
@@ -311,6 +296,8 @@ impl App {
                 .is_some()
                 .then_some(ViewerOutcome::Abandoned)
         });
+        self.workspace.explore_abandon_detail();
+        self.presentation.retire_frame();
         self.finish_viewer_departure(outcome.is_some());
     }
 
@@ -318,7 +305,6 @@ impl App {
         self.model.abandon_viewer();
         self.model
             .set_foreground_visual(Some(PresentationSourceKind::Explore));
-        self.presentation.retire_frame();
         self.presentation.stop_requested |= stop;
         self.dispatch_viewer_desired();
     }
@@ -375,12 +361,6 @@ impl App {
                 });
             }
         }
-        if let Some(observation) = update.observation
-            && let Some(connection) = self.connection.as_mut()
-        {
-            let result = connection.send_renderer_observation(observation);
-            self.retire_if_closed(result);
-        }
         self.reconcile_surface_frame();
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
@@ -413,7 +393,6 @@ impl App {
             }
             _ => return Task::none(),
         }
-        self.send_surface_observation();
         self.dispatch_explore_viewport()
     }
 
@@ -454,29 +433,7 @@ impl App {
             ApplicationIntentEndpoint::PresentationSelect,
             move |correlation| crate::generated::encode_presentation_Select(correlation, source),
         ) {
-            crate::presentation_surface::gallery::select(
-                self.model.explore.snapshot.as_ref(),
-                &frame,
-            );
             self.model.record_presentation_sent(frame);
-        }
-    }
-
-    pub(super) fn send_surface_observation(&mut self) {
-        if self.model.window_width == 0
-            || self.model.window_height == 0
-            || !self.model.scale_factor.is_finite()
-            || self.model.scale_factor <= 0.0
-        {
-            return;
-        }
-        if let Some(connection) = self.connection.as_mut() {
-            let result = connection.send_renderer_observation(RendererObservation::Surface {
-                width: self.model.window_width,
-                height: self.model.window_height,
-                scale: self.model.scale_factor,
-            });
-            self.retire_if_closed(result);
         }
     }
 
@@ -501,17 +458,6 @@ impl App {
     pub(super) fn reconcile_presentation(&mut self, recovery: bool) {
         self.reconcile_viewer();
         self.dispatch_viewer_desired();
-        if let Some(snapshot) = self.model.explore.snapshot.as_ref() {
-            crate::presentation_surface::gallery::select(
-                (self.model.foreground_visual() == Some(PresentationSourceKind::Explore))
-                    .then_some(snapshot),
-                &snapshot.frame,
-            );
-        }
-        if let Err(error) = self.model.completed_presentation_is_obsolete() {
-            self.retire_peer(error);
-            return;
-        }
         self.sync_surface();
         if recovery
             && let Err(error) =
@@ -521,22 +467,8 @@ impl App {
             self.retire_peer(error);
             return;
         }
-        let refresh = if recovery {
-            self.model.presentation_recovery_refresh().filter(|frame| {
-                self.model.presentation.as_ref().is_none_or(|snapshot| {
-                    !self
-                        .presentation
-                        .pending
-                        .and_then(|surface| surface.frame)
-                        .is_some_and(|pending| {
-                            pending.matches_content(frame) && pending.matches_completed(snapshot)
-                        })
-                        && crate::presentation_surface::completed_content(frame, snapshot).is_none()
-                })
-            })
-        } else {
-            self.model.presentation_refresh()
-        };
+        let refresh = if recovery { self.model.presentation_recovery_refresh() }
+            else { self.model.presentation_refresh() };
         if let Some(frame) = refresh {
             self.select_presentation(frame);
         }
@@ -551,51 +483,25 @@ impl App {
 }
 
 impl Controller {
-    fn present(&mut self, frame: FrameReady, model: &ApplicationModel) -> bool {
-        crate::presentation_surface::invalidate_drawn_slot(frame);
+    fn present(&mut self, frame: FrameReady, _model: &ApplicationModel) -> bool {
         if self.pending.and_then(|pending| pending.frame) == Some(frame) {
             return false;
         }
-        if self.failed
-            && model
-                .presentation
-                .as_ref()
-                .is_none_or(|snapshot| !frame.matches_completed(snapshot))
-        {
-            if self
-                .pending
-                .and_then(|surface| surface.frame)
-                .is_some_and(|current| {
-                    crate::presentation_surface::same_mailbox_slot(current, frame)
-                        && current != frame
-                })
-            {
-                self.retire_pending();
-            }
-            crate::presentation_surface::release(frame);
-            return false;
-        }
-        let completed = model
-            .presentation
-            .as_ref()
-            .is_some_and(|snapshot| frame.matches_completed(snapshot));
-        let Some(surface) = self
-            .surface
-            .filter(|surface| frame.belongs_to(*surface))
-            .or_else(|| {
-                self.incumbent
-                    .filter(|surface| completed && frame.belongs_to(*surface))
-            })
-        else {
+        let Some(mut surface) = crate::presentation_surface::metadata::surface(frame) else {
             crate::presentation_surface::release(frame);
             return false;
         };
+        surface.integration = self.surface.is_some_and(|surface| surface.integration);
         if let Some(previous) = self.pending.and_then(|pending| pending.frame)
             && previous.presentation_revision >= frame.presentation_revision
         {
             if previous != frame {
                 crate::presentation_surface::release(frame);
             }
+            return false;
+        }
+        if !crate::presentation_surface::accept_publication(frame) {
+            crate::presentation_surface::release(frame);
             return false;
         }
         if let Some(previous) = self.pending.and_then(|pending| pending.frame)
@@ -607,22 +513,19 @@ impl Controller {
             crate::presentation_surface::retire_publication(previous);
             crate::presentation_surface::discard_sample(previous);
         }
-        if !crate::presentation_surface::accept_publication(frame) {
-            return false;
-        }
+        crate::presentation_surface::invalidate_drawn_slot(frame);
+        self.surface = Some(Surface { frame: None, ..surface });
         self.pending = Some(Surface {
             frame: Some(frame),
             ..surface
         });
         self.pending_rejected = false;
-        if completed {
-            self.incumbent = Some(surface);
-        }
+        self.incumbent = Some(surface);
         true
     }
 
     pub(super) fn retire_frame(&mut self) {
-        crate::presentation_surface::authorize_draw(None);
+        crate::presentation_surface::retire_samples();
         self.retire_pending();
         self.retained = None;
         crate::presentation_surface::clear_drawn_detail();
@@ -649,211 +552,37 @@ impl Controller {
         recovery: bool,
     ) -> Result<(), UiError> {
         crate::presentation_surface::authorize_draw(None);
-        if feature == FeatureId::Explore
-            && model.explore.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.ready
-                    && snapshot.mode == crate::generated::ExploreMode::Gallery
-                    && snapshot.order.matchingcount == 0
-            })
-        {
-            // The gallery replaces the image with its local empty outcome.
-            // No replacement image draw will release the previous sample.
-            #[cfg(target_arch = "wasm32")]
-            let retirement_trace = if crate::presentation_surface::surface_trace_enabled() {
-                model
-                    .explore
-                    .snapshot
-                    .as_ref()
-                    .map(crate::presentation_surface::empty_gallery_retirement_trace)
-            } else {
-                None
-            };
-            crate::presentation_surface::retire_samples();
+        if matches!(feature, FeatureId::Train | FeatureId::Validate | FeatureId::Export) {
             self.retire_frame();
-            self.incumbent = None;
-            #[cfg(target_arch = "wasm32")]
-            if let Some(record) = retirement_trace {
-                crate::presentation_surface::emit_surface_trace(&record);
+            return Ok(());
+        }
+        let _ = recovery;
+        if self.pending_rejected {
+            self.retire_pending();
+        }
+        if let Some(surface) = self.pending {
+            crate::presentation_surface::reconcile_completed(surface, model);
+            if let Some(retained) = crate::presentation_surface::retained_surface()
+                .filter(|retained| retained.frame == surface.frame) {
+                self.retained = Some(retained);
+                self.incumbent = Some(retained);
+                self.pending = None;
+                self.pending_rejected = false;
             }
-            return Ok(());
-        }
-        crate::presentation_surface::authorize_acquisition(
-            (!matches!(
-                feature,
-                FeatureId::Train | FeatureId::Validate | FeatureId::Export
-            ))
-            .then_some(self.surface)
-            .flatten(),
-            model,
-        );
-        // Transport loss clears domain facts, not retained sample custody.
-        let Some(snapshot) = model.presentation.as_ref() else {
-            return Ok(());
-        };
-        if matches!(
-            feature,
-            FeatureId::Train | FeatureId::Validate | FeatureId::Export
-        ) {
-            self.retire_frame();
-            return Ok(());
-        }
-        let decision = model.completed_presentation_reconciliation()?;
-        if decision == crate::view_model::PresentationReconciliation::Matching
-            && let Some(snapshot) = model.presentation.as_ref()
-            && let Some(retained) =
-                crate::presentation_surface::completed_content(&snapshot.completed, snapshot)
-        {
+        } else if let Some(retained) = self.retained {
             crate::presentation_surface::reconcile_completed(retained, model);
-            self.retained = Some(retained);
-            self.incumbent = Some(retained);
         }
-        let Some(frame) = self.pending.and_then(|surface| surface.frame) else {
-            return Ok(());
-        };
-        let acquired = crate::presentation_surface::acquired_publication(frame);
-        let completed = frame.matches_completed(snapshot) || acquired;
-        if recovery && !completed {
-            self.retire_pending();
-            return Ok(());
-        }
-        if completed {
-            self.incumbent = self.pending;
-        }
-        if self.failed && !completed {
-            self.retire_pending();
-            return Ok(());
-        }
-        // A future physical publication may be awaiting its control snapshot.
-        // Neither that ordering nor a later domain snapshot alone abandons it.
-        if frame.presentation_revision <= snapshot.presentationrevision {
-            if !acquired
-                && (decision == crate::view_model::PresentationReconciliation::Superseded
-                    || !completed)
-            {
-                self.retire_pending();
-            } else if acquired
-                || decision == crate::view_model::PresentationReconciliation::Matching
-            {
-                crate::presentation_surface::gallery::confirm(
-                    frame,
-                    &snapshot.completed,
-                    model.explore.snapshot.as_ref(),
-                );
-                crate::presentation_surface::reconcile_completed(
-                    self.pending.expect("matching pending surface"),
-                    model,
-                );
-                if let Some(retained) = crate::presentation_surface::retained_surface()
-                    .filter(|surface| surface.frame == Some(frame))
-                {
-                    self.retained = Some(retained);
-                    self.pending = None;
-                    self.pending_rejected = false;
-                }
-            }
-        }
-        if self.pending_rejected && crate::presentation_surface::gallery::awaiting_display(frame) {
-            // Matching metadata may have arrived after the rejected draw.
-            self.pending_rejected = false;
-        }
-        let selection_superseded = !completed
-            && snapshot.selected.instance != 0
-            && snapshot.selected.kind != PresentationSourceKind::None
-            && frame.content_session
-                != crate::generated::presentation_source_session(snapshot.selected.kind);
-        if (self.pending_rejected || selection_superseded)
-            && self
-                .pending
-                .zip(self.surface)
-                .is_some_and(|(pending, surface)| {
-                    surface.generation > pending.generation
-                        && (surface.high != pending.high || surface.low != pending.low)
-                })
-        {
-            // An ineligible incumbent must not hide an admitted replacement.
-            // A publication from an abandoned source selection will never receive
-            // matching completion metadata. Actual encoded reads keep their independent leases.
-            if let Some(pending) = self.pending {
-                crate::presentation_surface::trace_surface(
-                    if selection_superseded {
-                        "selection_superseded_publication_retired"
-                    } else {
-                        "rejected_publication_retired"
-                    },
-                    pending,
-                );
-            }
-            self.retire_pending();
+
+        Ok(())
+    }
+
+    fn sync(&mut self, _model: &ApplicationModel, integration: bool) -> Result<(), &'static str> {
+        for surface in [&mut self.surface, &mut self.incumbent, &mut self.pending, &mut self.retained].into_iter().flatten() {
+            surface.integration = integration;
         }
         Ok(())
     }
 
-    fn sync(&mut self, model: &ApplicationModel, integration: bool) -> Result<(), &'static str> {
-        let Some(snapshot) = model.presentation.as_ref() else {
-            return Ok(());
-        };
-        match surface_from_snapshot(snapshot) {
-            Ok(None) => {
-                if integration {
-                    crate::integration_control::report_surface_sync(self.surface, None);
-                }
-                self.discard();
-                crate::presentation_surface::retire_imports();
-            }
-            Ok(mut surface) => {
-                if let Some(surface) = surface.as_mut() {
-                    surface.integration = integration;
-                }
-                if integration {
-                    crate::integration_control::report_surface_sync(self.surface, surface);
-                }
-                if !self.surface.zip(surface).is_some_and(|(current, updated)| {
-                    crate::presentation_surface::same_allocation(current, updated)
-                }) {
-                    if let Some(updated) = surface {
-                        crate::presentation_surface::trace_surface("capability_selected", updated);
-                    }
-                    self.surface = surface;
-                    if self.incumbent.is_none() {
-                        self.incumbent = surface;
-                    }
-                } else if let (Some(current), Some(updated)) = (&mut self.surface, surface) {
-                    current.timeline_ready = updated.timeline_ready;
-                }
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    }
-}
-
-fn surface_from_snapshot(snapshot: &PresentationSnapshot) -> Result<Option<Surface>, &'static str> {
-    if snapshot.capability.condition == PresentationCapabilityCondition::Unavailable {
-        return Ok(None);
-    }
-    if !matches!(
-        snapshot.capability.condition,
-        PresentationCapabilityCondition::Admitted | PresentationCapabilityCondition::Ready
-    ) {
-        return Err("invalid Presentation capability condition");
-    }
-    let surface = Surface {
-        high: snapshot.capability.surfacehigh,
-        low: snapshot.capability.surfacelow,
-        generation: snapshot.capability.generation,
-        width: snapshot.capability.extent.width,
-        height: snapshot.capability.extent.height,
-        timeline_ready: snapshot.timelineready,
-        frame: None,
-        integration: false,
-        crop: None,
-        viewer_identity: None,
-        fit_revision: 0,
-    };
-    surface
-        .valid()
-        .then_some(Some(surface))
-        .ok_or("invalid Presentation capability")
 }
 
 #[cfg(test)]
@@ -1299,23 +1028,6 @@ mod tests {
                     },
                 ),
             });
-            let mut presentation = app.model.presentation.clone().unwrap();
-            presentation.revision += 1;
-            presentation.presentationrevision += 1;
-            presentation.selected = completed.frame.source.clone();
-            presentation.completed = completed.frame.clone();
-            presentation.completedsourcerevision = completed.revision;
-            presentation.capability.generation += 1;
-            presentation.capability.extent = completed.frame.extent.clone();
-            app.reduce_event(SystemEvent {
-                state_revision: presentation.revision,
-                delivery: crate::generated::EventDelivery::LatestState,
-                event: crate::generated::ApplicationEvent::PresentationPresentationCompleted(
-                    crate::generated::PresentationCompleted {
-                        snapshot: presentation,
-                    },
-                ),
-            });
             assert_eq!(app.model.viewed_explore_frame(), Some(completed.frame));
         }
     }
@@ -1375,6 +1087,9 @@ mod tests {
         record_drawn_detail(
             Surface {
                 frame: Some(frame),
+                viewer_identity: app.model.explore.snapshot.as_ref().and_then(|snapshot|
+                    snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image))),
+                crop: (crop != [0, 0, frame.content_width, frame.content_height]).then_some(crop),
                 ..surface
             },
             crop,
@@ -1388,6 +1103,8 @@ mod tests {
         let (model, frame) = crate::view_model::test_support::explore_presentation();
         app.model = model;
         app.workspace.select(FeatureId::Explore);
+        app.presentation.surface = crate::presentation_surface::metadata::surface(frame)
+            .map(|surface| Surface { frame: None, ..surface });
         app.sync_surface();
         (app, frame)
     }
@@ -1417,74 +1134,88 @@ mod tests {
     }
 
     #[test]
-    fn empty_gallery_retires_samples_without_waiting_for_presentation_completion() {
+    fn logical_empty_and_missing_snapshots_cannot_retire_physical_samples() {
         for direct_sampling in [false, true] {
-            let (mut app, mut frame) = viewer_app();
-            frame.direct_sampling = direct_sampling;
-            app.present_native_frame(frame);
-            let surface = app.presentation.surface().unwrap();
-            app.presentation.retained = Some(surface);
-            let explore = app.model.explore.snapshot.as_mut().unwrap();
-            explore.ready = true;
-            explore.busy = true;
-            explore.mode = crate::generated::ExploreMode::Gallery;
-            explore.order.matchingcount = 0;
-            explore.frame.revision += 1;
-            let read = crate::presentation_surface::test_sample_read(frame);
-            app.reconcile_surface_frame();
-            assert!(app.presentation.pending.is_none());
-            assert!(app.presentation.retained.is_none());
-            assert!(app.presentation.incumbent.is_none());
-            assert!(app.presentation.surface.is_some());
-            assert!(test_releases().is_empty());
-            drop(read);
-            assert_eq!(test_releases(), vec![frame]);
-
-            let late = FrameReady {
-                presentation_revision: frame.presentation_revision + 1,
-                content_sequence: frame.content_sequence + 1,
-                slot: 1,
-                ..frame
-            };
-            app.present_native_frame(late);
-            drop(app.on_presentation(Message::Surface(
-                crate::presentation_surface::Notification::Copied(late),
-            )));
-            app.reconcile_surface_frame();
-            assert!(app.presentation.pending.is_none());
-            assert!(app.presentation.retained.is_none());
-            assert_eq!(test_releases(), vec![frame, late]);
+            for condition in 0..4 {
+                let (mut app, mut frame) = viewer_app();
+                frame.direct_sampling = direct_sampling;
+                let (sender, _receiver) = Connection::test_channel();
+                app.connection = Some(sender);
+                app.reconcile_viewer();
+                install_next(&app, frame);
+                app.present_native_frame(frame);
+                let retained = app.presentation.surface().unwrap();
+                app.presentation.retained = Some(retained);
+                let read = crate::presentation_surface::test_sample_read(frame);
+                let explore = app.model.explore.snapshot.as_mut().unwrap();
+                explore.ready = true;
+                explore.mode = ExploreMode::Gallery;
+                explore.order.matchingcount = 0;
+                explore.frame.revision += 1;
+                match condition {
+                    0 => explore.busy = true,
+                    1 => explore.ready = false,
+                    2 => app.model.explore.snapshot = None,
+                    _ => app.model.presentation = None,
+                }
+                app.reconcile_viewer();
+                app.presentation.reconcile(&app.model, FeatureId::Explore, false).unwrap();
+                assert_eq!(app.presentation.retained, Some(retained));
+                assert_eq!(app.presentation.pending, Some(retained));
+                assert!(test_releases().is_empty());
+                app.presentation.discard();
+                assert!(test_releases().is_empty());
+                drop(read);
+                assert_eq!(test_releases(), vec![frame]);
+            }
         }
     }
 
     #[test]
-    fn only_active_ready_empty_gallery_removes_the_retained_fallback() {
-        for condition in 0..5 {
+    fn graphics_notifications_schedule_detail_and_empty_composition_without_application_events() {
+        for empty in [false, true] {
             let (mut app, frame) = viewer_app();
-            app.present_native_frame(frame);
-            let retained = app.presentation.surface().unwrap();
-            app.presentation.retained = Some(retained);
-            let explore = app.model.explore.snapshot.as_mut().unwrap();
-            explore.ready = true;
-            explore.busy = true;
-            explore.mode = crate::generated::ExploreMode::Gallery;
-            explore.order.matchingcount = 0;
-            let mut feature = FeatureId::Explore;
-            match condition {
-                0 => explore.ready = false,
-                1 => explore.mode = crate::generated::ExploreMode::Detail,
-                2 => explore.order.matchingcount = 1,
-                3 => feature = FeatureId::Annotate,
-                _ => app.model.explore.snapshot = None,
+            if empty {
+                let mut metadata = app.model.explore.snapshot.clone().unwrap();
+                metadata.mode = ExploreMode::Gallery;
+                metadata.order.matchingcount = 0;
+                metadata.order.visibleindices.clear();
+                metadata.gallery.slots.clear();
+                metadata.viewport.columns = 4;
+                metadata.viewport.rowcount = 3;
+                metadata.viewport.firstrow = 0;
+                metadata.viewport.extent = metadata.frame.extent.clone();
+                crate::view_model::test_support::gallery_layout(&mut metadata);
+                crate::presentation_surface::metadata::install_explore(frame, &metadata);
             }
-            // Domain/control unavailability must retain ordinary fallback.
+            app.model.explore.snapshot = None;
             app.model.presentation = None;
-            app.presentation
-                .reconcile(&app.model, feature, false)
-                .unwrap();
-            assert_eq!(app.presentation.retained, Some(retained));
+            let update = app.presentation.update(
+                Message::Surface(crate::presentation_surface::Notification::Native(frame)), &app.model);
+            assert!(update.redraw);
+            app.reconcile_surface_frame();
+            let surface = app.presentation.surface();
+            match crate::presentation_surface::explore_display(surface).unwrap() {
+                crate::presentation_surface::ExploreDisplay::Gallery(shown, metadata) => {
+                    assert!(empty);
+                    assert_eq!(shown.frame, Some(frame));
+                    assert_eq!(metadata.order.matchingcount, 0);
+                }
+                crate::presentation_surface::ExploreDisplay::Detail(shown, _) => {
+                    assert!(!empty);
+                    assert_eq!(shown.frame, Some(frame));
+                }
+            }
+            let state = crate::view::explore::state::State::default();
+            drop(crate::view::explore::view(&state, &app.model, &app.settings, surface, 1200.0));
             assert!(test_releases().is_empty());
+            // Import readiness and copy completion use the same independent wake path.
+            assert!(app.presentation.update(
+                Message::Surface(crate::presentation_surface::Notification::Drawn), &app.model).redraw);
+            assert!(app.presentation.update(
+                Message::Surface(crate::presentation_surface::Notification::Copied(frame)), &app.model).redraw);
             app.presentation.discard();
+            assert_eq!(test_releases(), vec![frame]);
         }
     }
 
@@ -1501,471 +1232,139 @@ mod tests {
         assert_eq!(test_releases(), vec![frame]);
     }
 
+    fn install_next(app: &App, frame: FrameReady) {
+        let mut product = app.model.explore.snapshot.clone().unwrap();
+        product.frame.revision = frame.content_sequence;
+        product.frame.extent.width = frame.content_width;
+        product.frame.extent.height = frame.content_height;
+        crate::presentation_surface::metadata::install_explore(frame, &product);
+    }
+
     #[test]
-    fn pending_publication_waits_for_both_control_and_domain_metadata() {
+    fn graphics_receipt_is_usable_without_control_or_domain_observations() {
         let (mut app, frame) = viewer_app();
-        let pending = FrameReady {
-            presentation_revision: 6,
-            content_sequence: 2,
-            ..frame
-        };
-        app.present_native_frame(pending);
-        app.reconcile_surface_frame();
-        assert!(test_releases().is_empty());
-        let snapshot = app.model.presentation.as_mut().unwrap();
-        snapshot.presentationrevision = 6;
-        snapshot.completed.revision = 2;
-        snapshot.completedsourcerevision = 20;
-        app.reconcile_surface_frame();
-        assert!(test_releases().is_empty());
-        app.model.explore.snapshot.as_mut().unwrap().frame =
-            app.model.presentation.as_ref().unwrap().completed.clone();
-        app.model.explore.snapshot.as_mut().unwrap().revision = 20;
-        app.reconcile_surface_frame();
-        assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
-        record_draw(&app, pending, [0, 0, 640, 480]);
-        crate::presentation_surface::release(pending);
-        app.presentation.discard();
-        assert_eq!(test_releases(), vec![pending]);
-        assert!(crate::presentation_surface::drawn_detail().is_none());
-    }
-
-    #[test]
-    fn unpublished_successor_cannot_hide_or_reject_the_incumbent_capture() {
-        for rejected in [false, true] {
-            for receipt_first in [false, true] {
-                let (mut app, frame) = viewer_app();
-                let incumbent = app.presentation.surface().unwrap();
-                if receipt_first {
-                    app.present_native_frame(frame);
-                    if rejected {
-                        drop(app.on_presentation(Message::Surface(
-                            crate::presentation_surface::Notification::SampleRejected(frame),
-                        )));
-                        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-                        assert!(test_releases().is_empty());
-                    }
-                }
-                let snapshot = app.model.presentation.as_mut().unwrap();
-                snapshot.capability.surfacelow += 1;
-                snapshot.capability.generation += 1;
-                snapshot.capability.extent.width *= 2;
-                snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
-                app.sync_surface();
-                if !receipt_first {
-                    app.present_native_frame(frame);
-                    // A stale outcome cannot retire the current receipt.
-                    drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::SampleRejected(FrameReady {
-                            slot: 1,
-                            ..frame
-                        }),
-                    )));
-                    assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-                    if rejected {
-                        drop(app.on_presentation(Message::Surface(
-                            crate::presentation_surface::Notification::SampleRejected(frame),
-                        )));
-                    }
-                }
-                if rejected {
-                    assert_eq!(app.presentation.surface(), app.presentation.surface);
-                    assert_ne!(app.presentation.surface().unwrap().low, incumbent.low);
-                    assert!(app.presentation.surface().unwrap().frame.is_none());
-                    assert_eq!(test_releases(), vec![frame]);
-                    app.present_native_frame(frame);
-                    assert!(app.presentation.surface().unwrap().frame.is_none());
-                } else {
-                    let capture_surface = app.presentation.surface().unwrap();
-                    assert_eq!(
-                        capture_surface,
-                        Surface {
-                            frame: Some(frame),
-                            ..incumbent
-                        }
-                    );
-                    assert_ne!(capture_surface.low, app.presentation.surface.unwrap().low);
-                    assert!(test_releases().is_empty());
-                    let capture = crate::presentation_surface::test_sample_read(frame);
-                    app.sync_surface();
-                    assert_eq!(app.presentation.surface(), Some(capture_surface));
-                    assert!(test_releases().is_empty());
-                    drop(capture);
-                }
-                drop(app.on_presentation(Message::Surface(
-                    crate::presentation_surface::Notification::Copied(frame),
-                )));
-                assert_eq!(test_releases(), vec![frame]);
-                app.presentation.discard();
-                assert_eq!(test_releases(), vec![frame]);
-            }
-        }
-        for completed in [false, true] {
-            for selected_successor in [false, true] {
-                let (mut app, frame) = viewer_app();
-                let pending = FrameReady {
-                    presentation_revision: frame.presentation_revision + 1,
-                    content_sequence: frame.content_sequence + 1,
-                    ..frame
-                };
-                app.present_native_frame(pending);
-                if completed {
-                    let snapshot = app.model.presentation.as_mut().unwrap();
-                    snapshot.presentationrevision = pending.presentation_revision;
-                    snapshot.completed.revision = pending.content_sequence;
-                    app.model.explore.snapshot.as_mut().unwrap().frame = snapshot.completed.clone();
-                }
-                let snapshot = app.model.presentation.as_mut().unwrap();
-                if selected_successor {
-                    snapshot.selected = crate::view_model::test_support::visual_frame(
-                        PresentationSourceKind::Upscale,
-                        4,
-                    )
-                    .source;
-                }
-                // Selecting another source alone does not abandon physical custody.
-                app.reconcile_surface_frame();
-                assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
-                assert!(test_releases().is_empty());
-                let capture = crate::presentation_surface::test_sample_read(pending);
-                let snapshot = app.model.presentation.as_mut().unwrap();
-                snapshot.capability.surfacelow += 1;
-                snapshot.capability.generation += 1;
-                snapshot.capability.extent.width *= 2;
-                snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
-                app.sync_surface();
-                if !completed && selected_successor {
-                    assert_eq!(app.presentation.surface(), app.presentation.surface);
-                    assert!(app.presentation.surface().unwrap().frame.is_none());
-                } else {
-                    assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
-                }
-                // Retirement cannot return an active physical copy early.
-                assert!(test_releases().is_empty());
-                drop(capture);
-                app.presentation.discard();
-                assert_eq!(test_releases(), vec![pending]);
-            }
-        }
-    }
-
-    #[test]
-    fn reconnect_preserves_capture_custody_until_bootstrap_reconciliation() {
-        for matching in [false, true] {
-            for complete_before_disconnect in [false, true] {
-                let (mut app, frame) = viewer_app();
-                app.present_native_frame(frame);
-                let mut capture = Some(crate::presentation_surface::test_sample_read(frame));
-                let control = app.model.presentation.clone();
-                let explore = app.model.explore.snapshot.clone();
-                if complete_before_disconnect {
-                    drop(capture.take());
-                    drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::Copied(frame),
-                    )));
-                }
-                app.retire_peer(UiError::transport("capture continuity"));
-                assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-                let (sender, _receiver) = Connection::test_channel();
-                drop(app.on_transport(TransportEvent::Connected(sender)));
-                assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-                app.model.presentation = control;
-                app.model.explore.snapshot = explore;
-                app.model.connection = crate::view_model::ConnectionState::Connected;
-                app.model.set_foreground_feature(FeatureId::Explore);
-                app.workspace.select(FeatureId::Explore);
-                if !matching {
-                    let snapshot = app.model.presentation.as_mut().unwrap();
-                    snapshot.completed.revision += 1;
-                    snapshot.presentationrevision += 1;
-                    snapshot.completedsourcerevision += 1;
-                    let explore = app.model.explore.snapshot.as_mut().unwrap();
-                    explore.frame = snapshot.completed.clone();
-                    explore.revision = snapshot.completedsourcerevision;
-                }
-                app.reconcile_presentation(true);
-                assert_eq!(app.presentation.pending.is_some(), matching);
-                assert_eq!(
-                    test_releases(),
-                    if complete_before_disconnect {
-                        vec![frame]
-                    } else {
-                        vec![]
-                    }
-                );
-                // Matching receiver custody suppresses another Select even
-                // while the callback is outstanding; nonmatching recovery asks
-                // for the new foreground product.
-                assert_eq!(
-                    app.model
-                        .has_pending(ApplicationIntentEndpoint::PresentationSelect),
-                    !matching
-                );
-                drop(capture);
-                drop(app.on_presentation(Message::Surface(
-                    crate::presentation_surface::Notification::Copied(frame),
-                )));
-                assert_eq!(test_releases(), vec![frame]);
-                app.presentation.discard();
-                assert_eq!(test_releases(), vec![frame]);
-            }
-        }
-    }
-
-    #[test]
-    fn advertised_successor_preserves_completed_draw_identity_and_copy() {
-        let (mut app, frame) = viewer_app();
+        app.model.presentation = None;
+        app.model.explore.snapshot = None;
         app.present_native_frame(frame);
-        let completed = Surface {
-            frame: Some(frame),
-            ..app.presentation.surface.unwrap()
-        };
-        app.presentation.pending = None;
-        app.presentation.retained = Some(completed);
-        record_drawn_detail(completed, completed.content_region());
-        crate::presentation_surface::release(frame);
-        let snapshot = app.model.presentation.as_mut().unwrap();
-        snapshot.capability.surfacelow += 1;
-        snapshot.capability.generation += 1;
-        snapshot.capability.extent.width *= 2;
-        snapshot.capability.extent.height *= 2;
-        snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
-        app.sync_surface();
-        assert_eq!(app.presentation.retained, Some(completed));
-        assert_ne!(app.presentation.surface().unwrap().low, completed.low);
-        assert_eq!(
-            crate::presentation_surface::drawn_detail(),
-            Some((completed, completed.content_region()))
-        );
-        let (sender, _receiver) = Connection::test_channel();
-        app.connection = Some(sender);
-        assert!(app.copy_viewer_to_annotation());
+        app.reconcile_surface_frame();
+        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+        assert!(test_releases().is_empty());
+        app.presentation.discard();
         assert_eq!(test_releases(), vec![frame]);
     }
 
     #[test]
-    fn domain_control_publication_and_copy_reconcile_in_every_notification_order() {
-        for [
-            domain_position,
-            control_position,
-            physical_position,
-            copy_position,
-        ] in crate::view_model::test_support::presentation_arrival_orders()
-        {
+    fn replacement_receipts_preserve_encoder_custody_and_reject_stale_publications() {
+        let (mut app, frame) = viewer_app();
+        app.present_native_frame(frame);
+        let capture = crate::presentation_surface::test_sample_read(frame);
+        let next = FrameReady { low: frame.low+1, presentation_revision: frame.presentation_revision+1, ..frame };
+        install_next(&app, next);
+        app.present_native_frame(next);
+        assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
+        assert!(test_releases().is_empty());
+        app.present_native_frame(frame);
+        assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
+        drop(capture);
+        assert_eq!(test_releases(), vec![frame]);
+        app.presentation.discard();
+        assert_eq!(test_releases(), vec![frame, next]);
+    }
+
+    #[test]
+    fn reconnect_preserves_capture_with_newer_or_missing_application_metadata() {
+        for changed in [false, true] {
             let (mut app, frame) = viewer_app();
-            let next = FrameReady {
-                content_sequence: 2,
-                presentation_revision: 6,
-                ..frame
-            };
-            // Before-publication copy notification retains its fact without inventing a display lease.
-            drop(app.on_presentation(Message::Surface(
-                crate::presentation_surface::Notification::Copied(next),
-            )));
-            assert!(app.presentation.surface().unwrap().frame.is_none());
+            app.present_native_frame(frame);
+            let capture = crate::presentation_surface::test_sample_read(frame);
+            let mut restored = app.model.explore.snapshot.clone();
+            app.retire_peer(UiError::transport("capture continuity"));
+            assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+            if changed {
+                restored.as_mut().unwrap().frame.revision += 10;
+            }
+            app.model.explore.snapshot = restored;
+            app.model.presentation = None;
+            app.model.set_foreground_feature(FeatureId::Explore);
+            app.reconcile_surface_frame();
+            assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
             assert!(test_releases().is_empty());
+            app.presentation.discard();
+            assert!(test_releases().is_empty());
+            drop(capture);
+            assert_eq!(test_releases(), vec![frame]);
+        }
+    }
+
+    #[test]
+    fn domain_control_publication_and_copy_reconcile_in_every_notification_order() {
+        for [domain_position, control_position, physical_position, copy_position]
+            in crate::view_model::test_support::presentation_arrival_orders() {
+            let (mut app, frame) = viewer_app();
+            let next = FrameReady { content_sequence: 2, presentation_revision: 6, ..frame };
+            install_next(&app, next);
             for position in 0..4 {
                 if position == domain_position {
                     let explore = app.model.explore.snapshot.as_mut().unwrap();
-                    explore.frame.revision = 2;
-                    explore.revision = 20;
-                    app.reconcile_presentation(false);
+                    explore.frame.revision = 99;
+                    explore.revision += 20;
+                    app.reconcile_surface_frame();
                 } else if position == control_position {
-                    let snapshot = app.model.presentation.as_mut().unwrap();
-                    snapshot.completed.revision = 2;
-                    snapshot.completedsourcerevision = 20;
-                    snapshot.presentationrevision = 6;
-                    app.reconcile_presentation(false);
+                    app.model.presentation = None;
+                    app.reconcile_surface_frame();
                 } else if position == physical_position {
                     app.present_native_frame(next);
                 } else {
                     assert_eq!(position, copy_position);
-                    drop(app.on_presentation(Message::Surface(
-                        crate::presentation_surface::Notification::Copied(next),
-                    )));
+                    drop(app.on_presentation(Message::Surface(crate::presentation_surface::Notification::Copied(next))));
                 }
-                assert_eq!(
-                    app.presentation.surface().unwrap().frame,
-                    (position >= physical_position).then_some(next),
-                );
-                assert!(
-                    test_releases().is_empty(),
-                    "handoff retains physical custody at every intermediate step",
-                );
+                assert_eq!(app.presentation.surface().unwrap().frame,
+                    (position >= physical_position).then_some(next));
+                assert!(test_releases().is_empty());
             }
-            assert_eq!(app.presentation.surface().unwrap().frame, Some(next));
-            assert!(test_releases().is_empty());
             app.presentation.discard();
             assert_eq!(test_releases(), vec![next]);
         }
     }
 
     #[test]
-    fn invalidated_late_frame_and_surface_replacement_release_exactly_once() {
-        let (mut app, frame) = viewer_app();
-        app.model.explore.requested_selection = Some(9);
-        app.present_native_frame(frame);
-        assert!(app.presentation.surface().unwrap().frame.is_none());
-        assert_eq!(test_releases(), vec![frame]);
-        app.model.explore.requested_selection = None;
-        let pending = FrameReady {
-            presentation_revision: 6,
-            content_sequence: 2,
-            slot: 1,
-            ..frame
-        };
-        app.present_native_frame(pending);
-        app.model
-            .presentation
-            .as_mut()
-            .unwrap()
-            .capability
-            .generation += 1;
-        app.sync_surface();
-        assert_eq!(test_releases(), vec![frame]);
-        assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
-        app.presentation.discard();
-        assert_eq!(test_releases(), vec![frame, pending]);
-    }
-
-    #[test]
-    fn unavailable_capability_returns_the_frame_and_retires_imports_idempotently() {
+    fn rejected_graphics_receipt_preserves_retained_fallback_and_actual_readers() {
         let (mut app, frame) = viewer_app();
         app.present_native_frame(frame);
-        app.model
-            .presentation
-            .as_mut()
-            .unwrap()
-            .capability
-            .condition = PresentationCapabilityCondition::Unavailable;
-        app.sync_surface();
-        assert!(app.presentation.surface().is_none());
-        assert_eq!(test_releases(), vec![frame]);
-        app.sync_surface();
-        crate::presentation_surface::retire_imports();
-        assert_eq!(test_releases(), vec![frame]);
-    }
-
-    #[test]
-    fn admitted_replacements_preserve_incumbent_and_reject_abandoned_candidates() {
-        let (mut app, frame) = viewer_app();
-        app.present_native_frame(frame);
-        let mut latest = frame;
-        for generation in 2..5 {
-            let snapshot = app.model.presentation.as_mut().unwrap();
-            snapshot.capability.generation = generation;
-            snapshot.capability.surfacelow = generation + 10;
-            snapshot.capability.condition = PresentationCapabilityCondition::Admitted;
-            app.sync_surface();
-            assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-            app.present_native_frame(latest);
-            assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-            latest.low = generation + 10;
-            latest.presentation_revision += 1;
-        }
-        // The newest candidate may replace the incumbent; abandoned advertised
-        // candidates never acquire its completion-associated identity.
-        app.present_native_frame(latest);
-        assert_eq!(app.presentation.surface().unwrap().frame, Some(latest));
-        app.presentation.discard();
-        let releases = test_releases();
-        assert_eq!(
-            releases
-                .iter()
-                .filter(|released| **released == frame)
-                .count(),
-            1
-        );
-        assert_eq!(
-            releases
-                .iter()
-                .filter(|released| **released == latest)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn failure_retires_unpublished_frame_but_preserves_completed_product() {
-        let (mut app, frame) = viewer_app();
-        app.present_native_frame(frame);
-        app.presentation.failed = true;
-        app.reconcile_surface_frame();
-        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+        let retained = app.presentation.surface().unwrap();
+        app.presentation.retained = Some(retained);
+        let retained_read = crate::presentation_surface::test_sample_read(frame);
+        let next = FrameReady { presentation_revision: 6, content_sequence: 2, slot: 1, ..frame };
+        install_next(&app, next);
+        app.present_native_frame(next);
+        let read = crate::presentation_surface::test_sample_read(next);
+        drop(app.on_presentation(Message::Surface(crate::presentation_surface::Notification::SampleRejected(next))));
+        assert_eq!(app.presentation.retained, Some(retained));
+        assert!(app.presentation.pending.is_none());
         assert!(test_releases().is_empty());
-        let pending = FrameReady {
-            presentation_revision: 6,
-            content_sequence: 2,
-            slot: 1,
-            ..frame
-        };
-        app.present_native_frame(pending);
-        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
-        assert_eq!(test_releases(), vec![pending]);
+        drop(read);
+        assert_eq!(test_releases(), vec![next]);
+        app.presentation.discard();
+        drop(retained_read);
+        assert_eq!(test_releases(), vec![next, frame]);
     }
 
     #[test]
-    fn failure_after_pending_publication_keeps_only_the_completed_copy_receipt() {
+    fn application_writer_failure_does_not_revoke_a_completed_graphics_receipt() {
         let (mut app, frame) = viewer_app();
         app.present_native_frame(frame);
-        record_draw(&app, frame, [0, 0, 640, 480]);
-        crate::presentation_surface::release(frame);
-        let pending = FrameReady {
-            presentation_revision: 6,
-            content_sequence: 2,
-            slot: 1,
-            ..frame
-        };
-        app.present_native_frame(pending);
         let mut snapshot = app.model.presentation.clone().unwrap();
         snapshot.revision += 1;
-        app.reduce_event(SystemEvent {
-            state_revision: 0,
+        app.reduce_event(SystemEvent { state_revision: 0,
             delivery: crate::generated::EventDelivery::Critical,
             event: crate::generated::ApplicationEvent::PresentationPresentationFailed(
-                crate::generated::PresentationFailed {
-                    snapshot,
-                    detail: "writer stopped".into(),
-                },
-            ),
+                crate::generated::PresentationFailed { snapshot, detail: "writer stopped".into() }),
         });
-        assert!(app.presentation.surface().unwrap().frame.is_none());
-        assert_eq!(
-            crate::presentation_surface::drawn_detail(),
-            Some((
-                Surface {
-                    frame: Some(frame),
-                    ..app.presentation.surface.unwrap()
-                },
-                [0, 0, 640, 480]
-            ))
-        );
-        assert_eq!(test_releases(), vec![frame, pending]);
-        app.present_native_frame(frame);
-        assert!(app.presentation.surface().unwrap().frame.is_none());
-        assert_eq!(test_releases(), vec![frame, pending]);
-        let (sender, _receiver) = Connection::test_channel();
-        app.connection = Some(sender);
-        assert!(app.copy_viewer_to_annotation());
-    }
-
-    #[test]
-    fn overwritten_mailbox_slot_cannot_restore_an_old_draw_receipt() {
-        let (mut app, frame) = viewer_app();
-        app.present_native_frame(frame);
-        record_draw(&app, frame, [0, 0, 640, 480]);
-        crate::presentation_surface::release(frame);
-        let pending = FrameReady {
-            presentation_revision: 6,
-            content_sequence: 2,
-            ..frame
-        };
-        app.present_native_frame(pending);
-        assert!(crate::presentation_surface::drawn_detail().is_none());
-        app.presentation.failed = true;
-        app.reconcile_surface_frame();
-        assert!(app.presentation.surface().unwrap().frame.is_none());
-        assert_eq!(test_releases(), vec![frame, pending]);
+        assert_eq!(app.presentation.surface().unwrap().frame, Some(frame));
+        assert!(app.model.error.is_some());
+        assert!(test_releases().is_empty());
+        app.presentation.discard();
+        assert_eq!(test_releases(), vec![frame]);
     }
 
     #[test]
@@ -1976,6 +1375,7 @@ mod tests {
                 presentation_revision: 6,
                 ..frame
             };
+            install_next(&app, pending);
             app.present_native_frame(pending);
             match operation {
                 0 => {
@@ -2056,6 +1456,7 @@ mod tests {
                 slot: 1,
                 ..frame
             };
+            install_next(&app, pending);
             app.present_native_frame(pending);
             let (sender, mut receiver) = Connection::test_channel();
             app.connection = Some(sender);
@@ -2168,32 +1569,49 @@ mod tests {
             let before = app.model.annotation.snapshot.clone();
             record_draw(&app, frame, [0, 0, 640, 480]);
             match condition {
-                0 => app.model.explore.snapshot = None,
-                1 => app.model.explore.snapshot.as_mut().unwrap().mode = ExploreMode::Gallery,
-                2 => app.model.explore.snapshot.as_mut().unwrap().frame.revision = 0,
-                3 => app.model.explore.requested_selection = Some(9),
-                _ => {
-                    app.model
-                        .presentation
-                        .as_mut()
-                        .unwrap()
-                        .presentationrevision += 1
-                }
+                0 => app.model.annotation.snapshot = None,
+                1 => app.model.annotation.snapshot.as_mut().unwrap().busy = true,
+                2 => crate::presentation_surface::metadata::retire(frame),
+                3 => record_draw(&app, frame, [1, 0, 639, 480]),
+                _ => crate::presentation_surface::clear_drawn_detail(),
             }
+            let at_request = app.model.annotation.snapshot.clone();
             assert!(!app.copy_viewer_to_annotation());
-            if condition != 4 {
-                assert!(!app.open_annotation());
-            }
-            assert_eq!(app.model.annotation.snapshot, before);
+            assert_eq!(app.model.annotation.snapshot, at_request);
+            if condition >= 2 { assert_eq!(app.model.annotation.snapshot, before); }
             assert_eq!(app.model.pending_count(), 0);
         }
     }
 
     #[test]
-    fn viewer_copy_requires_the_selected_original_crop_and_exact_upscale() {
+    fn viewer_copy_ignores_unrelated_logical_sources_and_encodes_the_drawn_frame() {
+        for condition in 0..5 {
+            let (mut app, frame) = viewer_app();
+            let expected = app.model.explore.snapshot.as_ref().unwrap().frame.clone();
+            record_draw(&app, frame, [0, 0, 640, 480]);
+            let (sender, mut receiver) = Connection::test_channel();
+            app.connection = Some(sender);
+            match condition {
+                0 => app.model.explore.snapshot = None,
+                1 => app.model.explore.snapshot.as_mut().unwrap().mode = ExploreMode::Gallery,
+                2 => app.model.explore.snapshot.as_mut().unwrap().frame.revision = 0,
+                3 => app.model.explore.snapshot.as_mut().unwrap().detail.showoriginaldimensions = true,
+                _ => app.model.presentation = None,
+            }
+            if condition <= 2 { assert!(!app.open_annotation()); }
+            assert!(app.copy_viewer_to_annotation());
+            let crate::transport_connection::CapturedRecord::Intent(intent) = receiver.try_recv().unwrap()
+                else { panic!("expected exact Annotation Open"); };
+            assert_eq!(intent, crate::generated::encode_annotation_Open(intent.correlation,
+                AnnotationOpen { source: expected, originalcontent: false }).record);
+        }
+    }
+
+    #[test]
+    fn viewer_copy_classifies_the_drawn_crop_and_exact_retained_upscale() {
         let (mut app, mut frame) = viewer_app();
         let explore = app.model.explore.snapshot.as_mut().unwrap();
-        explore.detail.showoriginaldimensions = true;
+        explore.detail.showoriginaldimensions = false;
         let input = explore.frame.clone();
         let upscale = app.model.upscale_snapshot.as_mut().unwrap();
         upscale.ready = true;
@@ -2222,12 +1640,16 @@ mod tests {
         upscale.methods[0].frame = upscale.frame.clone();
         app.model
             .set_foreground_visual(Some(PresentationSourceKind::Upscale));
-        app.model.presentation.as_mut().unwrap().completed = expected.clone();
-        app.model.presentation.as_mut().unwrap().capability.extent = expected.extent.clone();
         frame.content_session = 5;
         frame.content_sequence = expected.revision;
         frame.content_width = expected.extent.width;
         frame.content_height = expected.extent.height;
+        use crate::presentation_surface::metadata;
+        let bytes = metadata::encode(expected.clone(), metadata::encode_product(
+            crate::generated::ApplicationSystem::Upscale, crate::generated::UpscaleImageMetadata::from(app.model.upscale_snapshot.as_ref().unwrap())),
+            Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore,
+                crate::generated::ExploreImageMetadata::from(app.model.explore.snapshot.as_ref().unwrap()))));
+        metadata::install(frame, frame.content_width, frame.content_height, frame.presentation_revision, &bytes).unwrap();
         app.presentation.surface.as_mut().unwrap().width = frame.content_width;
         app.presentation.surface.as_mut().unwrap().height = frame.content_height;
         app.presentation.pending = Some(Surface {
@@ -2236,8 +1658,9 @@ mod tests {
         });
         let (sender, mut receiver) = Connection::test_channel();
         app.connection = Some(sender);
-        record_draw(&app, frame, [0, 0, 2560, 1920]);
-        assert!(!app.copy_viewer_to_annotation());
+        // The captured Explore preference is deliberately the opposite of this draw.
+        app.model.explore.snapshot.as_mut().unwrap().detail.showoriginaldimensions = true;
+        app.model.explore.snapshot.as_mut().unwrap().frame.revision += 100;
         record_draw(&app, frame, [40, 80, 2000, 1200]);
         assert!(app.copy_viewer_to_annotation());
         let crate::transport_connection::CapturedRecord::Intent(intent) =

@@ -186,7 +186,7 @@ WorkspaceSurfaceFrameSignal WorkspaceSurfaceFrameSignal::create() {
     const int descriptor = ::memfd_create("mmltk-workspace-frame", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (descriptor < 0) { throw std::system_error(errno, std::generic_category(), "workspace frame signal memfd creation failed"); }
     result.descriptor_ = ScopedFd{descriptor};
-    constexpr std::size_t kSignalBytes = sizeof(detail::WorkspaceFrameSignal);
+    constexpr std::size_t kSignalBytes = detail::kWorkspaceFrameMappingBytes;
     if (::ftruncate(descriptor, static_cast<off_t>(kSignalBytes)) != 0) {
         throw std::system_error(errno, std::generic_category(), "workspace frame signal sizing failed");
     }
@@ -206,7 +206,7 @@ detail::WorkspaceFrameSignal* WorkspaceSurfaceFrameSignal::mapping() const noexc
 
 void WorkspaceSurfaceFrameSignal::reset() noexcept {
     if (mapping_ != nullptr) {
-        static_cast<void>(::munmap(mapping_, sizeof(detail::WorkspaceFrameSignal)));
+        static_cast<void>(::munmap(mapping_, detail::kWorkspaceFrameMappingBytes));
         mapping_ = nullptr;
     }
     descriptor_.reset();
@@ -236,6 +236,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         std::uint32_t width = 0U;
         std::uint32_t height = 0U;
         bool arena = false;
+        bool binding_retired = false;
         std::optional<Record> acquired{};
         bool release_submitted = false;
         std::uint64_t last_transfer = 0U;
@@ -535,6 +536,16 @@ struct WorkspaceSurfaceImportChannel::Impl {
             }
             const WorkspaceSurfaceImportId id{.high = record.id_high, .low = record.id_low};
             const auto admission = find_admission(id);
+            if (record.opcode == Opcode::BindingRetired) {
+                if (admission == admitted.end() || !admission->second.arena || admission->second.binding_retired ||
+                    source_transition_count == source_transitions.size()) {
+                    fail("workspace binding retirement is unknown or exceeds capacity");
+                    return;
+                }
+                admission->second.binding_retired = true;
+                push_source_transition(record);
+                continue;
+            }
             if (record.opcode == Opcode::Acquired) {
                 if (admission == admitted.end() || admission->second.arena || !contains(replied, id) ||
                     source_transition_count == source_transitions.size() || admission->second.acquired ||
@@ -705,6 +716,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 case Opcode::Arena:
                 case Opcode::Acquired:
                 case Opcode::ReleaseSubmitted:
+                case Opcode::BindingRetired:
                 case Opcode::ReadSettled:
                 case Opcode::Allocate:
                 case Opcode::Drop:

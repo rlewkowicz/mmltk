@@ -118,7 +118,7 @@ struct FixtureApplicationSystems final {
 };
 
 [[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
-    std::ifstream input(MMLTK_PROTOCOL_V16_CLIENT_FIXTURE_PATH);
+    std::ifstream input(MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH);
     REQUIRE(input.good());
     const auto nibble = [](const char value) -> unsigned char {
         if (value >= '0' && value <= '9') return static_cast<unsigned char>(value - '0');
@@ -211,8 +211,8 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
 
-TEST_CASE("Rust Protocol-16 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
-    STATIC_REQUIRE(kBrowserProtocolVersion == 16U);
+TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
+    STATIC_REQUIRE(kBrowserProtocolVersion == 17U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
     REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) ==
@@ -236,7 +236,6 @@ TEST_CASE("Rust Protocol-16 client fixtures are accepted by native codec", "[con
     const auto& model_dialog_fixture = fixture_named(fixtures, "Intent:file_dialog.Open.model_artifact");
     const auto& settings_fixture = fixture_named(fixtures, "Intent:settings.Update");
     const auto& interaction_fixture = fixture_named(fixtures, "Interaction:explore.UpdateViewport");
-    const auto& observation_fixture = fixture_named(fixtures, "RendererObservation");
     const auto& batch_fixture = fixture_named(fixtures, "Interaction:annotation.Input");
 
     const Intent intent = decode_intent_fixture(dialog_fixture);
@@ -392,15 +391,6 @@ TEST_CASE("Rust Protocol-16 client fixtures are accepted by native codec", "[con
         // evidence.
         CHECK(annotation.alternatives[alternative] == alternative);
 
-    const auto observation_record = decode_client_record(wire::ByteSegments{.first = observation_fixture.bytes, .second = {}});
-    REQUIRE(observation_record);
-    REQUIRE(std::holds_alternative<RendererObservation>(*observation_record));
-    const RendererObservation& observation = std::get<RendererObservation>(*observation_record);
-    CHECK(observation.kind == RendererObservationKind::Surface);
-    CHECK(observation.width == 640U);
-    CHECK(observation.height == 480U);
-    CHECK(observation.scale == 1.5);
-    CHECK(observation.sample_revision == 0U);
 }
 
 TEST_CASE("browser server records preserve reply and event error vocabulary", "[controller][browser][protocol]") {
@@ -516,7 +506,7 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
     REQUIRE(accepted.result);
 }
 
-TEST_CASE("Bootstrap uses the compact protocol-16 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
+TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
     STATIC_REQUIRE(kMaxRecordWireBytes >=
                    mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);
@@ -586,12 +576,6 @@ TEST_CASE("browser records reject duplicate identities and invalid renderer obse
                                                  {.field_id = 3U, .value = wire::Value{}},
                                                  {.field_id = 3U, .value = wire::Value{}},
                                              },
-                                     }},
-                                     encoded));
-    CHECK_FALSE(encode_client_record(ClientRecord{RendererObservation{
-                                         .kind = RendererObservationKind::Surface,
-                                         .width = 0U,
-                                         .height = 1080U,
                                      }},
                                      encoded));
 }

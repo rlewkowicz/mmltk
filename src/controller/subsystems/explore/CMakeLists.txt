@@ -22,6 +22,7 @@ target_link_libraries(mmltk_controller_explore_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::frameworks::serialization
         mmltk::controller::visual_runtime
         mmltk::backend::data
         mmltk::backend::imaging::explore

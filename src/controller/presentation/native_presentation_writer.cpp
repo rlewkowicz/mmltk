@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -19,6 +20,7 @@
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
+#include <charconv>
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
@@ -110,6 +112,7 @@ struct SampleArena final {
     PresentationSubmittedSource submitted{};
     abi::Record layout{};
     bool ready = false;
+    bool binding_retired = false;
 };
 struct AdmittedSource;
 struct Pending final {
@@ -117,6 +120,8 @@ struct Pending final {
     const VisualSourceReader* reader = nullptr;
     contracts::DiagnosticLink link{};
     std::uint64_t requested_owner = 0U;
+    AdmittedSource* destination = nullptr;
+    std::vector<std::byte> metadata{};
 };
 struct Transfer final {
     AdmittedSource* source;
@@ -185,9 +190,12 @@ struct AdmittedSource final {
     native::WorkspaceSurfaceFrameSignal signal;
     std::uint64_t next_transfer = 1U;
     bool withdrawing = false;
+    std::shared_ptr<std::atomic_bool> preparing = std::make_shared<std::atomic_bool>(false);
     gpu::ImageStream stream;
     Completion completion;
     std::optional<Transfer> transfer;
+    const VisualSourceReader* producer = nullptr;
+    bool detaching = false;
     bool exposed = false;
     bool acquired = false;
     bool release_submitted = false;
@@ -252,11 +260,15 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     }
     void Submit(PresentationSubmittedSource submitted, const VisualSourceReader& reader) override {
         if (!submitted.valid() || reader.source != submitted.observation.frame.source || !reader.observe_workspace ||
-            !reader.borrow_workspace || !reader.request_workspace || pending_)
+            !reader.request_workspace || pending_)
             throw std::invalid_argument("direct workspace submission is invalid");
         pending_ = Pending{.submitted = submitted,
                            .reader = &reader,
                            .link = diagnostics_.valid() ? services::DiagnosticSpanIds::Next() : contracts::DiagnosticLink{}};
+        if (reader.image_metadata) {
+            auto metadata = reader.image_metadata(submitted.observation.frame);
+            if (metadata) pending_->metadata = std::move(*metadata);
+        }
     }
     PresentationNativeOutcome Pump(std::uint64_t selection) override {
         {
@@ -287,15 +299,30 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     arena.reset();
                 }
         }
-        while (auto outcome = channel_.take_outcome())
-            Accept(std::move(*outcome));
         while (auto transition = channel_.take_source_transition())
             ObserveSourceTransition(*transition);
+        while (auto outcome = channel_.take_outcome())
+            Accept(std::move(*outcome));
         if (channel_.take_capacity_wake() && configuration_.completion_acceptance) configuration_.completion_acceptance->ObserveCapacity();
         DrainCompletion();
         RetireSources();
         PresentationNativeOutcome result;
-        if (transfer_ && stage_ == Stage::ReadyComplete && connected_.load(std::memory_order_acquire)) result = Publish();
+        if (transfer_ && stage_ == Stage::ReadyComplete) result = Publish();
+        if (!transfer_ && result.progress != PresentationNativeProgress::Published &&
+            ((active_ && active_->binding_retired) || (candidate_ && candidate_->binding_retired))) {
+            result.capability = Capability();
+            if (pending_ && pending_->destination && pending_->destination->preparing->load(std::memory_order_acquire))
+                return result;
+            const std::ptrdiff_t needed = int(active_ && active_->binding_retired) + int(candidate_ && candidate_->binding_retired);
+            if (std::ranges::count_if(retiring_, [](const auto& arena) { return !arena; }) < needed) return result;
+            if (pending_ && pending_->destination) pending_->destination->workspace->CancelDisplayWrite();
+            pending_.reset();
+            if (candidate_ && candidate_->binding_retired)
+                RetireArena(candidate_, VisualDiagnosticOperation::PresentationCandidateWithdrawal);
+            if (active_ && active_->binding_retired)
+                RetireArena(active_, VisualDiagnosticOperation::PresentationActiveWithdrawal);
+            result.progress = PresentationNativeProgress::BindingRetired;
+        }
         if (!transfer_ && pending_ && result.progress != PresentationNativeProgress::Published) result = Prepare(selection);
         result.capability = result.progress == PresentationNativeProgress::Published ? result.publication.capability : Capability();
         return result;
@@ -303,7 +330,6 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     int poll_fd() const noexcept override { return channel_.poll_fd(); }
     int completion_fd() const noexcept override { return wake_->get(); }
     bool wants_write() const noexcept override { return channel_.wants_write(); }
-    void SetApplicationPeerConnected(bool connected) noexcept override { connected_.store(connected, std::memory_order_release); }
     void SetExpectedBrowserProcessGroup(pid_t group) override { channel_.set_expected_process_group(group); }
     Retirement BrowserPeerLost() noexcept override {
         static_cast<void>(channel_.consume_peer_loss());
@@ -399,7 +425,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             }
             if (browser_terminal && source->transfer && source->release_complete)
                 Diagnose(VisualDiagnosticOperation::PresentationTerminalReadCompleted, *source->transfer, 1U);
-            source->workspace->CancelWrite();
+            source->workspace->CancelDisplayWrite();
             source->transfer.reset();
             source->exposed = source->acquired = source->release_submitted = source->release_complete = false;
             if (source->release_span) source->release_span->FinishWith([](auto& fact) { fact.context.outcome = 1U; });
@@ -527,47 +553,35 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         return layout;
     }
     void Request(const VisualSourceReader& reader, const gpu::ImageWorkspaceObservation& observed, const SampleArena& arena,
-                 std::uint64_t admitted = 0U) {
+                 AdmittedSource& source, bool detach_only = false) {
+        source.preparing->store(true, std::memory_order_release);
         VisualWorkspaceRequest request{.product_owner = observed.product_owner,
                                        .product_revision = observed.product_revision,
+                                       .detach_only = detach_only,
                                        .layout = Layout(arena),
                                        .display_execution = execution_,
-                                       .admitted_allocation = admitted,
-                                       .ready = [weak = std::weak_ptr{wake_}] {
+                                       .admitted_allocation = source.workspace->identity(),
+                                       .destination = source.workspace,
+                                       .ready = [completion = source.preparing, weak = std::weak_ptr{wake_}] {
+                                           completion->store(false, std::memory_order_release);
                                            if (const auto wake = weak.lock())
                                                static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
                                        }};
         try {
-            if (diagnostics_.valid()) {
-                auto diagnostic = std::make_shared<VisualWorkspaceDiagnostics>();
-                diagnostic->sink = diagnostics_;
-                diagnostic->context = presentation_diagnostic_fact(
-                                          VisualDiagnosticOperation::PresentationWorkspaceService,
-                                          {.submitted = pending_ && pending_->reader == &reader ? pending_->submitted : arena.submitted,
-                                           .publication = {.capability = CapabilityOf(arena)}},
-                                          settings_.device)
-                                          .context;
-                if (admitted != 0U) {
-                    for (const auto& source : sources_) {
-                        if (source->workspace->identity() == admitted) {
-                            diagnostic->context.workspace = native::workspace_source_diagnostic(source->description);
-                            break;
-                        }
-                    }
-                }
-                diagnostic->context.frame_revision = observed.product_revision;
-                diagnostic->context.source = {.source_session = presentation_source_session(reader.source.kind),
-                                              .source_instance = reader.source.instance,
-                                              .source_revision = observed.product_revision};
-                request.diagnostics = std::move(diagnostic);
-            }
-        } catch (...) {}
-        reader.request_workspace(std::move(request));
+            reader.request_workspace(std::move(request));
+        } catch (...) {
+            source.preparing->store(false, std::memory_order_release);
+            source.workspace->CancelDisplayWrite();
+            throw;
+        }
     }
     void Accept(native::WorkspaceSurfaceImportOutcome outcome) {
         if (candidate_ && candidate_->id == outcome.id) {
             DiagnoseArena(VisualDiagnosticOperation::PresentationImportOutcome, *candidate_, outcome.imported ? 1U : 0U);
-            if (!outcome.imported) throw std::runtime_error("Firefox arena admission failed");
+            if (!outcome.imported) {
+                if (candidate_->binding_retired) return;
+                throw std::runtime_error("Firefox arena admission failed");
+            }
             if (outcome.layout.opcode != abi::Opcode::ArenaReady || outcome.layout.width != candidate_->extent.width ||
                 outcome.layout.height != candidate_->extent.height)
                 throw std::runtime_error("Firefox arena layout identity mismatch");
@@ -578,7 +592,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
         for (auto& source : sources_) {
             if (source->id() != outcome.id) continue;
-            if (!outcome.imported) throw std::runtime_error("Firefox source admission failed");
+            if (!outcome.imported) {
+                if (source->withdrawing || (active_ && active_->id == source->arena() && active_->binding_retired) ||
+                    (candidate_ && candidate_->id == source->arena() && candidate_->binding_retired)) return;
+                throw std::runtime_error("Firefox source admission failed");
+            }
             if (source->withdrawing) return;
             if (outcome.memory_descriptor.get() < 0) throw std::runtime_error("Firefox source memory is unavailable");
             if (outcome.timeline_descriptor.get() < 0) throw std::runtime_error("Firefox source timeline is unavailable");
@@ -586,6 +604,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             DiagnoseSource(VisualDiagnosticOperation::PresentationSourceTimelineImportStarted, *source, 0U);
             source->timeline.emplace(std::move(outcome.timeline_descriptor));
             if (!source->workspace->QueueAllocation(std::move(outcome.memory_descriptor))) return;
+            source->workspace->Admit(source->workspace->identity(), source->description.device_incarnation);
             DiagnoseSource(VisualDiagnosticOperation::PresentationSourceReady, *source, 1U);
             const auto* arena = candidate_ && candidate_->id == source->arena() ? candidate_.get() : active_.get();
             if (!arena || arena->id != source->arena()) throw std::runtime_error("Firefox source belongs to a retired arena");
@@ -658,97 +677,111 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             });
             return PresentationNativeOutcome{};
         };
-        if (!connected_.load(std::memory_order_acquire) || !channel_.connected()) return wait("peer_unavailable");
-        if (pending_->submitted.selection_generation != selection) return Supersede();
+        if (!channel_.connected()) return wait("peer_unavailable");
+        if (pending_->reader->image_metadata && pending_->metadata.empty()) return Supersede();
+        if (pending_->destination && pending_->destination->preparing->load(std::memory_order_acquire))
+            return wait("producer_finalization_pending", nullptr, nullptr, pending_->destination);
+        if (pending_->submitted.selection_generation != selection) {
+            if (pending_->destination) pending_->destination->workspace->CancelDisplayWrite();
+            return Supersede();
+        }
         const auto& frame = pending_->submitted.observation.frame;
         auto* arena = EnsureArena(frame.extent);
         if (!arena || !arena->ready) return wait(arena ? "arena_not_ready" : "arena_unavailable", arena);
         const auto observed = pending_->reader->observe_workspace();
         if (observed.product_owner == 0U) return wait("product_unavailable", arena, &observed);
-        if (observed.product_revision != frame.revision) return Supersede();
-        const bool retired_workspace = observed.workspace && observed.workspace->retired();
-        if (!observed.workspace || retired_workspace || observed.workspace->layout() != Layout(*arena)) {
-            if (retired_workspace || pending_->requested_owner != observed.product_owner) {
-                Request(*pending_->reader, observed, *arena);
-                pending_->requested_owner = observed.product_owner;
-                return wait("workspace_requested", arena, &observed);
-            }
-            return wait("workspace_request_suppressed", arena, &observed);
+        if (observed.product_revision != frame.revision) {
+            if (pending_->destination) pending_->destination->workspace->CancelDisplayWrite();
+            return Supersede();
         }
-        AdmittedSource* admitted = nullptr;
-        for (auto& source : sources_)
-            if (!source->withdrawing && source->workspace->identity() == observed.workspace->identity() && source->arena() == arena->id)
-                admitted = source.get();
+        auto* admitted = pending_->destination;
         if (!admitted) {
-            // A workspace admits one initialized Vulkan source image. A fresh
-            // browser/arena must not repeat UNDEFINED ownership setup over an
-            // already published raw alias, even when its layout is identical.
-            if (observed.workspace->admitted()) {
-                Request(*pending_->reader, observed, *arena);
-                return wait("fresh_workspace_requested", arena, &observed);
+            for (auto& source : sources_) {
+                if (source->workspace == observed.workspace && !source->withdrawing && source->arena() == arena->id
+                    && !source->exposed && !source->transfer && !source->preparing->load(std::memory_order_acquire)) {
+                    admitted = source.get();
+                    break;
+                }
             }
-            if (sources_.size() == kSourceCapacity) return wait("source_capacity", arena, &observed);
-            const auto id = native::WorkspaceSurfaceImportId::generate();
-            auto packet = arena->layout;
-            packet.opcode = abi::Opcode::Allocate;
-            packet.descriptors = abi::kAllocateDescriptorCount;
-            packet.id_high = id.high;
-            packet.id_low = id.low;
-            packet.arena_high = arena->id.high;
-            packet.arena_low = arena->id.low;
-            packet.allocation_identity = observed.workspace->identity();
-            packet.size = observed.workspace->allocation_bytes();
-            auto source = std::make_unique<AdmittedSource>(packet, context_, wake_->get(), diagnostics_);
-            source->workspace = observed.workspace;
-            source->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
-            source->edge.reset(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
-            if (source->edge.get() < 0) throw std::runtime_error("native source eventfd creation failed");
-            source->signal = native::WorkspaceSurfaceFrameSignal::create();
-            auto access = source->workspace->ExportAccessDescriptor();
-            if (!channel_.admit_source(source->description, source->generation, source->edge.get(), source->signal.descriptor(),
-                                       access.get(), pending_->submitted.selection_generation, frame.revision))
-                return wait("source_admission_backpressure", arena, &observed);
-            sources_.push_back(std::move(source));
-            return wait("source_admission_submitted", arena, &observed, sources_.back().get());
+            for (auto& source : sources_)
+                if (!admitted && !source->withdrawing && source->arena() == arena->id && !source->exposed && !source->transfer &&
+                    !source->preparing->load(std::memory_order_acquire)) {
+                    admitted = source.get();
+                    break;
+                }
+            if (!admitted) {
+                const auto count = std::ranges::count_if(sources_, [&](const auto& source) {
+                    return !source->withdrawing && source->arena() == arena->id;
+                });
+                if (count == 2 || sources_.size() == kSourceCapacity) return wait("shared_back_slot_unavailable", arena, &observed);
+                const auto id = native::WorkspaceSurfaceImportId::generate();
+                auto workspace = gpu::ImageWorkspace::Create(context_, Layout(*arena), execution_);
+                auto packet = arena->layout;
+                packet.opcode = abi::Opcode::Allocate;
+                packet.descriptors = abi::kAllocateDescriptorCount;
+                packet.id_high = id.high;
+                packet.id_low = id.low;
+                packet.arena_high = arena->id.high;
+                packet.arena_low = arena->id.low;
+                packet.allocation_identity = workspace->identity();
+                packet.size = workspace->allocation_bytes();
+                auto source = std::make_unique<AdmittedSource>(packet, context_, wake_->get(), diagnostics_);
+                source->workspace = std::move(workspace);
+                source->workspace->SetDisplayAvailabilitySink(std::make_shared<const std::function<void()>>([weak = std::weak_ptr{wake_}] {
+                    if (const auto wake = weak.lock()) static_cast<void>(mmltk::common::io::signal_event_fd(wake->get()));
+                }));
+                source->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
+                source->edge.reset(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+                if (source->edge.get() < 0) throw std::runtime_error("native source eventfd creation failed");
+                source->signal = native::WorkspaceSurfaceFrameSignal::create();
+                auto access = source->workspace->ExportAccessDescriptor();
+                if (!channel_.admit_source(source->description, source->generation, source->edge.get(), source->signal.descriptor(),
+                                           access.get(), pending_->submitted.selection_generation, frame.revision))
+                    return wait("source_admission_backpressure", arena, &observed);
+                admitted = source.get();
+                sources_.push_back(std::move(source));
+            }
+            pending_->destination = admitted;
         }
-        if (!admitted->timeline || admitted->acquired || admitted->release_submitted)
-            return wait("source_not_reusable", arena, &observed, admitted);
-        if (!admitted->workspace->admitted()) {
-            Request(*pending_->reader, observed, *arena, admitted->workspace->identity());
-            return wait("workspace_admission_requested", arena, &observed, admitted);
+        if (!admitted->timeline || !admitted->workspace->admitted()) return wait("source_admission_pending", arena, &observed, admitted);
+        if (admitted->producer && admitted->producer != pending_->reader && admitted->workspace->product_owner() != 0U) {
+            if (!admitted->detaching) {
+                admitted->detaching = true;
+                Request(*admitted->producer, {}, *arena, *admitted, true);
+            }
+            return wait("previous_raw_product_detachment", arena, &observed, admitted);
         }
-        services::RuntimeDiagnosticSpan borrow_span(
-            diagnostics_,
-            [&] {
-                auto fact = presentation_diagnostic_fact(
-                    VisualDiagnosticOperation::PresentationSourceBorrowStarted,
-                    {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link},
-                    settings_.device);
-                fact.context.workspace = native::workspace_source_diagnostic(admitted->description);
-                return visual_diagnostic_boundary(fact, VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
-            },
-            pending_->link);
-        auto read = pending_->reader->borrow_workspace();
-        if (!read.valid()) {
-            Request(*pending_->reader, observed, *arena, admitted->workspace->identity());
-            return wait("workspace_borrow_unavailable", arena, &observed, admitted);
+        admitted->detaching = false;
+        admitted->producer = pending_->reader;
+        if (pending_->requested_owner == 0U) {
+            const bool direct = observed.workspace == admitted->workspace && admitted->workspace->revision() == frame.revision;
+            auto raw = direct ? pending_->reader->borrow() : gpu::BorrowedImageProductReadView{};
+            if (direct && (!raw.valid() || raw.plane(0U).revision() != frame.revision)) return Supersede();
+            if (!admitted->workspace->ReserveDisplayWrite()) return wait("shared_back_slot_unavailable", arena, &observed, admitted);
+            pending_->requested_owner = observed.product_owner;
+            if (direct) {
+                source_read_ = std::make_unique<gpu::ImageProductReadCompletion>(std::move(raw));
+            } else {
+                admitted->workspace->InvalidateWrite();
+                Request(*pending_->reader, observed, *arena, *admitted);
+                return wait("producer_finalization_pending", arena, &observed, admitted);
+            }
         }
-        if (read.identity() != admitted->workspace->identity() || read.revision() != frame.revision) return Supersede();
-        if (!admitted->workspace->ReserveWrite()) return wait("workspace_write_unavailable", arena, &observed, admitted);
+        if (admitted->workspace->revision() != frame.revision) {
+            admitted->workspace->CancelDisplayWrite();
+            return Supersede();
+        }
         try {
-            borrow_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });
             const auto transfer = mmltk::common::types::take_monotonic_identity(admitted->next_transfer);
             transfer_.emplace(
                 Transfer{.source = admitted,
-                         .pending = *pending_,
+                         .pending = std::move(*pending_),
                          .publication = {.capability = CapabilityOf(*arena),
                                          .timeline_ready = native::detail::workspace_timeline_ready(transfer),
                                          .presentation_revision = mmltk::common::types::take_monotonic_identity(next_publication_),
                                          .transfer_sequence = transfer},
-                         .plane = read.plane(),
-                         .physical_revision = read.revision()});
-            admitted->stream.Await(read);
-            source_read_ = std::move(read).TakeCompletion();
+                         .plane = admitted->workspace->plane(frame.extent.width, frame.extent.height),
+                         .physical_revision = admitted->workspace->revision()});
             diagnostics_.Emit([&] {
                 auto fact = Fact(VisualDiagnosticOperation::PresentationSourceReadSubmitted, *transfer_, 0U);
                 fact.value = 0U;
@@ -789,7 +822,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         native::detail::publish_workspace_frame_signal(
             source.signal.mapping(), transfer.publication.timeline_ready, transfer.publication.transfer_sequence,
             native::WorkspacePresentationLayer::Primary, {presentation_source_session(frame.source.kind), frame.revision},
-            transfer.publication.presentation_revision, frame.extent.width, frame.extent.height, transfer.physical_revision);
+            transfer.publication.presentation_revision, frame.extent.width, frame.extent.height, transfer.physical_revision,
+            transfer.pending.metadata);
         source.workspace->CancelWrite();
         source.exposed = true;
         if (!mmltk::common::io::signal_event_fd(source.edge.get())) throw std::runtime_error("native source frame publication failed");
@@ -807,6 +841,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         return outcome;
     }
     void ObserveSourceTransition(const abi::Record& record) {
+        if (record.opcode == abi::Opcode::BindingRetired) {
+            const native::WorkspaceSurfaceImportId id{record.id_high, record.id_low};
+            for (auto* arena : {active_.get(), candidate_.get()})
+                if (arena && arena->id == id) arena->binding_retired = true;
+            return;
+        }
         const auto found = std::ranges::find_if(sources_, [&](const auto& source) {
             return source->description.id_high == record.id_high && source->description.id_low == record.id_low;
         });
@@ -950,9 +990,26 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         });
     }
     void Diagnose(VisualDiagnosticOperation operation, const Transfer& transfer, std::uint64_t outcome) const noexcept {
-        if (diagnostics_.valid()) diagnostics_(Fact(operation, transfer, outcome));
+        if (!diagnostics_.valid()) return;
+        std::array<char, 16U> fingerprint{};
+        diagnostics_.Emit([&] {
+            auto fact = Fact(operation, transfer, outcome);
+            if (operation == VisualDiagnosticOperation::PresentationFrameEdge) {
+                std::uint64_t hash = 0xcbf29ce484222325ULL;
+                for (const auto byte : transfer.pending.metadata)
+                    hash = (hash ^ std::to_integer<std::uint8_t>(byte)) * 0x100000001b3ULL;
+                fact.context.metadata_bytes = transfer.pending.metadata.size();
+                fingerprint.fill('0');
+                std::array<char, 16U> digits{};
+                const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(), hash, 16);
+                const auto length = static_cast<std::size_t>(converted.ptr - digits.data());
+                std::copy_n(digits.begin(), length, fingerprint.end() - static_cast<std::ptrdiff_t>(length));
+                fact.context.metadata_fingerprint = {fingerprint.data(), fingerprint.size()};
+            }
+            return fact;
+        });
     }
-    static constexpr std::size_t kSourceCapacity = 24U;
+    static constexpr std::size_t kSourceCapacity = 6U;
     VisualDeviceSettings settings_;
     PresentationNativeConfiguration configuration_;
     bool pending_supersession_acceptance_ = configuration_.pending_supersession_acceptance;
@@ -971,7 +1028,6 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     std::unique_ptr<gpu::ImageProductReadCompletion> source_read_;
     std::uint64_t next_generation_ = 1U, next_publication_ = 1U;
     Stage stage_ = Stage::Idle;
-    std::atomic_bool connected_{true};
 };
 }  // namespace
 

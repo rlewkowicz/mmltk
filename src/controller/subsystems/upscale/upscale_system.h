@@ -58,6 +58,12 @@ struct UpscaleMethodSnapshot final {
     std::optional<UpscaleRequest> failure{};
     VisualFrame frame{};
 };
+struct UpscaleImageMetadata final {
+    VisualFrame frame{};
+    VisualFrame input{};
+    contracts::AnnotationSceneContent scene{};
+};
+
 struct UpscaleSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
@@ -86,7 +92,7 @@ class UpscaleSystem final {
    public:
     using visual_source = VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale,
                                                  mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>>;
+                                                 mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
     using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
     UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
                   VisualDiagnosticSink = {});
@@ -99,6 +105,8 @@ class UpscaleSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     // CLEANUP-IGNORE: The sealed Upscale facade publishes its own reflected snapshot and frame borrow.
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] UpscaleSnapshot snapshot() const;
+    [[nodiscard]] std::optional<UpscaleImageMetadata> ImageSnapshot(const VisualFrame&) const;
+    [[nodiscard]] std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> ImageSourceMetadata(const VisualFrame&) const;
     // CLEANUP-IGNORE: Upscale owns this ordinary read API; a shared facade would couple independent domain systems.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
@@ -118,6 +126,7 @@ MMLTK_REFLECT_ENUM(UpscaleKernel)
 MMLTK_REFLECT_ENUM(UpscaleFailureKind)
 MMLTK_REFLECT_FIELDS(UpscaleRequest)
 MMLTK_REFLECT_FIELDS(UpscaleMethodSnapshot)
+MMLTK_REFLECT_FIELDS(UpscaleImageMetadata)
 MMLTK_REFLECT_FIELDS(UpscaleSnapshot)
 MMLTK_REFLECT_FIELDS(UpscaleChanged)
 MMLTK_REFLECT_FIELDS(UpscaleFailed)

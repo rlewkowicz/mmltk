@@ -41,11 +41,14 @@ extern void wgpu_parent_external_texture_frame_ready(
     uint64_t aContentSession, uint64_t aContentSequence,
     uint64_t aPresentationRevision, uint32_t aContentWidth,
     uint32_t aContentHeight, bool aCopyComplete,
-    uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling) {
+    uint64_t aSourceHigh, uint64_t aSourceLow, bool aDirectSampling,
+    uint32_t aCapacityWidth, uint32_t aCapacityHeight, uint64_t aTransferSequence,
+    const uint8_t* aMetadata, size_t aMetadataBytes) {
   static_cast<WebGPUParent*>(aParent)->NotifyExternalTextureFrame(
       aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aLayer, aSlot, aContentSession,
       aContentSequence, aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete,
-      aSourceHigh, aSourceLow, aDirectSampling);
+      aSourceHigh, aSourceLow, aDirectSampling, aCapacityWidth, aCapacityHeight,
+      aTransferSequence, aMetadata, aMetadataBytes);
 }
 
 extern void wgpu_parent_workspace_source_requested(WGPUWebGPUParentPtr aParent, uint64_t aHigh, uint64_t aLow) {
@@ -492,18 +495,24 @@ void WebGPUParent::NotifyExternalTextureFrame(
     const uint64_t aContentSession, const uint64_t aContentSequence,
     const uint64_t aPresentationRevision, const uint32_t aContentWidth,
     const uint32_t aContentHeight, const bool aCopyComplete,
-    const uint64_t aSourceHigh, const uint64_t aSourceLow, const bool aDirectSampling) {
+    const uint64_t aSourceHigh, const uint64_t aSourceLow, const bool aDirectSampling,
+    const uint32_t aCapacityWidth, const uint32_t aCapacityHeight, const uint64_t aTransferSequence,
+    const uint8_t* aMetadata, const size_t aMetadataBytes) {
+  nsTArray<uint8_t> metadata;
+  if (aMetadataBytes) metadata.AppendElements(aMetadata, aMetadataBytes);
   RefPtr<WebGPUParent> self = this;
   nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableFunction(
       "WebGPUParent::NotifyExternalTextureFrame",
       [self = std::move(self), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
        aLayer, aSlot, aContentSession, aContentSequence,
-       aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling]() {
+       aPresentationRevision, aContentWidth, aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling,
+       aCapacityWidth, aCapacityHeight, aTransferSequence, metadata = std::move(metadata)]() {
         if (self->CanSend() && !self->SendExternalTextureFrame(
                                    aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
                                    aLayer, aSlot, aContentSession, aContentSequence,
                                    aPresentationRevision, aContentWidth,
-                                   aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling)) {
+                                   aContentHeight, aCopyComplete, aSourceHigh, aSourceLow, aDirectSampling,
+                                   aCapacityWidth, aCapacityHeight, aTransferSequence, metadata)) {
           NS_WARNING("SendExternalTextureFrame failed");
         }
       });
@@ -1667,21 +1676,15 @@ ipc::IPCResult WebGPUParent::RecvExternalTextureSlotRelease(
   return IPC_OK();
 }
 
-ipc::IPCResult WebGPUParent::RecvWorkspaceRequest(RawId aDeviceId, uint64_t aSurfaceIdHigh,
-                                                  uint64_t aSurfaceIdLow, uint32_t aWidth, uint32_t aHeight) {
+ipc::IPCResult WebGPUParent::RecvWorkspaceBind(RawId aDeviceId) {
   if (mContext && mActiveDeviceIds.Contains(aDeviceId)) {
-    ffi::wgpu_server_workspace_request(mContext.get(), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow, aWidth, aHeight);
+    ffi::wgpu_server_workspace_bind(mContext.get(), aDeviceId);
   }
   return IPC_OK();
 }
 
-ipc::IPCResult WebGPUParent::RecvWorkspaceAcquire(RawId aDeviceId, uint64_t aSurfaceIdHigh,
-                                                  uint64_t aSurfaceIdLow, uint64_t aContentSession,
-                                                  uint64_t aContentSequence, uint64_t aPublication) {
-  if (mContext && mActiveDeviceIds.Contains(aDeviceId)) {
-    ffi::wgpu_server_workspace_acquire(mContext.get(), aDeviceId, aSurfaceIdHigh, aSurfaceIdLow,
-                                     aContentSession, aContentSequence, aPublication);
-  }
+ipc::IPCResult WebGPUParent::RecvWorkspaceUnbind(const RawId aDeviceId) {
+  if (mContext) ffi::wgpu_server_workspace_unbind(mContext.get(), aDeviceId);
   return IPC_OK();
 }
 

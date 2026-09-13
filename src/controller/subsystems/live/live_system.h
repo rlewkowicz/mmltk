@@ -82,6 +82,7 @@ class LiveSystem final {
     [[nodiscard]] bool stopped() const noexcept;
     // CLEANUP-IGNORE: The Live snapshot and adjacent read API belong to this sealed domain, with shared execution in VisualRuntimeOwner.
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] LiveSnapshot snapshot() const;
+    [[nodiscard]] std::optional<VisualImageMetadata> ImageSnapshot(const VisualFrame&) const;
     // CLEANUP-IGNORE: Live exposes raw and display reads through its own public API; shared implementation remains private.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;

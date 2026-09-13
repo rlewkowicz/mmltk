@@ -361,7 +361,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     use mmltk_browser_app::generated::{ApplicationEvent, ApplicationReply, ApplicationSnapshot};
     use mmltk_browser_app::protocol::ServerRecord;
 
-    let bytes = fs::read(env!("MMLTK_PROTOCOL_V16_SERVER_FIXTURE_PATH"))?;
+    let bytes = fs::read(env!("MMLTK_PROTOCOL_V17_SERVER_FIXTURE_PATH"))?;
     let mut records = Vec::new();
     let mut kinds = BTreeSet::new();
     let mut cursor = 0_usize;
@@ -588,7 +588,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
                 FileDialogCancelledOrFileDialogSelectedVariant::FileDialogSelected(value) => {
                     require(selected, "native dialog selected/cancelled fixture changed")?;
                     require(
-                        value.path == "/tmp/protocol-v16-fixture",
+                        value.path == "/tmp/protocol-v17-fixture",
                         "native dialog selected path changed",
                     )?;
                 }
@@ -896,15 +896,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .encode()?,
         ));
     }
-    records.push((
-        "RendererObservation",
-        mmltk_browser_app::protocol::RendererObservation::Surface {
-            width: 640,
-            height: 480,
-            scale: 1.5,
-        }
-        .encode()?,
-    ));
     records.push((
         "IntegrationControl",
         generated::IntegrationControl {

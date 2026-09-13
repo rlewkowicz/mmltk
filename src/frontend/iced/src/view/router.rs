@@ -117,6 +117,10 @@ impl Router {
         self.explore.abandon_submission();
     }
 
+    pub fn explore_abandon_detail(&mut self) {
+        self.explore.abandon_detail();
+    }
+
     pub fn explore_request_viewport(
         &mut self,
         snapshot: Option<&crate::generated::ExploreSnapshot>,

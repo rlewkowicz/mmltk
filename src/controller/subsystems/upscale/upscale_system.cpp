@@ -288,6 +288,7 @@ class UpscaleSystem::Impl final {
                   selected_ = {};
                   input_request_.reset();
                   input_document_.reset();
+                  input_image_metadata_.reset();
                   state_.pending.reset();
                   state_.methods = {};
                   AdvanceRevision();
@@ -358,6 +359,7 @@ class UpscaleSystem::Impl final {
                     if (prepare_input) {
                         input_request_.reset();
                         input_document_.reset();
+                        input_image_metadata_.reset();
                         runtime.PublishInput(extent.width, extent.height, [model](auto clean, auto semantic, auto stream) {
                             model->Semantics({}, clean, stream);
                             if (semantic.valid()) model->Semantics({}, semantic, stream);
@@ -508,6 +510,7 @@ class UpscaleSystem::Impl final {
                             source_descriptor.height != request.source.extent.height)
                             throw contracts::UnavailableError("Upscale source geometry does not match its frame");
                         auto document = retained_input ? input_document_ : scale_visual_document(source.document, kUpscaleOutputScale);
+                        auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
                         auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                         if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
                         const auto copied_planes = diagnostics_.valid() ? source.pixels.plane_count() : 0U;
@@ -531,12 +534,14 @@ class UpscaleSystem::Impl final {
                             if (!current()) return {};
                             input_request_.reset();
                             input_document_.reset();
+                            input_image_metadata_.reset();
                             if (!current()) return {};
                             const auto paths = runtime.CopyInputFrom(
                                 std::move(source.pixels),
                                 [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); }, preserve_clean);
                             input_request_ = request;
                             input_document_ = document;
+                            input_image_metadata_ = image_metadata;
                             copy_span.FinishWith([&](auto& fact) { fact.copy_path = paths[preserve_clean ? 1U : 0U]; });
                         }
                         if (stop.stop_requested()) return {};
@@ -612,6 +617,7 @@ class UpscaleSystem::Impl final {
                             record.product = std::move(product);
                             record.request = request;
                             record.document = std::move(document);
+                            record.image_metadata = std::move(image_metadata);
                             record.frame = {
                                 .source =
                                     {
@@ -697,6 +703,16 @@ class UpscaleSystem::Impl final {
         }
         return snapshot();
     }
+    [[nodiscard]] std::optional<UpscaleImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        if (state_.frame != frame) return std::nullopt;
+        return UpscaleSystem::visual_source::ImageOf(state_);
+    }
+    [[nodiscard]] std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> ImageSourceMetadata(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        if (state_.frame != frame) return {};
+        return records_[static_cast<std::size_t>(state_.kernel)].image_metadata;
+    }
     UpscaleSnapshot snapshot() const {
         UpscaleSnapshot result;
         {
@@ -735,6 +751,7 @@ class UpscaleSystem::Impl final {
         selected_ = {};
         input_request_.reset();
         input_document_.reset();
+        input_image_metadata_.reset();
         document_.reset();
         state_.ready = false;
         state_.busy = false;
@@ -797,6 +814,7 @@ class UpscaleSystem::Impl final {
         mmltk::frameworks::gpu::ImageProductPool::Product product{};
         VisualFrame frame{};
         std::shared_ptr<const VisualDocument> document{};
+        std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> image_metadata{};
     };
     static bool SameSource(const UpscaleRequest& left, const UpscaleRequest& right) {
         return left.source == right.source && left.document == right.document;
@@ -836,6 +854,7 @@ class UpscaleSystem::Impl final {
     std::optional<UpscaleRequest> input_request_;
     // Shared four-times document projection for this exact receiver-owned input.
     std::shared_ptr<const VisualDocument> input_document_;
+    std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> input_image_metadata_;
     std::shared_ptr<const VisualDocument> document_;
     bool warm_admitted_ = false;
     bool warm_attempted_ = false;
@@ -864,6 +883,10 @@ void UpscaleSystem::Stop() noexcept {
 void UpscaleSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool UpscaleSystem::stopped() const noexcept { return impl_->stopped(); }
 UpscaleSnapshot UpscaleSystem::snapshot() const { return impl_->snapshot(); }
+std::optional<UpscaleImageMetadata> UpscaleSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
+std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> UpscaleSystem::ImageSourceMetadata(const VisualFrame& frame) const {
+    return impl_->ImageSourceMetadata(frame);
+}
 mmltk::frameworks::gpu::BorrowedImageProductReadView UpscaleSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace UpscaleSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation UpscaleSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

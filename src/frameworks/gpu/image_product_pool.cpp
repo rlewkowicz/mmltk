@@ -289,6 +289,23 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
     static_cast<void>(Commit(std::move(candidate)));
     return paths;
 }
+bool ImageProductPool::DetachDisplay(ImageStream& stream, const std::shared_ptr<ImageWorkspace>& workspace) {
+    for (const auto& slot : slots_)
+        if (!slot->buffer.DetachWorkspace(stream, workspace)) return false;
+    return true;
+}
+bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revision,
+                                      const std::shared_ptr<ImageWorkspace>& workspace, ImageWorkspaceFinalize finalize) {
+    const auto product = Selected();
+    if (!product.valid() || product.revision() != revision) return false;
+    for (const auto& slot : slots_) {
+        if (slot == product.slot_ && slot->buffer.ObserveWorkspace().workspace == workspace) continue;
+        if (!slot->buffer.DetachWorkspace(stream, workspace)) return false;
+    }
+    if (const auto prior = product.slot_->buffer.ObserveWorkspace().workspace; prior && prior != workspace)
+        if (!product.slot_->buffer.DetachWorkspace(stream, prior)) return false;
+    return PrepareWorkspace(product, workspace, std::move(finalize));
+}
 bool ImageProductPool::ConfigureWorkspace(Candidate& candidate, std::shared_ptr<ImageWorkspace> workspace,
                                           ImageWorkspaceFinalize finalize) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)

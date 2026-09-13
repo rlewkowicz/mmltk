@@ -86,23 +86,12 @@ pub(crate) fn explore_presentation() -> (ApplicationModel, crate::presentation_s
     explore.ready = true;
     explore.revision = 10;
     explore.mode = crate::generated::ExploreMode::Detail;
+    explore.dataset.identity = 1;
     explore.selectedimage = Some(0);
     explore.frame = source.clone();
     let control = model.presentation.as_mut().unwrap();
     control.selected = source.source.clone();
-    control.completed = source;
-    control.presentationrevision = frame.presentation_revision;
-    control.completedsourcerevision = explore.revision;
-    control.capability = crate::generated::PresentationCapability {
-        surfacehigh: frame.high,
-        surfacelow: frame.low,
-        generation: 1,
-        extent: VisualExtent {
-            width: frame.content_width,
-            height: frame.content_height,
-        },
-        condition: crate::generated::PresentationCapabilityCondition::Ready,
-    };
+    crate::presentation_surface::metadata::install_explore(frame, explore);
     (model, frame)
 }
 

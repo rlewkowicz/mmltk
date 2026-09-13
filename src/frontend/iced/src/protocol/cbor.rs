@@ -44,6 +44,18 @@ pub fn object<K: Into<String>>(fields: impl IntoIterator<Item = (K, Value)>) -> 
     )
 }
 
+pub(crate) fn decode_graphics_value(bytes: &[u8], maximum: usize) -> Result<Value, ProtocolError> {
+    if bytes.is_empty() || bytes.len() > maximum {
+        return Err(ProtocolError("invalid graphics metadata extent".into()));
+    }
+    let mut cursor = 0;
+    let value = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0)?;
+    if cursor != bytes.len() {
+        return Err(ProtocolError("trailing graphics metadata bytes".into()));
+    }
+    validate_dynamic_value(&value, maximum, maximum, MAX_INTENT_VALUE_DEPTH)?;
+    Ok(value)
+}
 pub fn reject_unknown_fields<E>(
     fields: &[(String, Value)],
     mut known: impl FnMut(&str) -> bool,

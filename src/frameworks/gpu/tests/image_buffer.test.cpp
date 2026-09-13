@@ -1610,6 +1610,116 @@ class WorkspaceAccessPeer final {
     ImageWorkspaceAccessSignal* signal_ = nullptr;
 };
 
+TEST_CASE("Shared display custody detaches raw aliases and never overwrites an unread offer", "[gpu][workspace][display]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [workspace, product] = fixture.PublishWorkspace(0);
+    const auto offered_revision = workspace->revision();
+    const auto offered_plane = product.Borrow().plane(0U).plane().data;
+    REQUIRE(workspace->ReserveDisplayWrite());
+    workspace->CancelWrite(); // Publish the offer while retaining graphics ownership.
+    CHECK_FALSE(workspace->ReserveWrite());
+    CHECK_FALSE(workspace->ReserveDisplayWrite());
+    WorkspaceAccessPeer peer(workspace);
+    auto candidate = fixture.runtime.TryAcquireOutput(product);
+    REQUIRE(candidate.valid());
+    fixture.runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
+    product = fixture.runtime.CommitOutput(std::move(candidate));
+    CHECK(product.Borrow().plane(0U).plane().data != offered_plane);
+    CHECK(workspace->revision() == offered_revision);
+    CHECK(workspace->product_owner() == 0U);
+    REQUIRE(peer.Acquire(peer.Access(), offered_revision));
+    CHECK_FALSE(workspace->ReserveWrite());
+    peer.Release();
+    REQUIRE(workspace->ReserveDisplayWrite());
+    REQUIRE(fixture.runtime.PrepareDisplay(product.revision(), workspace));
+    workspace->CancelWrite();
+    REQUIRE(peer.Acquire(peer.Access(), product.revision()));
+    peer.Release();
+    const auto copies = fixture.backend->same_copies.load();
+    candidate = fixture.runtime.TryAcquireOutput(product);
+    REQUIRE(candidate.valid());
+    fixture.runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
+    product = fixture.runtime.CommitOutput(std::move(candidate));
+    CHECK(product.Borrow().plane(0U).plane().data == offered_plane);
+    // A first reattachment may preserve a private baseline. Subsequent clean
+    // production writes directly into the admitted final allocation.
+    CHECK(fixture.backend->same_copies.load() <= copies + 1U);
+    const auto direct_copies = fixture.backend->same_copies.load();
+    candidate = fixture.runtime.TryAcquireOutput(product);
+    REQUIRE(candidate.valid());
+    fixture.runtime.Publish(candidate, 4U, 3U, [](auto, auto, auto) {});
+    product = fixture.runtime.CommitOutput(std::move(candidate));
+    CHECK(fixture.backend->same_copies.load() == direct_copies);
+    product = {};
+}
+
+TEST_CASE("Two completed display offers settle independently without mailbox custody", "[gpu][workspace][display]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [older, older_product] = fixture.PublishWorkspace(0);
+    auto [newer, newer_product] = fixture.PublishWorkspace(0);
+    REQUIRE(older->ReserveDisplayWrite());
+    REQUIRE(newer->ReserveDisplayWrite());
+    older->CancelWrite();
+    newer->CancelWrite();
+    WorkspaceAccessPeer old_peer(older), new_peer(newer);
+    REQUIRE(new_peer.Acquire(new_peer.Access(), newer_product.revision()));
+    REQUIRE(old_peer.Acquire(old_peer.Access(), older_product.revision()));
+    // A failed release-only submission returns its acquisition reservation;
+    // it does not return native display ownership or overwrite the offer.
+    old_peer.Abandon();
+    CHECK_FALSE(older->ReserveDisplayWrite());
+    REQUIRE(old_peer.Acquire(old_peer.Access(), older_product.revision()));
+    CHECK_FALSE(older->WriteAvailable());
+    CHECK_FALSE(newer->WriteAvailable());
+    const auto copies = fixture.backend->same_copies.load();
+    old_peer.Release(); // Actual release-only completion, without a mailbox.
+    CHECK(older->WriteAvailable());
+    CHECK_FALSE(newer->WriteAvailable());
+    REQUIRE(older->ReserveDisplayWrite());
+    older->CancelDisplayWrite();
+    new_peer.Release(); // The newer image's independent last-reader completion.
+    CHECK(newer->WriteAvailable());
+    REQUIRE(newer->ReserveDisplayWrite());
+    newer->CancelDisplayWrite();
+    CHECK(fixture.backend->same_copies.load() == copies);
+    CHECK(older_product.revision() == older->revision());
+    CHECK(newer_product.revision() == newer->revision());
+}
+
+TEST_CASE("A submitted display read survives terminal loss until exact completion", "[gpu][workspace][display]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [workspace, product] = fixture.PublishWorkspace(0);
+    REQUIRE(workspace->ReserveDisplayWrite());
+    workspace->CancelWrite();
+    WorkspaceAccessPeer peer(workspace);
+    REQUIRE(peer.Acquire(peer.Access(), product.revision()));
+    const auto reading = peer.Access();
+    workspace->Withdraw();
+    CHECK_FALSE(workspace->TerminalReadComplete(product.revision()));
+    CHECK_FALSE(workspace->ReserveDisplayWrite());
+    peer.TerminalComplete(reading);
+    REQUIRE(workspace->TerminalReadComplete(product.revision()));
+    workspace->CompleteRead(product.revision());
+    CHECK_FALSE(workspace->Acquired(product.revision()));
+}
+
+TEST_CASE("Display producer detachment waits for actual raw readers and preserves retained products", "[gpu][workspace][display]") {
+    WorkspaceRuntimeFixture fixture;
+    auto [workspace, product] = fixture.PublishWorkspace(0);
+    const auto revision = product.revision();
+    auto raw = product.Borrow();
+    REQUIRE(workspace->ReserveDisplayWrite());
+    const auto allocation = raw.plane(0U).plane().data;
+    CHECK_FALSE(fixture.runtime.DetachDisplay(workspace));
+    raw = {};
+    REQUIRE(fixture.runtime.DetachDisplay(workspace));
+    CHECK(workspace->product_owner() == 0U);
+    CHECK(product.revision() == revision);
+    CHECK(product.Borrow().plane(0U).plane().data != allocation);
+    workspace->CancelDisplayWrite();
+    product = {};
+}
+
 TEST_CASE("Exact external acquisition races replacement without reusing a held fallback", "[gpu][workspace][acquisition]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();

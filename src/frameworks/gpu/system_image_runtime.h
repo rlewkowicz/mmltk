@@ -93,6 +93,8 @@ class SystemImageRuntime final {
     [[nodiscard]] bool PrepareWorkspace(const CompletedOutput&, std::shared_ptr<ImageWorkspace>);
     [[nodiscard]] bool PrepareWorkspace(const ImageWorkspaceObservation&, std::shared_ptr<ImageWorkspace>);
     void FinalizeWorkspace(OutputCandidate&, ImageWorkspaceCoverage = {});
+    [[nodiscard]] bool PrepareDisplay(std::uint64_t revision, const std::shared_ptr<ImageWorkspace>&);
+    [[nodiscard]] bool DetachDisplay(const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
     void SelectOutput(const CompletedOutput&);

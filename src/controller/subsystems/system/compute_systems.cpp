@@ -550,6 +550,11 @@ class PredictSystem::Impl final {
         return snapshot();
     }
     void Shutdown() noexcept { worker_.StopAndWait(); }
+    [[nodiscard]] std::optional<VisualImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        if (state_.frame != frame) return std::nullopt;
+        return PredictSystem::visual_source::ImageOf(state_);
+    }
     [[nodiscard]] PredictSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
         return state_;
@@ -635,6 +640,7 @@ PredictSnapshot PredictSystem::Stop(contracts::PredictWorkflowIntent) noexcept {
 // CLEANUP-IGNORE: Predict exposes ordinary sealed lifecycle/read methods; VisualRuntimeOwner already owns shared workspace behavior.
 void PredictSystem::Shutdown() noexcept { impl_->Shutdown(); }
 PredictSnapshot PredictSystem::snapshot() const { return impl_->snapshot(); }
+std::optional<VisualImageMetadata> PredictSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView PredictSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace PredictSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation PredictSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

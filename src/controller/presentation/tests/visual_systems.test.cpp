@@ -6,6 +6,7 @@
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/browser/application_materializer.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
@@ -81,6 +82,34 @@ namespace {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+
+TEST_CASE("Graphics signal publishes exact bounded image metadata with its physical transfer", "[presentation][metadata]") {
+    namespace graphics = presentation::detail;
+    auto owned = presentation::WorkspaceSurfaceFrameSignal::create();
+    auto* signal = owned.mapping();
+    const std::array first{std::byte{0x83}, std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
+    graphics::publish_workspace_frame_signal(signal, 1U, 1U, presentation::WorkspacePresentationLayer::Primary,
+        {1U, 7U}, 3U, 640U, 480U, 7U, first);
+    CHECK(signal->metadata_bytes == first.size());
+    CHECK(signal->transfer_sequence == 1U);
+    CHECK(signal->physical_revision == 7U);
+    CHECK((signal->sequence_lock & 1U) == 0U);
+    const auto* payload = reinterpret_cast<const std::byte*>(signal) + sizeof(*signal);
+    CHECK(std::equal(first.begin(), first.end(), payload));
+    const auto sequence = signal->sequence_lock;
+    const std::vector<std::byte> oversized(graphics::kWorkspaceMetadataByteCapacity + 1U);
+    CHECK_THROWS_AS(graphics::publish_workspace_frame_signal(signal, 3U, 2U,
+        presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U, 8U, oversized), std::length_error);
+    CHECK(signal->sequence_lock == sequence);
+    CHECK(signal->transfer_sequence == 1U);
+    CHECK(std::equal(first.begin(), first.end(), payload));
+    const std::array second{std::byte{0x81}, std::byte{0x09}};
+    graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary,
+        {1U, 8U}, 4U, 640U, 480U, 8U, second);
+    CHECK(signal->metadata_bytes == second.size());
+    CHECK(signal->transfer_sequence == 2U);
+    CHECK(std::equal(second.begin(), second.end(), payload));
+}
 
 TEST_CASE("Gallery demand clips four neighboring rows independently", "[explore][cache]") {
     using explore_detail::GalleryThumbnailCache;
@@ -1683,31 +1712,6 @@ struct TestPresentationWriterState final {
         std::unique_lock lock(pump_mutex);
         return pump_changed.wait_for(lock, 2s, [&] { return pump_count > prior; });
     }
-    [[nodiscard]] std::uint64_t ArmWaiting() {
-        std::scoped_lock lock(pump_mutex);
-        return ++waiting_step;
-    }
-    void RecordWaiting(bool connected, std::uint64_t source_revision, bool has_pending, bool readiness_consumed) {
-        if (!readiness_consumed) return;
-        {
-            std::scoped_lock lock(pump_mutex);
-            waiting = {.step = waiting_step, .connected = connected, .source_revision = source_revision, .pending = has_pending};
-        }
-        pump_changed.notify_all();
-    }
-    [[nodiscard]] bool WaitDisconnected(std::uint64_t step, bool pending, std::uint64_t source_revision) {
-        std::unique_lock lock(pump_mutex);
-        return pump_changed.wait_for(lock, 2s, [&] {
-            return waiting.step == step && !waiting.connected && waiting.pending == pending && waiting.source_revision == source_revision;
-        });
-    }
-    struct Waiting {
-        std::uint64_t step = 0;
-        bool connected = true;
-        std::uint64_t source_revision = 0;
-        bool pending = false;
-    } waiting;
-    std::uint64_t waiting_step = 0;
     // CLEANUP-IGNORE: This descriptor begins presentation-writer readiness and lifecycle evidence, not fake GPU
     // synchronization and transfer counters.
     mmltk::common::io::ScopedFd readiness;
@@ -1726,6 +1730,7 @@ struct TestPresentationWriterState final {
     // CLEANUP-ON
     std::atomic_bool allow_publication{true};
     std::atomic_bool fail_pump{false};
+    std::atomic_bool retire_binding{false};
     std::atomic_bool block_pump{false};
     std::atomic_bool pump_block_reported{false};
     std::atomic<PresentationNativeWriter::Retirement> terminal_retirement{PresentationNativeWriter::Retirement::Released};
@@ -1837,6 +1842,10 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             if (prior == 0U) state_->allocation_retired.set_value();
         }
         mmltk::testsupport::ScopedTestCleanup pumped{[state = state_] { state->RecordPump(); }};
+        if (state_->retire_binding.exchange(false, std::memory_order_acq_rel)) {
+            pending_.reset();
+            return {.progress = PresentationNativeProgress::BindingRetired};
+        }
         if (submitted_.selection_generation != current_selection_generation) {
             pending_.reset();
             return {
@@ -1844,9 +1853,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
                 .submitted = submitted_,
             };
         }
-        const bool peer_connected = application_peer_connected_.load(std::memory_order_acquire);
-        if (!pending_ || !peer_connected || !state_->allow_publication.load(std::memory_order_acquire)) {
-            state_->RecordWaiting(peer_connected, submitted_.observation.frame.revision, pending_.has_value(), consumed > 0);
+        if (!pending_ || !state_->allow_publication.load(std::memory_order_acquire)) {
             return {.capability = capability()};
         }
         const bool candidate_target = candidate_ && pending_->capability.generation == candidate_->generation;
@@ -1886,9 +1893,6 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     int poll_fd() const noexcept override { return state_->readiness.get(); }
     int completion_fd() const noexcept override { return -1; }
     bool wants_write() const noexcept override { return false; }
-    void SetApplicationPeerConnected(const bool connected) noexcept override {
-        application_peer_connected_.store(connected, std::memory_order_release);
-    }
     void SetExpectedBrowserProcessGroup(pid_t) override {}
     Retirement BrowserPeerLost() noexcept override {
         try {
@@ -1934,7 +1938,6 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     std::optional<Allocation> active_;
     std::optional<Allocation> candidate_;
     std::optional<Allocation> retiring_;
-    std::atomic_bool application_peer_connected_{true};
     std::uint64_t next_generation_ = 1U;
 };
 
@@ -3975,15 +3978,48 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
                              }};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
+    const auto gallery_frame = explore.snapshot().frame;
+    const auto gallery_metadata = explore.ImageSnapshot(gallery_frame);
+    REQUIRE(gallery_metadata);
     auto admitted = explore.Select({.compiled_index = 1U});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().frame.extent == extents->padded);
 
     const auto full_frame = explore.snapshot().frame;
     CHECK((full_frame.content == VisualRegion{8U, 16U, 48U, 32U}));
-    admitted = explore.UpdateDetail({.show_original_dimensions = true});
-    CHECK(admitted.detail.show_original_dimensions);
-    CHECK(explore.snapshot().frame == full_frame);
+    const auto detail_metadata = explore.ImageSnapshot(full_frame);
+    REQUIRE(detail_metadata);
+    const auto raw = explore.BorrowFrame();
+    const auto captured = explore.BorrowDocument(full_frame);
+    REQUIRE(raw.valid());
+    REQUIRE(captured.valid());
+    REQUIRE(captured.image_metadata);
+    const auto captured_metadata = *captured.image_metadata;
+    const auto raw_data = raw.plane(0U).plane().data;
+    for (const bool original : {true, false}) {
+        admitted = explore.UpdateDetail({.show_original_dimensions = original});
+        CHECK(admitted.detail.show_original_dimensions == original);
+        CHECK(explore.snapshot().frame == full_frame);
+        for (const auto* baseline : {&*gallery_metadata, &*detail_metadata}) {
+            auto expected = *baseline;
+            expected.detail.show_original_dimensions = original;
+            const auto refreshed = explore.ImageSnapshot(baseline->frame);
+            REQUIRE(refreshed);
+            const auto actual_value = mmltk::frameworks::serialization::reflected_transport_value(*refreshed);
+            const auto expected_value = mmltk::frameworks::serialization::reflected_transport_value(expected);
+            REQUIRE(actual_value);
+            REQUIRE(expected_value);
+            CHECK(*actual_value == *expected_value);
+        }
+        const auto current = explore.BorrowDocument(full_frame);
+        REQUIRE(current.valid());
+        CHECK(current.document == captured.document);
+        CHECK(current.pixels.plane(0U).plane().data == raw_data);
+        CHECK(raw.valid());
+        CHECK(captured.pixels.valid());
+        CHECK(*captured.image_metadata == captured_metadata);
+        CHECK(settings.system().explore_settings_candidate().show_original_dimensions == original);
+    }
 }
 
 TEST_CASE("Explore Open commits the effective pending filter with a different catalog") {
@@ -5528,12 +5564,20 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
     EventGate events;
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&source](const VisualFrame& frame) {
+                              auto result = source.BorrowExact(frame);
+                              result.image_metadata = std::make_shared<const mmltk::frameworks::serialization::wire::Value>(frame.revision);
+                              return result;
+                          },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }};
     const auto initial = source.frame();
     static_cast<void>(upscale.Start(test_upscale_request({.source = initial})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
-    const auto clean_revision = upscale.snapshot().frame.clean_revision;
+    const auto completed_frame = upscale.snapshot().frame;
+    const auto retained_metadata = upscale.ImageSourceMetadata(completed_frame);
+    REQUIRE(retained_metadata);
+    CHECK(*retained_metadata == mmltk::frameworks::serialization::wire::Value(initial.revision));
+    const auto clean_revision = completed_frame.clean_revision;
     const auto baseline = upscale.BorrowDocument(upscale.snapshot().frame);
     REQUIRE(baseline.valid());
     backend->watched_copy_source.store(baseline.pixels.plane(1U).plane().data);
@@ -5542,10 +5586,16 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
     const auto current = source.frame();
     REQUIRE(current.clean_revision == initial.clean_revision);
     REQUIRE(current.revision != initial.revision);
+    CHECK(upscale.ImageSourceMetadata(completed_frame) == retained_metadata);
     const auto copies = backend->same_copies.load(std::memory_order_acquire);
     static_cast<void>(upscale.Start(test_upscale_request({.source = current})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == current; }));
     CHECK(runs->load(std::memory_order_acquire) == 1U);
+    const auto next_metadata = upscale.ImageSourceMetadata(upscale.snapshot().frame);
+    REQUIRE(next_metadata);
+    CHECK(*next_metadata == mmltk::frameworks::serialization::wire::Value(current.revision));
+    CHECK(*retained_metadata == mmltk::frameworks::serialization::wire::Value(initial.revision));
+    CHECK_FALSE(upscale.ImageSourceMetadata(completed_frame));
     CHECK(upscale.snapshot().frame.clean_revision == clean_revision);
     CHECK(backend->same_copies.load(std::memory_order_acquire) == copies + 2U);
     CHECK(backend->watched_source_copies.load() == 0U);
@@ -7280,6 +7330,77 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     CHECK_FALSE(channel.terminal_error());
 }
 
+TEST_CASE("Scoped binding retirement preserves a replacement while an old physical read settles", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::send_workspace_record;
+    using mmltk::testsupport::receive_workspace_record;
+    WorkspaceChannelFixture fixture;
+    const presentation::WorkspaceSurfaceImportId old_arena{11U, 12U}, new_arena{21U, 22U}, source{31U, 32U};
+    const auto layout = fixture.AdmitArena(old_arena, 1U, GENERATE(false, true));
+    fixture.AdmitSource(source, old_arena, layout, 2U);
+    auto acquired = WorkspaceChannelFixture::Acquisition(source);
+    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    fixture.channel.pump();
+    REQUIRE(fixture.channel.take_source_transition());
+    REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::BindingRetired,
+                                                       .id_high = old_arena.high, .id_low = old_arena.low}));
+    fixture.channel.pump();
+    const auto binding = fixture.channel.take_source_transition();
+    REQUIRE(binding);
+    CHECK(binding->opcode == abi::Opcode::BindingRetired);
+    fixture.AdmitArena(new_arena, 3U);
+    CHECK(fixture.channel.claimable(new_arena));
+    fixture.Withdraw(old_arena);
+    CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    acquired.opcode = abi::Opcode::ReleaseSubmitted;
+    REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+    fixture.channel.pump();
+    REQUIRE(fixture.channel.take_source_transition());
+    REQUIRE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
+    abi::Record settled{};
+    static_cast<void>(receive_workspace_record(fixture.peer.get(), settled));
+    CHECK(settled.opcode == abi::Opcode::ReadSettled);
+    fixture.Withdraw(source);
+    fixture.Retire(source, 2U);
+    fixture.Retire(old_arena, 1U);
+    CHECK(fixture.channel.claimable(new_arena));
+    CHECK_FALSE(fixture.channel.terminal_error());
+}
+
+TEST_CASE("A completed source can acquire and settle without any presented mailbox", "[workspace][protocol]") {
+    namespace abi = presentation::detail::workspace_surface_import;
+    using mmltk::testsupport::send_workspace_record;
+    using mmltk::testsupport::receive_workspace_record;
+    WorkspaceChannelFixture fixture;
+    const presentation::WorkspaceSurfaceImportId arena{41U, 42U}, older{51U, 52U}, newer{61U, 62U};
+    const auto layout = fixture.AdmitArena(arena, 1U, GENERATE(false, true));
+    fixture.AdmitSource(older, arena, layout, 2U);
+    fixture.AdmitSource(newer, arena, layout, 3U);
+    for (const auto id : {newer, older}) {
+        auto acquired = WorkspaceChannelFixture::Acquisition(id);
+        REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+        fixture.channel.pump();
+        REQUIRE(fixture.channel.take_source_transition());
+        CHECK_FALSE(fixture.channel.read_settled(id, {7U, 8U}, 9U, 1U));
+        acquired.opcode = abi::Opcode::ReleaseSubmitted;
+        REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
+        fixture.channel.pump();
+        REQUIRE(fixture.channel.take_source_transition());
+        REQUIRE(fixture.channel.read_settled(id, {7U, 8U}, 9U, 1U));
+        abi::Record settled{};
+        static_cast<void>(receive_workspace_record(fixture.peer.get(), settled));
+        CHECK(settled.opcode == abi::Opcode::ReadSettled);
+    }
+    REQUIRE(send_workspace_record(fixture.peer.get(), WorkspaceChannelFixture::Sample(arena)));
+    fixture.channel.pump();
+    fixture.Withdraw(older);
+    fixture.Retire(older, 2U);
+    fixture.Withdraw(newer);
+    fixture.Retire(newer, 3U);
+    CHECK(fixture.channel.claimable(arena));
+    CHECK_FALSE(fixture.channel.terminal_error());
+}
+
 TEST_CASE("A blocked acquisition notification retains exact settlement after a racing Drop", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7749,15 +7870,12 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     std::atomic<std::uint64_t> completed_events{0U};
     std::atomic<std::uint64_t> last_completed_revision{0U};
     std::atomic<std::uint64_t> last_completed_product{0U};
-    std::atomic<std::uint64_t> last_completed_sample{0U};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
-                                    [&events, &completed_events, &last_completed_revision, &last_completed_sample,
+                                    [&events, &completed_events, &last_completed_revision,
                                      &last_completed_product](PresentationSystem::event_type event) {
                                         if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
                                             last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
-                                            last_completed_sample.store(completed->snapshot.browser_completed_sample,
-                                                                        std::memory_order_release);
                                             completed_events.fetch_add(1U, std::memory_order_acq_rel);
                                             last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
                                         }
@@ -7768,32 +7886,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     publish_first_presentation(presentation, source, *writer_state, events);
     REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
 
-    const auto before_acknowledgement = presentation.snapshot();
-    const auto before_acknowledgement_events = completed_events.load(std::memory_order_acquire);
-    presentation.Observe({
-        .completed_sample = 7U,
-        .redraw_requested = false,
-    });
-    const auto acknowledged = presentation.snapshot();
-    CHECK(acknowledged.revision > before_acknowledgement.revision);
-    CHECK(acknowledged.browser_completed_sample == 7U);
-    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 1U);
-    CHECK(last_completed_revision.load(std::memory_order_acquire) == acknowledged.revision);
-    CHECK(last_completed_sample.load(std::memory_order_acquire) == 7U);
-
-    presentation.Observe({
-        .completed_sample = 7U,
-        .redraw_requested = false,
-    });
-    presentation.Observe({
-        .completed_sample = 6U,
-        .redraw_requested = false,
-    });
-    CHECK(presentation.snapshot().revision == acknowledged.revision);
-    CHECK(presentation.snapshot().browser_completed_sample == 7U);
-    CHECK(completed_events.load(std::memory_order_acquire) == before_acknowledgement_events + 1U);
-    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 1U);
-
     source.Advance();
     presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
@@ -7801,7 +7893,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(presentation.snapshot().completed_source_revision == 2U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
-    CHECK(presentation.snapshot().browser_completed_sample == 7U);
     REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 2U; }));
 
     writer_state->allow_publication.store(false, std::memory_order_release);
@@ -7822,15 +7913,12 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
 
-    const auto paused_step = writer_state->ArmWaiting();
     presentation.SetApplicationPeerConnected(false);
     source.Advance();
     presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
-    REQUIRE(writer_state->WaitDisconnected(paused_step, false, 4U));
-    CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
-    presentation.SetApplicationPeerConnected(true);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 5U; }));
+    presentation.SetApplicationPeerConnected(true);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 5U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 4U);
 
@@ -7840,12 +7928,9 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));
     presentation.SetApplicationPeerConnected(false);
     writer_state->allow_publication.store(true, std::memory_order_release);
-    const auto disconnected_step = writer_state->ArmWaiting();
     writer_state->SignalReadiness();
-    REQUIRE(writer_state->WaitDisconnected(disconnected_step, true, 6U));
-    CHECK(presentation.snapshot().completed.revision == 5U);
-    presentation.SetApplicationPeerConnected(true);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 6U; }));
+    presentation.SetApplicationPeerConnected(true);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 6U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
 
@@ -7853,7 +7938,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     // The stale advertised frame must not resubmit itself on every pump.
     source.PublishUnobserved();
     const auto before_rejected_borrow = writer_state->PumpCount();
-    presentation.Observe({.redraw_requested = true});
+    static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(writer_state->WaitForPumpAfter(before_rejected_borrow));
     const auto rejected_borrow = writer_state->PumpCount();
     writer_state->SignalReadiness();
@@ -7883,6 +7968,23 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
+}
+
+TEST_CASE("Presentation republishes an unchanged completed product after scoped binding retirement") {
+    PresentationSourceFixture source;
+    EventGate events;
+    auto writer = std::make_shared<TestPresentationWriterState>();
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
+                                    [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationScenario scenario{presentation, writer};
+    static_cast<void>(presentation.Select(source.identity()));
+    REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
+    const auto prior = presentation.snapshot();
+    writer->retire_binding.store(true, std::memory_order_release);
+    writer->SignalReadiness();
+    REQUIRE(events.Wait([&] { return presentation.snapshot().presentation_revision > prior.presentation_revision; }));
+    CHECK(presentation.snapshot().completed == prior.completed);
+    CHECK(presentation.snapshot().selected == prior.selected);
 }
 
 TEST_CASE("Presentation carries its submitted observation through metadata changes and reselection") {
@@ -7951,7 +8053,7 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
     source.SelectCompleted(first);
     static_cast<void>(presentation.Select(source.identity()));
     await_publication(4U);
-    presentation.Observe({.redraw_requested = true});  // Reconnected renderer requests a new physical receipt.
+    static_cast<void>(presentation.Select(source.identity()));  // Reconnected renderer requests a new physical receipt.
     await_publication(5U);
     first = {};
     second = {};

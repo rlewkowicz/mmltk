@@ -3,6 +3,7 @@ use iced::{Event, Point, Rectangle, mouse, wgpu};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) mod gallery;
+pub(crate) mod metadata;
 pub(crate) mod labels;
 pub(crate) mod pixel_trace;
 #[cfg(target_arch = "wasm32")]
@@ -115,7 +116,7 @@ pub(crate) fn emit_surface_trace(line: &str) {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreSnapshot>) -> String {
+pub(crate) fn gallery_trace_fields(snapshot: Option<&crate::generated::ExploreImageMetadata>) -> String {
     snapshot.map_or_else(String::new, |snapshot| format!(
         ",\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"source_observation_revision\":{},\"dataset_identity\":{},\"gallery_generation\":{},\"ready_slots\":{:?},\"columns\":{},\"rows\":{},\"first_row\":{},\"matching_count\":{},\"visible_indices\":{:?},\"row_capacity\":{},\"row_origin\":{},\"card_extent\":{},\"augmentation_enabled\":{},\"augmentation_seed\":{}",
         crate::generated::presentation_source_session(snapshot.frame.source.kind), snapshot.frame.source.instance, snapshot.frame.revision,
@@ -134,7 +135,7 @@ fn trace_image(
     control: &str,
     surface: Surface,
     requested: Surface,
-    snapshot: Option<&crate::generated::ExploreSnapshot>,
+    snapshot: Option<&crate::generated::ExploreImageMetadata>,
     geometry: Option<(Rectangle, Option<(Rectangle, Rectangle)>)>,
 ) {
     if !surface_trace_enabled() {
@@ -151,9 +152,10 @@ fn trace_image(
         format!(",\"bounds\":{}{visible}", rect(bounds))
     });
     emit_surface_trace(&format!(
-        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}{}{geometry}}}",
+        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}{}{}{geometry}}}",
         surface_trace_fields(surface, requested),
         gallery_trace_fields(snapshot),
+        surface.frame.map_or_else(String::new, metadata::trace_fields),
     ));
 }
 
@@ -163,7 +165,7 @@ fn trace_image(
     _control: &str,
     _surface: Surface,
     _requested: Surface,
-    _snapshot: Option<&crate::generated::ExploreSnapshot>,
+    _snapshot: Option<&crate::generated::ExploreImageMetadata>,
     _geometry: Option<(Rectangle, Option<(Rectangle, Rectangle)>)>,
 ) {
 }
@@ -180,7 +182,7 @@ fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle,
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreSnapshot) {
+pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreImageMetadata) {
     if surface_trace_enabled()
         && snapshot.gallery.generation != 0
         && snapshot.frame.source.instance != 0
@@ -197,76 +199,7 @@ pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreSnapshot)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn trace_gallery_source(_snapshot: &crate::generated::ExploreSnapshot) {}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn empty_gallery_retirement_trace(
-    snapshot: &crate::generated::ExploreSnapshot,
-) -> String {
-    // Snapshot facts only, without cloning sample readers. The caller emits
-    // after logical retirement; physical GPU settlement has its own receipts.
-    let images = RENDERER.with(|renderer| {
-        let renderer = renderer.borrow();
-        let sample =
-            |surface: Surface, gallery: Option<&crate::generated::ExploreSnapshot>, read: bool| {
-                format!(
-                    "{{{},\"read_held\":{read}{}}}",
-                    surface_trace_fields(surface, surface),
-                    gallery_trace_fields(gallery),
-                )
-            };
-        let image = |imported: Option<&Imported>| {
-            imported.map_or_else(
-                || "null".to_owned(),
-                |imported| {
-                    let image = &imported.image;
-                    let retained = image.retained().map_or_else(
-                        || "null".to_owned(),
-                        |surface| {
-                            sample(
-                                surface,
-                                image.gallery.as_deref(),
-                                image.retained_read.is_some(),
-                            )
-                        },
-                    );
-                    let pending = image.pending_sample.as_ref().map_or_else(
-                        || "null".to_owned(),
-                        |pending| {
-                            sample(
-                                pending.surface,
-                                pending.gallery.as_deref(),
-                                pending.read.is_some(),
-                            )
-                        },
-                    );
-                    format!("{{\"retained\":{retained},\"pending\":{pending}}}")
-                },
-            )
-        };
-        format!(
-            "{{\"imported\":{},\"pending\":{}}}",
-            image(
-                renderer
-                    .as_ref()
-                    .and_then(|renderer| renderer.imported.as_ref())
-            ),
-            image(
-                renderer
-                    .as_ref()
-                    .and_then(|renderer| renderer.pending.as_ref())
-            ),
-        )
-    });
-    format!(
-        "{{\"event\":\"iced.presentation.empty_gallery_retired\",\"control\":\"{}\",\"ready\":{},\"mode\":\"{:?}\",\"busy\":{}{},\"retired_images\":{images}}}",
-        crate::view::explore::GALLERY_WORKSPACE_ID,
-        snapshot.ready,
-        snapshot.mode,
-        snapshot.busy,
-        gallery_trace_fields(Some(snapshot)),
-    )
-}
+pub(super) fn trace_gallery_source(_snapshot: &crate::generated::ExploreImageMetadata) {}
 
 pub(crate) fn trace_atlas_stage(stage: &str, draw: &crate::integration_control::AtlasDraw) {
     trace_image(
@@ -463,6 +396,7 @@ impl SampleRead {
 }
 
 fn settle_sample(frame: FrameReady) {
+    metadata::retire(frame);
     RELEASED_FRAMES.with(|released| {
         let mut slots = released.get();
         remember_frame(&mut slots, frame);
@@ -608,39 +542,32 @@ pub(crate) fn record_drawn_detail(surface: Surface, crop: [u32; 4]) {
     });
 }
 
-pub(crate) fn viewer_copy_matches(
-    model: &crate::view_model::ApplicationModel,
-    source: &crate::generated::VisualFrame,
-) -> bool {
-    drawn_detail().is_some_and(|(surface, crop)| {
-        let Some(frame) = surface.frame else {
-            return false;
-        };
-        let original = model
-            .explore
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.detail.showoriginaldimensions);
-        let expected = if original {
-            [
-                source.content.x,
-                source.content.y,
-                source.content.width,
-                source.content.height,
-            ]
-        } else {
-            [0, 0, source.extent.width, source.extent.height]
-        };
-        (model
-            .presentation
-            .as_ref()
-            .is_some_and(|snapshot| frame.matches_completed(snapshot))
-            || retained_detail_for(model, source)
-                .is_some_and(|retained| retained.frame == Some(frame)))
-            && frame.belongs_to(surface)
-            && frame.matches_content(source)
-            && crop == expected
-    })
+pub(crate) fn viewer_annotation_request() -> Option<crate::generated::AnnotationOpen> {
+    let (surface, crop) = drawn_detail()?;
+    let frame = surface.frame?;
+    let paired = metadata::pending(frame)?;
+    let detail = paired.detail?;
+    let source = detail.frame();
+    if !paired.view_ready || paired.surface.frame != Some(frame)
+        || !same_allocation(surface, paired.surface) || !frame.belongs_to(surface)
+        || source.revision == 0 || !frame.matches_content(source) || metadata::product(frame).as_ref() != Some(source)
+        || detail.explore.mode != crate::generated::ExploreMode::Detail
+        || detail.viewer_identity().is_none() || surface.viewer_identity != detail.viewer_identity() {
+        return None;
+    }
+    let region = &source.content;
+    let content = [region.x, region.y, region.width, region.height];
+    let full = [0, 0, source.extent.width, source.extent.height];
+    if !metadata::valid_content(source) {
+        return None;
+    }
+    let originalcontent = match surface.crop {
+        Some(applied) if applied == content && crop == content => true,
+        Some(applied) if applied == full && crop == full => false,
+        None if crop == full => false,
+        _ => return None,
+    };
+    Some(crate::generated::AnnotationOpen { source: source.clone(), originalcontent })
 }
 
 pub(crate) fn same_mailbox_slot(left: FrameReady, right: FrameReady) -> bool {
@@ -665,15 +592,12 @@ const COPY_EVENT: &str = "gpuexternaltexturecopycomplete";
 #[cfg(target_arch = "wasm32")]
 const IMPORT_EVENT: &str = "gpuexternaltextureimportready";
 #[cfg(target_arch = "wasm32")]
-const MISS_EVENT: &str = "gpuexternaltextureacquiremiss";
-#[cfg(target_arch = "wasm32")]
 const SETTLED_EVENT: &str = "gpuexternaltexturereadsettled";
 #[cfg(target_arch = "wasm32")]
-const SURFACE_EVENTS: [&str; 5] = [
+const SURFACE_EVENTS: [&str; 4] = [
     FRAME_EVENT,
     COPY_EVENT,
     IMPORT_EVENT,
-    MISS_EVENT,
     SETTLED_EVENT,
 ];
 #[cfg(target_arch = "wasm32")]
@@ -705,16 +629,6 @@ impl FrameReady {
             && self.content_sequence == frame.revision
             && self.content_width == frame.extent.width
             && self.content_height == frame.extent.height
-    }
-
-    pub(crate) fn matches_completed(
-        self,
-        snapshot: &crate::generated::PresentationSnapshot,
-    ) -> bool {
-        // The advertised capability may already be an unpublished replacement.
-        // Allocation, layer, and slot remain those of this physical receipt.
-        self.presentation_revision == snapshot.presentationrevision
-            && self.matches_content(&snapshot.completed)
     }
 
     pub(crate) fn belongs_to(self, surface: Surface) -> bool {
@@ -913,59 +827,14 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 notify.wake();
                 return;
             }
-            let Some(ready) = event
-                .detail()
+            let detail = event.detail();
+            let Some(ready) = js_sys::Reflect::get(&detail, &"identity".into()).ok()
+                .and_then(|identity| identity
                 .as_string()
-                .and_then(|value| FrameReady::parse(&value))
+                .and_then(|value| FrameReady::parse(&value)))
             else {
                 return;
             };
-            if event.type_() == MISS_EVENT {
-                if ready.slot != u32::MAX {
-                    return;
-                }
-                let changed = DRAW_AUTHORIZATION.with(|authorization| {
-                    let mut authorization = authorization.borrow_mut();
-                    let trace = surface_trace_enabled()
-                        .then(|| acquisition_trace_fields(&authorization));
-                    let matched = authorization
-                        .acquiring
-                        .as_ref()
-                        .and_then(|offer| offer.surface.frame)
-                        .is_some_and(|offer| same_publication(offer, ready));
-                    let changed = if matched {
-                        authorization.acquiring = None;
-                        authorization
-                            .offered
-                            .as_ref()
-                            .and_then(|offer| offer.surface.frame)
-                            .is_some_and(|offer| !same_publication(offer, ready))
-                    } else {
-                        false
-                    };
-                    if let Some(trace) = trace {
-                        let reason = if changed {
-                            "different_offer_waiting"
-                        } else if matched {
-                            "no_different_offer"
-                        } else {
-                            "no_matching_acquisition"
-                        };
-                        emit_surface_trace(&format!(
-                            "{{\"event\":\"iced.frame.acquire_miss_received\",\"surface\":\"{:016x}{:016x}\",\"reason\":\"{reason}\",\"matched_acquisition\":{matched},\"acquiring_cleared\":{matched},\"wake_required\":{changed}{},\"authorization_before\":{{{trace}}}}}",
-                            ready.high,
-                            ready.low,
-                            frame_trace_fields(Some(ready)),
-                        ));
-                    }
-                    changed
-                });
-                if changed {
-                    pending.borrow_mut().drawn = true;
-                    notify.wake();
-                }
-                return;
-            }
             if ready.slot >= MAILBOX_SLOTS {
                 return;
             }
@@ -981,6 +850,27 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
             if event.type_() == COPY_EVENT {
                 pending.borrow_mut().complete(ready);
                 notify.wake();
+                return;
+            }
+            // A repeated notification does not own a second physical read.
+            // Keep the accepted immutable receipt and its existing custody.
+            if metadata::surface(ready).is_some() {
+                return;
+            }
+            let integer = |name: &str| js_sys::Reflect::get(&detail, &name.into()).ok()
+                .and_then(|value| value.as_f64())
+                .filter(|value| value.is_finite() && value.fract() == 0.0 && *value > 0.0 && *value <= u32::MAX as f64)
+                .map(|value| value as u32);
+            let metadata = js_sys::Reflect::get(&detail, &"metadata".into()).ok()
+                .and_then(|value| value.dyn_into::<js_sys::Uint8Array>().ok());
+            let transfer = js_sys::Reflect::get(&detail, &"transfer".into()).ok()
+                .and_then(|value| value.as_string()).and_then(|value| u64::from_str_radix(&value, 16).ok());
+            let decoded = integer("capacityWidth").zip(integer("capacityHeight")).zip(transfer).zip(metadata)
+                .is_some_and(|(((width, height), transfer), bytes)|
+                    bytes.length() as usize <= crate::generated::WORKSPACE_METADATA_BYTE_CAPACITY &&
+                    metadata::install(ready, width, height, transfer, &bytes.to_vec()).is_ok());
+            if !decoded {
+                release(ready);
                 return;
             }
             invalidate_drawn_slot(ready);
@@ -1004,7 +894,7 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return None;
             }
         }
-        Some(FrameListener { window, callback })
+        Some(FrameListener { window, callback, stop_binding: bind_workspace() })
     });
     unfold(
         (mailbox, wake, listener),
@@ -1026,11 +916,20 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
 struct FrameListener {
     window: web_sys::Window,
     callback: Closure<dyn FnMut(web_sys::Event)>,
+    stop_binding: js_sys::Function,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(module = "/src/presentation_surface/graphics.mjs")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = bindWorkspace)]
+    fn bind_workspace() -> js_sys::Function;
 }
 
 #[cfg(target_arch = "wasm32")]
 impl Drop for FrameListener {
     fn drop(&mut self) {
+        let _ = self.stop_binding.call0(&wasm_bindgen::JsValue::UNDEFINED);
         COMPLETION_WAKE.with(|notify| *notify.borrow_mut() = None);
         for name in SURFACE_EVENTS {
             let _ = self
@@ -1697,344 +1596,20 @@ thread_local! {
     // One matching domain/control frontier; independent of GPU completion and
     // external sample custody. It can authorize an already-submitted queue read.
     static DRAW_AUTHORIZATION: std::cell::RefCell<DrawAuthorization> = const {
-        std::cell::RefCell::new(DrawAuthorization { draw: None, offered: None, acquiring: None })
+        std::cell::RefCell::new(DrawAuthorization { draw: None })
     };
 }
 
 struct DrawAuthorization {
     draw: Option<FrameReady>,
-    offered: Option<PendingImage>,
-    acquiring: Option<PendingImage>,
-}
-
-#[cfg(target_arch = "wasm32")]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct AcquisitionRequestTrace {
-    reason: &'static str,
-    requested: Option<Surface>,
-    offered: Option<Surface>,
-    acquiring: Option<Surface>,
-    draw: Option<FrameReady>,
-}
-
-#[cfg(target_arch = "wasm32")]
-thread_local! {
-    // Only enabled diagnostics access these bounded, effect-only comparisons.
-    // They retain identities and text, never sample readers or model owners.
-    static LAST_ACQUISITION_AUTHORIZATION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static LAST_ACQUISITION_REQUEST: std::cell::Cell<Option<AcquisitionRequestTrace>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(target_arch = "wasm32")]
-fn acquisition_trace_fields(authorization: &DrawAuthorization) -> String {
-    // Offers precede Firefox's physical source selection, so their source
-    // identity is still zero. Preserve receipt identities when known; never
-    // substitute the arena identity for an unknown producer source.
-    let image = |pending: Option<&PendingImage>| {
-        pending.map_or_else(
-            || "null".to_owned(),
-            |pending| {
-                format!(
-                    "{{{},\"read_held\":{},\"complete\":{},\"view_ready\":{},\"gallery\":{},\"detail\":{},\"annotation\":{}}}",
-                    surface_trace_fields(pending.surface, pending.surface),
-                    pending.read.is_some(),
-                    pending.complete,
-                    pending.view_ready,
-                    pending.gallery.is_some(),
-                    pending.detail.is_some(),
-                    pending.annotation.is_some(),
-                )
-            },
-        )
-    };
-    let draw = authorization.draw.map_or_else(
-        || "null".to_owned(),
-        |frame| {
-            format!(
-                "{{\"surface\":\"{:016x}{:016x}\"{}}}",
-                frame.high,
-                frame.low,
-                frame_trace_fields(Some(frame)),
-            )
-        },
-    );
-    format!(
-        "\"offered\":{},\"acquiring\":{},\"draw\":{draw}",
-        image(authorization.offered.as_ref()),
-        image(authorization.acquiring.as_ref()),
-    )
-}
-
-#[cfg(target_arch = "wasm32")]
-fn visual_frame_trace_fields(frame: &crate::generated::VisualFrame) -> String {
-    format!(
-        "\"source_kind\":{},\"source_instance\":{},\"source_revision\":{},\"clean_revision\":{},\"content_width\":{},\"content_height\":{},\"content\":[{},{},{},{}]",
-        crate::generated::presentation_source_session(frame.source.kind),
-        frame.source.instance,
-        frame.revision,
-        frame.cleanrevision,
-        frame.extent.width,
-        frame.extent.height,
-        frame.content.x,
-        frame.content.y,
-        frame.content.width,
-        frame.content.height,
-    )
-}
-
-fn trace_acquisition_authorization(
-    reason: &'static str,
-    surface: Option<Surface>,
-    model: &crate::view_model::ApplicationModel,
-    decision: Option<
-        &Result<crate::view_model::PresentationReconciliation, crate::view_model::UiError>,
-    >,
-    authorization: &DrawAuthorization,
-) {
-    #[cfg(target_arch = "wasm32")]
-    if surface_trace_enabled() {
-        use crate::view_model::PresentationReconciliation;
-        let reconciliation = match decision {
-            None => "not_checked",
-            Some(Err(_)) => "error",
-            Some(Ok(PresentationReconciliation::Matching)) => "matching",
-            Some(Ok(PresentationReconciliation::MetadataPending)) => "metadata_pending",
-            Some(Ok(PresentationReconciliation::Superseded)) => "superseded",
-        };
-        let surface = surface.map_or_else(String::new, |surface| {
-            format!("{},", surface_trace_fields(surface, surface))
-        });
-        let presentation = model.presentation.as_ref().map_or_else(
-            || "null".to_owned(),
-            |snapshot| {
-                let observed = model
-                    .frame_observation_for(snapshot.completed.source.kind)
-                    .map_or_else(
-                        || "null".to_owned(),
-                        |observation| {
-                            format!(
-                                "{{\"source_observation_revision\":{},{}}}",
-                                observation.snapshotrevision,
-                                visual_frame_trace_fields(observation.frame),
-                            )
-                        },
-                    );
-                format!(
-                    "{{\"revision\":{},\"presentation_revision\":{},\"timeline_ready\":{},\"selected_source_kind\":{},\"selected_source_instance\":{},\"completed_source_revision\":{},\"completed\":{{{}}},\"observed_completed_source\":{observed},\"capability_surface\":\"{:016x}{:016x}\",\"capability_generation\":{},\"capability_condition\":\"{:?}\",\"capability_width\":{},\"capability_height\":{}}}",
-                    snapshot.revision,
-                    snapshot.presentationrevision,
-                    snapshot.timelineready,
-                    crate::generated::presentation_source_session(snapshot.selected.kind),
-                    snapshot.selected.instance,
-                    snapshot.completedsourcerevision,
-                    visual_frame_trace_fields(&snapshot.completed),
-                    snapshot.capability.surfacehigh,
-                    snapshot.capability.surfacelow,
-                    snapshot.capability.generation,
-                    snapshot.capability.condition,
-                    snapshot.capability.extent.width,
-                    snapshot.capability.extent.height,
-                )
-            },
-        );
-        let explore = model.explore.snapshot.as_ref().map_or_else(
-            || "null".to_owned(),
-            |snapshot| {
-                let selected = snapshot
-                    .selectedimage
-                    .map_or_else(|| "null".to_owned(), |image| image.to_string());
-                format!(
-                    "{{\"revision\":{},\"ready\":{},\"mode\":\"{:?}\",\"dataset_identity\":{},\"selected_image\":{selected},{}}}",
-                    snapshot.revision,
-                    snapshot.ready,
-                    snapshot.mode,
-                    snapshot.dataset.identity,
-                    visual_frame_trace_fields(&snapshot.frame),
-                )
-            },
-        );
-        let requested_selection = model
-            .explore
-            .requested_selection
-            .map_or_else(|| "null".to_owned(), |image| image.to_string());
-        let line = format!(
-            "{{\"event\":\"iced.presentation.acquire_authorization\",\"reason\":\"{reason}\",\"reconciliation\":\"{reconciliation}\",{surface}\"foreground\":\"{:?}\",\"presentation\":{presentation},\"explore\":{explore},\"requested_selection\":{requested_selection},\"requested_upscale\":{},\"current_upscale\":{},{}}}",
-            model.foreground_visual(),
-            model.explore.requested_upscale.is_some(),
-            model.current_upscale().is_some(),
-            acquisition_trace_fields(authorization),
-        );
-        LAST_ACQUISITION_AUTHORIZATION.with(|last| {
-            if last.borrow().as_ref() == Some(&line) {
-                return;
-            }
-            emit_surface_trace(&line);
-            *last.borrow_mut() = Some(line);
-        });
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    let _ = (reason, surface, model, decision, authorization);
-}
-
-#[cfg(target_arch = "wasm32")]
-fn trace_acquisition_request(
-    reason: &'static str,
-    requested: Option<Surface>,
-    authorization: &DrawAuthorization,
-) {
-    if !surface_trace_enabled() {
-        return;
-    }
-    let state = AcquisitionRequestTrace {
-        reason,
-        requested,
-        offered: authorization.offered.as_ref().map(|offer| offer.surface),
-        acquiring: authorization.acquiring.as_ref().map(|offer| offer.surface),
-        draw: authorization.draw,
-    };
-    LAST_ACQUISITION_REQUEST.with(|last| {
-        if last.get() == Some(state) {
-            return;
-        }
-        last.set(Some(state));
-        let surface = state
-            .offered
-            .or(requested)
-            .map_or_else(String::new, |surface| {
-                format!(
-                    "{},",
-                    surface_trace_fields(surface, requested.unwrap_or(surface)),
-                )
-            });
-        let requested = requested.map_or_else(
-            || "null".to_owned(),
-            |surface| format!("{{{}}}", surface_trace_fields(surface, surface)),
-        );
-        emit_surface_trace(&format!(
-            "{{\"event\":\"iced.presentation.acquire_request\",\"reason\":\"{reason}\",{surface}\"requested\":{requested},{}}}",
-            acquisition_trace_fields(authorization),
-        ));
-    });
 }
 
 pub(crate) fn authorize_draw(frame: Option<FrameReady>) {
     DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().draw = frame);
 }
 
-pub(crate) fn authorize_acquisition(
-    surface: Option<Surface>,
-    model: &crate::view_model::ApplicationModel,
-) {
-    DRAW_AUTHORIZATION.with(|authorization| {
-        let mut authorization = authorization.borrow_mut();
-        let Some((surface, snapshot)) = surface.zip(model.presentation.as_ref()) else {
-            authorization.offered = None;
-            trace_acquisition_authorization(
-                "surface_or_presentation_missing",
-                surface,
-                model,
-                None,
-                &authorization,
-            );
-            return;
-        };
-        let decision = model.completed_presentation_reconciliation();
-        if !matches!(
-            decision,
-            Ok(crate::view_model::PresentationReconciliation::Matching)
-        ) {
-            authorization.offered = None;
-            trace_acquisition_authorization(
-                "model_not_matching",
-                Some(surface),
-                model,
-                Some(&decision),
-                &authorization,
-            );
-            return;
-        }
-        let visual = &snapshot.completed;
-        let frame = FrameReady {
-            high: surface.high,
-            low: surface.low,
-            layer: 0,
-            slot: 0,
-            content_session: crate::generated::presentation_source_session(visual.source.kind),
-            content_sequence: visual.revision,
-            presentation_revision: snapshot.presentationrevision,
-            content_width: visual.extent.width,
-            content_height: visual.extent.height,
-            source_high: 0,
-            source_low: 0,
-            direct_sampling: false,
-        };
-        if authorization
-            .offered
-            .as_ref()
-            .and_then(|offer| offer.surface.frame)
-            == Some(frame)
-        {
-            trace_acquisition_authorization(
-                "offer_unchanged",
-                Some(surface),
-                model,
-                Some(&decision),
-                &authorization,
-            );
-            return;
-        }
-        gallery::confirm(frame, visual, model.explore.snapshot.as_ref());
-        let annotation = (visual.source.kind
-            == crate::generated::PresentationSourceKind::Annotation)
-            .then(|| AnnotationContent::from_model(model, frame))
-            .flatten();
-        if visual.source.kind == crate::generated::PresentationSourceKind::Annotation
-            && annotation.is_none()
-        {
-            trace_acquisition_authorization(
-                "annotation_metadata_unavailable",
-                Some(surface),
-                model,
-                Some(&decision),
-                &authorization,
-            );
-            return;
-        }
-        authorization.offered = Some(PendingImage {
-            read: None,
-            surface: Surface {
-                frame: Some(frame),
-                ..surface
-            },
-            gallery: gallery::matching(Some(frame)),
-            detail: matches!(
-                visual.source.kind,
-                crate::generated::PresentationSourceKind::Explore
-                    | crate::generated::PresentationSourceKind::Upscale
-            )
-            .then(|| DetailContent::from_model(model, frame))
-            .flatten(),
-            annotation,
-            placement: Placement::Contain,
-            complete: false,
-            view_ready: true,
-        });
-        trace_acquisition_authorization(
-            "offered",
-            Some(surface),
-            model,
-            Some(&decision),
-            &authorization,
-        );
-    });
-}
-
 pub(crate) fn retire_samples() {
-    let authorization = DRAW_AUTHORIZATION.with(|authorization| {
-        let mut authorization = authorization.borrow_mut();
-        authorization.draw = None;
-        (authorization.offered.take(), authorization.acquiring.take())
-    });
+    authorize_draw(None);
     let samples = RENDERER.with(|renderer| {
         let mut renderer = renderer.borrow_mut();
         renderer.as_mut().map(|renderer| {
@@ -2052,65 +1627,15 @@ pub(crate) fn retire_samples() {
             ]
         })
     });
-    gallery::clear();
     clear_drawn_detail();
     // Last-reader settlement can reenter page ownership. All RefCell borrows
     // must end before any sample lease is dropped.
-    drop(authorization);
     drop(samples);
 }
 
 pub(crate) fn retire_imports() {
     authorize_draw(None);
-    DRAW_AUTHORIZATION.with(|authorization| {
-        let mut authorization = authorization.borrow_mut();
-        authorization.offered = None;
-        authorization.acquiring = None;
-    });
-    gallery::clear();
     RENDERER.with(|renderer| *renderer.borrow_mut() = None);
-}
-
-pub(crate) fn acquired_publication(frame: FrameReady) -> bool {
-    DRAW_AUTHORIZATION.with(|authorization| {
-        authorization
-            .borrow()
-            .acquiring
-            .as_ref()
-            .and_then(|pending| pending.surface.frame)
-            .is_some_and(|offered| same_publication(offered, frame))
-    }) || RENDERER.with(|renderer| {
-        renderer.borrow().as_ref().is_some_and(|renderer| {
-            [&renderer.imported, &renderer.pending]
-                .into_iter()
-                .flatten()
-                .any(|imported| {
-                    imported
-                        .image
-                        .pending_sample
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            pending.view_ready && pending.surface.frame == Some(frame)
-                        })
-                })
-        })
-    })
-}
-
-pub(crate) fn completed_content(
-    frame: &crate::generated::VisualFrame,
-    snapshot: &crate::generated::PresentationSnapshot,
-) -> Option<Surface> {
-    RENDERER.with(|renderer| {
-        let renderer = renderer.borrow();
-        let renderer = renderer.as_ref()?;
-        [&renderer.imported, &renderer.pending]
-            .into_iter()
-            .find_map(|imported| {
-                let imported = imported.as_ref()?;
-                imported.image.completed_content(frame, snapshot)
-            })
-    })
 }
 
 pub(crate) fn retained_surface() -> Option<Surface> {
@@ -2121,57 +1646,48 @@ pub(crate) fn retained_surface() -> Option<Surface> {
     })
 }
 
-pub(crate) fn retained_detail() -> Option<(Surface, DetailContent)> {
-    RENDERER.with(|renderer| {
-        let renderer = renderer.borrow();
-        let image = &renderer.as_ref()?.imported.as_ref()?.image;
-        Some((image.retained()?, image.detail.clone()?))
-    })
+#[derive(Clone)]
+pub(crate) enum ExploreDisplay {
+    Gallery(Surface, std::sync::Arc<crate::generated::ExploreImageMetadata>),
+    Detail(Surface, DetailContent),
 }
 
-pub(crate) fn retained_detail_for(
-    model: &crate::view_model::ApplicationModel,
-    frame: &crate::generated::VisualFrame,
-) -> Option<Surface> {
-    let explore = model.explore.snapshot.as_ref()?;
-    RENDERER.with(|renderer| {
-        let renderer = renderer.borrow();
-        let image = &renderer.as_ref()?.imported.as_ref()?.image;
-        let surface = image.retained()?;
-        let retained = surface.frame?;
-        let detail = image.detail.as_ref()?;
-        (image
-            .retained_read
-            .as_ref()
-            .is_some_and(|read| read.0 == retained)
-            && retained.belongs_to(surface)
-            && retained.matches_content(frame)
-            && detail.frame() == frame
-            && detail.explore.dataset.identity == explore.dataset.identity
-            && detail.explore.selectedimage == explore.selectedimage
-            && detail.explore.frame == explore.frame
-            && detail.explore.document == explore.document)
-            .then_some(surface)
-    })
+impl ExploreDisplay {
+    fn paired(surface: Surface, gallery: Option<&std::sync::Arc<crate::generated::ExploreImageMetadata>>,
+        detail: Option<&DetailContent>) -> Option<Self> {
+        if let Some(gallery) = gallery { return Some(Self::Gallery(surface, gallery.clone())); }
+        detail.map(|detail| Self::Detail(surface, detail.clone()))
+    }
 }
 
-pub(crate) fn drawable_detail(requested: Surface) -> Option<(Surface, DetailContent)> {
-    RENDERER
-        .with(|renderer| {
-            let renderer = renderer.borrow();
-            let renderer = renderer.as_ref()?;
-            SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
-                .find_map(|(_, pending)| Some((requested, pending.detail.clone()?)))
-        })
-        .or_else(|| {
-            retained_detail().map(|(retained, detail)| {
-                if retained.frame == requested.frame && same_allocation(retained, requested) {
-                    (requested, detail)
-                } else {
-                    (retained, detail)
-                }
-            })
-        })
+pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDisplay> {
+    if let Some(surface) = requested && let Some(frame) = surface.frame {
+        let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten()
+            .filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
+        let incumbent = RENDERER.with(|renderer| renderer.borrow().as_ref()
+            .and_then(|renderer| renderer.imported.as_ref()).is_some_and(|imported|
+                imported.image.retained().is_some()
+                    && (imported.image.gallery.is_some() || imported.image.detail.is_some())));
+        // The initial accepted offer can construct the first shader owner.
+        // With an incumbent, reconciliation must acquire the replacement first.
+        let accepted = live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame))));
+        if accepted && let Some(paired) = metadata::pending(frame)
+            && paired.view_ready && same_allocation(surface, paired.surface) {
+            return ExploreDisplay::paired(surface, paired.gallery.as_ref(), paired.detail.as_ref());
+        }
+    }
+    RENDERER.with(|renderer| {
+        let renderer = renderer.borrow();
+        let renderer = renderer.as_ref()?;
+        for imported in renderer.pending.iter().chain(renderer.imported.iter()) {
+            if let Some(pending) = imported.image.pending_sample.as_ref()
+                && imported.image.submitted_draw(pending.surface).is_some() {
+                return ExploreDisplay::paired(pending.surface, pending.gallery.as_ref(), pending.detail.as_ref());
+            }
+        }
+        let image = &renderer.imported.as_ref()?.image;
+        image.explore_display(image.retained()?)
+    })
 }
 
 pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, AnnotationContent)> {
@@ -2205,166 +1721,8 @@ struct SurfaceRenderer {
     requested: Option<Surface>,
     reconstruction_probe: Option<((u64, u64, u64), (u64, u64, u64))>,
     draws: std::collections::HashMap<&'static str, PreparedDraw>,
-    #[cfg(target_arch = "wasm32")]
-    browser_device: Option<BrowserDevice>,
 }
 
-#[cfg(target_arch = "wasm32")]
-struct BrowserDevice {
-    canvas: web_sys::HtmlCanvasElement,
-    device: wasm_bindgen::JsValue,
-    requested: Option<Surface>,
-}
-
-#[cfg(target_arch = "wasm32")]
-impl Drop for BrowserDevice {
-    fn drop(&mut self) {
-        self.clear_request();
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-impl BrowserDevice {
-    fn clear_request(&mut self) {
-        if let Some(previous) = self.requested.take() {
-            trace_surface("capability_replaced", previous);
-        }
-    }
-
-    fn configured(canvas: &web_sys::HtmlCanvasElement) -> Option<wasm_bindgen::JsValue> {
-        let context = canvas.get_context("webgpu").ok()??;
-        let getter = js_sys::Reflect::get(&context, &"getConfiguration".into())
-            .ok()?
-            .dyn_into::<js_sys::Function>()
-            .ok()?;
-        let configuration = getter.call0(&context).ok()?;
-        if configuration.is_null() || configuration.is_undefined() {
-            return None;
-        }
-        js_sys::Reflect::get(&configuration, &"device".into())
-            .ok()
-            .filter(|device| !device.is_null() && !device.is_undefined())
-    }
-    fn discover() -> Option<Self> {
-        let canvases = web_sys::window()?
-            .document()?
-            .query_selector_all("canvas")
-            .ok()?;
-        let mut selected: Option<Self> = None;
-        for index in 0..canvases.length() {
-            let Some(canvas) = canvases
-                .item(index)
-                .and_then(|node| node.dyn_into::<web_sys::HtmlCanvasElement>().ok())
-            else {
-                continue;
-            };
-            let Some(device) = Self::configured(&canvas) else {
-                continue;
-            };
-            if selected
-                .as_ref()
-                .is_some_and(|selected| !js_sys::Object::is(&selected.device, &device))
-            {
-                return None;
-            }
-            if selected.is_none() {
-                selected = Some(Self {
-                    canvas,
-                    device,
-                    requested: None,
-                });
-            }
-        }
-        selected
-    }
-    fn call(&self, name: &str, arguments: &js_sys::Array) -> bool {
-        js_sys::Reflect::get(&self.device, &name.into())
-            .ok()
-            .and_then(|method| method.dyn_into::<js_sys::Function>().ok())
-            .is_some_and(|method| method.apply(&self.device, arguments).is_ok())
-    }
-    fn request(&mut self, surface: Surface) -> bool {
-        let Some(device) = Self::configured(&self.canvas) else {
-            return false;
-        };
-        if !js_sys::Object::is(&self.device, &device) {
-            self.device = device;
-            self.clear_request();
-            DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().acquiring = None);
-        }
-        if self
-            .requested
-            .is_some_and(|requested| same_allocation(requested, surface))
-        {
-            return true;
-        }
-        let arguments = js_sys::Array::new();
-        arguments.push(&format!("{:016x}{:016x}", surface.high, surface.low).into());
-        arguments.push(&surface.width.into());
-        arguments.push(&surface.height.into());
-        if !self.call("requestWorkspace", &arguments) {
-            return false;
-        }
-        self.clear_request();
-        self.requested = Some(surface);
-        trace_surface("capability_requested", surface);
-        true
-    }
-    fn acquire(&self) {
-        let offer = DRAW_AUTHORIZATION.with(|authorization| {
-            let mut authorization = authorization.borrow_mut();
-            let Some(offer) = authorization.offered.as_ref() else {
-                trace_acquisition_request("no_offer", self.requested, &authorization);
-                return None;
-            };
-            let Some(frame) = offer.surface.frame else {
-                trace_acquisition_request("offer_has_no_frame", self.requested, &authorization);
-                return None;
-            };
-            if authorization.acquiring.is_some() {
-                trace_acquisition_request("acquisition_in_flight", self.requested, &authorization);
-                return None;
-            }
-            if authorization
-                .draw
-                .is_some_and(|draw| same_publication(draw, frame))
-            {
-                trace_acquisition_request(
-                    "publication_already_authorized",
-                    self.requested,
-                    &authorization,
-                );
-                return None;
-            }
-            authorization.acquiring = Some(offer.clone());
-            trace_acquisition_request("request_prepared", self.requested, &authorization);
-            Some(frame)
-        });
-        let Some(frame) = offer else {
-            return;
-        };
-        let arguments = js_sys::Array::new();
-        for word in [
-            format!("{:016x}{:016x}", frame.high, frame.low),
-            format!("{:016x}", frame.content_session),
-            format!("{:016x}", frame.content_sequence),
-            format!("{:016x}", frame.presentation_revision),
-        ] {
-            arguments.push(&word.into());
-        }
-        if !self.call("acquireWorkspace", &arguments) {
-            DRAW_AUTHORIZATION.with(|authorization| {
-                let mut authorization = authorization.borrow_mut();
-                authorization.acquiring = None;
-                trace_acquisition_request("browser_call_failed", self.requested, &authorization);
-            });
-        } else if surface_trace_enabled() {
-            DRAW_AUTHORIZATION.with(|authorization| {
-                trace_acquisition_request("request_sent", self.requested, &authorization.borrow());
-            });
-        }
-    }
-}
 
 fn same_publication(left: FrameReady, right: FrameReady) -> bool {
     left.high == right.high
@@ -2391,7 +1749,7 @@ struct ImagePublication {
     pending_sample: Option<PendingImage>,
     completed: Option<FrameReady>,
     retained_read: Option<std::sync::Arc<SampleRead>>,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
+    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
     placement: Placement,
@@ -2527,24 +1885,31 @@ impl AnnotationContent {
 
 #[derive(Clone)]
 pub(crate) struct DetailContent {
-    explore: std::sync::Arc<crate::generated::ExploreSnapshot>,
-    upscale: Option<std::sync::Arc<crate::generated::UpscaleSnapshot>>,
+    explore: std::sync::Arc<crate::generated::ExploreImageMetadata>,
+    upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
 }
 
 impl DetailContent {
-    fn from_model(model: &crate::view_model::ApplicationModel, frame: FrameReady) -> Option<Self> {
-        let explore = model.explore.snapshot.as_ref()?;
-        model.selected_detail_source()?;
-        let upscale = model
-            .current_upscale()
-            .filter(|upscale| frame.matches_content(&upscale.frame));
-        if upscale.is_none() && !frame.matches_content(&explore.frame) {
-            return None;
-        }
-        Some(Self {
-            explore: std::sync::Arc::new(explore.clone()),
-            upscale: upscale.map(|upscale| std::sync::Arc::new(upscale.clone())),
-        })
+    pub(crate) fn configure_surface(&self, mut surface: Surface, original: bool, fit_revision: u64) -> Surface {
+        surface.viewer_identity = self.viewer_identity();
+        surface.fit_revision = fit_revision;
+        surface.crop = original.then(|| {
+            let region = &self.frame().content;
+            [region.x, region.y, region.width, region.height]
+        });
+        surface
+    }
+
+    pub(crate) fn viewer_identity(&self) -> Option<(u64, u32)> {
+        self.explore.selectedimage.map(|image| (self.explore.dataset.identity, image))
+    }
+
+    pub(crate) fn input_frame(&self) -> &crate::generated::VisualFrame {
+        &self.explore.frame
+    }
+
+    pub(crate) fn original_dimensions(&self) -> bool {
+        self.explore.detail.showoriginaldimensions
     }
 
     pub(crate) fn frame(&self) -> &crate::generated::VisualFrame {
@@ -2563,25 +1928,14 @@ impl DetailContent {
         &self.explore.overlay
     }
 
-    fn matches_model(&self, model: &crate::view_model::ApplicationModel) -> bool {
-        model
-            .explore
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.revision == self.explore.revision)
-            && self.upscale.as_ref().map(|snapshot| snapshot.revision)
-                == model
-                    .current_upscale()
-                    .filter(|snapshot| snapshot.frame == *self.frame())
-                    .map(|snapshot| snapshot.revision)
-    }
+
 }
 
 #[derive(Clone)]
 struct PendingImage {
     read: Option<std::sync::Arc<SampleRead>>,
     surface: Surface,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
+    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
     placement: Placement,
@@ -2595,7 +1949,7 @@ struct PreparedDraw {
     bounds: Rectangle,
     geometry: PlacementGeometry,
     placement: Placement,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreSnapshot>>,
+    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
     uniform: wgpu::Buffer,
     bindings: [wgpu::BindGroup; 2],
     key: GeometryKey,
@@ -2684,8 +2038,6 @@ impl SurfaceRenderer {
             requested: None,
             reconstruction_probe: None,
             draws: std::collections::HashMap::new(),
-            #[cfg(target_arch = "wasm32")]
-            browser_device: None,
         }
     }
 
@@ -2746,15 +2098,7 @@ impl SurfaceRenderer {
         let pending_texture = self.pending.as_ref().is_some_and(|pending| {
             same_allocation(pending.image.surface, requested) && pending.image.completed.is_none()
         });
-        #[cfg(target_arch = "wasm32")]
-        let pending_capability = self
-            .browser_device
-            .as_ref()
-            .and_then(|browser| browser.requested)
-            .is_some_and(|surface| same_allocation(surface, requested));
-        #[cfg(not(target_arch = "wasm32"))]
-        let pending_capability = false;
-        if !pending_texture && !pending_capability {
+        if !pending_texture {
             return;
         }
         let completed = imported.image.surface;
@@ -2956,19 +2300,7 @@ impl SurfaceRenderer {
         if !surface.valid() {
             return;
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            if self.browser_device.is_none() {
-                self.browser_device = BrowserDevice::discover();
-            }
-            let Some(browser) = self.browser_device.as_mut() else {
-                return;
-            };
-            if !browser.request(surface) {
-                return;
-            }
-            browser.acquire();
-        }
+
         if self
             .imported
             .as_ref()
@@ -3358,16 +2690,6 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
     let Some(frame) = surface.frame else {
         return;
     };
-    if !acquired_publication(frame)
-        && (model.completed_presentation_reconciliation().ok()
-            != Some(crate::view_model::PresentationReconciliation::Matching)
-            || model
-                .presentation
-                .as_ref()
-                .is_none_or(|snapshot| !frame.matches_completed(snapshot)))
-    {
-        return;
-    }
     authorize_draw(Some(frame));
     RENDERER.with(|renderer| {
         let mut renderer = renderer.borrow_mut();
@@ -3391,7 +2713,6 @@ pub(crate) fn reconcile_completed(surface: Surface, model: &crate::view_model::A
         if let Some(imported) = renderer.imported.as_mut()
             && imported.image.completed == Some(frame)
         {
-            imported.image.refresh_detail(model);
             return;
         }
         if renderer
@@ -3435,48 +2756,9 @@ impl ImagePublication {
         (self.pending_sample.take(), self.retained_read.take())
     }
 
-    fn reconcile_pending(
-        &mut self,
-        frame: FrameReady,
-        model: &crate::view_model::ApplicationModel,
-    ) {
-        let Some(pending) = self
-            .pending_sample
-            .as_mut()
-            .filter(|pending| pending.surface.frame == Some(frame))
-        else {
-            return;
-        };
-        if pending.view_ready {
-            return;
-        }
-        pending.view_ready = true;
-        if frame.content_session
-            == crate::generated::presentation_source_session(
-                crate::generated::PresentationSourceKind::Annotation,
-            )
-        {
-            if pending.annotation.is_none() {
-                pending.annotation = AnnotationContent::from_model(model, frame);
-            }
-            pending.view_ready = pending.annotation.is_some();
-        }
-        if let Some(current) = gallery::matching(Some(frame))
-            && pending
-                .gallery
-                .as_ref()
-                .is_none_or(|previous| previous.dataset.identity == current.dataset.identity)
-        {
-            pending.gallery = Some(current);
-        }
-        if pending
-            .detail
-            .as_ref()
-            .is_none_or(|detail| !detail.matches_model(model))
-        {
-            if let Some(detail) = DetailContent::from_model(model, frame) {
-                pending.detail = Some(detail);
-            }
+    fn reconcile_pending(&mut self, frame: FrameReady, _model: &crate::view_model::ApplicationModel) {
+        if let Some(pending) = self.pending_sample.as_mut().filter(|pending| pending.surface.frame == Some(frame)) {
+            pending.complete |= copy_completed(frame);
         }
     }
 
@@ -3488,45 +2770,23 @@ impl ImagePublication {
                 && same_allocation(pending.surface, requested)
                 && DRAW_AUTHORIZATION
                     .with(|authorization| authorization.borrow().draw == pending.surface.frame)
-                && pending
-                    .gallery
-                    .as_ref()
-                    .is_none_or(|snapshot| gallery::current_source(snapshot))
+
         })
     }
 
-    fn refresh_detail(&mut self, model: &crate::view_model::ApplicationModel) {
-        if self
-            .detail
-            .as_ref()
-            .is_none_or(|detail| !detail.matches_model(model))
-        {
-            // A later source selection does not revoke the facts retained with
-            // this completed read. Replace them only with exact matching facts.
-            if let Some(detail) = self
-                .surface
-                .frame
-                .and_then(|frame| DetailContent::from_model(model, frame))
-            {
-                self.detail = Some(detail);
-            }
+    fn explore_display(&self, requested: Surface) -> Option<ExploreDisplay> {
+        if let Some(pending) = self.submitted_draw(requested) {
+            return ExploreDisplay::paired(requested, pending.gallery.as_ref(), pending.detail.as_ref());
         }
+        let retained = self.retained()?;
+        let surface = if retained.frame == requested.frame && same_allocation(retained, requested) {
+            requested
+        } else { retained };
+        ExploreDisplay::paired(surface, self.gallery.as_ref(), self.detail.as_ref())
     }
 
     fn retained(&self) -> Option<Surface> {
         (self.completed.is_some() && self.completed == self.surface.frame).then_some(self.surface)
-    }
-
-    fn completed_content(
-        &self,
-        frame: &crate::generated::VisualFrame,
-        snapshot: &crate::generated::PresentationSnapshot,
-    ) -> Option<Surface> {
-        self.retained().filter(|surface| {
-            surface.frame.is_some_and(|completed| {
-                completed.matches_content(frame) && completed.matches_completed(snapshot)
-            })
-        })
     }
 
     fn complete(&mut self, frame: FrameReady) {
@@ -3547,38 +2807,18 @@ impl ImagePublication {
         }
     }
 
-    fn promote(&mut self, frame: FrameReady, model: &crate::view_model::ApplicationModel) -> bool {
+    fn promote(&mut self, frame: FrameReady, _model: &crate::view_model::ApplicationModel) -> bool {
         let authorized = self
             .pending_sample
             .as_ref()
             .is_some_and(|pending| pending.view_ready);
-        if (!authorized
-            && (model.completed_presentation_reconciliation().ok()
-                != Some(crate::view_model::PresentationReconciliation::Matching)
-                || model
-                    .presentation
-                    .as_ref()
-                    .is_none_or(|snapshot| !frame.matches_completed(snapshot))))
-            || !self
-                .pending_sample
-                .as_ref()
-                .is_some_and(|pending| pending.complete && pending.surface.frame == Some(frame))
-        {
-            return false;
-        }
+        if !authorized || !self.pending_sample.as_ref().is_some_and(|pending|
+            pending.complete && pending.surface.frame == Some(frame)) { return false; }
         let pending = self
             .pending_sample
             .take()
             .expect("matching completed sample");
         trace_surface("sample_promotion_started", pending.surface);
-        if pending
-            .gallery
-            .as_ref()
-            .is_some_and(|snapshot| !gallery::current_source(snapshot))
-        {
-            trace_surface("sample_promotion_rejected", pending.surface);
-            return false;
-        }
         self.surface = pending.surface;
         self.gallery = pending.gallery;
         self.detail = pending.detail;
@@ -3586,7 +2826,6 @@ impl ImagePublication {
         self.placement = pending.placement;
         self.completed = Some(frame);
         self.retained_read = pending.read;
-        self.refresh_detail(model);
         trace_surface("sample_promoted", self.surface);
         true
     }
@@ -3753,32 +2992,16 @@ impl Imported {
         if let Some(probe) = &self.pixel_trace[trace_index] {
             probe.sample(self.image.surface, borrow.clone());
         }
-        let acquired = DRAW_AUTHORIZATION.with(|authorization| {
-            let mut authorization = authorization.borrow_mut();
-            if authorization
-                .acquiring
-                .as_ref()
-                .and_then(|pending| pending.surface.frame)
-                .is_some_and(|offered| same_publication(offered, frame))
-            {
-                authorization.acquiring.take()
-            } else {
-                None
-            }
-        });
-        self.image.pending_sample = Some(PendingImage {
-            read: Some(borrow),
-            surface: self.image.surface,
-            gallery: acquired
-                .as_ref()
-                .and_then(|facts| facts.gallery.clone())
-                .or_else(|| self.image.gallery.clone()),
-            detail: acquired.as_ref().and_then(|facts| facts.detail.clone()),
-            annotation: acquired.as_ref().and_then(|facts| facts.annotation.clone()),
-            placement: self.image.placement,
-            complete: copy_completed(frame),
-            view_ready: acquired.is_some(),
-        });
+        let Some(mut acquired) = metadata::pending(frame) else {
+            drop(borrow);
+            notify_surface(Notification::SampleRejected(frame));
+            return;
+        };
+        acquired.read = Some(borrow);
+        acquired.surface = self.image.surface;
+        acquired.complete = copy_completed(frame);
+        self.image.placement = acquired.placement;
+        self.image.pending_sample = Some(acquired);
         if surface_trace_enabled()
             && let Some(sample) = self.image.pending_sample.as_ref()
         {
@@ -3921,17 +3144,6 @@ pub(crate) fn release(frame: FrameReady) {
     }) {
         return;
     }
-    DRAW_AUTHORIZATION.with(|authorization| {
-        let mut authorization = authorization.borrow_mut();
-        if authorization
-            .acquiring
-            .as_ref()
-            .and_then(|offer| offer.surface.frame)
-            .is_some_and(|offer| same_publication(offer, frame))
-        {
-            authorization.acquiring = None;
-        }
-    });
     take_publication(frame);
     if reserve_release(frame) {
         settle_sample(frame);
@@ -3992,6 +3204,7 @@ fn dispatch_release(frame: FrameReady) {
 
 #[cfg(test)]
 pub(crate) fn reset_test_releases() {
+    metadata::reset();
     authorize_draw(None);
     BORROWS.with(|borrows| borrows.set([None; SAMPLE_CAPACITY]));
     RELEASED_FRAMES.with(|released| released.set([None; SAMPLE_CAPACITY]));
@@ -4089,414 +3302,457 @@ fn fs_main(input: Output) -> @location(0) vec4<f32> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn paired_empty_gallery_replaces_detail_only_through_normal_read_custody() {
+        for direct_sampling in [false, true] {
+            for logical_first in [false, true] {
+                reset_test_releases();
+                let (mut model, mut old) = crate::view_model::test_support::explore_presentation();
+                old.direct_sampling = direct_sampling;
+                metadata::install_explore(old, model.explore.snapshot.as_ref().unwrap());
+                assert!(accept_publication(old));
+                let initial = metadata::pending(old).unwrap();
+                let held_encoder = SampleRead::acquire(old).unwrap();
+                let mut image = ImagePublication {
+                    surface: initial.surface, completed: Some(old), pending_sample: None,
+                    retained_read: Some(held_encoder.clone()), gallery: initial.gallery,
+                    detail: initial.detail, annotation: None, placement: initial.placement,
+                };
+                let mut empty = model.explore.snapshot.clone().unwrap();
+                empty.mode = crate::generated::ExploreMode::Gallery;
+                empty.order.matchingcount = 0;
+                empty.order.visibleindices.clear();
+                empty.gallery.slots.clear();
+                empty.viewport.columns = 4;
+                empty.viewport.rowcount = 3;
+                empty.viewport.firstrow = 0;
+                empty.viewport.extent = empty.frame.extent.clone();
+                crate::view_model::test_support::gallery_layout(&mut empty);
+                empty.frame.revision += 1;
+                let candidate = FrameReady { content_sequence: empty.frame.revision,
+                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old };
+                if logical_first { model.explore.snapshot = Some(empty.clone()); }
+                assert!(matches!(image.explore_display(image.surface), Some(ExploreDisplay::Detail(..))));
+                assert!(test_releases().is_empty());
+                metadata::install_explore(candidate, &empty);
+                assert!(accept_publication(candidate));
+                let requested = metadata::surface(candidate).unwrap();
+                let Some(ExploreDisplay::Gallery(shown, paired)) = explore_display(Some(requested))
+                    else { panic!("accepted empty graphics must select gallery composition"); };
+                assert_eq!(shown.frame, Some(candidate));
+                assert_eq!(paired.order.matchingcount, 0);
+                if !logical_first { model.explore.snapshot = Some(empty); }
+                let mut pending = metadata::pending(candidate).unwrap();
+                pending.read = SampleRead::acquire(candidate);
+                pending.complete = false;
+                image.pending_sample = Some(pending);
+                authorize_draw(Some(candidate));
+                assert!(matches!(image.explore_display(requested), Some(ExploreDisplay::Gallery(..))));
+                image.complete(candidate);
+                assert!(image.promote(candidate, &model));
+                assert!(test_releases().is_empty());
+                drop(held_encoder);
+                assert_eq!(test_releases(), vec![old]);
+                assert!(matches!(image.explore_display(requested), Some(ExploreDisplay::Gallery(..))));
+                drop(image.retire());
+                assert_eq!(test_releases(), vec![old, candidate]);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_detail_candidates_release_only_their_own_receipt() {
+        for upscale in [false, true] {
+            for invalid in 0..(if upscale { 10 } else { 8 }) {
+                reset_test_releases();
+                let (model, old) = crate::view_model::test_support::explore_presentation();
+                assert!(accept_publication(old));
+                let initial = metadata::pending(old).unwrap();
+                let image = ImagePublication {
+                    surface: initial.surface, completed: Some(old), pending_sample: None,
+                    retained_read: SampleRead::acquire(old), gallery: initial.gallery,
+                    detail: initial.detail, annotation: None, placement: initial.placement,
+                };
+                let mut source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+                match invalid {
+                    0 => source.dataset.identity = 0,
+                    1 => source.selectedimage = None,
+                    2 => source.frame.content.width = 0,
+                    3 => source.frame.content.height = 0,
+                    4 => source.frame.content.x = source.frame.extent.width,
+                    5 => source.frame.content.y = u32::MAX,
+                    6 => source.frame.content.width = u32::MAX,
+                    7 => {
+                        if upscale { source.mode = crate::generated::ExploreMode::Gallery; }
+                        else { source.frame.content.y = source.frame.extent.height; }
+                    }
+                    _ => {}
+                }
+                let mut output = source.frame.clone();
+                if invalid == 8 { output.content.width = 0; }
+                if invalid == 9 { output.content.x = u32::MAX; }
+                let (product, provenance) = if upscale {
+                    output.source.kind = crate::generated::PresentationSourceKind::Upscale;
+                    (metadata::encode_product(crate::generated::ApplicationSystem::Upscale,
+                        crate::generated::UpscaleImageMetadata {
+                            frame: output.clone(), input: source.frame.clone(), scene: source.scene.clone(),
+                        }), Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source)))
+                } else {
+                    (metadata::encode_product(crate::generated::ApplicationSystem::Explore, source), None)
+                };
+                let candidate = FrameReady {
+                    content_session: crate::generated::presentation_source_session(output.source.kind),
+                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old
+                };
+                let bytes = metadata::encode(output, product, provenance);
+                assert!(metadata::install(candidate, candidate.content_width, candidate.content_height, 2, &bytes).is_err());
+                // The native-event decoder takes this exact path before publication acceptance.
+                release(candidate);
+                assert!(metadata::surface(candidate).is_none());
+                assert!(matches!(image.explore_display(image.surface), Some(ExploreDisplay::Detail(..))));
+                assert_eq!(test_releases(), vec![candidate]);
+                drop(image);
+                assert_eq!(test_releases(), vec![candidate, old]);
+            }
+        }
+    }
+
+    #[test]
+    fn detail_crop_choice_survives_independent_acknowledgements_and_retained_upscale() {
+        for logical_first in [false, true] {
+            reset_test_releases();
+            let (model, frame) = crate::view_model::test_support::explore_presentation();
+            let mut logical = model.explore.snapshot.unwrap();
+            logical.detail.showoriginaldimensions = false;
+            let captured = std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical));
+            let old = DetailContent { explore: captured.clone(), upscale: None };
+            let mut state = crate::view::explore::state::State::default();
+            assert!(!state.detail_original(&old));
+            state.choose_detail_original(true);
+            logical.detail.showoriginaldimensions = true;
+            let paired = DetailContent {
+                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&logical)), upscale: None,
+            };
+            if logical_first { state.rebase(Some(&logical), false); }
+            assert!(state.detail_original(&old));
+            assert!(state.detail_original(&paired));
+            if !logical_first { state.rebase(Some(&logical), false); }
+            assert!(state.detail_original(&paired));
+            let mut output = old.frame().clone();
+            output.source.kind = crate::generated::PresentationSourceKind::Upscale;
+            let upscale = DetailContent { explore: captured.clone(),
+                upscale: Some(std::sync::Arc::new(crate::generated::UpscaleImageMetadata {
+                    frame: output, input: old.frame().clone(), scene: captured.scene.clone(),
+                })) };
+            assert!(!upscale.original_dimensions());
+            assert!(state.detail_original(&upscale));
+            assert!(!captured.detail.showoriginaldimensions);
+            // Re-entering the same cached result must retain the accepted local choice.
+            state.rebase(None, false);
+            assert!(state.detail_original(&upscale));
+            let mut replacement = old.clone();
+            std::sync::Arc::make_mut(&mut replacement.explore).selectedimage = Some(99);
+            assert!(!state.detail_original(&replacement));
+            state.choose_detail_original(true);
+            state.abandon_detail(); // Explicit departure or rejected intent.
+            assert!(!state.detail_original(&replacement));
+            state.choose_detail_original(true);
+            state.rebase(Some(&logical), true);
+            assert!(!state.detail_original(&replacement));
+            assert!(metadata::pending(frame).is_some());
+        }
+    }
+
+    #[test]
+    fn drawn_detail_projection_classifies_only_exact_paired_crops() {
+        for upscale in [false, true] {
+            for original in [false, true] {
+                reset_test_releases();
+                let (model, old) = crate::view_model::test_support::explore_presentation();
+                let mut source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+                source.detail.showoriginaldimensions = !original;
+                source.frame.content = crate::generated::VisualRegion { x: 8, y: 4, width: 320, height: 240 };
+                let mut product = source.frame.clone();
+                let (encoded, provenance) = if upscale {
+                    product.source.kind = crate::generated::PresentationSourceKind::Upscale;
+                    (metadata::encode_product(crate::generated::ApplicationSystem::Upscale,
+                        crate::generated::UpscaleImageMetadata {
+                            frame: product.clone(), input: source.frame.clone(), scene: source.scene.clone(),
+                        }),
+                     Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source.clone())))
+                } else {
+                    (metadata::encode_product(crate::generated::ApplicationSystem::Explore, source.clone()), None)
+                };
+                let physical = FrameReady {
+                    content_session: crate::generated::presentation_source_session(product.source.kind),
+                    presentation_revision: old.presentation_revision + 1, slot: 1, ..old
+                };
+                let bytes = metadata::encode(product.clone(), encoded, provenance);
+                metadata::install(physical, physical.content_width, physical.content_height, 2, &bytes).unwrap();
+                let pending = metadata::pending(physical).unwrap();
+                let detail = pending.detail.unwrap();
+                let surface = detail.configure_surface(pending.surface, original, 1);
+                let crop = surface.content_region();
+                record_drawn_detail(surface, crop);
+                let expected = crate::generated::AnnotationOpen { source: product, originalcontent: original };
+                assert_eq!(viewer_annotation_request(), Some(expected.clone()));
+                if !original {
+                    record_drawn_detail(Surface { crop: Some(crop), ..surface }, crop);
+                    assert_eq!(viewer_annotation_request(), Some(expected.clone()));
+                }
+                for invalid in 0..5 {
+                    let mut mixed = surface;
+                    let mut recorded = crop;
+                    match invalid {
+                        0 => mixed.width += 1,
+                        1 => mixed.viewer_identity = Some((999, 999)),
+                        2 => mixed.frame.as_mut().unwrap().presentation_revision += 1,
+                        3 => recorded[0] += 1,
+                        _ => mixed.crop = Some([1, 1, 1, 1]),
+                    }
+                    record_drawn_detail(mixed, recorded);
+                    assert!(viewer_annotation_request().is_none());
+                }
+                record_drawn_detail(surface, crop);
+                metadata::retire(physical);
+                assert!(viewer_annotation_request().is_none());
+                assert!(metadata::install(physical, physical.content_width, physical.content_height, 2,
+                    &bytes[..bytes.len() - 1]).is_err());
+                assert!(viewer_annotation_request().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn a_gallery_draw_cannot_supply_an_annotation_detail_source() {
+        reset_test_releases();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
+        let mut snapshot = model.explore.snapshot.unwrap();
+        snapshot.mode = crate::generated::ExploreMode::Gallery;
+        snapshot.viewport.columns = 4;
+        snapshot.viewport.extent = snapshot.frame.extent.clone();
+        snapshot.viewport.rowcount = 3;
+        snapshot.viewport.firstrow = 0;
+        snapshot.gallery.slots.clear();
+        snapshot.order.visibleindices.clear();
+        crate::view_model::test_support::gallery_layout(&mut snapshot);
+        metadata::install_explore(frame, &snapshot);
+        let surface = Surface {
+            viewer_identity: snapshot.selectedimage.map(|image| (snapshot.dataset.identity, image)),
+            ..metadata::surface(frame).unwrap()
+        };
+        record_drawn_detail(surface, surface.content_region());
+        assert!(viewer_annotation_request().is_none());
+    }
+
+    #[test]
+    fn detail_draws_require_paired_metadata_across_gallery_transitions_and_rejection() {
+        for from_gallery in [false, true] {
+            for metadata_first in [false, true] {
+                for reject in [false, true] {
+                    reset_test_releases();
+                    let (model, old) = crate::view_model::test_support::explore_presentation();
+                    let mut snapshot = model.explore.snapshot.clone().unwrap();
+                    snapshot.viewport.columns = 4;
+                    snapshot.viewport.extent = snapshot.frame.extent.clone();
+                    snapshot.viewport.rowcount = 3;
+                    snapshot.viewport.firstrow = 0;
+                    snapshot.gallery.slots.clear();
+                    snapshot.order.visibleindices.clear();
+                    crate::view_model::test_support::gallery_layout(&mut snapshot);
+                    snapshot.mode = if from_gallery { crate::generated::ExploreMode::Gallery }
+                        else { crate::generated::ExploreMode::Detail };
+                    metadata::install_explore(old, &snapshot);
+                    assert!(accept_publication(old));
+                    let initial = metadata::pending(old).unwrap();
+                    let mut image = ImagePublication {
+                        surface: initial.surface, completed: Some(old), pending_sample: None,
+                        retained_read: SampleRead::acquire(old), gallery: initial.gallery,
+                        detail: initial.detail, annotation: None, placement: initial.placement,
+                    };
+                    snapshot.mode = if from_gallery { crate::generated::ExploreMode::Detail }
+                        else { crate::generated::ExploreMode::Gallery };
+                    snapshot.frame.revision += 1;
+                    snapshot.frame.content.x = 7;
+                    snapshot.frame.content.width -= 7;
+                    let next = FrameReady { content_sequence: snapshot.frame.revision,
+                        presentation_revision: old.presentation_revision + 1, slot: 1, ..old };
+                    let requested = Surface { frame: Some(next), ..image.surface };
+                    if metadata_first { metadata::install_explore(next, &snapshot); }
+                    // Neither an unclassified image nor metadata alone is a draw.
+                    assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), !from_gallery);
+                    if !metadata_first { metadata::install_explore(next, &snapshot); }
+                    if reject {
+                        metadata::retire(next);
+                        assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), !from_gallery);
+                        continue;
+                    }
+                    assert!(accept_publication(next));
+                    let mut pending = metadata::pending(next).unwrap();
+                    pending.read = SampleRead::acquire(next);
+                    pending.complete = false;
+                    image.pending_sample = Some(pending);
+                    authorize_draw(Some(next));
+                    let display = image.explore_display(requested).unwrap();
+                    if let ExploreDisplay::Detail(shown, content) = display {
+                        assert_eq!(shown.frame, Some(next));
+                        let original = content.configure_surface(shown, true, 19);
+                        let region = &content.frame().content;
+                        assert_eq!(original.crop, Some([region.x, region.y, region.width, region.height]));
+                        assert_eq!(original.viewer_identity, content.viewer_identity());
+                        assert_eq!(original.fit_revision, 19);
+                        assert_eq!(content.configure_surface(shown, false, 20).crop, None);
+                    } else { assert!(!from_gallery); }
+                    image.complete(next);
+                    assert!(image.promote(next, &model));
+                    assert_eq!(matches!(image.explore_display(requested), Some(ExploreDisplay::Detail(..))), from_gallery);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upscale_detail_crop_and_identity_follow_its_retained_source_projection() {
+        reset_test_releases();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
+        let source = crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        let mut upscale_frame = source.frame.clone();
+        upscale_frame.source.kind = crate::generated::PresentationSourceKind::Upscale;
+        upscale_frame.revision += 1;
+        upscale_frame.content = crate::generated::VisualRegion { x: 8, y: 4, width: 32, height: 24 };
+        let upscale = crate::generated::UpscaleImageMetadata {
+            frame: upscale_frame, input: source.frame.clone(), scene: source.scene.clone(),
+        };
+        let physical = FrameReady {
+            content_session: crate::generated::presentation_source_session(upscale.frame.source.kind),
+            content_sequence: upscale.frame.revision, presentation_revision: frame.presentation_revision + 1,
+            slot: 1, ..frame
+        };
+        let bytes = metadata::encode(upscale.frame.clone(),
+            metadata::encode_product(crate::generated::ApplicationSystem::Upscale, upscale),
+            Some(metadata::encode_product(crate::generated::ApplicationSystem::Explore, source)));
+        metadata::install(physical, frame.content_width, frame.content_height, 2, &bytes).unwrap();
+        let pending = metadata::pending(physical).unwrap();
+        let detail = pending.detail.unwrap();
+        let surface = pending.surface;
+        assert!(physical.matches_content(detail.frame()));
+        let configured = detail.configure_surface(surface, true, 2);
+        assert_eq!(configured.crop, Some([8, 4, 32, 24]));
+        assert_eq!(configured.viewer_identity, detail.viewer_identity());
+        assert_eq!(detail.frame().source.kind, crate::generated::PresentationSourceKind::Upscale);
+    }
+
     use crate::view_model::test_support::physical_frame as frame_ready;
 
     #[test]
-    fn completion_authorization_matches_all_available_native_identity() {
-        let source = crate::view_model::test_support::visual_frame(
-            crate::generated::PresentationSourceKind::Explore,
-            7,
-        );
-        let mut model = crate::view_model::test_support::bootstrapped();
-        let snapshot = model.presentation.as_mut().unwrap();
-        snapshot.completed = source.clone();
-        snapshot.presentationrevision = 11;
-        snapshot.capability.surfacehigh = 1;
-        snapshot.capability.surfacelow = 2;
-        let original = frame_ready(
-            crate::generated::presentation_source_session(source.source.kind),
-            source.revision,
-            11,
-            source.extent.width,
-            source.extent.height,
-        );
-        let surface = surface_for_content_session(original.content_session);
-        assert!(original.matches_completed(snapshot));
-        for field in 0..8 {
-            let mut different = original;
+    fn graphics_metadata_matches_exact_content_and_capacity() {
+        reset_test_releases();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
+        let snapshot = model.explore.snapshot.unwrap();
+        let bytes = metadata::encode(snapshot.frame.clone(),
+            metadata::encode_product(crate::generated::ApplicationSystem::Explore, crate::generated::ExploreImageMetadata::from(&snapshot)), None);
+        for field in 0..4 {
+            let mut changed = frame;
             match field {
-                0 => different.high += 1,
-                1 => different.low += 1,
-                2 => different.layer += 1,
-                3 => different.slot = MAILBOX_SLOTS,
-                4 => different.content_session += 1,
-                5 => different.content_sequence += 1,
-                6 => different.presentation_revision += 1,
-                _ => different.content_width += 1,
+                0 => changed.content_session += 1,
+                1 => changed.content_sequence += 1,
+                2 => changed.content_width += 1,
+                _ => changed.content_height += 1,
             }
-            assert!(!different.matches_completed(snapshot) || !different.belongs_to(surface));
-            assert_ne!(different, original);
+            assert!(metadata::install(changed, 4096, 4096, 1, &bytes).is_err());
         }
-        assert!(
-            !FrameReady {
-                content_height: original.content_height + 1,
-                ..original
-            }
-            .matches_completed(snapshot)
-        );
-        let reused = FrameReady {
-            content_sequence: 8,
-            presentation_revision: 12,
-            ..original
-        };
-        assert!(same_mailbox_slot(original, reused));
-        assert_ne!(original, reused);
-        snapshot.capability.surfacelow += 1;
-        snapshot.capability.generation += 1;
-        snapshot.capability.condition = crate::generated::PresentationCapabilityCondition::Admitted;
-        assert!(original.matches_completed(snapshot));
-        assert!(original.belongs_to(surface));
+        assert!(metadata::install(frame, 1, 1, 1, &bytes).is_err());
+        assert!(metadata::install(frame, 640, 480, 0, &bytes).is_err());
+        assert!(metadata::install(frame, 640, 480, 1, &bytes[..bytes.len()-1]).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(metadata::install(frame, 640, 480, 1, &trailing).is_err());
+        assert!(metadata::pending(frame).is_some());
     }
 
     #[test]
     fn completed_predecessor_survives_every_metadata_and_copy_notification_order() {
-        use crate::view_model::test_support::{
-            annotation_object, explore_presentation, physical_surface,
-        };
-
+        use crate::view_model::test_support::{annotation_object, explore_presentation};
         for replacement in [false, true] {
-            for [
-                domain_position,
-                control_position,
-                physical_position,
-                copy_position,
-            ] in crate::view_model::test_support::presentation_arrival_orders()
-            {
+            for [domain_position, control_position, physical_position, copy_position]
+                in crate::view_model::test_support::presentation_arrival_orders() {
                 reset_test_releases();
                 let (mut model, old) = explore_presentation();
-                let mut previous = physical_surface(old);
-                previous.viewer_identity = Some((9, 0));
-                let explore = model.explore.snapshot.as_mut().unwrap();
-                explore.dataset.identity = 9;
-                explore.overlay.showlabels = true;
-                explore.scene.categories = vec![crate::generated::ArtifactClassName {
-                    value: "predecessor".into(),
-                }];
-                explore.scene.objects = vec![annotation_object(0)];
-                let mut next_explore = explore.clone();
-                next_explore.revision = 20;
-                next_explore.frame.revision = 2;
-                next_explore.scene.categories[0].value = "successor".into();
-                next_explore.scene.objects[0].box_.first.x += 17.0;
-                let snapshot = model.presentation.as_mut().unwrap();
-                let mut next = FrameReady {
-                    content_sequence: 2,
-                    presentation_revision: 6,
-                    slot: 1,
-                    ..old
-                };
-                let mut target = previous;
-                if replacement {
-                    next.low += 1;
-                    target.low = next.low;
-                    target.generation += 1;
-                    target.width *= 2;
-                    target.height *= 2;
-                }
-                target.frame = Some(next);
-                // Capability B is already advertised while completion still
-                // identifies A/F0. It cannot change the retained image.
-                snapshot.capability.surfacehigh = target.high;
-                snapshot.capability.surfacelow = target.low;
-                snapshot.capability.generation = target.generation;
-                snapshot.capability.extent.width = target.width;
-                snapshot.capability.extent.height = target.height;
-                snapshot.capability.condition = if replacement {
-                    crate::generated::PresentationCapabilityCondition::Admitted
-                } else {
-                    crate::generated::PresentationCapabilityCondition::Ready
-                };
-                let mut next_control = snapshot.clone();
-                next_control.completed = next_explore.frame.clone();
-                next_control.completedsourcerevision = 20;
-                next_control.presentationrevision = 6;
-                next_control.capability.condition =
-                    crate::generated::PresentationCapabilityCondition::Ready;
+                let previous = model.explore.snapshot.as_mut().unwrap();
+                previous.dataset.identity = 9;
+                previous.overlay.showlabels = true;
+                previous.scene.categories = vec![crate::generated::ArtifactClassName { value: "predecessor".into() }];
+                previous.scene.objects = vec![annotation_object(0)];
+                metadata::install_explore(old, previous);
+                let mut successor = previous.clone();
+                successor.revision += 10;
+                successor.frame.revision += 1;
+                successor.scene.categories[0].value = "successor".into();
+                successor.scene.objects[0].box_.first.x += 17.0;
+                let next = FrameReady { content_sequence: successor.frame.revision,
+                    presentation_revision: old.presentation_revision + 1, slot: 1,
+                    low: old.low + u64::from(replacement), ..old };
                 assert!(accept_publication(old));
-                let old_read = SampleRead::acquire(old).unwrap();
+                let previous = metadata::pending(old).unwrap();
                 let mut image = ImagePublication {
-                    surface: previous,
-                    pending_sample: None,
-                    completed: Some(old),
-                    retained_read: Some(old_read),
-                    gallery: None,
-                    detail: DetailContent::from_model(&model, old),
-                    annotation: None,
-                    placement: Placement::Contain,
+                    surface: previous.surface, completed: Some(old), pending_sample: None,
+                    retained_read: SampleRead::acquire(old), gallery: previous.gallery,
+                    detail: previous.detail, annotation: previous.annotation, placement: previous.placement,
                 };
-                record_drawn_detail(image.surface, image.surface.content_region());
-                assert!(viewer_copy_matches(
-                    &model,
-                    image.detail.as_ref().unwrap().frame()
-                ));
-                assert_eq!(
-                    image.completed_content(
-                        image.detail.as_ref().unwrap().frame(),
-                        model.presentation.as_ref().unwrap(),
-                    ),
-                    Some(previous)
-                );
-                assert!(
-                    image
-                        .completed_content(
-                            &next_explore.frame,
-                            model.presentation.as_ref().unwrap()
-                        )
-                        .is_none()
-                );
-                let mut replacement_image: Option<ImagePublication> = None;
-                let mut domain_arrived = false;
-                let mut control_arrived = false;
                 let mut copy_notified = false;
                 for position in 0..4 {
                     if position == domain_position {
-                        model.explore.snapshot = Some(next_explore.clone());
-                        domain_arrived = true;
+                        model.explore.snapshot = Some(successor.clone());
                     } else if position == control_position {
-                        model.presentation = Some(next_control.clone());
-                        control_arrived = true;
+                        // No application observation is needed to consume a graphics receipt.
+                        model.presentation = None;
+                        model.peer_disconnected(crate::view_model::UiError::transport("independent FD graphics"));
                     } else if position == physical_position {
+                        metadata::install_explore(next, &successor);
                         assert!(accept_publication(next));
-                        let read = SampleRead::acquire(next).unwrap();
-                        let pending = Some(PendingImage {
-                            read: Some(read),
-                            surface: target,
-                            gallery: None,
-                            detail: None,
-                            annotation: None,
-                            placement: Placement::Contain,
-                            complete: copy_completed(next),
-                            view_ready: false,
-                        });
-                        if replacement {
-                            replacement_image = Some(ImagePublication {
-                                surface: target,
-                                pending_sample: pending,
-                                completed: None,
-                                retained_read: None,
-                                gallery: None,
-                                detail: None,
-                                annotation: None,
-                                placement: Placement::Contain,
-                            });
-                        } else {
-                            image.pending_sample = pending;
-                        }
+                        let mut pending = metadata::pending(next).unwrap();
+                        pending.read = SampleRead::acquire(next);
+                        pending.complete = copy_notified;
+                        image.pending_sample = Some(pending);
                     } else {
                         assert_eq!(position, copy_position);
                         complete_sample(next);
-                        replacement_image
-                            .as_mut()
-                            .unwrap_or(&mut image)
-                            .complete(next);
+                        image.complete(next);
                         copy_notified = true;
                     }
-                    if replacement {
-                        if replacement_image
-                            .as_mut()
-                            .is_some_and(|candidate| candidate.promote(next, &model))
-                        {
-                            image = replacement_image.take().unwrap();
-                        }
-                    } else {
-                        let _ = image.promote(next, &model);
-                    }
-                    let promoted = domain_arrived
-                        && control_arrived
-                        && copy_notified
-                        && position >= physical_position;
-                    assert_eq!(image.surface, if promoted { target } else { previous });
+                    let _ = image.promote(next, &model);
+                    let promoted = copy_notified && position >= physical_position;
                     assert_eq!(image.completed, Some(if promoted { next } else { old }));
-                    assert_eq!(image.surface.frame.unwrap().slot, u32::from(promoted));
                     let meaning = image.detail.as_ref().unwrap();
-                    assert_eq!(
-                        meaning.scene().categories[0].value,
-                        if promoted { "successor" } else { "predecessor" }
-                    );
-                    assert_eq!(
-                        meaning.scene().objects[0].box_.first.x,
-                        if promoted {
-                            next_explore.scene.objects[0].box_.first.x
-                        } else {
-                            next_explore.scene.objects[0].box_.first.x - 17.0
-                        }
-                    );
-                    assert!(meaning.overlay().showlabels);
-                    record_drawn_detail(image.surface, image.surface.content_region());
-                    let authorized = model
-                        .viewed_explore_frame()
-                        .is_some_and(|source| viewer_copy_matches(&model, &source));
-                    assert_eq!(
-                        authorized,
-                        promoted || (!domain_arrived && !control_arrived)
-                    );
+                    assert_eq!(meaning.scene().categories[0].value,
+                        if promoted { "successor" } else { "predecessor" });
+                    assert_eq!(meaning.scene().objects[0].box_.first.x,
+                        successor.scene.objects[0].box_.first.x - if promoted { 0.0 } else { 17.0 });
                     assert_eq!(test_releases(), if promoted { vec![old] } else { vec![] });
                 }
-                image.complete(next); // A duplicate completion cannot promote or release twice.
+                model.explore.snapshot.as_mut().unwrap().overlay.showlabels = false;
+                image.reconcile_pending(next, &model);
+                assert!(image.detail.as_ref().unwrap().overlay().showlabels);
+                image.complete(next);
                 assert!(!image.promote(next, &model));
-                retire_publication(next);
-                assert_eq!(test_releases(), vec![old]);
-                // Label-only metadata advances no physical frame. Update
-                // its coherent semantics without replacing or releasing the sample.
-                let labels = model.explore.snapshot.as_mut().unwrap();
-                labels.revision += 1;
-                labels.overlay.showlabels = false;
-                assert_eq!(
-                    model.completed_presentation_reconciliation().unwrap(),
-                    crate::view_model::PresentationReconciliation::Matching
-                );
-                image.refresh_detail(&model);
-                assert!(!image.detail.as_ref().unwrap().overlay().showlabels);
-                assert_eq!(image.retained(), Some(target));
-                assert_eq!(test_releases(), vec![old]);
-                let obsolete = FrameReady {
-                    content_sequence: 3,
-                    presentation_revision: 7,
-                    slot: 0,
-                    ..next
-                };
+                let obsolete = FrameReady { presentation_revision: next.presentation_revision+1, slot: 0, ..next };
                 assert!(accept_publication(obsolete));
-                let unsettled = SampleRead::acquire(obsolete).unwrap();
-                image.pending_sample = Some(PendingImage {
-                    read: Some(unsettled.clone()),
-                    surface: Surface {
-                        frame: Some(obsolete),
-                        ..target
-                    },
-                    gallery: None,
-                    detail: None,
-                    annotation: None,
-                    placement: Placement::Contain,
-                    complete: false,
-                    view_ready: false,
-                });
-                let current = model.explore.snapshot.as_mut().unwrap();
-                current.revision = 40;
-                current.frame.revision = 4;
-                let completed = model.presentation.as_mut().unwrap();
-                completed.completed.revision = 3;
-                completed.completedsourcerevision = 30;
-                completed.presentationrevision = 7;
-                assert_eq!(
-                    model.completed_presentation_reconciliation().unwrap(),
-                    crate::view_model::PresentationReconciliation::Superseded
-                );
+                let encoded_reader = SampleRead::acquire(obsolete).unwrap();
+                let mut pending = metadata::pending(next).unwrap();
+                pending.surface.frame = Some(obsolete);
+                pending.read = Some(encoded_reader.clone());
+                pending.complete = false;
+                image.pending_sample = Some(pending);
                 image.discard(obsolete);
                 retire_publication(obsolete);
-                assert_eq!(test_releases(), vec![old]); // GPU custody still owns this release.
-                drop(unsettled);
+                assert_eq!(test_releases(), vec![old]);
+                drop(encoded_reader);
                 image.complete(obsolete);
                 assert!(!image.promote(obsolete, &model));
-                assert_eq!(image.retained(), Some(target));
-                assert_eq!(
-                    image.detail.as_ref().unwrap().scene().categories[0].value,
-                    "successor"
-                );
+                assert_eq!(image.completed, Some(next));
                 assert_eq!(test_releases(), vec![old, obsolete]);
                 drop(image);
                 assert_eq!(test_releases(), vec![old, obsolete, next]);
-            }
-        }
-    }
-
-    #[test]
-    fn sample_copy_is_reconciled_after_transport_continuity_recovery() {
-        use crate::generated::{ExploreMode, FeatureId, PresentationSourceKind};
-        use crate::view_model::test_support::{bootstrapped, physical_surface, visual_frame};
-        for matching in [false, true] {
-            for completed_before_disconnect in [false, true] {
-                reset_test_releases();
-                let mut model = bootstrapped();
-                model.set_foreground_feature(FeatureId::Explore);
-                let source = visual_frame(PresentationSourceKind::Explore, 1);
-                let frame = frame_ready(1, 1, 5, source.extent.width, source.extent.height);
-                let surface = physical_surface(frame);
-                let explore = model.explore.snapshot.as_mut().unwrap();
-                explore.ready = true;
-                explore.mode = ExploreMode::Detail;
-                explore.selectedimage = Some(0);
-                explore.revision = 10;
-                explore.frame = source.clone();
-                let control = model.presentation.as_mut().unwrap();
-                control.completed = source;
-                control.completedsourcerevision = 10;
-                control.presentationrevision = 5;
-                let restored_explore = model.explore.snapshot.clone();
-                let restored_control = model.presentation.clone();
-                assert!(accept_publication(frame));
-                let mut borrow = Some(SampleRead::acquire(frame).unwrap());
-                let mut image = ImagePublication {
-                    surface,
-                    completed: None,
-                    retained_read: None,
-                    pending_sample: Some(PendingImage {
-                        read: Some(borrow.as_ref().unwrap().clone()),
-                        surface,
-                        gallery: None,
-                        detail: None,
-                        annotation: None,
-                        placement: Placement::Contain,
-                        complete: false,
-                        view_ready: false,
-                    }),
-                    gallery: None,
-                    detail: None,
-                    annotation: None,
-                    placement: Placement::Contain,
-                };
-                authorize_draw(None);
-                assert!(image.submitted_draw(surface).is_none());
-                authorize_draw(Some(frame));
-                assert!(image.submitted_draw(surface).is_none());
-                image.pending_sample.as_mut().unwrap().view_ready = true;
-                assert!(image.submitted_draw(surface).is_some());
-                assert!(!image.pending_sample.as_ref().unwrap().complete);
-                assert!(image.retained().is_none());
-                authorize_draw(None);
-                // The draw-eligibility check above is temporary. This fixture's
-                // copy has not acquired matching immutable model facts.
-                image.pending_sample.as_mut().unwrap().view_ready = false;
-                if completed_before_disconnect {
-                    drop(borrow.take());
-                    image.complete(frame);
-                }
-                model.peer_disconnected(crate::view_model::UiError::transport("sample continuity"));
-                assert!(!image.promote(frame, &model));
-                model.peer_connected();
-                if !completed_before_disconnect {
-                    drop(borrow.take());
-                    image.complete(frame);
-                }
-                assert!(!image.promote(frame, &model));
-                assert!(test_releases().is_empty());
-                assert!(image.pending_sample.as_ref().unwrap().complete);
-                model.presentation = restored_control;
-                model.explore.snapshot = restored_explore;
-                model.set_foreground_feature(FeatureId::Explore);
-                if !matching {
-                    let current = model.explore.snapshot.as_mut().unwrap();
-                    current.revision += 1;
-                    current.frame.revision += 1;
-                }
-                assert_eq!(image.promote(frame, &model), matching);
-                if matching {
-                    assert_eq!(image.retained(), Some(surface));
-                    record_drawn_detail(surface, surface.content_region());
-                    assert!(viewer_copy_matches(
-                        &model,
-                        image.detail.as_ref().unwrap().frame()
-                    ));
-                } else {
-                    image.discard(frame);
-                    assert!(image.retained().is_none());
-                    assert!(image.pending_sample.is_none());
-                }
-                retire_publication(frame);
-                if matching {
-                    assert!(test_releases().is_empty());
-                }
-                drop(image);
-                assert_eq!(test_releases(), vec![frame]);
             }
         }
     }
@@ -4652,15 +3908,13 @@ mod tests {
                 completed: Some(frame),
                 retained_read: Some(read),
                 gallery: None,
-                detail: DetailContent::from_model(&model, frame),
+                detail: metadata::pending(frame).and_then(|image| image.detail),
                 annotation: None,
                 placement: Placement::Contain,
             };
             DRAW_AUTHORIZATION.with(|authorization| {
                 let mut authorization = authorization.borrow_mut();
                 authorization.draw = Some(next);
-                authorization.offered = image.pending_sample.clone();
-                authorization.acquiring = image.pending_sample.clone();
             });
             let retired = image.retire();
             assert!(image.retained().is_none());
@@ -4674,8 +3928,6 @@ mod tests {
             DRAW_AUTHORIZATION.with(|authorization| {
                 let authorization = authorization.borrow();
                 assert!(authorization.draw.is_none());
-                assert!(authorization.offered.is_none());
-                assert!(authorization.acquiring.is_none());
             });
             drop(retired);
             drop(encoded);

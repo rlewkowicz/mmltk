@@ -1,5 +1,5 @@
 use crate::protocol::client_records::{Intent, Interaction};
-use crate::protocol::{ProtocolError, RendererObservation};
+use crate::protocol::ProtocolError;
 use futures_channel::mpsc;
 use std::collections::VecDeque;
 use std::fmt;
@@ -37,7 +37,6 @@ pub(crate) enum OutboundRecord {
     Wake,
     Intent(Intent),
     Interaction(Interaction),
-    RendererObservation(RendererObservation),
     IntegrationControl(crate::generated::IntegrationControl),
 }
 
@@ -47,7 +46,6 @@ impl OutboundRecord {
             Self::Wake => Err(ProtocolError("input wake is not a wire record".into())),
             Self::Intent(value) => value.encode(),
             Self::Interaction(value) => value.encode(),
-            Self::RendererObservation(value) => value.encode(),
             Self::IntegrationControl(value) => value.encode(),
         }
     }
@@ -174,13 +172,6 @@ impl Connection {
         }
         self.wake()?;
         Ok(SendDisposition::Queued)
-    }
-
-    pub fn send_renderer_observation(
-        &mut self,
-        observation: RendererObservation,
-    ) -> Result<SendDisposition, OutboundSendError> {
-        self.send(OutboundRecord::RendererObservation(observation), true)
     }
 
     pub(crate) fn send_integration_control(
@@ -537,8 +528,7 @@ mod tests {
                 endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
                 value: Vec::new(),
             }),
-            OutboundRecord::RendererObservation(RendererObservation::Ready),
-        ];
+                    ];
         for record in records {
             assert!(!record.encode().expect("outbound record").is_empty());
         }
@@ -550,7 +540,7 @@ mod tests {
         let mut connection = Connection::new(sender);
         assert_eq!(
             connection
-                .send_renderer_observation(RendererObservation::Ready)
+                .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
                 .expect("first observation"),
             SendDisposition::Queued
         );
@@ -575,7 +565,7 @@ mod tests {
             );
         }
         assert_eq!(
-            connection.send_renderer_observation(RendererObservation::Ready),
+            connection.send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() }),
             Ok(SendDisposition::Dropped)
         );
         assert_eq!(
@@ -732,7 +722,7 @@ mod tests {
             assert!(!fixture.connection.retained.lock().unwrap().input.settled());
             fixture
                 .connection
-                .send_renderer_observation(RendererObservation::Ready)
+                .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
                 .unwrap();
             fixture
                 .connection
@@ -757,7 +747,7 @@ mod tests {
                 .skip(2)
                 .map(|record| record.kind)
                 .collect();
-            assert_eq!(ordinary, ["RendererObservation", "Intent", "Interaction"]);
+            assert_eq!(ordinary, ["Interaction", "Intent", "Interaction"]);
             fixture.credit(1);
             fixture.flush();
             assert_eq!(fixture.wire.len(), 6);
@@ -929,7 +919,7 @@ mod tests {
                             .unwrap();
                         fixture
                             .connection
-                            .send_renderer_observation(RendererObservation::Ready)
+                            .send_interaction(Interaction { replaceable: false, endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport, value: Vec::new() })
                             .unwrap();
                         fixture
                             .connection

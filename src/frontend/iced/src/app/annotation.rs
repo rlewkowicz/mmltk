@@ -105,28 +105,16 @@ impl App {
     }
 
     pub(super) fn open_annotation(&mut self) -> bool {
-        self.submit_annotation_open(self.model.selected_detail_source())
+        self.submit_annotation_open(self.model.selected_detail_source(), self.model.annotation_open_available())
     }
 
     pub(super) fn copy_viewer_to_annotation(&mut self) -> bool {
-        let source = self
-            .model
-            .viewed_explore_frame()
-            .filter(|source| crate::presentation_surface::viewer_copy_matches(&self.model, source));
-        let originalcontent = self
-            .model
-            .explore
-            .snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.detail.showoriginaldimensions);
-        self.submit_annotation_open(source.map(|source| AnnotationOpen {
-            source,
-            originalcontent,
-        }))
+        self.submit_annotation_open(crate::presentation_surface::viewer_annotation_request(),
+            self.model.annotation_import_available())
     }
 
-    fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>) -> bool {
-        if self.settings.has_local_edits() || !self.model.annotation_open_available() {
+    fn submit_annotation_open(&mut self, request: Option<AnnotationOpen>, available: bool) -> bool {
+        if self.settings.has_local_edits() || !available {
             self.model.error = Some(UiError::busy(
                 "Annotation is unavailable or already changing state.",
             ));

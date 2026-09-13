@@ -2,8 +2,10 @@
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <exception>
 #include <functional>
@@ -32,11 +34,15 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
     return *algorithm;
 }
 
-[[nodiscard]] VisualRuntimeFactory bind_explore_demand(VisualRuntimeFactory factory, ExploreDemandCheck demand) {
+[[nodiscard]] VisualRuntimeFactory bind_explore_demand(VisualRuntimeFactory factory, ExploreDemandCheck demand,
+                                                      std::shared_ptr<const ExploreLoadingPriority> priority) {
     if (!factory) return {};
-    return [factory = std::move(factory), demand = std::move(demand)](auto revisions) {
+    return [factory = std::move(factory), demand = std::move(demand), priority = std::move(priority)](auto revisions) {
         auto runtime = factory(std::move(revisions));
-        if (runtime) explore_algorithm(*runtime).SetCurrentDemand(demand);
+        if (runtime) {
+            explore_algorithm(*runtime).SetCurrentDemand(demand);
+            explore_algorithm(*runtime).SetLoadingPriority(priority);
+        }
         return runtime;
     };
 }
@@ -165,7 +171,7 @@ class ExploreSystem::Impl final {
           state_{.nproc = nproc, .maximum_atlas_extent = {settings.maximum_width, settings.maximum_height}},
           gallery_wake_(std::make_shared<GalleryWakeGate>([this] { SubmitGalleryContinuation(); })),
           worker_(
-              bind_explore_demand(std::move(factory), ExploreDemandCheck{latest_generation_}),
+              bind_explore_demand(std::move(factory), ExploreDemandCheck{latest_generation_}, loading_priority_),
               [this](const std::exception_ptr failure) { Failed(failure); },
               diagnostics_.valid()
                   ? detail::VisualRuntimeOwner::ActivityObservation{[diagnostics](const detail::VisualRuntimeOwner::ActivityStage stage,
@@ -369,6 +375,26 @@ class ExploreSystem::Impl final {
             return;
         }
         ValidateViewport(request.viewport);
+        {
+            std::scoped_lock admission(desired_admission_mutex_);
+            std::scoped_lock lock(mutex_);
+            RequireReady();
+            auto& desired = desired_ ? desired_->snapshot : state_;
+            if (ClampViewport(request.viewport, desired.order.matching_count) == desired.viewport) {
+                auto focused = request.focused_compiled_index;
+                if (desired.viewport == state_.viewport && focused &&
+                    std::ranges::find(state_.order.visible_indices, *focused) == state_.order.visible_indices.end())
+                    focused.reset();
+                desired.focused_image = focused;
+                desired.viewport_result = ExploreViewportResult{request, ExploreViewportOutcome::Ready};
+                if (desired.viewport == state_.viewport) {
+                    state_.focused_image = focused;
+                    state_.viewport_result = desired.viewport_result;
+                }
+                loading_priority_->Focus(focused);
+                return;
+            }
+        }
         static_cast<void>(QueueDesired(
             [&](ExploreSnapshot& desired) {
                 desired.viewport = ClampViewport(request.viewport, desired.order.matching_count);
@@ -469,6 +495,7 @@ class ExploreSystem::Impl final {
         ExploreSnapshot changed;
         {
             std::scoped_lock lock(mutex_);
+            RefreshRetainedMetadata([&](ExploreImageMetadata& metadata) { metadata.overlay.show_labels = request.show_labels; });
             installed_settings_ = std::move(refreshed);
             if (desired_ && desired_->settings) desired_->settings = installed_settings_;
             state_.overlay.show_labels = request.show_labels;
@@ -498,6 +525,9 @@ class ExploreSystem::Impl final {
         ExploreSnapshot changed;
         {
             std::scoped_lock lock(mutex_);
+            RefreshRetainedMetadata([&](ExploreImageMetadata& metadata) {
+                metadata.detail.show_original_dimensions = request.show_original_dimensions;
+            });
             installed_settings_ = std::move(refreshed);
             if (desired_ && desired_->settings) desired_->settings = installed_settings_;
             state_.detail.show_original_dimensions = request.show_original_dimensions;
@@ -606,6 +636,12 @@ class ExploreSystem::Impl final {
         std::scoped_lock lock(mutex_);
         return state_;
     }
+    [[nodiscard]] std::optional<ExploreImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
+        std::scoped_lock lock(mutex_);
+        for (const auto* retained : {&retained_gallery_, &retained_detail_})
+            if (retained->frame == frame && retained->metadata) return *retained->metadata;
+        return std::nullopt;
+    }
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
         VisualFrame published;
         {
@@ -618,15 +654,35 @@ class ExploreSystem::Impl final {
     }
     [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame& frame) const {
         std::shared_ptr<const VisualDocument> document;
+        std::shared_ptr<const ExploreImageMetadata> metadata;
         {
             std::scoped_lock lock(mutex_);
             if (!state_.ready || state_.mode != ExploreMode::Detail || state_.frame != frame) return {};
             document = document_;
+            metadata = retained_detail_.metadata;
         }
-        return {borrow_matching_visual_product(frame, worker_), std::move(document)};
+        if (!metadata || metadata->frame != frame) return {};
+        auto encoded = mmltk::frameworks::serialization::reflected_transport_value(*metadata);
+        if (!encoded) throw std::runtime_error("visual document image metadata cannot be projected");
+        return {borrow_matching_visual_product(frame, worker_), std::move(document),
+                std::make_shared<const mmltk::frameworks::serialization::wire::Value>(std::move(*encoded))};
     }
 
    private:
+    template <class Update>
+    void RefreshRetainedMetadata(Update update) {
+        const std::array retained{&retained_gallery_, &retained_detail_};
+        std::array<std::shared_ptr<const ExploreImageMetadata>, 2U> replacements;
+        for (std::size_t i = 0; i < retained.size(); ++i) {
+            if (!retained[i]->metadata) continue;
+            auto metadata = std::make_shared<ExploreImageMetadata>(*retained[i]->metadata);
+            update(*metadata);
+            replacements[i] = std::move(metadata);
+        }
+        for (std::size_t i = 0; i < retained.size(); ++i)
+            retained[i]->metadata = std::move(replacements[i]);
+    }
+
     template <class Install, class Persist>
     [[nodiscard]] ExploreSnapshot UpdateRenderSetting(Install install, Persist persist) {
         bool ready;
@@ -656,8 +712,7 @@ class ExploreSystem::Impl final {
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
     };
 
-    // Called with mutex_ held: demand generations may stay unchanged for
-    // focus-only input, so the accepted request ticket remains authoritative.
+    // Called with mutex_ held; only render requests own demand tickets.
     [[nodiscard]] bool CurrentDesired(const DesiredRequest& request) const noexcept {
         return desired_ && desired_->ticket == request.ticket && request.generation == latest_generation_->load(std::memory_order_acquire);
     }
@@ -691,10 +746,8 @@ class ExploreSystem::Impl final {
         if (reset_navigation || request->snapshot.selected_image != previous_selection) request->navigation = 0;
         const auto count = static_cast<std::int64_t>(std::max(1U, request->snapshot.order.matching_count));
         request->navigation = (request->navigation + navigation) % count;
-        request->generation = viewport_update && previous_viewport == request->snapshot.viewport && active_gallery_generation_ != 0U &&
-                                      latest_generation_->load(std::memory_order_acquire) != 0U
-                                  ? latest_generation_->load(std::memory_order_acquire)
-                                  : NextGeneration();
+        request->generation = NextGeneration();
+        loading_priority_->Focus(request->snapshot.focused_image);
         request->ticket = desired_work_sequence_ = mmltk::common::types::advance_monotonic_identity(desired_work_sequence_);
         request->direction = scroll_direction_;
         worker_.SetOutputRetry(false);
@@ -807,10 +860,12 @@ class ExploreSystem::Impl final {
         try {
             auto order = algorithm.Visible(plan.viewport);
             if (plan.focused_image && std::ranges::find(order.visible_indices, *plan.focused_image) == order.visible_indices.end()) {
+                const auto invalid_focus = plan.focused_image;
                 plan.focused_image.reset();
                 requested.focused_image.reset();
                 std::scoped_lock lock(mutex_);
-                if (CurrentDesired(*request)) request->snapshot.focused_image.reset();
+                if (CurrentDesired(*request) && request->snapshot.focused_image == invalid_focus)
+                    request->snapshot.focused_image.reset();
             }
             if (offset != 0 && requested.selected_image) {
                 const auto selected = algorithm.Adjacent(*requested.selected_image, offset);
@@ -864,8 +919,11 @@ class ExploreSystem::Impl final {
                 settled.augmentation = requested.augmentation;
                 settled.mode = requested.mode;
                 settled.selected_image = requested.selected_image;
-                settled.focused_image = requested.focused_image;
+                settled.focused_image = request->snapshot.focused_image;
                 settled.order = std::move(order);
+                if (settled.focused_image &&
+                    std::ranges::find(settled.order.visible_indices, *settled.focused_image) == settled.order.visible_indices.end())
+                    settled.focused_image.reset();
                 const bool discrete_pending = state_.busy;
                 CompleteProduct(settled, *rendered);
                 settled.busy = discrete_pending;
@@ -937,6 +995,7 @@ class ExploreSystem::Impl final {
         // Every allocating projection is prepared while the incumbent is still
         // selected. Stop and finalization share this boundary for every route.
         auto notification = ChangedNotification(settled);
+        auto metadata = std::make_shared<const ExploreImageMetadata>(ExploreSystem::visual_source::ImageOf(settled));
         std::scoped_lock finalization(open_finalization_mutex_);
         if (!worker_.TryCompleteActiveWork()) return {};
         persist();
@@ -958,9 +1017,11 @@ class ExploreSystem::Impl final {
             retained.output = std::move(product.retained);
             retained.frame = product.frame;
             retained.gallery = std::move(product.gallery);
+            retained.metadata = std::move(metadata);
             install();
             document_ = std::move(product.document);
             active_gallery_generation_ = retained.gallery.generation;
+            loading_priority_->Focus(settled.focused_image);
             state_ = std::move(settled);
         }
         if (continue_gallery) SubmitGalleryContinuation();
@@ -1695,6 +1756,7 @@ class ExploreSystem::Impl final {
     std::uint64_t semantic_identity_ = 0U;
     std::uint64_t next_semantic_identity_ = 1U;
     const std::shared_ptr<std::atomic<std::uint64_t>> latest_generation_ = std::make_shared<std::atomic<std::uint64_t>>(0U);
+    const std::shared_ptr<ExploreLoadingPriority> loading_priority_ = std::make_shared<ExploreLoadingPriority>();
     std::uint64_t active_gallery_generation_ = 0U;
     ExploreAlgorithm* configured_algorithm_ = nullptr;
     std::uint64_t next_shuffle_seed_ = 1U;
@@ -1703,6 +1765,7 @@ class ExploreSystem::Impl final {
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput output;
         VisualFrame frame{};
         ExploreGalleryReadiness gallery{};
+        std::shared_ptr<const ExploreImageMetadata> metadata{};
     };
     RetainedProduct retained_gallery_, retained_detail_;
     const mmltk::frameworks::gpu::SystemImageRuntime* retained_runtime_ = nullptr;
@@ -1738,6 +1801,7 @@ void ExploreSystem::Shutdown() noexcept { impl_->Shutdown(); }
 // CLEANUP-IGNORE: Explore exposes its independent ordinary facade; shared workspace execution already belongs to VisualRuntimeOwner.
 bool ExploreSystem::stopped() const noexcept { return impl_->stopped(); }
 ExploreSnapshot ExploreSystem::snapshot() const { return impl_->snapshot(); }
+std::optional<ExploreImageMetadata> ExploreSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView ExploreSystem::BorrowFrame() const { return impl_->BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace ExploreSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation ExploreSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }

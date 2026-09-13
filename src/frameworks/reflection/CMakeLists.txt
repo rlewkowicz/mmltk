@@ -12,6 +12,7 @@ mmltk_register_public_headers(mmltk_frameworks_reflection
         field_policy.h
         reflected_descriptors.h
         reflected_field_policy.h
+        record_projection.h
         reflection_metadata.h
         include/mmltk/frameworks/reflection/materializer.h
         include/mmltk/frameworks/reflection/member_path.h
