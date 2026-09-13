@@ -514,12 +514,11 @@ class AnnotationSystem::Impl final {
             }
         }
         if (!pending_baseline_.valid()) pending_baseline_ = runtime.Completed();
-        renderer_.SetOutputRetry(true);
         if (diagnostics_.valid()) {
             std::scoped_lock lock(render_mutex_);
             DiagnoseRender(VisualDiagnosticOperation::AnnotationOutputAcquireStarted, pending_description_, &pending_baseline_);
         }
-        auto output = runtime.TryAcquireOutput(pending_baseline_, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
+        auto output = renderer_.TryAcquireOutput(runtime, pending_baseline_, mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
         if (!output.valid()) {
             if (diagnostics_.valid()) {
                 std::scoped_lock lock(render_mutex_);
@@ -527,7 +526,6 @@ class AnnotationSystem::Impl final {
             }
             return;
         }
-        renderer_.SetOutputRetry(false);
         {
             std::scoped_lock lock(render_mutex_);
             if (!pending_render_) return;
@@ -538,33 +536,37 @@ class AnnotationSystem::Impl final {
         DiagnoseRender(VisualDiagnosticOperation::AnnotationOutputAcquired, description, &pending_baseline_);
         const VisualExtent extent{description.scene->frame_width, description.scene->frame_height};
         const bool fresh_source = clean_epoch_ != description.document_epoch;
-        const auto input = fresh_source ? runtime.BorrowInput() : mmltk::frameworks::gpu::BorrowedImageProductReadView{};
-        runtime.Publish(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
-            annotation_algorithm(runtime).Render(
-                description, fresh_source ? input.plane(0U).plane() : mmltk::frameworks::gpu::ImagePlaneView{}, clean, semantic, stream);
+        const auto input = runtime.BorrowInput();
+        const auto baseline = output.ObserveWorkspace();
+        runtime.PublishRetained(output, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
+            annotation_algorithm(runtime).Render(description, input.plane(0U).plane(), clean, semantic, stream);
+        }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
+        runtime.FinalizeWorkspace(output, annotation_algorithm(runtime).WorkspaceCoverage(baseline));
+        renderer_.DeferCompletion(runtime, [this, &runtime, output = std::move(output), fresh_source, extent]() mutable {
+            const auto& description = active_description_;
+            runtime.CommitOutput(std::move(output));
+            if (fresh_source) {
+                clean_epoch_ = description.document_epoch;
+                clean_revision_ = runtime.OutputFacts().revision;
+            }
+            auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
+            frame.clean_revision = clean_revision_;
+            std::optional<AnnotationRenderedFacts> evidence;
+            if (diagnostics_.valid())
+                evidence = AnnotationRenderedFacts{description.generation, description.document_epoch,
+                                                   description.scene_revision, description.editor};
+            AnnotationFrameState rendered;
+            {
+                std::scoped_lock lock(mutex_);
+                if (!state_.ready) return;
+                state_.frame = frame;
+                image_ = {frame, std::move(evidence)};
+                state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision);
+                rendered = {state_.revision, state_.ui_revision, frame};
+            }
+            Publish(AnnotationFrameChanged{rendered});
+            DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, description, &pending_baseline_, frame.revision);
         });
-        runtime.CommitOutput(std::move(output));
-        if (fresh_source) {
-            clean_epoch_ = description.document_epoch;
-            clean_revision_ = runtime.OutputFacts().revision;
-        }
-        auto frame = visual_frame({PresentationSourceKind::Annotation, 1U}, extent, runtime.OutputFacts().revision);
-        frame.clean_revision = clean_revision_;
-        std::optional<AnnotationRenderedFacts> evidence;
-        if (diagnostics_.valid())
-            evidence = AnnotationRenderedFacts{description.generation, description.document_epoch,
-                                               description.scene_revision, description.editor};
-        AnnotationFrameState rendered;
-        {
-            std::scoped_lock lock(mutex_);
-            if (!state_.ready) return;
-            state_.frame = frame;
-            image_ = {frame, std::move(evidence)};
-            state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision);
-            rendered = {state_.revision, state_.ui_revision, frame};
-        }
-        Publish(AnnotationFrameChanged{rendered});
-        DiagnoseRender(VisualDiagnosticOperation::AnnotationRenderPublished, description, &pending_baseline_, frame.revision);
     }
     void Reject(std::string detail, bool settle) {
         AnnotationSnapshot failed;

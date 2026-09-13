@@ -148,6 +148,8 @@ struct MaskRunsRgbaWork final {
     std::uint32_t run_count = 0U;
     RgbaColor color{};
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
+    float source_x = 0, source_y = 0, target_x = 0, target_y = 0, scale_x = 1, scale_y = 1;
 };
 
 struct BoxOutlineRgbaWork final {
@@ -156,6 +158,7 @@ struct BoxOutlineRgbaWork final {
     RgbColor color{};
     int thickness = 1;
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct SelectionHandlesRgbaWork final {
@@ -164,6 +167,7 @@ struct SelectionHandlesRgbaWork final {
     int handle_radius = 1;
     RgbaColor color{};
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct PolylineRgbaWork final {
@@ -173,6 +177,7 @@ struct PolylineRgbaWork final {
     RgbColor color{};
     int thickness = 1;
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct PointsRgbaWork final {
@@ -181,6 +186,7 @@ struct PointsRgbaWork final {
     int radius = 1;
     RgbaColor color{};
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct SkeletonRgbaWork final {
@@ -190,6 +196,7 @@ struct SkeletonRgbaWork final {
     RgbColor color{};
     int thickness = 1;
     NativeStream stream{};
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct BoolMaskPackWork final {

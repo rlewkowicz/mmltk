@@ -194,6 +194,30 @@ void VisualRuntimeOwner::SetOutputRetry(const bool armed) noexcept {
     if (!output_wake_->retry_armed)
         continuation_state_.fetch_and(static_cast<std::uint8_t>(~kOutputRetryPending), std::memory_order_acq_rel);
 }
+VisualRuntimeOwner::Runtime::OutputCandidate VisualRuntimeOwner::TryAcquireOutput(
+    Runtime& runtime, Runtime::CompletedOutput& baseline, mmltk::frameworks::gpu::ImagePlanePreservation preservation) {
+    // Arm before observing the pool: a receiver may release the last occupied
+    // allocation between the failed reservation and returning to the worker.
+    SetOutputRetry(true);
+    auto candidate = runtime.TryAcquireOutput(baseline, preservation);
+    if (candidate.valid()) SetOutputRetry(false);
+    return candidate;
+}
+void VisualRuntimeOwner::DeferCompletion(Runtime& runtime, Notification completed) {
+    if (completion_ || !completed) throw std::logic_error("visual GPU completion custody is unavailable");
+    completion_ = std::move(completed);
+    completion_runtime_ = &runtime;
+    completion_ready_.store(false, std::memory_order_release);
+    runtime.NotifyWorkCompletion([wake = std::weak_ptr{output_wake_}] {
+        if (const auto gate = wake.lock()) {
+            std::scoped_lock lock(gate->mutex);
+            if (gate->owner) {
+                gate->owner->completion_ready_.store(true, std::memory_order_release);
+                gate->owner->worker_.Wake();
+            }
+        }
+    });
+}
 bool VisualRuntimeOwner::RequestActiveStop() noexcept {
     std::stop_source stop{std::nostopstate};
     Notification cancellation;
@@ -415,6 +439,7 @@ VisualRuntimeOwner::Runtime* VisualRuntimeOwner::RuntimeForWork(std::stop_token 
         created->SetOutputAvailableSink([wake = std::weak_ptr{output_wake_}] {
             if (const auto gate = wake.lock()) {
                 std::scoped_lock lock(gate->mutex);
+                if (gate->owner) gate->owner->worker_.Wake();
                 if (gate->owner && gate->owner->workspace_retry_.load(std::memory_order_acquire)) {
                     gate->owner->workspace_pending_.store(true, std::memory_order_release);
                     gate->owner->worker_.Wake();
@@ -451,6 +476,14 @@ void VisualRuntimeOwner::Observe(const ActivityStage stage, const std::uint64_t 
 void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     Observe(ActivityStage::CycleEntered);
     FinishDeferredRetirement();
+    if (completion_) {
+        if (!completion_ready_.load(std::memory_order_acquire)) return;
+        completion_runtime_->CompleteWork();
+        auto completed = std::move(completion_);
+        completion_runtime_ = nullptr;
+        if (!worker_stop.stop_requested()) completed();
+    }
+    if (runtime_) runtime_->CompleteWorkspaces();
     ServiceWorkspace();
     std::optional<ScheduledWork> ordered_work;
     std::optional<Work> latest_work;
@@ -631,6 +664,17 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
         auto retirement = retired->Retire();
         failure = retirement.failure;
         safe = retirement.safe_to_destroy;
+        if (completion_runtime_ == retired.get()) {
+            // Retire establishes physical settlement or terminal custody first.
+            // Only then may the deferred candidate abandon its reservation.
+            completion_ = {};
+            completion_runtime_ = nullptr;
+            if (!safe && retirement.custody.deferred()) {
+                const auto finished = retirement.custody.FinishRetirement();
+                failure = combine_image_failures(failure, finished.failure);
+                safe = finished.completion_reached;
+            }
+        }
         if (!safe) {
             if (retirement.custody.deferred()) retirement.custody.SetRetirementSink(retirement_sink_);
             std::scoped_lock lock(mutex_);

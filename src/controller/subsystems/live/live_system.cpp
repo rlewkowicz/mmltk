@@ -158,11 +158,9 @@ class LiveSystem::Impl final {
             worker_.NotifyContinuationAt(next_capture_);
             return {};
         }
-        worker_.SetOutputRetry(true);
         if (!pending_output_.valid()) pending_output_ = runtime.Completed();
-        auto candidate = runtime.TryAcquireOutput(pending_output_);
+        auto candidate = worker_.TryAcquireOutput(runtime, pending_output_);
         if (!candidate.valid()) return {};
-        worker_.SetOutputRetry(false);
         if (!algorithm->AcquireOutput()) return {};
         bool captured = false;
         runtime.Publish(candidate, request_.extent.width, request_.extent.height,

@@ -10,6 +10,10 @@
 #include <span>
 #include <string>
 #include <vector>
+#include <cmath>
+#include <future>
+#include <cstring>
+#include <cuda_runtime_api.h>
 
 #include "src/acceptance/tests/filesystem_test_utils.hpp"
 #include "src/controller/presentation/visual_document.h"
@@ -17,6 +21,10 @@
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/frameworks/serialization/serialization.h"
+#include "src/controller/subsystems/annotation/detail/annotation_mask.h"
+#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/acceptance/tests/cuda_test_utils.hpp"
 
 namespace mmltk::controller {
 namespace {
@@ -715,33 +723,33 @@ TEST_CASE("Annotation changing mask previews reuse their private high-water stor
     REQUIRE(editor.Pointer(pointer).render_changed);
     c::AnnotationRenderState held, latest;
     editor.CaptureRender(held);
-    const auto initial = held.preview;
+    const auto initial = held.ObjectAt(0U);
     pointer.phase = c::contracts::AnnotationPointerPhase::Update;
     pointer.point = {30, 10};
     ++pointer.sequence;
     REQUIRE(editor.Pointer(pointer).render_changed);
     editor.CaptureRender(latest);
-    const auto* buffer = latest.preview.mask.runs.data();
-    const auto capacity = latest.preview.mask.runs.capacity();
+    const auto* buffer = latest.ObjectAt(0U).mask.runs.data();
+    const auto capacity = latest.ObjectAt(0U).mask.runs.capacity();
     pointer.point = {20, 10};
     ++pointer.sequence;
     REQUIRE(editor.Pointer(pointer).render_changed);
     editor.CaptureRender(latest);
-    CHECK(latest.preview.mask.runs.data() == buffer);
-    CHECK(latest.preview.mask.runs.capacity() == capacity);
-    CHECK(held.preview == initial);
+    CHECK(latest.ObjectAt(0U).mask.runs.data() == buffer);
+    CHECK(latest.ObjectAt(0U).mask.runs.capacity() == capacity);
+    CHECK(held.ObjectAt(0U) == initial);
     CHECK(latest.scene == held.scene);
     pointer.point = {30, 30};
     pointer.brush_radius = 3U;
     ++pointer.sequence;
     REQUIRE(editor.Pointer(pointer).render_changed);
     editor.CaptureRender(latest);
-    const auto completed_preview = latest.preview;
+    const auto completed_preview = latest.ObjectAt(0U);
     pointer.phase = c::contracts::AnnotationPointerPhase::End;
     ++pointer.sequence;
     REQUIRE(editor.Pointer(pointer).render_changed);
     CHECK(editor.ui().scene.objects.front().mask == completed_preview.mask);
-    CHECK(held.preview == initial);
+    CHECK(held.ObjectAt(0U) == initial);
     CHECK(held.scene->objects.empty());
     editor.CaptureRender(latest);
     CHECK_FALSE(latest.preview_object);
@@ -927,4 +935,176 @@ TEST_CASE("Annotation native capabilities reject incompatible typed tools and ta
     }));
     REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0}}).outcome == d::DocumentOutcome::Applied);
     CHECK(editor.ui().editor.tool == c::contracts::AnnotationTool::Select);
+}
+
+TEST_CASE("Indexed mask rows preserve fractional brush coverage and immutable stroke snapshots") {
+    namespace c = mmltk::controller::contracts;
+    namespace d = mmltk::controller::subsystems::annotation;
+    d::MaskRows rows;
+    d::MaskScratch scratch;
+    c::AnnotationObject mask{.shape = c::AnnotationShape::Mask};
+    rows.Assign(mask);
+    const c::AnnotationPoint from{0.25F, 62.5F}, to{12.75F, 65.25F};
+    rows.Stroke(from, to, 3U, 96U, 96U, false, scratch);
+    const auto held = rows;
+    rows.Materialize(mask);
+    const auto painted = mask;
+    std::array<bool, 96U * 96U> expected{};
+    const auto steps = static_cast<unsigned>(std::ceil(std::max(std::abs(to.x - from.x), std::abs(to.y - from.y))));
+    for (unsigned step = 0; step <= steps; ++step) {
+        const float t = static_cast<float>(step) / static_cast<float>(steps);
+        const c::AnnotationPoint center{from.x + t * (to.x - from.x), from.y + t * (to.y - from.y)};
+        for (unsigned y = 0; y < 96U; ++y)
+            for (unsigned x = 0; x < 96U; ++x) {
+                const float dx = static_cast<float>(x) + 0.5F - center.x;
+                const float dy = static_cast<float>(y) + 0.5F - center.y;
+                if (dx * dx + dy * dy <= 9.0F) expected[y * 96U + x] = true;
+            }
+    }
+    const auto pixels = [](const c::AnnotationObject& object) {
+        std::array<bool, 96U * 96U> result{};
+        for (const auto run : object.mask.runs)
+            for (unsigned x = run.first; x <= run.last; ++x) result[run.row * 96U + x] = true;
+        return result;
+    };
+    CHECK(pixels(mask) == expected);
+    rows.Stroke({6.5F, 63.5F}, {6.5F, 63.5F}, 2U, 96U, 96U, true, scratch);
+    rows.Materialize(mask);
+    for (unsigned y = 0; y < 96U; ++y)
+        for (unsigned x = 0; x < 96U; ++x) {
+            const float dx = static_cast<float>(x) - 6.0F, dy = static_cast<float>(y) - 63.0F;
+            if (dx * dx + dy * dy <= 4.0F) expected[y * 96U + x] = false;
+        }
+    CHECK(pixels(mask) == expected);
+    held.Materialize(mask);
+    CHECK(mask == painted);
+    rows.Assign({.shape = c::AnnotationShape::Mask});
+    rows.Materialize(mask);
+    CHECK_FALSE(mask.mask.present);
+    CHECK(mask.box == c::AnnotationBox{});
+    held.Materialize(mask);
+    CHECK(mask == painted);
+}
+
+TEST_CASE("Mask drag descriptions retain base intervals and commit exact transformed geometry") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    d::AnnotationDocument editor;
+    auto scene = c::test_scene("test://mask-transform");
+    scene.objects.push_back({.name = c::contracts::AnnotationText::From("mask"), .shape = c::contracts::AnnotationShape::Mask,
+                             .box = {{10, 10}, {14, 12}}, .mask = {.runs = {{10, 10, 13}, {11, 11, 12}}, .present = true}});
+    REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+    c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .target = {.object = 0U}, .point = {11.25F, 10.5F}};
+    REQUIRE(editor.Pointer(pointer).outcome == d::DocumentOutcome::Applied);
+    pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+    pointer.point = {13.75F, 12.75F};
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).render_changed);
+    c::AnnotationRenderState pending;
+    editor.CaptureRender(pending);
+    REQUIRE(pending.TransformsMask(0U));
+    CHECK(&pending.DrawingObjectAt(0U) == &pending.scene->objects.front());
+    CHECK(pending.DrawingObjectAt(0U).mask == scene.objects.front().mask);
+    CHECK(pending.TargetBox(0U) == c::contracts::AnnotationBox{{12.5F, 12.25F}, {16.5F, 14.25F}});
+    const auto transformed = pending.ObjectAt(0U);
+    CHECK(transformed.box == c::contracts::AnnotationBox{{12, 12}, {17, 15}});
+    pointer.phase = c::contracts::AnnotationPointerPhase::End;
+    ++pointer.sequence;
+    REQUIRE(editor.Pointer(pointer).outcome == d::DocumentOutcome::Applied);
+    CHECK(editor.ui().scene.objects.front() == transformed);
+    REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
+    CHECK(editor.ui().scene.objects.front() == scene.objects.front());
+    REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
+    CHECK(editor.ui().scene.objects.front() == transformed);
+}
+
+TEST_CASE("Native annotation raster retains allocation damage and exact mask-transform overlaps", "[annotation][hardware]") {
+    namespace c = mmltk::controller;
+    namespace gpu = mmltk::frameworks::gpu;
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    std::promise<std::exception_ptr> done;
+    c::detail::VisualRuntimeOwner owner(c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U,
+                                                                                   .maximum_height = 64U}),
+                                       [&](auto failure) { done.set_value(failure); });
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        auto& algorithm = dynamic_cast<c::AnnotationAlgorithm&>(*runtime.model());
+        const auto open = [&](unsigned char value) {
+            runtime.PublishInput(64U, 64U, [value](auto clean, auto, auto stream) {
+                REQUIRE(cudaMemset2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes, value,
+                                           clean.descriptor.row_bytes(), clean.descriptor.height,
+                                           reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
+            });
+            const auto input = runtime.BorrowInput();
+            algorithm.Open(input.plane(0U).plane(), {});
+        };
+        open(49U);
+        auto scene = std::make_shared<c::contracts::AnnotationSceneContent>(c::test_scene("test://native-raster"));
+        scene->categories.push_back({.value = "second"});
+        scene->palette = {{0, 1, 1}, {120, 1, 1}};
+        scene->objects = {
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{10, 4}, {26, 20}}, .category = 1U},
+            {.shape = c::contracts::AnnotationShape::Mask, .box = {{6, 10}, {15, 16}}, .mask = {.present = true}}
+        };
+        for (std::uint16_t row = 10U; row != 16U; ++row) scene->objects.back().mask.runs.push_back({row, 6U, 14U});
+        c::AnnotationRenderState description;
+        description.scene = scene;
+        description.scene_revision = 1U;
+        description.document_epoch = 1U;
+        const auto render = [&](unsigned char clean_value) {
+            auto output = runtime.AcquireOutput();
+            const auto input = runtime.BorrowInput();
+            runtime.PublishRetained(output, 64U, 64U, [&](auto clean, auto semantic, auto stream) {
+                algorithm.Render(description, input.plane(0U).plane(), clean, semantic, stream);
+            });
+            runtime.CommitOutput(std::move(output));
+            const auto product = runtime.Borrow();
+            std::array<unsigned char, 64U * 64U * 4U> pixels;
+            for (std::size_t plane = 0U; plane != 2U; ++plane) {
+                const auto source = product.plane(plane).plane();
+                REQUIRE(cudaMemcpy2D(pixels.data(), 64U * 4U, reinterpret_cast<const void*>(source.data), source.descriptor.pitch_bytes,
+                                     64U * 4U, 64U, cudaMemcpyDeviceToHost) == cudaSuccess);
+                if (plane == 0U) CHECK(std::ranges::all_of(pixels, [clean_value](auto byte) { return byte == clean_value; }));
+            }
+            return pixels;
+        };
+        const auto pixel = [](const auto& pixels, unsigned x, unsigned y) {
+            const auto offset = (y * 64U + x) * 4U;
+            return std::array<unsigned char, 4U>{pixels[offset], pixels[offset + 1U], pixels[offset + 2U], pixels[offset + 3U]};
+        };
+        const auto original = render(49U);
+        CHECK(pixel(original, 10U, 12U) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+        CHECK(pixel(original, 10U, 4U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
+        auto moved = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
+        moved->objects.pop_back();
+        moved->objects[1].box = {{30, 4}, {46, 20}};
+        description.scene = moved;
+        ++description.scene_revision;
+        CHECK(pixel(render(49U), 10U, 12U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+        const auto rotated = render(49U);
+        CHECK(pixel(rotated, 10U, 12U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+        CHECK(pixel(rotated, 30U, 12U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
+        description.scene = scene;
+        ++description.scene_revision;
+        description.preview_object = 2U;
+        description.drag = c::AnnotationDragPreview{{.object = 2U}, {6, 12}, {8.5F, 14.25F}};
+        const auto preview = render(49U);
+        auto committed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
+        committed->objects[2] = description.ObjectAt(2U);
+        description.scene = committed;
+        description.preview_object.reset();
+        description.drag.reset();
+        ++description.scene_revision;
+        CHECK(render(49U) == preview);
+        CHECK(render(49U) == preview);
+        open(82U);
+        ++description.document_epoch;
+        CHECK(render(82U) == preview);
+        CHECK(render(82U) == preview);
+        return c::detail::VisualRuntimeOwner::Notification{[&] { done.set_value({}); }};
+    }));
+    auto result = done.get_future();
+    const auto failure = mmltk::testsupport::await_test_future(result, "native retained annotation raster");
+    if (failure) std::rethrow_exception(failure);
+    owner.StopAndWait();
 }

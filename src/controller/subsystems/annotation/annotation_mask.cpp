@@ -22,25 +22,6 @@ void normalize(Runs& runs) {
     runs.resize(count);
     if (count > c::kAnnotationMaskRunCapacity) throw std::length_error("Mask run capacity exceeded");
 }
-void subtract(Runs& runs, const Runs& removed, Runs& result) {
-    result.clear();
-    result.reserve(runs.size());
-    std::size_t next = 0;
-    for (auto run : runs) {
-        unsigned first = run.first;
-        while (next < removed.size() && (removed[next].row < run.row || (removed[next].row == run.row && removed[next].last < first)))
-            ++next;
-        for (auto index = next; index < removed.size() && removed[index].row == run.row && removed[index].first <= run.last; ++index) {
-            const auto cut = removed[index];
-            if (cut.first > first)
-                result.push_back({run.row, static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(cut.first - 1)});
-            first = std::max(first, static_cast<unsigned>(cut.last) + 1);
-            if (first > run.last) break;
-        }
-        if (first <= run.last) result.push_back({run.row, static_cast<std::uint16_t>(first), run.last});
-    }
-    runs.swap(result);
-}
 Runs complement(const Runs& runs, std::uint16_t width, std::uint16_t height) {
     Runs result;
     std::size_t next = 0;
@@ -107,8 +88,8 @@ Runs dilate(const Runs& runs, std::uint16_t radius, std::uint16_t width, std::ui
     return result;
 }
 }  // namespace
-void normalize_mask(c::AnnotationObject& object) {
-    normalize(object.mask.runs);
+namespace {
+void update_mask_bounds(c::AnnotationObject& object) {
     object.mask.present = !object.mask.runs.empty();
     object.box = {};
     if (!object.mask.present) return;
@@ -120,8 +101,48 @@ void normalize_mask(c::AnnotationObject& object) {
     object.box = {{static_cast<float>(first), static_cast<float>(object.mask.runs.front().row)},
                   {static_cast<float>(last) + 1, static_cast<float>(object.mask.runs.back().row) + 1}};
 }
-void stroke_mask(c::AnnotationObject& object, c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width,
-                 std::uint16_t height, bool erase, MaskScratch& scratch) {
+}  // namespace
+void normalize_mask(c::AnnotationObject& object) {
+    normalize(object.mask.runs);
+    update_mask_bounds(object);
+}
+void MaskRows::Assign(const c::AnnotationObject& object) {
+    if (!index_ || !index_.unique()) index_ = std::make_shared<Index>();
+    for (auto& block : index_->blocks) {
+        if (!block) continue;
+        if (!block.unique()) block = std::make_shared<Block>();
+        for (auto& row : block->rows) {
+            if (row && row.unique()) row->clear();
+            else row.reset();
+        }
+    }
+    index_->run_count = 0U;
+    for (const auto run : object.mask.runs) {
+        const auto block_index = run.row / kRowsPerBlock;
+        if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
+        auto& block = index_->blocks[block_index];
+        if (!block) block = std::make_shared<Block>();
+        auto& row = block->rows[run.row % kRowsPerBlock];
+        if (!row) row = std::make_shared<Runs>();
+        row->push_back(run);
+        ++index_->run_count;
+    }
+}
+void MaskRows::Materialize(c::AnnotationObject& object) const {
+    auto& runs = object.mask.runs;
+    runs.clear();
+    if (index_) {
+        runs.reserve(index_->run_count);
+        for (const auto& block : index_->blocks) {
+            if (!block) continue;
+            for (const auto& row : block->rows)
+                if (row) runs.insert(runs.end(), row->begin(), row->end());
+        }
+    }
+    update_mask_bounds(object);
+}
+void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width,
+                     std::uint16_t height, bool erase, MaskScratch& scratch) {
     auto& stroke = scratch.stroke;
     stroke.clear();
     const float dx = to.x - from.x, dy = to.y - from.y;
@@ -143,12 +164,56 @@ void stroke_mask(c::AnnotationObject& object, c::AnnotationPoint from, c::Annota
         if (stroke.size() > c::kAnnotationMaskRunCapacity * 2) normalize(stroke);
     }
     normalize(stroke);
-    normalize(object.mask.runs);
-    if (erase)
-        subtract(object.mask.runs, stroke, scratch.result);
-    else
-        object.mask.runs.insert(object.mask.runs.end(), stroke.begin(), stroke.end());
-    normalize_mask(object);
+    if (stroke.empty()) return;
+    if (!index_) index_ = std::make_shared<Index>();
+    else if (!index_.unique()) index_ = std::make_shared<Index>(*index_);
+    for (std::size_t begin = 0U; begin < stroke.size();) {
+        auto end = begin + 1U;
+        while (end < stroke.size() && stroke[end].row == stroke[begin].row) ++end;
+        const auto block_index = stroke[begin].row / kRowsPerBlock;
+        if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
+        auto& block = index_->blocks[block_index];
+        if (!block) block = std::make_shared<Block>();
+        else if (!block.unique()) block = std::make_shared<Block>(*block);
+        auto& row = block->rows[stroke[begin].row % kRowsPerBlock];
+        if (!row) row = std::make_shared<Runs>();
+        else if (!row.unique()) row = std::make_shared<Runs>(*row);
+        const auto old_count = row->size();
+        auto& result = scratch.result;
+        result.clear();
+        if (erase) {
+            auto cut = begin;
+            for (const auto run : *row) {
+                unsigned first = run.first;
+                while (cut < end && stroke[cut].last < first) ++cut;
+                for (auto index = cut; index < end && stroke[index].first <= run.last; ++index) {
+                    if (stroke[index].first > first)
+                        result.push_back({run.row, static_cast<std::uint16_t>(first),
+                                          static_cast<std::uint16_t>(stroke[index].first - 1U)});
+                    first = std::max(first, static_cast<unsigned>(stroke[index].last) + 1U);
+                    if (first > run.last) break;
+                }
+                if (first <= run.last) result.push_back({run.row, static_cast<std::uint16_t>(first), run.last});
+            }
+        } else {
+            const auto append = [&](c::AnnotationMaskRun run) {
+                if (!result.empty() && static_cast<unsigned>(result.back().last) + 1U >= run.first)
+                    result.back().last = std::max(result.back().last, run.last);
+                else result.push_back(run);
+            };
+            auto existing = row->begin();
+            auto added = begin;
+            while (existing != row->end() || added < end) {
+                if (added == end || (existing != row->end() && existing->first <= stroke[added].first)) append(*existing++);
+                else append(stroke[added++]);
+            }
+        }
+        const auto count = index_->run_count - old_count + result.size();
+        if (count > c::kAnnotationMaskRunCapacity) throw std::length_error("Mask run capacity exceeded");
+        row->swap(result);
+        index_->run_count = count;
+        begin = end;
+    }
 }
 void transform_mask(c::AnnotationObject& object, c::AnnotationBox from, c::AnnotationBox to, MaskScratch& scratch) {
     if (to.first.x >= to.second.x || to.first.y >= to.second.y) {

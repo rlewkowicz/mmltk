@@ -1093,10 +1093,8 @@ class ExploreSystem::Impl final {
                 if (!pending_baseline) throw std::logic_error("Explore semantic detail requires pending baseline custody");
                 baseline = retained_detail_.output;
             }
-            worker_.SetOutputRetry(true);
-            output = reserved_output_.valid() ? std::move(reserved_output_) : runtime.TryAcquireOutput(baseline);
+            output = reserved_output_.valid() ? std::move(reserved_output_) : worker_.TryAcquireOutput(runtime, baseline);
             if (!output.valid()) { return std::nullopt; }
-            worker_.SetOutputRetry(false);
             algorithm.PrepareOutputPublication(change, plan.mode);
             const auto submit = [&](const auto clean, const auto semantic, const auto stream) {
                 if (plan.mode == ExploreMode::Gallery)
@@ -1301,10 +1299,8 @@ class ExploreSystem::Impl final {
                                                             .staging_bytes = advanced.active_pinned_bytes}};
                 });
                 mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
-                worker_.SetOutputRetry(true);
-                auto output = runtime.TryAcquireOutput(baseline);
+                auto output = worker_.TryAcquireOutput(runtime, baseline);
                 if (!output.valid()) return {};
-                worker_.SetOutputRetry(false);
                 algorithm.PrepareOutputPublication(ExploreOutputChange::Semantic);
                 try {
                     runtime.PublishRetained(
@@ -1471,8 +1467,7 @@ class ExploreSystem::Impl final {
     [[nodiscard]] detail::VisualRuntimeOwner::Notification RunDiscrete(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                                                        const std::stop_token stop, PendingDiscrete pending) {
         mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
-        worker_.SetOutputRetry(true);
-        reserved_output_ = runtime.TryAcquireOutput(baseline);
+        reserved_output_ = worker_.TryAcquireOutput(runtime, baseline);
         if (!reserved_output_.valid()) {
             {
                 std::scoped_lock lock(mutex_);
@@ -1488,7 +1483,6 @@ class ExploreSystem::Impl final {
             worker_.SetOutputRetry(false);
             return FinalizeQueuedCancellation();
         }
-        worker_.SetOutputRetry(false);
         try {
             auto notification = pending.work(runtime, stop);
             reserved_output_ = {};

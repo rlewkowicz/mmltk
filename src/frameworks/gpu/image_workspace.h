@@ -73,6 +73,7 @@ struct ImageWorkspaceRegion final {
     std::int32_t y1 = 0;
     std::int32_t x2 = 0;
     std::int32_t y2 = 0;
+    constexpr bool operator==(const ImageWorkspaceRegion&) const noexcept = default;
 };
 struct ImageWorkspaceContent final {
     std::uint64_t owner = 0U;
@@ -86,6 +87,25 @@ struct ImageWorkspaceCoverage final {
     std::span<const ImageWorkspaceRegion> regions{};
     bool full_image = true;
     ImageWorkspaceContent baseline{};
+};
+// Bounded raw-allocation history lets either physical display allocation
+// accumulate all changes since its own completed content. An unknown baseline,
+// source replacement or history overflow conservatively initializes the image.
+class ImageWorkspaceDamage final {
+   public:
+    void Record(ImageWorkspaceContent, ImageWorkspaceCoverage) noexcept;
+    [[nodiscard]] ImageWorkspaceCoverage Since(ImageWorkspaceContent, ImageWorkspaceContent,
+                                                std::uint64_t allocation) noexcept;
+   private:
+    struct Change final {
+        ImageWorkspaceContent before{}, after{};
+        ImageWorkspaceRegion bounds{};
+        bool full = true;
+    };
+    std::array<Change, 64U> changes_{};
+    std::size_t next_ = 0U, count_ = 0U;
+    ImageWorkspaceContent newest_{};
+    ImageWorkspaceRegion accumulated_{};
 };
 using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
                                                   ImageWorkspaceCoverage, std::uintptr_t stream)>;
@@ -150,9 +170,13 @@ class ImageWorkspace final {
     void Withdraw() noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
     [[nodiscard]] bool Contains(ImageWorkspaceContent) const noexcept;
+    [[nodiscard]] ImageWorkspaceContent Content() const noexcept;
     [[nodiscard]] ImageStreamSettlement Settle() noexcept;
     [[nodiscard]] ImagePlaneView plane(std::uint32_t width, std::uint32_t height) const;
     void Finalize(BorrowedImageProductReadView, ImageWorkspaceCoverage, const ImageWorkspaceFinalize&);
+    // Owner-worker completion drain. A notification permits settlement, never
+    // publication or resource destruction from inside the host callback.
+    void Complete();
 
    private:
     // Failure latch belongs only to this independent physical allocation.

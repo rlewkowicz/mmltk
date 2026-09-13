@@ -85,9 +85,13 @@ class SystemImageRuntime final {
                                                 ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] OutputCandidate TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
-    void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
+    void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit,
+                         ImageSubmission = ImageSubmission::Complete);
+    void NotifyWorkCompletion(std::function<void()>);
+    void CompleteWork();
     CompletedOutput CommitOutput(OutputCandidate&&);
     void FinalizeWorkspace(OutputCandidate&, ImageWorkspaceCoverage = {});
+    void CompleteWorkspaces();
     [[nodiscard]] bool PrepareDisplay(std::uint64_t revision, const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] bool DetachDisplay(const std::shared_ptr<ImageWorkspace>&);
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;

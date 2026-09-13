@@ -53,11 +53,15 @@ mmltk_link_declarations(mmltk_controller_data_compute_systems PUBLIC
 mmltk_register_header_isolation(mmltk_controller_data_compute_systems)
 
 function(mmltk_add_controller_subsystems_system_tests)
+    find_package(Vulkan REQUIRED)
     add_executable(mmltk_controller_data_compute_systems_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
+        ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
+    mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
+        ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(mmltk_controller_data_compute_systems_tests PRIVATE
@@ -67,7 +71,9 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk::common::io
         mmltk::controller::data_compute_systems
         mmltk::controller::direct_services
-        mmltk_backend_data_test_support)
+        mmltk_backend_data_test_support
+        CUDA::cuda_driver
+        Vulkan::Vulkan)
     catch_discover_tests(
         mmltk_controller_data_compute_systems_tests
         TEST_PREFIX "controller::data_compute_systems::"

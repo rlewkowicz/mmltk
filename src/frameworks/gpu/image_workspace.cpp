@@ -24,6 +24,41 @@
 
 namespace mmltk::frameworks::gpu {
 
+namespace {
+void merge_workspace_damage(ImageWorkspaceRegion& result, ImageWorkspaceRegion region) noexcept {
+    if (region.x1 >= region.x2 || region.y1 >= region.y2) return;
+    if (result.x1 >= result.x2 || result.y1 >= result.y2) { result = region; return; }
+    result.x1 = std::min(result.x1, region.x1);
+    result.y1 = std::min(result.y1, region.y1);
+    result.x2 = std::max(result.x2, region.x2);
+    result.y2 = std::max(result.y2, region.y2);
+}
+}
+void ImageWorkspaceDamage::Record(ImageWorkspaceContent current, ImageWorkspaceCoverage coverage) noexcept {
+    if (!current.valid() || current == newest_) return;
+    auto& change = changes_[next_];
+    change = {.before = coverage.baseline, .after = current, .full = coverage.full_image};
+    for (const auto region : coverage.regions) merge_workspace_damage(change.bounds, region);
+    next_ = (next_ + 1U) % changes_.size();
+    count_ = std::min(count_ + 1U, changes_.size());
+    newest_ = current;
+}
+ImageWorkspaceCoverage ImageWorkspaceDamage::Since(ImageWorkspaceContent baseline, ImageWorkspaceContent current,
+                                                   std::uint64_t allocation) noexcept {
+    accumulated_ = {};
+    if (!baseline.valid() || baseline.owner != current.owner) return {};
+    auto cursor = baseline;
+    for (std::size_t index = 0U; index < count_ && cursor != current; ++index) {
+        const auto& change = changes_[(next_ + changes_.size() - count_ + index) % changes_.size()];
+        if (change.before != cursor) continue;
+        if (change.full) return {};
+        merge_workspace_damage(accumulated_, change.bounds);
+        cursor = change.after;
+    }
+    if (cursor != current) return {};
+    return {.allocation_identity = allocation, .regions = {&accumulated_, 1U}, .full_image = false, .baseline = baseline};
+}
+
 bool ImageWorkspaceLayout::valid() const noexcept {
     const auto maximum = std::numeric_limits<std::size_t>::max();
     return format == ImageFormat::Rgba8 && device >= 0 && device_incarnation != 0U && width != 0U && height != 0U &&
@@ -193,6 +228,38 @@ struct ImageWorkspace::State final {
     std::uintptr_t producer_completion = 0U;
     std::array<std::unique_ptr<ImageProductBuffer>, 2U> transfers;
     std::optional<BorrowedImageProductReadView> unsettled_source;
+    std::unique_ptr<ImageProductReadCompletion> pending_source;
+    ImageStream* pending_execution = nullptr;
+    ImageWorkspaceContent pending_content{};
+    std::uint32_t pending_width = 0U, pending_height = 0U;
+    std::atomic_bool completion_notified{false};
+    void FinishPending(const ImageStreamSettlement& settled, bool publish) noexcept {
+        if (!pending_source) return;
+        if (!settled.completion_reached) {
+            pending_source->Quarantine();
+            owner->Failed(settled.failure ? settled.failure : workspace_release_failure("workspace completion was not established"));
+            return;
+        }
+        if (publish && !settled.failure) {
+            width = pending_width;
+            height = pending_height;
+            content = pending_content;
+            content_valid = true;
+            revision = content.revision;
+            std::atomic_ref{access_signal->generation}.store(content.revision, std::memory_order_relaxed);
+        } else {
+            content = {};
+            content_valid = false;
+            revision = 0U;
+            width = height = 0U;
+        }
+        write_invalidated = false;
+        write_reserved = false;
+        PublishAccess(content_valid ? kWorkspaceAccessAvailable : kWorkspaceAccessEmpty);
+        pending_execution = nullptr;
+        pending_source->Complete();
+        pending_source.reset();
+    }
     std::uintptr_t completion = 0U;
     std::uintptr_t completed_event = 0U;
     std::uint64_t identity = 0U;
@@ -321,6 +388,10 @@ bool ImageWorkspace::Contains(ImageWorkspaceContent content) const noexcept {
     std::scoped_lock lock(state_->access);
     return content.valid() && state_->content_valid && state_->content == content;
 }
+ImageWorkspaceContent ImageWorkspace::Content() const noexcept {
+    std::scoped_lock lock(state_->access);
+    return state_->content;
+}
 ImagePlaneView ImageWorkspace::plane(std::uint32_t width, std::uint32_t height) const {
     if (!admitted() || state_->allocation->empty() || width == 0U || height == 0U || width > layout().width || height > layout().height)
         throw std::invalid_argument("workspace logical extent exceeds capacity");
@@ -397,7 +468,7 @@ void ImageWorkspace::InvalidateWrite() noexcept {
 void ImageWorkspace::CancelWrite() noexcept {
     {
         std::scoped_lock lock(state_->access);
-        if (!state_->write_reserved) return;
+        if (!state_->write_reserved || state_->pending_source) return;
         if (state_->write_invalidated) {
             state_->revision = 0U;
             state_->content = {};
@@ -519,6 +590,7 @@ ImageStreamSettlement ImageWorkspace::Settle() noexcept {
         settled.completion_reached = settled.completion_reached && producer.completion_reached;
         settled.failure = combine_image_failures(settled.failure, producer.failure);
     }
+    state_->FinishPending(settled, true);
     if (const auto failure = state_->owner->failure()) {
         settled.completion_reached = false;
         settled.failure = combine_image_failures(settled.failure, failure);
@@ -530,10 +602,22 @@ ImageStreamSettlement ImageWorkspace::Settle() noexcept {
     }
     return settled;
 }
+void ImageWorkspace::Complete() {
+    CheckOwner();
+    std::scoped_lock lock(state_->access);
+    if (!state_->pending_source || !state_->completion_notified.load(std::memory_order_acquire)) return;
+    // The notification executes before CUDA returns from the host callback.
+    // Settlement on the execution owner proves that physical return as well.
+    const auto settled = state_->pending_execution->Settle();
+    state_->FinishPending(settled, true);
+    if (settled.failure) std::rethrow_exception(settled.failure);
+    if (!settled.completion_reached) CheckOwner();
+}
 void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspaceCoverage coverage,
                               const ImageWorkspaceFinalize& finalize) {
     CheckOwner();
-    std::scoped_lock lock(state_->access);
+    std::unique_lock lock(state_->access);
+    if (state_->pending_source) return;
     if (!admitted() || !source.valid() || state_->unsettled_source) throw std::invalid_argument("workspace source is unavailable");
     const auto clean = source.plane(0U).plane();
     const ImageWorkspaceContent content{clean.allocation.owner, source.plane(0U).revision()};
@@ -579,26 +663,31 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
             finalize(input, source.plane_count() == 2U ? source.plane(1U).plane() : ImagePlaneView{}, destination, coverage,
                      execution->native_handle());
         }
+        state_->pending_source = std::make_unique<ImageProductReadCompletion>(std::move(source));
+        state_->pending_execution = execution;
+        state_->pending_content = content;
+        state_->pending_width = clean.descriptor.width;
+        state_->pending_height = clean.descriptor.height;
+        state_->completion_notified.store(false, std::memory_order_release);
+        execution->Notify([state = state_.get()] {
+            state->completion_notified.store(true, std::memory_order_release);
+            if (const auto sink = state->availability_sink.load(std::memory_order_acquire)) {
+                try { (*sink)(); } catch (...) {}
+            }
+        });
         execution->Record(completion);
-        execution->Synchronize();
         state_->completed_event = completion;
-        state_->width = clean.descriptor.width;
-        state_->height = clean.descriptor.height;
-        state_->content = content;
-        state_->content_valid = true;
-        state_->revision = content.revision;
-        state_->write_invalidated = false;
-        state_->write_reserved = false;
-        std::atomic_ref{state_->access_signal->generation}.store(content.revision, std::memory_order_relaxed);
-        state_->PublishAccess(kWorkspaceAccessAvailable);
     } catch (...) {
         const auto failure = std::current_exception();
         state_->content = {};
         state_->width = state_->height = 0U;
         const auto settled = execution->Settle();
+        state_->FinishPending(settled, false);
         if (!settled.completion_reached) {
-            source.Quarantine();
-            state_->unsettled_source.emplace(std::move(source));
+            if (source.valid()) {
+                source.Quarantine();
+                state_->unsettled_source.emplace(std::move(source));
+            }
             state_->owner->Failed(combine_image_failures(failure, settled.failure));
         } else {
             state_->write_reserved = false;
@@ -606,6 +695,8 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
         }
         execution->RethrowAfterSettlement(failure);
     }
+    lock.unlock();
+    Complete();
 }
 
 struct BorrowedImageWorkspace::Lease final {

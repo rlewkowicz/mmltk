@@ -248,6 +248,16 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         BindContext(context);
         CheckCuda("synchronize image event", cuEventSynchronize(reinterpret_cast<CUevent>(event)));
     }
+    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, std::function<void()> wake) override {
+        BindContext(context);
+        auto callback = std::make_unique<std::function<void()>>(std::move(wake));
+        CheckCuda("enqueue image completion notification", cuLaunchHostFunc(reinterpret_cast<CUstream>(stream),
+            [](void* value) {
+                std::unique_ptr<std::function<void()>> notify(static_cast<std::function<void()>*>(value));
+                try { (*notify)(); } catch (...) {}
+            }, callback.get()));
+        static_cast<void>(callback.release());
+    }
     StreamSettlement SettleStream(const std::uintptr_t context, const std::uintptr_t stream) noexcept override {
         const auto bound = cuCtxSetCurrent(reinterpret_cast<CUcontext>(context));
         if (bound != CUDA_SUCCESS) return {.failure = CudaFailure("bind CUDA context for stream settlement", bound)};
@@ -332,6 +342,9 @@ void DeviceContext::DestroyEvent(std::uintptr_t event) const noexcept {
     if (event != 0U) state_->backend->DestroyEvent(state_->context, event);
 }
 void ImageStream::Record(std::uintptr_t event) { context_.state_->backend->RecordEvent(context_.state_->context, stream_, event); }
+void ImageStream::Notify(std::function<void()> wake) {
+    context_.state_->backend->NotifyStream(context_.state_->context, stream_, std::move(wake));
+}
 void ImageStream::AwaitEvent(std::uintptr_t event) { context_.state_->backend->WaitEvent(context_.state_->context, stream_, event); }
 
 ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
@@ -809,6 +822,7 @@ struct ImageProductBuffer::State final {
     std::shared_ptr<ImageWorkspace> workspace_reserved_;
     std::shared_ptr<ImageWorkspace> raw_workspace_;
     ImageWorkspaceFinalize finalize_;
+    ImageWorkspaceDamage damage_;
     ImageProductLayout layout_;
     std::array<std::unique_ptr<ImageBuffer>, 2U> planes_{};
     std::size_t plane_count_;
@@ -1153,8 +1167,10 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
     return true;
 }
 void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
+    CompleteWorkspace();
     {
         std::shared_lock transaction(state_->transaction_);
+        state_->damage_.Record({state_->planes_[0U]->state_->allocation_owner, state_->generation_}, coverage);
         if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_})) return;
     }
     auto source = Borrow();
@@ -1162,8 +1178,13 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
         state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()})) return;
     const auto extent = source.plane(0U).plane().descriptor;
     if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
+    coverage = state_->damage_.Since(state_->workspace_->Content(),
+        {source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}, state_->workspace_->identity());
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
     CancelWorkspaceWrite();
+}
+void ImageProductBuffer::CompleteWorkspace() {
+    if (state_->workspace_) state_->workspace_->Complete();
 }
 BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
     std::shared_lock transaction(state_->transaction_, std::try_to_lock);

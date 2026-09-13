@@ -277,13 +277,16 @@ SystemImageRuntime::CompletedOutput SystemImageRuntime::CommitOutput(OutputCandi
     return ActiveState().output->Commit(std::move(candidate));
 }
 void SystemImageRuntime::PublishRetained(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                                         ImageProductBuffer::ProductSubmit submit) {
+                                         ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
     auto& state = ActiveState();
-    state.output->PublishRetained(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
+    state.output->PublishRetained(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit), submission);
 }
+void SystemImageRuntime::NotifyWorkCompletion(std::function<void()> wake) { ActiveState().stream->Notify(std::move(wake)); }
+void SystemImageRuntime::CompleteWork() { ActiveState().stream->Synchronize(); }
 void SystemImageRuntime::FinalizeWorkspace(OutputCandidate& candidate, ImageWorkspaceCoverage coverage) {
     ActiveState().output->FinalizeWorkspace(candidate, coverage);
 }
+void SystemImageRuntime::CompleteWorkspaces() { ActiveState().output->CompleteWorkspaces(); }
 bool SystemImageRuntime::DetachDisplay(const std::shared_ptr<ImageWorkspace>& workspace) {
     auto& state = ActiveState();
     return state.output->DetachDisplay(*state.stream, workspace);

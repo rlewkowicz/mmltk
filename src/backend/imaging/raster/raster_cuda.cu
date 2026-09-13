@@ -2,6 +2,7 @@
 #include <device_launch_parameters.h>
 
 #include <cstdint>
+#include <algorithm>
 #include "src/backend/ml/cuda/detail/cuda_launch_common.cuh"
 
 #include "detail/raster_color.h"
@@ -414,11 +415,46 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
     const std::uint64_t start = launch.run_pairs[pair_index];
     const std::uint64_t length = launch.run_pairs[pair_index + 1U];
     if (start >= pixel_count) { return; }
+    if (launch.scale_x != 1 || launch.scale_y != 1 || launch.source_x != launch.target_x || launch.source_y != launch.target_y) {
+        if (launch.scale_x <= 0 || launch.scale_y <= 0 || length == 0) return;
+        const auto width = static_cast<std::uint64_t>(launch.overlay_region.width);
+        const float x = static_cast<float>(start % width), y = static_cast<float>(start / width);
+        const auto project = [](float value, float source, float target, float scale) {
+            // Match the separate float operations used when materializing the
+            // saved intervals; contraction can cross a floor/ceil boundary.
+            return __fadd_rn(target, __fmul_rn(__fsub_rn(value, source), scale));
+        };
+        const int first = max(max(0, launch.clip.x1),
+                              static_cast<int>(floorf(project(x, launch.source_x, launch.target_x, launch.scale_x))));
+        const int last = min(min(launch.overlay_region.width, launch.clip.x2),
+                             static_cast<int>(ceilf(project(x + static_cast<float>(length), launch.source_x,
+                                                           launch.target_x, launch.scale_x))));
+        const int top = max(max(0, launch.clip.y1),
+                            static_cast<int>(floorf(project(y, launch.source_y, launch.target_y, launch.scale_y))));
+        const int bottom = min(min(launch.overlay_region.height, launch.clip.y2),
+                               static_cast<int>(ceilf(project(y + 1, launch.source_y, launch.target_y, launch.scale_y))));
+        if (first >= last || top >= bottom) return;
+        const auto count = static_cast<std::uint64_t>(last - first) * static_cast<std::uint64_t>(bottom - top);
+        for (auto pixel = static_cast<std::uint64_t>(threadIdx.x); pixel < count; pixel += blockDim.x) {
+            const auto px = first + static_cast<int>(pixel % static_cast<std::uint64_t>(last - first));
+            const auto py = top + static_cast<int>(pixel / static_cast<std::uint64_t>(last - first));
+            // Scaling can map disjoint base intervals onto the same destination
+            // pixel. A single atomic RGBA store preserves canonical union
+            // coverage without a conflicting write or transformed-run upload.
+            const auto color = static_cast<unsigned>(launch.color.r) | (static_cast<unsigned>(launch.color.g) << 8U) |
+                               (static_cast<unsigned>(launch.color.b) << 16U) | (static_cast<unsigned>(launch.color.a) << 24U);
+            auto* destination = reinterpret_cast<unsigned*>(launch.overlay_region.pixels +
+                static_cast<std::size_t>(py) * launch.overlay_region.pitch_bytes + static_cast<std::size_t>(px) * 4U);
+            atomicExch(destination, color);
+        }
+        return;
+    }
     const std::uint64_t unclamped_end = start > UINT64_MAX - length ? UINT64_MAX : start + length;
     const std::uint64_t end = unclamped_end < pixel_count ? unclamped_end : pixel_count;
     for (std::uint64_t pixel = start + threadIdx.x; pixel < end; pixel += blockDim.x) {
         const int x = static_cast<int>(pixel % static_cast<std::uint64_t>(launch.overlay_region.width));
         const int y = static_cast<int>(pixel / static_cast<std::uint64_t>(launch.overlay_region.width));
+        if (x < launch.clip.x1 || x >= launch.clip.x2 || y < launch.clip.y1 || y >= launch.clip.y2) continue;
         cuda_launch::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
                                       cuda_launch::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
     }
@@ -427,9 +463,9 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
 __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutlineRgbaPitchedLaunch launch) {
     const auto& overlay = launch.overlay;
     const auto& box = launch.box;
-    const int x = global_thread_x();
-    const int y = global_thread_y();
-    if (x >= overlay.width || y >= overlay.height) { return; }
+    const int x = launch.clip.x1 + global_thread_x();
+    const int y = launch.clip.y1 + global_thread_y();
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height) { return; }
     if (!pixel_hits_box_edge(x, y, box.x1, box.y1, box.x2 - 1, box.y2 - 1, launch.thickness)) { return; }
 
     cuda_launch::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y,
@@ -439,9 +475,9 @@ __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutli
 __global__ void draw_selection_handles_rgba_pitched_kernel(const draw_launch::SelectionHandlesRgbaPitchedLaunch launch) {
     const auto& overlay = launch.overlay;
     const auto& box = launch.box;
-    const int x = global_thread_x();
-    const int y = global_thread_y();
-    if (x >= overlay.width || y >= overlay.height) { return; }
+    const int x = launch.clip.x1 + global_thread_x();
+    const int y = launch.clip.y1 + global_thread_y();
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height) { return; }
 
     const int corners_x[4] = {box.x1, box.x2 - 1, box.x1, box.x2 - 1};
     const int corners_y[4] = {box.y1, box.y1, box.y2 - 1, box.y2 - 1};
@@ -459,9 +495,9 @@ __global__ void draw_selection_handles_rgba_pitched_kernel(const draw_launch::Se
 __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgbaPitchedLaunch launch) {
     const auto& overlay = launch.overlay;
     const auto& points = launch.points;
-    const int x = global_thread_x();
-    const int y = global_thread_y();
-    if (x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) { return; }
+    const int x = launch.clip.x1 + global_thread_x();
+    const int y = launch.clip.y1 + global_thread_y();
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count < 2) { return; }
 
     const int segment_count = launch.closed ? points.point_count : points.point_count - 1;
     const float px = static_cast<float>(x) + 0.5f;
@@ -481,9 +517,9 @@ __global__ void draw_polyline_rgba_pitched_kernel(const draw_launch::PolylineRgb
 __global__ void draw_points_rgba_pitched_kernel(const draw_launch::PointsRgbaPitchedLaunch launch) {
     const auto& overlay = launch.overlay;
     const auto& points = launch.points;
-    const int x = global_thread_x();
-    const int y = global_thread_y();
-    if (x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
+    const int x = launch.clip.x1 + global_thread_x();
+    const int y = launch.clip.y1 + global_thread_y();
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || points.point_count <= 0) { return; }
 
     const float px = static_cast<float>(x) + 0.5f;
     const float py = static_cast<float>(y) + 0.5f;
@@ -503,9 +539,9 @@ __global__ void draw_skeleton_rgba_pitched_kernel(const draw_launch::SkeletonRgb
     const auto& overlay = launch.overlay;
     const auto& points = launch.points;
     const auto& edges = launch.edges;
-    const int x = global_thread_x();
-    const int y = global_thread_y();
-    if (x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr ||
+    const int x = launch.clip.x1 + global_thread_x();
+    const int y = launch.clip.y1 + global_thread_y();
+    if (x >= launch.clip.x2 || y >= launch.clip.y2 || x >= overlay.width || y >= overlay.height || points.points_xy == nullptr || edges.edge_indices == nullptr ||
         points.point_count <= 0 || edges.edge_count <= 0) {
         return;
     }
@@ -654,30 +690,51 @@ MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_manual_mask_runs_rgba_pitched, draw_
     return cudaGetLastError();
 }
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_box_outline_rgba_pitched, draw_launch::BoxOutlineRgbaPitchedLaunch, overlay,
-                                                   thickness, draw_launch::is_valid(launch.overlay), draw_box_outline_rgba_pitched_kernel)
+template <auto Kernel, class Launch>
+cudaError_t launch_editor_shape(Launch& launch, int& size) noexcept {
+    if (!draw_launch::is_valid(launch.overlay)) return cudaErrorInvalidValue;
+    if constexpr (requires { launch.points; }) {
+        const int minimum = requires { launch.closed; } ? 2 : 1;
+        if (!launch.points.points_xy || launch.points.point_count < minimum) return cudaErrorInvalidValue;
+    }
+    if constexpr (requires { launch.edges; })
+        if (!launch.edges.edge_indices || launch.edges.edge_count <= 0) return cudaErrorInvalidValue;
+    launch.clip.x1 = std::max(0, launch.clip.x1);
+    launch.clip.y1 = std::max(0, launch.clip.y1);
+    launch.clip.x2 = std::min(launch.overlay.width, launch.clip.x2);
+    launch.clip.y2 = std::min(launch.overlay.height, launch.clip.y2);
+    if (launch.clip.x1 >= launch.clip.x2 || launch.clip.y1 >= launch.clip.y2) return cudaSuccess;
+    size = draw_launch::normalized_positive_size(size);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(launch.clip.x2 - launch.clip.x1, launch.clip.y2 - launch.clip.y1);
+    void* arguments[] = {&launch};
+    return cudaLaunchKernel(reinterpret_cast<const void*>(Kernel), grid, block, arguments, 0U, launch.stream);
+}
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_selection_handles_rgba_pitched,
-                                                   draw_launch::SelectionHandlesRgbaPitchedLaunch, overlay, handle_radius,
-                                                   draw_launch::is_valid(launch.overlay), draw_selection_handles_rgba_pitched_kernel)
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_box_outline_rgba_pitched, draw_launch::BoxOutlineRgbaPitchedLaunch) {
+    auto normalized = launch;
+    return launch_editor_shape<draw_box_outline_rgba_pitched_kernel>(normalized, normalized.thickness);
+}
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_polyline_rgba_pitched, draw_launch::PolylineRgbaPitchedLaunch, overlay,
-                                                   thickness,
-                                                   draw_launch::is_valid(launch.overlay) && launch.points.points_xy != nullptr &&
-                                                       launch.points.point_count >= 2,
-                                                   draw_polyline_rgba_pitched_kernel)
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_selection_handles_rgba_pitched, draw_launch::SelectionHandlesRgbaPitchedLaunch) {
+    auto normalized = launch;
+    return launch_editor_shape<draw_selection_handles_rgba_pitched_kernel>(normalized, normalized.handle_radius);
+}
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_points_rgba_pitched, draw_launch::PointsRgbaPitchedLaunch, overlay, radius,
-                                                   draw_launch::is_valid(launch.overlay) && launch.points.points_xy != nullptr &&
-                                                       launch.points.point_count > 0,
-                                                   draw_points_rgba_pitched_kernel)
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_polyline_rgba_pitched, draw_launch::PolylineRgbaPitchedLaunch) {
+    auto normalized = launch;
+    return launch_editor_shape<draw_polyline_rgba_pitched_kernel>(normalized, normalized.thickness);
+}
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_skeleton_rgba_pitched, draw_launch::SkeletonRgbaPitchedLaunch, overlay,
-                                                   thickness,
-                                                   draw_launch::is_valid(launch.overlay) && launch.points.points_xy != nullptr &&
-                                                       launch.edges.edge_indices != nullptr && launch.points.point_count > 0 &&
-                                                       launch.edges.edge_count > 0,
-                                                   draw_skeleton_rgba_pitched_kernel)
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_points_rgba_pitched, draw_launch::PointsRgbaPitchedLaunch) {
+    auto normalized = launch;
+    return launch_editor_shape<draw_points_rgba_pitched_kernel>(normalized, normalized.radius);
+}
+
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_skeleton_rgba_pitched, draw_launch::SkeletonRgbaPitchedLaunch) {
+    auto normalized = launch;
+    return launch_editor_shape<draw_skeleton_rgba_pitched_kernel>(normalized, normalized.thickness);
+}
 
 #undef MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER
 #undef MMLTK_DRAW_CUDA_DEFINE_LAUNCHER

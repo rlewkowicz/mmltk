@@ -2,6 +2,7 @@ module;
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <span>
 #include <vector>
@@ -235,33 +236,40 @@ std::int32_t raster_mask_runs_rgba(const MaskRunsRgbaWork& work) noexcept {
         work.run_count > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
         return cudaErrorInvalidValue;
     }
+    if (!std::isfinite(work.source_x) || !std::isfinite(work.source_y) || !std::isfinite(work.target_x) ||
+        !std::isfinite(work.target_y) || !std::isfinite(work.scale_x) || !std::isfinite(work.scale_y) ||
+        work.scale_x < 0 || work.scale_y < 0) return cudaErrorInvalidValue;
+    if ((work.scale_x != 1 || work.scale_y != 1 || work.source_x != work.target_x || work.source_y != work.target_y) &&
+        (work.overlay.pitch_bytes % alignof(std::uint32_t) != 0U ||
+         reinterpret_cast<std::uintptr_t>(work.overlay.pixels) % alignof(std::uint32_t) != 0U)) return cudaErrorInvalidValue;
     return detail::launch_draw_manual_mask_runs_rgba_pitched(
-        {as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.run_pairs, work.run_count, work.color, as_stream(work.stream), work.clip,
+         work.source_x, work.source_y, work.target_x, work.target_y, work.scale_x, work.scale_y});
 }
 
 std::int32_t raster_box_outline_rgba(const BoxOutlineRgbaWork& work) noexcept {
     if (!drawable_box(work.overlay, work.box, work.thickness, work.stream)) { return cudaErrorInvalidValue; }
     return detail::launch_draw_box_outline_rgba_pitched(
-        {as_launch_surface(work.overlay), work.box, work.color, work.thickness, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.box, work.color, work.thickness, as_stream(work.stream), work.clip});
 }
 
 std::int32_t raster_selection_handles_rgba(const SelectionHandlesRgbaWork& work) noexcept {
     if (!drawable_box(work.overlay, work.box, work.handle_radius, work.stream)) { return cudaErrorInvalidValue; }
     return detail::launch_draw_selection_handles_rgba_pitched(
-        {as_launch_surface(work.overlay), work.box, work.handle_radius, work.color, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.box, work.handle_radius, work.color, as_stream(work.stream), work.clip});
 }
 
 std::int32_t raster_polyline_rgba(const PolylineRgbaWork& work) noexcept {
     if (!drawable_points(work.overlay, work.points, 2, work.thickness, work.stream)) { return cudaErrorInvalidValue; }
     return detail::launch_draw_polyline_rgba_pitched(
-        {as_launch_surface(work.overlay), work.points, work.closed, work.color, work.thickness, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.points, work.closed, work.color, work.thickness, as_stream(work.stream), work.clip});
 }
 
 std::int32_t raster_points_rgba(const PointsRgbaWork& work) noexcept {
     // CLEANUP-IGNORE: Point and polyline entry points preserve distinct typed work contracts and CUDA launches.
     if (!drawable_points(work.overlay, work.points, 1, work.radius, work.stream)) { return cudaErrorInvalidValue; }
     return detail::launch_draw_points_rgba_pitched(
-        {as_launch_surface(work.overlay), work.points, work.radius, work.color, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.points, work.radius, work.color, as_stream(work.stream), work.clip});
 }
 
 std::int32_t raster_skeleton_rgba(const SkeletonRgbaWork& work) noexcept {
@@ -270,7 +278,7 @@ std::int32_t raster_skeleton_rgba(const SkeletonRgbaWork& work) noexcept {
         return cudaErrorInvalidValue;
     }
     return detail::launch_draw_skeleton_rgba_pitched(
-        {as_launch_surface(work.overlay), work.points, work.edges, work.color, work.thickness, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), work.points, work.edges, work.color, work.thickness, as_stream(work.stream), work.clip});
 }
 
 std::int32_t pack_bool_masks(const BoolMaskPackWork& work) noexcept {

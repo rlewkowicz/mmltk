@@ -51,6 +51,9 @@ class ImageCopyBackend {
                                   std::size_t source_pitch, const ImagePlaneView& destination) = 0;
     virtual void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) = 0;
     virtual void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) = 0;
+    // Notification is wake-only. The owner must settle the following stream
+    // boundary before releasing any callback or GPU resource custody.
+    virtual void NotifyStream(std::uintptr_t context, std::uintptr_t stream, std::function<void()>) = 0;
     using StreamSettlement = ImageStreamSettlement;
     [[nodiscard]] virtual StreamSettlement SettleStream(std::uintptr_t context, std::uintptr_t stream) noexcept = 0;
 };
@@ -102,6 +105,7 @@ class ImageStream final {
     // Completion event belongs to this stream's retained device context.
     void Record(std::uintptr_t event);
     void AwaitEvent(std::uintptr_t event);
+    void Notify(std::function<void()>);
     [[noreturn]] void RethrowAfterSettlement(std::exception_ptr);
     [[nodiscard]] std::uintptr_t native_handle() const noexcept { return stream_; }
 
@@ -251,6 +255,7 @@ class ImageProductBuffer final {
     [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     [[nodiscard]] bool DetachWorkspace(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
     void FinalizeWorkspace(ImageWorkspaceCoverage = {});
+    void CompleteWorkspace();
     friend class BorrowedImageProductReadView;
     friend class ImageStream;
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);

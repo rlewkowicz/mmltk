@@ -16,7 +16,10 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <functional>
+#include <future>
+#include <algorithm>
 #include <utility>
+#include <vector>
 
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/image_failure.h"
@@ -197,6 +200,29 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::atomic<std::size_t> staged_uploads{0U};
     bool peer_access = false;
     bool defer_events = false;
+    std::atomic_bool defer_notifications{false};
+    std::atomic_size_t workspace_finalizations{0U};
+    [[nodiscard]] std::future<void> ObserveNextNotification() {
+        auto observed = std::make_shared<std::promise<void>>();
+        auto result = observed->get_future();
+        std::scoped_lock lock(mutex_);
+        notification_observer_ = std::move(observed);
+        return result;
+    }
+    [[nodiscard]] std::unique_ptr<mmltk::testsupport::TestGate> HoldStreamSettlements(std::string name) {
+        auto gate = std::make_unique<mmltk::testsupport::TestGate>(std::move(name));
+        std::scoped_lock lock(mutex_);
+        settlement_gate_ = gate->receipt();
+        return gate;
+    }
+    void CompleteNotifications() {
+        std::vector<std::function<void()>> completed;
+        {
+            std::scoped_lock lock(mutex_);
+            completed.swap(notifications_);
+        }
+        for (auto& wake : completed) { try { wake(); } catch (...) {} }
+    }
 
     void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U, std::exception_ptr failure = {}) noexcept {
         failure_point_ = point;
@@ -362,7 +388,26 @@ class FakeImageBackend final : public ImageCopyBackend {
         MaybeFail(FailurePoint::SynchronizeEvent);
         Wait(event);
     }
+    void NotifyStream(std::uintptr_t, std::uintptr_t, std::function<void()> wake) override {
+        std::shared_ptr<std::promise<void>> observed;
+        bool deferred = false;
+        {
+            std::scoped_lock lock(mutex_);
+            observed = std::exchange(notification_observer_, {});
+            deferred = defer_notifications.load();
+            if (deferred) notifications_.push_back(std::move(wake));
+        }
+        if (!deferred) wake();
+        if (observed) observed->set_value();
+    }
     StreamSettlement SettleStream(const std::uintptr_t context, std::uintptr_t) noexcept override {
+        CompleteNotifications();
+        std::optional<mmltk::testsupport::TestGate::Receipt> gate;
+        {
+            std::scoped_lock lock(mutex_);
+            gate = settlement_gate_;
+        }
+        if (gate) gate->ArriveAndWait();
         try {
             MaybeFail(FailurePoint::Bind);
             CheckDeviceBinding(context);
@@ -413,6 +458,9 @@ class FakeImageBackend final : public ImageCopyBackend {
 
     std::atomic<std::uintptr_t> next_{1U};
     std::mutex mutex_;
+    std::vector<std::function<void()>> notifications_;
+    std::shared_ptr<std::promise<void>> notification_observer_;
+    std::optional<mmltk::testsupport::TestGate::Receipt> settlement_gate_;
     std::condition_variable event_ready_;
     std::mutex copy_mutex_;
     std::optional<mmltk::testsupport::TestGate::Receipt> copy_gate_;
@@ -427,11 +475,38 @@ class FakeImageBackend final : public ImageCopyBackend {
     std::exception_ptr device_binding_failure_;
 };
 
+[[nodiscard]] inline ImageWorkspaceFinalize FakeWorkspaceFinalizer(std::shared_ptr<FakeImageBackend> backend) {
+    return [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
+                                         ImageWorkspaceCoverage coverage, std::uintptr_t) {
+        ++backend->workspace_finalizations;
+        const auto draw = [&](ImageWorkspaceRegion region) {
+            for (auto y = std::max(0, region.y1); y < std::min(static_cast<int>(clean.descriptor.height), region.y2); ++y) {
+                for (auto x = std::max(0, region.x1); x < std::min(static_cast<int>(clean.descriptor.width), region.x2); ++x) {
+                    const auto* base = reinterpret_cast<const std::uint8_t*>(clean.data) + y * clean.descriptor.pitch_bytes + x * 4U;
+                    auto* pixel = reinterpret_cast<std::uint8_t*>(destination.data) + y * destination.descriptor.pitch_bytes + x * 4U;
+                    std::memcpy(pixel, base, 4U);
+                    if (!semantic.valid()) continue;
+                    const auto* overlay = reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
+                    if (overlay[3] == 0U) continue;
+                    const float alpha = static_cast<float>(overlay[3]) / 255.0F;
+                    for (unsigned channel = 0U; channel != 3U; ++channel)
+                        pixel[channel] = static_cast<std::uint8_t>(base[channel] * (1.0F - alpha) + overlay[channel] * alpha);
+                    pixel[3] = 255U;
+                }
+            }
+        };
+        if (coverage.full_image) draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
+        else for (auto region : coverage.regions) draw(region);
+    };
+}
+
 [[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(
     const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
-    std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U) {
+    std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U,
+    ImageWorkspaceFinalize finalize = {}) {
     return
-        [device, backend, layout, model = std::move(model), output_buffer_count](std::shared_ptr<ImageProductRevisionSequence> revisions) {
+        [device, backend, layout, model = std::move(model), output_buffer_count,
+         finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
             return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
                 .device = device,
                 .backend = backend,
@@ -439,6 +514,7 @@ class FakeImageBackend final : public ImageCopyBackend {
                 .input_layout = layout,
                 .output_layout = layout,
                 .output_buffer_count = output_buffer_count,
+                .workspace_finalize = finalize,
                 .product_revisions = std::move(revisions),
             });
         };

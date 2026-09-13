@@ -1,6 +1,7 @@
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <cuda.h>
 
 #include <atomic>
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <barrier>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -42,6 +44,7 @@
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 
 namespace mmltk::controller {
 namespace {
@@ -566,7 +569,8 @@ class BlockingInspectRuntime final : public DatasetRuntime {
 
 class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime, public PredictRuntime {
    public:
-    FakeComputeRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
+    FakeComputeRuntime(std::shared_ptr<StopGate> gate, const bool fail, std::shared_ptr<std::atomic_size_t> predictions = {})
+        : gate_(std::move(gate)), fail_(fail), predictions_(std::move(predictions)) {}
 
     contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ValidateRequest, const std::stop_token stop,
                                    const ComputeProgressSink& progress) override {
@@ -578,6 +582,7 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
     }
     PredictRuntime::Product Run(mmltk::backend::models::rfdetr::PredictRequest, const std::stop_token stop,
                                 const ComputeProgressSink& progress) override {
+        if (predictions_) ++*predictions_;
         auto terminal = RunImpl(stop, progress);
         if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded)
             return {.terminal = std::move(terminal), .extent = {}, .rgba = {}, .boxes = {}};
@@ -601,6 +606,7 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
 
     std::shared_ptr<StopGate> gate_;
     bool fail_ = false;
+    std::shared_ptr<std::atomic_size_t> predictions_;
 };
 
 class FakeDialogRuntime final : public FileDialogRuntime {
@@ -1372,6 +1378,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
 
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto predict_gate = std::make_shared<StopGate>();
+    auto predictions = std::make_shared<std::atomic_size_t>(0U);
     std::atomic_size_t constructions = 0U;
     std::promise<PredictSystem::event_type> predict_failed;
     std::promise<PredictSystem::event_type> predict_succeeded;
@@ -1383,7 +1390,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
                           {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
                           [&] {
                               const bool fail = constructions++ == 0U;
-                              return std::make_unique<FakeComputeRuntime>(predict_gate, fail);
+                              return std::make_unique<FakeComputeRuntime>(predict_gate, fail, predictions);
                           },
                           [&](PredictSystem::event_type event) {
                               if (std::holds_alternative<PredictProgress>(event)) return;
@@ -1410,6 +1417,71 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     CHECK(completed_observation > failed_observation);
     CHECK(predict.snapshot().frame.valid());
     REQUIRE(predict.BorrowFrame().valid());
+    {
+        namespace gpu = mmltk::frameworks::gpu;
+        gpu::test_support::VulkanWorkspaceFixture allocation(0, 4U, 4U);
+        gpu::DeviceContext display(0, gpu::cuda_image_copy_backend());
+        auto workspace = gpu::ImageWorkspace::Create(display, allocation.layout());
+        REQUIRE(workspace->QueueAllocation(allocation.Export()));
+        workspace->Admit(workspace->identity(), allocation.layout().device_incarnation);
+        const auto observed = predict.ObserveWorkspace();
+        const gpu::ImageWorkspaceContent expected{observed.product_owner, observed.product_revision};
+        REQUIRE(expected.valid());
+        auto raw = predict.BorrowFrame();
+        REQUIRE(raw.valid());
+        CHECK(raw.plane(0U).plane().allocation.owner == expected.owner);
+        CHECK(raw.plane(0U).revision() == expected.revision);
+        const auto source_calls = predictions->load();
+        const auto request = [&] {
+            auto ready = std::make_shared<std::promise<void>>();
+            auto result = ready->get_future();
+            predict.RequestWorkspace({.product_owner = expected.owner, .product_revision = expected.revision,
+                                      .destination = workspace, .ready = [ready] { ready->set_value(); }});
+            return result;
+        };
+        auto ready = request();
+        // The explicit raw receiver prevents preparation from taking exclusive
+        // allocation access. No settling API is called to force readiness.
+        CHECK_FALSE(workspace->Contains(expected));
+        CHECK_FALSE(predict.BorrowWorkspace().valid());
+        CHECK(ready.wait_for(std::chrono::seconds{0}) == std::future_status::timeout);
+        raw = {};
+        mmltk::testsupport::await_test_future(ready, "Predict native workspace completion");
+        REQUIRE(workspace->Contains(expected));
+        {
+            auto completed = predict.BorrowWorkspace();
+            REQUIRE(completed.valid());
+            CHECK(completed.identity() == workspace->identity());
+            CHECK(completed.revision() == expected.revision);
+            display.Bind();
+            std::array<std::uint8_t, 4U * 4U * 4U> pixels{};
+            const auto plane = completed.plane();
+            CUDA_MEMCPY2D copy{};
+            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.srcDevice = plane.data;
+            copy.srcPitch = plane.descriptor.pitch_bytes;
+            copy.dstMemoryType = CU_MEMORYTYPE_HOST;
+            copy.dstHost = pixels.data();
+            copy.dstPitch = 4U * 4U;
+            copy.WidthInBytes = 4U * 4U;
+            copy.Height = 4U;
+            REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
+            CHECK(std::ranges::all_of(pixels, [](auto value) { return value == 255U; }));
+        }
+        ready = request();
+        mmltk::testsupport::await_test_future(ready, "Predict retained workspace completion");
+        CHECK(predict.BorrowWorkspace().revision() == expected.revision);
+        CHECK(predict.ObserveWorkspace().product_owner == expected.owner);
+        CHECK(predict.snapshot().revision == completed_observation);
+        CHECK(predictions->load() == source_calls);
+        CHECK(constructions == 2U);
+        auto detached = std::make_shared<std::promise<void>>();
+        auto released = detached->get_future();
+        predict.RequestWorkspace({.detach_only = true, .destination = workspace,
+                                  .ready = [detached] { detached->set_value(); }});
+        mmltk::testsupport::await_test_future(released, "Predict workspace detach");
+        workspace.reset();
+    }
     predict_gate->Reset();
     const auto admitted = predict.Start({});
     CHECK(admitted.revision > completed_observation);

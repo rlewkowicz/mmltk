@@ -2694,13 +2694,22 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         REQUIRE(cuMemcpy2D(&copy) == CUDA_SUCCESS);
         CHECK(std::ranges::all_of(pixels, [](auto byte) { return byte == std::byte{37U}; }));
     };
-    REQUIRE(runtime.PrepareDisplay(completed.revision(), workspace));
+    const auto prepare = [&](const std::shared_ptr<ImageWorkspace>& target) {
+        if (!runtime.PrepareDisplay(runtime.OutputFacts().revision, target)) {
+            const auto settled = target->Settle();
+            REQUIRE(settled.completion_reached);
+            REQUIRE_FALSE(settled.failure);
+        }
+        REQUIRE(runtime.PrepareDisplay(runtime.OutputFacts().revision, target));
+    };
+    prepare(workspace);
     CHECK(runtime.Borrow().plane(0U).plane().data == raw);
     CHECK(runtime.BorrowWorkspace().plane().data != raw);
     CHECK(finalizations == 1U);
     check_pixels(runtime.BorrowWorkspace().plane(), display);
     completed = {};
     runtime.Publish(4U, 3U, fill);
+    prepare(workspace);
     CHECK(runtime.Borrow().plane(0U).plane().allocation.identity == workspace->identity());
     CHECK(finalizations == 1U);
     check_pixels(runtime.Borrow().plane(0U).plane(), runtime.Borrow().plane(0U).context());
@@ -2736,7 +2745,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK(runtime.OutputFacts().revision == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     fail_finalization = false;
-    REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), replacement));
+    prepare(replacement);
     CHECK(runtime.BorrowWorkspace().revision() == grown_revision);
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     CHECK(finalizations == 3U);
@@ -2746,12 +2755,93 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         auto remote = ImageWorkspace::Create(DeviceContext(1, cuda_image_copy_backend()), remote_layout);
         REQUIRE(remote->QueueAllocation(remote_allocation.Export()));
         remote->Admit(remote->identity(), remote_layout.device_incarnation);
-        REQUIRE(runtime.PrepareDisplay(runtime.Completed().revision(), remote));
+        prepare(remote);
         CHECK(runtime.BorrowWorkspace().layout().device == 1);
         CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
         CHECK(finalizations == 3U);
         CHECK(remote->StorageFootprint().device_bytes == remote->allocation_bytes());
     }
+}
+
+TEST_CASE("Asynchronous workspace finalization retains raw custody until the owner settles its notification", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+            test_support::CopyImagePlane(destination, clean);
+        }});
+    runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    const auto raw = runtime.ObserveWorkspace();
+    backend->defer_notifications = true;
+    CHECK_FALSE(runtime.PrepareDisplay(raw.product_revision, workspace));
+    CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
+    CHECK_FALSE(runtime.DetachDisplay(workspace));
+    auto baseline = runtime.Completed();
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    CHECK(runtime.Borrow().valid());
+    backend->CompleteNotifications();
+    CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
+    CHECK(backend->planes_freed == 0U);
+    runtime.CompleteWorkspaces();
+    REQUIRE(workspace->Contains({raw.product_owner, raw.product_revision}));
+    CHECK(*reinterpret_cast<const std::byte*>(runtime.BorrowWorkspace().plane().data) == std::byte{37});
+    CHECK(runtime.TryAcquireOutput(baseline).valid());
+    CHECK(runtime.PrepareDisplay(raw.product_revision, workspace));
+}
+
+TEST_CASE("Shutdown settles pending workspace finalization with allocation-local cleanup custody", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto workspace = ImageWorkspaceTestAccess::Create(backend, ImageWorkspaceTestAccess::Layout(0));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    auto observation = workspace->ObserveRetirement();
+    SystemImageRuntime runtime({.device = 0, .backend = backend,
+        .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+            test_support::CopyImagePlane(destination, clean);
+        }});
+    runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+    backend->defer_notifications = true;
+    CHECK_FALSE(runtime.PrepareDisplay(runtime.OutputFacts().revision, workspace));
+    REQUIRE(observation.TransferToProducer());
+    workspace.reset();
+    const auto retired = runtime.Retire();
+    CHECK(retired.safe_to_destroy);
+    CHECK_FALSE(retired.failure);
+    CHECK(observation.TakeResult().complete);
+    CHECK_FALSE(observation.TakeResult().claimed);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+
+TEST_CASE("Workspace damage accumulates skipped raw revisions for each display baseline", "[gpu][workspace]") {
+    ImageWorkspaceDamage damage;
+    const std::array<ImageWorkspaceRegion, 2U> first{{{2, 3, 5, 7}, {9, 10, 12, 15}}};
+    damage.Record({7U, 1U}, {});
+    damage.Record({7U, 3U}, {.regions = first, .full_image = false, .baseline = {7U, 1U}});
+    const ImageWorkspaceRegion second{20, 1, 25, 4};
+    damage.Record({7U, 8U}, {.regions = {&second, 1U}, .full_image = false, .baseline = {7U, 3U}});
+    const auto older = damage.Since({7U, 1U}, {7U, 8U}, 101U);
+    REQUIRE_FALSE(older.full_image);
+    REQUIRE(older.regions.size() == 1U);
+    CHECK(older.allocation_identity == 101U);
+    CHECK(older.regions.front() == ImageWorkspaceRegion{2, 1, 25, 15});
+    const auto newer = damage.Since({7U, 3U}, {7U, 8U}, 102U);
+    REQUIRE_FALSE(newer.full_image);
+    CHECK(newer.regions.front() == second);
+    CHECK(damage.Since({9U, 3U}, {7U, 8U}, 102U).full_image);
+    CHECK(damage.Since({7U, 2U}, {7U, 8U}, 102U).full_image);
+    damage.Record({7U, 9U}, {});
+    CHECK(damage.Since({7U, 8U}, {7U, 9U}, 102U).full_image);
+    for (std::uint64_t revision = 10U; revision != 100U; ++revision)
+        damage.Record({7U, revision}, {.regions = {&second, 1U}, .full_image = false, .baseline = {7U, revision - 1U}});
+    CHECK(damage.Since({7U, 9U}, {7U, 99U}, 102U).full_image);
+    CHECK_FALSE(damage.Since({7U, 98U}, {7U, 99U}, 102U).full_image);
 }
 
 }  // namespace

@@ -210,6 +210,8 @@ struct ManualMaskRunsRgbaPitchedLaunch {
     std::uint32_t run_count = 0;
     RgbaColorU8 color;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
+    float source_x = 0, source_y = 0, target_x = 0, target_y = 0, scale_x = 1, scale_y = 1;
 };
 
 struct BoxOutlineRgbaPitchedLaunch {
@@ -218,6 +220,7 @@ struct BoxOutlineRgbaPitchedLaunch {
     RgbColorU8 color;
     int thickness = 1;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct SelectionHandlesRgbaPitchedLaunch {
@@ -226,6 +229,7 @@ struct SelectionHandlesRgbaPitchedLaunch {
     int handle_radius = 1;
     RgbaColorU8 color;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct PolylineRgbaPitchedLaunch {
@@ -235,6 +239,7 @@ struct PolylineRgbaPitchedLaunch {
     RgbColorU8 color;
     int thickness = 1;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct PointsRgbaPitchedLaunch {
@@ -243,6 +248,7 @@ struct PointsRgbaPitchedLaunch {
     int radius = 1;
     RgbaColorU8 color;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 struct SkeletonRgbaPitchedLaunch {
@@ -252,6 +258,7 @@ struct SkeletonRgbaPitchedLaunch {
     RgbColorU8 color;
     int thickness = 1;
     cudaStream_t stream = nullptr;
+    IntRect clip{0, 0, 2147483647, 2147483647};
 };
 
 }  // namespace draw_launch

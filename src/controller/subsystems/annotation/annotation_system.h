@@ -111,10 +111,13 @@ struct AnnotationEditRequest final {
 };
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
+    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
+        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const { return {}; }
     ~AnnotationAlgorithm() override = default;
     virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion) = 0;
     [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
-    // A missing source preserves the initialized clean plane; semantics are replaced completely.
+    // Source is the retained immutable document baseline. The algorithm owns
+    // allocation-local initialization, damage and reusable raster inputs.
     virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source,
                         mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
                         std::uintptr_t stream) const = 0;

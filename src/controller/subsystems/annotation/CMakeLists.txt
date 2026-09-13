@@ -47,7 +47,8 @@ function(mmltk_add_controller_annotation_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_document.test.cpp)
     target_link_libraries(mmltk_controller_annotation_tests PRIVATE
         mmltk_acceptance_support
-        mmltk::controller::annotation_system)
+        mmltk::controller::annotation_system
+        mmltk::controller::visual_runtime)
     catch_discover_tests(
         mmltk_controller_annotation_tests
         TEST_PREFIX "controller::annotation::"

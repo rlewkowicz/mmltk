@@ -101,7 +101,8 @@ class ImageProductPool final {
     void Publish(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
     // Writes only this candidate's existing storage. The callback receives
     // exact post-growth allocation facts and initializes newly acquired regions.
-    void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit);
+    void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit,
+                         ImageSubmission = ImageSubmission::Complete);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
     [[nodiscard]] bool PrepareDisplay(ImageStream&, std::uint64_t, const std::shared_ptr<ImageWorkspace>&, ImageWorkspaceFinalize);
@@ -110,6 +111,7 @@ class ImageProductPool final {
     // pixels; the completed product revision and raw plane addresses stay intact.
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     void FinalizeWorkspace(Candidate&, ImageWorkspaceCoverage);
+    void CompleteWorkspaces();
     [[nodiscard]] ImageStreamSettlement SettleWorkspaces() noexcept;
     // Existing shared product/plane leases own delayed release. Counted
     // completion objects retain those leases beyond their GPU callback.

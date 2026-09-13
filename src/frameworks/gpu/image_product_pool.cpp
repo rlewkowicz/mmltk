@@ -254,10 +254,9 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
     candidate.revision_ = revision;
 }
 void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                                       const std::uint64_t revision, ImageProductBuffer::ProductSubmit submit) {
-    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U ||
-        candidate.baseline_.slot_)
-        throw std::invalid_argument("retained image candidate is invalid or has a copy baseline");
+                                       const std::uint64_t revision, ImageProductBuffer::ProductSubmit submit, ImageSubmission submission) {
+    if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)
+        throw std::invalid_argument("retained image candidate is invalid");
     if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
     auto& slot = *candidate.slot_;
     if (slot.buffer.terminal() || !slot.buffer.writable()) throw std::runtime_error("retained image candidate is unavailable");
@@ -268,7 +267,7 @@ void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate
     }
     try {
         slot.buffer.PublishAs(stream, width, height, revision, false, std::move(submit));
-        stream.Synchronize();
+        if (submission == ImageSubmission::Complete) stream.Synchronize();
     } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
     candidate.revision_ = revision;
 }
@@ -312,9 +311,16 @@ bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<
                                         ImageWorkspaceFinalize finalize) {
     ValidateBaseline(product);
     if (!product.valid()) throw std::invalid_argument("workspace product is unavailable");
+    product.slot_->buffer.CompleteWorkspace();
+    const auto current = product.slot_->buffer.ObserveWorkspace();
+    if (current.workspace == workspace) {
+        product.slot_->buffer.FinalizeWorkspace();
+        return workspace->Contains({current.product_owner, current.product_revision});
+    }
     if (!product.slot_->buffer.ConfigureWorkspace(std::move(workspace), std::move(finalize))) return false;
     product.slot_->buffer.FinalizeWorkspace();
-    return true;
+    const auto completed = product.slot_->buffer.ObserveWorkspace();
+    return completed.workspace && completed.workspace->Contains({completed.product_owner, completed.product_revision});
 }
 BorrowedImageWorkspace ImageProductPool::BorrowWorkspace() const {
     std::unique_lock lock(admission_->mutex, std::try_to_lock);
@@ -327,6 +333,9 @@ void ImageProductPool::FinalizeWorkspace(Candidate& candidate, ImageWorkspaceCov
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ == 0U)
         throw std::invalid_argument("workspace candidate has no completed raw product");
     candidate.slot_->buffer.FinalizeWorkspace(coverage);
+}
+void ImageProductPool::CompleteWorkspaces() {
+    for (const auto& slot : slots_) slot->buffer.CompleteWorkspace();
 }
 ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
     ImageStreamSettlement result{.completion_reached = true};

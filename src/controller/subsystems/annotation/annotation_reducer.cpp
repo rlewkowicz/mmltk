@@ -100,6 +100,7 @@ struct DocumentState final {
     std::uint64_t next_identity = 1U;
     PointerFacts pointer{};
     domain::AnnotationObject brush;
+    MaskRows brush_rows;
     domain::AnnotationObject preview;
     MaskScratch mask_scratch;
     std::deque<JournalEntry> undo{};
@@ -636,13 +637,8 @@ void drag_object(domain::AnnotationObject& object, const domain::AnnotationPoint
     } else if (target.role == domain::AnnotationHandleRole::Point)
         object.point = point;
     else if (target.role == domain::AnnotationHandleRole::SplineKnot) {
-        auto& knot = object.spline_knots[*target.element];
-        const float dx = point.x - knot.point.x, dy = point.y - knot.point.y;
-        for (auto* handle : {&knot.in, &knot.out}) {
-            handle->point.x = std::clamp(handle->point.x + dx, 0.0F, static_cast<float>(scene.frame_width));
-            handle->point.y = std::clamp(handle->point.y + dy, 0.0F, static_cast<float>(scene.frame_height));
-        }
-        knot.point = point;
+        object.spline_knots[*target.element] =
+            annotation_drag_knot(object.spline_knots[*target.element], {target, origin, point}, scene);
     } else if (target.role == domain::AnnotationHandleRole::SplineInHandle || target.role == domain::AnnotationHandleRole::SplineOutHandle)
         set_spline_handle(object.spline_knots[*target.element], *target.role, point, scene);
     else if (target.role == domain::AnnotationHandleRole::SkeletonNode)
@@ -671,9 +667,6 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         pointer.preview = true;
     } else if ((pointer.action == AnnotationPointerAction::Select || pointer.action == AnnotationPointerAction::HandleDrag) &&
                pointer.target.object) {
-        auto& object = state.preview;
-        object = state.ui.scene.objects[*pointer.target.object];
-        drag_object(object, pointer.target, pointer.origin, point, state.ui.scene, state.mask_scratch);
         pointer.preview = true;
     }
 }
@@ -740,8 +733,10 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 state.pointer = {};
                 return refused(state);
             }
-            stroke_mask(brush, request.point, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
-                        tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+            state.brush_rows.Assign(brush);
+            brush.mask.runs.clear();
+            state.brush_rows.Stroke(request.point, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
+                                    tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
             state.pointer.brush = true;
         }
         update_drag_preview(state, request.point);
@@ -755,8 +750,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         }
         const bool changed = state.pointer.latest != request.point || state.pointer.brush_radius != brush_radius;
         if (state.pointer.brush && changed)
-            stroke_mask(state.brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
-                        state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+            state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
+                                   state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
         if (changed) update_drag_preview(state, request.point);
         state.pointer.latest = request.point;
         state.pointer.sequence = request.sequence;
@@ -779,9 +774,11 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     const auto target = state.pointer.target;
     const auto created_identity = state.pointer.created_identity;
     auto* brush = state.pointer.brush ? &state.brush : nullptr;
-    if (brush)
-        stroke_mask(*brush, state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
-                    tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+    if (brush) {
+        state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
+                               tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+        state.brush_rows.Materialize(*brush);
+    }
     state.pointer = {};
     const auto& scene = state.ui.scene;
     switch (action) {
@@ -1396,10 +1393,20 @@ class AnnotationDocument::Impl final {
         target.editor = state_.ui.editor;
         target.scene_revision = state_.ui.scene_revision;
         target.preview_object.reset();
+        target.drag.reset();
+        target.brush_rows.reset();
+        target.preview_materialized = false;
         target.preview_identity = state_.pointer.created_identity;
         if (state_.pointer.brush || state_.pointer.preview) {
             target.preview_object = state_.pointer.target.object.value_or(static_cast<std::uint16_t>(state_.ui.scene.objects.size()));
-            target.preview = state_.pointer.brush ? state_.brush : state_.preview;
+            if (state_.pointer.brush) {
+                target.preview = state_.brush;
+                target.brush_rows = state_.brush_rows;
+            } else if (state_.pointer.target.object) {
+                target.drag = AnnotationDragPreview{state_.pointer.target, state_.pointer.origin, state_.pointer.latest};
+            } else {
+                target.preview = state_.preview;
+            }
         }
     }
 
@@ -1481,3 +1488,25 @@ bool AnnotationDocument::ToolAvailable(domain::AnnotationTool tool, std::optiona
 void AnnotationDocument::CaptureRender(AnnotationRenderState& target) { impl_->CaptureRender(target); }
 
 }  // namespace mmltk::controller::subsystems::annotation
+
+namespace mmltk::controller {
+contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSplineKnot knot, const AnnotationDragPreview& drag,
+                                                     const contracts::AnnotationSceneContent& scene) {
+    if (drag.target.role == contracts::AnnotationHandleRole::SplineKnot) {
+        const float dx = drag.point.x - knot.point.x, dy = drag.point.y - knot.point.y;
+        for (auto* handle : {&knot.in, &knot.out}) {
+            handle->point.x = std::clamp(handle->point.x + dx, 0.0F, static_cast<float>(scene.frame_width));
+            handle->point.y = std::clamp(handle->point.y + dy, 0.0F, static_cast<float>(scene.frame_height));
+        }
+        knot.point = drag.point;
+    } else if (drag.target.role == contracts::AnnotationHandleRole::SplineInHandle ||
+               drag.target.role == contracts::AnnotationHandleRole::SplineOutHandle) {
+        subsystems::annotation::set_spline_handle(knot, *drag.target.role, drag.point, scene);
+    }
+    return knot;
+}
+void materialize_annotation_drag(contracts::AnnotationObject& object, const AnnotationDragPreview& drag,
+                                 const contracts::AnnotationSceneContent& scene, subsystems::annotation::MaskScratch& scratch) {
+    subsystems::annotation::drag_object(object, drag.target, drag.origin, drag.point, scene, scratch);
+}
+}  // namespace mmltk::controller
