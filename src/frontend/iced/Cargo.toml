@@ -32,6 +32,7 @@ iced_runtime = { path = "../../../third_party/iced/runtime" }
 iced = { path = "../../../third_party/iced", default-features = false, features = ["advanced", "fira-sans", "thread-pool", "wayland", "web-colors", "wgpu-bare"] }
 iced-fluent-theme = { path = "../../../third_party/iced-fluent-theme" }
 iced_aw = { path = "../../../third_party/iced_aw", default-features = false, features = ["number_input", "selection_list"] }
+wgpu = { version = "29", default-features = false, features = ["std", "wgsl", "vulkan"] }
 
 [profile.release]
 codegen-units = 1
