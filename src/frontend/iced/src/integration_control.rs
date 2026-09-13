@@ -50,10 +50,6 @@ pub(crate) fn notify_driver_draw(
     let _ = (control, source_revision, presentation_revision);
 }
 
-pub(crate) fn repeated_redraws_enabled() -> bool {
-    !COMPLETION_WITHOUT_INPUT.with(std::cell::Cell::get)
-}
-
 const TRAIN_CARD: &str = train::DATASET_CARD_ID;
 const COMPILE_DATASET: &str = train::COMPILE_DATASET_ID;
 const DATASET_STATUS: &str = train::DATASET_STATUS_ID;
@@ -279,6 +275,8 @@ const SETTINGS_GROUPS: [&str; 3] = [
     "settings.group.environment",
 ];
 const SETTINGS_SHOW_FPS: &str = "settings.show_fps";
+const WORKSPACE_FPS_PIXEL_FAILURE: &str =
+    "Workspace FPS screenshot did not contain its upper-right counter background and text";
 const SETTINGS_NUMERIC_CONTROLS: [&str; 5] = [
     "settings.ui_scale",
     "settings.font_size",
@@ -299,6 +297,11 @@ const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    WorkspaceFpsDrawn(reporting::FpsEvidence),
+    WorkspaceFpsScreenshot {
+        generation: u64,
+        image: iced::window::Screenshot,
+    },
     Scoped {
         generation: u64,
         receipt: Option<ProbeReceipt>,
@@ -520,6 +523,32 @@ struct SurfaceDrawObserver {
     atlas: Option<AtlasDraw>,
     atlas_pixels_owner: Option<std::sync::Arc<()>>,
     atlas_composition_owner: Option<std::sync::Arc<()>>,
+    fps_sample: Option<iced::time::Instant>,
+}
+
+pub(crate) fn report_workspace_fps(
+    control: &'static str,
+    meter: &crate::workspace_fps::Meter,
+    bounds: Rectangle,
+    clip: Rectangle,
+    dark: bool,
+) {
+    if !reporting_enabled() || meter.frames == 0 || meter.seconds < 0.5 {
+        return;
+    }
+    SURFACE_DRAW_OBSERVER.with(|observer| {
+        let mut observer = observer.borrow_mut();
+        if observer.fps_sample == Some(meter.sample_time()) { return; }
+        let evidence = reporting::FpsEvidence {
+            bounds, clip, dark, frames: meter.frames, seconds: meter.seconds,
+        };
+        if let Some(output) = observer.output_for(control)
+            && output.try_send(Message::WorkspaceFpsDrawn(evidence)).is_ok()
+        {
+            observer.fps_sample = Some(meter.sample_time());
+            reporting::workspace_fps(control, meter, evidence);
+        }
+    });
 }
 
 impl SurfaceDrawObserver {
@@ -1985,6 +2014,10 @@ fn click_after_surface_draw(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
+    AwaitWorkspaceFps,
+    AwaitWorkspaceFpsScreenshot,
+    RestoreWorkspaceFps,
+    AwaitWorkspaceFpsRestored,
     Disabled,
     AtlasPixelColumns(u32),
     AtlasPixelRestore,
@@ -2684,6 +2717,10 @@ pub struct Controller {
     atlas_fixture_boxes: bool,
     spinner_baseline: f64,
     show_fps_baseline: bool,
+    workspace_fps_baseline: bool,
+    workspace_fps_verified: bool,
+    workspace_fps_evidence: Option<reporting::FpsEvidence>,
+    workspace_fps_failure: Option<&'static str>,
     benchmark_baseline: bool,
     settings_revision: u64,
     numeric_target: f64,
@@ -2849,6 +2886,10 @@ impl Controller {
             atlas_fixture_boxes: false,
             spinner_baseline: 0.0,
             show_fps_baseline: false,
+            workspace_fps_baseline: false,
+            workspace_fps_verified: false,
+            workspace_fps_evidence: None,
+            workspace_fps_failure: None,
             benchmark_baseline: false,
             settings_revision: 0,
             numeric_target: 0.0,
@@ -3418,6 +3459,8 @@ impl Controller {
             return false;
         }
         match message {
+            Message::WorkspaceFpsScreenshot { generation, .. } =>
+                *generation == self.generation && self.phase == Phase::AwaitWorkspaceFpsScreenshot,
             Message::Scoped {
                 generation,
                 receipt,
@@ -3482,6 +3525,19 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
+            Message::WorkspaceFpsDrawn(evidence) => {
+                if self.phase == Phase::AwaitWorkspaceFps {
+                    self.workspace_fps_evidence = Some(evidence);
+                }
+                return None;
+            }
+            Message::WorkspaceFpsScreenshot { image, .. } => {
+                let Some(evidence) = self.workspace_fps_evidence else { return None; };
+                self.workspace_fps_failure = (!reporting::verify_workspace_fps_pixels(&image, evidence))
+                    .then_some(WORKSPACE_FPS_PIXEL_FAILURE);
+                self.phase = Phase::RestoreWorkspaceFps;
+                return None;
+            }
             Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {
                 return None;
             }
@@ -4872,6 +4928,40 @@ impl Controller {
             return Task::none();
         }
         match self.phase.clone() {
+            Phase::AwaitWorkspaceFps => {
+                if self.workspace_fps_evidence.is_none()
+                    || settings.has_local_edits()
+                    || model.native_settings_unsettled()
+                    || !crate::workspace_fps::enabled(settings)
+                {
+                    return Task::none();
+                }
+                self.phase = Phase::AwaitWorkspaceFpsScreenshot;
+                let generation = self.generation;
+                iced::window::latest().and_then(iced::window::screenshot).map(move |image| {
+                    RootMessage::Integration(Message::WorkspaceFpsScreenshot { generation, image })
+                })
+            }
+            Phase::RestoreWorkspaceFps => {
+                self.phase = Phase::AwaitWorkspaceFpsRestored;
+                Task::done(RootMessage::Settings(crate::view::settings::Message::PerformanceChanged(
+                    self.workspace_fps_baseline,
+                )))
+            }
+            Phase::AwaitWorkspaceFpsRestored
+                if !settings.has_local_edits() && !model.native_settings_unsettled()
+                    && crate::workspace_fps::enabled(settings) == self.workspace_fps_baseline
+                    && model.settings_snapshot.as_ref().is_some_and(|snapshot|
+                        snapshot.settingsstate.ui.showworkspaceperformance == self.workspace_fps_baseline) =>
+            {
+                if let Some(failure) = self.workspace_fps_failure {
+                    self.fail(failure);
+                    Task::none()
+                } else {
+                    self.workspace_fps_verified = true;
+                    self.advance_to(Phase::AwaitExploreReady)
+                }
+            }
             Phase::AtlasPixelColumns(columns) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -6156,6 +6246,15 @@ impl Controller {
                         .chain(explore_message(
                             explore::Message::Gallery(explore::gallery::Message::ColumnsChanged(4)),
                         ));
+                    }
+                    if reporting_enabled() && !self.workspace_fps_verified {
+                        self.workspace_fps_baseline = crate::workspace_fps::enabled(settings);
+                        self.workspace_fps_evidence = None;
+                        self.workspace_fps_failure = None;
+                        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().fps_sample = None);
+                        self.phase = Phase::AwaitWorkspaceFps;
+                        return Task::done(RootMessage::Settings(
+                            crate::view::settings::Message::PerformanceChanged(true)));
                     }
                     if !self.viewer_scenario.is_empty() {
                         self.selection_grid = Some((
@@ -9507,6 +9606,58 @@ mod tests {
             SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
             initialize_reporting(false, false);
         }
+    }
+
+    #[test]
+    fn recoverable_fps_pixel_failure_restores_and_settles_the_prior_setting() {
+        use iced::futures::StreamExt;
+        let mut fixture = ProbeFixture::new("square");
+        let mut model = crate::view_model::test_support::bootstrapped();
+        model.settings_snapshot.as_mut().unwrap().settingsstate.ui.showworkspaceperformance = true;
+        let mut settings = crate::view::settings::SettingsModel::default();
+        settings.install(model.settings_snapshot.as_ref().unwrap());
+        let router = crate::view::router::Router::default();
+        let driver = &mut fixture.controller;
+        driver.workspace_fps_baseline = false;
+        driver.workspace_fps_evidence = Some(reporting::FpsEvidence {
+            bounds: fixture.bounds, clip: fixture.bounds, dark: false, frames: 30, seconds: 0.5,
+        });
+        driver.phase = Phase::AwaitWorkspaceFpsScreenshot;
+        driver.update(Message::WorkspaceFpsScreenshot {
+            generation: driver.generation,
+            image: iced::window::Screenshot::new(vec![0; 4], iced::Size::new(1, 1), 1.0),
+        });
+        assert_eq!(driver.phase, Phase::RestoreWorkspaceFps);
+        assert_eq!(driver.workspace_fps_failure, Some(WORKSPACE_FPS_PIXEL_FAILURE));
+        assert_eq!(driver.failure_line, 0);
+        let task = driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None);
+        let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        let action = iced::futures::executor::block_on(actions.next()).unwrap();
+        let iced_runtime::Action::Output(RootMessage::Settings(message)) = action else {
+            panic!("FPS cleanup must use the ordinary settings mutation");
+        };
+        assert!(matches!(message, crate::view::settings::Message::PerformanceChanged(false)));
+        let outcome = crate::view::settings::update(&mut settings, message).unwrap();
+        assert!(matches!(outcome, Some(crate::view::settings::Outcome::SettingsEdited(
+            crate::view::settings::EditSchedule::Debounce(_)))));
+        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+        assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+        let request = settings.take_request().expect("canonical restoration request");
+        assert_eq!(request.updates.len(), 1);
+        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+        assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+        assert_eq!(driver.failure_line, 0);
+        let authoritative = model.settings_snapshot.as_mut().unwrap();
+        authoritative.revision += 1;
+        authoritative.settingsstate.ui.showworkspaceperformance = false;
+        settings.settle_success(authoritative);
+        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+        assert!(!crate::workspace_fps::enabled(&settings));
+        assert!(!model.settings_snapshot.as_ref().unwrap().settingsstate.ui.showworkspaceperformance);
+        assert_eq!(driver.phase, Phase::Failed);
+        assert_eq!(driver.workspace_fps_failure, Some(WORKSPACE_FPS_PIXEL_FAILURE));
+        assert!(driver.failure_line != 0);
+        assert!(!driver.workspace_fps_verified);
     }
 
     #[test]

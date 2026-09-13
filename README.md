@@ -1,39 +1,36 @@
 # Multi Model Loader Toolkit
 
-A real-time interface for training, prediction, annotation, augmentation, and composition of popular open-source models.
+A real time interface for training, prediction, annotation, augmentation, and composition of popular open source models.
 
 ## Current State
 
 ### Questionable License
 
-PyTorch and CUDA take many, many hours to build. NVIDIA publishes a container with PyTorch and CUDA under its own terms. I do not want to build PyTorch and CUDA in this repo. So I pull a pinned version of their container, and I take just the selected binaries this repo needs. Our development and runtime images are built independently on Ubuntu 24.04; NVIDIA's image is the binary donor. I'm not sure what that means for the licensing questions. Things would get weird really fast.
+Pytorch and Cuda take many many hours to build. Nvidia publishes a container with the latest pytorch and cuda, but it is licensed, so I cannot redistribute it. I do not want to build pytorch and cuda in this repo. So I pull their container, and I take just the selected binaries this repo needs. Our development and runtime images are built independently on Ubuntu 24.04; Nvidia's image is the binary donor. I'm not sure what that means. You can't claim the binaries are licensed if they are not licensed in the pytorch container. Things would get weird really fast.
 
-I'm going to implement YOLO26. I still have questions about how the upstream licensing applies to a native implementation. [SAM3](https://github.com/facebookresearch/sam3/blob/main/LICENSE), for example, has its own license to work through. IANAL (UANAL?), so who knows. I'm more of a birdlaw guy. My instinct is still "they can kick rocks" (I love Ultralytics and think they gave a TON to the community; I just mean that colloquially).
+I'm going to implement yolo26. Glenn is very protective and broadly interprets that GPLv3. This project is open source so it does not affect me in a sense because my modifications are public. [SAM3](https://github.com/facebookresearch/sam3/blob/main/LICENSE) for example, licenses their algorithms. It's explicit. IANAL (UANAL?) so who knows. I'm more of a birdlaw guy. But ultralytics license covers the code. This is C++. So I'm pretty sure they can kick rocks (I love ultralytics, and think they gave a TON to the community, I just mean that colloquially).
 
-I do my best to respect and post licenses. I post my code under the Apache license. So if I claim a thing, and then they claim a thing, can they claim a thing against you if you use my thing?
+I do my best to respect and post licenses. I just post my code as apache license. So if I claim a thing, and then they claim a thing, can they claim a thing against you if you use my thing?   
 
 ### OS Compatibility
 
-This is designed for CUDA and Linux only. The optimizations are built around CUDA and Linux-specific systems, and the GUI requires Wayland. Windows, WSL, and macOS are outside the supported and validated platform. It's my opinion that if you're going to be in this space, use Linux. Until everyone catches up, we're on CUDA.
+This is designed to be cuda and linux only. The massive performance gains come from targeted optimizations built around cuda and linux specific systems. You can try mac or windows, but I have not tested it. Windows does have WSL, but you're losing 30% performance and graphics memory to WDM anyway. Mac has Rosetta, but that's always had tenuous functionality. It's my opinion if you're going to be in this space, use linux and until everyone catches up, we're on cuda.
 
 ### CLI/RF-DETR
 
-RF-DETR aims for mathematical equivalence with the official Python repo. Hungarian matching uses a native rectangular assignment solver. Some functionality differs, such as seeded experiments. All of the SOTA object detection plays games with that anyway, and I don't feel that raw mAP is an indicator of functional training. I don't think anyone is training on COCO alone and publishing that mAP. There are libraries that autotune hyperparameters, custom datasets, etc. Chasing a peak benchmark is not indicative of general real-world training and execution performance.
+Should be 100% mathematically equivalent to the official python repo. Things like hungarian matching actually use scipys underlying C. Some of the functionality is not. Such as seeded experiments etc. All of the SOTA object detection plays games with that anyway, and I don't feel that raw MAP is an indicator of functional training. I don't think anyone is training on COCO alone and publishing that map. There's libraries that will autotune hyps, they have custom datasets etc. Chasing a peak benchmark is not indicative of general real world performance of training and execution.
 
 ### GUI
 
-The GUI is a highly custom Firefox app shell with a Rust UI built on Iced. Ancillary features such as crash reporting, telemetry, WebRTC, and various third-party assets have been pruned from the owned runtime. Compilation publishes the native reflected browser contract, and logical controls communicate typed intents to the native backend over a session-bound WebSocket.
+The GUI is a highly custom Firefox app shell with a Rust UI built on iced. Most ancillary features such as crash reporting, telemetry, WebRTC, and various third-party assets have been pruned entirely. Part of compilation publishes the audited native reflected browser contract, and logical controls communicate typed intents to the native backend over a session-bound WebSocket.
 
-Iced owns the interface, scrolling, layout, and pan/zoom. Native systems own image processing, annotations, augmentation, neural restoration, and final display production. Annotation consumes editing input independently of GPU rendering. Firefox allocates shared Vulkan workspaces that native CUDA fills; Iced samples them directly when the device and layout support it, otherwise Firefox makes one GPU copy into reusable sample storage. Display runs through WebGPU/Vulkan and Wayland. See [GUI interaction and presentation](docs/gui-interaction.md) for input ordering, reusable buffers, image custody, and redraw behavior.
+The graphics responsibility is deliberately split. iced/WebGPU owns latency-sensitive presentation work that does not modify the native product: scrolling, responsive layout, hit testing, atlas UV offsets, and detail pan/zoom. The native CUDA systems own compiled-tensor access, pinned gathers, augmentation, resampling, image and annotation products, and neural restoration. Iced draws text labels from the native annotation facts. Each producer keeps its working images private. `PresentationSystem` borrows a typed read view, performs one receiver-owned GPU copy and final composition, waits for that work to complete, and publishes only its own persistent exported backbuffer. Firefox imports that backbuffer for WebGPU/Vulkan composition and Wayland presentation. Browser image delivery stays on the GPU; typed CBOR/WebSocket messages carry application control and state. Iced view transforms reuse the completed browser image.
 
-Explore retains individual GPU thumbnails and the gallery while you visit an image. Scrolling prioritizes visible rows, then four rows ahead and four behind. Returning to the gallery reuses ready tiles and resumes unfinished work.
-
-Diagnostics and pixel probes are off during an ordinary `./mmltk --gui` run.
-Use the [logging guide](docs/logging.md) to capture a reproduction explicitly.
+The independent C++ systems architecture and its failure, shutdown, and GPU resource rules are documented in [CONTRACT.md](CONTRACT.md).
 
 ## Third Party and AI Development Workflows
 
-`third_party` contains aggressively modified upstreams. This project would not exist without AI, but at the same time you can't just say "One high quality C++ plz 🙏". There are a number of workflows this repo leans on to ensure proper class structure, reduced LOC, broadly DRY code, and C++ best practices. First-party code goes through both cross-file and within-file deduplication, as well as the configured static analysis suites.
+Third party contains aggressively modified upstreams. This project would not exist without AI, but at the same time you can't just say "One high quality C++ plz 🙏". There's a number of workflows this repo leans on to ensure proper class structure, reduced LOC, broadly DRY code, and best practices C++. All code goes through both cross file and within file deduplication, as well as the configured static analysis suites.
 
 ## Build
 

@@ -1,4 +1,4 @@
-use super::{PlacementGeometry, Program, Surface, ViewportOwner, placement_geometry};
+use super::{PlacementGeometry, Program, Surface, WorkspaceViewport, placement_geometry};
 use crate::fluent_theme::{Element, Theme};
 use iced::advanced::Renderer as _;
 use iced::advanced::text::Renderer as _;
@@ -95,6 +95,8 @@ pub(crate) fn view<'a, Message: 'a>(
     let surface = program.surface;
     let placement = program.placement;
     let transform_surface = program.surface;
+    let show_fps = program.show_fps;
+    let control_id = program.control_id;
     Element::new(Labelled {
         child: iced::widget::shader(program)
             .width(Fill)
@@ -104,6 +106,8 @@ pub(crate) fn view<'a, Message: 'a>(
         transform_surface,
         placement,
         source,
+        show_fps,
+        control_id,
     })
 }
 
@@ -113,6 +117,8 @@ struct Labelled<'a, Message> {
     transform_surface: Surface,
     placement: super::Placement,
     source: Source,
+    show_fps: bool,
+    control_id: &'static str,
 }
 
 impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
@@ -151,6 +157,13 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             shell,
             viewport,
         );
+        // The visible browser window drives retained draws independently of
+        // native content, optional FPS, and troubleshooting activation.
+        if matches!(event, Event::Window(iced::window::Event::RedrawRequested(_)))
+            && layout.bounds().intersection(viewport).is_some_and(|clip| clip.width > 0.0 && clip.height > 0.0)
+        {
+            shell.request_redraw();
+        }
     }
     fn mouse_interaction(
         &self,
@@ -187,7 +200,27 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             cursor,
             viewport,
         );
-        let state = tree.children[0].state.downcast_ref::<ViewportOwner>();
+        let state = tree.children[0].state.downcast_ref::<WorkspaceViewport>();
+        self.draw_labels(state, renderer, theme, layout, viewport);
+        if self.show_fps
+            && let Some(meter) = &state.fps
+            && let Some(clip) = layout.bounds().intersection(viewport)
+        {
+            crate::workspace_fps::draw(renderer, theme, meter, clip, self.control_id);
+        }
+    }
+}
+
+impl<Message> Labelled<'_, Message> {
+    fn draw_labels(
+        &self,
+        state: &WorkspaceViewport,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        layout: Layout<'_>,
+        viewport: &Rectangle,
+    ) {
+        if matches!(self.source, Source::Hidden) { return; }
         let mut bounds = layout.bounds();
         let mut placement = self.placement;
         if let Source::Gallery(snapshot) = &self.source {
@@ -198,7 +231,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             bounds,
             self.surface.content_extent(),
             placement,
-            state.transform_for(self.transform_surface),
+            state.viewport.transform_for(self.transform_surface),
         ) else {
             return;
         };
@@ -215,7 +248,7 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
         else {
             return;
         };
-        super::gallery::observe(None, crate::fluent_theme::conformance(theme).dark);
+        super::gallery::observe_theme(theme);
         let mut region = self.surface.content_region();
         if matches!(self.source, Source::Gallery(_)) {
             let extent = placement.logical_extent(self.surface.content_extent());
@@ -294,6 +327,101 @@ pub(crate) fn class_color(color: &crate::generated::AnnotationColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labelled_workspace_retains_the_actual_shader_pan_zoom_and_fps_state() {
+        use iced::advanced::renderer::Headless;
+        super::super::reset_test_releases();
+        let (mut model, frame) = crate::view_model::test_support::explore_presentation();
+        let snapshot = model.explore.snapshot.as_mut().unwrap();
+        snapshot.scene.categories = vec![crate::generated::ArtifactClassName { value: "person".into() }];
+        snapshot.scene.palette = vec![crate::generated::AnnotationColor {
+            hue: 120.0, saturation: 1.0, value: 0.8,
+        }];
+        snapshot.overlay.showlabels = true;
+        snapshot.overlay.classselection.mode = crate::generated::ExploreClassSelectionMode::All;
+        snapshot.scene.objects = [(100.0, 100.0), (30.0, 45.0)].into_iter().map(|(x, y)| {
+            let mut object = crate::view_model::test_support::annotation_object(0);
+            object.box_.first = crate::generated::AnnotationPoint { x, y };
+            object.box_.second = crate::generated::AnnotationPoint { x: x + 30.0, y: y + 30.0 };
+            object
+        }).collect();
+        super::super::metadata::install_explore(frame, snapshot);
+        assert!(super::super::accept_publication(frame));
+        super::super::authorize_draw(Some(frame));
+        super::super::complete_sample(frame);
+        let surface = crate::view_model::test_support::physical_surface(frame);
+        let source = Source::Detail(super::super::DetailContent {
+            explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&*snapshot)),
+            upscale: None,
+        });
+        let program = |show_fps| Program::<()> {
+            show_fps, input: None, local: None, publish: None, surface,
+            placement: super::super::Placement::Contain,
+            control_id: crate::view::workspace::STABLE_ID,
+        };
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))
+        ).expect("label-wrapper acceptance requires the container GPU backend");
+        let mut element = view(program(true), source.clone());
+        let mut tree = widget::Tree::new(&element);
+        tree.diff(element.as_widget_mut());
+        let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(640.0, 480.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(bounds.size(), bounds.size())).move_to(bounds.position());
+        let now = iced::time::Instant::now();
+        let deliver = |element: &mut Element<'_, ()>, tree: &mut widget::Tree,
+            renderer: &iced::Renderer, event: Event, cursor| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(tree, &event, Layout::new(&node), cursor, renderer,
+                &mut shell, &bounds);
+        };
+        deliver(&mut element, &mut tree, &renderer,
+            Event::Window(iced::window::Event::RedrawRequested(now)), mouse::Cursor::Unavailable);
+        let cursor = mouse::Cursor::Available(Point::new(200.0, 150.0));
+        deliver(&mut element, &mut tree, &renderer, Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 2.0 },
+        }), cursor);
+        deliver(&mut element, &mut tree, &renderer,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)), cursor);
+        deliver(&mut element, &mut tree, &renderer, Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(220.0, 160.0),
+        }), mouse::Cursor::Available(Point::new(220.0, 160.0)));
+        let render = |element: &Element<'_, ()>, tree: &widget::Tree, renderer: &mut iced::Renderer| {
+            let extent = iced::Size::new(680, 540);
+            renderer.reset(Rectangle::with_size(iced::Size::new(680.0, 540.0)));
+            element.as_widget().draw(tree, renderer, &crate::fluent_theme::app_theme(false),
+                &renderer::Style::default(), Layout::new(&node), mouse::Cursor::Unavailable, &bounds);
+            renderer.screenshot(&iced::widget::shader::Viewport::with_physical_size(extent, 1.0), Color::WHITE)
+        };
+        let before = render(&element, &tree, &mut renderer);
+        let pixel = |image: &[u8], x: usize, y: usize| -> [u8; 3] {
+            image[(y * 680 + x) * 4..(y * 680 + x) * 4 + 3].try_into().unwrap()
+        };
+        let green = |color: [u8; 3]| color[0] < 10 && color[1] > 150 && color[2] < 10;
+        // Expected transformed positions come from the physical wheel/pan
+        // gestures, and are observed in actual Labelled::draw GPU output.
+        assert!(green(pixel(&before, 79, 98)));
+        assert!(green(pixel(&before, 11, 30)));
+        assert_eq!(pixel(&before, 5, 30), [255; 3]); // The second label is clipped.
+        assert_eq!(pixel(&before, 111, 122), [0; 3]); // Its original position moved.
+        assert_eq!(pixel(&before, 572, 28), [255; 3]); // Enabled FPS background.
+        let glyph_pixels = (29..45).flat_map(|y| (580..632).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixel(&before, x, y).into_iter().all(|channel| channel < 160))
+            .count();
+        assert!(glyph_pixels >= 12, "FPS glyphs must occupy the counter interior");
+        let mut replacement = view(program(false), source);
+        tree.diff(replacement.as_widget_mut());
+        deliver(&mut replacement, &mut tree, &renderer,
+            Event::Window(iced::window::Event::RedrawRequested(now)), cursor);
+        let after = render(&replacement, &tree, &mut renderer);
+        assert_eq!(pixel(&after, 79, 98), pixel(&before, 79, 98));
+        assert_eq!(pixel(&after, 11, 30), pixel(&before, 11, 30));
+        assert_eq!(pixel(&after, 572, 28), [0; 3]);
+        drop(renderer);
+        super::super::RENDERER.with(|owner| drop(owner.borrow_mut().take()));
+    }
 
     #[test]
     fn gallery_labels_share_source_scale_and_clip_with_images_and_hits() {

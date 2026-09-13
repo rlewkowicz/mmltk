@@ -187,6 +187,7 @@ pub fn workspace<'a, Message: 'a>(
         settings_enabled,
         Composition::new(page, page_width).center_width(),
         input,
+        crate::workspace_fps::enabled(settings),
     )
     .map(map)
 }

@@ -2,6 +2,71 @@
 use super::*;
 use std::cell::RefCell;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FpsEvidence {
+    pub bounds: Rectangle,
+    pub clip: Rectangle,
+    pub dark: bool,
+    pub frames: u64,
+    pub seconds: f64,
+}
+
+pub(super) fn workspace_fps(
+    control: &'static str,
+    meter: &crate::workspace_fps::Meter,
+    evidence: FpsEvidence,
+) {
+    emit(|sink| {
+        sink.record("integration.workspace_fps", control, meter.text(),
+            [evidence.frames as f64, evidence.seconds,
+                f64::from(evidence.clip.x + evidence.clip.width - evidence.bounds.x - evidence.bounds.width),
+                f64::from(evidence.bounds.y - evidence.clip.y)]);
+    });
+}
+
+pub(super) fn verify_workspace_fps_pixels(
+    image: &iced::window::Screenshot,
+    evidence: FpsEvidence,
+) -> bool {
+    if !reporting_enabled() { return false; }
+    let scale = image.scale_factor;
+    let bounds = evidence.bounds;
+    let left = (bounds.x * scale).ceil().max(0.0) as u32;
+    let top = (bounds.y * scale).ceil().max(0.0) as u32;
+    let right = ((bounds.x + bounds.width) * scale).floor() as u32;
+    let bottom = ((bounds.y + bounds.height) * scale).floor() as u32;
+    if !scale.is_finite() || scale <= 0.0 || right > image.size.width
+        || bottom > image.size.height || right <= left + 4 || bottom <= top + 4
+        || image.rgba.len() != image.size.width as usize * image.size.height as usize * 4
+        || evidence.frames == 0 || evidence.seconds < 0.5
+    { return false; }
+    let mut background = 0;
+    let mut foreground = 0;
+    let mut border = 0;
+    let mut border_background = 0;
+    for y in top..bottom {
+        for x in left..right {
+            let offset = (y as usize * image.size.width as usize + x as usize) * 4;
+            let pixel = &image.rgba[offset..offset + 4];
+            let low = pixel[..3].iter().copied().min().unwrap();
+            let high = pixel[..3].iter().copied().max().unwrap();
+            let back = pixel[3] == 255 && if evidence.dark { high <= 8 } else { low >= 247 };
+            let front = pixel[3] == 255 && if evidence.dark { low >= 160 } else { high <= 95 };
+            background += usize::from(back);
+            foreground += usize::from(front);
+            if x == left || x + 1 == right || y == top || y + 1 == bottom {
+                border += 1;
+                border_background += usize::from(back);
+            }
+        }
+    }
+    let valid = background > foreground && foreground >= 12 && border_background * 10 >= border * 9;
+    emit(|sink| sink.record("integration.workspace_fps_pixels", EXPLORE_GALLERY,
+        if valid { "visible-counter" } else { "invalid-counter" },
+        [evidence.frames as f64, evidence.seconds, foreground as f64, border_background as f64]));
+    valid
+}
+
 pub(super) struct Owner {
     state: RefCell<Option<State>>,
 }
@@ -715,6 +780,39 @@ mod tests {
             STYLES.with(|styles| *styles.borrow_mut() = None);
             initialize_reporting(false, false);
         }
+    }
+
+    #[test]
+    fn workspace_fps_pixel_acceptance_uses_the_visible_counter_at_each_scale_and_theme() {
+        let capture = Capture::new(true);
+        for scale in [1.0, 1.5] {
+            for dark in [false, true] {
+                let size = iced::Size::new((100.0 * scale) as u32, (60.0 * scale) as u32);
+                let mut pixels = vec![if dark { 0 } else { 255 }; size.width as usize * size.height as usize * 4];
+                for pixel in pixels.chunks_exact_mut(4) { pixel[3] = 255; }
+                // A bounded contrasting text stroke inside the counter's
+                // opaque background; capture geometry comes from the widget.
+                for y in (14.0 * scale) as u32..(24.0 * scale) as u32 {
+                    for x in (68.0 * scale) as u32..(71.0 * scale) as u32 {
+                        let offset = (y as usize * size.width as usize + x as usize) * 4;
+                        pixels[offset..offset + 3].fill(if dark { 255 } else { 0 });
+                    }
+                }
+                let evidence = FpsEvidence {
+                    bounds: Rectangle::new(iced::Point::new(20.0, 6.0), iced::Size::new(74.0, 22.0)),
+                    clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
+                    dark, frames: 30, seconds: 0.5,
+                };
+                let screenshot = iced::window::Screenshot::new(pixels, size, scale);
+                assert!(verify_workspace_fps_pixels(&screenshot, evidence));
+            }
+        }
+        let records = capture.records();
+        assert_eq!(records.len(), 4);
+        assert!(records.iter().all(|(event, control, detail, values)| {
+            event == "integration.workspace_fps_pixels" && control == EXPLORE_GALLERY
+                && detail == "visible-counter" && values[0] == 30.0 && values[1] == 0.5
+        }));
     }
 
     #[test]

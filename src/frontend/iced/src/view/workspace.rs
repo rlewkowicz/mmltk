@@ -1,6 +1,6 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::{Surface, SurfaceGesture};
-use iced::widget::{container, shader, text};
+use iced::widget::{container, text};
 use iced::{Center, Fill, Length};
 
 pub const STABLE_ID: &str = "workflow.visual.workspace";
@@ -52,16 +52,18 @@ pub fn view(
     settings_edit_available: bool,
     center_width: f32,
     input: crate::workspace_input::Binding,
+    show_fps: bool,
 ) -> Element<'static, Message> {
     let (surface_width, surface_height) = surface_extent(center_width, selected);
-    let content: Element<'static, Message> = shader(crate::presentation_surface::Program {
+    let content: Element<'static, Message> = crate::presentation_surface::labels::view(crate::presentation_surface::Program {
+        show_fps,
         input: Some(input),
         local: None,
         surface: surface.unwrap_or_else(Surface::empty),
         publish: Some(Message::Gesture),
         placement: crate::presentation_surface::Placement::Contain,
         control_id: STABLE_ID,
-    }).width(Fill).height(Fill).into();
+    }, crate::presentation_surface::labels::Source::Hidden);
     let content = if surface.is_none() {
         iced::widget::stack![content, container(text("Waiting for a completed native frame"))
             .center(Fill).width(Fill).height(Fill)].into()

@@ -1856,7 +1856,7 @@ impl MmltkWorkspaceMirror {
             return;
         }
         self.active = false;
-        mmltk_workspace_channel::trace_state("mirror_stop", self.arena.surface_id, "texture_drop", false);
+        mmltk_workspace_channel::trace_state("mirror_stop", self.arena.surface_id, "texture_drop", || false);
         self.dispatcher.enqueue(MmltkWorkspaceDispatcherCommand::DetachDestination {
             surface_id: self.arena.surface_id,
         });
@@ -2940,10 +2940,10 @@ fn run_mmltk_workspace_dispatcher(shared: Arc<MmltkWorkspaceDispatcherShared>) {
                                 shared.pending_requests.lock().unwrap().remove(&arena.surface_id);
                                 arena.ready.store(true, Ordering::Release);
                                 arenas.insert(arena.surface_id, arena.clone());
-                                mmltk_workspace_channel::trace_state("registry_inserted", arena.surface_id, "dispatcher_owned", false);
+                                mmltk_workspace_channel::trace_state("registry_inserted", arena.surface_id, "dispatcher_owned", || false);
                                 unsafe { wgpu_parent_external_texture_import_ready(shared.owner, arena.device_id,
                                     arena.surface_id.high, arena.surface_id.low) };
-                                mmltk_workspace_channel::trace_state("import_ready_emitted", arena.surface_id, "layout_negotiated", false);
+                                mmltk_workspace_channel::trace_state("import_ready_emitted", arena.surface_id, "layout_negotiated", || false);
                                 mmltk_workspace_channel::send_arena_ready(arena.surface_id, arena.layout);
                                 if *shared.binding.lock().unwrap() != Some(arena.device_id) {
                                     arena.retire_binding();

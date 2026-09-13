@@ -15,17 +15,53 @@ pub struct Resources {
     holds: Vec<Arc<dyn Any + Send + Sync>>,
     pool: ResourcePool,
     observers: Vec<Box<dyn FnOnce(Settlement) + Send>>,
+    submissions: Vec<Arc<dyn Fn() + Send + Sync>>,
+}
+
+/// Optional observers of actual queue submission, independent of work completion.
+#[derive(Default)]
+pub struct Submissions {
+    observers: Vec<Arc<dyn Fn() + Send + Sync>>,
+    pool: Option<ResourcePool>,
+}
+
+impl Submissions {
+    /// Called immediately after the queue accepts this encoder's commands.
+    pub fn submitted(mut self) {
+        for observer in self.observers.drain(..) {
+            observer();
+        }
+    }
+}
+
+impl Drop for Submissions {
+    fn drop(&mut self) {
+        self.observers.clear();
+        let Some(pool) = &self.pool else { return; };
+        let mut spare = pool.0.lock().expect("submission staging");
+        if self.observers.capacity() > spare.submissions.capacity() {
+            std::mem::swap(&mut self.observers, &mut spare.submissions);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResourceStaging {
+    holds: Vec<Arc<dyn Any + Send + Sync>>,
+    submissions: Vec<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ResourcePool(Arc<Mutex<Vec<Arc<dyn Any + Send + Sync>>>>);
+pub(crate) struct ResourcePool(Arc<Mutex<ResourceStaging>>);
 
 impl ResourcePool {
     pub(crate) fn take(&self) -> Resources {
+        let mut staging = self.0.lock().expect("resource staging");
         Resources {
-            holds: std::mem::take(&mut *self.0.lock().expect("resource staging")),
+            holds: std::mem::take(&mut staging.holds),
             pool: self.clone(),
             observers: Vec::new(),
+            submissions: std::mem::take(&mut staging.submissions),
         }
     }
 }
@@ -38,6 +74,13 @@ pub enum Settlement {
 }
 
 impl Resources {
+    /// Register an observer once for this encoder, after encoding its drawing.
+    pub fn observe_submission(&mut self, observer: Arc<dyn Fn() + Send + Sync>) {
+        if !self.submissions.iter().any(|prior| Arc::ptr_eq(prior, &observer)) {
+            self.submissions.push(observer);
+        }
+    }
+
     /// Retain a safely shareable resource token, without moving UI state.
     pub fn retain<T: Any + Send + Sync>(&mut self, resource: Arc<T>) {
         self.holds.push(resource);
@@ -54,7 +97,15 @@ impl Resources {
         }
     }
 
-    pub(crate) fn attach(mut self, encoder: &wgpu::CommandEncoder) {
+    pub(crate) fn attach(mut self, encoder: &wgpu::CommandEncoder) -> Submissions {
+        let submissions = if self.submissions.is_empty() {
+            Submissions::default()
+        } else {
+            Submissions {
+                observers: std::mem::take(&mut self.submissions),
+                pool: Some(self.pool.clone()),
+            }
+        };
         if !self.holds.is_empty() || !self.observers.is_empty() {
             // Callback arrival also includes backend terminal failure. It is
             // resource settlement, never a successful-render notification.
@@ -63,6 +114,7 @@ impl Resources {
                 drop(self);
             });
         }
+        submissions
     }
 }
 
@@ -70,9 +122,13 @@ impl Drop for Resources {
     fn drop(&mut self) {
         self.settle(Settlement::Abandoned);
         self.holds.clear();
+        self.submissions.clear();
         let mut spare = self.pool.0.lock().expect("resource staging");
-        if self.holds.capacity() > spare.capacity() {
-            std::mem::swap(&mut self.holds, &mut *spare);
+        if self.holds.capacity() > spare.holds.capacity() {
+            std::mem::swap(&mut self.holds, &mut spare.holds);
+        }
+        if self.submissions.capacity() > spare.submissions.capacity() {
+            std::mem::swap(&mut self.submissions, &mut spare.submissions);
         }
     }
 }

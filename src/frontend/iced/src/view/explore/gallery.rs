@@ -292,7 +292,7 @@ pub(super) fn view<'a>(
         .unwrap_or(crate::generated::PresentationSourceKind::Explore);
     let input = input.for_source(empty_source, 0, None);
     let gallery = responsive(move |size| {
-        gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns, input.clone())
+        gallery_viewport(state, snapshot, presentation_title, paired.clone(), size, columns, input.clone(), crate::workspace_fps::enabled(settings))
     })
     .width(Fill)
     .height(Fill);
@@ -341,6 +341,7 @@ fn gallery_viewport<'a>(
     size: Size,
     columns: u32,
     input: crate::workspace_input::Binding,
+    show_fps: bool,
 ) -> Element<'a, Message> {
     let width = size.width.max(1.0);
     let height = size.height.max(1.0);
@@ -357,19 +358,19 @@ fn gallery_viewport<'a>(
     );
     let logical_geometry =
         super::state::logical_gallery_geometry(width, height, display_columns, matching, first_row);
-    crate::presentation_surface::gallery::observe(snapshot, false);
     let presented_grid = presented.map_or((columns, logical_geometry.row_count()), |snapshot| {
         (snapshot.viewport.columns, snapshot.viewport.rowcount)
     });
     let virtual_height = logical_geometry.virtual_height();
     let surface: Element<'a, Message> = displayed.as_ref().map_or_else(
         || {
-            let input_layer = iced::widget::shader(crate::presentation_surface::Program {
+            let input_layer = crate::presentation_surface::labels::view(crate::presentation_surface::Program {
+                show_fps,
                 input: Some(input.clone()),
                 local: None, publish: None, surface: Surface::empty(),
                 placement: crate::presentation_surface::Placement::Contain,
                 control_id: super::GALLERY_WORKSPACE_ID,
-            }).width(Fill).height(Fill);
+            }, crate::presentation_surface::labels::Source::Hidden);
             stack![input_layer, container(column![space::vertical(), text(presentation_title).size(22),
                 text(snapshot.map_or("", |value| value.failure.as_str())).size(12)
                     .style(crate::fluent_theme::text_secondary), space::vertical()].align_x(Center))
@@ -379,6 +380,7 @@ fn gallery_viewport<'a>(
         |(surface, metadata)| {
             let image = crate::presentation_surface::labels::view(
                 crate::presentation_surface::Program {
+                    show_fps,
                 input: Some(input.for_source(crate::generated::PresentationSourceKind::Explore, 0, None)),
                     local: Some(local_gestures(state, snapshot, columns)),
                     surface: *surface,

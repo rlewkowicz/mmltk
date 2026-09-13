@@ -3818,6 +3818,8 @@ struct BrowserAudit final {
     bool advanced_integer_persisted = false;
     bool advanced_floating_persisted = false;
     bool show_fps_round_trip = false;
+    bool workspace_fps_text = false;
+    bool workspace_fps_pixels = false;
     bool benchmark_round_trip = false;
     bool bootstrap = false;
     bool dataset_configured = false;
@@ -4249,6 +4251,23 @@ struct BrowserAudit final {
         } else if (event == "integration.show_fps") {
             show_fps_round_trip = record.value("control", "") == "settings.show_fps" && record.value("detail", "") == "round-trip" &&
                                   numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "d") > numeric(record, "c");
+        } else if (event == "integration.workspace_fps") {
+            auto label = textual(record, "detail");
+            double displayed = 0.0;
+            bool valid_text = false;
+            if (label.ends_with(" FPS")) {
+                label.remove_suffix(4U);
+                const auto parsed = std::from_chars(label.data(), label.data() + label.size(), displayed);
+                valid_text = parsed.ec == std::errc{} && parsed.ptr == label.data() + label.size();
+            }
+            workspace_fps_text |= record.value("control", "") == EXPLORE_GALLERY && valid_text &&
+                                  numeric(record, "a") > 0.0 && numeric(record, "b") >= 0.5 &&
+                                  std::abs(displayed - numeric(record, "a") / numeric(record, "b")) <= 0.5 &&
+                                  std::abs(numeric(record, "c") - 6.0) < 0.01 && std::abs(numeric(record, "d") - 6.0) < 0.01;
+        } else if (event == "integration.workspace_fps_pixels") {
+            workspace_fps_pixels |= record.value("control", "") == EXPLORE_GALLERY &&
+                                    record.value("detail", "") == "visible-counter" && numeric(record, "a") > 0.0 &&
+                                    numeric(record, "b") >= 0.5 && numeric(record, "c") >= 12.0 && numeric(record, "d") > 0.0;
         } else if (event == "integration.benchmark_override") {
             benchmark_round_trip = record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "round-trip" &&
                                    numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 &&
@@ -4911,6 +4930,7 @@ struct BrowserAudit final {
             compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
             model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip,
             "benchmark override interaction", explore_composition, "Explore composition", annotation_composition, "annotation composition",
+            workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
             settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released &&
                 ui_scale_restored && complete_pointer_drag && error_composition && error_modal_usable,
             "Settings composition",

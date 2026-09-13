@@ -6,12 +6,14 @@ thread_local! {
     static DARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn observe(_snapshot: Option<&crate::generated::ExploreSnapshot>, dark: bool) {
-    DARK.with(|value| value.set(dark));
+pub(super) fn observe_theme(theme: &crate::fluent_theme::Theme) {
+    if crate::integration_control::reporting_enabled() {
+        DARK.with(|value| value.set(theme.is_dark()));
+    }
 }
 
 pub(super) fn dark() -> bool {
-    DARK.with(|value| value.get())
+    crate::integration_control::reporting_enabled() && DARK.with(|value| value.get())
 }
 
 pub(super) fn valid_layout(snapshot: &ExploreImageMetadata) -> bool {
@@ -125,7 +127,6 @@ mod tests {
         snapshot.dataset.identity = 12;
         snapshot.revision += 1;
         snapshot.overlay.showlabels = !snapshot.overlay.showlabels;
-        observe(Some(&snapshot), false);
         assert_eq!(matching(Some(frame)).unwrap(), original);
         let next = FrameReady { slot: 1, presentation_revision: frame.presentation_revision+1, ..frame };
         metadata::install_explore(next, &snapshot);
@@ -256,7 +257,6 @@ mod tests {
         let mut replacement = snapshot.clone();
         replacement.revision += 1;
         replacement.gallery.layout.roworigin = 0;
-        observe(Some(&replacement), false);
         assert_eq!(
             matching(Some(physical)).unwrap().gallery.layout.roworigin,
             7

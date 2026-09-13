@@ -77,9 +77,9 @@ pub(super) fn write_diagnostic(format: impl FnOnce(&mut String) -> fmt::Result) 
     }
 }
 
-pub fn trace_state(event: &str, id: SurfaceId, detail: &str, source: bool) {
+pub fn trace_state(event: &str, id: SurfaceId, detail: &str, source: impl FnOnce() -> bool) {
     write_diagnostic(|line| write!(line,
-        "{{\"event\":\"firefox.workspace.{}{event}\",\"surface\":\"{id}\",\"detail\":\"{detail}\"}}", if source { "source." } else { "" }
+        "{{\"event\":\"firefox.workspace.{}{event}\",\"surface\":\"{id}\",\"detail\":\"{detail}\"}}", if source() { "source." } else { "" }
     ));
 }
 
@@ -615,17 +615,17 @@ impl Channel {
                 self.retire_source(id);
             }
         } else if self.admitted.remove(&id).is_some() {
-            trace_state("withdrawal", id, "before_claim", self.sources.contains_key(&id));
+            trace_state("withdrawal", id, "before_claim", || self.sources.contains_key(&id));
             // An unclaimed import will never otherwise produce its one
             // outcome. Settle the host's withdrawal tombstone and release
             // both descriptors immediately.
             self.withdrawn.insert(id);
             self.send(OPCODE_FAILED, id, FAILED_NOT_ADMITTED, 0, 0, 0, None);
         } else if self.claimed.contains(&id) || self.live.contains(&id) {
-            trace_state("withdrawal", id, "claimed_or_live", self.sources.contains_key(&id));
+            trace_state("withdrawal", id, "claimed_or_live", || self.sources.contains_key(&id));
             self.withdrawn.insert(id);
         } else if self.released.remove(&id) {
-            trace_state("withdrawal", id, "page_released", self.sources.contains_key(&id));
+            trace_state("withdrawal", id, "page_released", || self.sources.contains_key(&id));
             self.replied.remove(&id);
             self.withdrawn.insert(id);
             self.settled_releases.push_back(id);
@@ -638,7 +638,7 @@ impl Channel {
     }
 
     fn retire_source(&mut self, id: SurfaceId) {
-        trace_state("withdrawal", id, "source_read_released", true);
+        trace_state("withdrawal", id, "source_read_released", || true);
         self.live.remove(&id);
         self.replied.remove(&id);
         self.settled_releases.push_back(id);
@@ -792,7 +792,7 @@ impl Channel {
                     self.wake_dispatcher();
                 }
                 OPCODE_DROP => {
-                    trace_state("drop_received", id, "native_withdrawal", self.sources.contains_key(&id));
+                    trace_state("drop_received", id, "native_withdrawal", || self.sources.contains_key(&id));
                     if record.width != 0
                         || record.height != 0
                         || record.stride != 0
@@ -1043,7 +1043,7 @@ impl Channel {
             let id = SurfaceId { high: record.id_high, low: record.id_low };
             if record.opcode == OPCODE_RETIRED
                 || (record.opcode == OPCODE_FAILED && self.withdrawn.contains(&id)) {
-                trace_state("retired", id, "resources_released", self.sources.contains_key(&id));
+                trace_state("retired", id, "resources_released", || self.sources.contains_key(&id));
                 // The terminal has left the socket queue and no physical owner
                 // can refer to this capability. A late independent page claim
                 // is simply unknown and its local failure sends no new terminal.
@@ -1217,7 +1217,7 @@ pub fn send_ready(id: SurfaceId, allocation: Allocation, timeline: OwnedFd) {
     descriptors[READY_MEMORY_DESCRIPTOR] = Some(allocation.memory);
     descriptors[READY_TIMELINE_DESCRIPTOR] = Some(timeline);
     channel.pending.push_back(PendingRecord { record, descriptors });
-    trace_state("ready", id, "vulkan_allocation_initialized", true);
+    trace_state("ready", id, "vulkan_allocation_initialized", || true);
     channel.flush();
     channel.wake_dispatcher();
     if channel.sources.contains_key(&id) && channel.withdrawn.contains(&id) && channel.live.remove(&id) {
@@ -1479,7 +1479,7 @@ pub fn send_arena_ready(id: SurfaceId, mut record: Record) {
     if !channel.claimed.remove(&id) || !channel.live.insert(id)
         || channel.pending.len() >= PENDING_RECORD_CAPACITY { channel.fail(); return; }
     channel.replied.insert(id);
-    trace_state("ready", id, "arena_initialized", false);
+    trace_state("ready", id, "arena_initialized", || false);
     record.abi_version = ABI_VERSION;
     record.opcode = OPCODE_ARENA_READY;
     record.id_high = id.high;

@@ -47,7 +47,7 @@ for wrapper_argument in "$@"; do
     if [[ "${wrapper_argument}" == "--gui" ]]; then gui_diagnostics_quiet=1; fi
 done
 wrapper_log_level="${MMLTK_LOG_LEVEL:-}"
-if [[ -n "${MMLTK_GUI_TRACE_FILE:-}${MMLTK_ANNOTATION_DIAGNOSTICS:-}" || "${MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION:-}" == "1" ]] ||
+if [[ -n "${MMLTK_GUI_TRACE_FILE:-}" || "${MMLTK_ANNOTATION_DIAGNOSTICS:-}" == "1" || "${MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION:-}" == "1" ]] ||
     [[ "${wrapper_log_level,,}" != "off" && -n "${wrapper_log_level}${MMLTK_LOG_FILE:-}${MMLTK_LOG_DIR:-}" ]]; then
     gui_diagnostics_quiet=0
 fi
@@ -2070,6 +2070,9 @@ run_toolchain_command() {
             docker_args+=(--gpus all --env NVIDIA_DRIVER_CAPABILITIES=compute,utility)
         fi
     fi
+    if [[ "${invocation_mode}" == "test" && "${test_suite}" == "browser-app" ]]; then
+        docker_args+=(--gpus all --env NVIDIA_DRIVER_CAPABILITIES=graphics,utility --env WGPU_BACKEND=vulkan)
+    fi
     docker_args+=("${build_image_name}" -lc "${command}")
     docker "${docker_args[@]}"
 }
@@ -3113,6 +3116,17 @@ run_tests() {
         if (( ! gui_diagnostics_quiet )); then log "running iced browser application tests"; fi
         run_owned_toolchain_command "${test_run_container_name}" \
             'set -euo pipefail
+             browser_test_icds=""
+             for browser_test_icd in /etc/vulkan/icd.d/*nvidia*.json /usr/share/vulkan/icd.d/*nvidia*.json; do
+                 if [[ -r "${browser_test_icd}" ]]; then
+                     browser_test_icds+="${browser_test_icds:+:}${browser_test_icd}"
+                 fi
+             done
+             if [[ -z "${browser_test_icds}" ]]; then
+                 printf "%s\n" "browser-app GPU acceptance requires a container NVIDIA Vulkan ICD" >&2
+                 exit 1
+             fi
+             export VK_DRIVER_FILES="${browser_test_icds}"
              /workspace/tools/configure_cmake_graph.sh \
                  gui "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" '"${browser_test_configuration}"'
              cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \

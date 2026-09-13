@@ -304,6 +304,7 @@ impl Component {
                 || crate::generated::default_uiannotationbrushradius().unwrap(),
                 |draft| draft.ui.annotationbrushradius) as u16),
             self.keyboard_canvas.clone(),
+            crate::workspace_fps::enabled(settings),
         ))
         .into();
         let advanced = self

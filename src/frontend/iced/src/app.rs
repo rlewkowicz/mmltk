@@ -91,7 +91,11 @@ pub fn scale_factor(app: &App) -> f32 {
 pub fn subscription(app: &App) -> Subscription<Message> {
     Subscription::batch([
         crate::transport::subscription(app.config.clone()).map(Message::Transport),
-        iced::window::events().map(|(_, event)| Message::Window(event)),
+        iced::window::events().filter_map(|(_, event)| {
+            // Retained workspace cadence stays in the widget/window loop.
+            // A browser redraw does not coordinate with native snapshots.
+            (!matches!(event, iced::window::Event::RedrawRequested(_))).then_some(Message::Window(event))
+        }),
         crate::presentation_surface::subscription()
             .map(presentation::Message::Surface)
             .map(Message::Presentation),

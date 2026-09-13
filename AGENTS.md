@@ -66,9 +66,12 @@ Keep each document within its audience and purpose:
 
 - `README.md` is the user-facing introduction: entry points, quick starts,
   repository narrative, caveats, developer commentary, and 1000-foot
-  overviews. Preserve the developer's voice, humor, and interjections while
+  overviews. Do not modify anything above its first `## Build` heading.
+  Preserve that region verbatim, including spelling, formatting, links, and
+  technical claims; this also applies to documentation audits. From `## Build`
+  onward, preserve the developer's voice, humor, and interjections while
   correcting spelling and formatting. Move detailed reference and architecture
-  material into `docs/`.
+  material from that editable region into `docs/`.
 - `CONTRACT.md` defines high-level technical architecture: major application
   ownership, cross-repository flow, broad constraints, and critical component
   handoffs. Exclude implementation symbols, call sequences, and detailed code

@@ -101,7 +101,7 @@ impl Renderer {
         clear_color: Option<Color>,
         target: &wgpu::TextureView,
         viewport: &Viewport,
-    ) -> wgpu::CommandEncoder {
+    ) -> (wgpu::CommandEncoder, primitive::Submissions) {
         let mut encoder =
             self.engine
                 .device
@@ -112,7 +112,7 @@ impl Renderer {
         self.prepare(&mut encoder, viewport);
         let mut resources = self.primitive_resources.take();
         self.render(&mut encoder, target, clear_color, viewport, &mut resources);
-        resources.attach(&encoder);
+        let submissions = resources.attach(&encoder);
 
         self.quad.trim();
         self.triangle.trim();
@@ -126,7 +126,7 @@ impl Renderer {
             self.image_cache.borrow_mut().trim();
         }
 
-        encoder
+        (encoder, submissions)
     }
 
     pub fn present(
@@ -136,10 +136,11 @@ impl Renderer {
         frame: &wgpu::TextureView,
         viewport: &Viewport,
     ) -> wgpu::SubmissionIndex {
-        let encoder = self.draw(clear_color, frame, viewport);
+        let (encoder, observers) = self.draw(clear_color, frame, viewport);
 
         self.staging_belt.finish();
         let submission = self.engine.queue.submit([encoder.finish()]);
+        observers.submitted();
         self.staging_belt.recall();
         submission
     }
@@ -197,7 +198,7 @@ impl Renderer {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.draw(Some(background_color), &view, viewport);
+        let (mut encoder, observers) = self.draw(Some(background_color), &view, viewport);
 
         let texture = crate::color::convert(
             &self.engine.device,
@@ -232,6 +233,7 @@ impl Renderer {
 
         self.staging_belt.finish();
         let index = self.engine.queue.submit([encoder.finish()]);
+        observers.submitted();
         self.staging_belt.recall();
 
         let slice = output_buffer.slice(..);

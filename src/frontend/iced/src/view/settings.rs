@@ -545,6 +545,7 @@ mod tests {
             settings.draft.as_ref().unwrap().ui.showworkspaceperformance,
             !original
         );
+        assert_eq!(crate::workspace_fps::enabled(&settings), !original);
     }
 
     #[test]

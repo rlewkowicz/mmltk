@@ -171,6 +171,7 @@ fn trace_image(
 }
 
 fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle, clip: Rectangle) {
+    if !surface_trace_enabled() { return; }
     trace_image(
         event,
         control,
@@ -202,6 +203,7 @@ pub(super) fn trace_gallery_source(snapshot: &crate::generated::ExploreImageMeta
 pub(super) fn trace_gallery_source(_snapshot: &crate::generated::ExploreImageMetadata) {}
 
 pub(crate) fn trace_atlas_stage(stage: &str, draw: &crate::integration_control::AtlasDraw) {
+    if !surface_trace_enabled() { return; }
     trace_image(
         "scroll_stage",
         stage,
@@ -222,7 +224,6 @@ const MAILBOX_SLOTS: u32 = 2;
 // Firefox admits active, candidate, and retiring arenas, each with two slots.
 const ARENA_CAPACITY: usize = 3;
 const SAMPLE_CAPACITY: usize = ARENA_CAPACITY * MAILBOX_SLOTS as usize;
-const INTEGRATION_REDRAW_PASSES: u8 = 4;
 thread_local! {
     static DRAWN_DETAIL: std::cell::Cell<Option<(Surface, [u32; 4])>> = const { std::cell::Cell::new(None) };
     static RELEASED_FRAMES: std::cell::Cell<[Option<FrameReady>; SAMPLE_CAPACITY]> = const { std::cell::Cell::new([None; SAMPLE_CAPACITY]) };
@@ -1028,6 +1029,7 @@ impl Placement {
 
 #[derive(Clone)]
 pub(crate) struct Program<Message> {
+    pub show_fps: bool,
     pub input: Option<crate::workspace_input::Binding>,
     pub surface: Surface,
     pub publish: Option<fn(SurfaceGesture) -> Message>,
@@ -1072,6 +1074,7 @@ impl<Message> shader::Program<Message> for Program<Message> {
         _bounds: Rectangle,
     ) -> Self::Primitive {
         Primitive {
+            submission: state.fps.as_ref().filter(|_| self.show_fps).map(crate::workspace_fps::Meter::observer),
             surface: self.surface,
             transform: state.viewport.transform_for(self.surface),
             placement: self.placement,
@@ -1086,6 +1089,7 @@ impl<Message> shader::Program<Message> for Program<Message> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<shader::Action<Message>> {
+        crate::workspace_fps::Meter::update(&mut state.fps, self.show_fps, event);
         let dispatch = |gesture| {
             let message = self.local.as_ref().map_or_else(
                 || self.publish.map(|publish| publish(gesture)),
@@ -1134,6 +1138,7 @@ impl<Message> shader::Program<Message> for Program<Message> {
 pub(crate) struct WorkspaceViewport {
     viewport: ViewportOwner,
     input: crate::workspace_input::Capture,
+    fps: Option<crate::workspace_fps::Meter>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1145,8 +1150,6 @@ pub(crate) struct ViewportOwner {
     pointer_active: bool,
     last_pointer_sample: Option<SurfaceSample>,
     content_session: Option<(u64, u32, u64)>,
-    integration_redraw_revision: Option<(u64, Option<[u32; 4]>, u64)>,
-    integration_redraw_remaining: u8,
 }
 
 impl Default for ViewportOwner {
@@ -1159,8 +1162,6 @@ impl Default for ViewportOwner {
             pointer_active: false,
             last_pointer_sample: None,
             content_session: None,
-            integration_redraw_revision: None,
-            integration_redraw_remaining: 0,
         }
     }
 }
@@ -1222,39 +1223,6 @@ impl ViewportOwner {
         Some(SurfaceGesture { kind, sample })
     }
 
-    fn begin_integration_redraw(&mut self, surface: Surface) -> bool {
-        if !surface.integration {
-            return false;
-        }
-        if !crate::integration_control::repeated_redraws_enabled() {
-            self.integration_redraw_remaining = 0;
-            return false;
-        }
-        let Some(revision) = surface
-            .integration
-            .then_some(surface.frame)
-            .flatten()
-            .map(|frame| {
-                (
-                    frame.presentation_revision,
-                    surface.crop,
-                    surface.fit_revision,
-                )
-            })
-        else {
-            return false;
-        };
-        if self.integration_redraw_revision != Some(revision) {
-            self.integration_redraw_revision = Some(revision);
-            self.integration_redraw_remaining = INTEGRATION_REDRAW_PASSES;
-        }
-        if self.integration_redraw_remaining == 0 {
-            return false;
-        }
-        self.integration_redraw_remaining -= 1;
-        true
-    }
-
     fn update<Message>(
         &mut self,
         event: &Event,
@@ -1270,11 +1238,6 @@ impl ViewportOwner {
             }));
         }
         match event {
-            Event::Window(iced::window::Event::RedrawRequested(_))
-                if self.begin_integration_redraw(surface) =>
-            {
-                Some(shader::Action::request_redraw())
-            }
             Event::Mouse(mouse::Event::WheelScrolled { delta })
                 if placement == Placement::Contain && cursor.is_over(bounds) =>
             {
@@ -1523,12 +1486,18 @@ fn inverse_content_point(
     ))
 }
 
-#[derive(Debug)]
 pub(crate) struct Primitive {
+    submission: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     surface: Surface,
     transform: ViewTransform,
     placement: Placement,
     control_id: &'static str,
+}
+
+impl std::fmt::Debug for Primitive {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("WorkspacePrimitive").field("surface", &self.surface).finish_non_exhaustive()
+    }
 }
 
 impl shader::Primitive for Primitive {
@@ -1587,7 +1556,7 @@ impl shader::Primitive for Primitive {
             let Some(renderer) = renderer.as_ref() else {
                 return;
             };
-            renderer.render(encoder, target, *clip_bounds, self.control_id, resources);
+            renderer.render(encoder, target, *clip_bounds, self.control_id, resources, self.submission.as_ref());
         });
     }
 }
@@ -1753,10 +1722,15 @@ fn same_publication(left: FrameReady, right: FrameReady) -> bool {
 struct Imported {
     image: ImagePublication,
     views: [wgpu::TextureView; 2],
-    drawn_revision: AtomicU64,
-    draw_count: AtomicU64,
+    diagnostics: Option<DrawDiagnostics>,
     pixel_trace: [Option<std::sync::Arc<pixel_trace::PixelTrace>>; 2],
     _arena: [Option<std::sync::Arc<ArenaTexture>>; 2],
+}
+
+#[derive(Default)]
+struct DrawDiagnostics {
+    drawn_revision: AtomicU64,
+    draw_count: AtomicU64,
 }
 
 // CPU facts travel with their leased browser pixels, including across an
@@ -2277,8 +2251,7 @@ impl SurfaceRenderer {
                 placement,
             },
             views,
-            drawn_revision: AtomicU64::new(0),
-            draw_count: AtomicU64::new(0),
+            diagnostics: crate::integration_control::reporting_enabled().then(DrawDiagnostics::default),
             pixel_trace,
             _arena: textures,
         };
@@ -2318,6 +2291,7 @@ impl SurfaceRenderer {
         clip: Rectangle<u32>,
         control_id: &'static str,
         resources: &mut shader::Resources,
+        submission: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) {
         let Some(draw) = self.draws.get(control_id) else {
             if let Some(requested) = self.requested {
@@ -2402,6 +2376,9 @@ impl SurfaceRenderer {
         pass.draw(0..3, 0..1);
         drop(pass);
         resources.retain(read.clone());
+        if let Some(observer) = submission {
+            resources.observe_submission(observer.clone());
+        }
         #[cfg(target_arch = "wasm32")]
         if surface_trace_enabled() {
             // The closure carries exact immutable publication facts only. The
@@ -2462,11 +2439,11 @@ impl SurfaceRenderer {
             record_drawn_detail(draw.surface, draw.surface.content_region());
         }
         if draw.surface.integration {
-            let prior_draw = imported
-                .drawn_revision
-                .swap(frame.presentation_revision, Ordering::AcqRel);
-            let draw_count = imported.draw_count.fetch_add(1, Ordering::Relaxed) + 1;
-            let redraw = prior_draw == frame.presentation_revision;
+            let (redraw, draw_count) = imported.diagnostics.as_ref()
+                .filter(|_| crate::integration_control::reporting_enabled()).map_or((false, 0), |diagnostics| {
+                let previous = diagnostics.drawn_revision.swap(frame.presentation_revision, Ordering::Relaxed);
+                (previous == frame.presentation_revision, diagnostics.draw_count.fetch_add(1, Ordering::Relaxed) + 1)
+            });
             crate::integration_control::report_surface_draw(
                 control_id,
                 frame.presentation_revision,
@@ -3195,6 +3172,86 @@ fn fs_main(input: Output) -> @location(0) vec4<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_fps_observes_real_iced_gpu_submissions_and_retained_pixels() {
+        use iced::advanced::{Layout, renderer::{Headless, Renderer as _}, widget, layout};
+        reset_test_releases();
+        initialize_diagnostics(false, false);
+        crate::integration_control::initialize_reporting(false, false);
+        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        assert!(accept_publication(frame));
+        authorize_draw(Some(frame));
+        complete_sample(frame);
+        let surface = crate::view_model::test_support::physical_surface(frame);
+        let mut renderer = iced::futures::executor::block_on(
+            <iced::Renderer as Headless>::new(Default::default(), Some("wgpu"))
+        ).expect("workspace FPS functional acceptance requires the container GPU backend");
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(128.0, 96.0));
+        let viewport = Viewport::with_physical_size(iced::Size::new(128, 96), 1.0);
+        let program = Program::<()> {
+            show_fps: true, input: None, local: None, publish: None, surface,
+            placement: Placement::Contain, control_id: crate::view::workspace::STABLE_ID,
+        };
+        let mut element: crate::fluent_theme::Element<'_, ()> = iced::widget::shader(program)
+            .width(128).height(96).into();
+        let mut tree = widget::Tree::new(&element);
+        tree.diff(element.as_widget_mut());
+        let node = layout::Node::new(bounds.size());
+        let theme = crate::fluent_theme::app_theme(false);
+        let style = iced::advanced::renderer::Style::default();
+        let start = iced::time::Instant::now();
+        let sample = |tree: &mut widget::Tree, milliseconds| {
+            let state = tree.state.downcast_mut::<WorkspaceViewport>();
+            crate::workspace_fps::Meter::update(&mut state.fps, true,
+                &Event::Window(iced::window::Event::RedrawRequested(
+                    start + iced::time::Duration::from_millis(milliseconds))));
+            state.fps.as_ref().unwrap().frames
+        };
+        assert_eq!(sample(&mut tree, 0), 0);
+        let draw = |renderer: &mut iced::Renderer, node: &layout::Node| {
+            element.as_widget().draw(&tree, renderer, &theme, &style, Layout::new(node),
+                mouse::Cursor::Unavailable, &bounds);
+        };
+        renderer.reset(bounds);
+        draw(&mut renderer, &node);
+        draw(&mut renderer, &node);
+        let pixels = renderer.screenshot(&viewport, iced::Color::WHITE);
+        // Both primitives encoded the same retained workspace; one actual
+        // screenshot queue submission counted, and its native test texture drew.
+        assert_eq!(&pixels[(48 * 128 + 64) * 4..(48 * 128 + 64) * 4 + 3], &[0, 0, 0]);
+        assert_eq!(sample(&mut tree, 500), 1);
+        let (device, format) = RENDERER.with(|owner| {
+            let owner = owner.borrow();
+            let owner = owner.as_ref().unwrap();
+            (owner.device.clone(), owner.format)
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("workspace FPS functional target"),
+            size: wgpu::Extent3d { width: 128, height: 96, depth_or_array_layers: 1 },
+            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+            format, usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        });
+        let target = texture.create_view(&Default::default());
+        let _ = renderer.present(Some(iced::Color::WHITE), format, &target, &viewport);
+        assert_eq!(sample(&mut tree, 1000), 1);
+        // Encoding the retained image and then abandoning the exact encoder
+        // exercises physical custody without counting a queue submission.
+        drop(renderer.draw(Some(iced::Color::WHITE), &target, &viewport));
+        renderer.reset(bounds);
+        let clipped = layout::Node::new(bounds.size()).move_to(Point::new(300.0, 300.0));
+        element.as_widget().draw(&tree, &mut renderer, &theme, &style, Layout::new(&clipped),
+            mouse::Cursor::Unavailable, &bounds);
+        let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
+        assert_eq!(sample(&mut tree, 1500), 0);
+        renderer.reset(bounds);
+        element.as_widget().draw(&tree, &mut renderer, &theme, &style, Layout::new(&node),
+            mouse::Cursor::Unavailable, &bounds);
+        let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
+        assert_eq!(sample(&mut tree, 2000), 1);
+        drop(renderer);
+        RENDERER.with(|owner| drop(owner.borrow_mut().take()));
+    }
 
     #[test]
     fn paired_empty_gallery_replaces_detail_only_through_normal_read_custody() {
@@ -4754,36 +4811,6 @@ mod tests {
                 .synchronize_source(surface_for_content_session(2))
                 .is_none()
         );
-    }
-
-    #[test]
-    fn integration_requests_one_initial_and_three_same_revision_redraw_passes() {
-        let surface = |presentation_revision| Surface {
-            high: 1,
-            low: 2,
-            generation: 1,
-            width: 640,
-            height: 480,
-            timeline_ready: 1,
-            frame: Some(frame_ready(1, 1, presentation_revision, 640, 480)),
-            integration: true,
-            crop: None,
-            viewer_identity: None,
-            fit_revision: 0,
-        };
-        let mut viewport = ViewportOwner::default();
-        for _ in 0..INTEGRATION_REDRAW_PASSES {
-            assert!(viewport.begin_integration_redraw(surface(1)));
-        }
-        assert!(!viewport.begin_integration_redraw(surface(1)));
-        for _ in 0..INTEGRATION_REDRAW_PASSES {
-            assert!(viewport.begin_integration_redraw(surface(2)));
-        }
-        assert!(!viewport.begin_integration_redraw(surface(2)));
-        assert!(!viewport.begin_integration_redraw(Surface {
-            integration: false,
-            ..surface(3)
-        }));
     }
 
     #[test]

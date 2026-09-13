@@ -29,7 +29,10 @@ using domain::AnnotationEditorFacts;
 using domain::AnnotationSceneContent;
 
 [[nodiscard]] bool annotation_diagnostics_enabled() noexcept {
-    static const bool enabled = std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS") != nullptr;
+    static const bool enabled = [] {
+        const char* value = std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
     return enabled;
 }
 
