@@ -311,6 +311,7 @@ pub enum Message {
     },
     Advance,
     NumberWheelDelivered,
+    GalleryMouseDelivered,
     UpscalePixels {
         source: u64,
         presentation: u64,
@@ -1801,6 +1802,15 @@ pub(crate) fn report_annotation_gesture(detail: &str, values: [f64; 4]) {
     });
 }
 
+pub(crate) fn report_workspace_mouse(mouse: &crate::generated::WorkspaceMouse) {
+    reporting::emit(|sink| {
+        if mouse.source != crate::generated::PresentationSourceKind::Explore { return; }
+        let Some(point) = &mouse.point else { return; };
+        sink.record("integration.explore_mouse", EXPLORE_GALLERY, "shared-input-admitted",
+            [f64::from(point.x), f64::from(point.y), mouse.kind as u8 as f64, mouse.button as u8 as f64]);
+    });
+}
+
 pub(crate) fn report_gallery_scroll(detail: &str, values: impl FnOnce() -> [f64; 4]) {
     reporting::emit(|sink| {
         sink.record(
@@ -2195,7 +2205,8 @@ enum Phase {
     VisibleReadScroll(u32),
     AwaitVisibleRead(u32),
     AwaitVisibleReadPixels(u32, u64),
-    AwaitVisibleReadFocus(u32, u64),
+    AwaitVisibleReadHover(u32, u64),
+    VisibleReadSelect(u32, u64),
     AwaitVisibleReadSelection(u32, u64),
     AwaitVisibleReadReturn(u32, u64),
     AwaitVisibleReadOscillation(u32, u64, u8),
@@ -2360,7 +2371,8 @@ impl Phase {
             | Self::AwaitVisibleReadArm(_)
             | Self::AwaitVisibleRead(_)
             | Self::AwaitVisibleReadPixels(_, _)
-            | Self::AwaitVisibleReadFocus(_, _)
+            | Self::AwaitVisibleReadHover(_, _)
+            | Self::VisibleReadSelect(_, _)
             | Self::AwaitVisibleReadSelection(_, _)
             | Self::AwaitVisibleReadOscillation(_, _, _)
             | Self::AwaitVisibleReadReturn(_, _)
@@ -2635,7 +2647,7 @@ pub struct Controller {
     copy_objects: usize,
     copy_categories: Vec<crate::generated::ArtifactClassName>,
     gallery_completion_held: Option<(u64, u32)>,
-    sweep_baseline: Option<(u64, crate::generated::ExploreViewport, Option<u32>)>,
+    sweep_baseline: Option<(u64, crate::generated::ExploreViewport)>,
     explore_dataset_pane: Option<Rectangle>,
     explore_details_pane: Option<Rectangle>,
     reveal_offset: AbsoluteOffset,
@@ -2694,12 +2706,10 @@ impl Controller {
                 } else {
                     iced::Subscription::none()
                 },
-                iced::event::listen_with(|event, _, _| {
-                    matches!(
-                        event,
-                        iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. })
-                    )
-                    .then_some(Message::NumberWheelDelivered)
+                iced::event::listen_with(|event, _, _| match event {
+                    iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => Some(Message::NumberWheelDelivered),
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => Some(Message::GalleryMouseDelivered),
+                    _ => None,
                 })
                 .with(self.generation)
                 .map(|(generation, message)| Message::Scoped {
@@ -3360,14 +3370,14 @@ impl Controller {
     fn scroll_atlas(&mut self, stage: u8) -> Task<RootMessage> {
         self.phase = Phase::AwaitAtlasScroll(stage);
         match stage {
-            4 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::END),
-            5 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START),
+            5 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::END),
+            6 => iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START),
             _ => iced::widget::operation::scroll_to(
                 EXPLORE_GALLERY,
                 AbsoluteOffset {
                     x: 0.0,
                     y: self.atlas_row_extent
-                        * ([0.0, 1.0, 2.0, 10.0][stage as usize]
+                        * ([0.0, 1.0, 2.0, 10.0, 9.0][stage as usize]
                             + if matches!(stage, 0 | 2) {
                                 self.atlas_scroll_fraction
                             } else {
@@ -3448,10 +3458,11 @@ impl Controller {
                             Message::Advance
                                 | Message::Located { .. }
                                 | Message::NumberWheelDelivered
+                                | Message::GalleryMouseDelivered
                         ),
                     }
             }
-            Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered => true,
+            Message::Advance | Message::Located { .. } | Message::NumberWheelDelivered | Message::GalleryMouseDelivered => true,
             _ => false,
         }
     }
@@ -3472,6 +3483,12 @@ impl Controller {
         };
         let (control, bounds) = match message {
             Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {
+                return None;
+            }
+            Message::GalleryMouseDelivered => {
+                if let Phase::AwaitVisibleReadHover(index, generation) = self.phase {
+                    self.phase = Phase::VisibleReadSelect(index, generation);
+                }
                 return None;
             }
             Message::NumberWheelDelivered => {
@@ -6186,7 +6203,6 @@ impl Controller {
                     self.sweep_baseline = Some((
                         snapshot.revision,
                         snapshot.viewport.clone(),
-                        snapshot.focusedimage,
                     ));
                     return self.advance_to(Phase::AwaitExploreInitialPatch {
                         revision: snapshot.revision,
@@ -6693,7 +6709,6 @@ impl Controller {
                 self.sweep_baseline = Some((
                     snapshot.revision,
                     snapshot.viewport.clone(),
-                    snapshot.focusedimage,
                 ));
                 if self.viewer_scenario.is_empty() {
                     self.phase = Phase::GalleryColdRead(
@@ -6770,7 +6785,6 @@ impl Controller {
                     self.sweep_baseline = Some((
                         snapshot.revision,
                         snapshot.viewport.clone(),
-                        snapshot.focusedimage,
                     ));
                     self.phase = Phase::GallerySweep;
                     return self.arm(EXPLORE_GALLERY);
@@ -6792,7 +6806,7 @@ impl Controller {
             }
             Phase::GallerySweep => self.arm(EXPLORE_GALLERY),
             Phase::AwaitGallerySweep => {
-                let Some((revision, viewport, focused)) = &self.sweep_baseline else {
+                let Some((revision, viewport)) = &self.sweep_baseline else {
                     self.fail("Explore sweep baseline is unavailable");
                     return Task::none();
                 };
@@ -6801,7 +6815,7 @@ impl Controller {
                 };
                 if snapshot.busy
                     || snapshot.revision <= *revision
-                    || (&snapshot.viewport == viewport && snapshot.focusedimage == *focused)
+                    || &snapshot.viewport == viewport
                     || settings.has_local_edits()
                     || !model.explore_viewport_available()
                 {
@@ -7214,8 +7228,9 @@ impl Controller {
                     },
                 )
             }
+            Phase::AwaitVisibleReadHover(_, _) => Task::none(),
             Phase::AwaitVisibleReadPixels(index, generation)
-            | Phase::AwaitVisibleReadFocus(index, generation) => {
+            | Phase::VisibleReadSelect(index, generation) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
@@ -7251,7 +7266,7 @@ impl Controller {
                 };
                 if matches!(self.phase, Phase::AwaitVisibleReadPixels(_, _)) {
                     crate::presentation_surface::trace_atlas_stage("held-visible", draw);
-                    self.phase = Phase::AwaitVisibleReadFocus(index, generation);
+                    self.phase = Phase::AwaitVisibleReadHover(index, generation);
                     #[cfg(target_arch = "wasm32")]
                     if hover_after_surface_draw_js(
                         f64::from(target.center_x()),
@@ -7262,12 +7277,12 @@ impl Controller {
                     {
                         self.fail("held-placeholder hover dispatch failed");
                     }
-                } else if snapshot.focusedimage == Some(index) {
+                } else {
                     reporting::emit(|sink| {
                         sink.record(
-                            "integration.pending_focus",
+                            "integration.pending_hover",
                             EXPLORE_GALLERY,
-                            "native-focus-from-displayed-placeholder",
+                            "shared-mouse-placeholder-target",
                             [
                                 index as f64,
                                 generation as f64,
@@ -7696,9 +7711,9 @@ impl Controller {
                     .matchingcount
                     .div_ceil(snapshot.viewport.columns.max(1));
                 let settled = match stage {
-                    0..=3 => {
+                    0..=4 => {
                         let fractional = matches!(stage, 0 | 2);
-                        snapshot.viewport.firstrow == [0, 1, 2, 10][stage as usize]
+                        snapshot.viewport.firstrow == [0, 1, 2, 10, 9][stage as usize]
                             && snapshot.viewport.rowcount
                                 == self.atlas_return_rows + u32::from(fractional)
                             && if fractional {
@@ -7707,7 +7722,7 @@ impl Controller {
                                 self.atlas_clip.0.abs() < 1.0
                             }
                     }
-                    4 => {
+                    5 => {
                         snapshot.viewport.firstrow + snapshot.viewport.rowcount == total_rows
                             && self.atlas_clip.1.abs() < 1.0
                     }
@@ -7717,14 +7732,14 @@ impl Controller {
                     return Task::none();
                 }
                 crate::presentation_surface::trace_atlas_stage(
-                    ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
+                    ["fractional", "row1", "row2", "row10", "row9", "end", "restored"][stage as usize],
                     receipt,
                 );
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.atlas_scroll",
                         EXPLORE_GALLERY,
-                        ["fractional", "row1", "row2", "row10", "end", "restored"][stage as usize],
+                        ["fractional", "row1", "row2", "row10", "row9", "end", "restored"][stage as usize],
                         [
                             snapshot.frame.revision as f64,
                             snapshot.viewport.firstrow as f64,
@@ -7734,7 +7749,7 @@ impl Controller {
                     )
                 });
                 match stage {
-                    0..=4 => self.scroll_atlas(stage + 1),
+                    0..=5 => self.scroll_atlas(stage + 1),
                     _ => {
                         if self.session.profile == "retained" && self.viewer_scenario == "rapid" {
                             if !crate::presentation_surface::begin_capacity_acceptance() {
@@ -9492,6 +9507,22 @@ mod tests {
             SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);
             initialize_reporting(false, false);
         }
+    }
+
+    #[test]
+    fn delivered_gallery_mouse_advances_placeholder_selection_for_the_current_driver() {
+        let mut driver = Controller::new(true, false, String::new(), String::new(), "512".into(), String::new());
+        driver.phase = Phase::AwaitVisibleReadHover(5, 9);
+        driver.update(Message::Scoped {
+            generation: driver.generation.wrapping_add(1), receipt: None,
+            message: Box::new(Message::GalleryMouseDelivered),
+        });
+        assert_eq!(driver.phase, Phase::AwaitVisibleReadHover(5, 9));
+        driver.update(Message::Scoped {
+            generation: driver.generation, receipt: None,
+            message: Box::new(Message::GalleryMouseDelivered),
+        });
+        assert_eq!(driver.phase, Phase::VisibleReadSelect(5, 9));
     }
 
     #[test]

@@ -826,8 +826,10 @@ mod tests {
         explore.ready = true;
         explore.busy = false;
         let request = ExploreViewportUpdate {
-            viewport: crate::generated::default_request_exploreUpdateViewportviewport().unwrap(),
-            focusedcompiledindex: Some(3),
+            viewport: crate::generated::ExploreViewport {
+                extent: crate::generated::VisualExtent { width: 64, height: 64 },
+                firstrow: 0, rowcount: 1, columns: 1,
+            },
         };
         send.workspace
             .explore_request_viewport(send.model.explore.snapshot.as_ref(), request);
@@ -1181,7 +1183,6 @@ mod tests {
         let (mut interaction, _interaction_receiver) = ready();
         let _ = interaction.request_explore_viewport(ExploreViewportUpdate {
             viewport: crate::generated::default_request_exploreUpdateViewportviewport().unwrap(),
-            focusedcompiledindex: None,
         });
         assert_eq!(interaction.model.pending_count(), 0);
     }
@@ -1244,7 +1245,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(5, 7, 100)
                 .unwrap(),
-            focusedcompiledindex: Some(37),
         };
         drop(success.request_explore_viewport(draft_request));
         let mut authoritative = success.model.settings_snapshot.clone().unwrap();
@@ -1255,7 +1255,6 @@ mod tests {
         let settled = success.workspace.explore_dispatchable_viewport().unwrap();
         assert_eq!(settled.viewport.columns, 5);
         assert_eq!(settled.viewport.firstrow, 7);
-        assert_eq!(settled.focusedcompiledindex, Some(37));
 
         let (mut rejected, task) = boot();
         drop(task);
@@ -1274,7 +1273,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(5, 9, 100)
                 .unwrap(),
-            focusedcompiledindex: Some(49),
         };
         drop(rejected.request_explore_viewport(draft_request));
         let authoritative = rejected.model.settings_snapshot.clone().unwrap();
@@ -1283,7 +1281,6 @@ mod tests {
         let rolled_back = rejected.workspace.explore_dispatchable_viewport().unwrap();
         assert_eq!(rolled_back.viewport.columns, authoritative_columns);
         assert_eq!(rolled_back.viewport.firstrow, 9);
-        assert_eq!(rolled_back.focusedcompiledindex, Some(49));
     }
 
     #[test]
@@ -1335,7 +1332,6 @@ mod tests {
                     explore.ready = true;
                     explore.order.matchingcount = 100;
                     explore.viewport.firstrow = 11;
-                    explore.focusedimage = Some(34);
                 }
                 _ => {}
             }
@@ -1351,7 +1347,6 @@ mod tests {
         });
         let rebased = reconnect.workspace.explore_dispatchable_viewport().unwrap();
         assert_eq!(rebased.viewport, measured);
-        assert_eq!(rebased.focusedcompiledindex, Some(34));
     }
 
     #[test]
@@ -1395,7 +1390,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(columns, 0, 100)
                 .unwrap(),
-            focusedcompiledindex: None,
         };
         assert!(expected.viewport.rowcount > 1);
         assert_eq!(
@@ -1437,7 +1431,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(columns, 0, 0)
                 .unwrap(),
-            focusedcompiledindex: None,
         };
         drop(app.request_explore_viewport(measured.clone()));
 
@@ -1464,7 +1457,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(columns, 1, 100)
                 .unwrap(),
-            focusedcompiledindex: Some(5),
         };
         app.workspace
             .explore_request_viewport(app.model.explore.snapshot.as_ref(), sent.clone());
@@ -1476,7 +1468,6 @@ mod tests {
                 .workspace
                 .explore_measured_viewport(columns, last_filtered_row, 100)
                 .unwrap(),
-            focusedcompiledindex: Some(13),
         };
         app.workspace
             .explore_request_viewport(app.model.explore.snapshot.as_ref(), newer);
@@ -1484,7 +1475,6 @@ mod tests {
         let mut filtered = app.model.explore.snapshot.clone().unwrap();
         filtered.revision += 1;
         filtered.viewport = sent.viewport;
-        filtered.focusedimage = sent.focusedcompiledindex;
         filtered.order.matchingcount = filtered_count;
         let visible_begin = filtered
             .viewport
@@ -1504,13 +1494,11 @@ mod tests {
         let rebased = app.workspace.explore_dispatchable_viewport().unwrap();
         assert_eq!(rebased.viewport.firstrow, last_filtered_row);
         assert_eq!(rebased.viewport.rowcount, 1);
-        assert_eq!(rebased.focusedcompiledindex, Some(13));
 
         app.workspace.explore_viewport_queued(rebased.clone());
         let mut committed = app.model.explore.snapshot.clone().unwrap();
         committed.revision += 1;
         committed.viewport = rebased.viewport;
-        committed.focusedimage = rebased.focusedcompiledindex;
         reduce_explore_changed(&mut app, committed);
 
         assert!(app.workspace.explore_dispatchable_viewport().is_none());

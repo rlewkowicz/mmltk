@@ -486,11 +486,7 @@ impl State {
                     SINK.record(
                         "integration.explore_slot",
                         EXPLORE_GALLERY,
-                        if snapshot.focusedimage.is_some() {
-                            "current-focused"
-                        } else {
-                            "current"
-                        },
+                        "current",
                         [
                             snapshot.revision as f64,
                             snapshot.frame.revision as f64,
@@ -742,7 +738,6 @@ mod tests {
             snapshot.augmentation.enabled = true;
             snapshot.augmentation.seed = 73;
             snapshot.detail.showoriginaldimensions = false;
-            snapshot.focusedimage = Some(3);
             snapshot.order.visibleindices =
                 (0..crate::generated::EXPLORE_VISIBLE_ITEM_CAPACITY).collect();
             snapshot.gallery.slots = vec![true; snapshot.order.visibleindices.len()];
@@ -804,7 +799,7 @@ mod tests {
                         (
                             "integration.explore_slot".into(),
                             EXPLORE_GALLERY.into(),
-                            "current-focused".into(),
+                            "current".into(),
                             [11.0, 1.0, slot as f64, slot as f64]
                         )
                     );

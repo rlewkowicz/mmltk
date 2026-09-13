@@ -789,9 +789,10 @@ fn application_record_fixtures() -> Result<Vec<(&'static str, Vec<u8>)>, Box<dyn
         (
             "Interaction:explore.UpdateViewport",
             generated::encode_explore_UpdateViewport(generated::ExploreViewportUpdate {
-                viewport: generated::default_request_exploreUpdateViewportviewport()
-                    .map_err(io::Error::other)?,
-                focusedcompiledindex: None,
+                viewport: generated::ExploreViewport {
+                    extent: generated::VisualExtent { width: 64, height: 64 },
+                    firstrow: 0, rowcount: 1, columns: 1,
+                },
             })?
             .encode()?,
         ),

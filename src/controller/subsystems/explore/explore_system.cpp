@@ -35,14 +35,12 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
     return *algorithm;
 }
 
-[[nodiscard]] VisualRuntimeFactory bind_explore_demand(VisualRuntimeFactory factory, ExploreDemandCheck demand,
-                                                      std::shared_ptr<const ExploreLoadingPriority> priority) {
+[[nodiscard]] VisualRuntimeFactory bind_explore_demand(VisualRuntimeFactory factory, ExploreDemandCheck demand) {
     if (!factory) return {};
-    return [factory = std::move(factory), demand = std::move(demand), priority = std::move(priority)](auto revisions) {
+    return [factory = std::move(factory), demand = std::move(demand)](auto revisions) {
         auto runtime = factory(std::move(revisions));
         if (runtime) {
             explore_algorithm(*runtime).SetCurrentDemand(demand);
-            explore_algorithm(*runtime).SetLoadingPriority(priority);
         }
         return runtime;
     };
@@ -55,7 +53,6 @@ static_assert(std::is_nothrow_move_constructible_v<ExploreOrderCandidate>);
             .overlay = requested.overlay,
             .mode = requested.mode,
             .selected_image = requested.selected_image,
-            .focused_image = requested.focused_image,
             .augmentation_config = augmentation_config,
             .augmentation = requested.augmentation,
             .detail = requested.detail,
@@ -173,7 +170,7 @@ class ExploreSystem::Impl final {
           state_{.nproc = nproc, .maximum_atlas_extent = {settings.maximum_width, settings.maximum_height}},
           gallery_wake_(std::make_shared<GalleryWakeGate>([this] { SubmitGalleryContinuation(); })),
           worker_(
-              bind_explore_demand(std::move(factory), ExploreDemandCheck{latest_generation_}, loading_priority_),
+              bind_explore_demand(std::move(factory), ExploreDemandCheck{latest_generation_}),
               [this](const std::exception_ptr failure) { Failed(failure); },
               diagnostics_.valid()
                   ? detail::VisualRuntimeOwner::ActivityObservation{[diagnostics](const detail::VisualRuntimeOwner::ActivityStage stage,
@@ -313,7 +310,6 @@ class ExploreSystem::Impl final {
                         settled.detail = plan.detail;
                         settled.mode = ExploreMode::Gallery;
                         settled.selected_image.reset();
-                        settled.focused_image.reset();
                         CompleteProduct(settled, *rendered);
                         ExploreSettingsCandidate runtime_settings;
                         const auto catalog_identity = settled.dataset.class_catalog_identity;
@@ -383,24 +379,14 @@ class ExploreSystem::Impl final {
             RequireReady();
             auto& desired = desired_ ? desired_->snapshot : state_;
             if (ClampViewport(request.viewport, desired.order.matching_count) == desired.viewport) {
-                auto focused = request.focused_compiled_index;
-                if (desired.viewport == state_.viewport && focused &&
-                    std::ranges::find(state_.order.visible_indices, *focused) == state_.order.visible_indices.end())
-                    focused.reset();
-                desired.focused_image = focused;
                 desired.viewport_result = ExploreViewportResult{request, ExploreViewportOutcome::Ready};
-                if (desired.viewport == state_.viewport) {
-                    state_.focused_image = focused;
-                    state_.viewport_result = desired.viewport_result;
-                }
-                loading_priority_->Focus(focused);
+                if (desired.viewport == state_.viewport) state_.viewport_result = desired.viewport_result;
                 return;
             }
         }
         static_cast<void>(QueueDesired(
             [&](ExploreSnapshot& desired) {
                 desired.viewport = ClampViewport(request.viewport, desired.order.matching_count);
-                desired.focused_image = request.focused_compiled_index;
                 desired.viewport_result = ExploreViewportResult{request, ExploreViewportOutcome::Ready};
             },
             0, false, false, true));
@@ -432,7 +418,6 @@ class ExploreSystem::Impl final {
                 state.order = std::move(order);
                 state.mode = ExploreMode::Gallery;
                 state.selected_image.reset();
-                state.focused_image.reset();
             },
             [this, request](const ExploreSettingsCandidate& installed) -> std::optional<ExploreSettingsCandidate> {
                 return settings_system_.persist_explore_filter(installed, request);
@@ -459,7 +444,6 @@ class ExploreSystem::Impl final {
                 state.order = std::move(order);
                 state.mode = ExploreMode::Gallery;
                 state.selected_image.reset();
-                state.focused_image.reset();
             },
             [](const ExploreSettingsCandidate&) { return std::optional<ExploreSettingsCandidate>{}; }, shuffle_seed, std::nullopt,
             // CLEANUP-IGNORE: This candidate-failure label closes Reroll; detail update starts an independent endpoint.
@@ -749,7 +733,6 @@ class ExploreSystem::Impl final {
         const auto count = static_cast<std::int64_t>(std::max(1U, request->snapshot.order.matching_count));
         request->navigation = (request->navigation + navigation) % count;
         request->generation = NextGeneration();
-        loading_priority_->Focus(request->snapshot.focused_image);
         request->ticket = desired_work_sequence_ = mmltk::common::types::advance_monotonic_identity(desired_work_sequence_);
         request->direction = scroll_direction_;
         worker_.SetOutputRetry(false);
@@ -861,14 +844,6 @@ class ExploreSystem::Impl final {
         auto& algorithm = explore_algorithm(runtime);
         try {
             auto order = algorithm.Visible(plan.viewport);
-            if (plan.focused_image && std::ranges::find(order.visible_indices, *plan.focused_image) == order.visible_indices.end()) {
-                const auto invalid_focus = plan.focused_image;
-                plan.focused_image.reset();
-                requested.focused_image.reset();
-                std::scoped_lock lock(mutex_);
-                if (CurrentDesired(*request) && request->snapshot.focused_image == invalid_focus)
-                    request->snapshot.focused_image.reset();
-            }
             if (offset != 0 && requested.selected_image) {
                 const auto selected = algorithm.Adjacent(*requested.selected_image, offset);
                 if (!selected) throw contracts::UnavailableError("Explore filtered order is empty");
@@ -921,11 +896,7 @@ class ExploreSystem::Impl final {
                 settled.augmentation = requested.augmentation;
                 settled.mode = requested.mode;
                 settled.selected_image = requested.selected_image;
-                settled.focused_image = request->snapshot.focused_image;
                 settled.order = std::move(order);
-                if (settled.focused_image &&
-                    std::ranges::find(settled.order.visible_indices, *settled.focused_image) == settled.order.visible_indices.end())
-                    settled.focused_image.reset();
                 const bool discrete_pending = state_.busy;
                 CompleteProduct(settled, *rendered);
                 settled.busy = discrete_pending;
@@ -1023,7 +994,6 @@ class ExploreSystem::Impl final {
             install();
             document_ = std::move(product.document);
             active_gallery_generation_ = retained.gallery.generation;
-            loading_priority_->Focus(settled.focused_image);
             state_ = std::move(settled);
         }
         if (continue_gallery) SubmitGalleryContinuation();
@@ -1752,7 +1722,6 @@ class ExploreSystem::Impl final {
     std::uint64_t semantic_identity_ = 0U;
     std::uint64_t next_semantic_identity_ = 1U;
     const std::shared_ptr<std::atomic<std::uint64_t>> latest_generation_ = std::make_shared<std::atomic<std::uint64_t>>(0U);
-    const std::shared_ptr<ExploreLoadingPriority> loading_priority_ = std::make_shared<ExploreLoadingPriority>();
     std::uint64_t active_gallery_generation_ = 0U;
     ExploreAlgorithm* configured_algorithm_ = nullptr;
     std::uint64_t next_shuffle_seed_ = 1U;

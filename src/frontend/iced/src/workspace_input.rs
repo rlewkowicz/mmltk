@@ -30,8 +30,11 @@ impl Binding {
             if let Some(radius) = self.radius { mouse.brushradius = radius; }
         }
         if let Some(connection) = self.connection.lock().expect("workspace connection").as_mut() {
+            let observed = crate::integration_control::reporting_enabled().then(|| mouse.clone());
             if connection.send_workspace_mouse(mouse).is_err() {
                 connection.close();
+            } else if let Some(observed) = observed {
+                crate::integration_control::report_workspace_mouse(&observed);
             }
         }
     }

@@ -291,10 +291,13 @@ consumption and GPU-dependent document commands retain their separate completion
 requirements. The autonomous renderer consumes coherent native state and keeps
 its useful caches while external display storage is occupied.
 
-Explore mouse focus updates loading priority. Viewport changes, newly loaded
-content, and actual product changes update the content used by shared incremental
-rendering. All visual producers use that autonomous rendering path. Browser redraws
-follow the visible window's graphics cadence and can reuse unchanged completed pixels.
+Explore atlas loading follows the visible viewport and scroll direction: visible
+rows first, then leading rows, then prior rows. Cached rows entering the viewport
+populate its first result before additional content is fetched. Viewport changes,
+newly loaded content, and actual product changes update the content used by shared
+incremental rendering. All visual producers use that autonomous rendering path.
+Browser redraws follow the visible window's graphics cadence and can reuse unchanged
+completed pixels.
 The optional workspace FPS display counts actual browser queue submissions
 containing workspace draws and belongs to the workspace component.
 

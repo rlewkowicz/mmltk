@@ -238,10 +238,7 @@ class GalleryStream::Impl final {
         current_demand_ = std::move(check);
         demand_bound_ = true;
     }
-    void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority> priority) {
-        if (loading_priority_) throw std::logic_error("Explore gallery loading priority is already bound");
-        loading_priority_ = std::move(priority);
-    }
+
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                    const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
@@ -396,9 +393,7 @@ class GalleryStream::Impl final {
     [[nodiscard]] std::size_t CacheOffset(std::size_t position, std::uint8_t bank) const noexcept {
         return (bank * State().cache.size() + State().cache.Slot(position)) * State().cache.identity().extent;
     }
-    void Prioritize(std::optional<std::uint32_t>);
-    std::shared_ptr<const ExploreLoadingPriority> loading_priority_;
-    std::optional<std::uint32_t> scheduled_focus_;
+    void Prioritize();
     void PlaceTile(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uint32_t, std::uintptr_t,
                    bool semantic_only = false);
     [[nodiscard]] std::uint32_t AtlasY(const std::size_t logical) const noexcept {
@@ -546,13 +541,11 @@ class GalleryStream::Impl final {
         ExploreScrollDirection scroll_direction = ExploreScrollDirection::Forward;
         ExploreDetailView detail{};
         std::optional<std::uint32_t> selected_image;
-        std::optional<std::uint32_t> focused_image;
         std::uint64_t generation = 0U;
         bool show_labels = false;
     } pending_plan_;
     void PrepareReuse(const ExploreRenderPlan& plan) noexcept {
-        pending_plan_ = {plan.viewport,   plan.scroll_direction,   plan.detail, plan.selected_image, plan.focused_image,
-                         plan.generation, plan.overlay.show_labels};
+        pending_plan_ = {plan.viewport, plan.scroll_direction, plan.detail, plan.selected_image, plan.generation, plan.overlay.show_labels};
     }
     std::size_t prior_cumulative_ = 0U;
     std::size_t prior_reused_ = 0U;
@@ -664,8 +657,7 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
                 .remaining_tiles = State().visible_indices.size() - State().cumulative_tiles};
     }
     if (output_change != ExploreOutputChange::Initialize) {
-        const bool priority_changed =
-            State().plan.focused_image != plan.focused_image || State().plan.scroll_direction != plan.scroll_direction;
+        const bool direction_changed = State().plan.scroll_direction != plan.scroll_direction;
         SaveOverlay();
         const auto previous = State().plan.generation;
         State().plan = plan;
@@ -685,8 +677,8 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
             RestoreVisibleTiles(classes, clean, semantic, stream);
             RenderCachedSemantics(clean, semantic, stream);
         }
-        if (priority_changed)
-            Prioritize(plan.focused_image);
+        if (direction_changed)
+            Prioritize();
         else
             next_priority_ = 0U;
         return PublicationFacts(0U);
@@ -737,9 +729,11 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
     State().completed_slots.assign(State().visible_indices.size(), false);
     scheduled_slots_.resize(State().cache.size());
     undo_marks_.resize(State().cache.size());
-    Prioritize(plan.focused_image);
+    Prioritize();
     // Incumbent physical lanes remain untouched until this logical candidate
-    // commits. The ordinary continuation scan rebinds settled useful inputs.
+    // commits. Restore every valid cached visible tile before continuation
+    // admits misses; this applies equally to either side of a scroll reversal.
+    // The ordinary continuation scan rebinds settled useful inputs.
     SeedPlaceholders(classes, clean, semantic, stream);
     bool refresh_semantics = false;
     for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot) {
@@ -779,7 +773,13 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
                                         .operation = VisualDiagnosticOperation::AcceptancePlaceholderComplete,
                                         .generation = plan.generation,
                                         .value = State().visible_indices.size(),
-                                        .detail = explore_visible_indices_digest(State().visible_indices)};
+                                        .detail = explore_visible_indices_digest(State().visible_indices),
+                                        .context = {.capacity_width = State().reused_tiles,
+                                                    .admission = {.admission_first_row = plan.viewport.first_row,
+                                                                  .admission_row_count = plan.viewport.row_count,
+                                                                  .admission_columns = plan.viewport.columns,
+                                                                  .admission_forward =
+                                                                      plan.scroll_direction == ExploreScrollDirection::Forward}}};
         });
     }
     auto publication = PublicationFacts(stale_discarded_.exchange(0U, std::memory_order_acq_rel));
@@ -935,7 +935,7 @@ void GalleryStream::Impl::PrepareOutputPublication(const ExploreOutputChange cha
             scheduled_slots_.resize(committed_.cache.size());
             undo_marks_.resize(committed_.cache.size());
             desired_generation_.store(committed_.plan.generation, std::memory_order_release);
-            if (committed_.plan.mode == ExploreMode::Gallery) Prioritize(committed_.plan.focused_image);
+            if (committed_.plan.mode == ExploreMode::Gallery) Prioritize();
         }
         throw;
     }
@@ -960,14 +960,12 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
             for (auto& lane : lanes_)
                 ReconcileInitializationLane(*lane);
     } else if (publication_change_ == ExploreOutputChange::Unchanged) {
-        const bool focus_changed = committed_.plan.focused_image != pending_plan_.focused_image ||
-                                   committed_.plan.scroll_direction != pending_plan_.scroll_direction;
+        const bool direction_changed = committed_.plan.scroll_direction != pending_plan_.scroll_direction;
         committed_.plan.generation = pending_plan_.generation;
         committed_.plan.viewport = pending_plan_.viewport;
         committed_.plan.scroll_direction = pending_plan_.scroll_direction;
         committed_.plan.detail = pending_plan_.detail;
         committed_.plan.selected_image = pending_plan_.selected_image;
-        committed_.plan.focused_image = pending_plan_.focused_image;
         committed_.plan.overlay.show_labels = pending_plan_.show_labels;
         desired_generation_.store(pending_plan_.generation, std::memory_order_release);
         {
@@ -981,8 +979,8 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
                         static_cast<void>(ReserveInput(*lane));
                 }
         }
-        if ((focus_changed || mode_switched_) && committed_.plan.mode == ExploreMode::Gallery)
-            Prioritize(pending_plan_.focused_image);
+        if ((direction_changed || mode_switched_) && committed_.plan.mode == ExploreMode::Gallery)
+            Prioritize();
         else
             next_priority_ = 0U;
     }
@@ -1046,7 +1044,7 @@ bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
         }
         if ((publication_change_ == ExploreOutputChange::Initialize || overlay_undo_ || restored_mode) &&
             State().plan.mode == ExploreMode::Gallery)
-            Prioritize(State().plan.focused_image);
+            Prioritize();
         std::shared_ptr<const ExploreAlgorithm::GalleryReadySink> sink;
         {
             std::scoped_lock lock(lanes_mutex_);
@@ -1550,9 +1548,7 @@ ExploreStorageFootprint GalleryStream::Impl::StorageFootprint() const {
             .cache_cards = std::max(State().cache.size(), retained_.cache.size())};
 }
 
-void GalleryStream::Impl::Prioritize(std::optional<std::uint32_t> focused_image) {
-    if (loading_priority_) focused_image = loading_priority_->focused();
-    scheduled_focus_ = focused_image;
+void GalleryStream::Impl::Prioritize() {
     next_priority_ = 0U;
     State().priority_slots.clear();
     if (State().window_indices.empty()) return;
@@ -1560,14 +1556,8 @@ void GalleryStream::Impl::Prioritize(std::optional<std::uint32_t> focused_image)
     const auto first = std::min(static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns,
                                 State().window_first + State().window_indices.size());
     const auto visible_offset = first - State().window_first;
-    if (focused_image) {
-        const auto focused = std::ranges::find(State().visible_indices, *focused_image);
-        if (focused != State().visible_indices.end())
-            State().priority_slots.push_back(static_cast<std::uint32_t>(visible_offset + focused - State().visible_indices.begin()));
-    }
     for (std::size_t slot = 0U; slot != State().visible_indices.size(); ++slot)
-        if (State().priority_slots.empty() || visible_offset + slot != State().priority_slots.front())
-            State().priority_slots.push_back(static_cast<std::uint32_t>(visible_offset + slot));
+        State().priority_slots.push_back(static_cast<std::uint32_t>(visible_offset + slot));
     const auto end = visible_offset + State().visible_indices.size();
     const auto columns = State().viewport.columns;
     const auto ahead = [&] {
@@ -1681,7 +1671,6 @@ void GalleryStream::Impl::RebindInput(Lane& lane) {
 void GalleryStream::Impl::StartIdleLanes() {
     const auto generation = desired_generation_.load(std::memory_order_acquire);
     if (!Current(generation)) return;
-    if (loading_priority_ && loading_priority_->focused() != scheduled_focus_) Prioritize(loading_priority_->focused());
     // Rebind the acceptance gate to restored demand. In-flight reads keep
     // their physical lanes through cancellation and view changes.
     if (acceptance_) acceptance_->AdvanceGeneration(generation);
@@ -3416,9 +3405,7 @@ GalleryStream::~GalleryStream() {
 mmltk::common::concurrency::WorkerPool& GalleryStream::workers() noexcept { return impl_->workers(); }
 void GalleryStream::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) { impl_->SetReadySink(std::move(sink)); }
 void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { impl_->SetCurrentDemand(std::move(check)); }
-void GalleryStream::SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority> priority) {
-    impl_->SetLoadingPriority(std::move(priority));
-}
+
 ExploreOutputChange GalleryStream::OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                 const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
     return impl_->OutputChange(plan, visible, store, window);

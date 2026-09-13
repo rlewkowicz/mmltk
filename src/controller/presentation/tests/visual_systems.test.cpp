@@ -886,14 +886,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
         probe_->scroll_direction = plan.scroll_direction;
         probe_->priority_slots.clear();
-        if (plan.focused_image) {
-            const auto focused = std::ranges::find(probe_->visible, *plan.focused_image);
-            if (focused != probe_->visible.end())
-                probe_->priority_slots.push_back(static_cast<std::uint32_t>(focused - probe_->visible.begin()));
-        }
         for (std::size_t slot = 0U; slot != probe_->visible.size(); ++slot)
-            if (probe_->priority_slots.empty() || slot != probe_->priority_slots.front())
-                probe_->priority_slots.push_back(static_cast<std::uint32_t>(slot));
+            probe_->priority_slots.push_back(static_cast<std::uint32_t>(slot));
     }
     void ClearStreamingState() noexcept {
         std::scoped_lock lock(probe_->mutex);
@@ -2291,12 +2285,12 @@ class ExplorePressureFixture final {
         }
         probe.WaitIdle(3U);
     }
-    void RequestViewport(const std::uint32_t row, const std::optional<std::uint32_t> focus = {}) {
+    void RequestViewport(const std::uint32_t row, const bool expect_work = true) {
         auto next = viewport;
         next.first_row = row;
         const auto before = probe.attempts.load(std::memory_order_acquire);
-        scenario.system().UpdateViewport({.viewport = next, .focused_compiled_index = focus});
-        probe.WaitIdle(before + 1U);
+        scenario.system().UpdateViewport({.viewport = next});
+        if (expect_work) probe.WaitIdle(before + 1U);
     }
     [[nodiscard]] std::vector<Observation> Recorded() {
         std::scoped_lock lock(observation_mutex);
@@ -2320,13 +2314,13 @@ TEST_CASE("Explore retries only the newest desired product after held reads rele
     fixture.RequestViewport(0U);
     fixture.RequestViewport(1U);
     const auto generation = explore.LastInteractionGeneration();
-    fixture.RequestViewport(1U, 1U);
+    fixture.RequestViewport(1U, false);
     CHECK(explore.LastInteractionGeneration() == generation);
     CHECK(explore.snapshot().frame == held);
     fixture.held[0U] = {};
     REQUIRE(fixture.scenario.Wait([&] {
         const auto state = explore.snapshot();
-        return state.frame != held && state.viewport.first_row == 1U && state.focused_image == 1U;
+        return state.frame != held && state.viewport.first_row == 1U;
     }));
     CHECK(fixture.held[1U].valid());
     CHECK(fixture.held[2U].valid());
@@ -2396,7 +2390,7 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
     fixture.HoldGalleryPool();
     auto& explore = fixture.scenario.system();
     const auto incumbent = explore.snapshot();
-    fixture.RequestViewport(0U, 0U);
+    fixture.RequestViewport(0U);
     auto policy = ExploreFilterUpdate{.filter = incumbent.filter, .overlay = incumbent.overlay};
     policy.filter.minimum_instances = 1U;
     policy.overlay.show_boxes = !policy.overlay.show_boxes;
@@ -2409,7 +2403,6 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
         CHECK(predecessor.busy);
         CHECK(predecessor.filter == incumbent.filter);
         CHECK(predecessor.overlay == incumbent.overlay);
-        CHECK(predecessor.focused_image == 0U);
         fixture.held[1U] = {};
         REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().filter == policy.filter; }));
         const auto filtered = explore.snapshot();
@@ -2417,15 +2410,13 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
         CHECK(filtered.viewport.first_row == 0U);
         CHECK(filtered.overlay == policy.overlay);
         CHECK_FALSE(filtered.selected_image);
-        CHECK_FALSE(filtered.focused_image);
-        fixture.RequestViewport(1U, 1U);
+        fixture.RequestViewport(1U);
         const auto later = explore.snapshot();
         CHECK(later.filter == policy.filter);
         CHECK(later.overlay == policy.overlay);
         CHECK(later.viewport.first_row == 1U);
         CHECK(later.order.visible_indices == std::vector<std::uint32_t>{1U});
         CHECK_FALSE(later.selected_image);
-        CHECK(later.focused_image == 1U);
         const auto persisted = fixture.settings.system().explore_settings_candidate().preferences.policy;
         CHECK(persisted.filter == policy.filter);
         CHECK(persisted.overlay == policy.overlay);
@@ -2473,7 +2464,7 @@ TEST_CASE("Explore settles a pending predecessor on the incumbent before reconst
     ExplorePressureFixture fixture;
     fixture.HoldGalleryPool();
     auto& explore = fixture.scenario.system();
-    fixture.RequestViewport(0U, 0U);
+    fixture.RequestViewport(0U);
     const bool initial_h2d = fixture.settings.system().explore_settings_candidate().loading.h2d_dataloader;
     contracts::SettingsUpdateRequest update;
     update.updates.push_back(
@@ -2489,10 +2480,8 @@ TEST_CASE("Explore settles a pending predecessor on the incumbent before reconst
     REQUIRE(predecessor != observations.end());
     CHECK(predecessor->runtimes == 1U);
     CHECK(predecessor->snapshot.order.visible_indices == std::vector<std::uint32_t>{0U});
-    CHECK(predecessor->snapshot.focused_image == 0U);
     CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 2U);
     CHECK(explore.snapshot().frame != predecessor->snapshot.frame);
-    CHECK_FALSE(explore.snapshot().focused_image);
 }
 
 TEST_CASE("Stop cancels Explore work resumed by an output availability continuation") {
@@ -3156,24 +3145,103 @@ TEST_CASE("Explore publishes placeholders before loaders and patches released la
     probe->Release(1U);
     REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > first_patch.frame.revision; }));
     check_gallery_first_pixels(explore, 0x40U, 0x41U);
-    const auto before_focus = explore.snapshot();
-    CHECK(before_focus.gallery.slots == std::vector<bool>{true, true});
-    explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
-    REQUIRE(events.Wait([&] { return explore.snapshot().focused_image == 1U; }));
-    CHECK(explore.snapshot().gallery.generation == before_focus.gallery.generation);
-    CHECK(explore.snapshot().gallery.slots == before_focus.gallery.slots);
+    const auto completed = explore.snapshot();
+    CHECK(completed.gallery.slots == std::vector<bool>{true, true});
+    explore.SetInputPeer(1U);
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{6.25F, 2.0F}});
+    CHECK(explore.snapshot().gallery.generation == completed.gallery.generation);
+    CHECK(explore.snapshot().gallery.slots == completed.gallery.slots);
     std::scoped_lock lock(probe->mutex);
     CHECK(probe->lane_preparations == 2U);
+}
+
+TEST_CASE("Explore visible loading and independent producers progress through shared mouse input", "[explore][priority]") {
+    StreamingExploreFixture scenario{1U};
+    StreamingExploreFixture independent{1U};
+    const ExploreViewport viewport{.extent = {16U, 8U}, .row_count = 2U, .columns = 4U};
+    scenario.OpenAndWait(viewport);
+    independent.OpenAndWait(viewport);
+    auto& explore = scenario.system();
+    auto& probe = scenario.probe();
+    explore.SetInputPeer(1U);
+    const auto placeholders = explore.snapshot();
+    CHECK(placeholders.order.visible_indices == std::vector<std::uint32_t>{0U, 1U, 2U, 3U, 4U, 5U});
+    CHECK(std::ranges::none_of(placeholders.gallery.slots, [](bool ready) { return ready; }));
+    scenario.probe().AllowAllocation();
+    REQUIRE(probe.Wait([&] { return probe.assignments.size() == 1U; }));
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{12.5F, 0.5F}});
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{15.875F, 3.875F}});
+    probe.Release(0U);
+    REQUIRE(probe.Wait([&] { return probe.assignments.size() == 1U && probe.assignments.front().compiled_index == 1U; }));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().gallery.slots[0U]; }));
+    CHECK(explore.snapshot().order.visible_indices == placeholders.order.visible_indices);
+    CHECK_FALSE(explore.snapshot().gallery.slots[3U]);
+    independent.probe().AllowAllocation();
+    REQUIRE(independent.probe().Wait([&] { return independent.probe().assignments.size() == 1U; }));
+    independent.probe().Release(0U);
+    REQUIRE(independent.Wait([&] { return independent.system().snapshot().gallery.slots[0U]; }));
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{8.0F, 4.0F}});
+    probe.Release(1U);
+    REQUIRE(probe.Wait([&] { return probe.assignments.size() == 1U && probe.assignments.front().compiled_index == 2U; }));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().gallery.slots[1U]; }));
+    CHECK(explore.BorrowFrame().valid());
+}
+
+TEST_CASE("Explore retains content and accepts input through pending image completion and source changes", "[explore][priority]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto work = std::make_shared<ExploreWorkProbe>();
+    auto gate = std::make_shared<ExplorePostRenderGate>(1U);
+    LoadedSettings settings;
+    ExploreScenario scenario{settings, backend, [work, gate] {
+        return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
+                                                      nullptr, nullptr, work, gate);
+    }};
+    auto& explore = scenario.system();
+    mmltk::testsupport::ScopedTestCleanup release_gate{[&] { mmltk::testsupport::release_test_promise(gate->release); }};
+    scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
+    explore.SetInputPeer(1U);
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{1.5F, 1.5F}});
+    const auto prior = explore.snapshot();
+    auto retained = explore.BorrowFrame();
+    auto overlay = prior.overlay;
+    overlay.show_boxes = !overlay.show_boxes;
+    static_cast<void>(explore.UpdateOverlay(overlay));
+    mmltk::testsupport::await_test_promise(gate->entered, "pending Explore overlay");
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{60.5F, 1.5F}});
+    mmltk::testsupport::release_test_promise(gate->release);
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().overlay == overlay && explore.snapshot().frame != prior.frame; }));
+    CHECK(retained.valid());
+    CHECK(explore.snapshot().order.visible_indices == prior.order.visible_indices);
+    auto filter = explore.snapshot().filter;
+    filter.minimum_instances = 1U;
+    filter.order = ExploreOrder::Shuffled;
+    static_cast<void>(explore.UpdateFilter({.filter = filter, .overlay = overlay}));
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().filter == filter; }));
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{1.5F, 1.5F}});
+    const auto seed = explore.snapshot().order.shuffle_seed;
+    static_cast<void>(explore.Reroll());
+    REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().order.shuffle_seed != seed; }));
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{1.5F, 1.5F}});
+    scenario.OpenAndWait(explore.snapshot().viewport, "/replacement");
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{1.5F, 1.5F}});
+    static_cast<void>(explore.Stop());
 }
 
 TEST_CASE("Explore owns direction across accepted logical rows and zero-movement updates", "[explore][priority]") {
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    explore.SetInputPeer(1U);
     const auto check = [&](const std::uint32_t row, const ExploreScrollDirection direction) {
-        const auto before = explore.snapshot().revision;
+        const auto before = explore.snapshot();
+        const auto generation = explore.LastInteractionGeneration();
+        explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U,
+                       .point = WorkspacePoint{row % 2U == 0U ? 0.5F : 7.5F, 2.0F}});
         explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = row, .row_count = 1U, .columns = 2U}});
-        REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before; }));
+        if (before.viewport.first_row != row)
+            REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before.revision; }));
+        else
+            CHECK(explore.LastInteractionGeneration() == generation);
         std::scoped_lock lock(scenario.probe().mutex);
         CHECK(scenario.probe().scroll_direction == direction);
     };
@@ -4876,34 +4944,51 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
     SECTION("selection") { run(true); }
 }
 
-TEST_CASE("Explore focus never changes published target atlas slot identity") {
+TEST_CASE("Explore shared input lifecycles preserve atlas content through scrolling and selection", "[explore][priority]") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto work = std::make_shared<ExploreWorkProbe>();
     LoadedSettings settings;
     ExploreScenario scenario{settings, backend, ExploreScenario::TrackWork(work)};
     auto& explore = scenario.system();
-    scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
-
-    const auto before_focus = explore.snapshot().revision;
-    explore.UpdateViewport({.viewport = {.extent = {96U, 48U}, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
-    REQUIRE(scenario.Wait([&] {
-        const auto state = explore.snapshot();
-        return state.revision > before_focus && state.focused_image == 1U &&
-               state.order.visible_indices == std::vector<std::uint32_t>{0U, 1U};
-    }));
-    CHECK(work->rendered_count.load(std::memory_order_acquire) == 2U);
-    CHECK(work->rendered_slots[0].load(std::memory_order_acquire) == 0U);
-    CHECK(work->rendered_slots[1].load(std::memory_order_acquire) == 1U);
-
-    const auto before_scroll = explore.snapshot().revision;
-    explore.UpdateViewport(
-        {.viewport = {.extent = {96U, 48U}, .first_row = 1U, .row_count = 1U, .columns = 2U}, .focused_compiled_index = 1U});
-    REQUIRE(scenario.Wait([&] {
-        const auto state = explore.snapshot();
-        return state.revision > before_scroll && !state.focused_image && state.order.visible_indices == std::vector<std::uint32_t>{2U};
-    }));
-    CHECK(work->rendered_count.load(std::memory_order_acquire) == 1U);
-    CHECK(work->rendered_slots[0].load(std::memory_order_acquire) == 2U);
+    scenario.OpenAndWait({.extent = {96U, 96U}, .row_count = 2U, .columns = 2U});
+    explore.SetInputPeer(1U);
+    const auto before = explore.snapshot();
+    auto pixels = explore.BorrowFrame();
+    const auto renders = work->renders.load();
+    const auto motion = [&](const WorkspacePoint point, WorkspaceMouseKind kind = WorkspaceMouseKind::Motion) {
+        explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .kind = kind, .point = point});
+    };
+    motion({48.0F, 0.0F}, WorkspaceMouseKind::Enter);
+    motion({95.75F, 47.875F});
+    CHECK(explore.snapshot().frame == before.frame);
+    CHECK(work->renders.load() == renders);
+    motion({0.25F, 48.0F});
+    CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U,
+                                  .point = WorkspacePoint{1.0F, 1.0F}}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(motion({std::numeric_limits<float>::infinity(), 0.0F}), contracts::InvalidIntentError);
+    for (const auto point : {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F},
+                             WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
+        motion(point);
+    }
+    for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Release, WorkspaceMouseKind::Wheel}) {
+        motion({1.5F, 1.5F}, kind);
+    }
+    for (const auto kind : {WorkspaceMouseKind::Leave, WorkspaceMouseKind::Cancel}) {
+        motion({1.5F, 1.5F}, kind);
+        motion({1.5F, 1.5F});
+    }
+    explore.SetInputPeer(2U);
+    CHECK_THROWS_AS(motion({1.5F, 1.5F}), contracts::InvalidIntentError);
+    explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 2U, .point = WorkspacePoint{1.5F, 1.5F}});
+    explore.UpdateViewport({.viewport = {.extent = {96U, 48U}, .first_row = 1U, .row_count = 1U, .columns = 2U}});
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == 1U; }));
+    CHECK(work->rendered_count.load() == 1U);
+    CHECK(work->rendered_slots[0].load() == 2U);
+    static_cast<void>(explore.Select({.compiled_index = 2U}));
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().mode == ExploreMode::Detail; }));
+    static_cast<void>(explore.CloseDetail());
+    REQUIRE(scenario.Wait([&] { return explore.snapshot().mode == ExploreMode::Gallery; }));
+    CHECK(pixels.valid());
 }
 
 TEST_CASE("Explore selection and detail navigation publish complete bounded snapshots") {
@@ -4912,14 +4997,6 @@ TEST_CASE("Explore selection and detail navigation publish complete bounded snap
     ExploreScenario scenario{settings, backend};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 64U}, .row_count = 2U, .columns = 3U});
-    explore.UpdateViewport({.viewport = {.extent = {96U, 64U}, .row_count = 2U, .columns = 3U}, .focused_compiled_index = 2U});
-    REQUIRE(scenario.Wait([&] { return explore.snapshot().focused_image == 2U; }));
-    const auto before_stale_focus = explore.snapshot().revision;
-    explore.UpdateViewport({.viewport = {.extent = {96U, 64U}, .row_count = 2U, .columns = 3U}, .focused_compiled_index = 3U});
-    REQUIRE(scenario.Wait([&] {
-        const auto state = explore.snapshot();
-        return state.ready && !state.busy && state.revision > before_stale_focus && !state.focused_image;
-    }));
     CHECK_THROWS_AS(explore.Select({.compiled_index = 3U}), contracts::InvalidIntentError);
     static_cast<void>(explore.Select({.compiled_index = 1U}));
     REQUIRE(scenario.Wait([&] {

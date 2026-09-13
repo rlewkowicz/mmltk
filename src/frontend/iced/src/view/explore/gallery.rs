@@ -133,21 +133,7 @@ pub(super) fn update(
                 Some(super::state::GalleryGestureOutcome::Selected(index)) => {
                     Outcome::ImageSelected(index)
                 }
-                Some(super::state::GalleryGestureOutcome::Focused(index)) => {
-                    let Some(snapshot) = snapshot else {
-                        return Ok(None);
-                    };
-                    let columns = explore_columns(settings);
-                    let Some(mut request) = state.measured_layout_request(
-                        Some(snapshot),
-                        columns,
-                        snapshot.order.matchingcount,
-                    ) else {
-                        return Ok(None);
-                    };
-                    request.focusedcompiledindex = index;
-                    Outcome::ViewportChanged(request)
-                }
+                Some(super::state::GalleryGestureOutcome::Focused(_)) => return Ok(None),
                 None => return Ok(None),
             }
         }
@@ -463,7 +449,6 @@ fn gallery_viewport<'a>(
             )
             .map(|geometry| crate::generated::ExploreViewportUpdate {
                 viewport: geometry.viewport().clone(),
-                focusedcompiledindex: snapshot.and_then(|value| value.focusedimage),
             });
             Message::Scrolled {
                 first_row,
@@ -646,7 +631,6 @@ mod tests {
         snapshot.ready = true;
         snapshot.order.matchingcount = 1_000;
         snapshot.viewport.firstrow = 4;
-        snapshot.focusedimage = Some(16);
         let mut state = state::State::default();
         assert!(state.measure_gallery(
             600.0,
@@ -729,7 +713,6 @@ mod tests {
         snapshot.mode = crate::generated::ExploreMode::Gallery;
         snapshot.order.matchingcount = 8;
         snapshot.order.visibleindices = (0..8).collect();
-        snapshot.focusedimage = Some(0);
         snapshot.viewport.columns = 4;
         snapshot.viewport.rowcount = 2;
         snapshot.viewport.extent = crate::generated::VisualExtent {

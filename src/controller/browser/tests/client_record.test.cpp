@@ -296,7 +296,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     CHECK(decoded_interaction.viewport.first_row == 0U);
     CHECK(decoded_interaction.viewport.row_count == 1U);
     CHECK(decoded_interaction.viewport.columns == 1U);
-    CHECK_FALSE(decoded_interaction.focused_compiled_index);
+    CHECK(decoded_interaction.viewport.valid());
     const auto batch_view = decode_interaction_view(batch_fixture.bytes);
     REQUIRE(batch_view);
     CHECK(dispatch_interaction(systems, *batch_view).disposition == InteractionDispatchDisposition::Accepted);

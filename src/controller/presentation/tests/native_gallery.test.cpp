@@ -1130,28 +1130,24 @@ TEST_CASE("Native five six five row demand immediately retains pixel identity th
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled) == reads);
 }
 
-TEST_CASE("Native loading focus schedules outstanding cards and retains completed gallery pixels", "[explore][native][priority]") {
+TEST_CASE("Native visible admission retains completed gallery pixels through detail return", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
-    mmltk::testsupport::ScopedTempDir directory{"native-gallery-focus"};
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-visible"};
     const auto path = directory.path() / "compiled.bin";
     write_gallery_artifact(path, 0.25F, 9U);
     NativeGallery gallery{4U};
-    auto priority = std::make_shared<ExploreLoadingPriority>();
-    gallery.algorithm->SetLoadingPriority(priority);
     gallery.Open(path);
-    priority->Focus(7U);
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     {
         const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
         REQUIRE(admitted.size() == 2U);
-        CHECK(admitted.front() == 7U);
+        CHECK(admitted.front() == 0U);
     }
-    priority->Focus(6U);
     gallery.Drain();
     const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
     REQUIRE(admitted.size() >= 3U);
-    CHECK(admitted[2U] == 6U);
+    CHECK(admitted[2U] == 2U);
     const auto completed = gallery.algorithm->AdvanceGallery();
     CHECK(completed.cumulative_tiles == 8U);
     const auto pixels = gallery.Pixels(0U);
@@ -1167,16 +1163,16 @@ TEST_CASE("Native loading focus schedules outstanding cards and retains complete
     CHECK(gallery.Pixels(0U) == pixels);
 }
 
-TEST_CASE("Native disk admission follows immediate forward four then backward four", "[explore][native][priority]") {
+TEST_CASE("Native disk admission follows visible leading and prior rows in both directions", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     const auto reverse = GENERATE(false, true);
+    const auto first_row = GENERATE(0U, 10U, 100U);
     mmltk::testsupport::ScopedTempDir directory{"native-gallery-admission"};
     const auto path = directory.path() / "compiled.bin";
     write_gallery_artifact(path, 0.25F, 9U);
     NativeGallery gallery{2U};
-    gallery.plan.viewport.first_row = 10U;
-    gallery.plan.focused_image = 22U;
+    gallery.plan.viewport.first_row = first_row;
     gallery.plan.scroll_direction = reverse ? ExploreScrollDirection::Backward : ExploreScrollDirection::Forward;
     gallery.Open(path);
     gallery.Drain();
@@ -1187,13 +1183,16 @@ TEST_CASE("Native disk admission follows immediate forward four then backward fo
             if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled)
                 admitted.push_back(static_cast<std::uint32_t>(fact.detail));
     }
-    std::vector<std::uint32_t> expected{22U, 20U, 21U, 23U};
+    std::vector<std::uint32_t> expected;
+    const auto visible_end = std::min(203U, (first_row + 2U) * 2U);
+    for (auto image = first_row * 2U; image < visible_end; ++image) expected.push_back(image);
     const auto ahead = [&] {
-        for (std::uint32_t image = 24U; image < 32U; ++image)
+        for (auto image = visible_end; image < std::min(203U, (first_row + 6U) * 2U); ++image)
             expected.push_back(image);
     };
     const auto behind = [&] {
-        for (std::uint32_t row = 10U; row != 6U;) {
+        const auto begin = first_row > 4U ? first_row - 4U : 0U;
+        for (auto row = first_row; row != begin;) {
             --row;
             expected.push_back(row * 2U);
             expected.push_back(row * 2U + 1U);
@@ -1207,6 +1206,60 @@ TEST_CASE("Native disk admission follows immediate forward four then backward fo
         behind();
     }
     CHECK(admitted == expected);
+}
+
+TEST_CASE("Native viewport restoration publishes cached rows from either side before fetching misses", "[explore][native][cache]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-scroll-cache"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    NativeGallery gallery{2U};
+    gallery.plan.viewport.first_row = 10U;
+    gallery.Open(path);
+    gallery.Drain();
+    const auto move = [&](std::uint32_t row) {
+        if (row != gallery.plan.viewport.first_row)
+            gallery.plan.scroll_direction = row > gallery.plan.viewport.first_row ?
+                ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
+        gallery.plan.viewport.first_row = row;
+        ++gallery.plan.generation;
+        gallery.demand->store(gallery.plan.generation);
+        return gallery.Begin();
+    };
+    for (const auto row : {14U, 6U, 14U, 6U}) {
+        const auto restored = move(row);
+        CHECK(restored.reused_tiles == 4U);
+        CHECK(restored.cumulative_tiles == 4U);
+        CHECK(restored.ready_slots == std::vector<bool>{true, true, true, true});
+        CHECK(gallery.evidence.ReadAdmissions(gallery.plan.generation).empty());
+        const auto clean = gallery.Pixels(0U), semantic = gallery.Pixels(1U);
+        gallery.Drain();
+        CHECK(gallery.Pixels(0U) == clean);
+        CHECK(gallery.Pixels(1U) == semantic);
+    }
+    // Row one is outside every completed window; row two was prefetched
+    // behind the last viewport. The cached half is usable in the first result.
+    const auto cached = move(2U);
+    REQUIRE(cached.cumulative_tiles == 4U);
+    const auto cached_clean = gallery.Pixels(0U), cached_semantic = gallery.Pixels(1U);
+    const auto mixed = move(1U);
+    REQUIRE(mixed.ready_slots == std::vector<bool>{false, false, true, true});
+    CHECK(mixed.reused_tiles == 2U);
+    CHECK(mixed.remaining_tiles == 2U);
+    CHECK(gallery.evidence.ReadAdmissions(gallery.plan.generation).empty());
+    constexpr std::size_t row_bytes = 16U * 8U * 4U;
+    const auto initial_clean = gallery.Pixels(0U), initial_semantic = gallery.Pixels(1U);
+    CHECK(std::ranges::equal(std::span{initial_clean}.subspan(row_bytes), std::span{cached_clean}.first(row_bytes)));
+    CHECK(std::ranges::equal(std::span{initial_semantic}.subspan(row_bytes), std::span{cached_semantic}.first(row_bytes)));
+    gallery.Drain();
+    const auto admissions = gallery.evidence.ReadAdmissions(gallery.plan.generation);
+    REQUIRE(admissions.size() >= 2U);
+    CHECK(admissions[0U] == 2U);
+    CHECK(admissions[1U] == 3U);
+    const auto completed_clean = gallery.Pixels(0U), completed_semantic = gallery.Pixels(1U);
+    CHECK(std::ranges::equal(std::span{completed_clean}.subspan(row_bytes), std::span{cached_clean}.first(row_bytes)));
+    CHECK(std::ranges::equal(std::span{completed_semantic}.subspan(row_bytes), std::span{cached_semantic}.first(row_bytes)));
 }
 
 TEST_CASE("Native cold visible admission proceeds while obsolete speculation holds its physical lane", "[explore][native][priority]") {
@@ -1254,6 +1307,53 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
     held.Release();
     gallery.Drain();
     CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices == std::vector<std::uint32_t>{40U, 41U, 42U, 43U});
+}
+
+TEST_CASE("Native scroll reversal retains a useful pending read and cached visible tiles", "[explore][native][priority]") {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
+    mmltk::testsupport::ScopedTempDir directory{"native-gallery-reversal"};
+    const auto path = directory.path() / "compiled.bin";
+    write_gallery_artifact(path, 0.25F, 9U);
+    GalleryReadPause held{22U};
+    NativeGallery gallery{2U, false, true};
+    GalleryReadPause::ReleaseGuard release{held};
+    held.Bind(*gallery.gate);
+    gallery.plan.viewport.first_row = 10U;
+    gallery.Open(path);
+    for (;;) {
+        const auto observed = gallery.evidence.Epoch();
+        const auto progress = gallery.Step();
+        if (progress.cumulative_tiles == 3U) break;
+        gallery.evidence.Wait(observed);
+    }
+    held.Wait();
+    const auto before = gallery.Pixels(0U);
+    for (const auto row : {11U, 10U, 11U, 10U}) {
+        gallery.plan.scroll_direction = row == 11U ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
+        gallery.plan.viewport.first_row = row;
+        ++gallery.plan.generation;
+        gallery.demand->store(gallery.plan.generation);
+        const auto initial = gallery.Begin();
+        REQUIRE(initial.ready_slots.size() == 4U);
+        CHECK_FALSE(initial.ready_slots[row == 11U ? 0U : 2U]);
+        if (row == 10U) {
+            CHECK(initial.cumulative_tiles == 3U);
+            CHECK(gallery.Pixels(0U) == before);
+        }
+        static_cast<void>(gallery.Step());
+    }
+    held.Release();
+    gallery.Drain();
+    CHECK(gallery.algorithm->AdvanceGallery().cumulative_tiles == 4U);
+    std::size_t held_admissions = 0U;
+    {
+        std::scoped_lock lock(gallery.evidence.mutex);
+        for (const auto& fact : gallery.evidence.facts)
+            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.detail == 22U) ++held_admissions;
+    }
+    CHECK(held_admissions == 1U);
+    CHECK(gallery.Pixels(0U) != before);
 }
 
 TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed replacement resumes retained work",
@@ -1352,7 +1452,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     const auto revision = gallery.runtime->Completed().revision();
     for (unsigned repeat = 0U; repeat != 4U; ++repeat) {
         ++gallery.plan.generation;
-        if (repeat != 0U) gallery.plan.focused_image = repeat;
         gallery.demand->store(gallery.plan.generation);
         std::size_t allocations;
         ExploreGalleryPublication reused;
@@ -1372,7 +1471,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     const auto descriptors = gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared);
     const auto renders = gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted);
     const auto transfers = gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer);
-    gallery.plan.focused_image = 7U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
@@ -1380,15 +1478,13 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == transfers);
 
-    // A cold jump has no issued source reads until Advance. A metadata-only
-    // focus commit must therefore put the requested card first in that demand.
+    // A stationary repeat retains the cold viewport; its first visible card
+    // starts when ordinary continuation scheduling advances.
     gallery.plan.viewport.first_row = 400U / columns;
-    gallery.plan.focused_image.reset();
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     const auto cold_publications = gallery.publications;
-    gallery.plan.focused_image = 403U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
@@ -1397,7 +1493,7 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     {
         const auto admitted = gallery.evidence.ReadAdmissions(gallery.plan.generation);
         REQUIRE_FALSE(admitted.empty());
-        CHECK(admitted.front() == *gallery.plan.focused_image);
+        CHECK(admitted.front() == 400U);
     }
     gallery.Drain();
 
@@ -1414,7 +1510,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     const auto detail_semantic = gallery.Pixels(1U);
     gallery.plan.viewport.extent = {24U, 24U};
     gallery.plan.viewport.row_count = 3U;
-    gallery.plan.focused_image = 402U;
     gallery.plan.detail.show_original_dimensions = true;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1430,7 +1525,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.publications == detail_publications);
     CHECK(gallery.runtime->Completed().revision() == detail_revision);
     gallery.evidence.enabled.store(true);
-    gallery.plan.focused_image = 401U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
@@ -1874,7 +1968,6 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     ++gallery.plan.generation;
     gallery.plan.viewport.extent = {80U, 40U};
     gallery.plan.viewport.row_count = 5U;
-    gallery.plan.focused_image = 0U;
     gallery.plan.detail.show_original_dimensions = true;
     gallery.demand->store(gallery.plan.generation);
     const auto detail_publications = gallery.publications;

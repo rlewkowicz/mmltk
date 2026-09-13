@@ -55,6 +55,7 @@
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/contracts/visual_source.h"
+#include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -2453,6 +2454,13 @@ struct NativeAudit final {
     std::map<std::uint64_t, std::size_t> accepted_generations;
     std::vector<ViewportAcceptance> accepted_viewports;
     std::map<std::uint64_t, std::map<std::uint64_t, std::uint64_t>> placeholder_slots;
+    struct InitialCache final {
+        std::set<std::uint64_t> slots;
+        std::size_t restored_ordinal = 0U;
+        bool forward = true;
+    };
+    std::map<std::uint64_t, InitialCache> initial_cache;
+    bool cached_first_valid = true;
     std::map<std::uint64_t, std::size_t> placeholder_cardinalities;
     std::map<std::uint64_t, std::uint64_t> placeholder_digests;
     std::map<std::uint64_t, std::size_t> placeholder_ordinals;
@@ -2730,6 +2738,9 @@ struct NativeAudit final {
                 admission_priority_valid = false;
             else
                 admitted_reads.emplace(sequence, scalar(record, "detail"));
+            if (const auto cached = initial_cache.find(sequence); cached != initial_cache.end()) {
+                cached_first_valid &= cached->second.restored_ordinal != 0U && cached->second.restored_ordinal < ordinal;
+            }
         }
         server_started = server_started || event == "browser.server.started";
         peer_opened = peer_opened || event == "browser.server.peer_opened";
@@ -2779,6 +2790,8 @@ struct NativeAudit final {
             if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index))
                 reject_causal_evidence("placeholder slot identity");
             if (value < kAcceptanceSlotLimit) slots.insert_or_assign(value, compiled_index);
+            if (value < kAcceptanceSlotLimit && scalar(record, "capacity_width") == 1U)
+                initial_cache[sequence].slots.emplace(value);
         }
         if (owner == "explore" && event == "acceptance.placeholder.complete") {
             const auto cardinality = static_cast<std::size_t>(value);
@@ -2796,6 +2809,12 @@ struct NativeAudit final {
             if (cardinality <= kAcceptanceSlotLimit) {
                 placeholder_cardinalities.insert_or_assign(sequence, cardinality);
                 placeholder_digests.insert_or_assign(sequence, digest);
+                if (scalar(record, "admission_columns") != 0U) {
+                    auto& cached = initial_cache[sequence];
+                    cached.restored_ordinal = ordinal;
+                    cached.forward = record.value("admission_forward", true);
+                    cached_first_valid &= cached.slots.size() == scalar(record, "capacity_width");
+                }
                 // Gallery emits its inventory even when retained pixels make
                 // Explore's PlaceholderPublished/DiagnoseFrame conditional.
                 // This is the inventory's own entered boundary, not a
@@ -3230,7 +3249,7 @@ struct AtlasDrawAudit final {
         "content_session", "source_kind", "source_instance", "source_revision", "content_width",         "content_height",
         "columns",         "rows",        "first_row",       "matching_count",  "visible_indices",       "row_capacity",
         "row_origin",      "card_extent"};
-    static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "end", "restored"};
+    static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
     static constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
     static constexpr std::array return_names{"return-cached", "return-aligned", "return-extra", "return-restored"};
     std::map<SourceKey, nlohmann::json> sources;
@@ -3464,6 +3483,7 @@ struct AtlasDrawAudit final {
             if (name == "row1") matching = check(row == 1U, "scroll_stage_expected_row1", record);
             if (name == "row2") matching = check(row == 2U, "scroll_stage_expected_row2", record);
             if (name == "row10") matching = check(row == 10U, "scroll_stage_expected_row10", record);
+            if (name == "row9") matching = check(row == 9U, "scroll_stage_expected_row9", record);
             if (name == "restored")
                 matching = check(row == 0U && std::abs(image_top - clip_top) < 1.0, "restored_stage_row_or_clip_mismatch", record);
             if (name == "end") {
@@ -3834,7 +3854,13 @@ struct BrowserAudit final {
     bool atlas_native_capacity = false;
     std::uint64_t capacity_retry_publication = 0U;
     std::uint64_t capacity_retry_frame = 0U;
-    std::uint64_t pending_focus_index = std::numeric_limits<std::uint64_t>::max();
+    struct SharedExploreMotion final {
+        double x = 0.0, y = 0.0;
+        std::size_t ordinal = 0U;
+    };
+    std::vector<SharedExploreMotion> shared_explore_motion;
+    std::size_t held_visible_ordinal = 0U, pending_hover_ordinal = 0U;
+    std::uint64_t pending_hover_index = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t pending_selection_index = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t pending_read_generation = 0U;
     std::set<std::pair<std::uint64_t, std::uint64_t>> atlas_scaled_frames;
@@ -3917,6 +3943,26 @@ struct BrowserAudit final {
     std::uint64_t compiled_height = 0U;
     std::uint64_t presentation_receipt = 0U;
 
+    [[nodiscard]] bool held_placeholder_motion(const std::uint64_t index, const std::uint64_t generation) const {
+        const auto held = atlas_draws.held_stages.find("held-visible");
+        if (!atlas_draws.valid || held == atlas_draws.held_stages.end() || pending_hover_index != index ||
+            pending_read_generation != generation || held_visible_ordinal == 0U || pending_hover_ordinal <= held_visible_ordinal)
+            return false;
+        const auto& draw = held->second;
+        const auto columns = scalar(draw, "columns"), side = scalar(draw, "card_extent");
+        const auto& indices = draw["visible_indices"];
+        const auto image = std::ranges::find(indices, nlohmann::json(index));
+        if (columns == 0U || side == 0U || image == indices.end()) return false;
+        const auto slot = static_cast<std::size_t>(image - indices.begin());
+        return std::ranges::any_of(shared_explore_motion, [&](const auto& motion) {
+            return motion.ordinal > held_visible_ordinal && motion.ordinal < pending_hover_ordinal &&
+                   motion.x >= static_cast<double>((slot % columns) * side) &&
+                   motion.x < static_cast<double>((slot % columns + 1U) * side) &&
+                   motion.y >= static_cast<double>((slot / columns) * side) &&
+                   motion.y < static_cast<double>((slot / columns + 1U) * side);
+        });
+    }
+
     void consume_gallery_generation(const nlohmann::json& record) {
         const auto generation = scalar(record, "gallery_generation");
         const auto indices = record.find("visible_indices");
@@ -3994,6 +4040,9 @@ struct BrowserAudit final {
         }
         ++ordinal;
         const std::string event = record.value("event", "");
+        if (event == "iced.surface.scroll_stage" && record.value("control", "") == "held-visible" &&
+            atlas_draws.valid && atlas_draws.held_stages.contains("held-visible"))
+            held_visible_ordinal = ordinal;
         if (event == "iced.gallery.source") consume_gallery_generation(record);
         if (event == "integration.phase_progress") {
             const std::string deadline_class = record.value("control", "");
@@ -4306,9 +4355,17 @@ struct BrowserAudit final {
                 atlas_geometry_valid = false;
             else if (atlas_scaled_frames.size() < kAcceptanceRecordLimit)
                 atlas_scaled_frames.emplace(scalar(record, "a"), scalar(record, "b"));
-        } else if (event == "integration.pending_focus") {
-            pending_focus_index = scalar(record, "a");
+        } else if (event == "integration.explore_mouse") {
+            if (record.value("detail", "") == "shared-input-admitted" &&
+                scalar(record, "c") == static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)) {
+                if (shared_explore_motion.size() < kAcceptanceRecordLimit)
+                    shared_explore_motion.push_back({numeric(record, "a"), numeric(record, "b"), ordinal});
+                else bounds_valid = false;
+            }
+        } else if (event == "integration.pending_hover") {
+            pending_hover_index = scalar(record, "a");
             pending_read_generation = scalar(record, "b");
+            pending_hover_ordinal = ordinal;
         } else if (event == "integration.pending_selection") {
             pending_selection_index = scalar(record, "a");
             bounds_valid = bounds_valid && pending_read_generation == scalar(record, "b");
@@ -6146,7 +6203,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(browser.gallery_no_input_complete);
             CHECK(browser.owned_atlas_seen);
             CHECK(browser.atlas_draws.valid);
-            CHECK((browser.atlas_draws.stages == std::set<std::string>{"fractional", "row1", "row2", "row10", "end", "restored"}));
+            CHECK((browser.atlas_draws.stages == std::set<std::string>{"fractional", "row1", "row2", "row10", "row9", "end", "restored"}));
             CHECK(browser.atlas_draws.drawn_rows.contains(1U));
             CHECK(browser.atlas_draws.drawn_rows.contains(2U));
             CHECK(browser.atlas_draws.drawn_rows.contains(10U));
@@ -6158,12 +6215,34 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             if (profile_ == "retained") {
                 REQUIRE(visible_read_held.has_value());
                 REQUIRE(visible_read_released);
-                REQUIRE(browser.pending_focus_index == visible_read_held->compiled_index);
+                REQUIRE(browser.pending_hover_index == visible_read_held->compiled_index);
+                REQUIRE_FALSE(browser.shared_explore_motion.empty());
                 REQUIRE(browser.pending_selection_index == visible_read_held->compiled_index);
                 REQUIRE(browser.pending_read_generation == visible_read_held->generation);
                 REQUIRE(browser.atlas_draws.away_return);
                 REQUIRE(native.admission_seen);
                 REQUIRE(native.admission_priority_valid);
+                REQUIRE(native.cached_first_valid);
+                std::array<bool, 2U> cached_scroll_pixels{};
+                for (const auto& [generation, cached] : native.initial_cache) {
+                    if (cached.slots.empty() || cached.restored_ordinal == 0U) continue;
+                    const auto frames = native.published_frames.find(generation);
+                    if (frames == native.published_frames.end() || frames->second.empty()) continue;
+                    const auto first_frame = frames->second.front().second;
+                    for (const auto& [sample, acquisition] : browser.atlas_draws.acquisitions) {
+                        if (scalar(acquisition, "frame_revision") != first_frame) continue;
+                        const auto pixels = browser.atlas_draws.ready_cell_samples.find(sample);
+                        if (pixels == browser.atlas_draws.ready_cell_samples.end()) continue;
+                        const auto& slots = native.placeholder_slots.at(generation);
+                        if (std::ranges::any_of(cached.slots, [&](auto slot) {
+                                const auto image = slots.find(slot);
+                                return image != slots.end() && pixels->second.contains(image->second);
+                            }))
+                            cached_scroll_pixels[cached.forward ? 0U : 1U] = true;
+                    }
+                }
+                CHECK(cached_scroll_pixels[0U]);
+                CHECK(cached_scroll_pixels[1U]);
                 REQUIRE(native.admitted_reads.contains({visible_read_held->generation, visible_read_held->compiled_index}));
                 REQUIRE(browser.atlas_draws.held_stages.size() == 6U);
                 for (const auto& [stage, draw] : browser.atlas_draws.held_stages) {
@@ -6174,6 +6253,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     const auto slot = static_cast<std::size_t>(held - indices.begin());
                     REQUIRE(slot < draw["ready_slots"].size());
                     CHECK(draw["ready_slots"][slot] == (stage == "held-complete"));
+                    if (stage == "held-visible")
+                        CHECK(browser.held_placeholder_motion(visible_read_held->compiled_index, visible_read_held->generation));
                 }
                 REQUIRE(capacity_held.has_value());
                 REQUIRE(capacity_available);
@@ -6246,7 +6327,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(browser.atlas_themes.contains(dark ? "dark" : "light"));
             CHECK(browser.atlas_device_scales.contains(high_dpi ? 1.5 : 1.0));
             CHECK((browser.atlas_visibility_modes == std::set<std::uint64_t>{0, 1, 2, 3, 4, 5, 6, 7}));
-            CHECK((browser.atlas_scroll_stages == std::set<std::string>{"fractional", "row1", "row2", "row10", "end", "restored"}));
+            CHECK((browser.atlas_scroll_stages == std::set<std::string>{"fractional", "row1", "row2", "row10", "row9", "end", "restored"}));
         }
         CHECK(browser.detail_fit);
         CHECK(browser.surface_draws.contains(browser.viewer_presentation));
@@ -7704,11 +7785,11 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
 
 TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguous sources", "[workspace][audit]") {
     AtlasDrawAudit complete;
-    constexpr std::array names{"fractional", "row1", "row2", "row10", "end", "restored"};
-    constexpr std::array<std::uint64_t, 6U> first_rows{0U, 1U, 2U, 10U, 70U, 0U};
+    constexpr std::array names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
+    constexpr std::array<std::uint64_t, 7U> first_rows{0U, 1U, 2U, 10U, 9U, 71U, 0U};
     for (std::size_t index = 0U; index != names.size(); ++index) {
         const auto rows = index % 2U == 0U ? 5U : 4U;
-        const double top = index == 4U ? -250.0 : (index == 0U || index == 2U ? -37.25 : 0.0);
+        const double top = index == 5U ? -100.0 : (index == 0U || index == 2U ? -37.25 : 0.0);
         const auto draw = atlas_draw_record(23U + index, first_rows[index], rows, top);
         auto source = draw;
         source["event"] = "iced.gallery.source";
@@ -7772,7 +7853,7 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
 }
 
 TEST_CASE("atlas grid transitions belong only to consecutive stages on one allocation", "[workspace][audit]") {
-    constexpr std::array names{"fractional", "row1", "row2", "row10", "end", "restored"};
+    constexpr std::array names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
     const auto publish = [](AtlasDrawAudit& audit, nlohmann::json draw) {
         for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
             draw["event"] = event;
@@ -7781,8 +7862,8 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
     };
     AtlasDrawAudit between_stages;
     for (std::size_t index = 0U; index != names.size(); ++index) {
-        const std::array<std::uint64_t, 6U> first_rows{0U, 1U, 2U, 10U, 71U, 0U};
-        const double top = index == 4U ? -100.0 : (index == 0U ? -37.25 : 0.0);
+        const std::array<std::uint64_t, 7U> first_rows{0U, 1U, 2U, 10U, 9U, 71U, 0U};
+        const double top = index == 5U ? -100.0 : (index == 0U ? -37.25 : 0.0);
         auto draw = atlas_draw_record(70U + index, first_rows[index], 4U, top);
         publish(between_stages, draw);
         draw["event"] = "iced.surface.scroll_stage";
@@ -7808,8 +7889,8 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
             if (kind == "only-grow") rows = index < 2U ? 4U : 5U;
             if (kind == "only-shrink") rows = index < 2U ? 5U : 4U;
             if (replacement) rows = index % 2U == 0U ? 5U : 4U;
-            const std::array<std::uint64_t, 6U> first_rows{0U, 1U, 2U, 10U, 75U - rows, 0U};
-            const double top = index == 4U ? 500.0 - static_cast<double>(rows) * 150.0 : (index == 0U || index == 2U ? -37.25 : 0.0);
+            const std::array<std::uint64_t, 7U> first_rows{0U, 1U, 2U, 10U, 9U, 75U - rows, 0U};
+            const double top = index == 5U ? 500.0 - static_cast<double>(rows) * 150.0 : (index == 0U || index == 2U ? -37.25 : 0.0);
             auto draw = atlas_draw_record(30U + index, first_rows[index], rows, top);
             if (index != 0U) {
                 if (kind == "generation") draw["generation"] = 8U;
@@ -8234,6 +8315,42 @@ TEST_CASE("Source admission audit requires canonical allocation provenance", "[w
     }
 }
 
+TEST_CASE("held placeholder motion evidence uses only the target hover interval", "[workspace][audit]") {
+    for (const std::string_view timing : {"earlier", "during", "later"}) {
+        BrowserAudit audit;
+        const nlohmann::json motion{
+            {"event", "integration.explore_mouse"}, {"detail", "shared-input-admitted"}, {"a", 150.0}, {"b", 50.0},
+            {"c", static_cast<std::uint64_t>(mmltk::controller::WorkspaceMouseKind::Motion)}};
+        audit.consume(motion);
+        auto draw = atlas_draw_record(77U, 10U, 4U, 0.0);
+        draw["ready_slots"] = std::vector<bool>{true, false};
+        for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
+            draw["event"] = event;
+            audit.consume(draw);
+        }
+        auto pixel = draw;
+        pixel["event"] = "integration.atlas_ready_cell";
+        pixel["compiled_index"] = 40U;
+        pixel["sampled_pixels"] = 16U;
+        pixel["cell_sample_x"] = 50000U;
+        pixel["cell_sample_y"] = 50000U;
+        pixel["cell_sample_rgba"] = 0xff705030U;
+        pixel["matched"] = true;
+        audit.consume(pixel);
+        draw["event"] = "iced.surface.scroll_stage";
+        draw["control"] = "held-visible";
+        audit.consume(draw);
+        REQUIRE(audit.atlas_draws.valid);
+        REQUIRE(audit.held_visible_ordinal != 0U);
+        if (timing == "during") audit.consume(motion);
+        audit.consume({{"event", "integration.pending_hover"}, {"a", 41U}, {"b", 77U}});
+        if (timing == "later") audit.consume(motion);
+        CHECK(audit.held_placeholder_motion(41U, 77U) == (timing == "during"));
+        CHECK_FALSE(audit.held_placeholder_motion(40U, 77U));
+        CHECK_FALSE(audit.held_placeholder_motion(41U, 78U));
+    }
+}
+
 TEST_CASE("fixed gallery return rejects any intermediate readiness or ready-pixel loss", "[workspace][audit]") {
     for (const std::string_view defect :
          {"none", "placeholder", "missing-cell", "black-cell", "wrong-cell", "origin", "capacity", "clip"}) {
@@ -8323,5 +8440,32 @@ TEST_CASE("read admission checks actual eligible demand and independently clippe
         audit.consume(admission);
         CHECK(audit.admission_seen);
         CHECK(audit.admission_priority_valid == (defect == "none"));
+    }
+}
+
+TEST_CASE("cached viewport evidence joins initial readiness before new read admission", "[workspace][audit]") {
+    for (const bool forward : {false, true}) {
+        for (const bool restored_first : {false, true}) {
+            NativeAudit audit;
+            audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"},
+                           {"sequence", 7U}, {"value", 0U}, {"detail", 20U}, {"capacity_width", 1U}});
+            audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "acceptance.placeholder.slot"},
+                           {"sequence", 7U}, {"value", 1U}, {"detail", 21U}, {"capacity_width", 0U}});
+            const nlohmann::json restored{{"kind", "gui_runtime"}, {"owner", "explore"},
+                                          {"event", "acceptance.placeholder.complete"}, {"sequence", 7U},
+                                          {"value", 2U}, {"capacity_width", 1U}, {"admission_columns", 2U},
+                                          {"admission_first_row", 10U}, {"admission_row_count", 1U},
+                                          {"admission_forward", forward}};
+            const nlohmann::json admission{{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "gallery.read.scheduled"},
+                                           {"sequence", 7U}, {"detail", 21U}, {"admission_position", 21U},
+                                           {"admission_columns", 2U}, {"admission_first_row", 10U},
+                                           {"admission_row_count", 1U}, {"admission_forward", forward}, {"admission_tier", 0U}};
+            audit.consume(restored_first ? restored : admission);
+            audit.consume(restored_first ? admission : restored);
+            CHECK(audit.cached_first_valid == restored_first);
+            CHECK(audit.initial_cache.at(7U).slots == std::set<std::uint64_t>{0U});
+            CHECK(audit.initial_cache.at(7U).forward == forward);
+            CHECK(audit.admission_priority_valid);
+        }
     }
 }

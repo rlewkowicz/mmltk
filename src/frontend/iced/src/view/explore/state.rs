@@ -304,14 +304,7 @@ impl State {
                 .filter(|result| result.outcome != crate::generated::ExploreViewportOutcome::Ready)
                 .map(|result| result.request.clone())
                 .unwrap_or_else(|| Self::committed_viewport(snapshot));
-            if self.sent_viewport.as_ref().is_some_and(|sent| {
-                *sent == committed
-                    || (sent.viewport == snapshot.viewport
-                        && snapshot.focusedimage.is_none()
-                        && sent
-                            .focusedcompiledindex
-                            .is_some_and(|index| !snapshot.order.visibleindices.contains(&index)))
-            }) {
+            if self.sent_viewport.as_ref() == Some(&committed) {
                 self.sent_viewport = None;
             }
             if self.sent_viewport.is_none() && Some(&committed) == self.desired_viewport.as_ref() {
@@ -361,7 +354,6 @@ impl State {
     fn committed_viewport(snapshot: &ExploreSnapshot) -> ExploreViewportUpdate {
         ExploreViewportUpdate {
             viewport: snapshot.viewport.clone(),
-            focusedcompiledindex: snapshot.focusedimage,
         }
     }
 
@@ -407,7 +399,6 @@ impl State {
         }
         self.sent_viewport = Some(request);
         self.viewport_writable_wait = false;
-        self.reconcile_gallery_hover(None);
     }
 
     pub fn arm_viewport_writable_wait(&mut self) -> bool {
@@ -504,7 +495,6 @@ impl State {
             .unwrap_or(latest.viewport.firstrow);
         Some(ExploreViewportUpdate {
             viewport: self.measured_viewport(columns, first_row, matching_count)?,
-            focusedcompiledindex: latest.focusedcompiledindex,
         })
     }
 
@@ -546,21 +536,13 @@ impl State {
     }
 
     fn reconcile_gallery_hover(&self, snapshot: Option<&ExploreSnapshot>) {
-        let focused = self
-            .desired_viewport
-            .as_ref()
-            .or(self.sent_viewport.as_ref())
-            .map(|request| request.focusedcompiledindex)
-            .or_else(|| {
-                snapshot
-                    .filter(|value| GallerySource::current(Some(value)).is_some())
-                    .map(|value| value.focusedimage)
-            });
-        *self
-            .gallery_hover
-            .focused
-            .lock()
-            .expect("gallery local focus") = focused;
+        let mut focused = self.gallery_hover.focused.lock().expect("gallery local focus");
+        if !snapshot.is_some_and(|snapshot| {
+            GallerySource::current(Some(snapshot)).is_some()
+                && (*focused).is_none_or(|index| index.is_none_or(|index| snapshot.order.visibleindices.contains(&index)))
+        }) {
+            *focused = None;
+        }
     }
 
     pub(crate) fn gallery_input(
@@ -593,9 +575,6 @@ impl State {
                 None
             }
             crate::presentation_surface::SurfaceGestureKind::Viewport => {
-                // The callback marker only spans the current Iced batch. From
-                // reduction onward, retained admission/native focus owns it.
-                self.reconcile_gallery_hover(snapshot);
                 source.map(|_| GalleryGestureOutcome::Focused(selected))
             }
         }
@@ -738,7 +717,6 @@ mod tests {
     fn measured_unfocused_gallery() -> (State, ExploreSnapshot) {
         let mut snapshot = displayed_gallery_snapshot();
         snapshot.order.matchingcount = 100;
-        snapshot.focusedimage = None;
         let mut state = State::default();
         state.rebase(Some(&snapshot), false);
         state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
@@ -771,120 +749,92 @@ mod tests {
         )
     }
 
-    fn accept_local_focus(
-        state: &mut State,
-        snapshot: &ExploreSnapshot,
-        input: GalleryInput,
-    ) -> ExploreViewportUpdate {
-        let outcome = super::super::gallery::update(
-            state,
-            Some(snapshot),
-            &mut crate::view::settings::SettingsModel::default(),
+    fn accept_local_focus(state: &mut State, snapshot: &ExploreSnapshot, input: GalleryInput) {
+        assert!(super::super::gallery::update(
+            state, Some(snapshot), &mut crate::view::settings::SettingsModel::default(),
             super::super::gallery::Message::Surface(input),
-        )
-        .unwrap();
-        let Some(super::super::gallery::Outcome::ViewportChanged(request)) = outcome else {
-            panic!("local focus must become a retained viewport request");
-        };
-        state.request_viewport(Some(snapshot), request.clone());
-        request
+        ).unwrap().is_none());
     }
 
     #[test]
-    fn local_focus_follows_measurement_retained_admission_and_native_focus() {
-        let mut snapshot = displayed_gallery_snapshot();
-        snapshot.order.matchingcount = 100;
-        snapshot.focusedimage = None;
-        let mut state = State::default();
-        state.rebase(Some(&snapshot), false);
-        assert!(local_focus(&state, &snapshot).is_none());
-        state.measure_gallery(400.0, 200.0, capacity(0, 0), 4);
-        assert!(local_focus(&state, &snapshot).is_none());
-        state.measure_gallery(400.0, 200.0, capacity(400, 300), 4);
-
-        for ready in [false, true] {
-            snapshot.gallery.slots.fill(ready);
-            state.clear_viewport_admission();
-            let input = local_focus(&state, &snapshot).unwrap();
-            assert!(
-                local_focus(&state, &snapshot).is_none(),
-                "one focus per cell in an Iced batch"
-            );
-            let request = accept_local_focus(&mut state, &snapshot, input);
-            assert_eq!(request.focusedcompiledindex, Some(21));
-            assert!(local_focus(&state, &snapshot).is_none());
-            assert!(state.arm_viewport_writable_wait());
-            state.viewport_writable();
-            assert!(
-                local_focus(&state, &snapshot).is_none(),
-                "writable wake retains pending focus"
-            );
-            state.viewport_queued(request.clone());
-            snapshot.revision += 1;
-            state.rebase(Some(&snapshot), false);
-            assert!(
-                local_focus(&state, &snapshot).is_none(),
-                "unrelated state keeps admitted focus"
-            );
-            snapshot.viewport = request.viewport;
-            snapshot.focusedimage = Some(21);
-            state.rebase(Some(&snapshot), false);
-            assert!(state.sent_viewport.is_none());
-            assert!(
-                local_focus(&state, &snapshot).is_none(),
-                "committed focus suppresses motion"
-            );
-            snapshot.focusedimage = None;
-            state.rebase(Some(&snapshot), false);
-            assert!(
-                local_focus(&state, &snapshot).is_some(),
-                "native focus clearing permits renewed focus"
-            );
+    fn scroll_demand_preserves_partial_rows_and_selection_at_different_pointer_positions() {
+        for (x, y, selected) in [(50, 50, 10), (350, 150, 23)] {
+            let (mut state, snapshot) = measured_unfocused_gallery();
+            let input = state.gallery_hover.capture(
+                GallerySource::current(Some(&snapshot)).as_ref(),
+                Some(&ExploreImageMetadata::from(&snapshot)),
+                crate::presentation_surface::SurfaceGesture {
+                    kind: crate::presentation_surface::SurfaceGestureKind::Viewport,
+                    sample: gallery_sample(x, y),
+                },
+                true,
+            ).unwrap();
+            assert_eq!(input.selected, Some(selected));
+            accept_local_focus(&mut state, &snapshot, input);
+            for (first_row, fraction) in [(6, 0.5), (5, 0.0), (6, 0.5)] {
+                state.record_gallery_fraction(fraction);
+                let request = ExploreViewportUpdate {
+                    viewport: state.measured_viewport(4, first_row, 100).unwrap(),
+                };
+                let result = super::super::gallery::update(
+                    &mut state, Some(&snapshot), &mut crate::view::settings::SettingsModel::default(),
+                    super::super::gallery::Message::Scrolled {
+                        first_row, row_fraction: fraction, request: Some(request.clone()),
+                    },
+                ).unwrap();
+                let Some(super::super::gallery::Outcome::ViewportChanged(changed)) = result else {
+                    panic!("scroll must submit measured viewport demand");
+                };
+                assert_eq!(changed, request);
+                assert_eq!(changed.viewport.firstrow, first_row);
+                assert_eq!(changed.viewport.rowcount, if fraction == 0.0 { 2 } else { 3 });
+                assert_eq!(state.gallery_first_row(0), first_row);
+            }
         }
     }
 
     #[test]
-    fn row_return_and_failed_admission_recover_local_same_cell_focus() {
+    fn local_hover_retains_placeholder_identity_across_image_completion() {
+        for ready in [false, true] {
+            let (mut state, mut snapshot) = measured_unfocused_gallery();
+            snapshot.gallery.slots.fill(ready);
+            let input = local_focus(&state, &snapshot).unwrap();
+            assert_eq!(input.selected, Some(21));
+            accept_local_focus(&mut state, &snapshot, input);
+            assert!(local_focus(&state, &snapshot).is_none());
+            snapshot.revision += 1;
+            snapshot.gallery.slots.fill(true);
+            state.rebase(Some(&snapshot), false);
+            assert!(local_focus(&state, &snapshot).is_none());
+        }
+    }
+
+    #[test]
+    fn row_return_and_failed_admission_preserve_local_selection() {
         let (mut state, mut snapshot) = measured_unfocused_gallery();
         let input = local_focus(&state, &snapshot).unwrap();
-        let focused = accept_local_focus(&mut state, &snapshot, input);
-        state.viewport_queued(focused.clone());
+        accept_local_focus(&mut state, &snapshot, input);
+        let mut away = State::committed_viewport(&snapshot);
+        away.viewport.firstrow = 10;
+        state.request_viewport(Some(&snapshot), away.clone());
+        state.viewport_queued(away.clone());
         snapshot.viewportresult = Some(crate::generated::ExploreViewportResult {
-            request: focused,
+            request: away.clone(),
             outcome: crate::generated::ExploreViewportOutcome::AtlasExtentExceeded,
         });
         state.rebase(Some(&snapshot), false);
         assert!(state.sent_viewport.is_none());
-        let discarded = local_focus(&state, &snapshot).unwrap();
-        state.clear_viewport_admission();
-        assert_eq!(state.gallery_input(Some(&snapshot), discarded), None);
-        assert!(local_focus(&state, &snapshot).is_some());
-
+        assert!(local_focus(&state, &snapshot).is_none());
         snapshot.viewportresult = None;
-        snapshot.focusedimage = Some(21);
-        state.rebase(Some(&snapshot), false);
-        let mut away = State::committed_viewport(&snapshot);
-        away.viewport.firstrow = 10;
-        state.record_gallery_scroll(10);
-        state.request_viewport(Some(&snapshot), away.clone());
-        state.viewport_queued(away.clone());
         snapshot.viewport = away.viewport;
-        snapshot.focusedimage = None;
         snapshot.order.visibleindices = (40..48).collect();
         state.rebase(Some(&snapshot), false);
-        assert!(
-            state.sent_viewport.is_none(),
-            "native clearing settles the normalized request"
-        );
-        state.record_gallery_scroll(0);
         snapshot.viewport.firstrow = 0;
         snapshot.order.visibleindices = vec![10, 11, 12, 13, 20, 21, 22, 23];
         state.rebase(Some(&snapshot), false);
         let input = local_focus(&state, &snapshot).unwrap();
-        assert_eq!(
-            accept_local_focus(&mut state, &snapshot, input).focusedcompiledindex,
-            Some(21)
-        );
+        assert_eq!(input.selected, Some(21));
+        accept_local_focus(&mut state, &snapshot, input);
     }
 
     #[test]
@@ -956,11 +906,9 @@ mod tests {
         let mut snapshot = explore_snapshot();
         snapshot.ready = true;
         snapshot.viewport.firstrow = 1;
-        snapshot.focusedimage = Some(4);
         let committed = State::committed_viewport(&snapshot);
         let mut transported = committed.clone();
         transported.viewport.firstrow = 2;
-        transported.focusedcompiledindex = Some(8);
         let mut state = State::default();
         state.request_viewport(Some(&snapshot), transported.clone());
         state.viewport_queued(transported.clone());
@@ -996,7 +944,6 @@ mod tests {
         let viewport = state.measured_viewport(4, 2, 100).unwrap();
         let request = ExploreViewportUpdate {
             viewport,
-            focusedcompiledindex: Some(10),
         };
         state.request_viewport(None, request.clone());
         assert_eq!(state.dispatchable_viewport(), Some(request.clone()));
@@ -1006,7 +953,6 @@ mod tests {
         let mut snapshot = explore_snapshot();
         snapshot.ready = true;
         snapshot.viewport = request.viewport;
-        snapshot.focusedimage = request.focusedcompiledindex;
         state.rebase(Some(&snapshot), false);
         assert!(state.dispatchable_viewport().is_none());
     }
@@ -1027,7 +973,6 @@ mod tests {
             )
             .unwrap()
             .viewport,
-            focusedcompiledindex: None,
         };
         let mut state = State::default();
         state.request_viewport(Some(&snapshot), rejected.clone());
@@ -1042,7 +987,6 @@ mod tests {
         assert!(state.dispatchable_viewport().is_none());
         let restored = ExploreViewportUpdate {
             viewport: snapshot.viewport.clone(),
-            focusedcompiledindex: None,
         };
         state.request_viewport(Some(&snapshot), restored.clone());
         assert_eq!(state.dispatchable_viewport(), Some(restored));
@@ -1064,7 +1008,6 @@ mod tests {
                 firstrow,
                 ..crate::generated::default_request_exploreUpdateViewportviewport().unwrap()
             },
-            focusedcompiledindex: Some(firstrow),
         };
         let mut state = State::default();
         state.request_viewport(None, make(1));
@@ -1084,7 +1027,6 @@ mod tests {
                 firstrow,
                 ..crate::generated::default_request_exploreUpdateViewportviewport().unwrap()
             },
-            focusedcompiledindex: Some(firstrow),
         };
         let mut state = State::default();
         state.request_viewport(None, make(1));
@@ -1120,7 +1062,6 @@ mod tests {
         }
 
         snapshot.viewport = transported.viewport;
-        snapshot.focusedimage = transported.focusedcompiledindex;
         snapshot.frame.revision = 4;
         snapshot.revision = 4;
         state.rebase(Some(&snapshot), false);
@@ -1139,17 +1080,14 @@ mod tests {
         assert!(state.measure_gallery(600.0, 420.0, capacity(600, 420), 4));
         let first = ExploreViewportUpdate {
             viewport: state.measured_viewport(4, 1, 100).unwrap(),
-            focusedcompiledindex: Some(4),
         };
         let latest = ExploreViewportUpdate {
             viewport: state.measured_viewport(4, 3, 100).unwrap(),
-            focusedcompiledindex: Some(12),
         };
         state.request_viewport(Some(&snapshot), first.clone());
         state.viewport_queued(first.clone());
         state.request_viewport(Some(&snapshot), latest.clone());
         snapshot.viewport = first.viewport;
-        snapshot.focusedimage = first.focusedcompiledindex;
         state.rebase(Some(&snapshot), false);
         assert_eq!(state.dispatchable_viewport(), Some(latest.clone()));
         assert!(state.measure_gallery(620.0, 430.0, capacity(620, 430), 4));
@@ -1157,7 +1095,6 @@ mod tests {
             .measured_layout_request(Some(&snapshot), 4, 100)
             .unwrap();
         assert_eq!(merged.viewport.firstrow, latest.viewport.firstrow);
-        assert_eq!(merged.focusedcompiledindex, latest.focusedcompiledindex);
         assert_eq!(merged.viewport.extent.width % merged.viewport.columns, 0);
         assert!(merged.viewport.extent.width <= 620);
     }
@@ -1168,7 +1105,6 @@ mod tests {
         snapshot.ready = true;
         let first = ExploreViewportUpdate {
             viewport: snapshot.viewport.clone(),
-            focusedcompiledindex: None,
         };
         let mut latest = first.clone();
         latest.viewport.firstrow = 9;
@@ -1352,7 +1288,6 @@ mod tests {
         assert!(state.measure_gallery(600.0, 420.0, capacity(600, 420), 4));
         let sent = ExploreViewportUpdate {
             viewport: state.measured_viewport(4, 3, 1_000).unwrap(),
-            focusedcompiledindex: Some(12),
         };
         state.request_viewport(Some(&snapshot), sent.clone());
         state.viewport_queued(sent);
@@ -1375,7 +1310,7 @@ mod tests {
     }
 
     #[test]
-    fn column_rebase_preserves_latest_scroll_and_focus() {
+    fn column_rebase_preserves_latest_scroll() {
         let mut snapshot = explore_snapshot();
         snapshot.ready = true;
         snapshot.order.matchingcount = 1_000;
@@ -1383,7 +1318,6 @@ mod tests {
         state.measure_gallery(601.0, 601.0, capacity(601, 601), 4);
         let sent = ExploreViewportUpdate {
             viewport: state.measured_viewport(4, 1, 1_000).unwrap(),
-            focusedcompiledindex: Some(4),
         };
         state.request_viewport(Some(&snapshot), sent.clone());
         state.viewport_queued(sent);
@@ -1391,7 +1325,6 @@ mod tests {
             Some(&snapshot),
             ExploreViewportUpdate {
                 viewport: state.measured_viewport(4, 17, 1_000).unwrap(),
-                focusedcompiledindex: Some(71),
             },
         );
         state.measure_gallery(601.0, 601.0, capacity(601, 601), 5);
@@ -1402,7 +1335,6 @@ mod tests {
             (rebased.viewport.columns, rebased.viewport.firstrow),
             (5, 17)
         );
-        assert_eq!(rebased.focusedcompiledindex, Some(71));
     }
 
     #[test]
@@ -1416,7 +1348,6 @@ mod tests {
         state.record_gallery_fraction(0.5);
         let request = ExploreViewportUpdate {
             viewport: state.measured_viewport(4, 12, 100).unwrap(),
-            focusedcompiledindex: Some(48),
         };
         state.request_viewport(Some(&snapshot), request.clone());
         state.viewport_queued(request);
@@ -1693,7 +1624,6 @@ mod tests {
         };
         let viewport = ExploreViewportUpdate {
             viewport: snapshot.viewport.clone(),
-            focusedcompiledindex: Some(2),
         };
         let mut state = State::default();
         assert!(state.measure_gallery(700.0, 400.0, capacity(700, 400), 4));

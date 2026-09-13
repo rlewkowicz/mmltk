@@ -57,7 +57,6 @@ class GalleryStream final {
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);
     // Construction-only binding; retained unchanged through native retirement.
     void SetCurrentDemand(ExploreDemandCheck);
-    void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority>);
     [[nodiscard]] ExploreStorageFootprint StorageFootprint() const;
     [[nodiscard]] ExploreOutputChange OutputChange(const ExploreRenderPlan&, std::span<const std::uint32_t>,
                                                    const mmltk::backend::data::CompiledDataset*, std::span<const std::uint32_t>) const;

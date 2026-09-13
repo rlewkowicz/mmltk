@@ -71,7 +71,6 @@ struct ExploreOpen final {
 };
 struct ExploreViewportUpdate final {
     ExploreViewport viewport{};
-    std::optional<std::uint32_t> focused_compiled_index{};
     [[nodiscard]] bool valid() const noexcept { return viewport.square_geometry(); }
 };
 struct ExploreViewportResult final {
@@ -186,7 +185,6 @@ struct ExploreSnapshot final {
     ExploreDetailView detail{};
     ExploreMode mode = ExploreMode::Gallery;
     std::optional<std::uint32_t> selected_image{};
-    std::optional<std::uint32_t> focused_image{};
     VisualFrame frame{};
     VisualDocumentFacts document{};
     contracts::AnnotationSceneContent scene{};
@@ -199,7 +197,6 @@ struct ExploreRenderPlan final {
     ExploreOverlay overlay{};
     ExploreMode mode = ExploreMode::Gallery;
     std::optional<std::uint32_t> selected_image{};
-    std::optional<std::uint32_t> focused_image{};
     mmltk::backend::models::rfdetr::GpuAugmentationConfig augmentation_config{};
     ExploreAugmentationPreview augmentation{};
     ExploreDetailView detail{};
@@ -244,21 +241,6 @@ class ExploreDemandCheck final {
     std::shared_ptr<const std::atomic<std::uint64_t>> generation_;
 };
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
-// Input updates this bounded scalar; the loader reads it at its next scheduling
-// opportunity. It neither invalidates demand nor requests image production.
-class ExploreLoadingPriority final {
-   public:
-    void Focus(const std::optional<std::uint32_t> index) noexcept {
-        focused_.store(index ? static_cast<std::uint64_t>(*index) + 1U : 0U, std::memory_order_release);
-    }
-    [[nodiscard]] std::optional<std::uint32_t> focused() const noexcept {
-        const auto value = focused_.load(std::memory_order_acquire);
-        return value == 0U ? std::nullopt : std::optional{static_cast<std::uint32_t>(value - 1U)};
-    }
-
-   private:
-    std::atomic<std::uint64_t> focused_{0U};
-};
 enum class ExploreOutputChange : std::uint8_t { Initialize, Semantic, Unchanged };
 // Renderer-owned physical high-water capacities. Host bytes cover retained
 // cache meaning and render/scheduler metadata, not the compiled dataset, order,
@@ -313,7 +295,6 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void SetGalleryReadySink(GalleryReadySink) = 0;
     // Bind once during runtime construction, before any image ingress.
     virtual void SetCurrentDemand(ExploreDemandCheck) = 0;
-    virtual void SetLoadingPriority(std::shared_ptr<const ExploreLoadingPriority>) {}
     [[nodiscard]] virtual ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const = 0;
     [[nodiscard]] virtual ExploreStorageFootprint StorageFootprint() const { return {}; }
     // Logical candidate meaning follows the prepared GPU output. Commit this

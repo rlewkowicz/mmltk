@@ -617,7 +617,6 @@ pub(super) fn merge_explore_snapshot(
         differing!(detail);
         differing!(mode);
         differing!(selectedimage);
-        differing!(focusedimage);
         differing!(frame);
         differing!(document);
         differing!(scene);
