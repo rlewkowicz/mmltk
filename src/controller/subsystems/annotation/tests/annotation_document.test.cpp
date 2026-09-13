@@ -1101,6 +1101,60 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         ++description.document_epoch;
         CHECK(render(82U) == preview);
         CHECK(render(82U) == preview);
+        auto mixed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
+        mixed->objects = {
+            {.shape = c::contracts::AnnotationShape::Point, .point = {20, 8},
+             .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
+            {.shape = c::contracts::AnnotationShape::Spline,
+             .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
+             .spline_knots = {{{3, 20}}, {{12, 20}}}},
+            {.shape = c::contracts::AnnotationShape::Skeleton,
+             .mask = {.runs = {{48U, 40U, 52U}}, .present = true},
+             .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
+                                {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
+             .skeleton_edges = {{0U, 1U}}},
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{2, 2}, {10, 10}},
+             .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
+            {.shape = c::contracts::AnnotationShape::Box, .box = {{40, 41}, {55, 54}}, .category = 1U}
+        };
+        REQUIRE(mixed->valid());
+        description.scene = mixed;
+        description.editor.selected_object = 3U;
+        ++description.scene_revision;
+        const auto covered = render(82U);
+        CHECK(render(82U) == covered);
+        for (const unsigned row : {44U, 46U, 48U, 50U}) {
+            CHECK(pixel(covered, 40U, row) == std::array<unsigned char, 4U>{0, 255, 0, 255});
+            CHECK(pixel(covered, 46U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+        }
+        const auto compare_fresh = [&] {
+            const auto incremental = render(82U);
+            CHECK(render(82U) == incremental);
+            open(82U);
+            CHECK(render(82U) == incremental);
+            CHECK(render(82U) == incremental);
+            return incremental;
+        };
+        auto uncovered = std::make_shared<c::contracts::AnnotationSceneContent>(*mixed);
+        uncovered->objects.back().box = {{56, 41}, {62, 54}};
+        description.scene = uncovered;
+        ++description.scene_revision;
+        const auto exposed = compare_fresh();
+        for (const unsigned row : {44U, 46U, 48U, 50U})
+            CHECK(pixel(exposed, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+        for (const auto point : std::array<std::array<unsigned, 2U>, 5U>{{{20U, 8U}, {8U, 20U}, {8U, 12U},
+                                                                       {2U, 6U}, {15U, 15U}}}) {
+            CHECK(pixel(exposed, point[0], point[1]) == pixel(covered, point[0], point[1]));
+            CHECK(pixel(exposed, point[0], point[1])[3] == 255U);
+        }
+        auto removed = std::make_shared<c::contracts::AnnotationSceneContent>(*uncovered);
+        removed->objects.pop_back();
+        description.scene = removed;
+        ++description.scene_revision;
+        const auto remaining = compare_fresh();
+        CHECK(pixel(remaining, 56U, 46U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+        for (const unsigned row : {44U, 46U, 48U, 50U})
+            CHECK(pixel(remaining, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
         return c::detail::VisualRuntimeOwner::Notification{[&] { done.set_value({}); }};
     }));
     auto result = done.get_future();

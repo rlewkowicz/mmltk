@@ -82,24 +82,29 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     }
 
    private:
+    struct Footprint final {
+        raster::IntRect bounds{};
+        raster::IntRect runs{};
+    };
     struct Allocation final {
         std::uint64_t owner = 0U, identity = 0U, semantic = 0U, epoch = 0U;
         std::uint32_t width = 0U, height = 0U;
         std::optional<std::uint16_t> selected;
         std::vector<domain::AnnotationObject> objects;
-        std::vector<raster::IntRect> bounds;
+        std::vector<Footprint> footprints;
         std::vector<std::optional<AnnotationDragPreview>> transforms;
         std::vector<domain::AnnotationColor> palette;
     };
     mutable std::vector<Allocation> allocations_;
+    mutable std::vector<Footprint> footprints_;
     mutable mmltk::frameworks::gpu::ImageWorkspaceRegion damage_;
     mutable bool full_damage_ = true;
     static bool SameGeometry(const domain::AnnotationObject& a, const domain::AnnotationObject& b) {
         return a.shape == b.shape && a.point == b.point && a.spline_knots == b.spline_knots &&
                a.skeleton_nodes == b.skeleton_nodes && a.skeleton_edges == b.skeleton_edges && a.spline_closed == b.spline_closed;
     }
-    static bool SameDrawing(const domain::AnnotationObject& a, const domain::AnnotationObject& b) {
-        return SameGeometry(a, b) && a.box == b.box && a.mask.runs == b.mask.runs &&
+    static bool SameDrawing(const domain::AnnotationObject& a, const domain::AnnotationObject& b, bool same_runs) {
+        return SameGeometry(a, b) && a.box == b.box && same_runs &&
                a.category == b.category && a.enabled == b.enabled;
     }
     static domain::AnnotationBox DrawingBox(const AnnotationRenderState& description, std::size_t index) {
@@ -111,7 +116,19 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (box.first.x >= box.second.x || box.first.y >= box.second.y) return {};
         return {{std::floor(box.first.x), std::floor(box.first.y)}, {std::ceil(box.second.x), std::ceil(box.second.y)}};
     }
-    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index) {
+    static raster::IntRect RunBounds(const domain::AnnotationObject& object) {
+        if (object.mask.runs.empty()) return {};
+        raster::IntRect bounds{std::numeric_limits<int>::max(), std::numeric_limits<int>::max(), 0, 0};
+        for (const auto run : object.mask.runs) {
+            bounds.x1 = std::min(bounds.x1, static_cast<int>(run.first));
+            bounds.y1 = std::min(bounds.y1, static_cast<int>(run.row));
+            bounds.x2 = std::max(bounds.x2, static_cast<int>(run.last) + 1);
+            bounds.y2 = std::max(bounds.y2, static_cast<int>(run.row) + 1);
+        }
+        return bounds;
+    }
+    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index,
+                                  raster::IntRect runs, int width, int height) {
         const auto& object = description.DrawingObjectAt(index);
         if (!object.enabled) return {};
         const auto box = DrawingBox(description, index);
@@ -130,8 +147,41 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
         for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
             if (object.skeleton_nodes[node].visible) point(description.DrawingNode(index, node));
-        return {static_cast<int>(std::floor(x1)) - 9, static_cast<int>(std::floor(y1)) - 9,
-                static_cast<int>(std::ceil(x2)) + 9, static_cast<int>(std::ceil(y2)) + 9};
+        // Geometry includes the existing outline thickness and selection/vertex
+        // handles. Runs are independent drawing primitives for every named shape.
+        x1 = std::floor(x1) - 9; y1 = std::floor(y1) - 9;
+        x2 = std::ceil(x2) + 9; y2 = std::ceil(y2) + 9;
+        if (runs.x1 < runs.x2 && runs.y1 < runs.y2) {
+            float first = static_cast<float>(runs.x1), top = static_cast<float>(runs.y1);
+            float last = static_cast<float>(runs.x2), bottom = static_cast<float>(runs.y2);
+            bool visible = true;
+            if (description.TransformsMask(index)) {
+                const auto target = description.TargetBox(index);
+                const float sx = object.box.second.x > object.box.first.x ?
+                    (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x) : 1.0F;
+                const float sy = object.box.second.y > object.box.first.y ?
+                    (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y) : 1.0F;
+                visible = sx > 0 && sy > 0;
+                const auto project = [](float value, float source, float target, float scale) {
+                    // Keep the same separate float operations as the raster kernel.
+                    const volatile float delta = value - source;
+                    const volatile float scaled = delta * scale;
+                    return target + scaled;
+                };
+                first = std::floor(project(first, object.box.first.x, target.first.x, sx));
+                last = std::ceil(project(last, object.box.first.x, target.first.x, sx));
+                top = std::floor(project(top, object.box.first.y, target.first.y, sy));
+                bottom = std::ceil(project(bottom, object.box.first.y, target.first.y, sy));
+            }
+            if (visible) {
+                x1 = std::min(x1, first); y1 = std::min(y1, top);
+                x2 = std::max(x2, last); y2 = std::max(y2, bottom);
+            }
+        }
+        return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))),
+                static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
+                static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))),
+                static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
     }
     void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source,
                 const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
@@ -155,22 +205,33 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         }
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};
         const auto damage = [&](raster::IntRect bounds) {
+            if (bounds.x1 >= bounds.x2 || bounds.y1 >= bounds.y2) return;
             clip.x1 = std::min(clip.x1, bounds.x1); clip.y1 = std::min(clip.y1, bounds.y1);
             clip.x2 = std::max(clip.x2, bounds.x2); clip.y2 = std::max(clip.y2, bounds.y2);
         };
         const bool palette_changed = retained.palette != description.scene->palette;
+        footprints_.resize(description.ObjectCount());
         for (std::size_t index = 0; index < std::max(retained.objects.size(), description.ObjectCount()); ++index) {
             const bool previous = index < retained.objects.size();
             const bool current = index < description.ObjectCount();
-            const auto bounds = current ? Bounds(description, index) : raster::IntRect{};
+            const bool same_runs = previous && current &&
+                retained.objects[index].mask.runs == description.DrawingObjectAt(index).mask.runs;
+            if (current) {
+                const auto& object = description.DrawingObjectAt(index);
+                auto& footprint = footprints_[index];
+                footprint.runs = same_runs ? retained.footprints[index].runs : RunBounds(object);
+                footprint.bounds = Bounds(description, index, footprint.runs,
+                                          static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height));
+            }
+            const auto bounds = current ? footprints_[index].bounds : raster::IntRect{};
             const bool changed = !previous || !current || palette_changed ||
                 (retained.selected == index) != (description.editor.selected_object == index) ||
-                !SameDrawing(retained.objects[index], description.DrawingObjectAt(index)) ||
-                retained.bounds[index].x1 != bounds.x1 || retained.bounds[index].y1 != bounds.y1 ||
-                retained.bounds[index].x2 != bounds.x2 || retained.bounds[index].y2 != bounds.y2 ||
+                !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) ||
+                retained.footprints[index].bounds.x1 != bounds.x1 || retained.footprints[index].bounds.y1 != bounds.y1 ||
+                retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
                 retained.transforms[index] != (description.preview_object == index ? description.drag : std::nullopt);
             if (changed) {
-                if (previous) damage(retained.bounds[index]);
+                if (previous) damage(retained.footprints[index].bounds);
                 if (current) damage(bounds);
             }
         }
@@ -309,7 +370,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);
             if (!object.enabled) continue;
-            const auto bounds = Bounds(description, index);
+            const auto bounds = footprints_[index].bounds;
             if (bounds.x1 >= clip.x2 || bounds.x2 <= clip.x1 || bounds.y1 >= clip.y2 || bounds.y2 <= clip.y1) {
                 offset += object.mask.runs.size();
                 continue;
@@ -398,12 +459,11 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         retained.selected = description.editor.selected_object;
         retained.palette = description.scene->palette;
         retained.objects.resize(description.ObjectCount());
-        retained.bounds.resize(description.ObjectCount());
+        retained.footprints = footprints_;
         retained.transforms.resize(description.ObjectCount());
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);
             if (retained.objects[index] != object) retained.objects[index] = object;
-            retained.bounds[index] = Bounds(description, index);
             retained.transforms[index] = description.preview_object == index ? description.drag : std::nullopt;
         }
     }
