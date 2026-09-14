@@ -9,7 +9,7 @@ input-to-display latency guarantee.
 
 ## Typed application boundary
 
-The current application package protocol is **16**. Canonical C++ declarations
+The current application package protocol is **17**. Canonical C++ declarations
 own native types, field identities, constraints, defaults, endpoints, events,
 and snapshots. C++26 reflection generates typed Rust projections, compact
 interaction codecs, validation, exhaustive dispatch, and schema identity.
@@ -22,7 +22,7 @@ outer records and protocol version;
 [application_materializer.h](../src/controller/browser/application_materializer.h)
 derive the application boundary. The bootstrap supplies the schema
 fingerprint, current snapshots, and input peer epoch. The client validates
-agreement before installing native state. Compact Annotation and Explore
+agreement before installing native state. Compact workspace mouse and Explore
 interactions travel on the existing session-bound CBOR/WebSocket connection.
 
 Application output objects in snapshots, replies, and events use positional
@@ -39,113 +39,116 @@ defined in [reflected_cbor.h](../src/frameworks/serialization/reflected_cbor.h).
 
 Compact interactions use numeric opcodes generated from canonical endpoint
 order; their envelopes do not repeat protocol and endpoint identities already
-established by the connection. Annotation movement uses point deltas only
-when reconstruction is bit-exact and retained gesture metadata is unchanged.
-Begin/End/Cancel, changed parameters or targets, and inexact deltas use full
-absolute pointer records. Fractional coordinates and every accepted
-path-dependent sample survive this encoding. CBOR floats use the smallest
-exact representation.
+established by the connection. Mouse records preserve fractional image
+coordinates, button values, modifiers, click counts, wheel units and deltas,
+and source/peer/document ownership. Optional coordinates also allow input to
+an empty workspace. CBOR floats use the smallest exact representation.
 
-Protocol 16 is a complete package boundary: native host, Iced bundle, generated
+Protocol 17 is a complete package boundary: native host, Iced bundle, generated
 bindings, and cross-language fixtures must agree. Follow
 [binding generation and packaging](build.md#generated-bindings-and-dependency-maintenance);
 generated Rust is build output. The separate native/Firefox graphics ABI
 projects physical import records and frame signals; it does not carry
 application intents or own UI behavior.
 
-## Ordered annotation input and retained storage
+The WebSocket carries controls and logical UI facts. The independent FD graphics
+channel carries completed images and immutable `WorkspaceImageMetadata`:
+schema identity, frame dimensions/content region, and the corresponding native
+product projection, including atlas layout and labels where applicable.
+Firefox transports this payload opaquely. The
+[metadata decoder](../src/frontend/iced/src/presentation_surface/metadata.rs)
+validates its extent, schema, exact image identity, and product/source pairing
+before installing it. Malformed or mismatched metadata rejects that candidate
+while preserving safe read custody and the last valid image.
 
-The owning Iced canvas converts pointer movement through its view transform
-into native image coordinates and typed pointer targets. Each sample carries
-Begin, Update, End, or Cancel, plus interaction and sample sequence identities.
-The frontend keeps accepted samples until the native CPU-consumption watermark
-acknowledges their batch:
+## Shared immediate workspace input
+
+[workspace_input.rs](../src/frontend/iced/src/workspace_input.rs) captures
+movement, every button press/release, enter/leave, wheel, and cancellation for
+all workspace tabs. Click count accompanies a press, so one physical gesture
+has one native effect. Iced converts coordinates through the local view
+transform and retains pan, zoom, hover, and other component interaction state.
+Native Annotation resolves editing targets; passive products consume the same
+vocabulary without acquiring editing tools.
 
 ```text
-Iced gesture
-    → retained frontend samples
-    → compact batches on the existing socket
-    → native ordered CPU reduction
-          ├─ cumulative consumption credit → frontend storage reuse
-          └─ newest renderable state → GPU publication → presentation
+Iced capture
+    → ordered connection, retaining unsent records during transport pressure
+    → generated compact interaction on the existing socket
+    → the selected native owner's queue and domain effects
+          └─ changed content → dirty renderer → completed graphics image
 ```
 
-| Storage | Capacity and lifetime |
-| --- | --- |
-| Frontend sample deque | Starts at 64 samples, grows geometrically as needed, retains high-water capacity across gestures |
-| Frontend batch and codec buffers | Reused; capacities derive from generated native limits |
-| Native input slots | Two reusable slots, each holding at most 32 samples |
-| Native render descriptions | At most three reusable descriptions across input scratch, newest pending work, and active GPU work |
+The connection preserves the order of mouse records and ordinary commands,
+including records waiting for Bootstrap's peer epoch. It reuses encoding
+storage and retains mouse records through temporary pressure. Admission does
+not depend on frontend consumption credits, document-settlement barriers, or
+display completion. Allocation or essential transport failure closes the peer;
+it cannot silently shorten an accepted stroke.
 
-[AnnotationInput](../src/frontend/iced/src/annotation_input.rs) owns accepted
-samples, in-flight batches, document-command barriers, and reusable encoding
-storage. A batch does not cross a document epoch or a queued command's sample
-frontier. Both native slots being occupied leaves further samples retained
-in the frontend. It does not cancel the gesture or retire the peer. Extended
-stalls can grow frontend memory; failed growth reports a connection/input
-failure instead of silently committing a shortened stroke.
+## Ordered annotation input and retained storage
 
+The shared native
+[WorkspaceInputQueue](../src/controller/presentation/workspace_input.h)
+starts with 64 entries, grows geometrically, retains high-water capacity, and
+pops in constant time. Each domain owns its synchronization and execution.
 [AnnotationSystem](../src/controller/subsystems/annotation/annotation_system.h)
-validates the peer epoch, document epoch, next batch sequence, sample bounds,
-and available credits before admission. Its independent input worker owns
-the mutable `AnnotationDocument`, reducer, and history. It applies batches in
-order and preserves every path-dependent brush segment. Each consumed batch
-frees its slot and publishes a cumulative watermark **before GPU publication or a
-GPU render wait**. Input-progress records have reserved transport capacity and
-are processed before ordinary frontend application events. A stale peer's
-credits cannot release a replacement peer's samples.
+places mouse input, document commands, and peer boundaries in one native
+queue. Its independent input worker owns `AnnotationDocument`, the reducer,
+and history. It validates peer ownership on admission, consumes stale-document
+records as cancellation, and preserves every accepted path-dependent sample.
+Peer replacement queues old-gesture cleanup before replacement input.
 
 ## Document commands and settlement
 
-Annotation Open, Edit, Save, and Stop share ordered command admission.
-A command waits until every earlier accepted sample has been CPU-consumed.
-Later samples wait behind that command's settlement barrier. Ordinary document
-editing and saving settle on the input owner independently of display
-publication. Source opening and color sampling use explicit asynchronous GPU
-continuations; subsequent document effects retain their required order.
+Annotation Open, Edit, and Save execute after earlier admitted mouse records
+and commands on the input owner. Ordinary document editing and saving settle
+independently of display publication. Source opening and color sampling use
+asynchronous GPU continuations that suspend later dependent document effects.
+Transport can continue admitting ordered records, independent systems keep
+running, and Stop can request cancellation.
 
-A successful admission reply with `busy=true` is not completion. The frontend
-retains its barrier until the corresponding later non-busy native state has
-arrived; reply and event arrival order may differ. Rejected commands clear
-their barrier through the typed reply. Stop can pass an already unsettled
-command to request cancellation without taking over that command's settlement.
-Renderer observations and other systems' traffic continue independently.
-
-CPU credits therefore prove input consumption, not successful saving,
-rendering, or command completion. Domain rejections remain typed application
-outcomes. Invalid wire input, continuity loss, allocation failure, and peer
-replacement have their own connection/failure paths. Peer closure orders the
-native gesture cleanup before admitting input for a new peer.
+An admission reply with `busy=true` describes queued work. Completion produces
+later native state; admission and completion can advance separate revisions,
+and reply/event arrival order may differ. These are logical operation facts.
+They neither validate a texture nor acknowledge a GPU read. Domain rejection,
+wire failure, resource failure, and cancellation retain their typed outcomes.
 
 ## Reduction, publication, and source changes
 
 [annotation_system.cpp](../src/controller/subsystems/annotation/annotation_system.cpp)
 separates ordered reduction from a dedicated renderer. The input owner captures
-an immutable exact description, including shared scene and identity storage,
-editor facts, and preview geometry. It replaces only the newest unsubmitted
-description. The renderer retains its active description through GPU settlement.
-If no output allocation is writable, it retains the completed clean baseline
-and pending description and arms an availability notification while input keeps
-progressing. A receiver release triggers another publication attempt. There is
-no fixed batching delay, frame timer, or FIFO of intermediate render requests.
+an immutable description with shared scene storage, editor facts, and preview
+geometry. Three reusable descriptions cover input scratch, newest pending work,
+and active GPU work. The renderer retains its active description through
+settlement and may replace the newest unsubmitted description. If output storage
+is occupied, it retains the clean baseline and pending work and arms a real
+availability notification while input progresses.
 
 Logical UI facts describe the latest committed document; rendered scene and
 frame facts describe the exact completed pixels, even when newer input has
 overtaken them. Full Annotation UI state and compact frame progress have
 separate revisions. Preview-only publications do not resend the document.
-Canonical reflected projections keep body hit geometry, selected handles, and
-preview geometry separate from editable names and persistence-only facts.
-Reconnect carries both current logical state and retained drawable geometry
-within the existing snapshot and Bootstrap limits. Document import and size
-validation complete before committed state is replaced.
+Bootstrap restores logical UI state; graphics binding and image custody
+progress independently. Document import and size validation complete before
+committed state is replaced.
 
-A new gesture resolves its target from displayed geometry and uses the current
-logical tool. Runtime object and element identities travel with that geometry;
-the document resolves them into its current indices. Surviving objects remain
-editable while rendering lags, and deleted targets cannot silently retarget a
-reused index. Undo/Redo retains those identities with history. They are not saved
-in the named persistence format. Accepted same-document gesture progress keeps
-its original target through newer render publications.
+A press resolves its target against the current native document and logical
+tool, preserving selected-handle precedence and image-coordinate tolerances.
+The accepted gesture retains that target through subsequent samples, with
+runtime object/element identities preserved by history and Undo/Redo. These
+identities are not part of the saved named format. A positive fractional Box
+preview whose bounds truncate to empty integer raster coverage skips just the
+outline; the gesture, mask content, selection, and damage processing remain
+valid.
+
+All five visual systems use the shared
+[VisualRuntimeOwner](../src/controller/presentation/detail/visual_runtime_owner.h).
+Content/input changes, workspace admission, and actual GPU/storage completion
+wake dirty work. Clean and semantic planes, allocation-local damage, geometry,
+and staging retain reusable capacity. An idle native renderer has no repeating
+render timer. Redrawing a completed browser image does not rerun inference,
+upscaling, decoding, capture, or document edits.
 
 Producer events notify native Presentation directly through
 [ApplicationEventPublisher](../src/controller/browser/application_event_publisher.h)
@@ -162,8 +165,7 @@ borrowing the same stale observation.
 
 ## Native GPU custody and completion
 
-Each visual producer owns its raw processing products and final shareable
-display workspaces:
+Each visual producer owns its raw processing products and display preparation:
 
 | Producer | Raw product and retained work | Display preparation |
 | --- | --- | --- |
@@ -173,18 +175,20 @@ display workspaces:
 | [Live](../src/controller/subsystems/live/native_live_algorithm.cpp) | Media composite output lease and a clean system output | The existing media receiver copy writes the system output; admitted same-device output uses final workspace storage directly |
 | [Upscale](../src/controller/subsystems/upscale/upscale_system.cpp) | Receiver-owned clean/semantic input, transformed document, and cached derived products | Fused finalization of the selected retained result |
 
-The runtime's physical output pool has three slots for Explore, four for
-Upscale, and two each for Annotation, Predict, and Live. These pools also retain
-raw products and inactive gallery/detail/derived results; they are not all
-queued display frames. Current and overflow roles exchange on promotion without
-a pixel copy. Unacquired overflow may be replaced while the current image is
-externally held. Raw product readers and actual browser acquisitions separately
-prevent reuse. If no slot is writable, display work defers.
+The retained product pool has three slots for Explore, four for Upscale, and
+two each for Annotation, Predict, and Live. These raw pools include inactive
+gallery/detail/derived results. The foreground graphics binding separately owns
+two persistent display buffers. Selection reuses that pair; growth or device
+replacement may temporarily retain old buffers until their readers settle.
 
-Each admitted slot's workspace is reusable. A same-device clean-only output
-aliases its final storage; clean/semantic products retain both raw planes
-alongside final display storage. Allocation and logical product revision are
-independent.
+Raw product readers and actual browser acquisitions protect their own storage.
+A same-device clean-only output may alias available final storage when both
+lifetimes permit it. Otherwise raw work continues in independent retained
+storage while display buffers are occupied. Clean/semantic products retain both
+raw planes and use fused finalization. Completed products and front/back display
+roles can be selected without copying pixels. Allocation and logical product
+revision remain independent.
+
 The native runtime factories linked above and
 [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) define these
 inventories.
@@ -195,10 +199,9 @@ existing worker. A raw product can finish before browser layout is available.
 After Firefox allocation and CUDA import, the worker prepares that exact
 retained product without another command, repeated inference/editing, or
 another camera frame. First admission or growth can require a fill from retained
-raw data; subsequent
-production finalizes into the admitted storage. See [external workspace
-interoperability](gpu-execution.md#shared-workspace-interoperability) for the
-initial ownership and device requirements.
+raw data; subsequent production finalizes into the admitted storage.
+See [external workspace interoperability](gpu-execution.md#shared-workspace-interoperability)
+for the initial ownership and device requirements.
 
 Raw `BorrowFrame` and `BorrowDocument` consumers keep their existing meaning.
 Annotation, Upscale, and other processing receivers finish their required
@@ -206,20 +209,23 @@ copies before releasing borrowed inputs. Device mismatch uses the
 producer-owned same-device/peer/pinned transfer facilities. Those processing
 and device-boundary transfers are separate from display publication.
 
-Presentation observes and borrows the selected final workspace through
-`VisualSourceReader`. It owns admission, selection, publication, and native
-timeline signaling, with no display image allocation or pixel-copy/composition
-pass. Its short producer borrow protects readiness publication; a completed
-offer grants no browser read permission.
+Presentation observes the selected product through `VisualSourceReader`,
+captures that product's metadata, and coordinates admission/finalization on
+the producer execution owner. Firefox owns the display allocation; the native
+writer owns its imported custody, publication, and timeline signaling. There
+is no additional Presentation pixel-copy/composition pass. A short producer
+borrow protects readiness publication; a completed offer itself grants no
+browser read permission.
 
 [native_presentation_writer.cpp](../src/controller/presentation/native_presentation_writer.cpp)
 awaits producer readiness on its own GPU execution path, signals an odd ready
-value, publishes the exact frame identity, and raises the source's `eventfd`.
-During draw preparation, Firefox acquires the newest completed offer authorized
-by matching model facts through the physical allocation's nonblocking generation
-gate. It never waits for unfinished production on the interactive draw path.
-An acquisition miss retains the completed fallback and retries on a real
-readiness edge.
+value, publishes the exact frame identity with paired metadata, and raises the
+source's `eventfd`. Publication completes the metadata before exposing the slot.
+During draw preparation, Firefox's stable graphics binding acquires the latest
+completed offer through the physical allocation's nonblocking generation gate.
+It does not require a matching application snapshot or wait for unfinished
+production. An acquisition miss retains the completed fallback and retries on
+a real readiness edge.
 
 Direct mode samples the exact source image in `GENERAL`. Copy mode transfers
 it once into an available reusable sample slot. An acquired source stays
@@ -238,11 +244,11 @@ physical completion retains the affected custody and closes unsafe admission.
 Terminal cleanup does not rely on a dead browser advancing its semaphore.
 
 Source allocations and sample arenas have separate identities and lifetimes.
-The native writer bounds live source records to 24 across producer slots and
-retiring runtime generations, and admits at most three live arena generations
-across active, candidate, and retiring state. Arena capacity retains its
-high-water extent; growth prepares an unpublished candidate while preserving
-the completed fallback.
+The native writer admits at most two source allocations per arena and six
+source records in total, with at most three live arena generations across
+active, candidate, and retiring state. Arena capacity retains its high-water
+extent; growth prepares an unpublished candidate while preserving the completed
+fallback.
 
 Copy mode reuses a two-slot Primary-layer sample arena across source and
 pool-slot rotation: a completed fallback and an incoming sample. Direct mode
@@ -281,8 +287,8 @@ The reflected `ExploreAtlasLayout` travels with readiness and the exact
 product: `first_row`, `row_count`, `row_capacity`, `row_origin`, `columns`, and
 `card_extent`. Logical visible rows and physical high-water dimensions are
 different facts. The [gallery presentation module](../src/frontend/iced/src/presentation_surface/gallery.rs)
-supplies metadata for the eligible pending sample or the retained displayed
-sample. Cropping, labels, hit tests, and selection use that displayed snapshot,
+uses metadata paired with the eligible pending sample or retained displayed
+sample. Cropping, label placement, hit tests, and selection use that image,
 including circular row placement, while a newer layout is pending.
 
 A known placeholder cell already has a compiled-image identity. Hover and
@@ -290,21 +296,39 @@ selection remain available before its thumbnail is ready; readiness controls
 pixels and labels. Blank padding in a partial final row has no selectable
 image. Same-image detail revisions preserve pan/zoom and widget identity.
 
+Gallery and Detail Labels use the current local checkbox state over the labels
+and geometry paired with the displayed image. A label-only toggle needs no new
+GPU image. Boxes and Masks update native semantic planes through dirty work
+and completion notifications, including while the viewport stays still.
+During an augmentation refresh, retained clean pixels and their meaning remain
+paired until each replacement completes; see the
+[thumbnail cache rules](datasets.md#explore-thumbnails-and-atlas-residency).
+
+Select, Next, Previous, and Close cancel the departed detail viewer's derived
+request while retaining the last displayed GPU frame for replacement.
+Explicit route departure or component teardown retires its display custody.
+Transforms use component identity and paired image geometry. An accepted
+Original content preference stays with the same image through route changes
+and reconnect; a different image starts from its own native preference.
+Opening Annotation captures the exact displayed source and applied crop at
+dispatch, so a later preference or image change cannot alter that import.
+
 ## Browser draw eligibility and retained fallback
 
-The frontend reconciles native Presentation metadata with the owning domain's
-source facts before requesting exact draw-time acquisition. The returned sample
-retains those immutable facts. Iced samples either the direct source texture
-or the copied arena slice; it allocates no additional full-image capture texture
-and submits no capture pass. Copy and subsequent draw share queue ordering, so
-an authorized submitted copy can be drawn before its completion callback arrives.
+The graphics binding chooses a completed image locally and returns its immutable
+metadata with read custody. The frontend constructs labels and layout from that
+pair. Application snapshots independently update logical controls; they neither
+grant graphics permission nor select the image for a draw.
+Iced samples the direct source texture or copied arena slice without an
+additional full-image capture texture or capture pass. Copy and subsequent draw
+share queue ordering, so a submitted copy can be drawn before its completion
+callback arrives.
 
 An authorized direct acquisition already refers to completed source pixels and
 can become the retained fallback. Copy mode additionally requires physical copy
 completion. An obsolete completion cannot promote a different current source,
-release a newer sample, or replace its
-metadata. A capacity retry may reuse a logical publication while advancing its
-physical source transfer sequence.
+release a newer sample, or replace its metadata. A capacity retry may reuse a
+logical publication while advancing its physical source transfer sequence.
 
 `SampleRead` retains exact source/sample permission independently for displayed
 fallback, encoded/submitted draws, and enabled probes. Vendored Iced's
@@ -317,9 +341,9 @@ rendering.
 
 | Event | What it permits |
 | --- | --- |
-| Native input watermark | Reuse frontend sample storage and native admission credits |
-| Native Presentation publication | Reconcile the exact producer product with matching domain and control state |
-| Browser exact acquisition plus matching metadata | Draw the direct image, or queue a draw after the capability copy, with that image's geometry |
+| Native command admission/completion | Update logical operation state independently of graphics |
+| Native image publication | Expose a completed image and its paired metadata through graphics |
+| Browser acquisition and validated paired metadata | Draw the direct image, or queue a draw after the capability copy, with that image's geometry |
 | Source read-release submission | Arm native observation of the matching even timeline value; no reuse yet |
 | Actual even-value GPU settlement and `ReadSettled` | Settle the exact physical source read |
 | Direct acquisition, or completed copy, with matching metadata | Promote that exact image as the retained completed fallback |
@@ -327,11 +351,11 @@ rendering.
 | Final display/draw/probe hold release | Release page custody of the exact sample; direct source reuse also requires GPU read settlement |
 
 [presentation_surface.rs](../src/frontend/iced/src/presentation_surface.rs)
-owns page sample custody, draw authorization, and completed images;
+owns page sample custody, completed images, and draw preparation;
 [its gallery module](../src/frontend/iced/src/presentation_surface/gallery.rs)
 keeps atlas metadata attached to the image it describes.
-[app/presentation.rs](../src/frontend/iced/src/app/presentation.rs) reconciles
-transport state and viewer selection before view construction.
+[app/presentation.rs](../src/frontend/iced/src/app/presentation.rs) owns
+foreground routing, viewer transitions, and graphics notifications.
 
 The last valid completed browser image remains drawable while native work,
 capacity growth, or a newer copy is pending. Iced fit, pan, zoom, clipping,
@@ -341,14 +365,34 @@ also carries its own connection identity, even when revision numbers repeat.
 
 Unacquired offers require no source-read settlement. An acquired image rejected
 by the page still completes its GPU read and ownership release.
-Hidden/idle pages and capacity pressure do not turn unused
-offers into GPU reads. Page-local `ArenaTexture` retirement
+Hidden/idle pages and capacity pressure do not turn unused offers into GPU reads.
+Page-local `ArenaTexture` retirement
 explicitly destroys textures after views, bindings, probes, and exact readers
 release them; normal retirement does not depend on JavaScript collection.
 
+## Browser redraws and FPS
+
+The visible browser requests redraws from its graphics/window loop and can
+submit the last completed image continuously while native content is unchanged
+or newer work is pending. Native dirty rendering has its own event-driven
+progress.
+
+Show FPS enables one component-owned counter of actual browser queue
+submissions containing workspace draws, including retained pixels. Several
+workspace primitives using the same meter in one submission count once.
+Clipped, abandoned, or unsubmitted work counts zero. Encoding, swapchain
+presentation, and work-done callbacks are separate events.
+
+[workspace_fps.rs](../src/frontend/iced/src/workspace_fps.rs) caches the text and
+paragraph, refreshing them every 500 ms. The counter sits six pixels inside the
+workspace's upper-right corner. Disabling it removes the meter, clock, counter,
+and submission observer. This product setting is independent of diagnostics;
+opt-in acceptance uses an asynchronous canvas capture to check its placement
+and rendered text.
+
 ## Diagnostics and acceptance
 
-Diagnostic identities do not govern input order, credits, draw authorization,
+Diagnostic identities do not govern input order, draw authorization,
 cache validity, or resource lifetime. Ordinary `./mmltk --gui` leaves diagnostic
 collection and probes inactive. The [logging guide](logging.md) owns activation,
 delivery modes, and artifact formats, including the quiet acceptance driver's

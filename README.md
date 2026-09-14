@@ -65,8 +65,11 @@ hardware acceptance; [logging](docs/logging.md) explains captured evidence.
 ## Codebase
 
 Independent C++ systems own application work; Rust/Iced owns the interface.
-`PresentationSystem` selects and publishes producer-owned display workspaces.
-Firefox owns Vulkan allocation/export, sampling resources, and display cadence.
+`PresentationSystem` routes the foreground source and its graphics handoff.
+Firefox owns two reusable Vulkan display buffers, sampling resources, and
+display cadence. Completed images carry their own geometry and labels over
+the graphics channel; the browser can keep redrawing them while native work
+continues. See [GUI interaction and presentation](docs/gui-interaction.md).
 
 | Start here | Purpose |
 | --- | --- |

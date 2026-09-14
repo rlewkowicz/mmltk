@@ -7,7 +7,7 @@
 Ordinary `./mmltk --gui` has no active diagnostic sink, integration driver,
 reporting state, or pixel-probe owner. Disabled paths skip diagnostic payload
 collection, formatting, clock reads, counter updates, and I/O. Application
-state, resource identities, input credits, and physical completion still work.
+state, ordered input, resource custody, and physical completion still work.
 Diagnostic identities never determine their behavior.
 
 | Explicit setting | Effect |
@@ -107,7 +107,10 @@ and [JavaScript reporting state](../src/frontend/iced/src/integration_control/br
 With reporting disabled, payload callbacks, phase/revision/style deduplication,
 passive viewport queries, gallery scans, and diagnostic sinks stay inactive.
 Compact failed control receipts retain static source-line context without
-initializing reporting or probes.
+initializing reporting or probes. They also carry up to 4096 bytes of
+UTF-8-safe failure detail, including the native UI error kind, title, and body
+when available. Successful receipts carry no failure payload, and an inactive
+driver does not collect it.
 
 The Wayland session assigns one writer to each artifact under
 `build/validation`:
@@ -140,6 +143,9 @@ different purposes from these strict acceptance assertions.
   --correlate @workspace_source+transfer_sequence --format timeline --limit 80
 ./mmltk --logs --family latest-wayland-test \
   -q '@event=acceptance.physical_inventory' --format jsonl
+./mmltk --logs --family latest-wayland-test \
+  -q '@event=iced.surface.draw_submitted' \
+  --correlate @surface+draw_identity --format timeline --limit 60
 ```
 
 The packaged harness independently joins native source admission,
@@ -152,6 +158,13 @@ no GPU read. Acquired direct reads require `firefox.workspace.read_settled`;
 copied samples require `firefox.workspace.copy_completed`, each after matching
 forwarding and child-dispatch evidence.
 
+Each enabled Iced draw has a diagnostic-only `draw_identity` that joins exact
+selection/acquisition, `draw_encoded`, `draw_submitted`, and terminal
+`draw_settled` or `draw_abandoned` observations. Submission is recorded after
+the actual queue call. Independent draws may settle out of order; their exact
+identities preserve the join. Resource holds and physical timelines govern
+release even with diagnostics disabled.
+
 `acceptance.physical_inventory` reports these observed facts:
 
 | Fields | Interpretation |
@@ -159,6 +172,7 @@ forwarding and child-dispatch evidence.
 | `live_workspaces`, `workspace_bytes` | Nonretired admitted native source allocations and their allocation bytes |
 | `live_sample_arenas`, `live_sample_slots` | Live copied-sample arenas and their physical sample capacity; direct source wrappers are separate from sample storage |
 | `completed_browser_copies`, `settled_direct_reads` | Fully joined copy receipts or direct GPU-read settlement, according to the acquired mode |
+| `settled_release_only_reads` | Acquisitions returned through the physical ownership-release path without a displayed sample |
 | `unacquired_offers` | Observed offers without an acquired/releasing transfer |
 | `encoded_draws`, `settled_draws`, `abandoned_draws` | Actual Iced encoding and its terminal resource-custody outcomes |
 | `final_reader_releases` | Exact samples returned after their final read hold |
@@ -166,11 +180,10 @@ forwarding and child-dispatch evidence.
 
 These are allocation/lifetime and cumulative operation facts for the retained
 session, not frame latency or hardware throughput measurements. They do not
-count every internal algorithm transfer. The harness rejects obsolete
-`presentation.copy.*`, offer-driven `firefox.workspace.frame_released`, and
-Iced capture events, while source inspection and the
-complete direct-read/draw chain establish the removed passes. Absence of an
-event in a best-effort log alone cannot establish zero copies.
+count every internal algorithm transfer. Native workspace allocations, raw
+product pools, and copied browser sample storage are separate inventories.
+The complete direct-read/draw chain establishes a sampled source's physical
+path; absence of an event in a best-effort log cannot establish zero copies.
 
 Iced draw settlement proves release of a submitted resource batch; successful
 rendering additionally needs matching drawn-image/pixel evidence. Draw holds,
@@ -179,6 +192,17 @@ facts in the [presentation lifetime rules](gui-interaction.md#browser-draw-eligi
 Independent log drains retain incomplete joins across scenario/source retirement
 and require completion at final settlement. Missing evidence is a failed
 acceptance condition, not an inferred successful handoff.
+
+The acceptance-only undersized-candidate gate uses typed control to hold and
+release a synthetic pending allocation while the completed fallback is drawn.
+It is independent of product acknowledgement and render cadence. Empty-gallery
+acceptance likewise waits until paired zero-match atlas metadata reaches its
+exact draw before consuming the empty notice.
+
+Show FPS is a separate opt-in product meter. Its submission count does not
+replace these draw and lifetime records. The
+[FPS behavior](gui-interaction.md#browser-redraws-and-fps) and asynchronous
+acceptance canvas probe have separate activation and ownership.
 
 ## Start with a bounded investigation
 
@@ -326,8 +350,9 @@ overflow preserves the original text and reports the limit.
 
 Use `referenced_objects.0.type` or `objects.0.handle` for an exact list entry.
 A sole reported image or memory handle is also available as `vk_image` or
-`vk_memory`. The message is a validation-layer allegation; a handle match does
-not establish its cause.
+`vk_memory`; a sole command buffer is available as `vk_command_buffer`.
+The message is a validation-layer allegation; a handle match does not establish
+its cause.
 
 `--representatives` retains one first record per `--group-by` value, preferring
 physical records to copied test context. Full occurrence counts remain

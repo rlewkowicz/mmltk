@@ -359,8 +359,7 @@ The [gallery stream](../src/controller/subsystems/explore/gallery_stream.cpp)
 first places completed cached visible thumbnails. Disk admission and ready
 GPU work then prioritize:
 
-1. Every immediate row, including partially visible rows, with the focused
-   visible image first.
+1. Every visible row, including partially visible rows, in row order.
 2. Up to four rows forward in the last nonzero scroll direction, nearest first.
 3. Up to four rows behind, nearest first.
 
@@ -369,6 +368,9 @@ independently at dataset boundaries; missing rows on one side do not enlarge
 the other side. Priority governs admission, not asynchronous completion.
 In-flight work retains its custody, useful settled inputs can be rebound to
 new demand, and speculative admission preserves foreground lane capacity.
+Scroll position and direction supply demand; mouse hover and selection do not
+change loading priority. The frontend can submit its latest measured viewport
+while native work is busy.
 
 All disk/augmentation/raster misses produce completed individual GPU cache
 tiles before atlas placement. Pixel identity includes the retained dataset
@@ -377,6 +379,22 @@ extent. Filtered position and viewport row count are demand, not pixel identity.
 Overlay validity is separate: box/mask/class changes reuse clean tiles and
 retained annotation meaning; label visibility remains presentation state.
 Per-image augmentation and donor choices remain independent of batch order.
+
+Enabling augmentation, rerolling its seed, or disabling it keeps completed
+tiles when dataset identity, the retained compiled-file incarnation, and card
+raster extent still match. `GalleryThumbnailCache::Retained` exposes those
+drawable pixels together with their existing `GalleryTileMeaning`.
+`Find` additionally requires the current preview identity: retained entries
+marked `refresh_pending` remain drawable but still need replacement work.
+An incompatible dataset/incarnation or raster extent invalidates the entries.
+
+The first atlas result restores these completed visible tiles before admitting
+new misses. Each refreshed tile replaces both pixels and annotation meaning
+after completion. Semantic overlay changes can redraw boxes or masks from the
+retained meaning during a pending preview refresh; they do not clear
+`refresh_pending` or claim that old clean pixels satisfy the new preview.
+Thus labels and semantic geometry continue to describe the displayed pixels
+through enable, reroll, disable, cancellation, and partial progress.
 
 [GalleryThumbnailCache](../src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h)
 retains bounded high-water capacity derived from the admitted maximum viewport

@@ -35,10 +35,11 @@ diagnostics live under `src/controller/services/`.
 Annotation's [input executor](../src/controller/subsystems/annotation/annotation_system.cpp)
 owns the mutable document and ordered history through
 [AnnotationDocument](../src/controller/subsystems/annotation/detail/annotation_document.h).
-Its separate GPU execution owner receives
+Mouse records and document commands share its native ordered queue. Its
+separate GPU execution owner receives
 [immutable render descriptions](../src/controller/subsystems/annotation/detail/annotation_render_state.h).
 The [interaction guide](gui-interaction.md#ordered-annotation-input-and-retained-storage)
-describes their bounded handoff and command continuations.
+describes their retained storage and command continuations.
 
 The implementation layers below those systems are:
 
@@ -83,11 +84,17 @@ messages live in `app/`, `view/`, and the owning widgets. Use
 after changing the native schema.
 
 The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
-owns the current protocol, compact input representation, credit/command
-ordering, and state-publication details. The physical ring lives in
+owns the current protocol, compact input representation, native command
+ordering, and state-publication details. The physical transport ring lives in
 [browser_record_ring.h](../src/frameworks/transport/browser_record_ring.h);
-the retained annotation input owner lives in
-[annotation_input.rs](../src/frontend/iced/src/annotation_input.rs).
+shared mouse capture and immediate submission live in
+[workspace_input.rs](../src/frontend/iced/src/workspace_input.rs), with ordered
+outbound retention in
+[transport_connection.rs](../src/frontend/iced/src/transport_connection.rs).
+Canonical records come from
+[contracts/workspace_input.h](../src/controller/contracts/workspace_input.h);
+the shared native queue is
+[presentation/workspace_input.h](../src/controller/presentation/workspace_input.h).
 
 ## Presentation and browser integration
 
@@ -97,8 +104,10 @@ support, and visual diagnostics. Final display products belong to Explore,
 Annotation, Predict, Live, and Upscale. Predict's implementation is in
 [compute_systems.cpp](../src/controller/subsystems/system/compute_systems.cpp).
 
-[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) owns product
-storage and counted reads;
+[VisualRuntimeOwner](../src/controller/presentation/detail/visual_runtime_owner.h)
+runs dirty work and completion continuations on each producer's worker.
+[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) owns retained
+product storage and counted reads;
 [ImageWorkspace](../src/frameworks/gpu/image_workspace.h) owns native custody
 of a final Vulkan allocation and its immutable display layout;
 [ImportedImageBuffer](../src/frameworks/gpu/imported_image_buffer.h) retains
@@ -120,12 +129,17 @@ The Rust browser-image boundary is
 and its child modules. Firefox allocation/export and WebGPU/Vulkan integration
 live in the owned [third_party/firefox](../third_party/firefox) tree, including
 `gfx/wgpu_bindings/src/server.rs`. Iced owns view transforms and rendering;
-matching metadata authorizes nonblocking acquisition of a completed workspace
-and queue-ordered browser-image draws. Physical Vulkan image and semaphore
-owners retain device custody beyond registry and IPC removal.
+its stable graphics binding acquires the latest completed workspace with paired
+image metadata, independently of application snapshot delivery.
+[metadata.rs](../src/frontend/iced/src/presentation_surface/metadata.rs)
+validates that opaque payload against generated native types.
+Physical Vulkan image and semaphore owners retain device custody beyond
+registry and IPC removal.
 The vendored Iced [primitive resource batch](../third_party/iced/wgpu/src/primitive.rs)
 retains sampled resources through the actual encoder's submission or
 abandonment; it carries no application schema or selection policy.
+[workspace_fps.rs](../src/frontend/iced/src/workspace_fps.rs) owns the optional
+component meter, observing actual queue submissions separately from settlement.
 
 For lifetime and synchronization invariants, follow the contract's
 [GPU buffer flow](../CONTRACT.md#gpu-buffer-flow) and

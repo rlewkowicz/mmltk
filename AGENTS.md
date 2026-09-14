@@ -323,9 +323,8 @@ validation.
 
 - The main agent runs these ordered stages: full tidy, full build, every
   applicable cleanup profile, full tidy, cleanup review/remediation, final full
-  build, focused tests/acceptance. Cleanup never
-  precedes successful initial tidy/build or follows the final build; tests
-  require that final build to pass.
+  build, focused tests/acceptance. Cleanup never precedes successful initial
+  tidy/build or follows the final build; tests require that final build to pass.
 - Both builds use `./mmltk --build`. Both tidy passes use the complete
   configured `./mmltk --tidy` suite regardless of changed files or commits.
   Resolve every genuine finding before the initial build. Do not reuse earlier
@@ -345,8 +344,8 @@ validation.
 - After clean cleanup/tidy, spawn exactly one fresh sol xhigh cleanup adversarial
   reviewer for the cleanup stage, before the final rebuild. Supply
   the complete diff from `pre cleanup` and the workflow-agnostic verifier prompt
-  below exactly once. Require it to
-  prioritize time complexity and system-boundary demarcation while auditing
+  below exactly once. Require it to prioritize time complexity and
+  system-boundary demarcation while auditing
   cohesive ordinary C++ systems, high-quality DRY object-oriented design,
   appropriate public/private class ownership, properly sealed interfaces,
   appropriately scoped ordinary functions, canonical reflected schemas,
@@ -358,8 +357,9 @@ validation.
 - On `NOT COMPLETE`, the cleanup reviewer writes `remediationplan.md`; the main
   agent checks scope/architecture, implements the corrections, and updates the
   remediation plan directly. Follow up with that same reviewer until `COMPLETE`,
-  never spawning another cleanup reviewer or reissuing the prompt. After remediation,
-  rerun every applicable cleanup profile, then full tidy, before follow-up review.
+  never spawning another cleanup reviewer or reissuing the prompt. After
+  remediation, rerun every applicable cleanup profile, then full tidy, before
+  follow-up review.
 - After the reviewer returns `COMPLETE` and cleanup and tidy reruns are clean,
   commit all outstanding tracked cleanup, tidy, and remediation changes with
   the exact message `post cleanup`; keep `actionplan.md` uncommitted.
@@ -563,10 +563,11 @@ Resolve Rust duplication in the component owning the behavior or data.
 ## Git
 
 Unless the user explicitly overrides, commit only during `actionplan.md`
-execution: after each reviewed phase closes and after Final Validation for all
-remaining tracked cleanup/validation changes, including unrelated tracked
-changes. Leave post-review and other non-plan work uncommitted. Never add or
-commit `actionplan.md`.
+execution: after each reviewed implementation phase, at the required cleanup
+checkpoints, after Final Validation, and after the documentation pass. Include
+all remaining tracked changes, including unrelated tracked changes, at those
+commits. Leave non-plan work uncommitted. Never add or commit `actionplan.md`
+or `remediationplan.md`.
 
 ## Tests
 

@@ -3,7 +3,12 @@
 [Wiki index](README.md) · [Quick start](../README.md#build) · [Logging](logging.md) · [Headless Wayland](headless-wayland.md)
 
 The governing validation sequence and review/checkpoint rules are in
-[AGENTS.md](../AGENTS.md). Follow those rules when executing a plan.
+[AGENTS.md](../AGENTS.md#final-validation-workflow). Follow those rules when
+executing a plan, including the main agent's ownership of validation fixes and
+the single cleanup review before the final build. Successful required final
+build, tests, and acceptance lead to the implementation commit, documentation
+pass, and documentation commit; documentation does not reopen validation or
+introduce a whole-plan review.
 The commands below describe individual capabilities; they are not a substitute
 for the required stage ordering.
 
@@ -233,7 +238,7 @@ standalone evidence-audit cases.
 
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
-| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls, cached and held-miss gallery/detail returns, fractional rows, circular wrap, partial final row, wide/tall layouts, semantics, light/dark copy, rapid changes, then SIGINT |
+| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls, cached and held-miss gallery/detail returns, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy, FPS, rapid changes, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -265,12 +270,22 @@ completion order alone cannot establish that priority.
 
 The physical ledger distinguishes native source allocations from retained
 browser arenas and requires each exact acquisition, transfer, mode-specific
-settlement receipt, encoded draw, and final sample release. The capacity
-scenario deliberately delivers arena availability before the held native
+settlement receipt, encoded/submitted draw, and final sample release. A
+diagnostic-only draw identity joins each draw's encoding, actual submission,
+and terminal settlement; independent callbacks may arrive out of order. The
+capacity scenario deliberately delivers arena availability before the held native
 completion receipt, then verifies the exact retry. Allocation inventories,
 actual copy receipts, resource settlement, and rendered pixels have independent
 assertions; [logging evidence](logging.md#physical-presentation-evidence)
 describes the fields and their limits.
+
+The pending-supersession fixture uses a typed acceptance-only hold for a
+synthetic undersized candidate; it verifies the retained completed fallback
+before releasing that candidate. Empty-gallery acceptance consumes its notice
+only after the zero-match atlas and its paired metadata reach an encoded draw.
+The physical ledger separately requires submission and settlement.
+FPS acceptance combines actual submission observations with an
+asynchronous canvas read of the displayed counter.
 
 The ledger follows the negotiated mode: direct acquisitions retain the native
 source until actual GPU read settlement; copied samples require physical copy
@@ -290,14 +305,14 @@ at a time.
 
 | Existing target | Evidence it owns |
 | --- | --- |
-| `mmltk_controller_annotation_tests` | Independent input/render progress, document/history/save behavior, stable target identity through Undo/Redo, pressure, command barriers, rejection, and cancellation |
+| `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, rejection, and cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
-| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and priority, allocation-local atlas rollback, current/overflow reuse, late workspace admission, Vulkan-owned CUDA import and backing lifetime, exact raw/workspace reads, receiver/device transfers, separate acquisition/release/settlement, pressure, failure, and retirement |
+| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and viewport priority, augmentation refresh with paired meaning, allocation-local atlas rollback, independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `browser-app` | Retained input and credits, typed state reduction, canvas identity, logical versus displayed annotation geometry, all model/sample/copy arrival orders, encoded/submitted draw custody, completed fallback, exact displayed gallery interaction, quiet reporting, and JavaScript probe/callback settlement |
+| `browser-app` | Shared immediate mouse input and transport retention, typed state reduction, component/crop identity, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/callback settlement |
 | `workspace-wayland` | Actual packaged interaction, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, rendered pixels, recovery, and shutdown |
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
@@ -309,9 +324,10 @@ cleanup. Borrowed GPU locks are acquired and released on their owning thread;
 contention is probed from another thread. Test-side failure must settle
 pending readers before runtime teardown. Physical lifecycle, inventory,
 frame identity, patch counts, and rendered samples keep independent assertions.
-Missing, mismatched, duplicate, or reordered evidence is not replaced by
-inference from another artifact. An expired deadline or incomplete final drain
-cannot count as a passing scenario.
+Missing, mismatched, duplicate, or causally invalid evidence is not replaced by
+inference from another artifact. Exact draw identities allow valid non-FIFO
+completion while final release still requires every encoded reader to settle.
+An expired deadline or incomplete final drain cannot count as a passing scenario.
 
 Record the executed target/filter, package/build identity, assertions,
 terminal status, and hardware skips in the run's evidence under

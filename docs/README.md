@@ -14,13 +14,14 @@
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
   generated boundaries, frontend components, and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
-  formats, independent annotation input, command settlement, exact displayed
-  geometry, direct/copy acquisition, redraws, and physical resource lifetime.
+  formats, shared immediate mouse input, native command settlement, paired image
+  geometry, direct/copy acquisition, retained redraws, FPS, and resource lifetime.
 
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations, the compiled
-  binary format, loading, batch leases, and retained Explore thumbnails/atlases.
+  binary format, loading, batch leases, and Explore thumbnail/atlas retention
+  through viewport and augmentation changes.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, Vulkan allocation and CUDA import, provider capture, and
   capability inspection.

@@ -71,8 +71,9 @@ NUMA transfer trace. See [logging](logging.md) for joining captured identities.
 
 ## Shared-workspace interoperability
 
-Firefox allocates a linear Vulkan `R8G8B8A8_UNORM` image and one independent
-device-memory allocation per physical workspace slot. It exports opaque
+Firefox supplies two persistent foreground display slots, each with a linear
+Vulkan `R8G8B8A8_UNORM` image and independent device-memory allocation. These
+are separate from retained raw-product pools. It exports opaque
 memory and timeline-semaphore file descriptors over the existing `SCM_RIGHTS`
 channel. Native CUDA imports them on the matching device and writes a pitched
 linear image view. This is separate from CUDA DMA-BUF CPU mapping for GDRCopy
@@ -97,7 +98,8 @@ Native producer requests capacity on the browser's rendering device
     → Firefox completes initial external ownership and exports memory/timeline FDs
     → native producer execution owner imports the full allocation into CUDA
     → producer fills/finalizes it from authoritative raw data
-    → Presentation offers the exact completed workspace for browser acquisition
+    → Presentation publishes the completed image and paired opaque metadata
+    → the stable browser binding acquires the latest completed image locally
 ```
 
 The initial `UNDEFINED` transition occurs before producer filling. It cannot
@@ -117,6 +119,12 @@ Release frees the mapped base, destroys external memory, and only then releases
 backing and context custody. Allocation size, image offset, dedicated flags,
 and Vulkan alignment are distinct facts; CUDA VMM granularity is not mapping
 metadata for this path.
+
+Owner-thread completion, settlement, and cancelled writes wake display
+availability after releasing the workspace lock, only when physical storage
+is available. A held display read keeps its custody through these notifications.
+The next dirty render or pending admission resumes on that real availability
+edge.
 
 The independent backing reference survives browser resource retirement,
 replacement, and exporter process exit while native aliases or GPU work remain.
