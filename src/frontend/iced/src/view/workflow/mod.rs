@@ -39,7 +39,8 @@ const AUDIT_REGIONS: [Region; 8] = [
     Region::Status,
 ];
 pub fn ordinary_pages() -> impl Iterator<Item = crate::generated::FeatureId> {
-    crate::view::navigation::ORDER.into_iter()
+    crate::view::navigation::ORDER
+        .into_iter()
         .filter(|page| *page != crate::generated::FeatureId::Explore)
 }
 
@@ -334,7 +335,11 @@ mod tests {
             assert_eq!(layout.setup_width, width * 0.19);
             assert_eq!(layout.workspace_width, width * 0.62);
             assert_eq!(layout.diagnostics_width, width * 0.19);
-            assert!((layout.setup_width + layout.workspace_width + layout.diagnostics_width - width).abs() < 0.001);
+            assert!(
+                (layout.setup_width + layout.workspace_width + layout.diagnostics_width - width)
+                    .abs()
+                    < 0.001
+            );
         }
         let composition = Composition::new(crate::generated::FeatureId::Train, 1200.0);
         assert_eq!(
@@ -365,9 +370,15 @@ mod tests {
         assert_eq!(ordinary_pages().count(), 6);
         let pages = ordinary_pages().collect::<Vec<_>>();
         for (index, page) in pages.iter().enumerate() {
-            assert_eq!(Composition::new(*page, 1020.0).next_ordinary_page(), pages.get(index + 1).copied());
+            assert_eq!(
+                Composition::new(*page, 1020.0).next_ordinary_page(),
+                pages.get(index + 1).copied()
+            );
         }
-        assert_eq!(Composition::new(crate::generated::FeatureId::Explore, 1020.0).next_ordinary_page(), None);
+        assert_eq!(
+            Composition::new(crate::generated::FeatureId::Explore, 1020.0).next_ordinary_page(),
+            None
+        );
         for page in ordinary_pages() {
             assert_ne!(page, crate::generated::FeatureId::Explore);
             let composition = Composition::new(page, 1200.0);

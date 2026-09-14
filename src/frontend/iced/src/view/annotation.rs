@@ -193,10 +193,8 @@ impl Component {
             surface.fit_revision = surface.fit_revision.wrapping_add(self.fit_revision);
             surface
         });
-        let composition = crate::view::workflow::Composition::new(
-            crate::generated::FeatureId::Annotate,
-            width,
-        );
+        let composition =
+            crate::view::workflow::Composition::new(crate::generated::FeatureId::Annotate, width);
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
         let settings_settled = !settings.has_local_edits();
         let draft = settings

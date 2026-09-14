@@ -320,7 +320,8 @@ pub(super) fn view<'a>(
                 column![
                     labeled_number(
                         "First compiled index",
-                        crate::generated::constraint_workflowsexploremincompiledindex().stable_field_id,
+                        crate::generated::constraint_workflowsexploremincompiledindex()
+                            .stable_field_id,
                         filter
                             .as_ref()
                             .map_or(0, |request| request.filter.minimumcompiledindex)
@@ -331,7 +332,8 @@ pub(super) fn view<'a>(
                     ),
                     labeled_number(
                         "Last compiled index",
-                        crate::generated::constraint_workflowsexploremaxcompiledindex().stable_field_id,
+                        crate::generated::constraint_workflowsexploremaxcompiledindex()
+                            .stable_field_id,
                         filter
                             .as_ref()
                             .map_or(last_compiled_index, |request| request
@@ -511,12 +513,7 @@ fn instance_number<'a>(
     } else {
         text("Available after Explore is ready").size(11).into()
     };
-    column![
-        text(label),
-        input,
-    ]
-    .spacing(3)
-    .into()
+    column![text(label), input,].spacing(3).into()
 }
 
 fn source_label(source: crate::generated::ExploreDatasetSource) -> &'static str {
@@ -617,13 +614,22 @@ mod tests {
         let mut model = ready_explore_model();
         let state = super::super::state::State::default();
         for value in [(1_u64 << 53) + 1, u64::MAX - 1, u64::MAX] {
-            for message in [Message::ShuffleSeedChanged(value), Message::MaximumCompiledIndexChanged(value)] {
-                let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, message.clone()).unwrap()
-                else { panic!("typed filter request"); };
-                assert_eq!(match message {
-                    Message::ShuffleSeedChanged(_) => request.filter.shuffleseed,
-                    _ => request.filter.maximumcompiledindex,
-                }, value);
+            for message in [
+                Message::ShuffleSeedChanged(value),
+                Message::MaximumCompiledIndexChanged(value),
+            ] {
+                let Outcome::FilterEdited(request) =
+                    update(&state, &model, &mut settings, message.clone()).unwrap()
+                else {
+                    panic!("typed filter request");
+                };
+                assert_eq!(
+                    match message {
+                        Message::ShuffleSeedChanged(_) => request.filter.shuffleseed,
+                        _ => request.filter.maximumcompiledindex,
+                    },
+                    value
+                );
             }
         }
         model.snapshot.as_mut().unwrap().filter.minimuminstances = 4;
@@ -634,12 +640,28 @@ mod tests {
             (Message::MinimumInstancesChanged(0), 0, 8),
             (Message::MaximumInstancesChanged(10_000), 4, 10_000),
         ] {
-            let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, message).unwrap()
-            else { panic!("typed filter request"); };
-            assert_eq!((request.filter.minimuminstances, request.filter.maximuminstances), (minimum, maximum));
+            let Outcome::FilterEdited(request) =
+                update(&state, &model, &mut settings, message).unwrap()
+            else {
+                panic!("typed filter request");
+            };
+            assert_eq!(
+                (
+                    request.filter.minimuminstances,
+                    request.filter.maximuminstances
+                ),
+                (minimum, maximum)
+            );
         }
-        let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, Message::UnlimitedCompiledIndex).unwrap()
-        else { panic!("typed filter request"); };
+        let Outcome::FilterEdited(request) = update(
+            &state,
+            &model,
+            &mut settings,
+            Message::UnlimitedCompiledIndex,
+        )
+        .unwrap() else {
+            panic!("typed filter request");
+        };
         assert_eq!(request.filter.maximumcompiledindex, u64::MAX);
     }
 

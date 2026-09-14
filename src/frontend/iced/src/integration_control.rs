@@ -323,9 +323,15 @@ pub enum Message {
     Advance,
     NumberWheelDelivered,
     NumberInvalidDelivered,
-    NumberClipboardPrepared { revision: u64, result: Result<(), iced::clipboard::Error> },
+    NumberClipboardPrepared {
+        revision: u64,
+        result: Result<(), iced::clipboard::Error>,
+    },
     NumberPasteDelivered(bool),
-    NumberPasteRead { target: String, result: Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error> },
+    NumberPasteRead {
+        target: String,
+        result: Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error>,
+    },
     GalleryMouseDelivered,
     UpscalePixels {
         source: u64,
@@ -902,40 +908,73 @@ fn reveal_axis(start: f32, size: f32, viewport_start: f32, viewport_size: f32) -
 #[derive(Debug, Clone, Copy)]
 enum AnnotationReveal {
     Control,
-    Tail { count: usize, narrow: bool },
+    Tail {
+        count: usize,
+        narrow: bool,
+    },
     Geometry,
-    Source { extent: [f32; 2], region: Rectangle, margin: f32 },
+    Source {
+        extent: [f32; 2],
+        region: Rectangle,
+        margin: f32,
+    },
 }
 
 fn contains_rectangle(outer: Rectangle, inner: Rectangle) -> bool {
-    outer.width > 0.0 && outer.height > 0.0 && inner.width > 0.0 && inner.height > 0.0
-        && inner.x >= outer.x - 0.01 && inner.y >= outer.y - 0.01
+    outer.width > 0.0
+        && outer.height > 0.0
+        && inner.width > 0.0
+        && inner.height > 0.0
+        && inner.x >= outer.x - 0.01
+        && inner.y >= outer.y - 0.01
         && inner.x + inner.width <= outer.x + outer.width + 0.01
         && inner.y + inner.height <= outer.y + outer.height + 0.01
 }
 
 impl ControlBounds {
     fn visible(self) -> Option<Rectangle> {
-        self.target.intersection(&self.page)?.intersection(&self.horizontal)
+        self.target
+            .intersection(&self.page)?
+            .intersection(&self.horizontal)
             .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
     }
 
     fn requested(self, reveal: AnnotationReveal) -> Option<Rectangle> {
-        if self.page.width <= 0.0 || self.page.height <= 0.0
-            || self.horizontal.width <= 0.0 || self.horizontal.height <= 0.0
-            || self.target.width <= 0.0 || self.target.height <= 0.0 {
+        if self.page.width <= 0.0
+            || self.page.height <= 0.0
+            || self.horizontal.width <= 0.0
+            || self.horizontal.height <= 0.0
+            || self.target.width <= 0.0
+            || self.target.height <= 0.0
+        {
             return None;
         }
         Some(match reveal {
             AnnotationReveal::Control | AnnotationReveal::Tail { .. } => self.target,
             // Metadata-only inspection has no click or pixel sample.
-            AnnotationReveal::Geometry => Rectangle { width: 1.0, height: 1.0, ..self.target },
-            AnnotationReveal::Source { extent, region, margin } => {
-                if extent[0] <= 0.0 || extent[1] <= 0.0 { return None; }
+            AnnotationReveal::Geometry => Rectangle {
+                width: 1.0,
+                height: 1.0,
+                ..self.target
+            },
+            AnnotationReveal::Source {
+                extent,
+                region,
+                margin,
+            } => {
+                if extent[0] <= 0.0 || extent[1] <= 0.0 {
+                    return None;
+                }
                 let scale = (self.target.width / extent[0]).min(self.target.height / extent[1]);
                 Rectangle {
-                    x: self.target.x + (self.target.width - extent[0] * scale) * 0.5 + region.x * scale - margin,
-                    y: self.target.y + (self.target.height - extent[1] * scale) * 0.5 + region.y * scale - margin,
+                    x: self.target.x
+                        + (self.target.width - extent[0] * scale) * 0.5
+                        + region.x * scale
+                        - margin,
+                    y: self.target.y
+                        + (self.target.height - extent[1] * scale) * 0.5
+                        + region.y * scale
+                        - margin,
                     width: region.width * scale + 2.0 * margin,
                     height: region.height * scale + 2.0 * margin,
                 }
@@ -946,45 +985,81 @@ impl ControlBounds {
 
 fn scroll_control_into_view(control: String, reveal: AnnotationReveal) -> Task<RootMessage> {
     measure_control(control).then(move |bounds| {
-        let Some(target) = bounds.requested(reveal) else { return Task::none(); };
-        let x = reveal_axis(target.x, target.width, bounds.horizontal.x, bounds.horizontal.width);
+        let Some(target) = bounds.requested(reveal) else {
+            return Task::none();
+        };
+        let x = reveal_axis(
+            target.x,
+            target.width,
+            bounds.horizontal.x,
+            bounds.horizontal.width,
+        );
         let y = reveal_axis(target.y, target.height, bounds.page.y, bounds.page.height);
-        iced::widget::operation::scroll_by(crate::view::PAGE_SCROLL_ID,
-            AbsoluteOffset { x: 0.0, y })
-            .chain(iced::widget::operation::scroll_by(crate::view::HORIZONTAL_SCROLL_ID,
-                AbsoluteOffset { x, y: 0.0 }))
+        iced::widget::operation::scroll_by(
+            crate::view::PAGE_SCROLL_ID,
+            AbsoluteOffset { x: 0.0, y },
+        )
+        .chain(iced::widget::operation::scroll_by(
+            crate::view::HORIZONTAL_SCROLL_ID,
+            AbsoluteOffset { x, y: 0.0 },
+        ))
     })
 }
 
 fn reveal_control(control: String, generation: u64, reveal: AnnotationReveal) -> Task<RootMessage> {
     measure_control(control.clone()).then(move |before| {
         let control = control.clone();
-        scroll_control_into_view(control.clone(), reveal).chain(measure_control(control.clone()).map(move |bounds| {
-            let viewport = bounds.page.intersection(&bounds.horizontal);
-            let verified = bounds.visible().is_some() && viewport.zip(bounds.requested(reveal))
-                .is_some_and(|(viewport, requested)| contains_rectangle(viewport, requested));
-            let tail_verified = if let AnnotationReveal::Tail { count, narrow } = reveal {
-                let before_viewport = before.page.intersection(&before.horizontal);
-                let offscreen_gap = before_viewport.map_or(-1.0, |viewport| before.target.y - viewport.y - viewport.height);
-                let valid = count >= 32 && offscreen_gap > 0.0 && verified;
-                if let Some(viewport) = viewport.filter(|_| valid) {
-                    reporting::emit(|sink| sink.record("integration.annotation_tail", &control,
-                        if narrow { "narrow" } else { "wide" },
-                        [count as f64, f64::from(offscreen_gap), f64::from(bounds.target.y - viewport.y),
-                            f64::from(viewport.y + viewport.height - bounds.target.y - bounds.target.height)]));
-                }
-                valid
-            } else { true };
-            RootMessage::Integration(Message::Scoped {
-                generation,
-                receipt: None,
-                message: Box::new(Message::Located {
-                    control: control.clone(),
-                    // Source conversion always retains full surface geometry.
-                    bounds: if verified && tail_verified { bounds.target } else { Rectangle::default() },
-                }),
-            })
-        }))
+        scroll_control_into_view(control.clone(), reveal).chain(
+            measure_control(control.clone()).map(move |bounds| {
+                let viewport = bounds.page.intersection(&bounds.horizontal);
+                let verified = bounds.visible().is_some()
+                    && viewport.zip(bounds.requested(reveal)).is_some_and(
+                        |(viewport, requested)| contains_rectangle(viewport, requested),
+                    );
+                let tail_verified = if let AnnotationReveal::Tail { count, narrow } = reveal {
+                    let before_viewport = before.page.intersection(&before.horizontal);
+                    let offscreen_gap = before_viewport.map_or(-1.0, |viewport| {
+                        before.target.y - viewport.y - viewport.height
+                    });
+                    let valid = count >= 32 && offscreen_gap > 0.0 && verified;
+                    if let Some(viewport) = viewport.filter(|_| valid) {
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.annotation_tail",
+                                &control,
+                                if narrow { "narrow" } else { "wide" },
+                                [
+                                    count as f64,
+                                    f64::from(offscreen_gap),
+                                    f64::from(bounds.target.y - viewport.y),
+                                    f64::from(
+                                        viewport.y + viewport.height
+                                            - bounds.target.y
+                                            - bounds.target.height,
+                                    ),
+                                ],
+                            )
+                        });
+                    }
+                    valid
+                } else {
+                    true
+                };
+                RootMessage::Integration(Message::Scoped {
+                    generation,
+                    receipt: None,
+                    message: Box::new(Message::Located {
+                        control: control.clone(),
+                        // Source conversion always retains full surface geometry.
+                        bounds: if verified && tail_verified {
+                            bounds.target
+                        } else {
+                            Rectangle::default()
+                        },
+                    }),
+                })
+            }),
+        )
     })
 }
 
@@ -1698,7 +1773,12 @@ impl AtlasDraw {
 
 #[cfg(target_arch = "wasm32")]
 fn atlas_resize_dimensions(step: u8) -> (f64, f64) {
-    [(1200.0, 850.0), (1000.0, 1020.0), (1300.0, 760.0), (1500.0, 600.0)][step as usize]
+    [
+        (1200.0, 850.0),
+        (1000.0, 1020.0),
+        (1300.0, 760.0),
+        (1500.0, 600.0),
+    ][step as usize]
 }
 
 fn atlas_scroll_window(size: iced::Size, columns: u32) -> (u32, f32) {
@@ -2275,7 +2355,8 @@ fn replace_number_input(bounds: Rectangle, value: &str, selection_length: usize)
 
 #[cfg(target_arch = "wasm32")]
 fn paste_number_input(bounds: Rectangle) -> bool {
-    let Some(mut output) = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone()) else {
+    let Some(mut output) = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+    else {
         return false;
     };
     let completed = wasm_bindgen::closure::Closure::once_into_js(move |delivered: bool| {
@@ -2319,7 +2400,11 @@ fn click_after_surface_draw(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CopyScaleStage { Wide, Narrow, Restore }
+enum CopyScaleStage {
+    Wide,
+    Narrow,
+    Restore,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
@@ -2447,9 +2532,18 @@ enum Phase {
     ExploreDatasetPane,
     ExploreDetailsPane,
     ExploreNumericStart(u8),
-    ExploreNumericControl { index: u8, step: u8 },
-    ExploreNumericReveal { index: u8, step: u8 },
-    AwaitExploreNumeric { index: u8, step: u8 },
+    ExploreNumericControl {
+        index: u8,
+        step: u8,
+    },
+    ExploreNumericReveal {
+        index: u8,
+        step: u8,
+    },
+    AwaitExploreNumeric {
+        index: u8,
+        step: u8,
+    },
     AwaitExploreNumericWheel(u8),
     AwaitExploreNumericInvalid(u8),
     AwaitExploreClipboard(u64),
@@ -2600,7 +2694,10 @@ enum Phase {
         index: u16,
     },
     CopyLayout(u8),
-    CopyListSetup { stage: u8, revision: u64 },
+    CopyListSetup {
+        stage: u8,
+        revision: u64,
+    },
     CopySwatchWait,
     CopyCapability,
     CopyCapabilityWait,
@@ -2776,11 +2873,21 @@ fn region_id(page: FeatureId, index: usize) -> &'static str {
 
 fn explore_integer_id(index: u8) -> String {
     match index {
-        0 => crate::generated::constraint_workflowsexploremininstances().stable_field_id.to_string(),
-        1 => crate::generated::constraint_workflowsexploremaxinstances().stable_field_id.to_string(),
-        2 => crate::generated::constraint_workflowsexploreshuffleseed().stable_field_id.to_string(),
-        3 => crate::generated::constraint_workflowsexploremincompiledindex().stable_field_id.to_string(),
-        4 => crate::generated::constraint_workflowsexploremaxcompiledindex().stable_field_id.to_string(),
+        0 => crate::generated::constraint_workflowsexploremininstances()
+            .stable_field_id
+            .to_string(),
+        1 => crate::generated::constraint_workflowsexploremaxinstances()
+            .stable_field_id
+            .to_string(),
+        2 => crate::generated::constraint_workflowsexploreshuffleseed()
+            .stable_field_id
+            .to_string(),
+        3 => crate::generated::constraint_workflowsexploremincompiledindex()
+            .stable_field_id
+            .to_string(),
+        4 => crate::generated::constraint_workflowsexploremaxcompiledindex()
+            .stable_field_id
+            .to_string(),
         _ => unreachable!("five Explore integer fields"),
     }
 }
@@ -2788,7 +2895,11 @@ fn explore_integer_id(index: u8) -> String {
 fn explore_seed_target(baseline: u64) -> u64 {
     const PRIMARY: u64 = (1_u64 << 53) + 1;
     const ALTERNATE: u64 = (1_u64 << 53) + 3;
-    if baseline == PRIMARY { ALTERNATE } else { PRIMARY }
+    if baseline == PRIMARY {
+        ALTERNATE
+    } else {
+        PRIMARY
+    }
 }
 
 fn explore_integer_value(snapshot: &crate::generated::ExploreSnapshot, index: u8) -> u64 {
@@ -2937,7 +3048,11 @@ fn same_numeric_value(left: f64, right: f64) -> bool {
     (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0
 }
 
-fn annotation_layout_scale(current_scale: f32, logical_width: f32, narrow: bool) -> Result<f32, &'static str> {
+fn annotation_layout_scale(
+    current_scale: f32,
+    logical_width: f32,
+    narrow: bool,
+) -> Result<f32, &'static str> {
     let constraint = crate::generated::constraint_uiuiscale();
     let (minimum, maximum) = constraint
         .minimum
@@ -2959,7 +3074,9 @@ fn annotation_layout_scale(current_scale: f32, logical_width: f32, narrow: bool)
     let unscaled_width = current_scale * logical_width;
     let target_width = crate::view::PAGE_MIN_WIDTH * if narrow { 0.98 } else { 1.1 };
     let scale = (unscaled_width / target_width).clamp(minimum, maximum);
-    if !unscaled_width.is_finite() || (unscaled_width / scale < crate::view::PAGE_MIN_WIDTH) != narrow {
+    if !unscaled_width.is_finite()
+        || (unscaled_width / scale < crate::view::PAGE_MIN_WIDTH) != narrow
+    {
         return Err("Native UI-scale bounds cannot reach the requested Annotation layout");
     }
     Ok(scale)
@@ -3141,9 +3258,10 @@ impl Controller {
                     iced::Subscription::none()
                 },
                 iced::event::listen_with(|event, _, _| match event {
-                    iced::Event::Clipboard(iced::advanced::clipboard::Event::Read { target: Some(target), result }) => {
-                        Some(Message::NumberPasteRead { target, result })
-                    }
+                    iced::Event::Clipboard(iced::advanced::clipboard::Event::Read {
+                        target: Some(target),
+                        result,
+                    }) => Some(Message::NumberPasteRead { target, result }),
                     iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => {
                         Some(Message::NumberWheelDelivered)
                     }
@@ -3702,72 +3820,85 @@ impl Controller {
 
     fn annotation_points(&self, width: f64, height: f64) -> [f64; 4] {
         self.copy_product_gesture.unwrap_or_else(|| {
-                        if let Some(object) = self
-                            .copy_before
-                            .as_ref()
-                            .filter(|_| self.viewer_scenario == "copy")
-                        {
-                            let b = &object.box_;
-                            let mut start = [
-                                f64::from((b.first.x + b.second.x) / 2.0),
-                                f64::from((b.first.y + b.second.y) / 2.0),
-                            ];
-                            if self.copy_step == 0 || self.copy_step == 3 {
-                                if let Some(run) = object.mask.runs.first() {
-                                    start = [
-                                        (f64::from(run.first) + f64::from(run.last)) / 2.0,
-                                        f64::from(run.row) + 0.5,
-                                    ];
-                                }
-                            }
-                            if self.copy_step == 2 {
-                                start = [
-                                    (f64::from(b.second.x) + 3.0).min(width - 1.0),
-                                    f64::from((b.first.y + b.second.y) / 2.0),
-                                ];
-                            }
-                            if self.copy_step == 1 {
-                                start = [f64::from(b.second.x), f64::from(b.second.y)];
-                            }
-                            [
-                                start[0],
-                                start[1],
-                                (start[0] + 8.0).min(width - 1.0),
-                                (start[1] + 8.0).min(height - 1.0),
-                            ]
-                        } else {
-                            let top = match self.copy_step {
-                                5 => 0.15,
-                                6 => 0.35,
-                                7 => 0.7,
-                                _ => 0.3,
-                            };
-                            let [x, y, ex, ey] = match self.copy_shape_points {
-                                0 => [0.25, top, 0.3, top + 0.05],
-                                1 => [0.6, top, 0.65, top + 0.05],
-                                _ => [0.45, 0.65, 0.5, 0.7],
-                            };
-                            [x * width, y * height, ex * width, ey * height]
-                        }
+            if let Some(object) = self
+                .copy_before
+                .as_ref()
+                .filter(|_| self.viewer_scenario == "copy")
+            {
+                let b = &object.box_;
+                let mut start = [
+                    f64::from((b.first.x + b.second.x) / 2.0),
+                    f64::from((b.first.y + b.second.y) / 2.0),
+                ];
+                if self.copy_step == 0 || self.copy_step == 3 {
+                    if let Some(run) = object.mask.runs.first() {
+                        start = [
+                            (f64::from(run.first) + f64::from(run.last)) / 2.0,
+                            f64::from(run.row) + 0.5,
+                        ];
+                    }
+                }
+                if self.copy_step == 2 {
+                    start = [
+                        (f64::from(b.second.x) + 3.0).min(width - 1.0),
+                        f64::from((b.first.y + b.second.y) / 2.0),
+                    ];
+                }
+                if self.copy_step == 1 {
+                    start = [f64::from(b.second.x), f64::from(b.second.y)];
+                }
+                [
+                    start[0],
+                    start[1],
+                    (start[0] + 8.0).min(width - 1.0),
+                    (start[1] + 8.0).min(height - 1.0),
+                ]
+            } else {
+                let top = match self.copy_step {
+                    5 => 0.15,
+                    6 => 0.35,
+                    7 => 0.7,
+                    _ => 0.3,
+                };
+                let [x, y, ex, ey] = match self.copy_shape_points {
+                    0 => [0.25, top, 0.3, top + 0.05],
+                    1 => [0.6, top, 0.65, top + 0.05],
+                    _ => [0.45, 0.65, 0.5, 0.7],
+                };
+                [x * width, y * height, ex * width, ey * height]
+            }
         })
     }
 
     fn annotation_reveal(&self, control: &str) -> AnnotationReveal {
         if matches!(self.phase, Phase::CopyLayout(2 | 3)) {
-            return AnnotationReveal::Tail { count: if matches!(self.phase, Phase::CopyLayout(2)) {
-                self.copy_layout_objects
-            } else { self.copy_layout_classes }, narrow: self.copy_narrow };
+            return AnnotationReveal::Tail {
+                count: if matches!(self.phase, Phase::CopyLayout(2)) {
+                    self.copy_layout_objects
+                } else {
+                    self.copy_layout_classes
+                },
+                narrow: self.copy_narrow,
+            };
         }
         if control != ANNOTATION_SURFACE {
-            return if control == ANNOTATION_SIDEBAR { AnnotationReveal::Geometry } else { AnnotationReveal::Control };
+            return if control == ANNOTATION_SIDEBAR {
+                AnnotationReveal::Geometry
+            } else {
+                AnnotationReveal::Control
+            };
         }
         if let Some(probe) = &self.annotation_probe {
             if let Some(pixel) = probe.pixels.chunks_exact(7).next() {
                 let radius = pixel[6] as f32;
                 return AnnotationReveal::Source {
                     extent: probe.extent.map(|value| value as f32),
-                    region: Rectangle { x: pixel[0] as f32 - radius, y: pixel[1] as f32 - radius,
-                        width: radius * 2.0, height: radius * 2.0 },
+                    region: Rectangle {
+                        x: pixel[0] as f32 - radius,
+                        y: pixel[1] as f32 - radius,
+                        width: radius * 2.0,
+                        height: radius * 2.0,
+                    },
                     margin: 2.0 / self.input_scale,
                 };
             }
@@ -3775,9 +3906,17 @@ impl Controller {
         if matches!(self.phase, Phase::AnnotationPointer(_)) {
             if let Some(frame) = self.annotation_frame_ready {
                 let extent = [frame.content_width as f32, frame.content_height as f32];
-                let [x, y, ex, ey] = self.annotation_points(f64::from(extent[0]), f64::from(extent[1])).map(|value| value as f32);
-                return AnnotationReveal::Source { extent,
-                    region: Rectangle { x: x.min(ex), y: y.min(ey), width: (ex-x).abs(), height: (ey-y).abs() },
+                let [x, y, ex, ey] = self
+                    .annotation_points(f64::from(extent[0]), f64::from(extent[1]))
+                    .map(|value| value as f32);
+                return AnnotationReveal::Source {
+                    extent,
+                    region: Rectangle {
+                        x: x.min(ex),
+                        y: y.min(ey),
+                        width: (ex - x).abs(),
+                        height: (ey - y).abs(),
+                    },
                     margin: 1.0 / self.input_scale,
                 };
             }
@@ -3785,29 +3924,62 @@ impl Controller {
         AnnotationReveal::Geometry
     }
 
-    fn copy_scale_transition(&mut self, model: &ApplicationModel, applied_scale: f32, stage: CopyScaleStage) -> Task<RootMessage> {
-        let scale = if stage == CopyScaleStage::Restore { self.copy_original_scale } else {
-            match annotation_layout_scale(applied_scale, model.window_width as f32, stage == CopyScaleStage::Narrow) {
+    fn copy_scale_transition(
+        &mut self,
+        model: &ApplicationModel,
+        applied_scale: f32,
+        stage: CopyScaleStage,
+    ) -> Task<RootMessage> {
+        let scale = if stage == CopyScaleStage::Restore {
+            self.copy_original_scale
+        } else {
+            match annotation_layout_scale(
+                applied_scale,
+                model.window_width as f32,
+                stage == CopyScaleStage::Narrow,
+            ) {
                 Ok(value) => value,
-                Err(detail) => { self.fail(detail); return Task::none(); }
+                Err(detail) => {
+                    self.fail(detail);
+                    return Task::none();
+                }
             }
         };
         let unchanged = same_numeric_value(f64::from(scale), f64::from(applied_scale));
-        let revision = model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision);
-        self.settings_revision = if unchanged { revision.saturating_sub(1) } else { revision };
+        let revision = model
+            .settings_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.revision);
+        self.settings_revision = if unchanged {
+            revision.saturating_sub(1)
+        } else {
+            revision
+        };
         self.copy_requested_scale = scale;
         self.phase = Phase::CopyAwaitScale(stage);
-        if unchanged { return self.advance_to(self.phase.clone()); }
-        Task::done(RootMessage::Settings(crate::view::settings::Message::UiScaleChanged(scale)))
-            .chain(Task::done(RootMessage::Settings(crate::view::settings::Message::UiScaleReleased)))
+        if unchanged {
+            return self.advance_to(self.phase.clone());
+        }
+        Task::done(RootMessage::Settings(
+            crate::view::settings::Message::UiScaleChanged(scale),
+        ))
+        .chain(Task::done(RootMessage::Settings(
+            crate::view::settings::Message::UiScaleReleased,
+        )))
     }
 
     fn copy_layout_control(&self, step: u8) -> String {
         match step {
             0 => "workflow.workspace_and_advanced".into(),
             1 => "workflow.diagnostics".into(),
-            2 => format!("annotation.object.{}", self.copy_layout_objects.saturating_sub(1)),
-            3 => format!("annotation.class.{}", self.copy_layout_classes.saturating_sub(1)),
+            2 => format!(
+                "annotation.object.{}",
+                self.copy_layout_objects.saturating_sub(1)
+            ),
+            3 => format!(
+                "annotation.class.{}",
+                self.copy_layout_classes.saturating_sub(1)
+            ),
             4 => VIEWER_SAVE.into(),
             5 => ANNOTATION_TIMELINE.into(),
             6 => ANNOTATION_STOP.into(),
@@ -3822,7 +3994,11 @@ impl Controller {
         self.location_pending = true;
         let control = control.into();
         if control.starts_with("annotation.") {
-            reveal_control(control.clone(), self.generation, self.annotation_reveal(&control))
+            reveal_control(
+                control.clone(),
+                self.generation,
+                self.annotation_reveal(&control),
+            )
         } else {
             locate(control, self.generation)
         }
@@ -3843,9 +4019,14 @@ impl Controller {
             let task = reveal_control(control.clone(), self.generation, reveal);
             if matches!(reveal, AnnotationReveal::Tail { .. }) {
                 iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, RelativeOffset::START)
-                    .chain(iced::widget::operation::snap_to(crate::view::HORIZONTAL_SCROLL_ID, RelativeOffset::START))
+                    .chain(iced::widget::operation::snap_to(
+                        crate::view::HORIZONTAL_SCROLL_ID,
+                        RelativeOffset::START,
+                    ))
                     .chain(task)
-            } else { task }
+            } else {
+                task
+            }
         } else {
             iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
                 .chain(locate(control, self.generation))
@@ -4231,7 +4412,9 @@ impl Controller {
                 if self.phase == Phase::AwaitExploreClipboard(revision) {
                     match result {
                         Ok(()) => self.phase = Phase::ExploreNumericControl { index: 2, step: 6 },
-                        Err(error) => self.fail_detail(|| format!("Explore clipboard preparation failed: {error:?}").into()),
+                        Err(error) => self.fail_detail(|| {
+                            format!("Explore clipboard preparation failed: {error:?}").into()
+                        }),
                     }
                 }
                 return None;
@@ -4241,10 +4424,16 @@ impl Controller {
                     && target == explore_integer_id(2)
                 {
                     match result {
-                        Ok(content) if matches!(content.as_ref(), iced::clipboard::Content::Text(text)
-                            if text == &self.explore_integer_target.to_string()) => self.explore_paste_read = true,
+                        Ok(content)
+                            if matches!(content.as_ref(), iced::clipboard::Content::Text(text)
+                            if text == &self.explore_integer_target.to_string()) =>
+                        {
+                            self.explore_paste_read = true
+                        }
                         Ok(_) => self.fail("Explore paste read different clipboard contents"),
-                        Err(error) => self.fail_detail(|| format!("Explore clipboard read failed: {error:?}").into()),
+                        Err(error) => self.fail_detail(|| {
+                            format!("Explore clipboard read failed: {error:?}").into()
+                        }),
                     }
                 }
                 return None;
@@ -4348,7 +4537,8 @@ impl Controller {
                             self.copy_swatch_ready = true;
                         } else {
                             self.annotation_pixel_progress.1 += 1;
-                            if self.annotation_pixel_progress.1 >= self.annotation_pixel_progress.2 {
+                            if self.annotation_pixel_progress.1 >= self.annotation_pixel_progress.2
+                            {
                                 self.annotation_pixels_receipt = request_receipt;
                             }
                         }
@@ -4632,7 +4822,9 @@ impl Controller {
                     && (bounds.y - image.y).abs() <= 1.0
                     && page.horizontal_overflow == self.copy_narrow;
                 if !valid {
-                    self.fail("Annotation must retain shared columns with narrow horizontal overflow");
+                    self.fail(
+                        "Annotation must retain shared columns with narrow horizontal overflow",
+                    );
                     return None;
                 }
                 reporting::emit(|sink| {
@@ -4640,19 +4832,31 @@ impl Controller {
                         "integration.annotation_layout",
                         "workflow.diagnostics",
                         if self.copy_narrow { "narrow" } else { "wide" },
-                        [f64::from(image.width), f64::from(bounds.width),
-                            f64::from(page.page_width), f64::from(self.copy_viewport_width)],
+                        [
+                            f64::from(image.width),
+                            f64::from(bounds.width),
+                            f64::from(page.page_width),
+                            f64::from(self.copy_viewport_width),
+                        ],
                     )
                 });
                 self.phase = Phase::CopyLayout(2);
                 None
             }
             Phase::CopyLayout(step @ 2..=6) => {
-                reporting::emit(|sink| sink.record(
-                    "integration.annotation_reachable", &control,
-                    if self.copy_narrow { "narrow" } else { "wide" },
-                    [f64::from(bounds.x), f64::from(bounds.y), f64::from(bounds.width), f64::from(bounds.height)],
-                ));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.annotation_reachable",
+                        &control,
+                        if self.copy_narrow { "narrow" } else { "wide" },
+                        [
+                            f64::from(bounds.x),
+                            f64::from(bounds.y),
+                            f64::from(bounds.width),
+                            f64::from(bounds.height),
+                        ],
+                    )
+                });
                 self.phase = Phase::CopyLayout(step + 1);
                 None
             }
@@ -5008,7 +5212,8 @@ impl Controller {
                 self.phase = Phase::ExploreNumericStart(0);
                 None
             }
-            Phase::ExploreNumericControl { index, step } | Phase::ExploreNumericReveal { index, step } => {
+            Phase::ExploreNumericControl { index, step }
+            | Phase::ExploreNumericReveal { index, step } => {
                 let Some(pane) = self.explore_dataset_pane else {
                     self.fail("Explore numeric input has no sidebar bounds");
                     return None;
@@ -5166,7 +5371,10 @@ impl Controller {
                 }
                 None
             }
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => {
+            Phase::ViewerSelect
+            | Phase::AtlasReturnSelect
+            | Phase::AtlasResizeSelect(_)
+            | Phase::AtlasAwaySelect(_) => {
                 let resizing = match self.phase {
                     Phase::AtlasResizeSelect(step) => Some(step),
                     _ => None,
@@ -5542,7 +5750,8 @@ impl Controller {
         }));
         if reveal_annotation {
             // Restore both axes before waiting for a completed canvas draw.
-            scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry).chain(continuation)
+            scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry)
+                .chain(continuation)
         } else {
             continuation
         }
@@ -7233,40 +7442,79 @@ impl Controller {
             Phase::ExploreDatasetPane => self.arm(EXPLORE_DATASET_PANE),
             Phase::ExploreDetailsPane => self.arm(EXPLORE_DETAILS_PANE),
             Phase::ExploreNumericStart(index) => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                if !model.explore_mutation_available() || settings.has_local_edits() || model.has_explore_pending() {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if !model.explore_mutation_available()
+                    || settings.has_local_edits()
+                    || model.has_explore_pending()
+                {
                     return Task::none();
                 }
                 if index == 5 {
                     self.phase = Phase::ExplorePolicyOrderReady;
-                    return iced::widget::operation::snap_to(explore::DATASET_SCROLL_ID, RelativeOffset::START);
+                    return iced::widget::operation::snap_to(
+                        explore::DATASET_SCROLL_ID,
+                        RelativeOffset::START,
+                    );
                 }
                 let value = explore_integer_value(snapshot, index);
                 self.explore_integer_baseline = value;
                 self.explore_integer_target = match index {
-                    0 => if value == 0 { 1 } else { 0 },
-                    1 => if value == 10_000 { 9_999 } else { 10_000 },
+                    0 => {
+                        if value == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    1 => {
+                        if value == 10_000 {
+                            9_999
+                        } else {
+                            10_000
+                        }
+                    }
                     2 => explore_seed_target(value),
-                    3 => if value == 0 { 1 } else { 0 },
-                    _ => value.min(u64::from(snapshot.dataset.imagecount.saturating_sub(1))).saturating_sub(1),
+                    3 => {
+                        if value == 0 {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    _ => value
+                        .min(u64::from(snapshot.dataset.imagecount.saturating_sub(1)))
+                        .saturating_sub(1),
                 };
                 self.explore_integer_revision = snapshot.revision;
                 self.phase = Phase::ExploreNumericControl { index, step: 0 };
                 self.arm(explore_integer_id(index))
             }
             Phase::ExploreNumericControl { index, .. } => self.arm(explore_integer_id(index)),
-            Phase::ExploreNumericReveal { index, .. } => self.arm_revealed(explore::DATASET_SCROLL_ID, explore_integer_id(index)),
+            Phase::ExploreNumericReveal { index, .. } => {
+                self.arm_revealed(explore::DATASET_SCROLL_ID, explore_integer_id(index))
+            }
             Phase::AwaitExploreNumeric { index, step } => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                if snapshot.busy || model.has_explore_pending() { return Task::none(); }
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.busy || model.has_explore_pending() {
+                    return Task::none();
+                }
                 let value = explore_integer_value(snapshot, index);
                 if step < 3 {
                     if value != self.explore_integer_baseline {
                         self.fail("Explore integer changed from an edge click or wheel");
                         return Task::none();
                     }
-                    if step == 2 { self.numeric_replacement = "x".to_owned(); }
-                    self.phase = Phase::ExploreNumericControl { index, step: step + 1 };
+                    if step == 2 {
+                        self.numeric_replacement = "x".to_owned();
+                    }
+                    self.phase = Phase::ExploreNumericControl {
+                        index,
+                        step: step + 1,
+                    };
                     return self.arm(explore_integer_id(index));
                 }
                 if step == 3 {
@@ -7278,19 +7526,39 @@ impl Controller {
                     self.phase = Phase::ExploreNumericControl { index, step: 4 };
                     return self.arm(explore_integer_id(index));
                 }
-                let expected = if step == 4 || step == 6 { self.explore_integer_target } else { self.explore_integer_baseline };
-                if value != expected || snapshot.revision <= self.explore_integer_revision
+                let expected = if step == 4 || step == 6 {
+                    self.explore_integer_target
+                } else {
+                    self.explore_integer_baseline
+                };
+                if value != expected
+                    || snapshot.revision <= self.explore_integer_revision
                     || !explore_integer_persisted(model, index, expected)
                     || (step == 6 && !self.explore_paste_read)
-                { return Task::none(); }
+                {
+                    return Task::none();
+                }
                 if step == 4 {
-                    reporting::emit(|sink| sink.record("integration.explore_integer", &explore_integer_id(index),
-                        &value.to_string(), [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_integer",
+                            &explore_integer_id(index),
+                            &value.to_string(),
+                            [
+                                self.explore_integer_revision as f64,
+                                snapshot.revision as f64,
+                                1.0,
+                                1.0,
+                            ],
+                        )
+                    });
                     self.explore_integer_revision = snapshot.revision;
                     self.numeric_replacement = self.explore_integer_baseline.to_string();
                     if index == 4 && self.explore_integer_baseline == u64::MAX {
                         self.phase = Phase::AwaitExploreNumeric { index, step: 5 };
-                        return explore_message(explore::Message::Dataset(explore::dataset::Message::UnlimitedCompiledIndex));
+                        return explore_message(explore::Message::Dataset(
+                            explore::dataset::Message::UnlimitedCompiledIndex,
+                        ));
                     }
                     self.phase = Phase::ExploreNumericControl { index, step: 5 };
                     self.arm(explore_integer_id(index))
@@ -7300,23 +7568,43 @@ impl Controller {
                     // may consume them through its ordinary paste shortcut.
                     self.explore_paste_read = false;
                     self.explore_integer_revision = snapshot.revision;
-                    reporting::emit(|sink| sink.record("integration.explore_integer_paste_baseline",
-                        &explore_integer_id(index), &value.to_string(),
-                        [snapshot.revision as f64, 0.0, 1.0, 1.0]));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_integer_paste_baseline",
+                            &explore_integer_id(index),
+                            &value.to_string(),
+                            [snapshot.revision as f64, 0.0, 1.0, 1.0],
+                        )
+                    });
                     self.phase = Phase::AwaitExploreClipboard(snapshot.revision);
                     let generation = self.generation;
                     let revision = snapshot.revision;
-                    iced::clipboard::write(self.explore_integer_target.to_string()).map(move |result| {
-                        RootMessage::Integration(Message::Scoped {
-                            generation,
-                            receipt: None,
-                            message: Box::new(Message::NumberClipboardPrepared { revision, result }),
-                        })
-                    })
+                    iced::clipboard::write(self.explore_integer_target.to_string()).map(
+                        move |result| {
+                            RootMessage::Integration(Message::Scoped {
+                                generation,
+                                receipt: None,
+                                message: Box::new(Message::NumberClipboardPrepared {
+                                    revision,
+                                    result,
+                                }),
+                            })
+                        },
+                    )
                 } else if step == 6 {
-                    reporting::emit(|sink| sink.record("integration.explore_integer_paste",
-                        &explore_integer_id(index), &value.to_string(),
-                        [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.explore_integer_paste",
+                            &explore_integer_id(index),
+                            &value.to_string(),
+                            [
+                                self.explore_integer_revision as f64,
+                                snapshot.revision as f64,
+                                1.0,
+                                1.0,
+                            ],
+                        )
+                    });
                     self.explore_integer_revision = snapshot.revision;
                     self.numeric_replacement = self.explore_integer_baseline.to_string();
                     self.phase = Phase::ExploreNumericControl { index, step: 7 };
@@ -7324,9 +7612,19 @@ impl Controller {
                 } else {
                     if step == 7 {
                         self.explore_paste_read = false;
-                        reporting::emit(|sink| sink.record("integration.explore_integer_paste_restored",
-                            &explore_integer_id(index), &value.to_string(),
-                            [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.explore_integer_paste_restored",
+                                &explore_integer_id(index),
+                                &value.to_string(),
+                                [
+                                    self.explore_integer_revision as f64,
+                                    snapshot.revision as f64,
+                                    1.0,
+                                    1.0,
+                                ],
+                            )
+                        });
                     }
                     self.advance_to(Phase::ExploreNumericStart(index + 1))
                 }
@@ -7994,9 +8292,10 @@ impl Controller {
                 self.arm(explore::DETAIL_FIT_ID)
             }
             Phase::DetailFit => self.arm(explore::DETAIL_FIT_ID),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => {
-                self.arm(EXPLORE_GALLERY)
-            }
+            Phase::ViewerSelect
+            | Phase::AtlasReturnSelect
+            | Phase::AtlasResizeSelect(_)
+            | Phase::AtlasAwaySelect(_) => self.arm(EXPLORE_GALLERY),
             Phase::AwaitAtlasCapacity
                 if !settings.has_local_edits()
                     && model.settings_edit_available()
@@ -8551,38 +8850,77 @@ impl Controller {
                 Task::none()
             }
             Phase::AwaitAtlasResizeGallery(step) => {
-                let (Some(snapshot), Some(size)) =
-                    (model.explore.snapshot.as_ref(), router.explore_gallery_size())
-                else { return Task::none(); };
+                let (Some(snapshot), Some(size)) = (
+                    model.explore.snapshot.as_ref(),
+                    router.explore_gallery_size(),
+                ) else {
+                    return Task::none();
+                };
                 if snapshot.mode != crate::generated::ExploreMode::Gallery
-                    || snapshot.busy || model.has_explore_pending()
+                    || snapshot.busy
+                    || model.has_explore_pending()
                     || (step == 3 && Some(size) != self.resize_original_size)
-                { return Task::none(); }
+                {
+                    return Task::none();
+                }
                 #[cfg(target_arch = "wasm32")]
                 if step < 3 {
-                    let (width, height) = if step == 1 { (1000.0, 1020.0) } else { (1500.0, 600.0) };
+                    let (width, height) = if step == 1 {
+                        (1000.0, 1020.0)
+                    } else {
+                        (1500.0, 600.0)
+                    };
                     if !canvas_size_settled_js(width, height)
-                        || model.window_width != width as u32 || model.window_height != height as u32
-                    { return Task::none(); }
+                        || model.window_width != width as u32
+                        || model.window_height != height as u32
+                    {
+                        return Task::none();
+                    }
                 }
                 let Some(expected) = router.explore_measured_layout_request(
-                    Some(snapshot), snapshot.viewport.columns, snapshot.order.matchingcount,
-                ) else { return Task::none(); };
-                if snapshot.viewport != expected.viewport { return Task::none(); }
-                let Some(draw) = self.confirmed_atlas(snapshot)
+                    Some(snapshot),
+                    snapshot.viewport.columns,
+                    snapshot.order.matchingcount,
+                ) else {
+                    return Task::none();
+                };
+                if snapshot.viewport != expected.viewport {
+                    return Task::none();
+                }
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
-                else { return Task::none(); };
+                else {
+                    return Task::none();
+                };
                 let required_rows = atlas_scroll_window(size, snapshot.viewport.columns).0;
-                if snapshot.viewport.rowcount < required_rows || snapshot.gallery.slots.iter().any(|ready| !*ready) {
+                if snapshot.viewport.rowcount < required_rows
+                    || snapshot.gallery.slots.iter().any(|ready| !*ready)
+                {
                     return Task::none();
                 }
                 if step < 3 {
                     crate::presentation_surface::trace_atlas_stage(
-                        ["resize-landscape", "resize-portrait-return", "resize-landscape-return"][step as usize], draw,
+                        [
+                            "resize-landscape",
+                            "resize-portrait-return",
+                            "resize-landscape-return",
+                        ][step as usize],
+                        draw,
                     );
-                    reporting::emit(|sink| sink.record("integration.atlas_resize", EXPLORE_GALLERY,
-                        ["landscape", "portrait-return", "landscape-return"][step as usize],
-                        [f64::from(size.width), f64::from(size.height), f64::from(required_rows), f64::from(snapshot.viewport.rowcount)]));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.atlas_resize",
+                            EXPLORE_GALLERY,
+                            ["landscape", "portrait-return", "landscape-return"][step as usize],
+                            [
+                                f64::from(size.width),
+                                f64::from(size.height),
+                                f64::from(required_rows),
+                                f64::from(snapshot.viewport.rowcount),
+                            ],
+                        )
+                    });
                 }
                 if step == 2 {
                     self.phase = Phase::AwaitAtlasResizeGallery(3);
@@ -8595,47 +8933,80 @@ impl Controller {
                     self.resize_previous_size = None;
                     return self.advance_to(Phase::AwaitAtlasReturnReady);
                 }
-                self.selection_grid = Some((snapshot.viewport.columns, snapshot.viewport.rowcount,
-                    snapshot.viewport.firstrow, snapshot.revision, snapshot.frame.revision));
+                self.selection_grid = Some((
+                    snapshot.viewport.columns,
+                    snapshot.viewport.rowcount,
+                    snapshot.viewport.firstrow,
+                    snapshot.revision,
+                    snapshot.frame.revision,
+                ));
                 self.resize_previous_size = Some(size);
                 self.phase = Phase::AtlasResizeSelect(step);
                 self.arm(EXPLORE_GALLERY)
             }
             Phase::AwaitAtlasResizeDetail(step) => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
-                if snapshot.busy || !self.detail_drawn(frame, snapshot) { return Task::none(); }
+                let Some(snapshot) = model.explore.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if snapshot.busy || !self.detail_drawn(frame, snapshot) {
+                    return Task::none();
+                }
                 self.phase = Phase::AwaitAtlasResizeMeasurement(step * 2);
                 #[cfg(target_arch = "wasm32")]
                 {
                     let (width, height) = atlas_resize_dimensions(step * 2);
-                    if !canvas_size_js(width, height) { self.fail("cannot resize canvas beneath Detail"); }
+                    if !canvas_size_js(width, height) {
+                        self.fail("cannot resize canvas beneath Detail");
+                    }
                 }
                 Task::none()
             }
             Phase::AwaitAtlasResizeMeasurement(step) => {
-                let Some(size) = router.explore_gallery_size() else { return Task::none(); };
-                if Some(size) == self.resize_previous_size { return Task::none(); }
+                let Some(size) = router.explore_gallery_size() else {
+                    return Task::none();
+                };
+                if Some(size) == self.resize_previous_size {
+                    return Task::none();
+                }
                 #[cfg(target_arch = "wasm32")]
                 {
                     let (width, height) = atlas_resize_dimensions(step);
                     if !canvas_size_settled_js(width, height)
-                        || model.window_width != width as u32 || model.window_height != height as u32
-                    { return Task::none(); }
+                        || model.window_width != width as u32
+                        || model.window_height != height as u32
+                    {
+                        return Task::none();
+                    }
                 }
                 self.resize_previous_size = Some(size);
-                reporting::emit(|sink| sink.record("integration.atlas_resize_measured", EXPLORE_GALLERY,
-                    "detail-layout", [f64::from(step), f64::from(size.width), f64::from(size.height), 1.0]));
+                reporting::emit(|sink| {
+                    sink.record(
+                        "integration.atlas_resize_measured",
+                        EXPLORE_GALLERY,
+                        "detail-layout",
+                        [
+                            f64::from(step),
+                            f64::from(size.width),
+                            f64::from(size.height),
+                            1.0,
+                        ],
+                    )
+                });
                 if step % 2 == 0 {
                     self.phase = Phase::AwaitAtlasResizeMeasurement(step + 1);
                     #[cfg(target_arch = "wasm32")]
                     {
                         let (width, height) = atlas_resize_dimensions(step + 1);
-                        if !canvas_size_js(width, height) { self.fail("cannot repeat canvas resize beneath Detail"); }
+                        if !canvas_size_js(width, height) {
+                            self.fail("cannot repeat canvas resize beneath Detail");
+                        }
                     }
                     Task::none()
                 } else {
                     self.phase = Phase::AwaitAtlasResizeGallery(step / 2 + 1);
-                    explore_message(explore::Message::Detail(explore::detail::Message::CloseRequested))
+                    explore_message(explore::Message::Detail(
+                        explore::detail::Message::CloseRequested,
+                    ))
                 }
             }
             Phase::AwaitAtlasReturnReady => {
@@ -9771,45 +10142,82 @@ impl Controller {
                 self.arm_scrolled("annotation.undo", RelativeOffset::START)
             }
             Phase::CopyListSetup { stage, .. } => {
-                let Some(snapshot) = model.annotation.snapshot.as_ref() else { return Task::none(); };
-                if !model.annotation_edit_available() || snapshot.uirevision <= self.copy_list_revision {
+                let Some(snapshot) = model.annotation.snapshot.as_ref() else {
+                    return Task::none();
+                };
+                if !model.annotation_edit_available()
+                    || snapshot.uirevision <= self.copy_list_revision
+                {
                     return Task::none();
                 }
                 let ui = &snapshot.ui;
-                let Some(selected) = ui.editor.selectedobject.and_then(|index| ui.scene.objects.get(index as usize)) else {
-                    self.fail("Annotation long-list setup requires a selected object"); return Task::none();
+                let Some(selected) = ui
+                    .editor
+                    .selectedobject
+                    .and_then(|index| ui.scene.objects.get(index as usize))
+                else {
+                    self.fail("Annotation long-list setup requires a selected object");
+                    return Task::none();
                 };
                 self.copy_list_revision = snapshot.uirevision;
-                self.phase = Phase::CopyListSetup { stage, revision: snapshot.uirevision };
+                self.phase = Phase::CopyListSetup {
+                    stage,
+                    revision: snapshot.uirevision,
+                };
                 use annotation::sidebar::Message as Sidebar;
                 let command = match stage {
                     0 => {
-                        self.phase = Phase::CopyListSetup { stage: 1, revision: snapshot.uirevision };
+                        self.phase = Phase::CopyListSetup {
+                            stage: 1,
+                            revision: snapshot.uirevision,
+                        };
                         Sidebar::Sidebar(crate::generated::AnnotationSidebarCommand::Duplicate)
                     }
                     1 if selected.enabled => {
-                        self.phase = Phase::CopyListSetup { stage: 1, revision: snapshot.uirevision };
-                        return annotation_message(annotation::Message::Sidebar(Sidebar::SelectedObjectEnabled(false)))
-                            .chain(annotation_message(annotation::Message::Sidebar(Sidebar::SelectedObjectApplied(selected.category))));
+                        self.phase = Phase::CopyListSetup {
+                            stage: 1,
+                            revision: snapshot.uirevision,
+                        };
+                        return annotation_message(annotation::Message::Sidebar(
+                            Sidebar::SelectedObjectEnabled(false),
+                        ))
+                        .chain(annotation_message(
+                            annotation::Message::Sidebar(Sidebar::SelectedObjectApplied(
+                                selected.category,
+                            )),
+                        ));
                     }
                     1 if ui.scene.objects.len() < self.copy_list_object_target => {
                         Sidebar::Sidebar(crate::generated::AnnotationSidebarCommand::Duplicate)
                     }
                     1 | 2 if ui.scene.categories.len() < self.copy_list_class_target => {
-                        self.phase = Phase::CopyListSetup { stage: 2, revision: snapshot.uirevision };
+                        self.phase = Phase::CopyListSetup {
+                            stage: 2,
+                            revision: snapshot.uirevision,
+                        };
                         return annotation_message(annotation::Message::Sidebar(Sidebar::CategoryDraftChanged(
                             format!("Acceptance long category {} with a label that wraps inside its assigned column", ui.scene.categories.len()))))
                             .chain(annotation_message(annotation::Message::Sidebar(Sidebar::CategoryApplied)));
                     }
                     1 | 2 => {
-                        self.phase = Phase::CopyListSetup { stage: 3, revision: snapshot.uirevision };
+                        self.phase = Phase::CopyListSetup {
+                            stage: 3,
+                            revision: snapshot.uirevision,
+                        };
                         Sidebar::ObjectSelected((self.copy_objects + 2) as u16)
                     }
                     _ => {
-                        if ui.scene.objects.len() != self.copy_list_object_target || ui.scene.categories.len() != self.copy_list_class_target {
-                            self.fail("Annotation long-list setup did not preserve its exact bounded inventory"); return Task::none();
+                        if ui.scene.objects.len() != self.copy_list_object_target
+                            || ui.scene.categories.len() != self.copy_list_class_target
+                        {
+                            self.fail("Annotation long-list setup did not preserve its exact bounded inventory");
+                            return Task::none();
                         }
-                        return self.copy_scale_transition(model, applied_scale, CopyScaleStage::Wide);
+                        return self.copy_scale_transition(
+                            model,
+                            applied_scale,
+                            CopyScaleStage::Wide,
+                        );
                     }
                 };
                 annotation_message(annotation::Message::Sidebar(command))
@@ -9940,11 +10348,15 @@ impl Controller {
                 }
                 let width = model.window_width as f32;
                 if !width.is_finite() || width <= 0.0 {
-                    self.fail("Annotation settled viewport is invalid"); return Task::none();
+                    self.fail("Annotation settled viewport is invalid");
+                    return Task::none();
                 }
                 self.copy_narrow = width < crate::view::PAGE_MIN_WIDTH;
-                if stage != CopyScaleStage::Restore && self.copy_narrow != (stage == CopyScaleStage::Narrow) {
-                    self.fail("Annotation scale did not establish the requested layout"); return Task::none();
+                if stage != CopyScaleStage::Restore
+                    && self.copy_narrow != (stage == CopyScaleStage::Narrow)
+                {
+                    self.fail("Annotation scale did not establish the requested layout");
+                    return Task::none();
                 }
                 if stage != CopyScaleStage::Restore {
                     let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -9976,8 +10388,15 @@ impl Controller {
                         return Task::none();
                     }
                     self.copy_product_gesture = None;
-                    return self.copy_scale_transition(model, applied_scale,
-                        if self.copy_narrow { CopyScaleStage::Restore } else { CopyScaleStage::Narrow });
+                    return self.copy_scale_transition(
+                        model,
+                        applied_scale,
+                        if self.copy_narrow {
+                            CopyScaleStage::Restore
+                        } else {
+                            CopyScaleStage::Narrow
+                        },
+                    );
                 };
                 self.copy_product_frame = snapshot.frame.revision;
                 // Commands and completed reads can leave pixels unchanged.
@@ -10380,7 +10799,9 @@ impl Controller {
                     }
                     let samples = annotation_checks::probes(&snapshot.ui);
                     let key = (snapshot.frame.revision, presentation_revision);
-                    if self.annotation_pixel_progress.0 != key || self.annotation_pixel_progress.1 >= samples.len() / 7 {
+                    if self.annotation_pixel_progress.0 != key
+                        || self.annotation_pixel_progress.1 >= samples.len() / 7
+                    {
                         self.annotation_pixel_progress = (key, 0, samples.len() / 7);
                     }
                     let index = self.annotation_pixel_progress.1;
@@ -10388,8 +10809,12 @@ impl Controller {
                         self.fail("Annotation pixel inventory lost its next expected sample");
                         return Task::none();
                     };
-                    if !self.prepare_annotation_probe(snapshot.frame.revision, presentation_revision,
-                        [snapshot.frame.extent.width, snapshot.frame.extent.height], pixel.to_vec()) {
+                    if !self.prepare_annotation_probe(
+                        snapshot.frame.revision,
+                        presentation_revision,
+                        [snapshot.frame.extent.width, snapshot.frame.extent.height],
+                        pixel.to_vec(),
+                    ) {
                         return Task::none();
                     }
                     return self.arm(ANNOTATION_SURFACE);
@@ -10492,11 +10917,15 @@ impl Controller {
                             .draft
                             .as_ref()
                             .map_or(1.0, |draft| draft.ui.uiscale);
-                        self.copy_narrow = (model.window_width as f32) < crate::view::PAGE_MIN_WIDTH;
+                        self.copy_narrow =
+                            (model.window_width as f32) < crate::view::PAGE_MIN_WIDTH;
                         self.copy_list_object_target = snapshot.ui.scene.objects.len() + 32;
                         self.copy_list_class_target = snapshot.ui.scene.categories.len() + 32;
                         self.copy_list_revision = snapshot.uirevision.saturating_sub(1);
-                        return self.advance_to(Phase::CopyListSetup { stage: 0, revision: snapshot.uirevision });
+                        return self.advance_to(Phase::CopyListSetup {
+                            stage: 0,
+                            revision: snapshot.uirevision,
+                        });
                     }
                     self.copy_step += 1;
                     self.copy_shape_points = 0;
@@ -10917,7 +11346,14 @@ pub(crate) mod tests {
             snapshot.busy = false;
             snapshot.revision = 17;
             snapshot.filter.shuffleseed = baseline;
-            model.settings_snapshot.as_mut().unwrap().settingsstate.workflows.explore.shuffleseed = baseline;
+            model
+                .settings_snapshot
+                .as_mut()
+                .unwrap()
+                .settingsstate
+                .workflows
+                .explore
+                .shuffleseed = baseline;
             let driver = &mut fixture.controller;
             driver.phase = Phase::ExploreNumericStart(2);
             let router = crate::view::router::Router::default();
@@ -10926,7 +11362,14 @@ pub(crate) mod tests {
             assert_ne!(target, baseline);
             assert!(target > (1_u64 << 53));
             assert_eq!(target % 2, 1);
-            assert_eq!(target, if baseline == (1_u64 << 53) + 1 { (1_u64 << 53) + 3 } else { (1_u64 << 53) + 1 });
+            assert_eq!(
+                target,
+                if baseline == (1_u64 << 53) + 1 {
+                    (1_u64 << 53) + 3
+                } else {
+                    (1_u64 << 53) + 1
+                }
+            );
             assert_eq!(target.to_string().parse::<u64>(), Ok(target));
             driver.phase = Phase::AwaitExploreNumeric { index: 2, step: 5 };
             model.explore.snapshot.as_mut().unwrap().revision += 1;
@@ -10943,35 +11386,82 @@ pub(crate) mod tests {
         let driver = &mut fixture.controller;
         driver.phase = Phase::AwaitExploreClipboard(17);
         let scoped = |generation, message| Message::Scoped {
-            generation, receipt: None, message: Box::new(message),
+            generation,
+            receipt: None,
+            message: Box::new(message),
         };
-        driver.update(scoped(driver.generation.wrapping_add(1), Message::NumberClipboardPrepared {
-            revision: 17, result: Ok(()),
-        }));
+        driver.update(scoped(
+            driver.generation.wrapping_add(1),
+            Message::NumberClipboardPrepared {
+                revision: 17,
+                result: Ok(()),
+            },
+        ));
         assert_eq!(driver.phase, Phase::AwaitExploreClipboard(17));
-        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
-            revision: 16, result: Ok(()),
-        }));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberClipboardPrepared {
+                revision: 16,
+                result: Ok(()),
+            },
+        ));
         assert_eq!(driver.phase, Phase::AwaitExploreClipboard(17));
-        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
-            revision: 17, result: Ok(()),
-        }));
-        assert_eq!(driver.phase, Phase::ExploreNumericControl { index: 2, step: 6 });
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberClipboardPrepared {
+                revision: 17,
+                result: Ok(()),
+            },
+        ));
+        assert_eq!(
+            driver.phase,
+            Phase::ExploreNumericControl { index: 2, step: 6 }
+        );
         driver.phase = Phase::AwaitExploreNumeric { index: 2, step: 6 };
+        driver.update(scoped(
+            driver.generation.wrapping_add(1),
+            Message::NumberPasteDelivered(false),
+        ));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberPasteDelivered(true),
+        ));
+        assert_eq!(
+            driver.phase,
+            Phase::AwaitExploreNumeric { index: 2, step: 6 }
+        );
         driver.explore_integer_target = (1_u64 << 53) + 1;
-        let contents = std::sync::Arc::new(iced::clipboard::Content::Text(driver.explore_integer_target.to_string()));
-        driver.update(scoped(driver.generation, Message::NumberPasteRead {
-            target: explore_integer_id(0), result: Ok(contents.clone()),
-        }));
+        let contents = std::sync::Arc::new(iced::clipboard::Content::Text(
+            driver.explore_integer_target.to_string(),
+        ));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberPasteRead {
+                target: explore_integer_id(0),
+                result: Ok(contents.clone()),
+            },
+        ));
         assert!(!driver.explore_paste_read);
-        driver.update(scoped(driver.generation, Message::NumberPasteRead {
-            target: explore_integer_id(2), result: Ok(contents),
-        }));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberPasteRead {
+                target: explore_integer_id(2),
+                result: Ok(contents),
+            },
+        ));
         assert!(driver.explore_paste_read);
-        driver.fail("completed test cancellation");
-        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
-            revision: 17, result: Ok(()),
-        }));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberPasteDelivered(false),
+        ));
+        assert!(driver.failure.contains("paste shortcut delivery failed"));
+        driver.update(scoped(
+            driver.generation,
+            Message::NumberClipboardPrepared {
+                revision: 17,
+                result: Ok(()),
+            },
+        ));
         assert_eq!(driver.phase, Phase::Failed);
         assert!(!driver.explore_paste_read);
     }
@@ -10981,13 +11471,29 @@ pub(crate) mod tests {
         for writing in [true, false] {
             let mut fixture = ProbeFixture::new("square");
             let driver = &mut fixture.controller;
-            driver.phase = if writing { Phase::AwaitExploreClipboard(17) }
-                else { Phase::AwaitExploreNumeric { index: 2, step: 6 } };
-            let error = iced::clipboard::Error::Unknown { description: std::sync::Arc::new("clipboard permission rejected".into()) };
-            let message = if writing { Message::NumberClipboardPrepared { revision: 17, result: Err(error) } }
-                else { Message::NumberPasteRead { target: explore_integer_id(2), result: Err(error) } };
+            driver.phase = if writing {
+                Phase::AwaitExploreClipboard(17)
+            } else {
+                Phase::AwaitExploreNumeric { index: 2, step: 6 }
+            };
+            let error = iced::clipboard::Error::Unknown {
+                description: std::sync::Arc::new("clipboard permission rejected".into()),
+            };
+            let message = if writing {
+                Message::NumberClipboardPrepared {
+                    revision: 17,
+                    result: Err(error),
+                }
+            } else {
+                Message::NumberPasteRead {
+                    target: explore_integer_id(2),
+                    result: Err(error),
+                }
+            };
             driver.update(Message::Scoped {
-                generation: driver.generation, receipt: None, message: Box::new(message),
+                generation: driver.generation,
+                receipt: None,
+                message: Box::new(message),
             });
             assert_eq!(driver.phase, Phase::Failed);
             assert!(driver.failure.contains("clipboard permission rejected"));
@@ -12746,12 +13252,24 @@ pub(crate) mod tests {
         );
         assert_eq!(Phase::AwaitPointer(1).deadline_class(), "work");
         for stage in 0..=3 {
-            let first = Phase::CopyListSetup { stage, revision: 10 };
-            let settled = Phase::CopyListSetup { stage, revision: 11 };
+            let first = Phase::CopyListSetup {
+                stage,
+                revision: 10,
+            };
+            let settled = Phase::CopyListSetup {
+                stage,
+                revision: 11,
+            };
             assert_eq!(first.deadline_class(), "work");
             assert_eq!(settled.deadline_class(), "work");
             assert_ne!(first, settled);
-            assert_eq!(settled, Phase::CopyListSetup { stage, revision: 11 });
+            assert_eq!(
+                settled,
+                Phase::CopyListSetup {
+                    stage,
+                    revision: 11
+                }
+            );
         }
         assert_eq!(Phase::Complete.deadline_class(), "work");
         assert_eq!(Phase::AwaitSettings.deadline_class(), "interaction");
@@ -12770,28 +13288,81 @@ pub(crate) mod tests {
 
     #[test]
     fn annotation_reveal_proves_subregions_without_rescaling_full_geometry() {
-        let full = Rectangle { x: -100.0, y: -200.0, width: 1000.0, height: 1600.0 };
-        let viewport = Rectangle { x: 0.0, y: 50.0, width: 700.0, height: 500.0 };
-        let measured = ControlBounds { target: full, page: viewport, horizontal: viewport };
+        let full = Rectangle {
+            x: -100.0,
+            y: -200.0,
+            width: 1000.0,
+            height: 1600.0,
+        };
+        let viewport = Rectangle {
+            x: 0.0,
+            y: 50.0,
+            width: 700.0,
+            height: 500.0,
+        };
+        let measured = ControlBounds {
+            target: full,
+            page: viewport,
+            horizontal: viewport,
+        };
         let visible = measured.visible().unwrap();
         assert_eq!(visible, viewport);
-        assert!(!contains_rectangle(visible, measured.requested(AnnotationReveal::Control).unwrap()));
+        assert!(!contains_rectangle(
+            visible,
+            measured.requested(AnnotationReveal::Control).unwrap()
+        ));
         let request = AnnotationReveal::Source {
             extent: [1000.0, 1600.0],
-            region: Rectangle { x: 250.0, y: 300.0, width: 10.0, height: 20.0 }, margin: 2.0,
+            region: Rectangle {
+                x: 250.0,
+                y: 300.0,
+                width: 10.0,
+                height: 20.0,
+            },
+            margin: 2.0,
         };
         let requested = measured.requested(request).unwrap();
-        assert_eq!(requested, Rectangle { x: 148.0, y: 98.0, width: 14.0, height: 24.0 });
+        assert_eq!(
+            requested,
+            Rectangle {
+                x: 148.0,
+                y: 98.0,
+                width: 14.0,
+                height: 24.0
+            }
+        );
         assert!(contains_rectangle(visible, requested));
         assert_eq!(measured.target, full);
-        let trailing = ControlBounds { target: Rectangle { y: 400.0, ..full }, ..measured };
-        assert!(!contains_rectangle(viewport, trailing.requested(request).unwrap()));
-        let clamped = ControlBounds { target: Rectangle { x: 650.0, width: 100.0, ..full }, ..measured };
-        assert!(!contains_rectangle(clamped.visible().unwrap(), clamped.target));
-        let missing = ControlBounds { page: Rectangle::default(), ..measured };
+        let trailing = ControlBounds {
+            target: Rectangle { y: 400.0, ..full },
+            ..measured
+        };
+        assert!(!contains_rectangle(
+            viewport,
+            trailing.requested(request).unwrap()
+        ));
+        let clamped = ControlBounds {
+            target: Rectangle {
+                x: 650.0,
+                width: 100.0,
+                ..full
+            },
+            ..measured
+        };
+        assert!(!contains_rectangle(
+            clamped.visible().unwrap(),
+            clamped.target
+        ));
+        let missing = ControlBounds {
+            page: Rectangle::default(),
+            ..measured
+        };
         assert!(missing.visible().is_none());
         assert!(missing.requested(request).is_none());
-        let absent = ControlBounds { target: Rectangle::default(), ..measured };
+        let absent = ControlBounds {
+            target: Rectangle::default(),
+            ..measured
+        };
         assert!(absent.visible().is_none());
         assert!(absent.requested(request).is_none());
     }
@@ -12806,17 +13377,30 @@ pub(crate) mod tests {
             assert!((minimum..=maximum).contains(&original));
             let physical_width = 1500.0;
             let original_width = physical_width / original;
-            assert_eq!(original_width < crate::view::PAGE_MIN_WIDTH, initially_narrow);
+            assert_eq!(
+                original_width < crate::view::PAGE_MIN_WIDTH,
+                initially_narrow
+            );
             let wide = annotation_layout_scale(original, original_width, false).unwrap();
             assert!(physical_width / wide >= crate::view::PAGE_MIN_WIDTH);
             let narrow = annotation_layout_scale(wide, physical_width / wide, true).unwrap();
             assert!(physical_width / narrow < crate::view::PAGE_MIN_WIDTH);
-            let mut controller = Controller::new(false, false, String::new(), String::new(), "512".into(), "copy".into());
+            let mut controller = Controller::new(
+                false,
+                false,
+                String::new(),
+                String::new(),
+                "512".into(),
+                "copy".into(),
+            );
             controller.copy_original_scale = original;
             let model = ApplicationModel::default();
             drop(controller.copy_scale_transition(&model, narrow, CopyScaleStage::Restore));
             assert_eq!(controller.copy_requested_scale, original);
-            assert_eq!(controller.phase, Phase::CopyAwaitScale(CopyScaleStage::Restore));
+            assert_eq!(
+                controller.phase,
+                Phase::CopyAwaitScale(CopyScaleStage::Restore)
+            );
         }
     }
 

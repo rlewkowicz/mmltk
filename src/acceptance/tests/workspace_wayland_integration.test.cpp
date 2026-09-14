@@ -3572,22 +3572,23 @@ struct AtlasDrawAudit final {
         const auto name = record.value("control", "");
         if (name.starts_with("resize-")) {
             static constexpr std::array names{"resize-landscape", "resize-portrait-return", "resize-landscape-return"};
-            bool matching = check(resize_stages.size() < names.size() && name == names[resize_stages.size()],
-                                  "resize_stage_out_of_order", record) && source_stage_matches_draw(record);
+            bool matching =
+                check(resize_stages.size() < names.size() && name == names[resize_stages.size()], "resize_stage_out_of_order", record) &&
+                source_stage_matches_draw(record);
             if (matching) {
                 const auto& clip = record.at("clip");
                 const auto& image = record.at("image");
-                matching = check(image[1].get<double>() + image[3].get<double>() >=
-                                     clip[1].get<double>() + clip[3].get<double>() - 1.0,
+                matching = check(image[1].get<double>() + image[3].get<double>() >= clip[1].get<double>() + clip[3].get<double>() - 1.0,
                                  "resized_atlas_does_not_cover_lower_rows", record);
                 if (!resize_stages.empty()) {
                     const auto& previous = resize_stages.back();
                     const bool portrait = name == "resize-portrait-return";
-                    matching = matching && check(portrait ? scalar(record, "rows") > scalar(previous, "rows")
-                                                 : scalar(record, "rows") < scalar(previous, "rows"),
-                                                 "resize_row_direction_mismatch", record, &previous) &&
-                               check_fields(record, previous, {"dataset_identity", "columns", "first_row"},
-                                            "resize_changed_gallery_identity");
+                    matching =
+                        matching &&
+                        check(portrait ? scalar(record, "rows") > scalar(previous, "rows")
+                                       : scalar(record, "rows") < scalar(previous, "rows"),
+                              "resize_row_direction_mismatch", record, &previous) &&
+                        check_fields(record, previous, {"dataset_identity", "columns", "first_row"}, "resize_changed_gallery_identity");
                 }
             }
             valid = valid && matching;
@@ -4433,24 +4434,22 @@ struct BrowserAudit final {
             }
         } else if (event == "integration.explore_integer_paste_baseline") {
             if (!explore_seed_control.empty() && record.value("control", "") == explore_seed_control &&
-                scalar(record, "detail") != explore_seed_target &&
-                scalar(record, "a") != 0U && scalar(record, "c") == 1U && scalar(record, "d") == 1U)
+                scalar(record, "detail") != explore_seed_target && scalar(record, "a") != 0U && scalar(record, "c") == 1U &&
+                scalar(record, "d") == 1U)
                 explore_paste_baseline = record;
         } else if (event == "integration.explore_integer_paste") {
             if (explore_paste_baseline && record.value("control", "") == explore_seed_control &&
-                scalar(record, "detail") == explore_seed_target &&
-                scalar(record, "a") == scalar(*explore_paste_baseline, "a") && scalar(record, "b") > scalar(record, "a") &&
-                scalar(record, "c") == 1U && scalar(record, "d") == 1U)
+                scalar(record, "detail") == explore_seed_target && scalar(record, "a") == scalar(*explore_paste_baseline, "a") &&
+                scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U)
                 explore_paste_value = record;
         } else if (event == "integration.explore_integer_paste_restored") {
-            explore_paste_restored = explore_paste_baseline && explore_paste_value &&
-                record.value("control", "") == explore_seed_control &&
-                scalar(record, "detail") == scalar(*explore_paste_baseline, "detail") &&
-                scalar(record, "a") == scalar(*explore_paste_value, "b") && scalar(record, "b") > scalar(record, "a") &&
-                scalar(record, "c") == 1U && scalar(record, "d") == 1U;
+            explore_paste_restored = explore_paste_baseline && explore_paste_value && record.value("control", "") == explore_seed_control &&
+                                     scalar(record, "detail") == scalar(*explore_paste_baseline, "detail") &&
+                                     scalar(record, "a") == scalar(*explore_paste_value, "b") &&
+                                     scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U;
         } else if (event == "integration.atlas_resize_measured") {
-            if (record.value("detail", "") == "detail-layout" && numeric(record, "b") > 0.0 &&
-                numeric(record, "c") > 0.0 && scalar(record, "d") == 1U)
+            if (record.value("detail", "") == "detail-layout" && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 &&
+                scalar(record, "d") == 1U)
                 detail_resize_measurements.insert(scalar(record, "a"));
         } else if (event == "integration.atlas_resize") {
             if (numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && scalar(record, "c") > 0U &&
@@ -4573,21 +4572,19 @@ struct BrowserAudit final {
             else
                 annotation_capabilities.insert(record.value("detail", ""));
         } else if (event == "integration.annotation_tail") {
-            if (scalar(record, "a") >= 32U && numeric(record, "b") > 0.0 &&
-                numeric(record, "c") >= -0.01 && numeric(record, "d") >= -0.01)
+            if (scalar(record, "a") >= 32U && numeric(record, "b") > 0.0 && numeric(record, "c") >= -0.01 && numeric(record, "d") >= -0.01)
                 annotation_tails[record.value("detail", "")].emplace(record.value("control", ""), scalar(record, "a"));
         } else if (event == "integration.annotation_reachable") {
-            if (numeric(record, "a") >= -1.0 && numeric(record, "b") >= -1.0 &&
-                numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0)
+            if (numeric(record, "a") >= -1.0 && numeric(record, "b") >= -1.0 && numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0)
                 annotation_reachable[record.value("detail", "")].insert(record.value("control", ""));
         } else if (event == "integration.annotation_layout") {
             annotation_layouts.insert(record.value("detail", ""));
-            annotation_layout_valid = annotation_layout_valid && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 &&
-                                      std::abs(numeric(record, "a") / numeric(record, "c") - 0.62) < 0.002 &&
-                                      std::abs(numeric(record, "b") / numeric(record, "c") - 0.19) < 0.002 &&
-                                      numeric(record, "c") >= 1020.0 && numeric(record, "c") <= 1500.0 &&
-                                      (record.value("detail", "") == "narrow" ? numeric(record, "d") < 1020.0
-                                                                                 : numeric(record, "d") >= 1020.0);
+            annotation_layout_valid =
+                annotation_layout_valid && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 &&
+                std::abs(numeric(record, "a") / numeric(record, "c") - 0.62) < 0.002 &&
+                std::abs(numeric(record, "b") / numeric(record, "c") - 0.19) < 0.002 && numeric(record, "c") >= 1020.0 &&
+                numeric(record, "c") <= 1500.0 &&
+                (record.value("detail", "") == "narrow" ? numeric(record, "d") < 1020.0 : numeric(record, "d") >= 1020.0);
         } else if (event == "integration.annotation_product") {
             ++annotation_product_operations[record.value("detail", "")];
             annotation_pixels_valid =
@@ -5032,16 +5029,14 @@ struct BrowserAudit final {
         const Bounds* const annotation_save = page_bound("Annotate", "annotation.save");
         const bool annotation_composition =
             annotation_workspace != nullptr && annotation_diagnostics != nullptr && annotation_setup != nullptr &&
-            annotation_center != nullptr && annotation_advanced != nullptr && annotation_save != nullptr &&
-            annotation_sidebar.valid() && annotation_timeline.valid() && annotation_operation.valid() &&
-            annotation_stop.valid() && annotation_brush.valid() && annotation_tool_control.valid() &&
-            annotation_diagnostics->contains_horizontally(annotation_sidebar) &&
+            annotation_center != nullptr && annotation_advanced != nullptr && annotation_save != nullptr && annotation_sidebar.valid() &&
+            annotation_timeline.valid() && annotation_operation.valid() && annotation_stop.valid() && annotation_brush.valid() &&
+            annotation_tool_control.valid() && annotation_diagnostics->contains_horizontally(annotation_sidebar) &&
             annotation_diagnostics->contains_horizontally(annotation_operation) &&
             annotation_diagnostics->contains_horizontally(annotation_stop) &&
             annotation_diagnostics->contains_horizontally(annotation_brush) &&
             annotation_diagnostics->contains_horizontally(annotation_tool_control) &&
-            annotation_center->contains_horizontally(annotation_timeline) &&
-            annotation_setup->contains(*annotation_save) &&
+            annotation_center->contains_horizontally(annotation_timeline) && annotation_setup->contains(*annotation_save) &&
             annotation_advanced->y >= annotation_workspace->y + annotation_workspace->height - 1.0 &&
             std::abs(annotation_setup->width / page_width - 0.19) < 0.002 &&
             std::abs(annotation_center->width / page_width - 0.62) < 0.002 &&
@@ -5168,12 +5163,12 @@ struct BrowserAudit final {
             primary_action_geometry, "primary action geometry", reference_columns, "workflow column geometry", vertical_composition,
             "workflow vertical composition", advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls",
             explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression",
-            explore_paste_restored, "Explore clipboard paste persistence and restoration",
-            spinnerless_integer, "integer spinner suppression", spinnerless_floating, "floating spinner suppression",
-            advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence",
-            compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
-            model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip,
-            "benchmark override interaction", explore_composition, "Explore composition", annotation_composition, "annotation composition",
+            explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer,
+            "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted,
+            "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement,
+            "Dataset progress placement", model_progress_placement, "Model progress containment", model_composition && model_copy,
+            "Model card composition", benchmark_override.valid() && benchmark_round_trip, "benchmark override interaction",
+            explore_composition, "Explore composition", annotation_composition, "annotation composition",
             workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
             settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released &&
                 ui_scale_restored && complete_pointer_drag && error_composition && error_modal_usable,
@@ -8120,12 +8115,13 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
 }
 
 TEST_CASE("Explore clipboard evidence requires an exact seed and authoritative restoration", "[workspace][audit]") {
-    for (const std::string_view defect : {"none", "alternate", "target-mismatch", "baseline-collision", "typed-only", "rounded", "control", "persistence", "baseline", "revision"}) {
+    for (const std::string_view defect : {"none", "alternate", "target-mismatch", "baseline-collision", "typed-only", "rounded", "control",
+                                          "persistence", "baseline", "revision"}) {
         INFO(defect);
         BrowserAudit audit;
         const auto entry = [](const char* event, const char* value, const std::uint64_t before, const std::uint64_t after) {
-            return nlohmann::json{{"event", event}, {"control", "seed-field"}, {"detail", value},
-                                  {"a", before}, {"b", after}, {"c", 1U}, {"d", 1U}};
+            return nlohmann::json{{"event", event}, {"control", "seed-field"}, {"detail", value}, {"a", before}, {"b", after}, {"c", 1U},
+                                  {"d", 1U}};
         };
         const auto* target = defect == "alternate" ? "9007199254740995" : "9007199254740993";
         const auto* baseline = defect == "alternate" || defect == "baseline-collision" ? "9007199254740993" : "73";

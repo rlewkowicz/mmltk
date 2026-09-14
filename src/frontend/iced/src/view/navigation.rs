@@ -115,7 +115,12 @@ mod tests {
 
     #[test]
     fn visual_inventory_is_an_exhaustive_generated_feature_permutation() {
-        assert_eq!(ORDER.map(label), ["Train", "Validate", "Predict", "Export", "Live", "Annotate", "Explore"]);
+        assert_eq!(
+            ORDER.map(label),
+            [
+                "Train", "Validate", "Predict", "Export", "Live", "Annotate", "Explore"
+            ]
+        );
         assert_eq!(ORDER.len(), crate::generated::FEATURE_ID_VALUES.len());
         for feature in crate::generated::FEATURE_ID_VALUES {
             assert_eq!(

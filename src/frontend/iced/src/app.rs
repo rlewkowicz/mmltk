@@ -1602,7 +1602,10 @@ mod tests {
                         columns,
                     }),
                 )));
-                assert_eq!(app.workspace.explore_gallery_size(), Some(iced::Size::new(width, height)));
+                assert_eq!(
+                    app.workspace.explore_gallery_size(),
+                    Some(iced::Size::new(width, height))
+                );
                 assert_eq!(app.model.pending_count(), 0);
             }
             drop(app.on_workspace(crate::view::router::Message::Explore(
@@ -1616,11 +1619,15 @@ mod tests {
             returned.mode = crate::generated::ExploreMode::Gallery;
             returned.revision += 1;
             reduce_explore_changed(&mut app, returned);
-            let expected = app.workspace.explore_measured_layout_request(
-                app.model.explore.snapshot.as_ref(), columns, 127,
-            ).unwrap();
+            let expected = app
+                .workspace
+                .explore_measured_layout_request(app.model.explore.snapshot.as_ref(), columns, 127)
+                .unwrap();
             assert_eq!(expected.viewport.firstrow, 2);
-            assert_eq!(app.workspace.explore_dispatchable_viewport(), Some(expected));
+            assert_eq!(
+                app.workspace.explore_dispatchable_viewport(),
+                Some(expected)
+            );
         }
     }
 

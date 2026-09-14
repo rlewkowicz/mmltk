@@ -685,87 +685,84 @@ impl Component {
                 let selected_mask = self.selected_shape(model, AnnotationShape::Mask);
                 let selected_skeleton = self.selected_shape(model, AnnotationShape::Skeleton);
                 let objects = state.scene.objects.iter().enumerate().fold(
-                        column![text(format!("Objects ({})", state.scene.objects.len()))]
-                            .spacing(4),
-                        |list, (index, object)| {
-                            let name = state
-                                .scene
-                                .categories
-                                .get(object.category as usize)
-                                .map_or("Unknown class", |name| name.value.as_str());
-                            let swatch = state
-                                .scene
-                                .palette
-                                .get(object.category as usize)
-                                .map(crate::presentation_surface::labels::class_color)
-                                .unwrap_or(iced::Color::WHITE);
-                            list.push(
-                                container(
-                                    button(
-                                        row![
-                                            text("●").color(swatch),
-                                            text(format!(
-                                                "{}{} · {}{}",
-                                                if state.editor.selectedobject == Some(index as u16)
-                                                {
-                                                    "✓ "
-                                                } else {
-                                                    ""
-                                                },
-                                                name,
-                                                shape_label(object.shape),
-                                                if object.enabled { "" } else { " (hidden)" }
-                                            )).width(Fill)
-                                        ]
-                                        .spacing(6),
-                                    )
-                                    .width(Fill)
-                                    .on_press_maybe(
-                                        available.then_some(Message::ObjectSelected(index as u16)),
-                                    ),
+                    column![text(format!("Objects ({})", state.scene.objects.len()))].spacing(4),
+                    |list, (index, object)| {
+                        let name = state
+                            .scene
+                            .categories
+                            .get(object.category as usize)
+                            .map_or("Unknown class", |name| name.value.as_str());
+                        let swatch = state
+                            .scene
+                            .palette
+                            .get(object.category as usize)
+                            .map(crate::presentation_surface::labels::class_color)
+                            .unwrap_or(iced::Color::WHITE);
+                        list.push(
+                            container(
+                                button(
+                                    row![
+                                        text("●").color(swatch),
+                                        text(format!(
+                                            "{}{} · {}{}",
+                                            if state.editor.selectedobject == Some(index as u16) {
+                                                "✓ "
+                                            } else {
+                                                ""
+                                            },
+                                            name,
+                                            shape_label(object.shape),
+                                            if object.enabled { "" } else { " (hidden)" }
+                                        ))
+                                        .width(Fill)
+                                    ]
+                                    .spacing(6),
                                 )
-                                .id(format!("annotation.object.{index}")),
+                                .width(Fill)
+                                .on_press_maybe(
+                                    available.then_some(Message::ObjectSelected(index as u16)),
+                                ),
                             )
-                        },
-                    );
-                let categories =
-                    state.scene.categories.iter().enumerate().fold(
-                        column![text("Class for new objects")].spacing(4),
-                        |list, (index, name)| {
-                            let swatch = state
-                                .scene
-                                .palette
-                                .get(index)
-                                .map(crate::presentation_surface::labels::class_color)
-                                .unwrap_or(iced::Color::WHITE);
-                            list.push(
-                                container(
-                                    button(
-                                        row![
-                                            text("●").color(swatch),
-                                            text(format!(
-                                                "{}{}",
-                                                if state.editor.selectedcategory
-                                                    == Some(index as u16)
-                                                {
-                                                    "✓ "
-                                                } else {
-                                                    ""
-                                                },
-                                                name.value
-                                            )).width(Fill)
-                                        ]
-                                        .spacing(6),
-                                    )
-                                    .width(Fill)
-                                    .on_press_maybe(
-                                        available.then_some(Message::ClassSelected(index as u16)),
-                                    ),
+                            .id(format!("annotation.object.{index}")),
+                        )
+                    },
+                );
+                let categories = state.scene.categories.iter().enumerate().fold(
+                    column![text("Class for new objects")].spacing(4),
+                    |list, (index, name)| {
+                        let swatch = state
+                            .scene
+                            .palette
+                            .get(index)
+                            .map(crate::presentation_surface::labels::class_color)
+                            .unwrap_or(iced::Color::WHITE);
+                        list.push(
+                            container(
+                                button(
+                                    row![
+                                        text("●").color(swatch),
+                                        text(format!(
+                                            "{}{}",
+                                            if state.editor.selectedcategory == Some(index as u16) {
+                                                "✓ "
+                                            } else {
+                                                ""
+                                            },
+                                            name.value
+                                        ))
+                                        .width(Fill)
+                                    ]
+                                    .spacing(6),
                                 )
-                                .id(format!("annotation.class.{index}")),
+                                .width(Fill)
+                                .on_press_maybe(
+                                    available.then_some(Message::ClassSelected(index as u16)),
+                                ),
                             )
-                        },
-                    );
+                            .id(format!("annotation.class.{index}")),
+                        )
+                    },
+                );
                 let reclassify = button("Apply current class to selected object")
                     .width(Fill)
                     .on_press_maybe(

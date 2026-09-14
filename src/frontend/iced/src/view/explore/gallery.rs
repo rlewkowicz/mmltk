@@ -787,15 +787,43 @@ mod tests {
         snapshot.order.matchingcount = 127;
         let measurement = |height| Message::Measured {
             size: Size::new(601.5, 420.25),
-            maximum_extent: crate::generated::VisualExtent { width: 1024, height },
+            maximum_extent: crate::generated::VisualExtent {
+                width: 1024,
+                height,
+            },
             columns: 4,
         };
-        assert!(update(&mut state, None, &mut settings, measurement(0)).unwrap().is_none());
+        assert!(
+            update(&mut state, None, &mut settings, measurement(0))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(state.gallery_size(), Some(Size::new(601.5, 420.25)));
-        assert!(state.measured_layout_request(Some(&snapshot), 4, 127).is_none());
-        assert!(matches!(update(&mut state, Some(&snapshot), &mut settings, measurement(1024)).unwrap(),
-            Some(Outcome::ViewportChanged(_))));
-        assert!(update(&mut state, Some(&snapshot), &mut settings, measurement(1024)).unwrap().is_none());
+        assert!(
+            state
+                .measured_layout_request(Some(&snapshot), 4, 127)
+                .is_none()
+        );
+        assert!(matches!(
+            update(
+                &mut state,
+                Some(&snapshot),
+                &mut settings,
+                measurement(1024)
+            )
+            .unwrap(),
+            Some(Outcome::ViewportChanged(_))
+        ));
+        assert!(
+            update(
+                &mut state,
+                Some(&snapshot),
+                &mut settings,
+                measurement(1024)
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
