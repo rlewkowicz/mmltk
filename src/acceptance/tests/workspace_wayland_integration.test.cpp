@@ -38,6 +38,7 @@
 #include <string_view>
 #include <system_error>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -320,6 +321,7 @@ class BrowserHostProcess final {
     BrowserHostProcess& operator=(const BrowserHostProcess&) = delete;
 
     [[nodiscard]] int control_fd() const noexcept { return control_write_.get(); }
+    [[nodiscard]] std::string_view frontend_failure() const noexcept { return frontend_failure_; }
     [[nodiscard]] bool explore_control_closed() const noexcept { return explore_control_closed_; }
     [[nodiscard]] int pidfd() const noexcept { return pidfd_.get(); }
     [[nodiscard]] bool active() const noexcept { return child_ > 0 && pidfd_.get() >= 0; }
@@ -343,13 +345,26 @@ class BrowserHostProcess final {
 
     [[nodiscard]] std::optional<mmltk::controller::ExploreAcceptanceGate::ControlObservation> receive_explore_event() noexcept {
         if (control_write_.get() < 0) return std::nullopt;
-        mmltk::controller::ExploreAcceptanceGate::ControlObservation event;
+        using Observation = ExploreAcceptanceGate::ControlObservation;
+        Observation event{};
+        frontend_failure_ = {};
         ssize_t consumed = -1;
         do {
-            consumed = ::recv(control_write_.get(), &event, sizeof(event), 0);
+            consumed = ::recv(control_write_.get(), control_buffer_.data(), control_buffer_.size(), MSG_TRUNC);
         } while (consumed < 0 && errno == EINTR);
-        if (consumed == static_cast<ssize_t>(sizeof(event))) return event;
-        if (consumed == 1 && event.event == mmltk::controller::ExploreAcceptanceGate::ControlEvent::InitialWait) return event;
+        if (consumed >= static_cast<ssize_t>(sizeof(event))
+            && consumed <= static_cast<ssize_t>(control_buffer_.size())) {
+            std::memcpy(&event, control_buffer_.data(), sizeof(event));
+            const auto bytes = static_cast<std::size_t>(consumed) - sizeof(event);
+            const bool failed = event.event == ExploreAcceptanceGate::ControlEvent::Frontend
+                && event.slot == static_cast<std::uint64_t>(mmltk::controller::contracts::IntegrationControlKind::Failed);
+            if ((bytes == 0U || failed) && (!failed || event.staging_bytes != 0U)) {
+                frontend_failure_ = {control_buffer_.data() + sizeof(event), bytes};
+                return event;
+            }
+        }
+        if (consumed == 1 && static_cast<unsigned char>(control_buffer_[0]) ==
+            static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait)) return event;
         explore_control_closed_ = consumed == 0;
         control_write_.reset();
         return std::nullopt;
@@ -436,6 +451,9 @@ class BrowserHostProcess final {
     pid_t peer_group_ = -1;
     ScopedFd peer_pidfd_;
     ScopedFd control_write_;
+    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) +
+        mmltk::controller::contracts::kIntegrationFailureMaxBytes> control_buffer_;
+    std::string_view frontend_failure_;
     bool explore_control_closed_ = false;
     int status_ = -1;
 };
@@ -474,6 +492,7 @@ struct SurfaceAudit final {
     struct Reconstruction final {
         std::string completed;
         std::string requested;
+        std::uint64_t publication = 0U;
         std::size_t ordinal = 0U;
     };
     struct SourceRead final {
@@ -517,6 +536,7 @@ struct SurfaceAudit final {
         std::uint64_t settled = 0U;
         std::uint64_t abandoned = 0U;
         bool acquired = false;
+        std::size_t acquired_at = 0U;
         bool released = false;
         std::optional<MetadataReceipt> metadata;
     };
@@ -524,7 +544,6 @@ struct SurfaceAudit final {
         std::uint64_t generation = 0U;
         std::uint64_t width = 0U;
         std::uint64_t height = 0U;
-        std::uint64_t iced_generation = 0U;
         std::uint64_t browser_width = 0U;
         std::uint64_t browser_height = 0U;
         unsigned native_stage = 0U;
@@ -535,11 +554,10 @@ struct SurfaceAudit final {
         bool withdrawn = false;
         bool candidate_withdrawn = false;
         bool native_retired = false;
-        bool firefox_withdrawn = false;
-        bool firefox_retired = false;
+        std::size_t firefox_withdrawn = 0U;
+        std::size_t firefox_retired = 0U;
+        std::size_t admitted = 0U;
         std::size_t created = 0U;
-        std::size_t requested = 0U;
-        std::size_t replaced = 0U;
         std::size_t acquired = 0U;
         std::size_t discarded = 0U;
         std::size_t retired = 0U;
@@ -548,6 +566,7 @@ struct SurfaceAudit final {
         std::map<std::pair<std::uint64_t, std::uint64_t>, TransferReceipt> transfers;
         std::map<std::uint64_t, ReceiverReceipt> receipts;
         std::map<std::uint64_t, SampleCustody> custody;
+        std::unordered_map<std::uint64_t, std::size_t> draw_indices;
         std::map<std::string, unsigned, std::less<>> source_textures;
         std::size_t import_dropped = 0U;
         std::map<std::uint64_t, unsigned> source_steps;
@@ -656,12 +675,19 @@ struct SurfaceAudit final {
     struct Draw final {
         std::string selected;
         std::string requested;
+        std::uint64_t publication = 0U;
         std::size_t ordinal = 0U;
+        std::size_t encoded = 0U;
+        std::size_t submitted = 0U;
+        std::uint64_t identity = 0U;
+        std::size_t settled = 0U;
+        bool abandoned = false;
     };
     std::map<std::string, SurfaceState, std::less<>> surfaces;
     std::vector<Draw> draws;
     std::string failure;
     std::size_t browser_ordinal = 0U;
+    std::size_t scenario_started = 0U;
     bool native_shutdown = false;
     bool browser_shutdown = false;
     bool browser_exited = false;
@@ -955,6 +981,9 @@ struct SurfaceAudit final {
         if (event == "browser.invalid_webgpu_texture") reject("Firefox reported an invalid WebGPU texture");
         browser_shutdown =
             browser_shutdown || (event == "firefox.workspace.channel_terminal" && record.value("terminal", "") == "orderly_bridge_close");
+        // An unavailable draw has no acquired image or physical transition.
+        // BrowserAudit separately checks missing draws after owned atlas content.
+        if (event == "iced.surface.sample_draw_missing") return;
         if (event.starts_with("firefox.workspace.source.")) {
             if (event.ends_with("claim_outcome") && record.value("outcome", "") != "claimed")
                 reject("Firefox failed to claim an admitted source");
@@ -1006,9 +1035,10 @@ struct SurfaceAudit final {
             if (state.firefox_stage != from) reject("Firefox admission stages are missing, duplicate, or reordered");
             state.firefox_stage = from + 1U;
         };
-        if (event == "firefox.workspace.admitted")
+        if (event == "firefox.workspace.admitted") {
             advance(0U);
-        else if (event == "firefox.workspace.claim_outcome" && record.value("outcome", "") == "claimed")
+            state.admitted = browser_ordinal;
+        } else if (event == "firefox.workspace.claim_outcome" && record.value("outcome", "") == "claimed")
             advance(1U);
         else if (event == "firefox.workspace.claim_outcome")
             reject("Firefox failed to claim the advertised surface");
@@ -1022,11 +1052,13 @@ struct SurfaceAudit final {
             advance(3U);
         else if (event == "firefox.workspace.ready")
             advance(4U);
-        else if (event == "firefox.workspace.withdrawal")
-            state.firefox_withdrawn = true;
-        else if (event == "firefox.workspace.retired") {
+        else if (event == "firefox.workspace.withdrawal" || event == "firefox.workspace.drop_received") {
+            if (state.firefox_stage == 0U || state.firefox_retired)
+                reject("Firefox withdrawal lacks a live admitted arena");
+            if (state.firefox_withdrawn == 0U) state.firefox_withdrawn = browser_ordinal;
+        } else if (event == "firefox.workspace.retired") {
             if (!state.firefox_withdrawn || state.firefox_retired) reject("Firefox retirement lacks its unique withdrawal");
-            state.firefox_retired = true;
+            state.firefox_retired = browser_ordinal;
         }
         if (event == "firefox.workspace.frame_released") { reject("obsolete offer-driven release has no acquired physical read"); }
         if (event == "firefox.workspace.release_only_submitted" || event == "firefox.workspace.release_only_completed") {
@@ -1119,31 +1151,62 @@ struct SurfaceAudit final {
             } else if (event == "iced.surface.draw_encoded") {
                 if (!custody.acquired || custody.encoded >= custody.selected)
                     reject("Iced encoding lacks selection of its acquired image");
-                else
-                    ++custody.encoded;
+                else {
+                    const auto identity = scalar(record, "draw_identity");
+                    if (draws.empty() || draws.back().selected != id ||
+                        draws.back().requested != record.value("requested_surface", "") || draws.back().publication != publication ||
+                        draws.back().encoded != 0U || identity == 0U ||
+                        !state.draw_indices.emplace(identity, draws.size() - 1U).second)
+                        reject("Iced encoding lacks its exact selected draw");
+                    else {
+                        ++custody.encoded;
+                        draws.back().encoded = browser_ordinal;
+                        draws.back().identity = identity;
+                    }
+                }
             } else if (event == "iced.frame.sample_released") {
                 if (custody.encoded != custody.settled + custody.abandoned)
                     reject("Iced final sample release preceded encoded reader settlement");
                 custody.released = true;
             } else if (custody.settled + custody.abandoned >= custody.encoded) {
                 reject("Iced batch settlement is missing, duplicate, or reordered");
-            } else if (event == "iced.frame.draw_settled") {
-                ++custody.settled;
             } else {
-                ++custody.abandoned;
+                const auto found = state.draw_indices.find(scalar(record, "draw_identity"));
+                if (found == state.draw_indices.end()) {
+                    reject("Iced settlement lacks its exact encoded draw");
+                    return;
+                }
+                auto& draw = draws[found->second];
+                if (draw.publication != publication || draw.requested != record.value("requested_surface", "") || draw.settled != 0U) {
+                    reject("Iced settlement duplicates or changes its encoded draw");
+                    return;
+                }
+                draw.settled = browser_ordinal;
+                draw.abandoned = event == "iced.frame.draw_abandoned";
+                if (draw.abandoned)
+                    ++custody.abandoned;
+                else
+                    ++custody.settled;
             }
         }
         if (!event.starts_with("iced.surface.")) return;
-        const auto generation = scalar(record, "generation");
-        if (generation == 0U || !record.contains("width") || !record.contains("height") ||
-            (state.iced_generation != 0U && state.iced_generation != generation))
+        if (!record.contains("width") || !record.contains("height"))
             reject("Iced surface provenance is missing or inconsistent");
-        state.iced_generation = generation;
-        if (event == "iced.surface.capability_requested") {
-            if (state.requested == 0U) state.requested = browser_ordinal;
-        } else if (event == "iced.surface.capability_replaced") {
-            if (state.requested == 0U) reject("replaced capability was never requested");
-            state.replaced = browser_ordinal;
+        if (event == "iced.surface.draw_submitted") {
+            const auto publication = scalar(record, "presentation_revision");
+            const std::string requested = record.value("requested_surface", "");
+            const auto sample = state.samples.find(publication);
+            const auto custody = state.custody.find(publication);
+            const auto found = state.draw_indices.find(scalar(record, "draw_identity"));
+            auto* draw = found != state.draw_indices.end() ? &draws[found->second] : nullptr;
+            if (!valid_identity(requested) || sample == state.samples.end() || sample->second != scalar(record, "frame_revision") ||
+                draw == nullptr || draw->publication != publication || draw->requested != requested || draw->submitted != 0U ||
+                draw->settled != 0U || draw->encoded == 0U || draw->encoded >= browser_ordinal || state.retired != 0U ||
+                custody == state.custody.end() || custody->second.released ||
+                custody->second.settled + custody->second.abandoned >= custody->second.encoded)
+                reject("Iced submission lacks its exact prior encoded draw");
+            else
+                draw->submitted = browser_ordinal;
         } else if (event == "iced.surface.source_texture_create" || event == "iced.surface.source_texture_destroyed") {
             const std::string source = record.value("source", "");
             if (!valid_identity(source) || !record.value("direct_sampling", false)) {
@@ -1189,32 +1252,40 @@ struct SurfaceAudit final {
                     reject("Iced metadata acquisition lacks its exact dispatched physical transfer");
                 custody.metadata = metadata_receipt(record);
                 custody.acquired = true;
+                custody.acquired_at = browser_ordinal;
                 state.acquired = browser_ordinal;
             } else {
                 if (!custody.acquired) reject("Iced selected image without an exact sample lease");
                 ++custody.selected;
                 if (!valid_identity(record.value("requested_surface", "")))
                     reject("Iced selected draw lacks requested capability identity");
-                draws.push_back({id, record.value("requested_surface", ""), browser_ordinal});
+                if (draws.size() >= kAcceptanceRecordLimit) {
+                    reject("Iced draw identity inventory exhausted");
+                    return;
+                }
+                draws.push_back({id, record.value("requested_surface", ""), publication, browser_ordinal});
             }
         } else if (event == "iced.surface.pending_discarded") {
             if (state.created == 0U || state.discarded != 0U) reject("Iced pending discard does not name a unique live import");
             state.discarded = browser_ordinal;
         } else if (event == "iced.surface.renderer_reconstructed") {
             const std::string requested = record.value("requested_surface", "");
+            const auto retained = state.custody.find(scalar(record, "presentation_revision"));
             if (state.retired != 0U)
                 reject("Iced surface used after texture retirement");
-            else if (!valid_identity(requested) || requested == id || state.acquired == 0U)
+            else if (!valid_identity(requested) || requested == id || state.acquired == 0U || retained == state.custody.end() ||
+                     !retained->second.acquired || retained->second.released)
                 reject("pipeline reconstruction lacks its retained sample");
             else {
                 if (!admit(requested)) return;
                 auto& pending = surfaces[requested];
-                const auto preparation = pending.requested != 0U ? pending.requested : pending.created;
-                if (pending.reconstruction || preparation == 0U || state.acquired >= preparation || pending.acquired != 0U ||
+                const auto preparation = pending.admitted;
+                if (pending.reconstruction || preparation == 0U || retained->second.acquired_at >= browser_ordinal ||
+                    pending.acquired != 0U ||
                     pending.discarded != 0U || pending.retired != 0U)
                     reject("renderer reconstruction is duplicate or outside its exact pending ownership window");
                 else
-                    pending.reconstruction = Reconstruction{id, requested, browser_ordinal};
+                    pending.reconstruction = Reconstruction{id, requested, scalar(record, "presentation_revision"), browser_ordinal};
             }
         } else if (event == "iced.surface.import_dropped") {
             if (state.created == 0U || state.import_dropped != 0U) reject("Iced import drop lacks its unique owner");
@@ -1288,11 +1359,16 @@ struct SurfaceAudit final {
         }
         for (const auto& [publication, custody] : state.custody) {
             if (custody.selected != custody.encoded) return false;
+            // A visible retained image keeps drawing while acceptance advances.
+            // After positive completed-draw evidence, its live read may own
+            // additional GPU submissions. Final release and retirement still
+            // require every encoded reader to settle below and in browser().
+            const bool live_draw = permit_held && state.retired == 0U && custody.acquired && !custody.released && custody.settled != 0U;
             // Process exit ends the page's remaining readers without delivering
             // JavaScript callbacks. It does not establish a successful draw.
-            // A live page or an explicitly destroyed texture still needs every
-            // ordinary submission receipt; bridge closure alone is insufficient.
-            if (custody.encoded != custody.settled + custody.abandoned && !(browser_exited && state.retired == 0U)) return false;
+            // A released sample or explicitly destroyed texture still needs
+            // every ordinary receipt; bridge closure alone is insufficient.
+            if (custody.encoded != custody.settled + custody.abandoned && !live_draw && !(browser_exited && state.retired == 0U)) return false;
             if (state.retired != 0U && custody.acquired && !custody.released) return false;
         }
         for (const auto& [publication, frame] : state.samples) {
@@ -1324,15 +1400,26 @@ struct SurfaceAudit final {
     [[nodiscard]] std::string joined_surface_failure(const std::string& id, const SurfaceState& state) const {
         if (!receipts_joined(id, state))
             return "surface " + id + " lacks exact source, paired metadata, dispatch, or physical completion evidence";
-        if (state.created == 0U && state.samples.empty() && state.requested != 0U && state.candidate_withdrawn) {
-            if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || state.replaced == 0U)
-                return "unsampled candidate " + id + " lacks capability replacement and physical retirement";
+        if (state.created == 0U && state.samples.empty()) {
+            if (state.native_stage != 4U || state.firefox_stage != 5U || state.import_failed || state.firefox_import_failed ||
+                state.width != state.browser_width || state.height != state.browser_height)
+                return "unsampled arena " + id + " lacks matching native and Firefox admission";
+            if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || !state.withdrawn)
+                return "unsampled arena " + id + " lacks withdrawal and physical retirement";
+            const bool released_without_sampling =
+                !state.publications.empty() && state.publications.size() == state.receipts.size() &&
+                std::ranges::all_of(state.receipts, [](const auto& receipt) {
+                    return receipt.second.release_only && receipt.second.stage == 3U;
+                });
+            if ((!released_without_sampling && (!state.publications.empty() || !state.reads.empty() || !state.transfers.empty() ||
+                                                 !state.receipts.empty())) ||
+                !state.custody.empty() || !state.source_textures.empty())
+                return "unsampled arena " + id + " has image custody without a receiver texture";
             return {};
         }
-        if (state.created == 0U && state.samples.empty() && !state.candidate_withdrawn) return {};
         if (state.firefox_import_failed) {
             const bool native_rejection = state.native_stage == 4U && state.import_failed;
-            if (!native_rejection || state.generation != state.iced_generation || state.width != state.browser_width ||
+            if (!native_rejection || state.width != state.browser_width ||
                 state.height != state.browser_height || !state.native_retired)
                 return "rejected import " + id + " lacks matching native admission and retirement";
             if (state.firefox_stage != 2U || state.created == 0U || state.acquired != 0U || state.discarded <= state.created ||
@@ -1348,7 +1435,7 @@ struct SurfaceAudit final {
                                              return transfer.second.terminal == TerminalRead::Retained;
                                          });
                                      });
-        if (state.native_stage != 4U || state.generation != state.iced_generation || state.width != state.browser_width ||
+        if (state.native_stage != 4U || state.width != state.browser_width ||
             state.height != state.browser_height || (!state.native_retired && !writer_retained))
             return "surface " + id + " lacks matching native/browser import and retirement";
         if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
@@ -1382,7 +1469,8 @@ struct SurfaceAudit final {
         for (const auto& [id, state] : surfaces) {
             if (state.native_stage != 4U) return incomplete(id, "native arena admission");
             if (!receipts_joined(id, state, true)) return incomplete(id, "source receipt, paired image metadata, or draw custody");
-            if (state.native_retired && !joined_surface_failure(id, state).empty()) return incomplete(id, "retired arena settlement");
+            if (state.native_retired)
+                if (const auto reason = joined_surface_failure(id, state); !reason.empty()) return incomplete(id, reason);
             for (const auto& [publication, frame] : state.samples) {
                 const auto produced = state.publications.find(publication);
                 if (produced == state.publications.end() || produced->second != frame)
@@ -1402,7 +1490,7 @@ struct SurfaceAudit final {
         for (auto iterator = surfaces.begin(); iterator != surfaces.end();) {
             auto& [id, state] = *iterator;
             if (state.native_retired && (state.firefox_retired || state.firefox_import_failed) &&
-                (state.retired != 0U || (state.created == 0U && state.replaced != 0U))) {
+                (state.retired != 0U || state.created == 0U)) {
                 if (const auto reason = joined_surface_failure(id, state); !reason.empty()) { return; }
                 iterator = surfaces.erase(iterator);
                 continue;
@@ -1416,30 +1504,76 @@ struct SurfaceAudit final {
             const auto& [id, source] = item;
             return source.native.retired() && source.browser.retired() && source_joined(source) && !surfaces.contains(source.arena);
         });
-        draws.clear();
+        // Keep unfinished callbacks addressable across scenario changes. Only
+        // draws selected in the new scenario can prove its renderer handoff.
+        scenario_started = browser_ordinal;
+        std::erase_if(draws, [&](const Draw& draw) { return draw.settled != 0U || !surfaces.contains(draw.selected); });
+        for (auto& [_, state] : surfaces)
+            state.draw_indices.clear();
+        for (std::size_t index = 0U; index != draws.size(); ++index)
+            if (draws[index].identity != 0U)
+                surfaces.at(draws[index].selected).draw_indices.emplace(draws[index].identity, index);
+    }
+
+    [[nodiscard]] const SampleCustody* settled_draw(const Draw& draw) const {
+        const auto& surface = surfaces.at(draw.selected);
+        const auto custody = surface.custody.find(draw.publication);
+        if (draw.ordinal <= scenario_started || custody == surface.custody.end() || !custody->second.acquired ||
+            custody->second.acquired_at >= draw.ordinal || draw.submitted <= draw.encoded || draw.encoded <= draw.ordinal ||
+            draw.settled <= draw.submitted || draw.abandoned)
+            return nullptr;
+        return &custody->second;
+    }
+
+    [[nodiscard]] const Draw* pending_fallback(const std::string& candidate) const {
+        const auto found = surfaces.find(candidate);
+        if (!failure.empty() || found == surfaces.end()) return nullptr;
+        const auto& pending = found->second;
+        if (pending.admitted == 0U || pending.acquired != 0U || !pending.publications.empty() || !pending.reconstruction ||
+            pending.reconstruction->requested != candidate || pending.reconstruction->ordinal <= pending.admitted)
+            return nullptr;
+        const auto& active_identity = pending.reconstruction->completed;
+        const auto& active = surfaces.at(active_identity);
+        std::size_t latest_prior_acquisition = 0U;
+        for (const auto& [_, surface] : surfaces)
+            for (const auto& [publication, custody] : surface.custody)
+                if (custody.acquired_at < pending.reconstruction->ordinal)
+                    latest_prior_acquisition = std::max(latest_prior_acquisition, custody.acquired_at);
+        const auto retained = active.custody.find(pending.reconstruction->publication);
+        if (active.generation >= pending.generation || retained == active.custody.end() ||
+            retained->second.acquired_at == 0U || retained->second.acquired_at != latest_prior_acquisition ||
+            !receipts_joined(active_identity, active, true))
+            return nullptr;
+        const auto fallback = std::ranges::find_if(draws, [&](const Draw& draw) {
+            return draw.selected == active_identity && draw.requested == (pending.created == 0U ? active_identity : candidate) &&
+                   draw.publication == pending.reconstruction->publication && draw.ordinal > pending.reconstruction->ordinal &&
+                   settled_draw(draw) != nullptr;
+        });
+        return fallback == draws.end() ? nullptr : &*fallback;
     }
 
     [[nodiscard]] bool pending_supersession_completed() const {
         if (!failure.empty()) return false;
         for (const auto& [b, pending] : surfaces) {
-            const auto preparation = pending.requested != 0U ? pending.requested : pending.created;
-            const auto discarded = pending.created == 0U ? pending.replaced : pending.discarded;
-            const bool retired = pending.created == 0U ? pending.replaced > preparation : pending.retired > discarded;
+            const auto preparation = pending.admitted;
+            const auto discarded = pending.created == 0U ? pending.firefox_withdrawn : pending.discarded;
+            const bool retired = pending.created == 0U ? pending.firefox_retired > discarded : pending.retired > discarded;
             if (!pending.candidate_withdrawn || preparation == 0U || pending.acquired != 0U || !pending.publications.empty() ||
                 discarded <= preparation || !retired || !pending.reconstruction || pending.reconstruction->requested != b ||
-                pending.reconstruction->ordinal <= preparation || pending.reconstruction->ordinal >= discarded ||
+                pending.reconstruction->ordinal <= preparation ||
+                (pending.created != 0U && pending.reconstruction->ordinal >= discarded) ||
                 !pending.firefox_retired || !pending.native_retired)
                 continue;
-            const auto& active_identity = pending.reconstruction->completed;
-            const auto& active = surfaces.at(active_identity);
-            std::size_t latest_prior_acquisition = 0U;
-            for (const auto& [_, candidate] : surfaces)
-                if (candidate.acquired < preparation) latest_prior_acquisition = std::max(latest_prior_acquisition, candidate.acquired);
-            if (active.generation >= pending.generation || active.acquired == 0U || active.acquired != latest_prior_acquisition) continue;
+            if (!joined_surface_failure(b, pending).empty()) continue;
+            const auto* fallback = pending_fallback(b);
+            if (!fallback) continue;
             for (const auto& draw : draws) {
                 const auto& latest = surfaces.at(draw.selected);
+                const auto custody = settled_draw(draw);
                 if (latest.generation > pending.generation && latest.created > preparation && latest.acquired > discarded &&
-                    draw.ordinal > latest.acquired && draw.requested == draw.selected)
+                    latest.acquired > pending.reconstruction->ordinal &&
+                    draw.ordinal > fallback->ordinal && draw.requested == draw.selected && custody != nullptr &&
+                    custody->acquired_at == latest.acquired && receipts_joined(draw.selected, latest, true))
                     return true;
             }
         }
@@ -1709,7 +1843,8 @@ struct PixelBoundaryAudit final {
                 for (const auto* field : {"transfer_sequence", "timeline_ready", "timeline_release"})
                     copy(field);
             } else {
-                for (const auto* field : {"allocation_generation", "width", "height"})
+                identity["workspace_source"] = record.value("source", "");
+                for (const auto* field : {"width", "height"})
                     copy(field);
             }
         }
@@ -1767,7 +1902,7 @@ struct PixelBoundaryAudit final {
                                scalar(identity, "timeline_ready") != scalar(fact, "timeline_ready") ||
                                scalar(identity, "timeline_release") != scalar(fact, "timeline_ready") + 1U))
                 reject("Firefox physical timeline receipt differs");
-            if (owner == 3U && (scalar(identity, "allocation_generation") != scalar(fact, "allocation_generation") ||
+            if (owner == 3U && (identity.value("workspace_source", "") != fact.value("workspace_source", "") ||
                                 scalar(identity, "width") != scalar(fact, "capacity_width") ||
                                 scalar(identity, "height") != scalar(fact, "capacity_height")))
                 reject("Iced allocation differs from native publication");
@@ -1925,7 +2060,6 @@ struct PixelBoundaryAudit final {
                 auto& value = composition.cards[card][kind];
                 auto stable_record = record;
                 stable_record.erase("elapsed_ms");
-                stable_record.erase("timeline_ready");
                 if (value && *value != stable_record)
                     reject("duplicate-conflicting composition card sample");
                 else
@@ -1956,7 +2090,7 @@ struct PixelBoundaryAudit final {
         if (!enabled && (event == "presentation.frame.edge" || event == "firefox.workspace.frame_forwarded")) return;
         const std::string surface = boundary == 0U ? SurfaceAudit::native_identity(record) : record.value("surface", "");
         const Key key{surface, scalar(record, "presentation_revision")};
-        if (surface.empty() || key.second == 0U) {
+        if (!SurfaceAudit::valid_identity(surface) || key.second == 0U) {
             reject("invalid physical pixel publication");
             return;
         }
@@ -2039,7 +2173,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
                                 {"sample_rgba", 0xff705030U}};
     const std::string surface = SurfaceAudit::native_identity(native);
     const auto pixel = [&](const char* event, const char* boundary) {
-        return nlohmann::json{{"event", event},
+        nlohmann::json record{{"event", event},
                               {"boundary", boundary},
                               {"surface", surface},
                               {"source", "00000000000000030000000000000004"},
@@ -2051,13 +2185,18 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
                               {"content_height", 384U},
                               {"width", 894U},
                               {"height", 1080U},
-                              {"allocation_generation", 2U},
                               {"transfer_sequence", 4U},
                               {"timeline_ready", 7U},
                               {"timeline_release", 8U},
                               {"layer", 0U},
                               {"slot", 1U},
                               {"sample_rgba", 0xff705030U}};
+        if (std::string_view{event}.starts_with("iced.surface.")) {
+            record.erase("transfer_sequence");
+            record.erase("timeline_ready");
+            record.erase("timeline_release");
+        }
+        return record;
     };
     auto imported = pixel("firefox.workspace.pixel", "import");
     auto mailbox = pixel("firefox.workspace.pixel", "mailbox");
@@ -2127,19 +2266,38 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
             CHECK(receipt.receivers[1].identity.empty());
         }
     }
-    for (const auto field : {"sample_rgba", "content_session", "frame_revision", "allocation_generation", "layer", "slot", "sample_x"}) {
+    for (const auto field : {"sample_rgba", "content_session", "frame_revision", "width", "height", "layer", "slot", "sample_x"}) {
         auto changed = owned;
         changed[field] = field == std::string_view{"sample_rgba"} ? 0x00705030U : 8U;
         PixelBoundaryAudit audit;
         fill(audit, changed);
         CHECK_FALSE(audit.failure.empty());
     }
+    for (const bool direct : {false, true}) {
+        for (const auto source : {"", "00000000000000030000000000000005"}) {
+            auto changed = owned;
+            changed["source"] = source;
+            PixelBoundaryAudit audit;
+            fill(audit, changed, false, false, {}, 7U, direct);
+            CHECK_FALSE(audit.failure.empty());
+            CHECK_FALSE(audit.raw_complete());
+        }
+        for (const auto arena : {"", "00000000000000010000000000000003"}) {
+            auto changed = owned;
+            changed["surface"] = arena;
+            PixelBoundaryAudit audit;
+            fill(audit, changed, false, false, {}, 7U, direct);
+            CHECK_FALSE(audit.raw_complete());
+            CHECK_FALSE(audit.retained_logical_content);
+        }
+    }
     PixelBoundaryAudit partial;
     fill(partial, owned, true);
     CHECK(partial.joined.back() == 0U);
     CHECK_FALSE(partial.retained_logical_content);
     for (const auto field :
-         {"source_instance", "clean_revision", "source_observation_revision", "content_x", "capacity_width", "timeline_ready"}) {
+         {"source_instance", "clean_revision", "source_observation_revision", "content_x", "allocation_generation", "capacity_width",
+          "timeline_ready"}) {
         PixelBoundaryAudit audit;
         fill(audit, owned);
         auto edge = native;
@@ -3236,17 +3394,17 @@ class FirstAuditFailure final {
 
 struct AtlasDrawAudit final {
     using SourceKey = std::array<std::uint64_t, 4U>;
-    using SampleKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
-    using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>;
+    using SampleKey = std::pair<std::string, std::uint64_t>;
+    using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
     static constexpr std::initializer_list<const char*> source_fields{
         "content_session", "source_kind", "source_instance", "source_revision", "content_width",   "content_height", "dataset_identity",
         "columns",         "rows",        "first_row",       "matching_count",  "visible_indices", "row_capacity",   "row_origin",
         "card_extent"};
     static constexpr std::initializer_list<const char*> image_fields{
-        "surface",         "generation",  "width",           "height",          "presentation_revision", "frame_revision",
-        "content_session", "source_kind", "source_instance", "source_revision", "content_width",         "content_height",
-        "columns",         "rows",        "first_row",       "matching_count",  "visible_indices",       "row_capacity",
-        "row_origin",      "card_extent"};
+        "surface",         "width",        "height",          "presentation_revision", "frame_revision", "content_session",
+        "source_kind",     "source_instance", "source_revision", "content_width",       "content_height", "columns",
+        "rows",            "first_row",    "matching_count",  "visible_indices",       "row_capacity",   "row_origin",
+        "card_extent"};
     static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
     static constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
     static constexpr std::array return_names{"return-cached", "return-aligned", "return-extra", "return-restored"};
@@ -3295,9 +3453,11 @@ struct AtlasDrawAudit final {
             const auto& [key, record] = entry;
             const auto count = record.find("matching_count");
             if (count == record.end() || !count->is_number_unsigned() || *count != 0U) return false;
-            const auto& [identity, generation, publication] = key;
+            const auto& [identity, publication] = key;
             const auto surface = physical.surfaces.find(identity);
-            if (surface == physical.surfaces.end() || surface->second.iced_generation != generation) return false;
+            if (surface == physical.surfaces.end() || surface->second.width != scalar(record, "width") ||
+                surface->second.height != scalar(record, "height"))
+                return false;
             const auto draw = surface->second.custody.find(publication);
             return draw != surface->second.custody.end() && draw->second.acquired && draw->second.settled != 0U;
         });
@@ -3343,11 +3503,11 @@ struct AtlasDrawAudit final {
     }
 
     [[nodiscard]] static SampleKey sample_key(const nlohmann::json& record) {
-        return {record.value("surface", ""), scalar(record, "generation"), scalar(record, "presentation_revision")};
+        return {record.value("surface", ""), scalar(record, "presentation_revision")};
     }
 
     [[nodiscard]] static AllocationKey allocation_key(const nlohmann::json& record) {
-        return {record.value("surface", ""), scalar(record, "generation"), scalar(record, "width"), scalar(record, "height")};
+        return {record.value("surface", ""), scalar(record, "width"), scalar(record, "height")};
     }
 
     void observe_staged_rows(const AllocationKey& allocation, const std::uint64_t rows) {
@@ -3626,7 +3786,7 @@ struct AtlasDrawAudit final {
             check(source != sources.end(), "draw_gallery_source_missing", record) &&
             check(capture != acquisitions.end(), "draw_sample_acquisition_missing", record) &&
             check(visible(record), "draw_visible_geometry_invalid", record) &&
-            check(SurfaceAudit::valid_identity(record.value("surface", "")) && scalar(record, "generation") != 0U &&
+            check(SurfaceAudit::valid_identity(record.value("surface", "")) &&
                       scalar(record, "presentation_revision") != 0U,
                   "draw_sample_identity_invalid", record) &&
             check(width <= scalar(record, "width") && height <= scalar(record, "height"), "draw_content_exceeds_allocation", record) &&
@@ -5610,7 +5770,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
               << "\nnative JSONL: " << diagnostics << "\nnative runtime log: " << runtime_log << "\nFirefox log: " << firefox_log << '\n'
               << std::flush;
 
-    if (!logging) {
+    if (profile_ == "blocked" || profile_ == "quiet") {
         // The acceptance socket reports entry into the real I/O gate. This
         // shutdown case needs neither diagnostic records nor a startup delay.
         std::uint64_t progress = 0U;
@@ -5646,6 +5806,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 if (kind == Kind::Failed)
                     FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index
                                                                     << ", frontend source line " << entered->staging_bytes
+                                                                    << "\nfrontend error: " << process.frontend_failure()
                                                                     << "\nnative runtime output:\n"
                                                                     << read_tail(runtime_log));
                 if (kind == Kind::PressureEntered) {
@@ -5670,11 +5831,13 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         const auto terminal = await_shutdown(process, deadline.get());
         REQUIRE(terminal.has_value());
         CHECK(*terminal == 0);
-        CHECK_FALSE(std::filesystem::exists(diagnostics));
-        CHECK_FALSE(std::filesystem::exists(firefox_log));
-        CHECK_FALSE(std::filesystem::exists(artifact_sibling(diagnostics, "-application.log")));
-        INFO("quiet runtime output: " << read_tail(runtime_log));
-        CHECK(std::filesystem::file_size(runtime_log) == 0U);
+        if (!logging) {
+            CHECK_FALSE(std::filesystem::exists(diagnostics));
+            CHECK_FALSE(std::filesystem::exists(firefox_log));
+            CHECK_FALSE(std::filesystem::exists(artifact_sibling(diagnostics, "-application.log")));
+            INFO("quiet runtime output: " << read_tail(runtime_log));
+            CHECK(std::filesystem::file_size(runtime_log) == 0U);
+        }
         return;
     }
 
@@ -5741,6 +5904,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     bool capacity_armed = false;
     bool capacity_available = false;
     std::optional<ExploreAcceptanceGate::ControlObservation> capacity_held;
+    std::optional<std::string> supersession_held;
+    bool supersession_released = false;
     bool terminal_failure_observed = false;
     std::uint64_t released_placeholder_generation = 0U;
     NativeAudit::FinalCursorGenerations final_generations;
@@ -5774,6 +5939,12 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             return slots != native.placeholder_slots.end() && browser.rendered_frame_for_slots(slots->second, browser_frame->second, 0U);
         });
     };
+    const auto terminal_annotation_ready = [&] {
+        return viewer_scenario != "terminal" || (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
+                                                 browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer &&
+                                                 browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
+                                                 browser.surface_redraws.contains(browser.presentation_receipt));
+    };
     const auto acceptance_blockers = [&] {
         std::vector<std::string> blockers;
         const auto add = [&blockers](const std::string_view owner, const std::string_view blocker) {
@@ -5781,8 +5952,15 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         };
         add("surface", surface_audit.failure);
         add("pixel", pixel_audit.failure);
-        add("native", native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
-        add("browser", browser.readiness_blocker());
+        if (viewer_scenario.empty()) {
+            add("native", native.readiness_blocker(final_generations, seeded_augmentation_ready(), pixel_fixture));
+            add("browser", browser.readiness_blocker());
+        } else {
+            if (!native.presentation_ready || !native.explore_rendered) blockers.emplace_back("native: viewer product");
+            if (!browser.viewer_complete || !browser.surface_draws.contains(browser.viewer_presentation))
+                blockers.emplace_back("browser: completed viewer draw");
+            if (!terminal_annotation_ready()) blockers.emplace_back("native/browser: terminal Annotation lifecycle");
+        }
         if (pixel_fixture) {
             if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical))
                 blockers.emplace_back("rendered probe: vertical padding export");
@@ -5799,6 +5977,11 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         if (!frontend_settled_) blockers.emplace_back("frontend: typed scenario settlement");
         std::string surface_blocker;
         if (!surface_audit.evidence_settled(&surface_blocker)) add("surface", surface_blocker);
+        if (pending_reconstruction && !surface_audit.pending_supersession_completed())
+            blockers.emplace_back("surface: completed pending-candidate handoff");
+        if ((viewer_scenario.empty() || viewer_scenario == "copy" || viewer_scenario == "semantics") &&
+            !pixel_audit.continuity_complete(viewer_scenario.empty()))
+            blockers.emplace_back("pixel: copy and semantic continuity");
         if (pixel_fixture && !pixel_audit.composition_complete()) blockers.emplace_back("pixel: atlas fixture composition");
         return blockers;
     };
@@ -5830,12 +6013,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                                                   {"held_compiled_index", native.held_compiled_index},
                                                   {"held_staging_bytes", native.held_capacity}});
     };
-    const auto terminal_annotation_ready = [&] {
-        return viewer_scenario != "terminal" || (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
-                                                 browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer &&
-                                                 browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
-                                                 browser.surface_redraws.contains(browser.presentation_receipt));
-    };
     bool readiness_reached = false;
     for (;;) {
         consume_records();
@@ -5858,6 +6035,11 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 final_generations = *identified;
         }
         const auto recovery = pixel_audit.probe_failure_evidence(probe_failure);
+        if (supersession_held && !supersession_released && surface_audit.pending_fallback(*supersession_held)) {
+            command_explore(static_cast<std::uint8_t>(ExploreAcceptanceGate::ControlCommand::ReleasePendingSupersession),
+                            "released pending arena after the exact retained fallback draw settled");
+            supersession_released = true;
+        }
         if (recover_before_reads && !recovery_redraw_requested && recovery.forwarded) {
             command_explore(16U, "requested exact-content probe recovery");
             recovery_redraw_requested = true;
@@ -5989,6 +6171,14 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 record_acceptance_state("acceptance.control.failed", true);
                 process.terminate();
                 FAIL("workspace Wayland Explore control event was invalid");
+            }
+            if (event->event == ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld) {
+                REQUIRE(pending_reconstruction);
+                REQUIRE_FALSE(supersession_held.has_value());
+                REQUIRE((event->source_high != 0U || event->source_low != 0U));
+                supersession_held = SurfaceAudit::native_identity(
+                    {{"surface_high", event->source_high}, {"surface_low", event->source_low}});
+                continue;
             }
             if (event->event == ExploreAcceptanceGate::ControlEvent::VisibleReadHeld) {
                 REQUIRE(visible_read_armed);
@@ -6620,7 +6810,9 @@ void workspace_wayland_gdr() {
 
 void workspace_wayland_quiet() {
     const std::string profile = GENERATE("blocked", "quiet");
-    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, false};
+    const char* const diagnostics = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_QUIET_DIAGNOSTICS");
+    const bool logging = diagnostics && std::string_view{diagnostics} == "1";
+    WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, logging, false, true, {}, false};
     session.RunScenario("quiet", true);
 }
 
@@ -6857,7 +7049,11 @@ namespace {
 
 [[nodiscard]] nlohmann::json browser_surface_record(const char* event, const std::uint64_t low = 12U) {
     const std::string_view name{event};
+    static std::uint64_t next_draw = 0U;
+    static std::unordered_map<std::uint64_t, std::uint64_t> current_draw;
+    if (name == "iced.surface.sample_draw_selected") current_draw[low] = ++next_draw;
     return {{"event", event},
+            {"draw_identity", current_draw[low]},
             {"surface",
              SurfaceAudit::native_identity(native_surface_record("", name.starts_with("firefox.workspace.source.") ? low + 1000U : low))},
             {"source", SurfaceAudit::native_identity(native_surface_record("", low + 1000U))},
@@ -6876,7 +7072,6 @@ namespace {
             {"timeline_ready", 1U},
             {"timeline_release", 2U},
             {"requested_surface", SurfaceAudit::native_identity(native_surface_record("", low))},
-            {"generation", 7U},
             {"width", 64U},
             {"height", 32U},
             {"frame_revision", 23U},
@@ -6923,12 +7118,13 @@ constexpr std::array browser_surface_events{"firefox.workspace.admitted",
                                             "iced.surface.sample_acquired",
                                             "iced.surface.sample_draw_selected",
                                             "iced.surface.draw_encoded",
+                                            "iced.surface.draw_submitted",
                                             "iced.frame.draw_settled",
                                             "firefox.workspace.withdrawal",
                                             "iced.frame.sample_released",
                                             "iced.surface.texture_destroyed",
                                             "firefox.workspace.retired"};
-constexpr std::size_t browser_live_stages = 16U;
+constexpr std::size_t browser_live_stages = 17U;
 
 void record_source_transfer(SurfaceAudit& audit, const bool acquired = true) {
     for (std::size_t stage = 0U; stage < (acquired ? 15U : 13U); ++stage)
@@ -6962,6 +7158,37 @@ void record_receiver_withdrawal(SurfaceAudit& audit) {
     audit.browser(browser_surface_record("firefox.workspace.retired"));
 }
 
+TEST_CASE("unsampled arena retirement joins native and Firefox physical ownership", "[workspace][audit]") {
+    const std::string fault = GENERATE("complete", "native-admission", "browser-admission", "dimensions", "native-withdrawal",
+                                      "browser-withdrawal", "native-retirement", "browser-retirement", "failed-retirement");
+    CAPTURE(fault);
+    SurfaceAudit audit;
+    for (std::size_t stage = 0U; stage < 4U; ++stage)
+        if (fault != "native-admission" || stage != 2U) audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < 6U; ++stage) {
+        if (stage == 1U || (fault == "browser-admission" && stage == 4U)) continue;
+        auto record = browser_surface_record(browser_surface_events[stage]);
+        if (fault == "dimensions") record["width"] = 65U;
+        audit.browser(record);
+    }
+    if (fault != "native-withdrawal") audit.native(native_surface_record("presentation.candidate.withdrawal"));
+    if (fault != "browser-withdrawal") audit.browser(browser_surface_record("firefox.workspace.drop_received"));
+    if (fault != "native-retirement") {
+        auto retirement = native_surface_record("presentation.retirement");
+        if (fault == "failed-retirement") retirement["outcome"] = 0U;
+        audit.native(retirement);
+    }
+    if (fault != "browser-retirement") audit.browser(browser_surface_record("firefox.workspace.retired"));
+    if (fault == "complete") {
+        CHECK(audit.joined_failure().empty());
+        CHECK(audit.evidence_settled());
+        audit.SettleScenario();
+        CHECK(audit.surfaces.empty());
+    } else {
+        CHECK_FALSE(audit.joined_failure().empty());
+    }
+}
+
 TEST_CASE("Image metadata stays paired with its acquired pixels through retained draws", "[workspace][audit]") {
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -6969,13 +7196,61 @@ TEST_CASE("Image metadata stays paired with its acquired pixels through retained
         audit.browser(browser_surface_record(browser_surface_events[stage]));
     REQUIRE(audit.evidence_settled());
     audit.SettleScenario();
-    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.frame.draw_settled"})
+    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted",
+                             "iced.frame.draw_settled"})
         audit.browser(browser_surface_record(event));
     REQUIRE(audit.evidence_settled());
     const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
     REQUIRE(surface.custody.at(1U).metadata.has_value());
     CHECK(surface.custody.at(1U).metadata == surface.transfers.at({1U, 1U}).metadata);
     CHECK(surface.custody.at(1U).settled == 2U);
+}
+
+TEST_CASE("exact draw submission survives non-FIFO encoder settlement", "[workspace][audit]") {
+    SurfaceAudit audit;
+    for (const auto* event : native_surface_events)
+        audit.native(native_surface_record(event));
+    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    const auto submitted_identity = audit.draws.front().identity;
+    audit.SettleScenario();
+    REQUIRE(audit.draws.size() == 1U);
+    // The older encoder entered the queue. A later encoder of the same
+    // publication is abandoned before the older work-done callback arrives.
+    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.frame.draw_abandoned"})
+        audit.browser(browser_surface_record(event));
+    auto settled = browser_surface_record("iced.frame.draw_settled");
+    settled["draw_identity"] = submitted_identity;
+    audit.browser(settled);
+    for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
+        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    REQUIRE(audit.joined_failure().empty());
+    REQUIRE(audit.draws.size() == 2U);
+    CHECK(audit.draws[0].submitted > audit.draws[0].encoded);
+    CHECK(audit.draws[0].settled > audit.draws[0].submitted);
+    CHECK_FALSE(audit.draws[0].abandoned);
+    CHECK(audit.draws[1].submitted == 0U);
+    CHECK(audit.draws[1].abandoned);
+}
+
+TEST_CASE("draw submission requires exact encoded identity and live custody", "[workspace][audit]") {
+    const std::string fault = GENERATE("complete", "width", "height", "requested", "publication", "before-encoding",
+                                      "after-settlement", "duplicate", "draw-identity");
+    CAPTURE(fault);
+    SurfaceAudit audit;
+    record_source_transfer(audit);
+    for (std::size_t stage = 9U; stage < browser_live_stages - 2U; ++stage)
+        if (fault != "before-encoding" || std::string_view{browser_surface_events[stage]} != "iced.surface.draw_encoded")
+            audit.browser(browser_surface_record(browser_surface_events[stage]));
+    if (fault == "after-settlement") audit.browser(browser_surface_record("iced.frame.draw_abandoned"));
+    auto submitted = browser_surface_record("iced.surface.draw_submitted");
+    if (fault == "width" || fault == "height") submitted.erase(fault);
+    if (fault == "requested") submitted["requested_surface"] = "";
+    if (fault == "publication") submitted["presentation_revision"] = 2U;
+    if (fault == "draw-identity") submitted.erase("draw_identity");
+    audit.browser(submitted);
+    if (fault == "duplicate") audit.browser(submitted);
+    CHECK(audit.failure.empty() == (fault == "complete"));
 }
 
 TEST_CASE("Image metadata acceptance validates payload and physical transfer identity", "[workspace][audit]") {
@@ -7017,6 +7292,7 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
     CHECK(audit.draws.empty());
     audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
     audit.browser(browser_surface_record("iced.surface.draw_encoded"));
+    audit.browser(browser_surface_record("iced.surface.draw_submitted"));
     audit.browser(browser_surface_record("iced.frame.draw_settled"));
     CHECK(audit.evidence_settled());
     CHECK(audit.draws.size() == 1U);
@@ -7202,7 +7478,15 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
             audit.native(native_surface_record(event));
         for (std::size_t index = 0U; index < browser_surface_events.size(); ++index)
             if (index != omitted) audit.browser(browser_surface_record(browser_surface_events[index]));
-        CHECK_FALSE(audit.joined_failure().empty());
+        if (std::string_view{browser_surface_events[omitted]} == "iced.surface.draw_submitted") {
+            // Physical closure remains independent of proof that this exact
+            // selected/requested draw entered a submitted encoder.
+            CHECK(audit.joined_failure().empty());
+            REQUIRE(audit.draws.size() == 1U);
+            CHECK(audit.draws.front().submitted == 0U);
+        } else {
+            CHECK_FALSE(audit.joined_failure().empty());
+        }
     }
     SurfaceAudit reordered;
     reordered.native(native_surface_record("presentation.admission.written"));
@@ -7478,29 +7762,64 @@ TEST_CASE("surface join rejects otherwise complete traces for different physical
 
 namespace {
 
-enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBeforeDraw, DuplicateReconstruction, DifferentCompleted };
+enum class MissingHandoffEvidence {
+    PendingDiscard, Reconstruction, CaptureBeforeDraw, DuplicateReconstruction, DifferentCompleted,
+    Fallback, FallbackPublication, FallbackRequest, ReplacementPublication, AcquisitionAfterReconstruction, OlderCompleted,
+    AbandonedFallback, AbandonedReplacement, FallbackSubmission, ReplacementSubmission,
+    DuplicateFallbackSubmission, DuplicateReplacementSubmission
+};
+enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
 
-[[nodiscard]] SurfaceAudit pending_handoff(const std::optional<MissingHandoffEvidence> missing = std::nullopt) {
+[[nodiscard]] SurfaceAudit pending_handoff(const std::optional<MissingHandoffEvidence> missing = std::nullopt,
+                                         const bool pending_texture = true, const bool incumbent_after_admission = false,
+                                         const bool retain_latest = false) {
     SurfaceAudit audit;
-    const auto native = [&](const char* event, const std::uint64_t surface) {
+    const auto native = [&](const char* event, const std::uint64_t surface, const std::uint64_t publication = 1U) {
         auto record = native_surface_record(event, surface);
         record["sequence"] = surface;
         record["allocation_generation"] = surface;
+        if (publication != 1U) {
+            record["trace_id"] = 31U + publication;
+            record["span_id"] = 31U + publication;
+            if (scalar(record, "presentation_revision") != 0U) {
+                record["value"] = publication;
+                record["presentation_revision"] = publication;
+                record["transfer_sequence"] = publication;
+                record["timeline_ready"] = publication * 2U - 1U;
+            }
+        }
         audit.native(record);
     };
-    const auto browser = [&](const char* event, const std::uint64_t surface, const std::uint64_t requested = 0U) {
+    const auto browser = [&](const char* event, const std::uint64_t surface, const std::uint64_t requested = 0U,
+                             const std::uint64_t publication = 1U, const HandoffSubmission submission = HandoffSubmission::Submit) {
         auto record = browser_surface_record(event, surface);
-        record["generation"] = surface;
         if (requested != 0U) record["requested_surface"] = SurfaceAudit::native_identity(native_surface_record("", requested));
+        record["presentation_revision"] = publication;
+        record["transfer_sequence"] = publication;
+        record["timeline_ready"] = publication * 2U - 1U;
+        record["timeline_release"] = publication * 2U;
+        record["slot"] = (publication - 1U) % 2U;
         audit.browser(record);
         if (std::string_view{event} == "iced.surface.sample_draw_selected") {
             record["event"] = "iced.surface.draw_encoded";
             audit.browser(record);
-            record["event"] = "iced.frame.draw_settled";
-            audit.browser(record);
+            if (submission == HandoffSubmission::Submit || submission == HandoffSubmission::Duplicate ||
+                submission == HandoffSubmission::Pending) {
+                record["event"] = "iced.surface.draw_submitted";
+                audit.browser(record);
+                if (submission == HandoffSubmission::Duplicate) audit.browser(record);
+            }
+            if (submission != HandoffSubmission::Pending) {
+                record["event"] = submission == HandoffSubmission::Abandon ? "iced.frame.draw_abandoned" : "iced.frame.draw_settled";
+                audit.browser(record);
+            }
         }
     };
     constexpr std::uint64_t d = 11U, a = 12U, b = 13U, c = 14U;
+    const bool newer_incumbent = incumbent_after_admission || missing == MissingHandoffEvidence::FallbackPublication ||
+                                 missing == MissingHandoffEvidence::AcquisitionAfterReconstruction ||
+                                 missing == MissingHandoffEvidence::OlderCompleted;
+    const std::uint64_t retained_publication = newer_incumbent ? 2U : 1U;
     if (missing == MissingHandoffEvidence::DifferentCompleted)
         for (const char* event : native_surface_events)
             native(event, d);
@@ -7513,7 +7832,14 @@ enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBefor
     native("presentation.retirement", b);
     for (std::size_t stage = 4U; stage < 15U; ++stage)
         native(native_surface_events[stage], c);
+    if (newer_incumbent)
+        for (std::size_t stage = 7U; stage < 15U; ++stage)
+            native(native_surface_events[stage], a, 2U);
+    if (missing == MissingHandoffEvidence::ReplacementPublication)
+        for (std::size_t stage = 7U; stage < 15U; ++stage)
+            native(native_surface_events[stage], c, 2U);
     for (const auto surface : {a, c}) {
+        if (retain_latest && surface == c) continue;
         native("presentation.active.withdrawal", surface);
         native("presentation.retirement", surface);
     }
@@ -7523,19 +7849,37 @@ enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBefor
     for (std::size_t stage = 0U; stage < 14U; ++stage)
         browser(browser_surface_events[stage], a);
     for (std::size_t stage = 0U; stage < 6U; ++stage)
-        browser(browser_surface_events[stage], b);
+        if (pending_texture || stage != 1U) browser(browser_surface_events[stage], b);
+    if (newer_incumbent)
+        for (std::size_t stage = 9U; stage < 13U; ++stage)
+            if (stage != 12U || missing != MissingHandoffEvidence::AcquisitionAfterReconstruction)
+                browser(browser_surface_events[stage], a, 0U, 2U);
     if (missing != MissingHandoffEvidence::Reconstruction)
-        browser("iced.surface.renderer_reconstructed", missing == MissingHandoffEvidence::DifferentCompleted ? d : a, b);
+        browser("iced.surface.renderer_reconstructed", missing == MissingHandoffEvidence::DifferentCompleted ? d : a, b,
+                missing == MissingHandoffEvidence::OlderCompleted ? 1U : retained_publication);
     if (missing == MissingHandoffEvidence::DuplicateReconstruction) browser("iced.surface.renderer_reconstructed", a, b);
-    browser("iced.surface.sample_draw_selected", a, b);
-    browser("firefox.workspace.withdrawal", b);
+    if (missing == MissingHandoffEvidence::AcquisitionAfterReconstruction)
+        browser("iced.surface.sample_acquired", a, 0U, 2U);
+    if (missing != MissingHandoffEvidence::Fallback)
+        browser("iced.surface.sample_draw_selected", a,
+                pending_texture || missing == MissingHandoffEvidence::FallbackRequest ? b : a,
+                missing == MissingHandoffEvidence::FallbackPublication ? 1U : retained_publication,
+                missing == MissingHandoffEvidence::AbandonedFallback ? HandoffSubmission::Abandon :
+                missing == MissingHandoffEvidence::FallbackSubmission ? HandoffSubmission::Omit :
+                missing == MissingHandoffEvidence::DuplicateFallbackSubmission ? HandoffSubmission::Duplicate : HandoffSubmission::Submit);
+    if (missing == MissingHandoffEvidence::AbandonedFallback && pending_texture)
+        browser("iced.surface.sample_draw_selected", a, a, retained_publication);
+    if (pending_texture || missing != MissingHandoffEvidence::PendingDiscard)
+        browser("firefox.workspace.drop_received", b);
     for (std::size_t stage = 0U; stage < 2U; ++stage)
         browser(browser_surface_events[stage], c);
-    if (missing != MissingHandoffEvidence::PendingDiscard) browser("iced.surface.pending_discarded", b);
-    browser("iced.surface.import_dropped", b);
-    browser("iced.surface.texture_destroyed", b);
+    if (pending_texture) {
+        if (missing != MissingHandoffEvidence::PendingDiscard) browser("iced.surface.pending_discarded", b);
+        browser("iced.surface.import_dropped", b);
+        browser("iced.surface.texture_destroyed", b);
+    }
     browser("firefox.workspace.retired", b);
-    browser("iced.surface.sample_draw_selected", a, c);
+    browser("iced.surface.sample_draw_selected", a, c, retained_publication);
     for (std::size_t stage = 2U; stage < 6U; ++stage)
         browser(browser_surface_events[stage], c);
     for (std::size_t stage = 6U; stage < 12U; ++stage)
@@ -7545,12 +7889,27 @@ enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBefor
         browser("iced.surface.sample_acquired", c);
     } else {
         browser("iced.surface.sample_acquired", c);
-        browser("iced.surface.sample_draw_selected", a, c);
-        browser("iced.surface.sample_draw_selected", c);
+        browser("iced.surface.sample_draw_selected", a, c, retained_publication);
+        if (missing == MissingHandoffEvidence::ReplacementPublication)
+            for (std::size_t stage = 9U; stage < 13U; ++stage)
+                browser(browser_surface_events[stage], c, 0U, 2U);
+        browser("iced.surface.sample_draw_selected", c, 0U, 1U,
+                missing == MissingHandoffEvidence::AbandonedReplacement ? HandoffSubmission::Abandon :
+                missing == MissingHandoffEvidence::ReplacementSubmission ? HandoffSubmission::Omit :
+                missing == MissingHandoffEvidence::DuplicateReplacementSubmission ? HandoffSubmission::Duplicate : HandoffSubmission::Submit);
+        if (missing == MissingHandoffEvidence::AbandonedReplacement)
+            browser("iced.surface.sample_draw_selected", c, a);
     }
-    for (const auto surface : {a, c})
+    if (newer_incumbent) browser("iced.frame.sample_released", a, 0U, 2U);
+    if (missing == MissingHandoffEvidence::ReplacementPublication) browser("iced.frame.sample_released", c, 0U, 2U);
+    for (const auto surface : {a, c}) {
+        if (retain_latest && surface == c) {
+            browser("iced.surface.sample_draw_selected", c, c, 1U, HandoffSubmission::Pending);
+            continue;
+        }
         for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
             browser(browser_surface_events[stage], surface);
+    }
     if (missing == MissingHandoffEvidence::DifferentCompleted)
         for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
             browser(browser_surface_events[stage], d);
@@ -7558,15 +7917,34 @@ enum class MissingHandoffEvidence { PendingDiscard, Reconstruction, CaptureBefor
 }
 
 TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[workspace][audit]") {
-    const auto complete = pending_handoff();
+    const bool pending_texture = GENERATE(false, true);
+    CAPTURE(pending_texture);
+    const auto complete = pending_handoff(std::nullopt, pending_texture);
     REQUIRE(complete.joined_failure().empty());
     CHECK(complete.pending_supersession_completed());
+    const auto progressed = pending_handoff(std::nullopt, pending_texture, true);
+    INFO("post-admission incumbent completion: " << progressed.joined_failure());
+    REQUIRE(progressed.joined_failure().empty());
+    CHECK(progressed.pending_supersession_completed());
+    const auto drawing = pending_handoff(std::nullopt, pending_texture, true, true);
+    REQUIRE(drawing.evidence_settled());
+    CHECK(drawing.pending_supersession_completed());
     for (const auto missing :
          {MissingHandoffEvidence::PendingDiscard, MissingHandoffEvidence::Reconstruction, MissingHandoffEvidence::CaptureBeforeDraw,
-          MissingHandoffEvidence::DuplicateReconstruction, MissingHandoffEvidence::DifferentCompleted}) {
-        const auto audit = pending_handoff(missing);
+          MissingHandoffEvidence::DuplicateReconstruction, MissingHandoffEvidence::DifferentCompleted,
+          MissingHandoffEvidence::Fallback, MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
+          MissingHandoffEvidence::ReplacementPublication, MissingHandoffEvidence::AcquisitionAfterReconstruction,
+          MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback,
+          MissingHandoffEvidence::AbandonedReplacement, MissingHandoffEvidence::FallbackSubmission,
+          MissingHandoffEvidence::ReplacementSubmission, MissingHandoffEvidence::DuplicateFallbackSubmission,
+          MissingHandoffEvidence::DuplicateReplacementSubmission}) {
+        if (pending_texture && missing == MissingHandoffEvidence::FallbackRequest) continue;
+        const auto audit = pending_handoff(missing, pending_texture);
         INFO("surface join: " << audit.joined_failure());
-        if (missing != MissingHandoffEvidence::CaptureBeforeDraw && missing != MissingHandoffEvidence::DuplicateReconstruction)
+        if (missing != MissingHandoffEvidence::CaptureBeforeDraw && missing != MissingHandoffEvidence::DuplicateReconstruction &&
+            missing != MissingHandoffEvidence::AcquisitionAfterReconstruction &&
+            missing != MissingHandoffEvidence::DuplicateFallbackSubmission && missing != MissingHandoffEvidence::DuplicateReplacementSubmission &&
+            (pending_texture || missing != MissingHandoffEvidence::PendingDiscard))
             CHECK(audit.joined_failure().empty());
         else
             CHECK_FALSE(audit.joined_failure().empty());
@@ -7588,7 +7966,6 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
         {"dataset_identity", 11U},
         {"gallery_generation", revision},
         {"surface", "000000000000000b000000000000000c"},
-        {"generation", 7U},
         {"width", 512U},
         {"height", 1024U},
         {"layer", 0U},
@@ -7769,7 +8146,6 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         pending["event"] = event;
         pending["control"] = "explore.detail.workspace";
         pending["surface"] = "000000000000000b000000000000000d";
-        pending["generation"] = 8U;
         browser.consume(pending);
         CHECK(browser.owned_atlas_current);
         browser.consume(missing);
@@ -7889,10 +8265,10 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
     CHECK(between_stages.valid);
     CHECK(between_stages.grid_round_trip);
 
-    for (const auto* scenario : {"constant", "only-grow", "only-shrink", "generation", "surface", "width", "height"}) {
+    for (const auto* scenario : {"constant", "only-grow", "only-shrink", "surface-high", "surface-low", "width", "height"}) {
         INFO(scenario);
         const std::string_view kind{scenario};
-        const bool replacement = kind == "generation" || kind == "surface" || kind == "width" || kind == "height";
+        const bool replacement = kind == "surface-high" || kind == "surface-low" || kind == "width" || kind == "height";
         AtlasDrawAudit audit;
         // These valid draws contain a complete round trip but belong to no stage.
         for (std::uint64_t index = 0U; index != 3U; ++index)
@@ -7908,8 +8284,8 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
             const double top = index == 5U ? 500.0 - static_cast<double>(rows) * 150.0 : (index == 0U || index == 2U ? -37.25 : 0.0);
             auto draw = atlas_draw_record(30U + index, first_rows[index], rows, top);
             if (index != 0U) {
-                if (kind == "generation") draw["generation"] = 8U;
-                if (kind == "surface") draw["surface"] = "000000000000000b000000000000000d";
+                if (kind == "surface-high") draw["surface"] = "000000000000000d000000000000000c";
+                if (kind == "surface-low") draw["surface"] = "000000000000000b000000000000000d";
                 if (kind == "width") draw["width"] = 1024U;
                 if (kind == "height") draw["height"] = scalar(draw, "height") + 1U;
             }
@@ -7951,6 +8327,7 @@ TEST_CASE("Source retirement remains independent of a retained sample arena", "[
     CHECK(audit.evidence_settled());
     audit.browser(browser_surface_record("iced.surface.sample_draw_selected"));
     audit.browser(browser_surface_record("iced.surface.draw_encoded"));
+    audit.browser(browser_surface_record("iced.surface.draw_submitted"));
     audit.browser(browser_surface_record("iced.frame.draw_settled"));
     CHECK(audit.failure.empty());
     CHECK(audit.evidence_settled());
@@ -8086,7 +8463,7 @@ TEST_CASE("Source publication joins survive independent drains and retirement be
 }
 
 TEST_CASE("Direct fallback custody requires positive source read settlement without copy evidence", "[workspace][audit]") {
-    for (const std::string_view fault : {"none", "missing", "mode", "copy", "early-destruction"}) {
+    for (const std::string_view fault : {"none", "missing", "mode", "copy", "early-destruction", "pending-release"}) {
         INFO("direct receipt fault: " << fault);
         SurfaceAudit audit;
         const auto native = [&](const char* event) {
@@ -8110,6 +8487,12 @@ TEST_CASE("Direct fallback custody requires positive source read settlement with
         REQUIRE(audit.failure.empty());
         CHECK(audit.evidence_settled());
         CHECK_FALSE(audit.joined_failure().empty());
+        browser("iced.surface.sample_draw_selected");
+        browser("iced.surface.draw_encoded");
+        browser("iced.surface.draw_submitted");
+        CHECK(audit.evidence_settled());
+        CHECK_FALSE(audit.joined_failure().empty());
+        if (fault != "pending-release") browser("iced.frame.draw_settled");
         if (fault == "early-destruction") browser("iced.surface.source_texture_destroyed");
         if (fault == "copy") browser("firefox.workspace.copy_completed");
         browser("iced.frame.sample_released");
@@ -8422,6 +8805,7 @@ TEST_CASE("physical ledger distinguishes abandonment and rejects obsolete image 
         for (const auto* event : native_surface_events)
             audit.native(native_surface_record(event));
         for (const auto* event : browser_surface_events) {
+            if (std::string_view{event} == "iced.surface.draw_submitted") continue;
             if (std::string_view{event} == "iced.frame.draw_settled") {
                 if (defect == "early-release") audit.browser(browser_surface_record("iced.frame.sample_released"));
                 if (defect == "settlement") continue;

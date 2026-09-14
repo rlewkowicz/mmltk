@@ -81,6 +81,12 @@ class VisualRuntimeOwner final {
     bool RequestActiveStop() noexcept;
     void RequestStop() noexcept;
     void StopAndWait() noexcept;
+    // After StopAndWait and release of domain-owned products, finish healthy
+    // retirement that no longer has a worker. External readers never block.
+    void FinishStoppedRetirement() noexcept;
+    // On the owner worker, or after it has stopped, finish notified retirement
+    // after domain products release. The caller owns failure publication.
+    [[nodiscard]] std::exception_ptr FinishDeferredRetirement() noexcept;
     [[nodiscard]] bool stopped() const noexcept;
     [[nodiscard]] bool busy() const noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView Borrow() const;
@@ -119,7 +125,6 @@ class VisualRuntimeOwner final {
     void ReportFailure(std::exception_ptr) noexcept;
     [[nodiscard]] std::exception_ptr FinishRuntimeReplacement(bool) noexcept;
     [[nodiscard]] std::exception_ptr RetireOwned(std::unique_ptr<Runtime>) noexcept;
-    void FinishDeferredRetirement() noexcept;
     void ServiceWorkspace();
     void RestorePolicy();
     void NotifyReaders() const;

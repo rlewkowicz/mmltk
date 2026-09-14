@@ -3,6 +3,7 @@
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_worker.h"
 
 #include <algorithm>
@@ -121,6 +122,10 @@ class AnnotationSystem::Impl final {
         // has joined. All mailbox/document/resource storage outlives both workers.
         renderer_.StopAndWait();
         input_worker_.WaitStopped();
+        // A render parked behind output pressure may still retain its baseline.
+        // Both execution owners are quiescent before releasing that product.
+        pending_baseline_ = {};
+        renderer_.FinishStoppedRetirement();
     }
     [[nodiscard]] bool stopped() const noexcept { return input_worker_.stopped() && renderer_.stopped(); }
     [[nodiscard]] std::optional<AnnotationImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
@@ -590,6 +595,7 @@ class AnnotationSystem::Impl final {
     void Reject(std::string detail, bool settle) { Publish(AnnotationFailed{CaptureUi(settle), std::move(detail)}); }
     void RendererFailed(std::exception_ptr failure) noexcept {
         pending_baseline_ = {};
+        failure = mmltk::frameworks::gpu::combine_image_failures(failure, renderer_.FinishDeferredRetirement());
         clean_epoch_ = clean_revision_ = 0U;
         {
             std::scoped_lock lock(render_mutex_);

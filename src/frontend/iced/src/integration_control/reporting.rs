@@ -35,27 +35,56 @@ pub(super) fn workspace_fps(
     });
 }
 
-pub(super) fn verify_workspace_fps_pixels(
-    image: &iced::window::Screenshot,
-    evidence: FpsEvidence,
-) -> bool {
+#[derive(Debug, Clone)]
+pub struct FpsPixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl FpsPixels {
+    pub(super) fn valid_extent(width: u32, height: u32, bytes: usize) -> bool {
+        width > 4
+            && height > 4
+            && bytes <= 1_048_576
+            && (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(4))
+                == Some(bytes)
+    }
+}
+
+pub(super) fn verify_workspace_fps_pixels(image: &FpsPixels, evidence: FpsEvidence) -> bool {
     if !reporting_enabled() {
         return false;
     }
-    let scale = image.scale_factor;
     let bounds = evidence.bounds;
-    let left = (bounds.x * scale).ceil().max(0.0) as u32;
-    let top = (bounds.y * scale).ceil().max(0.0) as u32;
-    let right = ((bounds.x + bounds.width) * scale).floor() as u32;
-    let bottom = ((bounds.y + bounds.height) * scale).floor() as u32;
-    if !scale.is_finite()
-        || scale <= 0.0
-        || right > image.size.width
-        || bottom > image.size.height
-        || right <= left + 4
-        || bottom <= top + 4
-        || image.rgba.len() != image.size.width as usize * image.size.height as usize * 4
+    let clip = evidence.clip;
+    if ![
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        clip.x,
+        clip.y,
+        clip.width,
+        clip.height,
+    ]
+    .into_iter()
+    .all(f32::is_finite)
+        || bounds.width <= 0.0
+        || bounds.height <= 0.0
+        || clip.width <= 0.0
+        || clip.height <= 0.0
+        || bounds.x < clip.x
+        || bounds.y < clip.y
+        || bounds.x + bounds.width > clip.x + clip.width
+        || bounds.y + bounds.height > clip.y + clip.height
+        || (clip.x + clip.width - bounds.x - bounds.width - 6.0).abs() > 0.01
+        || (bounds.y - clip.y - 6.0).abs() > 0.01
+        || !FpsPixels::valid_extent(image.width, image.height, image.rgba.len())
         || evidence.frames == 0
+        || !evidence.seconds.is_finite()
         || evidence.seconds < 0.5
     {
         return false;
@@ -64,22 +93,24 @@ pub(super) fn verify_workspace_fps_pixels(
     let mut foreground = 0;
     let mut border = 0;
     let mut border_background = 0;
-    for y in top..bottom {
-        for x in left..right {
-            let offset = (y as usize * image.size.width as usize + x as usize) * 4;
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let offset = (y as usize * image.width as usize + x as usize) * 4;
             let pixel = &image.rgba[offset..offset + 4];
+            if pixel[3] != 255 {
+                return false;
+            }
             let low = pixel[..3].iter().copied().min().unwrap();
             let high = pixel[..3].iter().copied().max().unwrap();
-            let back = pixel[3] == 255 && if evidence.dark { high <= 8 } else { low >= 247 };
-            let front = pixel[3] == 255
-                && if evidence.dark {
-                    low >= 160
-                } else {
-                    high <= 95
-                };
+            let back = if evidence.dark { high <= 8 } else { low >= 247 };
+            let front = if evidence.dark {
+                low >= 160
+            } else {
+                high <= 95
+            };
             background += usize::from(back);
             foreground += usize::from(front);
-            if x == left || x + 1 == right || y == top || y + 1 == bottom {
+            if x == 0 || x + 1 == image.width || y == 0 || y + 1 == image.height {
                 border += 1;
                 border_background += usize::from(back);
             }
@@ -104,6 +135,37 @@ pub(super) fn verify_workspace_fps_pixels(
         )
     });
     valid
+}
+
+#[cfg(test)]
+pub(super) fn fps_pixel_fixture(dark: bool, scale: f32) -> (FpsPixels, FpsEvidence) {
+    let width = (74.0 * scale) as u32;
+    let height = (22.0 * scale) as u32;
+    let mut rgba = vec![if dark { 0 } else { 255 }; width as usize * height as usize * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    // Representative contrasting glyph stroke, safely inside the padded border.
+    for y in (8.0 * scale) as u32..(18.0 * scale) as u32 {
+        for x in (48.0 * scale) as u32..(51.0 * scale) as u32 {
+            let offset = (y as usize * width as usize + x as usize) * 4;
+            rgba[offset..offset + 3].fill(if dark { 255 } else { 0 });
+        }
+    }
+    (
+        FpsPixels {
+            width,
+            height,
+            rgba,
+        },
+        FpsEvidence {
+            bounds: Rectangle::new(iced::Point::new(20.0, 6.0), iced::Size::new(74.0, 22.0)),
+            clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
+            dark,
+            frames: 30,
+            seconds: 0.5,
+        },
+    )
 }
 
 pub(super) struct Owner {
@@ -392,7 +454,7 @@ impl State {
             [
                 frame.content_sequence as f64,
                 frame.presentation_revision as f64,
-                surface.map_or(0.0, |candidate| candidate.generation as f64),
+                0.0,
                 if matching_surface { 1.0 } else { 0.0 },
             ],
         );
@@ -822,40 +884,14 @@ mod tests {
     #[test]
     fn workspace_fps_pixel_acceptance_uses_the_visible_counter_at_each_scale_and_theme() {
         let capture = Capture::new(true);
-        for scale in [1.0, 1.5] {
+        for scale in [1.0, 1.25, 1.5, 2.25] {
             for dark in [false, true] {
-                let size = iced::Size::new((100.0 * scale) as u32, (60.0 * scale) as u32);
-                let mut pixels = vec![
-                    if dark { 0 } else { 255 };
-                    size.width as usize * size.height as usize * 4
-                ];
-                for pixel in pixels.chunks_exact_mut(4) {
-                    pixel[3] = 255;
-                }
-                // A bounded contrasting text stroke inside the counter's
-                // opaque background; capture geometry comes from the widget.
-                for y in (14.0 * scale) as u32..(24.0 * scale) as u32 {
-                    for x in (68.0 * scale) as u32..(71.0 * scale) as u32 {
-                        let offset = (y as usize * size.width as usize + x as usize) * 4;
-                        pixels[offset..offset + 3].fill(if dark { 255 } else { 0 });
-                    }
-                }
-                let evidence = FpsEvidence {
-                    bounds: Rectangle::new(
-                        iced::Point::new(20.0, 6.0),
-                        iced::Size::new(74.0, 22.0),
-                    ),
-                    clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
-                    dark,
-                    frames: 30,
-                    seconds: 0.5,
-                };
-                let screenshot = iced::window::Screenshot::new(pixels, size, scale);
-                assert!(verify_workspace_fps_pixels(&screenshot, evidence));
+                let (pixels, evidence) = fps_pixel_fixture(dark, scale);
+                assert!(verify_workspace_fps_pixels(&pixels, evidence));
             }
         }
         let records = capture.records();
-        assert_eq!(records.len(), 4);
+        assert_eq!(records.len(), 8);
         assert!(records.iter().all(|(event, control, detail, values)| {
             event == "integration.workspace_fps_pixels"
                 && control == EXPLORE_GALLERY
@@ -863,6 +899,68 @@ mod tests {
                 && values[0] == 30.0
                 && values[1] == 0.5
         }));
+    }
+
+    #[test]
+    fn fps_pixels_require_opaque_text_background_complete_extent_and_unclipped_placement() {
+        let _capture = Capture::new(true);
+        for dark in [false, true] {
+            let (pixels, evidence) = fps_pixel_fixture(dark, 1.0);
+            let mut missing = pixels.clone();
+            missing.rgba.clear();
+            assert!(!verify_workspace_fps_pixels(&missing, evidence));
+            let mut background = pixels.clone();
+            for pixel in background.rgba.chunks_exact_mut(4) {
+                pixel[..3].fill(if dark { 0 } else { 255 });
+            }
+            assert!(!verify_workspace_fps_pixels(&background, evidence));
+            let mut transparent = pixels.clone();
+            transparent.rgba[3] = 0;
+            assert!(!verify_workspace_fps_pixels(&transparent, evidence));
+            let mut incomplete = pixels.clone();
+            incomplete.rgba.pop();
+            assert!(!verify_workspace_fps_pixels(&incomplete, evidence));
+            let mut border = pixels.clone();
+            for pixel in border.rgba[..border.width as usize * 4].chunks_exact_mut(4) {
+                pixel[..3].fill(if dark { 255 } else { 0 });
+            }
+            assert!(!verify_workspace_fps_pixels(&border, evidence));
+            assert!(!verify_workspace_fps_pixels(
+                &pixels,
+                FpsEvidence {
+                    dark: !dark,
+                    ..evidence
+                }
+            ));
+            for seconds in [0.0, 0.499, f64::NAN, f64::INFINITY] {
+                assert!(!verify_workspace_fps_pixels(
+                    &pixels,
+                    FpsEvidence {
+                        seconds,
+                        ..evidence
+                    }
+                ));
+            }
+            assert!(!verify_workspace_fps_pixels(
+                &pixels,
+                FpsEvidence {
+                    frames: 0,
+                    ..evidence
+                }
+            ));
+            for x in [f32::NAN, -1.0, 21.0, 100.0] {
+                assert!(!verify_workspace_fps_pixels(
+                    &pixels,
+                    FpsEvidence {
+                        bounds: Rectangle {
+                            x,
+                            ..evidence.bounds
+                        },
+                        ..evidence
+                    }
+                ));
+            }
+        }
     }
 
     #[test]
@@ -925,6 +1023,7 @@ mod tests {
                 String::new(),
             );
             let (mut model, frame) = crate::view_model::test_support::explore_presentation();
+            let surface = crate::view_model::test_support::physical_surface(frame);
             model.window_width = 1280;
             model.window_height = 720;
             let snapshot = model.explore.snapshot.as_mut().unwrap();
@@ -944,7 +1043,7 @@ mod tests {
                 1.5,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(surface),
             ));
             assert_eq!(driver.phase, Phase::SettingsOpen);
             assert_eq!(driver.input_scale, 1.5);
@@ -1059,7 +1158,7 @@ mod tests {
                 1.5,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(surface),
             ));
             assert!(capture.records().is_empty());
             model.explore.snapshot.as_mut().unwrap().revision = 10;
@@ -1069,7 +1168,7 @@ mod tests {
                 1.5,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(surface),
             ));
             assert!(capture.records().is_empty());
             let snapshot = model.explore.snapshot.as_mut().unwrap();
@@ -1081,7 +1180,7 @@ mod tests {
                 1.5,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(surface),
             ));
             let records = capture.records();
             assert_eq!(records.len(), if enabled { 2 } else { 0 });
@@ -1172,7 +1271,7 @@ mod tests {
                 1.0,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(surface),
             ));
             assert_eq!(driver.phase, Phase::TrainNavigation);
             if !enabled {
@@ -1197,7 +1296,7 @@ mod tests {
                     1.0,
                     &router,
                     FeatureId::Explore,
-                    Some(frame),
+                    Some(surface),
                 ));
                 assert_eq!(driver.phase, Phase::TrainNavigation);
                 STYLES.with(|styles| styles.borrow_mut().as_mut().unwrap().clear());
@@ -1235,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_queries_failure_detail_and_reporting_dedupe_share_the_lazy_boundary() {
+    fn passive_reporting_and_failure_receipts_have_independent_activation() {
         for enabled in [false, true] {
             let capture = Capture::new(enabled);
             let mut driver = Controller::new(
@@ -1299,7 +1398,7 @@ mod tests {
             driver.report_phase_progress();
             driver.report_phase_progress();
             driver.observe_reporting(|_| panic!("failed controller ran passive reporting"));
-            assert_eq!(query_count.get(), if enabled { 3 } else { 0 });
+            assert_eq!(query_count.get(), if enabled { 3 } else { 1 });
             let records = capture.records();
             if !enabled {
                 assert!(records.is_empty());
@@ -1344,10 +1443,10 @@ mod tests {
                 crate::view::navigation::label(FeatureId::Train)
             );
             assert_eq!(records[2].3, [1.0, 0.0, 0.0, 0.0]);
-            for (index, detail, generation, matching) in [
-                (3, "accepted", 1.0, 1.0),
-                (4, "surface-missing", 0.0, 0.0),
-                (5, "rejected", 1.0, 0.0),
+            for (index, detail, matching) in [
+                (3, "accepted", 1.0),
+                (4, "surface-missing", 0.0),
+                (5, "rejected", 0.0),
             ] {
                 assert_eq!(records[index].2, detail);
                 assert_eq!(
@@ -1355,7 +1454,7 @@ mod tests {
                     [
                         frame.content_sequence as f64,
                         frame.presentation_revision as f64,
-                        generation,
+                        0.0,
                         matching
                     ]
                 );
@@ -1403,7 +1502,7 @@ mod tests {
         let (mut connection, _transport_capture) =
             crate::transport_connection::Connection::test_channel();
         connection.observe_integration_pressure(1);
-        let expected = |kind, progress, failureline| {
+        let expected = |kind, progress, failureline, failure: &str| {
             crate::generated::IntegrationControl {
                 protocolversion: crate::generated::BROWSER_PROTOCOL_VERSION,
                 receipt: crate::generated::IntegrationControlReceipt {
@@ -1411,6 +1510,7 @@ mod tests {
                     sequence: 1,
                     progress,
                     failureline,
+                    failure: failure.into(),
                     readgeneration: 0,
                     compiledindex: 0,
                 },
@@ -1426,7 +1526,10 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(wire, vec![expected(IntegrationControlKind::Progress, 5, 0)]);
+        assert_eq!(
+            wire,
+            vec![expected(IntegrationControlKind::Progress, 5, 0, "")]
+        );
         wire.clear();
         let sample_count = 129;
         for index in 0..sample_count {
@@ -1450,7 +1553,7 @@ mod tests {
         assert_eq!(wire.len(), sample_count + 1);
         assert_eq!(
             wire.last().unwrap(),
-            &expected(IntegrationControlKind::PressureEntered, 0, 0)
+            &expected(IntegrationControlKind::PressureEntered, 0, 0, "")
         );
         driver.phase = Phase::Complete;
         assert!(connection.integration_pressure_settled());
@@ -1462,9 +1565,12 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(wire, vec![expected(IntegrationControlKind::Settled, 10, 0)]);
+        assert_eq!(
+            wire,
+            vec![expected(IntegrationControlKind::Settled, 10, 0, "")]
+        );
         let failure_line = line!() + 1;
-        driver.fail_detail(|| panic!("quiet failure formatting ran"));
+        driver.fail("Protocol: Invalid snapshot: inconsistent frame revision");
         assert_eq!(driver.failure_line, failure_line);
         driver.publish_control(&mut connection);
         wire.clear();
@@ -1476,7 +1582,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             wire,
-            vec![expected(IntegrationControlKind::Failed, 15, failure_line)]
+            vec![expected(
+                IntegrationControlKind::Failed,
+                15,
+                failure_line,
+                "Protocol: Invalid snapshot: inconsistent frame revision"
+            )]
         );
         let forwarded_line = line!() + 1;
         driver.fail("static quiet failure");

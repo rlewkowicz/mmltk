@@ -276,6 +276,10 @@ void VisualRuntimeOwner::StopAndWait() noexcept {
     worker_.WaitStopped();
     Observe(ActivityStage::JoinCompleted);
 }
+void VisualRuntimeOwner::FinishStoppedRetirement() noexcept {
+    if (!worker_.stopped()) std::terminate();
+    if (auto failure = FinishDeferredRetirement()) ReportFailure(failure);
+}
 bool VisualRuntimeOwner::stopped() const noexcept { return worker_.stopped(); }
 bool VisualRuntimeOwner::busy() const noexcept {
     std::scoped_lock lock(mutex_);
@@ -479,7 +483,7 @@ void VisualRuntimeOwner::Observe(const ActivityStage stage, const std::uint64_t 
 }
 void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
     Observe(ActivityStage::CycleEntered);
-    FinishDeferredRetirement();
+    if (auto failure = FinishDeferredRetirement()) ReportFailure(failure);
     if (completion_) {
         if (!completion_ready_.load(std::memory_order_acquire)) return;
         completion_runtime_->CompleteWork();
@@ -702,13 +706,13 @@ std::exception_ptr VisualRuntimeOwner::RetireOwned(std::unique_ptr<Runtime> reti
     return failure;
 }
 
-void VisualRuntimeOwner::FinishDeferredRetirement() noexcept {
-    if (!retirement_ready_.exchange(false, std::memory_order_acq_rel)) return;
+std::exception_ptr VisualRuntimeOwner::FinishDeferredRetirement() noexcept {
+    if (!retirement_ready_.exchange(false, std::memory_order_acq_rel)) return {};
     Runtime::UnsafeCustody custody;
     {
         std::scoped_lock lock(mutex_);
         auto* retained = std::get_if<Runtime::UnsafeCustody>(&retained_);
-        if (!retained || !retained->deferred()) return;
+        if (!retained || !retained->deferred()) return {};
         custody = std::move(*retained);
     }
     const auto settled = custody.FinishRetirement();
@@ -723,7 +727,7 @@ void VisualRuntimeOwner::FinishDeferredRetirement() noexcept {
             retained_.emplace<Runtime::UnsafeCustody>(std::move(custody));
         }
     }
-    if (settled.failure) ReportFailure(settled.failure);
+    return settled.failure;
 }
 
 VisualRuntimeOwner::StagedReplacement::StagedReplacement(VisualRuntimeOwner& owner) : owner_(&owner) {

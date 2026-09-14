@@ -82,12 +82,37 @@ void PresentationAcceptanceGate::ObserveCapacity() {
         std::scoped_lock lock(mutex_);
         if (stopped_ || (!armed_ && !held_)) return;
         capacity_seen_ = true;
-        if (!held_ || receipt_.capacity_available) return;
-        receipt_.capacity_available = true;
+        if (!held_ || receipt_.boundary == Boundary::Capacity) return;
+        receipt_.boundary = Boundary::Capacity;
         receipt = receipt_;
         observe = observer_;
     }
     if (observe) observe(receipt);
+}
+void PresentationAcceptanceGate::HoldSupersession(const std::uint64_t high, const std::uint64_t low) {
+    std::function<void(Receipt)> observe;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopped_ || supersession_held_) return;
+        supersession_held_ = true;
+        observe = observer_;
+    }
+    if (observe) observe({.source_high = high, .source_low = low, .boundary = Boundary::Supersession});
+}
+bool PresentationAcceptanceGate::SupersessionHeld() {
+    std::scoped_lock lock(mutex_);
+    return supersession_held_;
+}
+bool PresentationAcceptanceGate::ReleaseSupersession() {
+    std::function<void()> wake;
+    {
+        std::scoped_lock lock(mutex_);
+        if (stopped_ || !supersession_held_) return false;
+        supersession_held_ = false;
+        wake = wake_;
+    }
+    if (wake) wake();
+    return true;
 }
 void PresentationAcceptanceGate::Stop() noexcept {
     std::function<void()> wake;
@@ -96,6 +121,7 @@ void PresentationAcceptanceGate::Stop() noexcept {
         stopped_ = true;
         armed_ = false;
         held_ = false;
+        supersession_held_ = false;
         wake = std::move(wake_);
         observer_ = {};
     }
@@ -581,6 +607,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     SampleArena* EnsureArena(VisualExtent extent) {
         if (candidate_) {
             if (Contains(*candidate_, extent)) return candidate_.get();
+            if (configuration_.completion_acceptance && configuration_.completion_acceptance->SupersessionHeld()) return nullptr;
             if (candidate_->ready && std::ranges::any_of(retiring_, [](const auto& arena) { return !arena; }))
                 RetireArena(candidate_, VisualDiagnosticOperation::PresentationCandidateWithdrawal);
             return nullptr;
@@ -603,6 +630,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             pending_->submitted.observation.frame.source.kind == PresentationSourceKind::Upscale) {
             pending_supersession_acceptance_ = false;
             arena->extent = active_->extent;
+            if (configuration_.completion_acceptance)
+                configuration_.completion_acceptance->HoldSupersession(arena->id.high, arena->id.low);
         }
         DiagnoseArena(VisualDiagnosticOperation::PresentationArenaAdvertised, *arena, 1U);
         if (!channel_.admit_arena(arena->id, arena->generation, arena->extent.width, arena->extent.height,
@@ -841,6 +870,17 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         }
         admitted->detaching = false;
         admitted->producer = pending_->reader;
+        services::RuntimeDiagnosticSpan borrow_span(
+            diagnostics_,
+            [&] {
+                auto fact = presentation_diagnostic_fact(
+                    VisualDiagnosticOperation::PresentationSourceBorrowStarted,
+                    {.submitted = pending_->submitted, .publication = {.capability = CapabilityOf(*arena)}, .link = pending_->link},
+                    settings_.device);
+                fact.context.workspace = native::workspace_source_diagnostic(admitted->description);
+                return visual_diagnostic_boundary(fact, VisualDiagnosticOperation::PresentationSourceBorrowCompleted);
+            },
+            pending_->link);
         if (pending_->requested_owner == 0U) {
             const bool direct =
                 observed.workspace == admitted->workspace && admitted->workspace->Contains({observed.product_owner, frame.revision});
@@ -861,6 +901,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             return Supersede();
         }
         try {
+            borrow_span.FinishWith([](auto& fact) { fact.context.outcome = 1U; });
             const auto transfer = mmltk::common::types::take_monotonic_identity(admitted->next_transfer);
             transfer_.emplace(
                 Transfer{.source = admitted,

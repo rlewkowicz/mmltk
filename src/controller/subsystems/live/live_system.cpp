@@ -1,6 +1,7 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 #include <condition_variable>
@@ -23,7 +24,8 @@ class LiveSystem::Impl final {
           diagnostics_(diagnostics),
           worker_(std::move(factory), [this](const std::exception_ptr failure) {
               pending_output_ = {};
-              auto detail = visual_failure_detail(failure, "Live GPU worker failed");
+              const auto reported = mmltk::frameworks::gpu::combine_image_failures(failure, worker_.FinishDeferredRetirement());
+              auto detail = visual_failure_detail(reported, "Live GPU worker failed");
               LiveSnapshot settled;
               {
                   std::scoped_lock lock(mutex_);

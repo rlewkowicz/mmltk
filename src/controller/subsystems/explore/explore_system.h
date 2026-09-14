@@ -34,6 +34,10 @@
 
 namespace mmltk::controller {
 
+namespace services {
+class RuntimeDiagnosticTarget;
+}
+
 class SettingsSystem;
 
 inline constexpr std::size_t kExploreVisibleItemCapacity = 256U;
@@ -420,6 +424,7 @@ class ExploreAcceptanceGate final {
         NativeCompletionHeld = 0x85U,
         NativeCapacityAvailable = 0x86U,
         VisibleReadHeld = 0x87U,
+        PendingSupersessionHeld = 0x88U,
     };
     enum class ControlCommand : std::uint8_t {
         InitialRelease = 1U,
@@ -431,6 +436,7 @@ class ExploreAcceptanceGate final {
         Redraw = 16U,
         ArmNativeCompletion = 32U,
         ReleaseNativeCompletion = 64U,
+        ReleasePendingSupersession = 65U,
     };
     [[nodiscard]] std::uint64_t FrontendSequence() const noexcept;
     void SetCompletionCommand(std::function<bool(ControlCommand)>);
@@ -440,9 +446,12 @@ class ExploreAcceptanceGate final {
     // Installed only by the explicit integration host. The descriptor reader
     // remains the sole receiver of parent commands throughout the session.
     void SetFrontendCommand(FrontendCommand);
+    void SetDiagnostics(services::RuntimeDiagnosticTarget);
     // One acceptance-only redraw while initial reads remain held.
     void SetRedrawCommand(std::function<bool()>);
-    [[nodiscard]] bool ObserveFrontend(contracts::IntegrationControlReceipt) noexcept;
+    [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt&) noexcept;
+    // Failed frontend observations append the canonical bounded failure text to this
+    // header in the same socket packet. All other observations contain only the header.
     struct ControlObservation final {
         ControlEvent event = ControlEvent::InitialWait;
         std::uint64_t generation = 0U;

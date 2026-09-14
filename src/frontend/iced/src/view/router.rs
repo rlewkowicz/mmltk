@@ -56,6 +56,11 @@ impl Default for Router {
 }
 
 impl Router {
+    #[cfg(test)]
+    pub(crate) fn explore_state_for_test(&mut self) -> &mut explore::state::State {
+        self.explore.state_for_test()
+    }
+
     pub const fn active(&self) -> FeatureId {
         self.active
     }
@@ -114,8 +119,12 @@ impl Router {
         self.explore.abandon_submission();
     }
 
-    pub fn explore_abandon_detail(&mut self) {
-        self.explore.abandon_detail();
+    pub fn explore_submit_detail(&mut self, original: bool) {
+        self.explore.submit_detail(original);
+    }
+
+    pub fn explore_settle_detail(&mut self, accepted: bool) {
+        self.explore.settle_detail(accepted);
     }
 
     pub fn explore_request_viewport(

@@ -872,11 +872,15 @@ class BindingEmitter final {
             output_ << kind_type << "::" << writer.identifier(name, true) << " => " << (Policy.server ? "true" : "false") << ",\n";
         });
         output_ << "} }\n";
+        symbols_.Reserve("module", "INTEGRATION_FAILURE_MAX_BYTES", "canonical failure receipt byte limit");
+        output_ << "pub const INTEGRATION_FAILURE_MAX_BYTES: usize = "
+                << mmltk::controller::contracts::kIntegrationFailureMaxBytes << ";\n";
         symbols_.Reserve("module", "integration_receipt_valid", "canonical integration receipt policy");
         output_ << "pub const fn integration_receipt_valid(receipt: &"
                 << writer.rust_type<mmltk::controller::contracts::IntegrationControlReceipt>()
                 << ") -> bool { receipt.sequence != 0 && (matches!(receipt.kind, " << kind_type
-                << "::Failed) == (receipt.failureline != 0)) && match receipt.kind {\n";
+                << "::Failed) == (receipt.failureline != 0)) && receipt.failure.len() <= INTEGRATION_FAILURE_MAX_BYTES && "
+                << "(matches!(receipt.kind, " << kind_type << "::Failed) || receipt.failure.is_empty()) && match receipt.kind {\n";
         mmltk::controller::contracts::visit_integration_commands([&]<auto, auto Policy>(const auto name) {
             output_ << kind_type << "::" << writer.identifier(name, true) << " => receipt.readgeneration "
                     << (Policy.read_generation ? "!=" : "==") << " 0" << (Policy.compiled_index ? "" : " && receipt.compiledindex == 0")

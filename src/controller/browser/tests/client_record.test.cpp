@@ -210,12 +210,35 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
 
+TEST_CASE("integration failure text has a bounded failed-only canonical payload", "[controller][browser][protocol]") {
+    using namespace mmltk::controller::contracts;
+    for (const auto size : {0U, 1U, static_cast<unsigned>(kIntegrationFailureMaxBytes)}) {
+        IntegrationControl source{.receipt = {.kind = IntegrationControlKind::Failed, .sequence = 3U,
+            .progress = 7U, .failureline = 123U, .failure = std::string(size, 'x')}};
+        wire::ByteBuffer encoded;
+        REQUIRE(encode_client_record(ClientRecord{source}, encoded));
+        const auto decoded = decode_client_record({.first = encoded, .second = {}});
+        REQUIRE(decoded);
+        CHECK(std::get<IntegrationControl>(*decoded) == source);
+        CHECK_FALSE(decode_server_record({.first = encoded, .second = {}}));
+        source.receipt.failure.assign(kIntegrationFailureMaxBytes + 1U, 'x');
+        CHECK_FALSE(encode_client_record(ClientRecord{source}, encoded));
+    }
+    visit_integration_commands([&]<auto kind, auto policy>(auto) {
+        if constexpr (kind != IntegrationControlKind::Failed) {
+            const IntegrationControl source{.receipt = {.kind = kind, .sequence = 3U,
+                .read_generation = policy.read_generation ? 1U : 0U, .failure = "Protocol: invalid frame"}};
+            CHECK_FALSE(integration_receipt_valid(source.receipt));
+        }
+    });
+}
+
 TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
     STATIC_REQUIRE(kBrowserProtocolVersion == 17U);
     const auto fixtures = protocol_client_fixtures();
     constexpr auto annotation_alternatives = std::variant_size_v<decltype(AnnotationEdit::value)>;
     REQUIRE(std::ranges::count_if(fixtures, [](const auto& fixture) { return !fixture.kind.starts_with("IntegrationControl:"); }) ==
-            7U + annotation_alternatives);
+            6U + annotation_alternatives);
     for (const auto* name : {"IntegrationControl:capacity", "IntegrationControl:visible-arm", "IntegrationControl:visible-release"}) {
         const auto decoded = decode_client_record({.first = fixture_named(fixtures, name).bytes, .second = {}});
         REQUIRE(decoded);
@@ -336,8 +359,8 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     const auto accepted_interaction = dispatch_interaction(systems, interaction);
     CHECK(accepted_interaction.disposition == InteractionDispatchDisposition::Accepted);
     CHECK_FALSE(accepted_interaction.error.has_value());
-    CHECK(explore.latest.extent.width == 0U);
-    CHECK(explore.latest.extent.height == 0U);
+    CHECK(explore.latest.extent.width == 64U);
+    CHECK(explore.latest.extent.height == 64U);
 
     const auto malformed_interaction =
         dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id, .value = {std::byte{0xf6}}});

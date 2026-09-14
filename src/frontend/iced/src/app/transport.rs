@@ -143,8 +143,11 @@ impl App {
         }) && decoded.is_ok();
         let (filter_admission_revision, filter_failed) =
             Self::classify_explore_reply(context, &decoded);
-        if context == Some(ApplicationIntentEndpoint::ExploreUpdateDetail) && decoded.is_err() {
-            self.abandon_explore_edit(ApplicationIntentEndpoint::ExploreUpdateDetail);
+        if context == Some(ApplicationIntentEndpoint::ExploreUpdateDetail) {
+            self.workspace.explore_settle_detail(decoded.is_ok());
+            if decoded.is_err() {
+                self.model.explore.desired_detail = None;
+            }
         }
         let _ = self.model.reduce_reply(reply.correlation, decoded);
         let installed_settings = self

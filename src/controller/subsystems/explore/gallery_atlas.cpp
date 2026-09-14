@@ -23,7 +23,7 @@ ExploreAtlasLayout GalleryAtlas::Begin(const mmltk::frameworks::gpu::ImagePlaneV
     const auto rows = clean.descriptor.height / pixels.extent;
     if (rows < viewport.row_count || static_cast<std::uint64_t>(rows) * viewport.columns > kExploreVisibleItemCapacity)
         throw std::invalid_argument("Explore atlas lacks bounded visible row capacity");
-    if (found->clean != clean.allocation || found->semantic != semantic.allocation || found->pixels != pixels ||
+    if (found->clean != clean.allocation || found->semantic != semantic.allocation || !found->pixels.SameSource(pixels) ||
         found->columns != viewport.columns || found->rows != rows) {
         found->cells.assign(static_cast<std::size_t>(rows) * viewport.columns, {});
         found->clean = clean.allocation;

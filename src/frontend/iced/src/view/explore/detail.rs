@@ -70,7 +70,9 @@ pub(super) fn view<'a>(
         .viewer_identity()
         .expect("validated detail viewer")
         .1;
-    let overlay = content.overlay().clone();
+    let overlay = state
+        .presented_filter(model.explore.snapshot.as_ref())
+        .map_or_else(|| content.overlay().clone(), |request| request.overlay);
     let image = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {
             show_fps: crate::workspace_fps::enabled(settings),
@@ -81,7 +83,7 @@ pub(super) fn view<'a>(
             placement: crate::presentation_surface::Placement::Contain,
             control_id: super::DETAIL_WORKSPACE_ID,
         },
-        crate::presentation_surface::labels::Source::Detail(content),
+        crate::presentation_surface::labels::Source::Detail(content, overlay.showlabels),
     );
     let active = model.displayed_upscale_kernel();
     let pending = model

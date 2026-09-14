@@ -84,6 +84,15 @@ struct Scope final {
 namespace mmltk::controller {
 namespace {
 
+void check_labels(const std::span<const ExploreLabel> actual, const std::span<const ExploreLabel> expected) {
+    REQUIRE(actual.size() == expected.size());
+    for (std::size_t index = 0U; index != actual.size(); ++index) {
+        CHECK(actual[index].box == expected[index].box);
+        CHECK(actual[index].category == expected[index].category);
+        CHECK(actual[index].compiled_index == expected[index].compiled_index);
+    }
+}
+
 // A real compiled artifact keeps source reads, RLE projection, augmentation,
 // CUDA rendering, cache ownership and runtime publication in the test path.
 void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start,
@@ -896,7 +905,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     mmltk::testsupport::ScopedTempDir directory{"native-gallery"};
     const auto path = directory.path() / "compiled.bin";
     write_gallery_artifact(path, 0.25F, 9U);
-    NativeGallery gallery{columns};
+    NativeGallery gallery{columns, false, true};
     gallery.Open(path);
     gallery.Drain();
     {
@@ -1044,13 +1053,29 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before_resize);
     CHECK(gallery.Pixels(0U).size() == static_cast<std::size_t>(columns) * 16U * 32U * 4U);
+    const auto before_preview_clean = gallery.Pixels(0U);
+    const auto before_preview_semantic = gallery.Pixels(1U);
+    const auto before_preview_labels = gallery.algorithm->Labels();
     gallery.plan.augmentation.enabled = true;
     gallery.plan.augmentation_config.enabled = true;
     ++gallery.plan.augmentation.seed;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
     const auto before_augmentation = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
-    gallery.Begin();
+    const auto refreshing = gallery.Begin();
+    CHECK(refreshing.remaining_tiles == columns * 2U);
+    CHECK(std::ranges::equal(gallery.Pixels(0U), before_preview_clean));
+    CHECK(std::ranges::equal(gallery.Pixels(1U), before_preview_semantic));
+    check_labels(gallery.algorithm->Labels(), before_preview_labels);
+    {
+        std::scoped_lock lock(gallery.evidence.mutex);
+        const auto restored = std::ranges::find_if(gallery.evidence.facts, [&](const auto& fact) {
+            return fact.operation == VisualDiagnosticOperation::AcceptancePlaceholderComplete &&
+                   fact.generation == gallery.plan.generation;
+        });
+        REQUIRE(restored != gallery.evidence.facts.end());
+        CHECK(restored->context.capacity_width == columns * 2U);
+    }
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before_augmentation);
     const auto augmented_storage = gallery.algorithm->StorageFootprint();
@@ -1058,6 +1083,35 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(augmented_storage.augmentation_pinned_bytes > 0U);
     CHECK(augmented_storage.device_bytes >= augmented_storage.augmentation_device_bytes + augmented_storage.cache_device_bytes);
     CHECK(augmented_storage.pinned_bytes >= augmented_storage.augmentation_pinned_bytes);
+    for (const bool reroll : {true, false}) {
+        CAPTURE(reroll);
+        const auto retained_clean = gallery.Pixels(0U);
+        const auto retained_semantic = gallery.Pixels(1U);
+        const auto retained_labels = gallery.algorithm->Labels();
+        const auto prior_reads = gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted);
+        if (reroll)
+            ++gallery.plan.augmentation.seed;
+        else
+            gallery.plan.augmentation.enabled = false;
+        gallery.demand->store(++gallery.plan.generation);
+        gallery.Begin(nullptr, false);
+        CHECK(std::ranges::equal(gallery.Pixels(0U), retained_clean));
+        CHECK(std::ranges::equal(gallery.Pixels(1U), retained_semantic));
+        check_labels(gallery.algorithm->Labels(), retained_labels);
+        CHECK(gallery.Begin().remaining_tiles == columns * 2U);
+        CHECK(std::ranges::equal(gallery.Pixels(0U), retained_clean));
+        CHECK(std::ranges::equal(gallery.Pixels(1U), retained_semantic));
+        check_labels(gallery.algorithm->Labels(), retained_labels);
+        // Semantics can update the retained image while its next preview is
+        // still pending, without declaring the old clean tiles refreshed.
+        gallery.plan.overlay.show_boxes = !gallery.plan.overlay.show_boxes;
+        gallery.demand->store(++gallery.plan.generation);
+        CHECK(gallery.Begin().remaining_tiles == columns * 2U);
+        CHECK(std::ranges::equal(gallery.Pixels(0U), retained_clean));
+        check_labels(gallery.algorithm->Labels(), retained_labels);
+        gallery.Drain();
+        CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > prior_reads);
+    }
     gallery.plan.viewport.first_row = 0U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1590,6 +1644,8 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
         gallery.runtime->BindContext();
         gallery.demand->store(0U);
         gallery.algorithm->StopIngress();
+        gallery.gallery_product = {};
+        gallery.detail_product = {};
         stopped.set_value();
         return gallery.runtime->Retire();
     });
@@ -2069,14 +2125,6 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
     using Stage = ExploreAcceptanceGate::SubmissionStage;
     const auto checkpoint = GENERATE(Stage::BeforeCacheAdmission, Stage::CacheCleanSubmitted, Stage::Background);
     CAPTURE(checkpoint);
-    const auto check_labels = [](const auto& actual, const auto& expected) {
-        REQUIRE(actual.size() == expected.size());
-        for (std::size_t index = 0U; index != actual.size(); ++index) {
-            CHECK(actual[index].box == expected[index].box);
-            CHECK(actual[index].category == expected[index].category);
-            CHECK(actual[index].compiled_index == expected[index].compiled_index);
-        }
-    };
     mmltk::testsupport::ScopedTempDir directory{"native-gallery-admission"};
     const auto path = directory.path() / "compiled.bin";
     // One visible image and one speculative image make the affected cache
@@ -2267,6 +2315,35 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
     CHECK(gate.AwaitInitialRelease(7U) == ExploreAcceptanceGate::WaitResult::Stale);
     gate.Stop();
     CHECK(gate.AwaitInitialRelease(8U) == ExploreAcceptanceGate::WaitResult::Stale);
+}
+
+TEST_CASE("acceptance failure forwards exact bounded text in its terminal packet", "[explore][acceptance][control]") {
+    const auto size = GENERATE(std::size_t{0U}, std::size_t{17U}, contracts::kIntegrationFailureMaxBytes);
+    AcceptanceGateFixture fixture{SOCK_SEQPACKET};
+    auto& gate = fixture.gate();
+    gate.SetFrontendCommand([](auto) { return true; });
+    contracts::IntegrationControlReceipt receipt{.kind = contracts::IntegrationControlKind::Failed,
+        .sequence = 1U, .progress = 87U, .failureline = 123U, .failure = std::string(size, 'x')};
+    auto invalid = receipt;
+    invalid.sequence = 2U;
+    CHECK_FALSE(gate.ObserveFrontend(invalid));
+    invalid = receipt;
+    invalid.failure.assign(contracts::kIntegrationFailureMaxBytes + 1U, 'x');
+    CHECK_FALSE(gate.ObserveFrontend(invalid));
+    REQUIRE(gate.ObserveFrontend(receipt));
+    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) + contracts::kIntegrationFailureMaxBytes> packet;
+    const auto received = ::recv(fixture.commands().get(), packet.data(), packet.size(), MSG_DONTWAIT | MSG_TRUNC);
+    REQUIRE(received == static_cast<ssize_t>(sizeof(ExploreAcceptanceGate::ControlObservation) + size));
+    ExploreAcceptanceGate::ControlObservation header;
+    std::memcpy(&header, packet.data(), sizeof(header));
+    CHECK(header.event == ExploreAcceptanceGate::ControlEvent::Frontend);
+    CHECK(header.generation == receipt.sequence);
+    CHECK(header.slot == static_cast<std::uint64_t>(receipt.kind));
+    CHECK(header.compiled_index == receipt.progress);
+    CHECK(header.staging_bytes == receipt.failureline);
+    CHECK(std::string_view(packet.data() + sizeof(header), size) == receipt.failure);
+    CHECK(gate.ClaimTerminalReport());
+    CHECK_FALSE(gate.ObserveFrontend(receipt));
 }
 
 TEST_CASE("acceptance gate rejects premature advancement and unavailable callbacks", "[explore][acceptance][control]") {
@@ -2475,18 +2552,36 @@ TEST_CASE("native completion gate preserves the capacity-before-consumption wake
     const PresentationAcceptanceGate::Receipt held{3U, 4U, 5U, 6U};
     REQUIRE(gate.Hold(held));
     REQUIRE(receipts.size() == 1U);
-    CHECK_FALSE(receipts.front().capacity_available);
+    CHECK(receipts.front().boundary == PresentationAcceptanceGate::Boundary::Completion);
     gate.SetObserver([&](const auto receipt) { receipts.push_back(receipt); });
     gate.ObserveCapacity();
     gate.ObserveCapacity();
     REQUIRE(receipts.size() == 2U);
-    CHECK(receipts.back().capacity_available);
+    CHECK(receipts.back().boundary == PresentationAcceptanceGate::Boundary::Capacity);
     CHECK(receipts.back().publication == held.publication);
     REQUIRE(gate.Release());
     CHECK(wakes == 1U);  // Explicit wake survives an already drained completion edge.
     CHECK_FALSE(gate.Hold(held));
     CHECK_FALSE(gate.Release());
+    CHECK_FALSE(gate.ReleaseSupersession());
+    gate.SetWake([&] {
+        ++wakes;
+        CHECK_FALSE(gate.SupersessionHeld());
+    });
+    gate.HoldSupersession(7U, 8U);
+    REQUIRE(gate.SupersessionHeld());
+    REQUIRE(receipts.size() == 3U);
+    CHECK(receipts.back().boundary == PresentationAcceptanceGate::Boundary::Supersession);
+    CHECK(receipts.back().source_high == 7U);
+    CHECK(receipts.back().source_low == 8U);
+    gate.HoldSupersession(9U, 10U);
+    CHECK(receipts.size() == 3U);
+    REQUIRE(gate.ReleaseSupersession());
+    CHECK(wakes == 2U);
+    CHECK_FALSE(gate.ReleaseSupersession());
+    gate.HoldSupersession(11U, 12U);
     gate.Stop();
+    CHECK_FALSE(gate.SupersessionHeld());
     CHECK_FALSE(gate.Arm());
 }
 

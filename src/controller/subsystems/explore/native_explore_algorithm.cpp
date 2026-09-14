@@ -1,11 +1,14 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/services/runtime_diagnostics.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/controller/subsystems/explore/detail/gallery_thumbnail_cache.h"
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 
 #include <algorithm>
 #include <array>
@@ -13,6 +16,8 @@
 #include <cerrno>
 #include <cstddef>
 #include <condition_variable>
+#include <concepts>
+#include <type_traits>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -202,34 +207,44 @@ class ExploreAcceptanceGate::Impl final {
         // The caller rechecks current demand outside this callback before read.
     }
 
-    [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
+    [[nodiscard]] bool ObserveFrontend(const contracts::IntegrationControlReceipt& receipt) noexcept {
         std::scoped_lock lock(mutex_);
         using Kind = contracts::IntegrationControlKind;
-        if (terminal_ || !frontend_command_ || receipt.sequence != frontend_sequence_ || frontend_settled_ ||
-            contracts::integration_server_command(receipt.kind))
+        const auto reject = [&](const std::string_view reason) {
+            TraceFrontendRejection(receipt, reason);
             return false;
-        if (!contracts::integration_receipt_valid(receipt)) return false;
-        if (receipt.kind == Kind::CapacityArmRequested && std::exchange(capacity_requested_, true)) return false;
+        };
+        if (terminal_) return reject("terminal");
+        if (!frontend_command_) return reject("no_frontend_command");
+        if (receipt.sequence != frontend_sequence_) return reject("scenario_mismatch");
+        if (frontend_settled_) return reject("settled");
+        if (contracts::integration_server_command(receipt.kind)) return reject("wrong_direction");
+        if (!contracts::integration_receipt_valid(receipt)) return reject("invalid_receipt");
+        if (receipt.kind == Kind::CapacityArmRequested && std::exchange(capacity_requested_, true)) return reject("duplicate_capacity_arm");
         if (receipt.kind == Kind::VisibleReadArmRequested) {
-            if (visible_requested_) return false;
+            if (visible_requested_) return reject("duplicate_visible_arm");
             visible_requested_ = true;
             visible_index_ = receipt.compiled_index;
         }
-        if (receipt.kind == Kind::VisibleReadReleaseRequested &&
-            (!visible_held_ || visible_released_ || receipt.read_generation != visible_generation_ ||
-             receipt.compiled_index != visible_index_ || std::exchange(visible_release_requested_, true)))
-            return false;
+        if (receipt.kind == Kind::VisibleReadReleaseRequested) {
+            if (!visible_held_) return reject("visible_not_held");
+            if (visible_released_) return reject("visible_already_released");
+            if (receipt.read_generation != visible_generation_) return reject("visible_generation_mismatch");
+            if (receipt.compiled_index != visible_index_) return reject("visible_index_mismatch");
+            if (std::exchange(visible_release_requested_, true)) return reject("duplicate_visible_release");
+        }
         if (receipt.kind == Kind::Progress) {
-            if (receipt.progress <= frontend_progress_ || (receipt.progress & 3U) == 0U) return false;
+            if (receipt.progress <= frontend_progress_) return reject("nonincreasing_progress");
+            if ((receipt.progress & 3U) == 0U) return reject("invalid_progress_class");
             frontend_progress_ = receipt.progress;
         }
-        if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return false;
+        if (receipt.kind == Kind::PressureEntered && std::exchange(frontend_pressure_, true)) return reject("duplicate_pressure");
         if (receipt.kind == Kind::Settled) frontend_settled_ = true;
         const bool sent = SendControlObservation({.event = ControlEvent::Frontend,
                                                   .generation = receipt.sequence,
                                                   .slot = static_cast<std::uint64_t>(receipt.kind),
                                                   .compiled_index = receipt.progress,
-                                                  .staging_bytes = receipt.failureline});
+                                                  .staging_bytes = receipt.failureline}, &receipt);
         if (!sent || receipt.kind == Kind::Failed) {
             terminal_ = true;
             changed_.notify_all();
@@ -249,13 +264,72 @@ class ExploreAcceptanceGate::Impl final {
         if (reader_.joinable()) reader_.join();
     }
 
+    void SetDiagnostics(services::RuntimeDiagnosticTarget diagnostics) {
+        std::scoped_lock lock(mutex_);
+        diagnostics_ = std::move(diagnostics);
+    }
+
    private:
-    [[nodiscard]] bool SendControlObservation(const ControlObservation& observation) const noexcept {
+    void TraceFrontendRejection(const contracts::IntegrationControlReceipt& receipt, const std::string_view reason,
+                                const ssize_t sent = 0, const int send_error = 0) const noexcept {
+        if (!diagnostics_.valid()) return;
+        try {
+            namespace serialization = mmltk::frameworks::serialization;
+            using Value = serialization::wire::Value;
+            // Rejected receipts must remain inspectable even when their values
+            // violate the canonical transport validation constraints.
+            Value::Object received;
+            mmltk::frameworks::reflection::visit_materialized_members<contracts::IntegrationControlReceipt>(
+                [&]<class Declaration>(const auto& field) {
+                    const auto& value = receipt.*Declaration::pointer;
+                    if constexpr (std::same_as<std::remove_cvref_t<decltype(value)>, std::string>)
+                        received.emplace_back(std::string(field.member_name), Value(value));
+                    else
+                        received.emplace_back(std::string(field.member_name), Value(static_cast<std::uint64_t>(value)));
+                });
+            diagnostics_.write_browser_event("integration.frontend.rejected", Value(Value::Object{
+                {"reason", Value(std::string(reason))},
+                {"receipt", Value(std::move(received))},
+                {"expected_sequence", Value(frontend_sequence_)},
+                {"previous_progress", Value(frontend_progress_)},
+                {"terminal", Value(terminal_)},
+                {"frontend_installed", Value(static_cast<bool>(frontend_command_))},
+                {"settled", Value(frontend_settled_)},
+                {"capacity_requested", Value(capacity_requested_)},
+                {"visible_requested", Value(visible_requested_)},
+                {"visible_held", Value(visible_held_)},
+                {"visible_released", Value(visible_released_)},
+                {"visible_release_requested", Value(visible_release_requested_)},
+                {"expected_read_generation", Value(visible_generation_)},
+                {"expected_compiled_index", Value(static_cast<std::uint64_t>(visible_index_))},
+                {"pressure_entered", Value(frontend_pressure_)},
+                {"send_result", Value(static_cast<std::int64_t>(sent))},
+                {"send_errno", Value(static_cast<std::int64_t>(send_error))},
+            }));
+        } catch (...) {}
+    }
+
+    [[nodiscard]] bool SendControlObservation(const ControlObservation& observation,
+                                              const contracts::IntegrationControlReceipt* receipt = nullptr) const noexcept {
+        const bool trace_send = receipt != nullptr && diagnostics_.valid();
+        const std::string_view failure = receipt ? std::string_view(receipt->failure) : std::string_view{};
+        std::array<iovec, 2U> parts{{
+            {.iov_base = const_cast<ControlObservation*>(&observation), .iov_len = sizeof(observation)},
+            {.iov_base = const_cast<char*>(failure.data()), .iov_len = failure.size()},
+        }};
+        msghdr message{};
+        message.msg_iov = parts.data();
+        message.msg_iovlen = failure.empty() ? 1U : 2U;
+        const auto expected = static_cast<ssize_t>(sizeof(observation) + failure.size());
         ssize_t written = -1;
         do {
-            written = ::send(command_.get(), &observation, sizeof(observation), MSG_NOSIGNAL | MSG_DONTWAIT);
+            written = ::sendmsg(command_.get(), &message, MSG_NOSIGNAL | MSG_DONTWAIT);
         } while (written < 0 && errno == EINTR);
-        return written == static_cast<ssize_t>(sizeof(observation));
+        if (written != expected && trace_send) {
+            const int send_error = written < 0 ? errno : 0;
+            TraceFrontendRejection(*receipt, "control_send", written, send_error);
+        }
+        return written == expected;
     }
 
     [[nodiscard]] std::uint8_t ReadCommand() noexcept {
@@ -305,7 +379,8 @@ class ExploreAcceptanceGate::Impl final {
                 } else if (command == 4U) {
                     release_held_ = true;
                 } else if ((command == static_cast<std::uint8_t>(ControlCommand::ArmNativeCompletion) ||
-                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion)) &&
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleaseNativeCompletion) ||
+                            command == static_cast<std::uint8_t>(ControlCommand::ReleasePendingSupersession)) &&
                            completion_command_) {
                     completion = completion_command_;
                 } else if (command == 16U && !redraw_claimed_ && !release_all_ && !release_one_ && initial_released_generation_ == 0U &&
@@ -383,6 +458,7 @@ class ExploreAcceptanceGate::Impl final {
     bool visible_released_ = false;
     std::uint32_t visible_index_ = 0U;
     std::uint64_t visible_generation_ = 0U;
+    services::RuntimeDiagnosticTarget diagnostics_;
     std::uint64_t frontend_sequence_ = 1U;
     bool frontend_settled_ = false;
     bool frontend_pressure_ = false;
@@ -410,13 +486,14 @@ bool ExploreAcceptanceGate::ClaimTerminalReport() { return impl_->ClaimTerminalR
 void ExploreAcceptanceGate::Stop() noexcept { impl_->Stop(); }
 void ExploreAcceptanceGate::StopAndJoin() noexcept { impl_->StopAndJoin(); }
 void ExploreAcceptanceGate::SetFrontendCommand(FrontendCommand callback) { impl_->SetFrontendCommand(std::move(callback)); }
+void ExploreAcceptanceGate::SetDiagnostics(services::RuntimeDiagnosticTarget diagnostics) { impl_->SetDiagnostics(std::move(diagnostics)); }
 std::uint64_t ExploreAcceptanceGate::FrontendSequence() const noexcept { return impl_->FrontendSequence(); }
 void ExploreAcceptanceGate::SetCompletionCommand(std::function<bool(ControlCommand)> callback) {
     impl_->SetCompletionCommand(std::move(callback));
 }
 bool ExploreAcceptanceGate::ObserveControl(const ControlObservation& observation) noexcept { return impl_->ObserveControl(observation); }
 void ExploreAcceptanceGate::SetRedrawCommand(std::function<bool()> callback) { impl_->SetRedrawCommand(std::move(callback)); }
-bool ExploreAcceptanceGate::ObserveFrontend(const contracts::IntegrationControlReceipt receipt) noexcept {
+bool ExploreAcceptanceGate::ObserveFrontend(const contracts::IntegrationControlReceipt& receipt) noexcept {
     return impl_->ObserveFrontend(receipt);
 }
 void ExploreAcceptanceGate::SetProductObserver(void* context, void (*observer)(void*, ProductObservation) noexcept) noexcept {

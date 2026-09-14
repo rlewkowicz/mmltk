@@ -7,12 +7,9 @@ pub(crate) fn physical_surface(
     crate::presentation_surface::Surface {
         high: frame.high,
         low: frame.low,
-        generation: 1,
         width: frame.content_width,
         height: frame.content_height,
-        timeline_ready: 0,
         frame: Some(frame),
-        integration: false,
         crop: None,
         viewer_identity: None,
         fit_revision: 0,

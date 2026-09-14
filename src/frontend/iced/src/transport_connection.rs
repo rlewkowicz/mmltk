@@ -233,6 +233,7 @@ impl Connection {
                         sequence,
                         progress: 0,
                         failureline: 0,
+                        failure: String::new(),
                         readgeneration: 0,
                         compiledindex: 0,
                     },

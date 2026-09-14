@@ -212,6 +212,16 @@ struct ImageWorkspace::State final {
         const auto epoch = gate.load(std::memory_order_relaxed) & ~kWorkspaceAccessMask;
         gate.store(epoch | role, std::memory_order_release);
     }
+    void NotifyDisplayAvailable() const noexcept {
+        if (display_held.load(std::memory_order_acquire)) return;
+        const auto role = std::atomic_ref{access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask;
+        if (role != kWorkspaceAccessEmpty && role != kWorkspaceAccessAvailable) return;
+        if (const auto sink = display_availability_sink.load(std::memory_order_acquire)) {
+            try {
+                (*sink)();
+            } catch (...) {}
+        }
+    }
     void Withdraw() noexcept {
         std::scoped_lock lock(access);
         auto gate = std::atomic_ref{access_signal->access};
@@ -489,6 +499,7 @@ void ImageWorkspace::CancelWrite() noexcept {
             (*sink)();
         } catch (...) {}
     }
+    state_->NotifyDisplayAvailable();
 }
 bool ImageWorkspace::ReserveDisplayWrite() {
     std::scoped_lock lock(state_->access);
@@ -505,6 +516,7 @@ void ImageWorkspace::CancelDisplayWrite() noexcept {
             (*sink)();
         } catch (...) {}
     }
+    state_->NotifyDisplayAvailable();
 }
 std::uint64_t ImageWorkspace::product_owner() const noexcept { return state_->owner->product_owner.load(std::memory_order_acquire); }
 void ImageWorkspace::SetDisplayAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
@@ -593,7 +605,8 @@ void ImageWorkspace::Admit(std::uint64_t allocation_identity, std::uint64_t devi
 }
 ImageStreamSettlement ImageWorkspace::Settle() noexcept {
     if (!state_) return {.completion_reached = true};
-    std::scoped_lock lock(state_->access);
+    std::unique_lock lock(state_->access);
+    const bool pending = bool(state_->pending_source);
     auto settled = state_->stream ? state_->stream->Settle() : ImageStreamSettlement{.completion_reached = true};
     if (state_->producer_stream) {
         const auto producer = state_->producer_stream->Settle();
@@ -610,16 +623,24 @@ ImageStreamSettlement ImageWorkspace::Settle() noexcept {
         if (!settled.failure) settled.failure = workspace_release_failure("workspace completion was not established");
         state_->owner->Failed(settled.failure);
     }
+    const bool available = pending && !state_->pending_source;
+    lock.unlock();
+    if (available) state_->NotifyDisplayAvailable();
     return settled;
 }
 void ImageWorkspace::Complete() {
     CheckOwner();
-    std::scoped_lock lock(state_->access);
+    std::unique_lock lock(state_->access);
     if (!state_->pending_source || !state_->completion_notified.load(std::memory_order_acquire)) return;
     // The notification executes before CUDA returns from the host callback.
     // Settlement on the execution owner proves that physical return as well.
     const auto settled = state_->pending_execution->Settle();
     state_->FinishPending(settled, true);
+    const bool available = !state_->pending_source;
+    lock.unlock();
+    // CUDA's callback wakes the producer to settle its work. Presentation
+    // independently waits for the resulting writable, completed workspace.
+    if (available) state_->NotifyDisplayAvailable();
     if (settled.failure) std::rethrow_exception(settled.failure);
     if (!settled.completion_reached) CheckOwner();
 }

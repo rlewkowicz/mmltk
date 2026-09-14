@@ -75,12 +75,18 @@ class GalleryThumbnailCache final {
         std::uint32_t extent = 0U;
         bool augmented = false;
         bool operator==(const Identity&) const noexcept = default;
+        // A changed preview replaces pixels, but completed tiles from the same
+        // artifact and raster extent remain drawable until replacement.
+        [[nodiscard]] bool SameSource(const Identity& other) const noexcept {
+            return incarnation == other.incarnation && dataset == other.dataset && extent == other.extent;
+        }
     };
     struct Entry final {
         std::size_t position = std::numeric_limits<std::size_t>::max();
         std::uint32_t compiled_index = 0U;
         std::uint8_t bank = 0U;
         std::uint8_t semantic_bank = 0U;
+        bool refresh_pending = false;
         std::shared_ptr<const GalleryTileMeaning> meaning{};
         std::uint64_t semantic_identity = 0U;
     };
@@ -103,10 +109,12 @@ class GalleryThumbnailCache final {
     [[nodiscard]] const Identity& identity() const noexcept { return identity_; }
     [[nodiscard]] std::size_t Slot(std::size_t position) const noexcept { return demand_slots_[position - demand_first_]; }
     [[nodiscard]] const Entry* Find(std::uint32_t compiled_index) const noexcept;
+    [[nodiscard]] const Entry* Retained(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] const Entry& Physical(std::size_t slot) const { return entries_.at(slot); }
     void Restore(std::size_t slot, Entry entry) noexcept;
     void Complete(std::size_t position, std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning>,
                   std::uint64_t semantic_identity, std::uint8_t bank = 0U, std::uint8_t semantic_bank = 0U);
+    void UpdateSemantics(std::size_t position, std::uint64_t semantic_identity, std::uint8_t semantic_bank);
     [[nodiscard]] std::size_t MeaningBytes(const GalleryThumbnailCache* other = nullptr,
                                            std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings = {}) const;
 

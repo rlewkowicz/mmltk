@@ -12,6 +12,7 @@
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 
 namespace mmltk::controller::browser {
 namespace {
@@ -174,6 +175,15 @@ struct ApplicationBrowserHost::Impl final {
         try {
             if (is_interaction_record(bytes)) {
                 auto view = decode_interaction_view(bytes);
+                if (!view) {
+                    diagnostics.Emit([&] {
+                        return services::RuntimeDiagnosticFact{
+                            .owner = contracts::DiagnosticOwner::BrowserRuntime,
+                            .event = "browser.interaction.decode_rejected",
+                            .value = bytes.size(),
+                        };
+                    });
+                }
                 return view && interaction(*installed, *view);
             }
             auto decoded = decode_client_record({.first = bytes});
@@ -231,7 +241,21 @@ struct ApplicationBrowserHost::Impl final {
                     } else if constexpr (std::same_as<Type, Interaction>) {
                         return interaction(*installed, InteractionView{value});
                     } else if constexpr (std::same_as<Type, IntegrationControl>) {
-                        return integration && integration->ObserveFrontend(value.receipt);
+                        const bool accepted = integration && integration->ObserveFrontend(value.receipt);
+                        if (!accepted && diagnostics.valid()) {
+                            try {
+                                namespace serialization = mmltk::frameworks::serialization;
+                                using Value = serialization::wire::Value;
+                                auto receipt = serialization::reflected_value(value.receipt);
+                                if (receipt) {
+                                    diagnostics.write_browser_event("browser.integration.rejected", Value(Value::Object{
+                                        {"receipt", std::move(*receipt)},
+                                        {"gate_installed", Value(static_cast<bool>(integration))},
+                                    }));
+                                }
+                            } catch (...) {}
+                        }
+                        return accepted;
                     }
                 },
                 std::move(*decoded));
@@ -360,6 +384,7 @@ bool ApplicationBrowserHost::install(ApplicationSystems& systems) noexcept { ret
 void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate,
                                                  std::shared_ptr<PresentationAcceptanceGate> completion) {
     if (!gate || impl_->integration) throw std::invalid_argument("integration gate installation is unique");
+    gate->SetDiagnostics(impl_->diagnostics);
     std::weak_ptr<Impl> weak = impl_;
     gate->SetFrontendCommand([weak](const contracts::IntegrationControlReceipt receipt) {
         const auto owner = weak.lock();
@@ -380,9 +405,15 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
         std::weak_ptr<ExploreAcceptanceGate> receiver = gate;
         completion->SetObserver([receiver](const PresentationAcceptanceGate::Receipt receipt) {
             if (const auto target = receiver.lock()) {
-                if (!target->ObserveControl({.event = receipt.capacity_available
-                                                          ? ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable
-                                                          : ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld,
+                const auto event = [&] {
+                    switch (receipt.boundary) {
+                        case PresentationAcceptanceGate::Boundary::Completion: return ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld;
+                        case PresentationAcceptanceGate::Boundary::Capacity: return ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable;
+                        case PresentationAcceptanceGate::Boundary::Supersession: return ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld;
+                    }
+                    std::unreachable();
+                }();
+                if (!target->ObserveControl({.event = event,
                                              .source_high = receipt.source_high,
                                              .source_low = receipt.source_low,
                                              .transfer = receipt.transfer,
@@ -395,6 +426,7 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
             if (!owner || !owner->admission.load(std::memory_order_acquire)) return false;
             using Command = ExploreAcceptanceGate::ControlCommand;
             using Kind = contracts::IntegrationControlKind;
+            if (command == Command::ReleasePendingSupersession) return completion->ReleaseSupersession();
             Kind kind;
             if (command == Command::ArmNativeCompletion) {
                 if (!completion->Arm()) return false;

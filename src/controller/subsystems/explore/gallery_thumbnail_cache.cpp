@@ -24,7 +24,11 @@ void GalleryThumbnailCache::Configure(const std::size_t count, Identity identity
     if (count > kMaximumCards) throw std::invalid_argument("Explore cache exceeds the viewport row bound");
     if (identity_ == identity && count <= entries_.size()) return;
     if (identity_ != identity) {
-        entries_.clear();
+        if (identity_.SameSource(identity)) {
+            for (auto& entry : entries_)
+                entry.refresh_pending = true;
+        } else
+            entries_.clear();
         identity_ = std::move(identity);
         demand_slots_.clear();
         std::ranges::fill(pinned_, false);
@@ -124,6 +128,11 @@ void GalleryThumbnailCache::Clear() noexcept {
 }
 
 const GalleryThumbnailCache::Entry* GalleryThumbnailCache::Find(const std::uint32_t compiled_index) const noexcept {
+    const auto* entry = Retained(compiled_index);
+    return entry && !entry->refresh_pending ? entry : nullptr;
+}
+
+const GalleryThumbnailCache::Entry* GalleryThumbnailCache::Retained(const std::uint32_t compiled_index) const noexcept {
     const auto slot = Lookup(compiled_index);
     return slot != absent && entries_[slot].meaning ? &entries_[slot] : nullptr;
 }
@@ -149,6 +158,17 @@ void GalleryThumbnailCache::Complete(const std::size_t position, const std::uint
                          .semantic_bank = semantic_bank,
                          .meaning = std::move(meaning),
                          .semantic_identity = semantic_identity};
+}
+
+void GalleryThumbnailCache::UpdateSemantics(const std::size_t position, const std::uint64_t semantic_identity,
+                                            const std::uint8_t semantic_bank) {
+    if (semantic_bank > 1U) throw std::invalid_argument("Explore cache plane version is invalid");
+    const auto slot = Slot(position);
+    auto& entry = entries_.at(slot);
+    if (!entry.meaning) throw std::logic_error("Explore semantic refresh requires retained clean pixels");
+    Save(slot);
+    entry.semantic_identity = semantic_identity;
+    entry.semantic_bank = semantic_bank;
 }
 
 std::size_t GalleryThumbnailCache::MetadataBytes() const noexcept {

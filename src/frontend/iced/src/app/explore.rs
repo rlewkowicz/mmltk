@@ -45,7 +45,7 @@ impl App {
 
     pub(super) fn abandon_explore_edit(&mut self, context: ApplicationIntentEndpoint) {
         if context == ApplicationIntentEndpoint::ExploreUpdateDetail {
-            self.workspace.explore_abandon_detail();
+            self.workspace.explore_settle_detail(false);
             self.model.explore.desired_detail = None;
         }
         if matches!(
@@ -330,16 +330,7 @@ impl App {
 
     pub(super) fn dispatch_explore_viewport(&mut self) -> Task<Message> {
         self.dispatch_explore_desired();
-        if self.settings.has_local_edits()
-            || !self.model.explore_viewport_available()
-            || self.model.has_explore_pending()
-            || self
-                .model
-                .explore
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.busy)
-        {
+        if self.settings.has_local_edits() || !self.model.explore_viewport_available() {
             return Task::none();
         }
         let Some(request) = self.workspace.explore_dispatchable_viewport() else {
@@ -449,9 +440,13 @@ impl App {
             && let Some(request) = self.model.explore.desired_detail.clone()
             && self.submit_intent(
                 ApplicationIntentEndpoint::ExploreUpdateDetail,
-                |correlation| crate::generated::encode_explore_UpdateDetail(correlation, request),
+                |correlation| {
+                    crate::generated::encode_explore_UpdateDetail(correlation, request.clone())
+                },
             )
         {
+            self.workspace
+                .explore_submit_detail(request.showoriginaldimensions);
             self.model.explore.desired_detail = None;
         }
         if !self.model.has_explore_pending()

@@ -738,13 +738,15 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
     bool refresh_semantics = false;
     for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot) {
         const auto position = static_cast<std::size_t>(plan.viewport.first_row) * plan.viewport.columns + slot;
-        const auto* entry = State().cache.Find(State().visible_indices[slot]);
+        const auto* entry = State().cache.Retained(State().visible_indices[slot]);
         if (!entry) continue;
         State().tile_meanings[slot] = entry->meaning;
         refresh_semantics |= entry->semantic_identity != plan.semantic_identity;
         PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
-        scheduled_slots_[State().cache.Slot(position)] = plan.generation;
-        ++State().reused_tiles;
+        if (!entry->refresh_pending) {
+            scheduled_slots_[State().cache.Slot(position)] = plan.generation;
+            ++State().reused_tiles;
+        }
     }
     if (refresh_semantics) {
         RenderCachedSemantics(clean, semantic, stream);
@@ -758,7 +760,10 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
         FlushProbes(stream);
     }
     if (acceptance_ && diagnostics_.valid()) {
-        for (std::size_t slot = 0U; slot != State().visible_indices.size(); ++slot)
+        std::uint32_t restored_tiles = 0U;
+        for (std::size_t slot = 0U; slot != State().visible_indices.size(); ++slot) {
+            const auto restored = static_cast<std::uint32_t>(State().tile_meanings[slot] != nullptr);
+            restored_tiles += restored;
             diagnostics_.Emit([&] {
                 return VisualDiagnosticFact{
                     .system = contracts::DiagnosticOwner::Explore,
@@ -766,8 +771,9 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
                     .generation = plan.generation,
                     .value = slot,
                     .detail = State().visible_indices[slot],
-                    .context = {.capacity_width = static_cast<std::uint32_t>(State().tile_meanings[slot] != nullptr)}};
+                    .context = {.capacity_width = restored}};
             });
+        }
         diagnostics_.Emit([&] {
             return VisualDiagnosticFact{
                 .system = contracts::DiagnosticOwner::Explore,
@@ -775,7 +781,7 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
                 .generation = plan.generation,
                 .value = State().visible_indices.size(),
                 .detail = explore_visible_indices_digest(State().visible_indices),
-                .context = {.capacity_width = State().reused_tiles,
+                .context = {.capacity_width = restored_tiles,
                             .admission = {.admission_first_row = plan.viewport.first_row,
                                           .admission_row_count = plan.viewport.row_count,
                                           .admission_columns = plan.viewport.columns,
@@ -1794,11 +1800,12 @@ void GalleryStream::Impl::PrepareCacheWrite(const std::uintptr_t stream) {
         throw std::overflow_error("Explore retained cache planes exceed addressable raster storage");
     const auto bytes = height * pitch;
     const bool replacement = publication_active_ && !borrowed_cache_ &&
-                             (State().cache.size() != committed_.cache.size() || State().cache.identity() != committed_.cache.identity());
+                             (State().cache.size() != committed_.cache.size() ||
+                              !State().cache.identity().SameSource(committed_.cache.identity()));
     if (replacement) State().cache_active = 1U - committed_.cache_active;
     for (auto* family : {&storage_.buffers_.cached_clean_, &storage_.buffers_.cached_semantic_})
         EnsureBuffer((*family)[State().cache_active], std::max<std::size_t>(bytes, 1U), "Explore candidate tile cache allocation failed");
-    if (!replacement || State().cache.identity() != committed_.cache.identity()) return;
+    if (!replacement || !State().cache.identity().SameSource(committed_.cache.identity())) return;
     // Capacity growth relocates retained individual tiles into an unpublished
     // allocation. Bank strides use physical capacity, never logical demand.
     for (std::size_t slot = 0U; slot < committed_.cache.size(); ++slot) {
@@ -1848,7 +1855,7 @@ void GalleryStream::Impl::PlaceTile(const mmltk::frameworks::gpu::ImagePlaneView
                                     const std::uintptr_t stream, const bool semantic_only) {
     const auto side = State().cache.identity().extent;
     const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
-    const auto* entry = State().cache.Find(State().visible_indices[slot]);
+    const auto* entry = State().cache.Retained(State().visible_indices[slot]);
     if (!entry) throw std::logic_error("Explore atlas placement requires a completed cache tile");
     const auto x = slot % State().viewport.columns * side;
     const auto physical = atlas_.Physical(slot);
@@ -1870,9 +1877,10 @@ void GalleryStream::Impl::PlaceTile(const mmltk::frameworks::gpu::ImagePlaneView
         copy(semantic, true);
         atlas_.Stage(physical, entry->meaning, entry->semantic_identity);
     }
-    if (State().tile_meanings[slot] != entry->meaning || !State().completed_slots[slot]) SaveSlot(position);
+    const bool completed = !entry->refresh_pending && !State().completed_slots[slot];
+    if (State().tile_meanings[slot] != entry->meaning || completed) SaveSlot(position);
     State().tile_meanings[slot] = entry->meaning;
-    if (!State().completed_slots[slot]) {
+    if (completed) {
         State().completed_slots[slot] = true;
         ++State().cumulative_tiles;
     }
@@ -1976,13 +1984,11 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
         for (const auto slot : slots) {
             if (!Current(State().plan.generation)) return;
             const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
-            const auto* incumbent = State().cache.Find(State().visible_indices[slot]);
+            const auto* incumbent = State().cache.Retained(State().visible_indices[slot]);
             if (!incumbent) throw std::logic_error("Explore semantic refresh lost its clean tile");
-            const auto clean_bank = incumbent->bank;
             const auto semantic_bank = WritableCacheBank(position, true);
             SaveSlot(position);
-            State().cache.Complete(position, State().visible_indices[slot], State().tile_meanings[slot], State().plan.semantic_identity,
-                                   clean_bank, semantic_bank);
+            State().cache.UpdateSemantics(position, State().plan.semantic_identity, semantic_bank);
             PlaceTile(clean, target, slot, stream, true);
         }
         if (diagnostics_.valid())
@@ -2232,7 +2238,7 @@ void GalleryStream::Impl::RestoreVisibleTiles(const std::span<const explore::Exp
                                               const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {
     SeedPlaceholders(classes, clean, semantic, stream);
     for (std::size_t slot = 0U; slot < State().visible_indices.size(); ++slot)
-        if (State().cache.Find(State().visible_indices[slot])) PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
+        if (State().cache.Retained(State().visible_indices[slot])) PlaceTile(clean, semantic, static_cast<std::uint32_t>(slot), stream);
 }
 
 ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -2608,7 +2614,7 @@ void GalleryStream::Impl::SeedPlaceholders(const std::span<const explore::Explor
         const auto row = (physical / columns + State().atlas.row_capacity - State().atlas.row_origin) % State().atlas.row_capacity;
         const auto logical = row * columns + physical % columns;
         const bool visible = row < State().atlas.row_count && logical < State().visible_indices.size();
-        if (visible && State().cache.Find(State().visible_indices[logical])) continue;
+        if (visible && State().cache.Retained(State().visible_indices[logical])) continue;
         if (atlas_.Empty(physical, visible)) continue;
         atlas_.Touch(physical);
         if (visible) {
@@ -2834,7 +2840,7 @@ void GalleryStream::Impl::DiagnoseRendered(const mmltk::frameworks::gpu::ImagePl
     if (sample_card && State().cache.size() != 0U) {
         reference = Target(CachePlane(false));
         const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
-        const auto* retained = State().cache.Find(compiled_index);
+        const auto* retained = State().cache.Retained(compiled_index);
         const auto bank = retained ? retained->bank : WritableCacheBank(position);
         reference.data += CacheOffset(position, bank) * reference.pitch_bytes;
         reference.height = reference.width;

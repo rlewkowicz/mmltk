@@ -214,10 +214,7 @@ fn button_value(button: mouse::Button) -> (WorkspaceMouseButton, u16) {
 mod tests {
     use super::*;
 
-    fn assert_output(
-        connection: &crate::transport_connection::Connection,
-        expected: Vec<Vec<u8>>,
-    ) {
+    fn assert_output(connection: &crate::transport_connection::Connection, expected: Vec<Vec<u8>>) {
         let mut actual = Vec::new();
         connection
             .flush(|bytes| {

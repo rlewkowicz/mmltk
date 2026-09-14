@@ -21,8 +21,8 @@ fn label_bounds(
 
 #[derive(Clone)]
 pub(crate) enum Source {
-    Gallery(std::sync::Arc<crate::generated::ExploreImageMetadata>),
-    Detail(super::DetailContent),
+    Gallery(std::sync::Arc<crate::generated::ExploreImageMetadata>, bool),
+    Detail(super::DetailContent, bool),
     Hidden,
 }
 
@@ -39,7 +39,7 @@ impl Source {
         ),
     ) {
         match self {
-            Self::Gallery(snapshot) if snapshot.overlay.showlabels => {
+            Self::Gallery(snapshot, true) => {
                 for item in &snapshot.labels {
                     if let (Some(name), Some(color)) = (
                         snapshot.dataset.classnames.get(item.category as usize),
@@ -56,7 +56,7 @@ impl Source {
                     }
                 }
             }
-            Self::Detail(content) if content.overlay().showlabels => {
+            Self::Detail(content, true) => {
                 let scene = content.scene();
                 let overlay = content.overlay();
                 for object in &scene.objects {
@@ -211,7 +211,11 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Labelled<'_, Message> {
             && let Some(meter) = &state.fps
             && let Some(clip) = layout.bounds().intersection(viewport)
         {
-            crate::workspace_fps::draw(renderer, theme, meter, clip, self.control_id);
+            // Iced batches parent-layer quads before its shader primitives.
+            // Keep both meter background and glyphs above the workspace image.
+            renderer.with_layer(clip, |renderer| {
+                crate::workspace_fps::draw(renderer, theme, meter, clip, self.control_id);
+            });
         }
     }
 }
@@ -225,12 +229,15 @@ impl<Message> Labelled<'_, Message> {
         layout: Layout<'_>,
         viewport: &Rectangle,
     ) {
-        if matches!(self.source, Source::Hidden) {
+        if matches!(
+            self.source,
+            Source::Hidden | Source::Gallery(_, false) | Source::Detail(_, false)
+        ) {
             return;
         }
         let mut bounds = layout.bounds();
         let mut placement = self.placement;
-        if let Source::Gallery(snapshot) = &self.source {
+        if let Source::Gallery(snapshot, _) = &self.source {
             bounds.y += super::gallery::row_offset(placement, snapshot, bounds.width);
             placement = super::gallery::placement(snapshot);
         }
@@ -257,7 +264,7 @@ impl<Message> Labelled<'_, Message> {
         };
         super::gallery::observe_theme(theme);
         let mut region = self.surface.content_region();
-        if matches!(self.source, Source::Gallery(_)) {
+        if matches!(self.source, Source::Gallery(..)) {
             let extent = placement.logical_extent(self.surface.content_extent());
             region = [0, 0, extent.0, extent.1];
         }
@@ -298,7 +305,7 @@ impl<Message> Labelled<'_, Message> {
                         },
                         clip,
                     );
-                    if self.surface.integration
+                    if crate::integration_control::reporting_enabled()
                         && let Some(frame) = self.surface.frame
                     {
                         crate::integration_control::report_viewer_label(
@@ -368,10 +375,15 @@ mod tests {
         super::super::authorize_draw(Some(frame));
         super::super::complete_sample(frame);
         let surface = crate::view_model::test_support::physical_surface(frame);
-        let source = Source::Detail(super::super::DetailContent {
-            explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&*snapshot)),
-            upscale: None,
-        });
+        let source = Source::Detail(
+            super::super::DetailContent {
+                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                    &*snapshot,
+                )),
+                upscale: None,
+            },
+            true,
+        );
         let program = |show_fps| Program::<()> {
             show_fps,
             input: None,
@@ -381,6 +393,7 @@ mod tests {
             placement: super::super::Placement::Contain,
             control_id: crate::view::workspace::STABLE_ID,
         };
+        let _renderer_cleanup = super::super::TestRendererCleanup;
         let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
             Default::default(),
             Some("wgpu"),
@@ -510,8 +523,6 @@ mod tests {
         assert_eq!(pixel(&after, 79, 98), pixel(&before, 79, 98));
         assert_eq!(pixel(&after, 11, 30), pixel(&before, 11, 30));
         assert_eq!(pixel(&after, 572, 28), [0; 3]);
-        drop(renderer);
-        super::super::RENDERER.with(|owner| drop(owner.borrow_mut().take()));
     }
 
     #[test]
@@ -601,17 +612,21 @@ mod tests {
             let mut snapshot = crate::view_model::test_support::explore_snapshot();
             snapshot.scene = scene.clone();
             snapshot.overlay = overlay.clone();
-            Source::Detail(super::super::DetailContent {
-                explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
-                    &snapshot,
-                )),
-                upscale: None,
-            })
+            Source::Detail(
+                super::super::DetailContent {
+                    explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+                        &snapshot,
+                    )),
+                    upscale: None,
+                },
+                overlay.showlabels,
+            )
         };
         assert!(
-            collect(Source::Gallery(std::sync::Arc::new(
-                crate::generated::ExploreImageMetadata::from(&snapshot)
-            )))
+            collect(Source::Gallery(
+                std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(&snapshot)),
+                snapshot.overlay.showlabels
+            ))
             .is_empty()
         );
         let labels = collect(detail(&snapshot.scene, &snapshot.overlay));

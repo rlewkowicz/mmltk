@@ -222,6 +222,8 @@ int main(int argc, char** argv) {
             }
             const char* const pending_supersession = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION");
             config.pending_supersession_acceptance = pending_supersession != nullptr && std::string_view{pending_supersession} == "1";
+            if (config.pending_supersession_acceptance && !config.completion_acceptance)
+                config.completion_acceptance = std::make_shared<mmltk::controller::PresentationAcceptanceGate>();
         }
         if (lifecycle_trace != nullptr && *lifecycle_trace != '\0') {
             config.diagnostics = mmltk::controller::services::DiagnosticsClient{std::filesystem::path{lifecycle_trace}};

@@ -737,6 +737,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(audit.last_descriptor_rle() > source_rle_count);
     check_published_frame(system);
     REQUIRE_FALSE(system.snapshot().labels.empty());
+    const auto augmented_labels = system.snapshot().labels;
     const auto image_pixel_count = audit.image_pixel_count();
     placeholder_count = audit.placeholder_count();
     augmented = system.RerollAugmentation();
@@ -747,9 +748,11 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const auto pending_replacement = audit.pending_snapshot();
     REQUIRE(pending_replacement.has_value());
     CHECK(pending_replacement->gallery.generation == system.snapshot().gallery.generation);
-    // A new seed invalidates the old tile meanings. Placeholders must not
-    // advertise labels belonging to the previous generation's image pixels.
-    CHECK(pending_replacement->labels.empty());
+    // The next seed is pending, while completed pixels and their exact labels
+    // remain drawable until each replacement tile is ready.
+    CHECK(std::ranges::equal(pending_replacement->labels, augmented_labels, [](const auto& actual, const auto& expected) {
+        return actual.box == expected.box && actual.category == expected.category && actual.compiled_index == expected.compiled_index;
+    }));
     CHECK(system.snapshot().gallery.slots == std::vector<bool>{true, true});
     CHECK_FALSE(system.snapshot().labels.empty());
     CHECK(system.snapshot().frame.revision > augmented_frame);
@@ -1000,13 +1003,18 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
             {.path = "workflows.explore.show_labels", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
         };
         static_cast<void>(settings.Update(std::move(update)));
+        const auto candidate = settings.explore_settings_candidate();
+        auto policy = candidate.preferences.policy;
+        policy.filter.minimum_instances = 1U;
+        static_cast<void>(settings.persist_explore_filter(candidate, policy));
         NativeExploreFixture subject{settings, h2d};
         auto& audit = subject.audit;
         auto& system = subject.system;
         static_cast<void>(system.UpdateAugmentation({.enabled = true}));
         static_cast<void>(system.Open(
-            {.viewport = {.extent = {64U, 32U}, .first_row = 5U, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
+            {.viewport = {.extent = {64U, 32U}, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
         wait_for_native_gallery(audit, system, 0U, 0U);
+        REQUIRE(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
         REQUIRE(audit.Wait([&] { return audit.augmentation_count() != 0U; }));
         CHECK_FALSE(audit.failed());
         CHECK((audit.last_valid_donors() != 0U) == donor_fits);
@@ -1423,7 +1431,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
                 observed.remaining = fact.logical_size;
                 observed.before = fact.capacity_before;
                 observed.after = fact.capacity_after;
-            } else {
+            } else if (prepared) {
                 observed.prepared = std::move(fact.artifact);
             }
         }
@@ -1494,7 +1502,6 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     const auto settled = system.snapshot();
     {
         std::scoped_lock lock(observation.mutex);
-        CHECK(observation.released.expired());
         CHECK(observation.remaining == 0U);
         CHECK(observation.before != 0U);
         CHECK(observation.after == observation.before);
@@ -1502,7 +1509,6 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     }
     CHECK(held.plane(0U).revision() == incumbent.frame.revision);
     if (outcome == Outcome::Commit) {
-        CHECK(incumbent_artifact.expired());
         CHECK(settled.frame != incumbent.frame);
     } else {
         CHECK_FALSE(incumbent_artifact.expired());
@@ -1520,6 +1526,15 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     held = {};
     gate->Stop();
     system.Shutdown();
+    // Clearing the inactive product drops its own references. A shared artifact
+    // can still belong to the active product or an unfinished read; shutdown
+    // joins those owners before final destruction is observable.
+    CHECK(incumbent_artifact.expired());
+    {
+        std::scoped_lock lock(observation.mutex);
+        CHECK(observation.released.expired());
+        CHECK(observation.prepared.expired());
+    }
 }
 
 }  // namespace

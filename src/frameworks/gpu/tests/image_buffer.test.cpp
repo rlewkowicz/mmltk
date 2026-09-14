@@ -1708,8 +1708,9 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
     auto backend = std::make_shared<FakeImageBackend>();
-    SystemImageRuntime runtime(
-        {.device = 0, .backend = backend, .output_buffer_count = 2U, .workspace_finalize = [](auto, auto, auto, auto, auto) {}});
+    auto config = test_support::WorkspaceRuntimeConfig(backend);
+    config.output_buffer_count = 2U;
+    SystemImageRuntime runtime(std::move(config));
     const auto workspace = [&] {
         auto result = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
             backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
@@ -1749,7 +1750,7 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
     candidate = runtime.TryAcquireOutput(baseline);
     REQUIRE(candidate.valid());
     CHECK_FALSE(overflow_peer.Acquire(old_access, old_revision));
-    runtime.Publish(candidate, 4U, 3U, fill(33U));
+    runtime.PublishRetained(candidate, 4U, 3U, fill(33U));
     baseline = runtime.CommitOutput(std::move(candidate));
     REQUIRE(runtime.PrepareDisplay(baseline.revision(), overflow));
     overflow->CancelDisplayWrite();
@@ -2123,7 +2124,7 @@ TEST_CASE("Allocation retirement publishes cleanup before waking and closes late
     observation.SetWake({});
 }
 
-TEST_CASE("Late workspace preparation stays pending through raw and counted access", "[gpu][workspace]") {
+TEST_CASE("Late workspace preparation preserves raw and counted read custody", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     WorkspaceRuntimeFixture fixture;
     auto& runtime = fixture.runtime;
@@ -2143,9 +2144,11 @@ TEST_CASE("Late workspace preparation stays pending through raw and counted acce
     REQUIRE(borrowed.valid());
     CHECK(borrowed.revision() == observed.product_revision);
     auto completion = std::move(borrowed).TakeCompletion();
-    CHECK_FALSE(runtime.PrepareDisplay(observed.product_revision, workspace));
+    CHECK(runtime.PrepareDisplay(observed.product_revision, workspace));
+    CHECK_FALSE(runtime.DetachDisplay(workspace));
     completion->Complete();
     completion.reset();
+    REQUIRE(runtime.DetachDisplay(workspace));
     REQUIRE(runtime.PrepareDisplay(observed.product_revision, workspace));
     CHECK(runtime.ObserveWorkspace().product_revision == observed.product_revision);
 }
@@ -2765,6 +2768,18 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
         backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
     const auto raw = runtime.ObserveWorkspace();
+    const bool settle_directly = GENERATE(false, true);
+    struct DisplayObservation {
+        std::size_t notifications = 0U;
+        bool ready = false;
+    };
+    const auto display = std::make_shared<DisplayObservation>();
+    workspace->SetDisplayAvailabilitySink(std::make_shared<const std::function<void()>>(
+        [display, weak = std::weak_ptr{workspace}, content = ImageWorkspaceContent{raw.product_owner, raw.product_revision}] {
+            ++display->notifications;
+            const auto completed = weak.lock();
+            display->ready = completed && completed->Contains(content) && completed->WriteAvailable();
+        }));
     backend->defer_notifications = true;
     CHECK_FALSE(runtime.PrepareDisplay(raw.product_revision, workspace));
     CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
@@ -2772,11 +2787,26 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     auto baseline = runtime.Completed();
     CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.Borrow().valid());
+    CHECK_FALSE(workspace->ReserveDisplayWrite());
     backend->CompleteNotifications();
     CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
+    CHECK(display->notifications == 0U);
     CHECK(backend->planes_freed == 0U);
-    runtime.CompleteWorkspaces();
+    if (settle_directly) {
+        const auto settled = workspace->Settle();
+        REQUIRE(settled.completion_reached);
+        REQUIRE_FALSE(settled.failure);
+    } else {
+        runtime.CompleteWorkspaces();
+    }
     REQUIRE(workspace->Contains({raw.product_owner, raw.product_revision}));
+    CHECK(display->notifications == 1U);
+    CHECK(display->ready);
+    runtime.CompleteWorkspaces();
+    CHECK(display->notifications == 1U);
+    REQUIRE(workspace->ReserveDisplayWrite());
+    workspace->CancelDisplayWrite();
+    workspace->SetDisplayAvailabilitySink({});
     CHECK(*reinterpret_cast<const std::byte*>(runtime.BorrowWorkspace().plane().data) == std::byte{37});
     CHECK(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.PrepareDisplay(raw.product_revision, workspace));
@@ -2789,15 +2819,17 @@ TEST_CASE("Shutdown settles pending workspace finalization with allocation-local
     auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
         backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
     auto observation = workspace->ObserveRetirement();
-    SystemImageRuntime runtime(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend));
-    runtime.Publish(4U, 3U, [](auto, auto, auto) {});
-    backend->defer_notifications = true;
-    CHECK_FALSE(runtime.PrepareDisplay(runtime.OutputFacts().revision, workspace));
-    REQUIRE(observation.TransferToProducer());
-    workspace.reset();
-    const auto retired = runtime.Retire();
-    CHECK(retired.safe_to_destroy);
-    CHECK_FALSE(retired.failure);
+    {
+        SystemImageRuntime runtime(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend));
+        runtime.Publish(4U, 3U, [](auto, auto, auto) {});
+        backend->defer_notifications = true;
+        CHECK_FALSE(runtime.PrepareDisplay(runtime.OutputFacts().revision, workspace));
+        REQUIRE(observation.TransferToProducer());
+        workspace.reset();
+        const auto retired = runtime.Retire();
+        CHECK(retired.safe_to_destroy);
+        CHECK_FALSE(retired.failure);
+    }
     CHECK(observation.TakeResult().complete);
     CHECK_FALSE(observation.TakeResult().claimed);
     CHECK(backend->planes_allocated == backend->planes_freed);

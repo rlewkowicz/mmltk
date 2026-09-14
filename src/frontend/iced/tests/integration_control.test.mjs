@@ -48,7 +48,9 @@ function canvasFixture(t, diagnostics = false, driver = true) {
         },
         getImageData(x, y, width, height) {
           allocations.reads++;
+          sampling.lastRead = [x, y, width, height];
           if (sampling.error) throw sampling.error;
+          if (sampling.data) return {data: sampling.data};
           const pixel = sampling.pixel(sourceX + x, sourceY + y);
           return {data: Uint8ClampedArray.from({length: width * height * 4}, (_, i) => pixel[i % 4])};
         },
@@ -421,4 +423,143 @@ test('partial atlas sampling reports each exact ready card and reuses canvas sto
   assert.equal(f.allocations.scratch, 1);
   assert.equal(f.allocations.reads, 2);
   assert.deepEqual(f.events, []);
+});
+
+const fpsValues = [20, 6, 74, 22, 0, 0, 100, 60, 30, .5, 0];
+function fpsCapture(results, values = fpsValues, scale = 1) {
+  browser.mmltkIntegrationFpsDraw(gallery, values);
+  browser.mmltkIntegrationFpsPixels(browser.mmltkIntegrationProbe(gallery), values, scale,
+    (...result) => results.push(result));
+}
+
+test('FPS product activation without diagnostics collects no geometry or canvas pixels', t => {
+  const f = canvasFixture(t, false, false);
+  browser.mmltkIntegrationFpsDraw(gallery, fpsValues);
+  assert.deepEqual(f.frames, []);
+  assertQuiet(f);
+});
+
+for (const [dpi, uiScale] of [[1, 1], [1.25, 1.5], [1.5, 1.25], [2, 1.5]]) {
+  test(`FPS capture uses actual canvas backing/CSS dimensions at DPI ${dpi} and UI scale ${uiScale}`, t => {
+    const f = canvasFixture(t, true);
+    f.canvas.width = 640 * dpi; f.canvas.height = 480 * dpi;
+    // Deliberately disagree: actual canvas dimensions, not ambient devicePixelRatio, own conversion.
+    window.devicePixelRatio = 3;
+    browser.mmltkIntegrationReceipt(gallery, 'fps', 7, 11);
+    const result = [];
+    fpsCapture(result, fpsValues, uiScale);
+    assert.equal(f.allocations.reads, 0);
+    assert.equal(f.frames.length, 1);
+    f.flushFrames();
+    const scale = dpi * uiScale;
+    const left = Math.ceil(20 * scale), top = Math.ceil(6 * scale);
+    const width = Math.floor(94 * scale) - left, height = Math.floor(28 * scale) - top;
+    assert.deepEqual(f.sampling.lastRead, [left, top, width, height]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0][0], 'observed');
+    assert.deepEqual(result[0][1], [width, height]);
+    assert.ok(result[0][2] instanceof Uint8ClampedArray);
+    assert.equal(result[0][2].length, width * height * 4);
+    assert.equal(f.allocations.copies, 1);
+    assert.equal(f.allocations.reads, 1);
+    assert.equal(f.allocations.scratch, 1);
+    fpsCapture([], fpsValues, uiScale);
+    f.flushFrames();
+    assert.equal(f.allocations.scratch, 1, 'scenario scratch storage is reused');
+  });
+}
+
+for (const change of ['css', 'backing', 'canvas', 'receipt', 'counter', 'sample', 'scenario']) {
+  test(`FPS ${change} invalidation discards old capture and rearms current displayed evidence`, t => {
+    const f = canvasFixture(t, true);
+    browser.mmltkIntegrationReceipt(gallery, 'fps', 7, 11);
+    const old = [], current = [];
+    fpsCapture(old);
+    const values = fpsValues.slice();
+    if (change === 'css') f.css.width += 1;
+    if (change === 'backing') f.canvas.width += 1;
+    if (change === 'canvas') {
+      const replacement = {...f.canvas};
+      document.querySelector = () => replacement;
+    }
+    if (change === 'counter') values[0] += .5;
+    if (change === 'sample') values[8] += 1;
+    if (change === 'scenario') browser.mmltkIntegrationResetScenario();
+    browser.mmltkIntegrationReceipt(gallery, change === 'receipt' ? 'new' : 'fps', 7, 11);
+    browser.mmltkIntegrationFpsDraw(gallery, values);
+    f.flushFrames();
+    assert.deepEqual(old, [['invalidated', 0, 0]]);
+    assert.equal(f.allocations.reads, 0);
+    fpsCapture(current, values);
+    f.flushFrames();
+    assert.equal(current.length, 1);
+    assert.equal(current[0][0], 'observed');
+  });
+}
+
+test('FPS replacement on the same image has distinct ownership and obsolete finally work is inert', t => {
+  const f = canvasFixture(t, true);
+  browser.mmltkIntegrationReceipt(gallery, 'same', 7, 11);
+  const old = [], current = [];
+  fpsCapture(old);
+  fpsCapture(current);
+  assert.deepEqual(old, [['invalidated', 0, 0]]);
+  f.frames.shift()();
+  assert.deepEqual(old, [['invalidated', 0, 0]]);
+  f.flushFrames();
+  assert.equal(current.length, 1);
+  assert.equal(current[0][0], 'observed');
+  assert.equal(f.allocations.reads, 1);
+});
+
+for (const stop of ['reset', 'diagnostics', 'driver']) {
+  test(`FPS ${stop} settles a queued once callback and leaves subsequent work inert`, t => {
+    const f = canvasFixture(t, true);
+    browser.mmltkIntegrationReceipt(gallery, 'fps', 7, 11);
+    const result = [];
+    fpsCapture(result);
+    if (stop === 'reset') browser.mmltkIntegrationResetScenario();
+    if (stop === 'diagnostics') browser.mmltkIntegrationInitialize(false);
+    if (stop === 'driver') browser.mmltkIntegrationDriver(false);
+    assert.deepEqual(result, [[stop === 'driver' ? 'failed' : 'invalidated', 0, 0]]);
+    f.flushFrames();
+    assert.equal(result.length, 1);
+    assert.equal(f.allocations.reads, 0);
+  });
+}
+
+for (const invalid of ['missing', 'nonfinite', 'scale', 'clipped', 'outside', 'bytes', 'exception']) {
+  test(`FPS ${invalid} capture fails once without declaring pixel evidence`, t => {
+    const f = canvasFixture(t, true);
+    browser.mmltkIntegrationReceipt(gallery, 'fps', 7, 11);
+    const values = fpsValues.slice(), result = [];
+    if (invalid === 'missing') values.pop();
+    if (invalid === 'nonfinite') values[0] = Infinity;
+    if (invalid === 'clipped') values[6] = 80;
+    if (invalid === 'outside') { values[0] = 700; values[6] = 800; }
+    if (invalid === 'bytes') f.sampling.data = new Uint8ClampedArray(3);
+    if (invalid === 'exception') f.sampling.error = new Error('canvas read unavailable');
+    fpsCapture(result, values, invalid === 'scale' ? NaN : 1);
+    f.flushFrames();
+    assert.deepEqual(result, [['failed', 0, 0]]);
+    browser.mmltkIntegrationResetScenario();
+    assert.equal(result.length, 1);
+  });
+}
+
+
+test('FPS capture freezes caller data and later canvas changes invalidate the completed receipt', t => {
+  const f = canvasFixture(t, true);
+  browser.mmltkIntegrationReceipt(gallery, 'fps', 7, 11);
+  const values = fpsValues.slice(), results = [];
+  browser.mmltkIntegrationFpsDraw(gallery, values);
+  const receipt = browser.mmltkIntegrationProbe(gallery);
+  browser.mmltkIntegrationFpsPixels(receipt, values, 1, (...result) => results.push(result));
+  values[0] = 500;
+  f.flushFrames();
+  assert.equal(results[0][0], 'observed');
+  assert.deepEqual(f.sampling.lastRead, [20, 6, 74, 22]);
+  assert.equal(browser.mmltkIntegrationFpsCurrent(receipt, fpsValues), true);
+  f.css.width += 1;
+  assert.equal(browser.mmltkIntegrationFpsCurrent(receipt, fpsValues), false);
 });

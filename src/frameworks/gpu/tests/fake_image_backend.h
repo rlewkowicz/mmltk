@@ -162,8 +162,9 @@ inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneVie
     }
 }
 
-[[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(std::shared_ptr<ImageCopyBackend> backend,
-                                                                     std::shared_ptr<ImageProductRevisionSequence> revisions = {}) {
+[[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(
+    std::shared_ptr<ImageCopyBackend> backend,
+    std::shared_ptr<ImageProductRevisionSequence> revisions = std::make_shared<ImageProductRevisionSequence>()) {
     return {.device = 0,
             .backend = std::move(backend),
             .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },

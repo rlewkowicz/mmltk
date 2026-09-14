@@ -125,9 +125,26 @@ impl App {
             ));
             return false;
         };
-        self.submit_intent(
+        let observed = self.integration.as_ref().map(|_| {
+            (
+                request.clone(),
+                self.model
+                    .annotation
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.inputdocumentepoch),
+            )
+        });
+        let submitted = self.submit_intent(
             ApplicationIntentEndpoint::AnnotationOpen,
             move |correlation| crate::generated::encode_annotation_Open(correlation, request),
-        )
+        );
+        if submitted
+            && let (Some(integration), Some((request, epoch))) =
+                (self.integration.as_mut(), observed)
+        {
+            integration.observe_annotation_open(request, epoch);
+        }
+        submitted
     }
 }

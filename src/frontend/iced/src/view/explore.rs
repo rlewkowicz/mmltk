@@ -112,6 +112,11 @@ pub struct Component {
 }
 
 impl Component {
+    #[cfg(test)]
+    pub(crate) fn state_for_test(&mut self) -> &mut state::State {
+        &mut self.state
+    }
+
     pub fn rebase(&mut self, model: &ApplicationModel) {
         self.state.rebase(model.explore.snapshot.as_ref(), false);
     }
@@ -132,8 +137,12 @@ impl Component {
         self.state.abandon_submission();
     }
 
-    pub fn abandon_detail(&mut self) {
-        self.state.abandon_detail();
+    pub fn submit_detail(&mut self, original: bool) {
+        self.state.submit_detail(original);
+    }
+
+    pub fn settle_detail(&mut self, accepted: bool) {
+        self.state.settle_detail(accepted);
     }
 
     pub fn request_viewport(

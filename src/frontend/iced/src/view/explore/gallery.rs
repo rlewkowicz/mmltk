@@ -443,7 +443,14 @@ fn gallery_viewport<'a>(
                     },
                     control_id: super::GALLERY_WORKSPACE_ID,
                 },
-                crate::presentation_surface::labels::Source::Gallery(metadata.clone()),
+                crate::presentation_surface::labels::Source::Gallery(
+                    metadata.clone(),
+                    state
+                        .presented_filter(snapshot)
+                        .map_or(metadata.overlay.showlabels, |request| {
+                            request.overlay.showlabels
+                        }),
+                ),
             );
             if metadata.order.matchingcount == 0 {
                 stack![

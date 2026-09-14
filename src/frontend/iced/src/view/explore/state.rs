@@ -235,6 +235,7 @@ pub struct State {
     dataset_identity: u64,
     pub(super) fit_revision: u64,
     detail_view: std::cell::Cell<Option<DetailView>>,
+    detail_submission: Option<(Option<(u64, u32)>, bool)>,
     submitted_filter: Option<SubmittedFilter>,
     sent_viewport: Option<ExploreViewportUpdate>,
     desired_viewport: Option<ExploreViewportUpdate>,
@@ -247,8 +248,8 @@ pub struct State {
 #[derive(Debug, Clone, Copy)]
 struct DetailView {
     identity: Option<(u64, u32)>,
-    original: bool,
-    chosen: bool,
+    accepted: Option<bool>,
+    desired: Option<bool>,
 }
 
 impl State {
@@ -257,32 +258,58 @@ impl State {
         content: &crate::presentation_surface::DetailContent,
     ) -> bool {
         let identity = content.viewer_identity();
-        let mut view = self
+        let view = self
             .detail_view
             .get()
             .filter(|view| view.identity == identity)
             .unwrap_or(DetailView {
                 identity,
-                original: content.original_dimensions(),
-                chosen: false,
+                accepted: None,
+                desired: None,
             });
-        if !view.chosen {
-            view.original = content.original_dimensions();
-        }
         self.detail_view.set(Some(view));
-        view.original
+        view.desired
+            .or(view.accepted)
+            .unwrap_or_else(|| content.original_dimensions())
     }
 
     pub(crate) fn choose_detail_original(&mut self, original: bool) {
         if let Some(mut view) = self.detail_view.get() {
-            view.original = original;
-            view.chosen = true;
+            view.desired = Some(original);
             self.detail_view.set(Some(view));
         }
     }
 
-    pub fn abandon_detail(&mut self) {
-        self.detail_view.set(None);
+    pub fn submit_detail(&mut self, original: bool) {
+        self.detail_submission = self.detail_view.get().map(|view| (view.identity, original));
+    }
+
+    pub fn settle_detail(&mut self, accepted: bool) {
+        let submitted = self.detail_submission.take();
+        if let Some(mut view) = self.detail_view.get() {
+            if let Some((identity, original)) = submitted {
+                if identity != view.identity {
+                    return;
+                }
+                if accepted {
+                    view.accepted = Some(original);
+                }
+                if !accepted || view.desired == Some(original) {
+                    view.desired = None;
+                }
+            } else if !accepted {
+                view.desired = None;
+            }
+            self.detail_view.set(Some(view));
+        }
+    }
+
+    fn reset_detail_submission(&mut self) {
+        self.detail_submission = None;
+        if let Some(mut view) = self.detail_view.get() {
+            view.desired = None;
+            self.detail_view.set(Some(view));
+        }
     }
 
     pub fn rebase(&mut self, snapshot: Option<&ExploreSnapshot>, bootstrap: bool) {
@@ -295,7 +322,20 @@ impl State {
             self.clear_viewport_admission();
         }
         if bootstrap {
-            self.abandon_detail();
+            self.reset_detail_submission();
+            // A replacement peer can settle a native edit whose reply was lost.
+            // This reconciles only the UI choice; paired graphics still own geometry.
+            if let Some(snapshot) = snapshot
+                && let Some(mut view) = self.detail_view.get()
+                && snapshot
+                    .selectedimage
+                    .map(|image| (snapshot.dataset.identity, image))
+                    == view.identity
+                && view.identity.is_some()
+            {
+                view.accepted = Some(snapshot.detail.showoriginaldimensions);
+                self.detail_view.set(Some(view));
+            }
             self.submitted_filter = None;
             self.clear_viewport_admission();
             if let Some(measured) = self.measured_gallery.as_mut() {

@@ -2,7 +2,13 @@ let integrationState;
 let integrationDriver;
 
 export function mmltkIntegrationDriver(enabled) {
-  if (!enabled) { integrationDriver = undefined; return; }
+  if (!enabled) {
+    integrationDriver = undefined;
+    const pending = integrationState?.fpsPending;
+    if (integrationState) integrationState.fpsPending = undefined;
+    pending?.completed('failed');
+    return;
+  }
   integrationDriver ??= {integrationFullscreenSettled:false, integrationAnnotationPointerEnd:null,
     pendingSurfaceClick:undefined, readySurface:undefined};
 }
@@ -31,6 +37,8 @@ export function mmltkIntegrationInitialize(enabled) {
     compositionPending: false,
     canvasScratch: undefined,
     canvasContext: undefined,
+    fpsDraw: undefined,
+    fpsPending: undefined,
     integrationRenderKey: 0,
     inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown'],
     onInput: undefined,
@@ -350,6 +358,7 @@ function runBoundaryPixels({points,fields,control,source,presentation,receipt}) 
 function canvasPixelBounds(canvas, cssBounds, control) {
   const css = canvas.getBoundingClientRect();
   if (![canvas.width, canvas.height, css.width, css.height].every(value => Number.isFinite(value) && value > 0) ||
+      ![css.x, css.y].every(Number.isFinite) ||
       cssBounds.length !== 4 || !cssBounds.every(Number.isFinite) || cssBounds[2] <= 0 || cssBounds[3] <= 0) {
     throw new Error('invalid canvas or CSS probe dimensions');
   }
@@ -358,6 +367,78 @@ function canvasPixelBounds(canvas, cssBounds, control) {
   report({event: 'integration.canvas_probe_geometry', control, detail: 'css-to-backing-pixels',
     canvas: [canvas.width, canvas.height], css: [css.width, css.height], css_bounds: cssBounds, pixel_bounds: pixels});
   return pixels;
+}
+
+// The displayed counter is diagnostic evidence, separate from its image receipt.
+// A new meter sample or layout invalidates a pending capture even on retained pixels.
+export function mmltkIntegrationFpsDraw(control, values) {
+  if (!integrationState) return;
+  const prior = integrationState.fpsDraw;
+  if (prior?.control === control && values.length === prior.values.length &&
+      values.every((value, index) => value === prior.values[index])) return;
+  integrationState.fpsDraw = {control, values: Array.from(values)};
+}
+
+export function mmltkIntegrationFpsCurrent(receipt, values) {
+  const draw = integrationState?.fpsDraw;
+  return probeCurrent(receipt) && draw?.control === receipt.control &&
+    values.length === draw.values.length && values.every((value, index) => value === draw.values[index]);
+}
+
+export function mmltkIntegrationFpsPixels(receipt, values, uiScale, completed) {
+  completed = integrationCompletion(completed);
+  if (!integrationState) return;
+  if (!integrationDriver) { completed('failed'); return; }
+  const owner = integrationState;
+  const draw = owner.fpsDraw;
+  if (values.length !== 11 || !values.every(Number.isFinite) ||
+      !Number.isFinite(uiScale) || uiScale <= 0) {
+    completed('failed'); return;
+  }
+  if (!mmltkIntegrationFpsCurrent(receipt, values)) {
+    completed('invalidated'); return;
+  }
+  // Requests have their own identity: retiring an old request must not retire a
+  // replacement for the very same canvas, image receipt and counter sample.
+  const pending = {receipt, draw, completed};
+  const previous = owner.fpsPending;
+  owner.fpsPending = pending;
+  previous?.completed('invalidated');
+  integrationFrame(() => {
+    try {
+      if (!probeCurrent(receipt) || owner.fpsPending !== pending || owner.fpsDraw !== draw) {
+        completed('invalidated'); return;
+      }
+      const [x, y, width, height, clipX, clipY, clipWidth, clipHeight] = draw.values;
+      if (width <= 0 || height <= 0 || clipWidth <= 0 || clipHeight <= 0 ||
+          x < clipX || y < clipY || x + width > clipX + clipWidth || y + height > clipY + clipHeight) {
+        throw new Error('clipped FPS counter');
+      }
+      const canvas = receipt.drawn.geometry.canvas;
+      const bounds = canvasPixelBounds(canvas, [x, y, width, height].map(value => value * uiScale), receipt.control);
+      const left = Math.ceil(bounds[0]), top = Math.ceil(bounds[1]);
+      const right = Math.floor(bounds[0] + bounds[2]), bottom = Math.floor(bounds[1] + bounds[3]);
+      const pixelWidth = right - left, pixelHeight = bottom - top;
+      if (left < 0 || top < 0 || right > canvas.width || bottom > canvas.height ||
+          pixelWidth <= 4 || pixelHeight <= 4 || pixelWidth * pixelHeight * 4 > 1048576) {
+        throw new Error('invalid FPS capture extent');
+      }
+      const context = canvasSnapshot(canvas);
+      const pixels = context.getImageData(left, top, pixelWidth, pixelHeight).data;
+      if (!(pixels instanceof Uint8ClampedArray) || pixels.length !== pixelWidth * pixelHeight * 4) {
+        throw new Error('incomplete FPS capture');
+      }
+      if (!probeCurrent(receipt) || owner.fpsPending !== pending || owner.fpsDraw !== draw) {
+        completed('invalidated'); return;
+      }
+      completed('observed', [pixelWidth, pixelHeight], pixels);
+    } catch (_) {
+      // Rust owns pixel classification and restore-before-failure reporting.
+      completed('failed');
+    } finally {
+      if (integrationState === owner && owner.fpsPending === pending) owner.fpsPending = undefined;
+    }
+  });
 }
 
 export function mmltkIntegrationAnnotationSwatch(receipt, cssBounds,color,control,detail,button,completed){

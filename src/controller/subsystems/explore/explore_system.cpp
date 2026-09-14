@@ -377,7 +377,8 @@ class ExploreSystem::Impl final {
             std::scoped_lock lock(mutex_);
             RequireReady();
             auto& desired = desired_ ? desired_->snapshot : state_;
-            if (ClampViewport(request.viewport, desired.order.matching_count) == desired.viewport) {
+            if (ClampViewport(request.viewport, desired.order.matching_count) == desired.viewport &&
+                (desired_ || desired.mode != ExploreMode::Gallery || active_gallery_generation_ != 0U)) {
                 desired.viewport_result = ExploreViewportResult{request, ExploreViewportOutcome::Ready};
                 if (desired.viewport == state_.viewport) state_.viewport_result = desired.viewport_result;
                 return;
@@ -572,21 +573,24 @@ class ExploreSystem::Impl final {
         worker_.StopAndWait();
         // A cancelled replacement may restore the incumbent while joining.
         // Reapply the same issued invalidation before releasing the issuer.
-        std::scoped_lock admission(desired_admission_mutex_);
-        std::scoped_lock lock(mutex_);
-        latest_generation_->store(generation, std::memory_order_release);
-        active_gallery_generation_ = 0U;
-        desired_.reset();
-        if (state_.render_pending) {
-            state_.render_pending = false;
-            AdvanceRevision();
+        {
+            std::scoped_lock admission(desired_admission_mutex_);
+            std::scoped_lock lock(mutex_);
+            latest_generation_->store(generation, std::memory_order_release);
+            active_gallery_generation_ = 0U;
+            desired_.reset();
+            if (state_.render_pending) {
+                state_.render_pending = false;
+                AdvanceRevision();
+            }
+            pending_discrete_.reset();
+            reserved_output_ = {};
+            retained_gallery_ = {};
+            retained_detail_ = {};
+            retained_runtime_ = nullptr;
+            configured_algorithm_ = nullptr;
         }
-        pending_discrete_.reset();
-        reserved_output_ = {};
-        retained_gallery_ = {};
-        retained_detail_ = {};
-        retained_runtime_ = nullptr;
-        configured_algorithm_ = nullptr;
+        worker_.FinishStoppedRetirement();
     }
     [[nodiscard]] bool stopped() const noexcept { return worker_.stopped(); }
     [[nodiscard]] ExploreSnapshot snapshot() const {
@@ -1633,10 +1637,6 @@ class ExploreSystem::Impl final {
     }
     void Failed(const std::exception_ptr failure) noexcept {
         worker_.SetOutputRetry(false);
-        auto detail = visual_failure_detail(failure, "Explore GPU worker failed");
-        ExploreFailureKind kind = ExploreFailureKind::Operation;
-        if (mmltk::frameworks::gpu::find_image_failure<mmltk::frameworks::gpu::GdrTransportUnavailable>(failure))
-            kind = ExploreFailureKind::SelectedTransportUnavailable;
         ExploreSnapshot retained;
         {
             std::scoped_lock lock(mutex_);
@@ -1644,6 +1644,19 @@ class ExploreSystem::Impl final {
         }
         const bool retain_product =
             retained.ready && retained.frame.valid() && visual_product_matches_frame(retained.frame, worker_.Borrow());
+        if (!retain_product) {
+            std::scoped_lock lock(mutex_);
+            retained_gallery_ = {};
+            retained_detail_ = {};
+            retained_runtime_ = nullptr;
+        }
+        // Releasing the last domain product can complete healthy retirement.
+        // Establish admission before publishing the failure that permits reopen.
+        const auto reported = mmltk::frameworks::gpu::combine_image_failures(failure, worker_.FinishDeferredRetirement());
+        auto detail = visual_failure_detail(reported, "Explore GPU worker failed");
+        ExploreFailureKind kind = ExploreFailureKind::Operation;
+        if (mmltk::frameworks::gpu::find_image_failure<mmltk::frameworks::gpu::GdrTransportUnavailable>(reported))
+            kind = ExploreFailureKind::SelectedTransportUnavailable;
         ExploreSnapshot failed;
         bool resume_gallery = false;
         {
@@ -1667,9 +1680,6 @@ class ExploreSystem::Impl final {
             if (!retain_product) {
                 active_gallery_generation_ = 0U;
                 runtime_initialized_ = false;
-                retained_gallery_ = {};
-                retained_detail_ = {};
-                retained_runtime_ = nullptr;
             }
             resume_gallery = retain_product && active_gallery_generation_ != 0U;
         }

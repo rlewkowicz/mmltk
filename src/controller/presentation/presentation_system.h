@@ -127,16 +127,17 @@ class PresentationNativeWriter {
     virtual void TerminalCustodyInstalled() noexcept {}
 };
 using PresentationNativeWriterFactory = std::function<std::unique_ptr<PresentationNativeWriter>()>;
-// Acceptance-only custody of a completion notification. Physical GPU work and
-// the publisher socket remain live while consumption of this receipt is held.
+// Explicit acceptance holds. Physical GPU work and the publisher socket remain
+// live while a completion is held or a pending arena awaits its fallback draw.
 class PresentationAcceptanceGate final {
    public:
+    enum class Boundary : std::uint8_t { Completion, Capacity, Supersession };
     struct Receipt final {
         std::uint64_t source_high = 0U;
         std::uint64_t source_low = 0U;
         std::uint64_t transfer = 0U;
         std::uint64_t publication = 0U;
-        bool capacity_available = false;
+        Boundary boundary = Boundary::Completion;
     };
     void SetWake(std::function<void()>);
     void SetObserver(std::function<void(Receipt)>);
@@ -144,6 +145,9 @@ class PresentationAcceptanceGate final {
     [[nodiscard]] bool Release();
     [[nodiscard]] bool Hold(Receipt);
     void ObserveCapacity();
+    void HoldSupersession(std::uint64_t high, std::uint64_t low);
+    [[nodiscard]] bool SupersessionHeld();
+    [[nodiscard]] bool ReleaseSupersession();
     void Stop() noexcept;
 
    private:
@@ -153,6 +157,7 @@ class PresentationAcceptanceGate final {
     bool armed_ = false;
     bool held_ = false;
     bool capacity_seen_ = false;
+    bool supersession_held_ = false;
     Receipt receipt_{};
     bool stopped_ = false;
 };

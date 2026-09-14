@@ -5,6 +5,7 @@
 #include <concepts>
 #include <type_traits>
 #include <meta>
+#include <string>
 
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -70,6 +71,8 @@ constexpr void visit_integration_commands(Visitor&& visitor) {
     return server;
 }
 
+inline constexpr std::size_t kIntegrationFailureMaxBytes = 4096U;
+
 struct IntegrationControlReceipt final {
     IntegrationControlKind kind = IntegrationControlKind::Progress;
     [[= mmltk::frameworks::reflection::Minimum{std::uint64_t{1U}}]] std::uint64_t sequence = 0U;
@@ -78,11 +81,14 @@ struct IntegrationControlReceipt final {
     std::uint32_t failureline = 0U;
     std::uint64_t read_generation = 0U;
     std::uint32_t compiled_index = 0U;
+    [[= mmltk::frameworks::reflection::MaxBytes{kIntegrationFailureMaxBytes}]] std::string failure{};
     bool operator==(const IntegrationControlReceipt&) const = default;
 };
 
 [[nodiscard]] constexpr bool integration_receipt_valid(const IntegrationControlReceipt& receipt) noexcept {
     if (receipt.sequence == 0U || (receipt.kind == IntegrationControlKind::Failed) != (receipt.failureline != 0U)) return false;
+    if (receipt.failure.size() > kIntegrationFailureMaxBytes ||
+        (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty())) return false;
     bool valid = false;
     visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
         if (receipt.kind == Kind)

@@ -39,6 +39,22 @@ pub struct App {
 pub fn boot() -> (App, Task<Message>) {
     let config = TransportConfig::from_page();
     crate::presentation_surface::initialize_diagnostics(config.surface_trace, config.pixel_trace);
+    #[cfg(target_arch = "wasm32")]
+    if config.surface_trace {
+        std::panic::set_hook(Box::new(|panic| {
+            if !crate::presentation_surface::surface_trace_enabled() {
+                return;
+            }
+            if let Ok(message) =
+                js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(&panic.to_string()))
+                && let Some(message) = message.as_string()
+            {
+                crate::presentation_surface::emit_surface_trace(&format!(
+                    "{{\"event\":\"iced.panic\",\"message\":{message}}}"
+                ));
+            }
+        }));
+    }
     crate::integration_control::initialize_reporting(
         config.integration && config.surface_trace,
         config.integration_pixel_fixture,
@@ -154,7 +170,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
     }
     app.reconcile_surface_frame();
-    let frame = app.presentation.surface().and_then(|surface| surface.frame);
+    let surface = app.presentation.surface();
     let presentation_task = app
         .presentation
         .redraw(previous_surface)
@@ -166,7 +182,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.settings.applied_scale(),
             &app.workspace,
             app.workspace.active(),
-            frame,
+            surface,
         );
         if let Some(connection) = app.connection.as_mut() {
             integration.publish_control(connection);
@@ -276,6 +292,150 @@ mod route_tests {
         assert!(task.units() > 0);
     }
 
+    fn fps_app() -> App {
+        let mut app = installed_app();
+        let mut settings = app.model.settings_snapshot.clone().unwrap();
+        settings.revision += 1;
+        settings.settingsstate.ui.showworkspaceperformance = true;
+        settings_event(&mut app, settings);
+        app.integration = Some(crate::integration_control::Controller::new(
+            false,
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
+        app
+    }
+
+    fn fps_outcome(
+        message: &mut crate::integration_control::Message,
+        outcome: crate::integration_control::FpsPixelOutcome,
+    ) {
+        use crate::integration_control::Message as Integration;
+        let Integration::Scoped { message, .. } = message else {
+            panic!("scenario completion");
+        };
+        let Integration::ProbeCompleted { message, .. } = message.as_mut() else {
+            panic!("owned completion");
+        };
+        **message = Integration::WorkspaceFpsPixels(outcome);
+    }
+
+    fn apply_fps_restoration(app: &mut App, task: Task<Message>, baseline: bool) {
+        use iced::futures::StreamExt;
+        let mut actions =
+            iced_runtime::task::into_stream(task).expect("completion must schedule restoration");
+        let action = iced::futures::executor::block_on(actions.next()).unwrap();
+        let iced_runtime::Action::Output(Message::Settings(message)) = action else {
+            panic!("completion must directly return the ordinary settings operation");
+        };
+        assert!(
+            matches!(message, crate::view::settings::Message::PerformanceChanged(value) if value == baseline)
+        );
+        // Process the returned application task, without another redraw or input.
+        drop(update(app, Message::Settings(message)));
+        assert_eq!(
+            app.settings.draft().unwrap().ui.showworkspaceperformance,
+            baseline
+        );
+        assert!(app.settings.state().has_local_edits());
+    }
+
+    #[test]
+    fn fps_canvas_completion_drives_restoration_through_the_application_guard() {
+        use crate::integration_control::{FpsPixelOutcome, tests::ProbeFixture};
+        for baseline in [false, true] {
+            for failed in [false, true] {
+                let mut app = fps_app();
+                let mut fixture = ProbeFixture::new("square");
+                let mut completion = fixture
+                    .prepare_app_fps(&app.model, app.settings.state(), baseline, true)
+                    .unwrap();
+                if failed {
+                    fps_outcome(&mut completion, FpsPixelOutcome::Failed);
+                }
+                std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
+                let task = update(&mut app, Message::Integration(completion));
+                apply_fps_restoration(&mut app, task, baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn disabling_fps_diagnostics_wakes_restoration_with_or_without_a_capture() {
+        use crate::integration_control::{self, FpsPixelOutcome, tests::ProbeFixture};
+        for baseline in [false, true] {
+            // Deliver either cancellation first to prove exactly one restoration.
+            for callback_first in [None, Some(false), Some(true)] {
+                let mut app = fps_app();
+                let mut fixture = ProbeFixture::new("square");
+                let mut callback = fixture.prepare_app_fps(
+                    &app.model,
+                    app.settings.state(),
+                    baseline,
+                    callback_first.is_some(),
+                );
+                let stale_pixels = callback.clone();
+                if let Some(message) = &mut callback {
+                    fps_outcome(message, FpsPixelOutcome::Cancelled);
+                }
+                std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
+                integration_control::initialize_reporting(false, false);
+                // This is the real disable notification, captured before diagnostic
+                // receipt retirement. No synthetic Advance rescues the driver.
+                let disabled = fixture
+                    .receiver
+                    .try_recv()
+                    .expect("disable must wake the scenario");
+                if let Some(stale_pixels) = stale_pixels {
+                    assert_eq!(
+                        update(&mut app, Message::Integration(stale_pixels)).units(),
+                        0
+                    );
+                }
+                let (first, second) = if callback_first == Some(true) {
+                    (callback.take().unwrap(), Some(disabled))
+                } else {
+                    (disabled, callback)
+                };
+                let task = update(&mut app, Message::Integration(first));
+                apply_fps_restoration(&mut app, task, baseline);
+                if let Some(second) = second {
+                    assert_eq!(update(&mut app, Message::Integration(second)).units(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fps_cancellation_preserves_terminal_transport_failure() {
+        use crate::integration_control::{self, tests::ProbeFixture};
+        let mut app = fps_app();
+        let mut fixture = ProbeFixture::new("square");
+        assert!(
+            fixture
+                .prepare_app_fps(&app.model, app.settings.state(), false, false)
+                .is_none()
+        );
+        std::mem::swap(app.integration.as_mut().unwrap(), &mut fixture.controller);
+        app.model.error = Some(UiError::protocol("terminal transport closed"));
+        integration_control::initialize_reporting(false, false);
+        let cancelled = fixture.receiver.try_recv().unwrap();
+        assert_eq!(update(&mut app, Message::Integration(cancelled)).units(), 0);
+        assert!(
+            !app.integration
+                .as_ref()
+                .unwrap()
+                .accepts_message(&integration_control::Message::Advance)
+        );
+        assert_eq!(
+            app.model.error.as_ref().unwrap().detail,
+            "terminal transport closed"
+        );
+    }
+
     #[test]
     fn stale_settings_event_does_not_rollback_optimistic_navigation() {
         let mut app = installed_app();
@@ -333,6 +493,163 @@ mod route_tests {
                 .currentview
         );
         assert!(!app.settings.has_local_edits());
+    }
+
+    #[test]
+    fn accepted_detail_preference_survives_route_and_peer_restoration() {
+        use crate::generated::{ApplicationIntentEndpoint, ApplicationSnapshot};
+        use crate::presentation_surface::{self, ExploreDisplay};
+        for delivery in 0..4 {
+            let lost_reply = delivery == 2;
+            presentation_surface::reset_test_releases();
+            let (model, input_frame) = crate::view_model::test_support::explore_presentation();
+            let mut app = installed_app();
+            app.model = model;
+            app.workspace.select(FeatureId::Explore);
+            let original = app.model.explore.snapshot.clone().unwrap();
+            let mut product = original.frame.clone();
+            product.source.kind = crate::generated::PresentationSourceKind::Upscale;
+            product.revision = 2;
+            product.extent = crate::generated::VisualExtent {
+                width: 1280,
+                height: 1280,
+            };
+            product.content = crate::generated::VisualRegion {
+                x: 0,
+                y: 320,
+                width: 1280,
+                height: 640,
+            };
+            let frame = crate::view_model::test_support::physical_frame(
+                crate::generated::presentation_source_session(product.source.kind),
+                2,
+                6,
+                1280,
+                1280,
+            );
+            let bytes = presentation_surface::metadata::encode(
+                product.clone(),
+                presentation_surface::metadata::encode_product(
+                    crate::generated::ApplicationSystem::Upscale,
+                    crate::generated::UpscaleImageMetadata {
+                        frame: product,
+                        input: original.frame.clone(),
+                        scene: original.scene.clone(),
+                    },
+                ),
+                Some(presentation_surface::metadata::encode_product(
+                    crate::generated::ApplicationSystem::Explore,
+                    crate::generated::ExploreImageMetadata::from(&original),
+                )),
+            );
+            presentation_surface::metadata::retire(input_frame);
+            presentation_surface::metadata::install(frame, 1280, 1280, 6, &bytes).unwrap();
+            assert!(presentation_surface::accept_publication(frame));
+            let surface = presentation_surface::metadata::surface(frame).unwrap();
+            let Some(ExploreDisplay::Detail(_, content)) =
+                presentation_surface::explore_display(Some(surface))
+            else {
+                panic!("paired detail fixture");
+            };
+            assert!(
+                !app.workspace
+                    .explore_state_for_test()
+                    .detail_original(&content)
+            );
+            let (connection, mut capture) = crate::transport_connection::Connection::test_channel();
+            app.connection = Some(connection);
+            app.workspace
+                .explore_state_for_test()
+                .choose_detail_original(true);
+            drop(app.on_explore(crate::view::explore::Outcome::DetailUpdated(
+                crate::generated::ExploreDetailUpdate {
+                    showoriginaldimensions: true,
+                },
+            )));
+            let mut detail_correlation = None;
+            while let Ok(record) = capture.try_recv() {
+                if let crate::transport_connection::CapturedRecord::Intent(intent) = record
+                    && app.model.pending_intent(intent.correlation)
+                        == Some(ApplicationIntentEndpoint::ExploreUpdateDetail)
+                {
+                    detail_correlation = Some(intent.correlation);
+                }
+            }
+            let correlation = detail_correlation.expect("ordinary detail submission");
+            let mut accepted = original.clone();
+            accepted.revision += 1;
+            accepted.detail.showoriginaldimensions = true;
+            if !lost_reply {
+                if matches!(delivery, 1 | 3) {
+                    drop(app.transition_page(FeatureId::Train));
+                }
+                if delivery == 3 {
+                    drop(app.transition_page(FeatureId::Explore));
+                    assert_eq!(
+                        app.model.pending_intent(correlation),
+                        Some(ApplicationIntentEndpoint::ExploreUpdateDetail)
+                    );
+                    let original = app
+                        .workspace
+                        .explore_state_for_test()
+                        .detail_original(&content);
+                    assert!(original);
+                    assert_eq!(
+                        content.configure_surface(surface, original, 0).crop,
+                        Some([0, 320, 1280, 640])
+                    );
+                }
+                app.reduce_reply(IntentReply {
+                    correlation,
+                    result: Ok(accepted.clone().into_application_transport_value()),
+                });
+                if delivery == 0 {
+                    drop(app.transition_page(FeatureId::Train));
+                }
+                drop(app.transition_page(FeatureId::Explore));
+                assert!(
+                    app.workspace
+                        .explore_state_for_test()
+                        .detail_original(&content)
+                );
+            }
+            app.retire_peer(UiError::transport("replacement peer"));
+            let snapshots = crate::generated::application_snapshot_defaults()
+                .unwrap()
+                .into_iter()
+                .map(|fact| match fact.value {
+                    ApplicationSnapshot::Explore(_) => {
+                        ApplicationSnapshot::Explore(accepted.clone())
+                    }
+                    ApplicationSnapshot::Settings(mut settings) => {
+                        settings.settingsstate.currentview = FeatureId::Explore;
+                        ApplicationSnapshot::Settings(settings)
+                    }
+                    value => value,
+                })
+                .collect();
+            app.install_bootstrap(Bootstrap {
+                input_epoch: 2,
+                schema_fingerprint: crate::generated::SCHEMA_FINGERPRINT,
+                snapshots,
+            });
+            assert_eq!(app.workspace.active(), FeatureId::Explore);
+            assert!(
+                app.workspace
+                    .explore_state_for_test()
+                    .detail_original(&content)
+            );
+            assert!(!content.original_dimensions()); // Cached metadata remains immutable.
+            let shown = content.configure_surface(
+                surface,
+                app.workspace
+                    .explore_state_for_test()
+                    .detail_original(&content),
+                0,
+            );
+            assert_eq!(shown.crop, Some([0, 320, 1280, 640]));
+            presentation_surface::retire_publication(frame);
+        }
     }
 
     #[test]
@@ -743,6 +1060,51 @@ mod tests {
             crate::view_model::ConnectionState::Connected
         );
         drop(receiver);
+    }
+
+    #[test]
+    fn gallery_scroll_admits_each_viewport_while_native_work_is_pending() {
+        for pending_overlay in [false, true] {
+            let (mut app, task) = boot();
+            drop(task);
+            install_default_bootstrap(&mut app);
+            app.workspace.select(FeatureId::Explore);
+            let snapshot = app.model.explore.snapshot.as_mut().unwrap();
+            snapshot.ready = true;
+            snapshot.busy = !pending_overlay;
+            snapshot.renderpending = pending_overlay;
+            snapshot.mode = crate::generated::ExploreMode::Gallery;
+            snapshot.order.matchingcount = 180_000;
+            if pending_overlay {
+                app.model
+                    .begin_intent(ApplicationIntentEndpoint::ExploreUpdateOverlay)
+                    .unwrap();
+            }
+            let (connection, mut capture) = Connection::test_channel();
+            app.connection = Some(connection);
+            for firstrow in [76, 77, 76, 79] {
+                let request = ExploreViewportUpdate {
+                    viewport: crate::generated::ExploreViewport {
+                        extent: crate::generated::VisualExtent {
+                            width: 896,
+                            height: 1120,
+                        },
+                        firstrow,
+                        rowcount: 5,
+                        columns: 4,
+                    },
+                };
+                drop(app.request_explore_viewport(request));
+                assert!(
+                    app.workspace.explore_dispatchable_viewport().is_none(),
+                    "native work must not hold the current visible-row request"
+                );
+                assert!(matches!(
+                    capture.try_recv().unwrap(),
+                    crate::transport_connection::CapturedRecord::Other
+                ));
+            }
+        }
     }
 
     #[test]

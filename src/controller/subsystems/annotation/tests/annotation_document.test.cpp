@@ -218,7 +218,11 @@ TEST_CASE("Native annotation target identities survive index shifts and journal 
     auto current_target = target;
     REQUIRE(editor.ResolveTarget(current_target));
     CHECK(current_target.target.object == 0U);
-    REQUIRE(editor.Pointer(current_target).outcome == document::DocumentOutcome::Applied);
+    auto begin = current_target;
+    begin.phase = contracts::AnnotationPointerPhase::Begin;
+    REQUIRE(editor.ResolveTarget(begin));
+    CHECK(begin.identity == current_target.identity);
+    REQUIRE(editor.Pointer(begin).outcome == document::DocumentOutcome::Applied);
     editor.PeerClosed();
     REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
     current_target = target;
@@ -309,7 +313,11 @@ TEST_CASE("Creation preview identities become document identities at commit") {
     REQUIRE(editor.Pointer(create).outcome == document::DocumentOutcome::Applied);
     REQUIRE(editor.ResolveTarget(displayed));
     REQUIRE(editor.Edit({.value = AnnotationToolEdit{contracts::AnnotationTool::Select}}).outcome == document::DocumentOutcome::Applied);
-    REQUIRE(editor.Pointer(displayed).outcome == document::DocumentOutcome::Applied);
+    auto begin = displayed;
+    begin.phase = contracts::AnnotationPointerPhase::Begin;
+    REQUIRE(editor.ResolveTarget(begin));
+    CHECK(begin.identity.object == displayed.identity.object);
+    REQUIRE(editor.Pointer(begin).outcome == document::DocumentOutcome::Applied);
     editor.PeerClosed();
     REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
     CHECK_FALSE(editor.ResolveTarget(displayed));
@@ -1052,11 +1060,20 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         auto scene = std::make_shared<c::contracts::AnnotationSceneContent>(c::test_scene("test://native-raster"));
         scene->categories.push_back({.value = "second"});
         scene->palette = {{0, 1, 1}, {120, 1, 1}};
-        scene->objects = {{.shape = c::contracts::AnnotationShape::Box, .box = {{4, 4}, {20, 20}}},
-                          {.shape = c::contracts::AnnotationShape::Box, .box = {{10, 4}, {26, 20}}, .category = 1U},
-                          {.shape = c::contracts::AnnotationShape::Mask, .box = {{6, 10}, {15, 16}}, .mask = {.present = true}}};
+        scene->objects = {{.name = c::contracts::AnnotationText::From("first box"),
+                           .shape = c::contracts::AnnotationShape::Box,
+                           .box = {{4, 4}, {20, 20}}},
+                          {.name = c::contracts::AnnotationText::From("second box"),
+                           .shape = c::contracts::AnnotationShape::Box,
+                           .box = {{10, 4}, {26, 20}},
+                           .category = 1U},
+                          {.name = c::contracts::AnnotationText::From("mask"),
+                           .shape = c::contracts::AnnotationShape::Mask,
+                           .box = {{6, 10}, {15, 16}},
+                           .mask = {.present = true}}};
         for (std::uint16_t row = 10U; row != 16U; ++row)
             scene->objects.back().mask.runs.push_back({row, 6U, 14U});
+        REQUIRE(scene->valid());
         c::AnnotationRenderState description;
         description.scene = scene;
         description.scene_revision = 1U;
@@ -1084,7 +1101,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         };
         const auto original = render(49U);
         CHECK(pixel(original, 10U, 12U) == std::array<unsigned char, 4U>{255, 0, 0, 92});
-        CHECK(pixel(original, 10U, 4U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
+        CHECK(pixel(original, 10U, 3U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
         auto moved = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
         moved->objects.pop_back();
         moved->objects[1].box = {{30, 4}, {46, 20}};
@@ -1093,7 +1110,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         CHECK(pixel(render(49U), 10U, 12U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
         const auto rotated = render(49U);
         CHECK(pixel(rotated, 10U, 12U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
-        CHECK(pixel(rotated, 30U, 12U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
+        CHECK(pixel(rotated, 29U, 12U) == std::array<unsigned char, 4U>{0, 255, 0, 255});
         description.scene = scene;
         ++description.scene_revision;
         description.preview_object = 2U;
@@ -1113,17 +1130,28 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         CHECK(render(82U) == preview);
         auto mixed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
         mixed->objects = {
-            {.shape = c::contracts::AnnotationShape::Point, .point = {20, 8}, .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
-            {.shape = c::contracts::AnnotationShape::Spline,
+            {.name = c::contracts::AnnotationText::From("point"),
+             .shape = c::contracts::AnnotationShape::Point,
+             .point = {20, 8},
+             .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
+            {.name = c::contracts::AnnotationText::From("spline"),
+             .shape = c::contracts::AnnotationShape::Spline,
              .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
              .spline_knots = {{{3, 20}}, {{12, 20}}}},
-            {.shape = c::contracts::AnnotationShape::Skeleton,
+            {.name = c::contracts::AnnotationText::From("skeleton"),
+             .shape = c::contracts::AnnotationShape::Skeleton,
              .mask = {.runs = {{48U, 40U, 52U}}, .present = true},
              .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
                                 {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
              .skeleton_edges = {{0U, 1U}}},
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{2, 2}, {10, 10}}, .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
-            {.shape = c::contracts::AnnotationShape::Box, .box = {{40, 41}, {55, 54}}, .category = 1U}};
+            {.name = c::contracts::AnnotationText::From("masked box"),
+             .shape = c::contracts::AnnotationShape::Box,
+             .box = {{2, 2}, {10, 10}},
+             .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
+            {.name = c::contracts::AnnotationText::From("covering box"),
+             .shape = c::contracts::AnnotationShape::Box,
+             .box = {{42, 41}, {55, 54}},
+             .category = 1U}};
         REQUIRE(mixed->valid());
         description.scene = mixed;
         description.editor.selected_object = 3U;
@@ -1149,7 +1177,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         const auto exposed = compare_fresh();
         for (const unsigned row : {44U, 46U, 48U, 50U})
             CHECK(pixel(exposed, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
-        for (const auto point : std::array<std::array<unsigned, 2U>, 5U>{{{20U, 8U}, {8U, 20U}, {8U, 12U}, {2U, 6U}, {15U, 15U}}}) {
+        for (const auto point : std::array<std::array<unsigned, 2U>, 5U>{{{20U, 8U}, {8U, 20U}, {8U, 12U}, {1U, 6U}, {15U, 15U}}}) {
             CHECK(pixel(exposed, point[0], point[1]) == pixel(covered, point[0], point[1]));
             CHECK(pixel(exposed, point[0], point[1])[3] == 255U);
         }
@@ -1158,9 +1186,54 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         description.scene = removed;
         ++description.scene_revision;
         const auto remaining = compare_fresh();
-        CHECK(pixel(remaining, 56U, 46U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+        CHECK(pixel(remaining, 55U, 46U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
         for (const unsigned row : {44U, 46U, 48U, 50U})
             CHECK(pixel(remaining, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+        c::subsystems::annotation::AnnotationDocument editor;
+        REQUIRE(editor.Open(c::test_scene("test://fractional-box-raster")).outcome ==
+                c::subsystems::annotation::DocumentOutcome::Applied);
+        REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);
+        c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {16.25F, 19.25F}};
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        editor.CaptureRender(description);
+        compare_fresh();
+        pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+        for (const auto point : std::array<c::contracts::AnnotationPoint, 7U>{
+                 {{16.5F, 19.5F}, {17.5F, 19.5F}, {16.5F, 20.5F}, {17.5F, 20.5F},
+                  {32.75F, 38.25F}, {16.5F, 19.5F}, {32.75F, 38.25F}}}) {
+            pointer.point = point;
+            ++pointer.sequence;
+            REQUIRE(editor.Pointer(pointer).render_changed);
+            editor.CaptureRender(description);
+            REQUIRE(description.preview_object == 0U);
+            CHECK(description.ObjectAt(0U).box == c::contracts::AnnotationBox{{16.25F, 19.25F}, point});
+            compare_fresh();
+        }
+        pointer.phase = c::contracts::AnnotationPointerPhase::End;
+        ++pointer.sequence;
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        editor.CaptureRender(description);
+        const auto finished = compare_fresh();
+        CHECK(pixel(finished, 24U, 18U)[3] == 255U);
+        REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).render_changed);
+        editor.CaptureRender(description);
+        compare_fresh();
+        REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).render_changed);
+        editor.CaptureRender(description);
+        CHECK(compare_fresh() == finished);
+        pointer = {.interaction_id = 2U, .sequence = 1U, .point = {40.25F, 43.25F}};
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        pointer.phase = c::contracts::AnnotationPointerPhase::Update;
+        pointer.point = {40.5F, 43.5F};
+        ++pointer.sequence;
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        editor.CaptureRender(description);
+        compare_fresh();
+        pointer.phase = c::contracts::AnnotationPointerPhase::Cancel;
+        ++pointer.sequence;
+        REQUIRE(editor.Pointer(pointer).render_changed);
+        editor.CaptureRender(description);
+        CHECK(compare_fresh() == finished);
         return c::detail::VisualRuntimeOwner::Notification{[&] { done.set_value({}); }};
     });
     REQUIRE(submitted);

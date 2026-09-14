@@ -721,11 +721,15 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     CHECK(delivered == 0U);
     CHECK(lost == 2U);
     SystemEvent published;
-    std::function<void(SystemEvent)> latest_sink = [&](SystemEvent event) { published = std::move(event); };
-    ApplicationEventPublisher<&ApplicationSystems::presentation> latest(latest_sink, [&] { ++lost; });
-    latest(PresentationSystem::event_type{PresentationFailed{.snapshot = {.revision = 73U}, .detail = "presentation failed"}});
+    std::function<void(SystemEvent)> presentation_sink = [&](SystemEvent event) { published = std::move(event); };
+    ApplicationEventPublisher<&ApplicationSystems::presentation> presentation(presentation_sink, [&] { ++lost; });
+    const PresentationFailed failure{.snapshot = {.revision = 73U}, .detail = "presentation failed"};
+    const auto expected = mmltk::frameworks::serialization::reflected_transport_value(failure);
+    REQUIRE(expected.has_value());
+    presentation(PresentationSystem::event_type{failure});
     CHECK(published.delivery == contracts::reflection::EventDelivery::Critical);
-    CHECK(published.state_revision == 73U);
+    CHECK(published.state_revision == 0U);
+    CHECK(published.value == *expected);
     CHECK(published.event_id ==
           ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationFailed>::event_id);
     CHECK(lost == 2U);

@@ -18,13 +18,23 @@ thread_local! {
 }
 
 pub(crate) fn initialize_reporting(enabled: bool, pixel_fixture: bool) {
-    if !enabled && reporting_enabled() {
+    let disabling = !enabled && reporting_enabled();
+    REPORTING_ENABLED.with(|flag| flag.set(enabled));
+    if disabling {
+        crate::presentation_surface::reset_reconstruction_probe();
+        // Cancellation belongs to the still-running scenario, even though its
+        // diagnostic receipts are about to retire. It also wakes pre-capture FPS.
+        let output = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone());
+        if let Some(mut output) = output {
+            output.receipt = None;
+            output.probe = None;
+            output.send(Message::ReportingDisabled);
+        }
         reset_observer();
     }
     PIXEL_FIXTURE_ENABLED.with(|flag| flag.set(enabled && pixel_fixture));
     #[cfg(target_arch = "wasm32")]
     initialize_js(enabled);
-    REPORTING_ENABLED.with(|flag| flag.set(enabled));
     COMPLETION_WITHOUT_INPUT.with(|flag| flag.set(false));
 }
 
@@ -276,7 +286,7 @@ const SETTINGS_GROUPS: [&str; 3] = [
 ];
 const SETTINGS_SHOW_FPS: &str = "settings.show_fps";
 const WORKSPACE_FPS_PIXEL_FAILURE: &str =
-    "Workspace FPS screenshot did not contain its upper-right counter background and text";
+    "Workspace FPS canvas capture did not contain its upper-right counter background and text";
 const SETTINGS_NUMERIC_CONTROLS: [&str; 5] = [
     "settings.ui_scale",
     "settings.font_size",
@@ -298,10 +308,8 @@ const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
 #[derive(Debug, Clone)]
 pub enum Message {
     WorkspaceFpsDrawn(reporting::FpsEvidence),
-    WorkspaceFpsScreenshot {
-        generation: u64,
-        image: iced::window::Screenshot,
-    },
+    WorkspaceFpsPixels(FpsPixelOutcome),
+    ReportingDisabled,
     Scoped {
         generation: u64,
         receipt: Option<ProbeReceipt>,
@@ -356,6 +364,33 @@ pub enum Message {
         receipt: AtlasDraw,
         outcome: ProbeOutcome,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum FpsPixelOutcome {
+    Invalidated,
+    Cancelled,
+    Captured(reporting::FpsPixels),
+    Failed,
+}
+
+impl reporting::FpsEvidence {
+    #[cfg(target_arch = "wasm32")]
+    fn canvas_values(self) -> [f64; 11] {
+        [
+            f64::from(self.bounds.x),
+            f64::from(self.bounds.y),
+            f64::from(self.bounds.width),
+            f64::from(self.bounds.height),
+            f64::from(self.clip.x),
+            f64::from(self.clip.y),
+            f64::from(self.clip.width),
+            f64::from(self.clip.height),
+            self.frames as f64,
+            self.seconds,
+            f64::from(u8::from(self.dark)),
+        ]
+    }
 }
 
 /// Invalidation is request retirement, never measured pixel evidence.
@@ -509,6 +544,23 @@ impl ScenarioOutput {
             message: Box::new(message),
         })
     }
+    fn send(&mut self, message: Message) {
+        if let Err(error) = self.try_send(message) {
+            if !error.is_full() {
+                return;
+            }
+            // A full observation channel cannot discard its terminal handoff.
+            let message = error.into_inner();
+            let mut sender = self.sender.clone();
+            use iced::Executor;
+            iced::executor::Default::new()
+                .expect("integration completion executor")
+                .spawn(async move {
+                    use iced::futures::SinkExt;
+                    let _ = sender.send(message).await;
+                });
+        }
+    }
 }
 
 #[derive(Default)]
@@ -524,6 +576,7 @@ struct SurfaceDrawObserver {
     atlas_pixels_owner: Option<std::sync::Arc<()>>,
     atlas_composition_owner: Option<std::sync::Arc<()>>,
     fps_sample: Option<iced::time::Instant>,
+    fps_draw: Option<reporting::FpsEvidence>,
 }
 
 pub(crate) fn report_workspace_fps(
@@ -538,9 +591,6 @@ pub(crate) fn report_workspace_fps(
     }
     SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
-        if observer.fps_sample == Some(meter.sample_time()) {
-            return;
-        }
         let evidence = reporting::FpsEvidence {
             bounds,
             clip,
@@ -548,6 +598,19 @@ pub(crate) fn report_workspace_fps(
             frames: meter.frames,
             seconds: meter.seconds,
         };
+        #[cfg(target_arch = "wasm32")]
+        fps_draw_js(control, &evidence.canvas_values());
+        let unchanged = if control == EXPLORE_GALLERY {
+            let unchanged = observer.fps_draw == Some(evidence);
+            observer.fps_draw = Some(evidence);
+            unchanged
+        } else {
+            observer.fps_draw = None;
+            true
+        };
+        if unchanged && observer.fps_sample == Some(meter.sample_time()) {
+            return;
+        }
         if let Some(output) = observer.output_for(control)
             && output
                 .try_send(Message::WorkspaceFpsDrawn(evidence))
@@ -679,7 +742,7 @@ pub(crate) fn record_probe_draw(
     image: Rectangle,
     clip: Rectangle,
 ) {
-    if !surface.integration || !reporting_enabled() {
+    if !reporting_enabled() {
         return;
     }
     SURFACE_DRAW_OBSERVER.with(|observer| {
@@ -856,6 +919,17 @@ fn sidebar_control_visible(pane: Rectangle, target: Rectangle) -> bool {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/integration_control/browser.mjs")]
 extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFpsDraw)]
+    fn fps_draw_js(control: &str, values: &[f64]);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFpsCurrent)]
+    fn fps_current_js(receipt: &wasm_bindgen::JsValue, values: &[f64]) -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFpsPixels)]
+    fn fps_pixels_js(
+        receipt: &wasm_bindgen::JsValue,
+        values: &[f64],
+        scale: f64,
+        completed: &wasm_bindgen::JsValue,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationInitialize)]
     fn initialize_js(enabled: bool);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationDriver)]
@@ -1340,6 +1414,69 @@ fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'static) -> wasm
             completed(outcome);
         },
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn sample_workspace_fps(mut output: ScenarioOutput, evidence: reporting::FpsEvidence, scale: f32) {
+    use wasm_bindgen::JsCast;
+    let receipt = output.canvas_probe.clone();
+    let completed = wasm_bindgen::closure::Closure::once_into_js(
+        move |status: wasm_bindgen::JsValue,
+              extent: wasm_bindgen::JsValue,
+              pixels: wasm_bindgen::JsValue| {
+            // Reset/disable still settles the once callback. It never copies stale bytes.
+            let current = reporting_enabled()
+                && SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+                    == output.generation;
+            let status = status.as_string();
+            let outcome = if !current {
+                FpsPixelOutcome::Cancelled
+            } else if status.as_deref() == Some("invalidated")
+                && extent.as_f64() == Some(0.0)
+                && pixels.as_f64() == Some(0.0)
+            {
+                FpsPixelOutcome::Invalidated
+            } else if status.as_deref() == Some("observed")
+                && js_sys::Array::is_array(&extent)
+                && pixels.is_instance_of::<js_sys::Uint8ClampedArray>()
+            {
+                let extent = js_sys::Array::from(&extent);
+                let pixels = pixels.unchecked_into::<js_sys::Uint8ClampedArray>();
+                match (extent.get(0).as_f64(), extent.get(1).as_f64()) {
+                    (Some(width), Some(height))
+                        if extent.length() == 2
+                            && [width, height].into_iter().all(|v| {
+                                v.is_finite()
+                                    && v > 0.0
+                                    && v <= f64::from(u32::MAX)
+                                    && v.fract() == 0.0
+                            })
+                            && reporting::FpsPixels::valid_extent(
+                                width as u32,
+                                height as u32,
+                                pixels.length() as usize,
+                            ) =>
+                    {
+                        FpsPixelOutcome::Captured(reporting::FpsPixels {
+                            width: width as u32,
+                            height: height as u32,
+                            rgba: pixels.to_vec(),
+                        })
+                    }
+                    _ => FpsPixelOutcome::Failed,
+                }
+            } else {
+                FpsPixelOutcome::Failed
+            };
+            output.send(Message::WorkspaceFpsPixels(outcome));
+        },
+    );
+    fps_pixels_js(
+        &receipt,
+        &evidence.canvas_values(),
+        f64::from(scale),
+        &completed,
+    );
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1880,6 +2017,23 @@ fn sampleable_presentation(
     )
 }
 
+fn displayed_detail(
+    surface: Option<crate::presentation_surface::Surface>,
+    snapshot: &crate::generated::ExploreSnapshot,
+) -> Option<crate::presentation_surface::Surface> {
+    let crate::presentation_surface::ExploreDisplay::Detail(shown, content) =
+        crate::presentation_surface::explore_display(surface)?
+    else {
+        return None;
+    };
+    (content.viewer_identity()
+        == snapshot
+            .selectedimage
+            .map(|image| (snapshot.dataset.identity, image))
+        && content.input_frame() == &snapshot.frame)
+        .then_some(shown)
+}
+
 fn fully_drawn_gallery(
     frame: Option<crate::presentation_surface::FrameReady>,
     snapshot: &crate::generated::ExploreSnapshot,
@@ -2001,7 +2155,7 @@ fn click_after_surface_draw(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     AwaitWorkspaceFps,
-    AwaitWorkspaceFpsScreenshot,
+    AwaitWorkspaceFpsPixels,
     RestoreWorkspaceFps,
     AwaitWorkspaceFpsRestored,
     Disabled,
@@ -2631,6 +2785,8 @@ pub struct Controller {
     control_phase: Option<Phase>,
     control_progress: u64,
     failure_line: u32,
+    failure: String,
+    annotation_open: Option<(crate::generated::AnnotationOpen, u64)>,
     desired_dark: Option<bool>,
     reuse_compiled: bool,
     bounded_document_revision: u64,
@@ -2706,6 +2862,10 @@ pub struct Controller {
     workspace_fps_baseline: bool,
     workspace_fps_verified: bool,
     workspace_fps_evidence: Option<reporting::FpsEvidence>,
+    workspace_fps_probe: Option<ScenarioOutput>,
+    workspace_fps_receipt: Option<ProbeReceipt>,
+    workspace_fps_scale: f32,
+    workspace_fps_result: Option<FpsPixelOutcome>,
     workspace_fps_failure: Option<&'static str>,
     benchmark_baseline: bool,
     settings_revision: u64,
@@ -2724,7 +2884,14 @@ impl Controller {
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.running() {
             iced::Subscription::batch([
-                if reporting_enabled() {
+                if reporting_enabled()
+                    || matches!(
+                        self.phase,
+                        Phase::AwaitWorkspaceFps | Phase::AwaitWorkspaceFpsPixels
+                    )
+                {
+                    // Keep the existing delivery owner until cancellation reaches
+                    // the driver; disabling diagnostics must not drop its receiver.
                     iced::Subscription::run(surface_draw_stream)
                 } else {
                     iced::Subscription::none()
@@ -2804,6 +2971,8 @@ impl Controller {
             control_phase: None,
             control_progress: 0,
             failure_line: 0,
+            failure: String::new(),
+            annotation_open: None,
             desired_dark: None,
             reuse_compiled: false,
             bounded_document_revision: 0,
@@ -2879,6 +3048,10 @@ impl Controller {
             workspace_fps_baseline: false,
             workspace_fps_verified: false,
             workspace_fps_evidence: None,
+            workspace_fps_probe: None,
+            workspace_fps_receipt: None,
+            workspace_fps_scale: 1.0,
+            workspace_fps_result: None,
             workspace_fps_failure: None,
             benchmark_baseline: false,
             settings_revision: 0,
@@ -3033,6 +3206,36 @@ impl Controller {
         Ok(())
     }
 
+    pub(crate) fn observe_annotation_open(
+        &mut self,
+        request: crate::generated::AnnotationOpen,
+        document_epoch: u64,
+    ) {
+        if self.running() {
+            self.annotation_open = Some((request, document_epoch));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn annotation_open_for_test(
+        &self,
+    ) -> Option<(&crate::generated::AnnotationOpen, u64)> {
+        self.annotation_open
+            .as_ref()
+            .map(|(request, epoch)| (request, *epoch))
+    }
+
+    fn require_original_crop(&mut self, frame: &crate::generated::VisualFrame) -> bool {
+        let content = &frame.content;
+        if self.viewer_drawn.is_none_or(|(_, _, draw)| {
+            draw.crop != [content.x, content.y, content.width, content.height]
+        }) {
+            self.fail("returning viewer lost the selected Original-content crop");
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn publish_control(
         &mut self,
         connection: &mut crate::transport_connection::Connection,
@@ -3081,6 +3284,7 @@ impl Controller {
                 Phase::AwaitVisibleReadArm(index) | Phase::VisibleReadRelease(index, _) => index,
                 _ => 0,
             },
+            failure: self.failure.clone(),
             failureline: if matches!(self.phase, Phase::Failed) {
                 self.failure_line
             } else {
@@ -3144,8 +3348,17 @@ impl Controller {
     fn fail_detail<'a>(&mut self, detail: impl FnOnce() -> std::borrow::Cow<'a, str>) {
         if self.generation != 0 {
             self.failure_line = std::panic::Location::caller().line();
+            let detail = detail();
+            let mut end = detail
+                .len()
+                .min(crate::generated::INTEGRATION_FAILURE_MAX_BYTES);
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.failure.clear();
+            self.failure.push_str(&detail[..end]);
+            reporting::emit(|sink| sink.record("integration.failed", "", &self.failure, [0.0; 4]));
         }
-        reporting::emit(|sink| sink.record("integration.failed", "", &detail(), [0.0; 4]));
         crate::presentation_surface::end_capacity_acceptance();
         self.phase = Phase::Failed;
         self.location_pending = false;
@@ -3339,6 +3552,11 @@ impl Controller {
     }
 
     fn copy_product_settled(&self, snapshot: &crate::generated::AnnotationSnapshot) -> bool {
+        // Command admission advances the UI revision while the operation still
+        // owns work. Check its result only after the native owner settles it.
+        if snapshot.busy {
+            return false;
+        }
         match self.copy_product_settlement {
             annotation_product::Settlement::NativeUi => {
                 snapshot.uirevision > self.copy_product_ui_revision
@@ -3419,6 +3637,53 @@ impl Controller {
         }
     }
 
+    fn workspace_fps_probe_current(&self) -> bool {
+        if !reporting_enabled() {
+            return false;
+        }
+        let (Some(output), Some(evidence)) =
+            (&self.workspace_fps_probe, self.workspace_fps_evidence)
+        else {
+            return false;
+        };
+        if output.receipt != current_receipt(EXPLORE_GALLERY)
+            || SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().fps_draw) != Some(evidence)
+        {
+            return false;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            fps_current_js(&output.canvas_probe, &evidence.canvas_values())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            true
+        }
+    }
+
+    fn cancel_workspace_fps(&mut self) {
+        self.workspace_fps_probe = None;
+        self.workspace_fps_result = None;
+        self.workspace_fps_failure = Some("Workspace FPS capture was cancelled");
+        self.phase = Phase::RestoreWorkspaceFps;
+    }
+
+    fn restore_workspace_fps(&mut self) -> Task<RootMessage> {
+        self.phase = Phase::AwaitWorkspaceFpsRestored;
+        Task::done(RootMessage::Settings(
+            crate::view::settings::Message::PerformanceChanged(self.workspace_fps_baseline),
+        ))
+    }
+
+    fn rearm_workspace_fps(&mut self) {
+        self.workspace_fps_probe = None;
+        self.workspace_fps_receipt = None;
+        self.workspace_fps_evidence = None;
+        self.workspace_fps_result = None;
+        SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().fps_sample = None);
+        self.phase = Phase::AwaitWorkspaceFps;
+    }
+
     fn confirmed_atlas(&self, snapshot: &crate::generated::ExploreSnapshot) -> Option<&AtlasDraw> {
         self.atlas_pixels.as_ref().filter(|draw| {
             draw.snapshot.frame == snapshot.frame && self.atlas_receipt.as_ref() == Some(*draw)
@@ -3449,9 +3714,6 @@ impl Controller {
             return false;
         }
         match message {
-            Message::WorkspaceFpsScreenshot { generation, .. } => {
-                *generation == self.generation && self.phase == Phase::AwaitWorkspaceFpsScreenshot
-            }
             Message::Scoped {
                 generation,
                 receipt,
@@ -3461,10 +3723,31 @@ impl Controller {
                     Message::ProbeCompleted { owner, message } => (Some(owner), message.as_ref()),
                     message => (None, message),
                 };
+                let cancellation = matches!(
+                    message,
+                    Message::ReportingDisabled
+                        | Message::WorkspaceFpsPixels(FpsPixelOutcome::Cancelled)
+                );
                 *generation == self.generation
-                    && *generation
-                        == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+                    && (cancellation
+                        || *generation
+                            == SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation))
                     && match message {
+                        Message::ReportingDisabled => {
+                            probe.is_none()
+                                && matches!(
+                                    self.phase,
+                                    Phase::AwaitWorkspaceFps | Phase::AwaitWorkspaceFpsPixels
+                                )
+                        }
+                        Message::WorkspaceFpsPixels(_) => {
+                            self.phase == Phase::AwaitWorkspaceFpsPixels
+                                && (cancellation || self.workspace_fps_result.is_none())
+                                && self
+                                    .workspace_fps_probe
+                                    .as_ref()
+                                    .is_some_and(|output| same_probe(&output.probe, probe))
+                        }
                         Message::UpscalePixels { .. } => {
                             same_probe(&self.upscale_pixel_owner, probe)
                         }
@@ -3486,10 +3769,14 @@ impl Controller {
                         _ => probe.is_none(),
                     }
                     && match receipt {
+                        // An owned completion must retire its request even when its
+                        // physical receipt changed while the browser was sampling.
+                        Some(_) if matches!(message, Message::WorkspaceFpsPixels(_)) => true,
                         Some(receipt) => current_receipt(receipt.control).as_ref() == Some(receipt),
                         None => matches!(
                             message,
-                            Message::Advance
+                            Message::ReportingDisabled
+                                | Message::Advance
                                 | Message::Located { .. }
                                 | Message::NumberWheelDelivered
                                 | Message::GalleryMouseDelivered
@@ -3519,20 +3806,37 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
-            Message::WorkspaceFpsDrawn(evidence) => {
-                if self.phase == Phase::AwaitWorkspaceFps {
-                    self.workspace_fps_evidence = Some(evidence);
+            Message::ReportingDisabled => {
+                if matches!(
+                    self.phase,
+                    Phase::AwaitWorkspaceFps | Phase::AwaitWorkspaceFpsPixels
+                ) {
+                    self.cancel_workspace_fps();
                 }
                 return None;
             }
-            Message::WorkspaceFpsScreenshot { image, .. } => {
-                let Some(evidence) = self.workspace_fps_evidence else {
-                    return None;
-                };
-                self.workspace_fps_failure =
-                    (!reporting::verify_workspace_fps_pixels(&image, evidence))
-                        .then_some(WORKSPACE_FPS_PIXEL_FAILURE);
-                self.phase = Phase::RestoreWorkspaceFps;
+            Message::WorkspaceFpsDrawn(evidence) => {
+                if self.phase == Phase::AwaitWorkspaceFps
+                    && request_receipt
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.control == EXPLORE_GALLERY)
+                {
+                    self.workspace_fps_evidence = Some(evidence);
+                    self.workspace_fps_receipt = request_receipt;
+                }
+                return None;
+            }
+            Message::WorkspaceFpsPixels(outcome) => {
+                let current = self.workspace_fps_probe_current();
+                if !reporting_enabled() || matches!(outcome, FpsPixelOutcome::Cancelled) {
+                    self.cancel_workspace_fps();
+                } else if !current || matches!(outcome, FpsPixelOutcome::Invalidated) {
+                    self.rearm_workspace_fps();
+                } else {
+                    // The next driver advance validates the applied UI scale as
+                    // well as the frozen draw before classifying or reporting pixels.
+                    self.workspace_fps_result = Some(outcome);
+                }
                 return None;
             }
             Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {
@@ -4881,8 +5185,9 @@ impl Controller {
         applied_scale: f32,
         router: &crate::view::router::Router,
         active: FeatureId,
-        frame: Option<crate::presentation_surface::FrameReady>,
+        surface: Option<crate::presentation_surface::Surface>,
     ) -> Task<RootMessage> {
+        let frame = surface.and_then(|surface| surface.frame);
         self.report_phase_progress();
         if !self.running() {
             return Task::none();
@@ -4900,6 +5205,14 @@ impl Controller {
                 ));
             }
             self.desired_dark = None;
+        }
+        if !reporting_enabled()
+            && matches!(
+                self.phase,
+                Phase::AwaitWorkspaceFps | Phase::AwaitWorkspaceFpsPixels
+            )
+        {
+            self.cancel_workspace_fps();
         }
         self.input_scale = applied_scale;
         self.observe_presentation(model, frame);
@@ -4921,7 +5234,9 @@ impl Controller {
                     | Phase::ViewerReconnect
             )
         {
-            self.fail_detail(|| format!("{}: {}", error.title, error.detail).into());
+            self.fail_detail(|| {
+                format!("{:?}: {}: {}", error.kind, error.title, error.detail).into()
+            });
             return Task::none();
         }
         match self.phase.clone() {
@@ -4933,23 +5248,42 @@ impl Controller {
                 {
                     return Task::none();
                 }
-                self.phase = Phase::AwaitWorkspaceFpsScreenshot;
-                let generation = self.generation;
-                iced::window::latest()
-                    .and_then(iced::window::screenshot)
-                    .map(move |image| {
-                        RootMessage::Integration(Message::WorkspaceFpsScreenshot {
-                            generation,
-                            image,
-                        })
-                    })
+                let evidence = self.workspace_fps_evidence.expect("observed FPS evidence");
+                let current = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().fps_draw);
+                if current != Some(evidence)
+                    || self.workspace_fps_receipt != current_receipt(EXPLORE_GALLERY)
+                {
+                    self.rearm_workspace_fps();
+                    return Task::none();
+                }
+                let Some(output) = probe_output(EXPLORE_GALLERY) else {
+                    return Task::none();
+                };
+                self.workspace_fps_probe = Some(output.clone());
+                self.workspace_fps_scale = applied_scale;
+                self.phase = Phase::AwaitWorkspaceFpsPixels;
+                #[cfg(target_arch = "wasm32")]
+                sample_workspace_fps(output, evidence, applied_scale);
+                Task::none()
             }
-            Phase::RestoreWorkspaceFps => {
-                self.phase = Phase::AwaitWorkspaceFpsRestored;
-                Task::done(RootMessage::Settings(
-                    crate::view::settings::Message::PerformanceChanged(self.workspace_fps_baseline),
-                ))
+            Phase::AwaitWorkspaceFpsPixels => {
+                if self.workspace_fps_scale != applied_scale || !self.workspace_fps_probe_current()
+                {
+                    self.rearm_workspace_fps();
+                } else if let Some(outcome) = self.workspace_fps_result.take() {
+                    let valid = match (outcome, self.workspace_fps_evidence) {
+                        (FpsPixelOutcome::Captured(image), Some(evidence)) => {
+                            reporting::verify_workspace_fps_pixels(&image, evidence)
+                        }
+                        _ => false,
+                    };
+                    self.workspace_fps_probe = None;
+                    self.workspace_fps_failure = (!valid).then_some(WORKSPACE_FPS_PIXEL_FAILURE);
+                    return self.restore_workspace_fps();
+                }
+                Task::none()
             }
+            Phase::RestoreWorkspaceFps => self.restore_workspace_fps(),
             Phase::AwaitWorkspaceFpsRestored
                 if !settings.has_local_edits()
                     && !model.native_settings_unsettled()
@@ -5267,6 +5601,9 @@ impl Controller {
                         ],
                     )
                 });
+                if !self.require_original_crop(&upscale.frame) {
+                    return Task::none();
+                }
                 self.viewer_continuity_request = Some(request.clone());
                 self.phase = Phase::ViewerAwaitDisconnect;
                 // Retiring the real outbound owner closes the worker's socket;
@@ -5330,6 +5667,9 @@ impl Controller {
                         ],
                     )
                 });
+                if !self.require_original_crop(&upscale.frame) {
+                    return Task::none();
+                }
                 self.annotation_sample_baseline = drawn;
                 let (next, control) = match self.viewer_scenario.as_str() {
                     "copy" => (Phase::OpenAnnotation, EXPLORE_ANNOTATE),
@@ -6065,14 +6405,33 @@ impl Controller {
                     && !settings.has_local_edits()
                     && model.explore_open_available() =>
             {
-                if model
-                    .explore
-                    .snapshot
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.mode == crate::generated::ExploreMode::Detail)
-                {
-                    self.phase = Phase::ExploreCloseDetail;
-                    return self.arm(EXPLORE_DETAIL_CLOSE);
+                use crate::presentation_surface::ExploreDisplay;
+                let logical = model.explore.snapshot.as_ref();
+                match crate::presentation_surface::explore_display(surface) {
+                    Some(ExploreDisplay::Detail(_, _)) => {
+                        if logical.is_some_and(|snapshot| {
+                            snapshot.mode == crate::generated::ExploreMode::Detail
+                        }) && model.explore_mutation_available()
+                        {
+                            self.phase = Phase::ExploreCloseDetail;
+                            return self.arm(EXPLORE_DETAIL_CLOSE);
+                        }
+                        return Task::none();
+                    }
+                    Some(ExploreDisplay::Gallery(_, _)) => {
+                        if logical.is_none_or(|snapshot| {
+                            snapshot.mode != crate::generated::ExploreMode::Gallery
+                        }) {
+                            return Task::none();
+                        }
+                    }
+                    None if logical.is_some_and(|snapshot| {
+                        snapshot.ready || snapshot.mode == crate::generated::ExploreMode::Detail
+                    }) =>
+                    {
+                        return Task::none();
+                    }
+                    None => {} // The initial empty page owns Open before any product exists.
                 }
                 if let Some(snapshot) = model
                     .explore
@@ -6092,7 +6451,10 @@ impl Controller {
             }
             Phase::ExploreCloseDetail => self.arm(EXPLORE_DETAIL_CLOSE),
             Phase::AwaitExploreGallery
-                if model.explore.snapshot.as_ref().is_some_and(|snapshot| {
+                if matches!(
+                    crate::presentation_surface::explore_display(surface),
+                    Some(crate::presentation_surface::ExploreDisplay::Gallery(_, _))
+                ) && model.explore.snapshot.as_ref().is_some_and(|snapshot| {
                     snapshot.mode == crate::generated::ExploreMode::Gallery && !snapshot.busy
                 }) && !model.explore.desired_close
                     && !model.has_explore_pending() =>
@@ -7011,6 +7373,7 @@ impl Controller {
                     || snapshot.busy
                     || settings.has_local_edits()
                     || !model.explore_mutation_available()
+                    || displayed_detail(surface, snapshot).is_none()
                 {
                     return Task::none();
                 }
@@ -7206,7 +7569,15 @@ impl Controller {
             Phase::AwaitAtlasEmpty
                 if model.explore.snapshot.as_ref().is_some_and(|value| {
                     value.ready && !value.busy && value.order.matchingcount == 0
-                }) =>
+                }) && matches!(
+                    crate::presentation_surface::explore_display(surface),
+                    Some(crate::presentation_surface::ExploreDisplay::Gallery(shown, metadata))
+                        if metadata.order.matchingcount == 0
+                            && shown.frame.is_some_and(|frame| {
+                                self.gallery_drawn
+                                    == Some((frame.presentation_revision, metadata.frame.revision))
+                            })
+                ) =>
             {
                 self.phase = Phase::AtlasEmpty;
                 self.arm(explore::GALLERY_EMPTY_ID)
@@ -8528,6 +8899,7 @@ impl Controller {
                     || selected == previous
                     || settings.has_local_edits()
                     || !model.explore_mutation_available()
+                    || displayed_detail(surface, snapshot).is_none()
                 {
                     return Task::none();
                 }
@@ -8566,6 +8938,7 @@ impl Controller {
                     || snapshot.selectedimage == Some(next)
                     || settings.has_local_edits()
                     || !model.annotation_open_available()
+                    || displayed_detail(surface, snapshot).is_none()
                 {
                     return Task::none();
                 }
@@ -8689,7 +9062,10 @@ impl Controller {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if snapshot.busy || snapshot.mode != crate::generated::ExploreMode::Detail {
+                if snapshot.busy
+                    || snapshot.mode != crate::generated::ExploreMode::Detail
+                    || displayed_detail(surface, snapshot).is_none()
+                {
                     return Task::none();
                 }
                 if self.viewer_drawn.is_none_or(|(presentation, source, _)| {
@@ -9096,6 +9472,10 @@ impl Controller {
                     || snapshot.busy
                     || snapshot.frame.revision == 0
                     || !model.annotation_edit_available()
+                    || self
+                        .annotation_open
+                        .as_ref()
+                        .is_none_or(|(_, before)| snapshot.inputdocumentepoch <= *before)
                 {
                     return Task::none();
                 }
@@ -9146,11 +9526,20 @@ impl Controller {
                         self.fail("viewed document imported no editable mask");
                         return Task::none();
                     }
-                    let Some(upscale) = model.upscale_snapshot.as_ref() else {
+                    let Some((request, _)) = self.annotation_open.as_ref() else {
+                        self.fail("Annotation import has no dispatched source receipt");
                         return Task::none();
                     };
-                    if snapshot.frame.extent.width != upscale.frame.content.width
-                        || snapshot.frame.extent.height != upscale.frame.content.height
+                    let expected = if request.originalcontent {
+                        [request.source.content.width, request.source.content.height]
+                    } else {
+                        [request.source.extent.width, request.source.extent.height]
+                    };
+                    if !request.originalcontent
+                        || snapshot.frame.extent.width != expected[0]
+                        || snapshot.frame.extent.height != expected[1]
+                        || u32::from(scene.framewidth) != expected[0]
+                        || u32::from(scene.frameheight) != expected[1]
                     {
                         self.fail("Annotation did not copy the viewed upscale crop");
                         return Task::none();
@@ -9588,18 +9977,18 @@ impl Controller {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    struct ProbeFixture {
-        controller: Controller,
-        receiver: iced::futures::channel::mpsc::Receiver<Message>,
+    pub(crate) struct ProbeFixture {
+        pub(crate) controller: Controller,
+        pub(crate) receiver: iced::futures::channel::mpsc::Receiver<Message>,
         surface: crate::presentation_surface::Surface,
         bounds: Rectangle,
     }
 
     impl ProbeFixture {
-        fn new(scenario: &str) -> Self {
+        pub(crate) fn new(scenario: &str) -> Self {
             initialize_reporting(true, true);
             let controller = Controller::new(
                 true,
@@ -9615,10 +10004,7 @@ mod tests {
                     Some(ScenarioOutput::new(controller.generation, sender))
             });
             let (_, frame) = crate::view_model::test_support::explore_presentation();
-            let surface = crate::presentation_surface::Surface {
-                integration: true,
-                ..crate::view_model::test_support::physical_surface(frame)
-            };
+            let surface = crate::view_model::test_support::physical_surface(frame);
             Self {
                 controller,
                 receiver,
@@ -9635,10 +10021,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn recoverable_fps_pixel_failure_restores_and_settles_the_prior_setting() {
-        use iced::futures::StreamExt;
-        let mut fixture = ProbeFixture::new("square");
+    fn fps_settings() -> (ApplicationModel, crate::view::settings::SettingsModel) {
         let mut model = crate::view_model::test_support::bootstrapped();
         model
             .settings_snapshot
@@ -9649,75 +10032,287 @@ mod tests {
             .showworkspaceperformance = true;
         let mut settings = crate::view::settings::SettingsModel::default();
         settings.install(model.settings_snapshot.as_ref().unwrap());
-        let router = crate::view::router::Router::default();
-        let driver = &mut fixture.controller;
-        driver.workspace_fps_baseline = false;
-        driver.workspace_fps_evidence = Some(reporting::FpsEvidence {
-            bounds: fixture.bounds,
-            clip: fixture.bounds,
-            dark: false,
-            frames: 30,
-            seconds: 0.5,
-        });
-        driver.phase = Phase::AwaitWorkspaceFpsScreenshot;
-        driver.update(Message::WorkspaceFpsScreenshot {
-            generation: driver.generation,
-            image: iced::window::Screenshot::new(vec![0; 4], iced::Size::new(1, 1), 1.0),
-        });
-        assert_eq!(driver.phase, Phase::RestoreWorkspaceFps);
-        assert_eq!(
-            driver.workspace_fps_failure,
-            Some(WORKSPACE_FPS_PIXEL_FAILURE)
-        );
-        assert_eq!(driver.failure_line, 0);
-        let task = driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None);
-        let mut actions = iced_runtime::task::into_stream(task).unwrap();
-        let action = iced::futures::executor::block_on(actions.next()).unwrap();
-        let iced_runtime::Action::Output(RootMessage::Settings(message)) = action else {
-            panic!("FPS cleanup must use the ordinary settings mutation");
-        };
-        assert!(matches!(
-            message,
-            crate::view::settings::Message::PerformanceChanged(false)
-        ));
-        let outcome = crate::view::settings::update(&mut settings, message).unwrap();
-        assert!(matches!(
-            outcome,
-            Some(crate::view::settings::Outcome::SettingsEdited(
-                crate::view::settings::EditSchedule::Debounce(_)
-            ))
-        ));
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
-        assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
-        let request = settings
-            .take_request()
-            .expect("canonical restoration request");
-        assert_eq!(request.updates.len(), 1);
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
-        assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
-        assert_eq!(driver.failure_line, 0);
-        let authoritative = model.settings_snapshot.as_mut().unwrap();
-        authoritative.revision += 1;
-        authoritative.settingsstate.ui.showworkspaceperformance = false;
-        settings.settle_success(authoritative);
-        drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
-        assert!(!crate::workspace_fps::enabled(&settings));
-        assert!(
-            !model
-                .settings_snapshot
+        (model, settings)
+    }
+
+    impl ProbeFixture {
+        fn request_fps(
+            &mut self,
+            model: &ApplicationModel,
+            settings: &crate::view::settings::SettingsModel,
+        ) -> ScenarioOutput {
+            record_probe_draw(
+                EXPLORE_GALLERY,
+                self.surface,
+                self.bounds,
+                self.bounds,
+                self.bounds,
+            );
+            let (_, evidence) = reporting::fps_pixel_fixture(false, 1.0);
+            let mut output = SURFACE_DRAW_OBSERVER.with(|observer| {
+                let mut observer = observer.borrow_mut();
+                observer.fps_draw = Some(evidence);
+                observer.output_for(EXPLORE_GALLERY).unwrap().clone()
+            });
+            self.controller.phase = Phase::AwaitWorkspaceFps;
+            output
+                .try_send(Message::WorkspaceFpsDrawn(evidence))
+                .unwrap();
+            self.controller.update(self.receiver.try_recv().unwrap());
+            drop(self.controller.advance(
+                model,
+                settings,
+                1.0,
+                &crate::view::router::Router::default(),
+                FeatureId::Explore,
+                None,
+            ));
+            assert_eq!(self.controller.phase, Phase::AwaitWorkspaceFpsPixels);
+            self.controller.workspace_fps_probe.clone().unwrap()
+        }
+        pub(crate) fn prepare_app_fps(
+            &mut self,
+            model: &ApplicationModel,
+            settings: &crate::view::settings::SettingsModel,
+            baseline: bool,
+            capture: bool,
+        ) -> Option<Message> {
+            self.controller.workspace_fps_baseline = baseline;
+            if !capture {
+                self.controller.phase = Phase::AwaitWorkspaceFps;
+                return None;
+            }
+            let mut output = self.request_fps(model, settings);
+            let (pixels, _) = reporting::fps_pixel_fixture(false, 1.0);
+            output.send(Message::WorkspaceFpsPixels(FpsPixelOutcome::Captured(
+                pixels,
+            )));
+            Some(self.receiver.try_recv().unwrap())
+        }
+
+        fn complete_fps(
+            &mut self,
+            output: &mut ScenarioOutput,
+            outcome: FpsPixelOutcome,
+            model: &ApplicationModel,
+            settings: &crate::view::settings::SettingsModel,
+        ) -> Task<RootMessage> {
+            output
+                .try_send(Message::WorkspaceFpsPixels(outcome))
+                .unwrap();
+            let message = self.receiver.try_recv().unwrap();
+            if !self.controller.accepts_message(&message) {
+                return Task::none();
+            }
+            self.controller.update(message);
+            self.controller.advance(
+                model,
+                settings,
+                1.0,
+                &crate::view::router::Router::default(),
+                FeatureId::Explore,
+                None,
+            )
+        }
+    }
+
+    #[test]
+    fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines() {
+        use iced::futures::StreamExt;
+        for baseline in [false, true] {
+            for result in 0..3 {
+                let mut fixture = ProbeFixture::new("square");
+                let (mut model, mut settings) = fps_settings();
+                fixture.controller.workspace_fps_baseline = baseline;
+                let mut output = fixture.request_fps(&model, &settings);
+                let (mut pixels, _) = reporting::fps_pixel_fixture(false, 1.0);
+                if result == 1 {
+                    pixels.rgba.pop();
+                }
+                let task = fixture.complete_fps(
+                    &mut output,
+                    if result == 2 {
+                        FpsPixelOutcome::Failed
+                    } else {
+                        FpsPixelOutcome::Captured(pixels)
+                    },
+                    &model,
+                    &settings,
+                );
+                let driver = &mut fixture.controller;
+                let router = crate::view::router::Router::default();
+                assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+                assert_eq!(
+                    driver.workspace_fps_failure,
+                    (result != 0).then_some(WORKSPACE_FPS_PIXEL_FAILURE)
+                );
+                assert_eq!(driver.failure_line, 0);
+                let mut actions = iced_runtime::task::into_stream(task).unwrap();
+                let action = iced::futures::executor::block_on(actions.next()).unwrap();
+                let iced_runtime::Action::Output(RootMessage::Settings(message)) = action else {
+                    panic!("FPS restoration must use ordinary settings mutation");
+                };
+                assert!(
+                    matches!(message, crate::view::settings::Message::PerformanceChanged(value) if value == baseline)
+                );
+                let outcome = crate::view::settings::update(&mut settings, message).unwrap();
+                assert!(matches!(
+                    outcome,
+                    Some(crate::view::settings::Outcome::SettingsEdited(_))
+                ));
+                drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+                assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+                let restoration = settings
+                    .take_request()
+                    .expect("canonical restoration request for either baseline");
+                assert_eq!(restoration.updates.len(), 1);
+                assert_eq!(
+                    restoration.updates[0],
+                    crate::generated::update_uishowworkspaceperformance(baseline)
+                );
+                drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+                assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+                let pending = model
+                    .begin_intent(crate::generated::ApplicationIntentEndpoint::SettingsUpdate)
+                    .unwrap();
+                let authoritative = model.settings_snapshot.as_mut().unwrap();
+                authoritative.revision += 1;
+                authoritative.settingsstate.ui.showworkspaceperformance = baseline;
+                settings.settle_success(authoritative);
+                drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+                assert_eq!(driver.phase, Phase::AwaitWorkspaceFpsRestored);
+                assert_eq!(driver.failure_line, 0);
+                model.abandon_intent(pending);
+                drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+                assert_eq!(crate::workspace_fps::enabled(&settings), baseline);
+                assert_eq!(
+                    model
+                        .settings_snapshot
+                        .as_ref()
+                        .unwrap()
+                        .settingsstate
+                        .ui
+                        .showworkspaceperformance,
+                    baseline
+                );
+                assert_eq!(driver.workspace_fps_verified, result == 0);
+                assert_eq!(
+                    driver.phase,
+                    if result == 0 {
+                        Phase::AwaitExploreReady
+                    } else {
+                        Phase::Failed
+                    }
+                );
+                assert_eq!(driver.failure_line != 0, result != 0);
+            }
+        }
+    }
+
+    #[test]
+    fn fps_capture_invalidation_rearms_and_obsolete_callbacks_cannot_finish_replacements() {
+        for change in 0..4 {
+            let mut fixture = ProbeFixture::new("square");
+            let (model, settings) = fps_settings();
+            let mut old = fixture.request_fps(&model, &settings);
+            let (pixels, _) = reporting::fps_pixel_fixture(false, 1.0);
+            let outcome = match change {
+                0 => FpsPixelOutcome::Invalidated,
+                1 => {
+                    let moved = Rectangle {
+                        x: 1.0,
+                        ..fixture.bounds
+                    };
+                    record_probe_draw(EXPLORE_GALLERY, fixture.surface, moved, moved, moved);
+                    FpsPixelOutcome::Captured(pixels.clone())
+                }
+                2 => {
+                    SURFACE_DRAW_OBSERVER.with(|observer| {
+                        observer.borrow_mut().fps_draw.as_mut().unwrap().bounds.x += 1.0
+                    });
+                    FpsPixelOutcome::Captured(pixels.clone())
+                }
+                _ => {
+                    SURFACE_DRAW_OBSERVER.with(|observer| {
+                        observer.borrow_mut().fps_draw.as_mut().unwrap().frames += 1
+                    });
+                    FpsPixelOutcome::Captured(pixels.clone())
+                }
+            };
+            drop(fixture.complete_fps(&mut old, outcome, &model, &settings));
+            assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFps);
+            assert!(!fixture.controller.workspace_fps_verified);
+            assert!(fixture.controller.workspace_fps_failure.is_none());
+            let mut replacement = fixture.request_fps(&model, &settings);
+            drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
+            assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsPixels);
+            assert!(same_probe(
+                &fixture
+                    .controller
+                    .workspace_fps_probe
+                    .as_ref()
+                    .unwrap()
+                    .probe,
+                replacement.probe.as_ref()
+            ));
+            drop(fixture.complete_fps(
+                &mut replacement,
+                FpsPixelOutcome::Captured(pixels),
+                &model,
+                &settings,
+            ));
+            assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsRestored);
+            assert!(fixture.controller.workspace_fps_failure.is_none());
+        }
+    }
+
+    #[test]
+    fn fps_capture_from_a_prior_scenario_cannot_settle_the_replacement() {
+        let mut fixture = ProbeFixture::new("square");
+        let (model, settings) = fps_settings();
+        let mut old = fixture.request_fps(&model, &settings);
+        fixture.controller.phase = Phase::Complete;
+        fixture
+            .controller
+            .reset_scenario(String::new(), String::new(), "512".into(), "square".into())
+            .unwrap();
+        let mut replacement = fixture.request_fps(&model, &settings);
+        drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
+        assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsPixels);
+        assert!(same_probe(
+            &fixture
+                .controller
+                .workspace_fps_probe
                 .as_ref()
                 .unwrap()
-                .settingsstate
-                .ui
-                .showworkspaceperformance
+                .probe,
+            replacement.probe.as_ref()
+        ));
+        let (pixels, _) = reporting::fps_pixel_fixture(false, 1.0);
+        drop(fixture.complete_fps(
+            &mut replacement,
+            FpsPixelOutcome::Captured(pixels),
+            &model,
+            &settings,
+        ));
+        assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsRestored);
+        assert!(fixture.controller.workspace_fps_failure.is_none());
+    }
+
+    #[test]
+    fn fps_capture_scale_change_rearms_without_accepting_the_old_result() {
+        let mut fixture = ProbeFixture::new("square");
+        let (model, settings) = fps_settings();
+        let mut old = fixture.request_fps(&model, &settings);
+        let router = crate::view::router::Router::default();
+        drop(
+            fixture
+                .controller
+                .advance(&model, &settings, 1.5, &router, FeatureId::Explore, None),
         );
-        assert_eq!(driver.phase, Phase::Failed);
-        assert_eq!(
-            driver.workspace_fps_failure,
-            Some(WORKSPACE_FPS_PIXEL_FAILURE)
-        );
-        assert!(driver.failure_line != 0);
-        assert!(!driver.workspace_fps_verified);
+        assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFps);
+        drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Failed, &model, &settings));
+        assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFps);
     }
 
     #[test]
@@ -9763,6 +10358,7 @@ mod tests {
                 sequence,
                 progress: 0,
                 failureline: 0,
+                failure: String::new(),
                 readgeneration: 0,
                 compiledindex: 0,
             };
@@ -9799,7 +10395,7 @@ mod tests {
                 1.0,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(crate::view_model::test_support::physical_surface(frame)),
             ));
         };
         {
@@ -9851,6 +10447,7 @@ mod tests {
             sequence: 1,
             progress: 0,
             failureline: 0,
+            failure: String::new(),
             readgeneration: 6,
             compiledindex: 47,
         };
@@ -9929,6 +10526,7 @@ mod tests {
                         sequence,
                         progress: 0,
                         failureline: 0,
+                        failure: String::new(),
                         readgeneration: 7,
                         compiledindex: 47,
                     })
@@ -9952,6 +10550,7 @@ mod tests {
                 sequence: 1,
                 progress: 0,
                 failureline: 0,
+                failure: String::new(),
                 readgeneration: 7,
                 compiledindex: 47,
             })
@@ -10003,12 +10602,59 @@ mod tests {
                         sequence: 2,
                         progress: 0,
                         failureline: 0,
+                        failure: String::new(),
                         readgeneration: 0,
                         compiledindex: 0,
                     })
                     .is_err(),
                 "viewer evidence cannot settle a destructive Annotation workflow"
             );
+            let (mut model, _) = crate::view_model::test_support::explore_presentation();
+            let source = model.explore.snapshot.as_ref().unwrap().frame.clone();
+            let snapshot = model.annotation.snapshot.as_mut().unwrap();
+            snapshot.ready = true;
+            snapshot.busy = false;
+            snapshot.frame.revision = 23;
+            snapshot.ui.documentrevision = 9;
+            snapshot.inputdocumentepoch = 31;
+            driver.phase = Phase::AwaitAnnotation;
+            let settings = crate::view::settings::SettingsModel::default();
+            let router = crate::view::router::Router::default();
+            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Annotate, None));
+            assert_eq!(driver.phase, Phase::AwaitAnnotation);
+            driver.observe_annotation_open(
+                crate::generated::AnnotationOpen {
+                    source,
+                    originalcontent: true,
+                },
+                31,
+            );
+            for (epoch, busy, imported) in
+                [(31, false, false), (32, true, false), (32, false, true)]
+            {
+                let snapshot = model.annotation.snapshot.as_mut().unwrap();
+                snapshot.inputdocumentepoch = epoch;
+                snapshot.busy = busy;
+                drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Annotate, None));
+                assert_eq!(driver.location_pending, imported);
+                assert_eq!(
+                    driver.phase,
+                    if imported {
+                        Phase::AnnotationTool {
+                            revision: model
+                                .annotation
+                                .snapshot
+                                .as_ref()
+                                .unwrap()
+                                .ui
+                                .interactionrevision,
+                            tool: crate::generated::AnnotationTool::Box,
+                        }
+                    } else {
+                        Phase::AwaitAnnotation
+                    }
+                );
+            }
         }
     }
 
@@ -10033,6 +10679,7 @@ mod tests {
             sequence: 2,
             progress: 0,
             failureline: 0,
+            failure: String::new(),
             readgeneration: 0,
             compiledindex: 0,
         };
@@ -10046,9 +10693,8 @@ mod tests {
         assert_eq!(driver.resolution, "512");
         assert!(driver.viewer_scenario.is_empty());
         assert!(!driver.reuse_compiled);
-        // A retained native Detail view still covers the Gallery's Open
-        // control after navigation. Close it through its own control and
-        // require native settlement before attempting the next Open.
+        // A retained paired Detail owns Close independently of logical delivery.
+        crate::presentation_surface::reset_test_releases();
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         model.connection = ConnectionState::Connected;
         model.window_width = 1200;
@@ -10077,12 +10723,34 @@ mod tests {
                 1.0,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(crate::view_model::test_support::physical_surface(frame)),
             ));
         };
         driver.desired_dark = None;
         driver.phase = Phase::AwaitExplore;
         assert!(model.explore_open_available());
+        // Logical Detail may arrive before any actual composition.
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitExplore);
+        assert!(!driver.location_pending);
+        for phase in [
+            Phase::AwaitDetail(0),
+            Phase::AwaitNext(99),
+            Phase::AwaitPrevious(99),
+            Phase::AwaitDetailAgain,
+        ] {
+            driver.phase = phase.clone();
+            drive(&mut driver, &model);
+            assert_eq!(driver.phase, phase);
+            assert!(!driver.location_pending);
+        }
+        driver.phase = Phase::AwaitExplore;
+        assert!(crate::presentation_surface::accept_publication(frame));
+        model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Gallery;
+        drive(&mut driver, &model);
+        assert_eq!(driver.phase, Phase::AwaitExplore);
+        assert!(!driver.location_pending);
+        model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Detail;
         drive(&mut driver, &model);
         assert_eq!(driver.phase, Phase::ExploreCloseDetail);
         assert!(driver.location_pending);
@@ -10110,6 +10778,26 @@ mod tests {
             let snapshot = model.explore.snapshot.as_mut().unwrap();
             snapshot.mode = mode;
             snapshot.busy = busy;
+            if mode == crate::generated::ExploreMode::Gallery && !busy {
+                // Logical Close settlement cannot uncover the old graphics overlay.
+                drive(&mut driver, &model);
+                assert_eq!(driver.phase, Phase::AwaitExploreGallery);
+                let mut gallery = model.explore.snapshot.clone().unwrap();
+                gallery.viewport.columns = 4;
+                gallery.viewport.rowcount = 3;
+                gallery.viewport.firstrow = 0;
+                gallery.viewport.extent = gallery.frame.extent.clone();
+                crate::view_model::test_support::gallery_layout(&mut gallery);
+                crate::presentation_surface::metadata::retire(frame);
+                crate::presentation_surface::metadata::install_explore(frame, &gallery);
+                // A new Gallery composition can precede logical Close settlement too.
+                model.explore.snapshot.as_mut().unwrap().mode =
+                    crate::generated::ExploreMode::Detail;
+                drive(&mut driver, &model);
+                assert_eq!(driver.phase, Phase::AwaitExploreGallery);
+                assert!(!driver.location_pending);
+                model.explore.snapshot.as_mut().unwrap().mode = mode;
+            }
             drive(&mut driver, &model);
             assert_eq!(driver.phase, expected);
             assert!(!driver.location_pending);
@@ -10181,6 +10869,50 @@ mod tests {
             );
             assert!(driver.reporting.state_is_absent());
         }
+        // The empty message must reach a draw before restoring the filters.
+        // Logical delivery, acquisition, and a preceding draw are insufficient.
+        let current_draw = (frame.presentation_revision, source);
+        for (logical_matches, displayed_matches, drawn, ready) in [
+            (0, None, Some(current_draw), false),
+            (0, Some(2), Some(current_draw), false),
+            (2, Some(0), Some(current_draw), false),
+            (0, Some(0), None, false),
+            (
+                0,
+                Some(0),
+                Some((frame.presentation_revision - 1, source)),
+                false,
+            ),
+            (0, Some(0), Some(current_draw), true),
+        ] {
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.order.matchingcount = logical_matches;
+            crate::presentation_surface::metadata::retire(frame);
+            if let Some(matching) = displayed_matches {
+                let mut product = snapshot.clone();
+                product.mode = crate::generated::ExploreMode::Gallery;
+                product.order.matchingcount = matching;
+                product.viewport.columns = 4;
+                product.viewport.rowcount = 3;
+                product.viewport.firstrow = 0;
+                product.viewport.extent = product.frame.extent.clone();
+                crate::view_model::test_support::gallery_layout(&mut product);
+                crate::presentation_surface::metadata::install_explore(frame, &product);
+            }
+            driver.gallery_drawn = drawn;
+            driver.phase = Phase::AwaitAtlasEmpty;
+            drive(&mut driver, &model);
+            assert_eq!(
+                driver.phase,
+                if ready {
+                    Phase::AtlasEmpty
+                } else {
+                    Phase::AwaitAtlasEmpty
+                }
+            );
+            assert_eq!(driver.location_pending, ready);
+            driver.location_pending = false;
+        }
         // The oversized measurement can resolve to the already committed
         // raster, so native viewport deduplication need not publish a revision.
         let snapshot = model.explore.snapshot.as_mut().unwrap();
@@ -10217,6 +10949,14 @@ mod tests {
             crate::generated::PresentationSourceKind::Annotation,
             1,
         );
+        annotation.inputdocumentepoch = 1;
+        driver.observe_annotation_open(
+            crate::generated::AnnotationOpen {
+                source: model.explore.snapshot.as_ref().unwrap().frame.clone(),
+                originalcontent: true,
+            },
+            0,
+        );
         driver.viewer_scenario = "terminal".into();
         driver.phase = Phase::AwaitAnnotation;
         drive(&mut driver, &model);
@@ -10227,7 +10967,7 @@ mod tests {
             1.0,
             &router,
             FeatureId::Annotate,
-            Some(frame),
+            Some(crate::view_model::test_support::physical_surface(frame)),
         ));
         assert!(matches!(driver.phase, Phase::AnnotationTool { .. }));
         assert!(driver.reporting.state_is_absent());
@@ -10252,12 +10992,237 @@ mod tests {
                     sequence: 2,
                     progress: 0,
                     failureline: 0,
+                    failure: String::new(),
                     readgeneration: 0,
                     compiledindex: 0,
                 })
                 .is_err(),
             "local completion is insufficient before the typed receipt was admitted"
         );
+    }
+
+    #[test]
+    fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_and_quiet_modes()
+     {
+        use crate::presentation_surface as surface;
+        use iced::advanced::{
+            Layout, layout,
+            renderer::{Headless, Renderer as _},
+            widget,
+        };
+        for enabled in [false, true] {
+            surface::reset_test_releases();
+            surface::initialize_diagnostics(enabled, false);
+            let mut fixture = ProbeFixture::new("atlas");
+            initialize_reporting(enabled, false);
+            while fixture.receiver.try_recv().is_ok() {}
+            let frame = fixture.surface.frame.unwrap();
+            let mut snapshot = crate::view_model::test_support::explore_snapshot();
+            snapshot.mode = crate::generated::ExploreMode::Gallery;
+            snapshot.frame = crate::view_model::test_support::visual_frame(
+                crate::generated::PresentationSourceKind::Explore,
+                frame.content_sequence,
+            );
+            snapshot.dataset.identity = 1;
+            snapshot.viewport.columns = 4;
+            snapshot.viewport.rowcount = 3;
+            snapshot.viewport.extent = snapshot.frame.extent.clone();
+            snapshot.order.matchingcount = 12;
+            snapshot.order.visibleindices = (0..12).collect();
+            snapshot.gallery.slots = vec![false; 12];
+            crate::view_model::test_support::gallery_layout(&mut snapshot);
+            surface::metadata::install_explore(frame, &snapshot);
+            // Only the graphics receipt and its paired metadata reach the renderer.
+            // No application snapshot is installed or reconciled before either draw.
+            drop(snapshot);
+            assert!(surface::accept_publication(frame));
+            surface::authorize_draw(Some(frame));
+            surface::complete_sample(frame);
+            let received = surface::metadata::surface(frame).unwrap();
+            let _renderer_cleanup = surface::TestRendererCleanup;
+            let mut renderer = iced::futures::executor::block_on(
+                <iced::Renderer as Headless>::new(Default::default(), Some("wgpu")),
+            )
+            .expect("first native gallery draw acceptance requires the container GPU backend");
+            let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(128.0, 96.0));
+            let viewport =
+                iced::widget::shader::Viewport::with_physical_size(iced::Size::new(128, 96), 1.0);
+            let node = layout::Node::new(bounds.size());
+            let theme = crate::fluent_theme::app_theme(false);
+            let style = iced::advanced::renderer::Style::default();
+            let mut first_pixels = None;
+            for requested in [received, received, surface::Surface::empty(), received] {
+                let program = surface::Program::<()> {
+                    show_fps: false,
+                    input: None,
+                    local: None,
+                    publish: None,
+                    surface: requested,
+                    placement: if requested.valid() {
+                        surface::Placement::GalleryGrid {
+                            columns: 4,
+                            rows: 3,
+                            row_capacity: 3,
+                            row_origin: 0,
+                            first_row: 0,
+                        }
+                    } else {
+                        surface::Placement::Contain
+                    },
+                    control_id: EXPLORE_GALLERY,
+                };
+                let mut element: crate::fluent_theme::Element<'_, ()> =
+                    iced::widget::shader(program).width(128).height(96).into();
+                let mut tree = widget::Tree::new(&element);
+                tree.diff(element.as_widget_mut());
+                renderer.reset(bounds);
+                element.as_widget().draw(
+                    &tree,
+                    &mut renderer,
+                    &theme,
+                    &style,
+                    Layout::new(&node),
+                    iced::mouse::Cursor::Unavailable,
+                    &bounds,
+                );
+                let pixels = renderer.screenshot(&viewport, iced::Color::WHITE);
+                if requested.valid() {
+                    assert_eq!(
+                        &pixels[(16 * 128 + 16) * 4..(16 * 128 + 16) * 4 + 3],
+                        &[0, 0, 0]
+                    );
+                    if let Some(first) = &first_pixels {
+                        assert_eq!(&pixels, first);
+                    } else {
+                        first_pixels = Some(pixels);
+                    }
+                } else {
+                    // An input-only workspace does not sample another component's
+                    // retained image. Returning to its image preserves custody.
+                    assert!(pixels.iter().all(|channel| *channel == 255));
+                }
+                let (displayed, metadata) = surface::gallery::displayed().unwrap();
+                assert_eq!(displayed.frame, Some(frame));
+                assert_eq!(metadata.gallery.slots, vec![false; 12]);
+                assert!(surface::test_releases().is_empty());
+            }
+            let mut atlas_drawn = false;
+            let mut gallery_drawn = false;
+            while let Ok(message) = fixture.receiver.try_recv() {
+                assert!(fixture.controller.accepts_message(&message));
+                if let Message::Scoped { message, .. } = &message {
+                    match message.as_ref() {
+                        Message::AtlasDrawn { receipt, .. } => {
+                            assert_eq!(receipt.surface.frame, Some(frame));
+                            assert_eq!(receipt.snapshot.gallery.slots, vec![false; 12]);
+                            assert_eq!(receipt.bounds, bounds);
+                            atlas_drawn = true;
+                        }
+                        Message::GalleryDrawn {
+                            presentation_revision,
+                            source_revision,
+                        } => {
+                            assert_eq!(*presentation_revision, frame.presentation_revision);
+                            assert_eq!(*source_revision, frame.content_sequence);
+                            gallery_drawn = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(atlas_drawn, enabled);
+            assert_eq!(gallery_drawn, enabled);
+            SURFACE_DRAW_OBSERVER.with(|observer| {
+                let observer = observer.borrow();
+                assert_eq!(observer.receipts.is_empty(), !enabled);
+                assert_eq!(observer.atlas.is_some(), enabled);
+            });
+            surface::retire_samples();
+            surface::retire_publication(frame);
+            surface::discard_sample(frame);
+            assert_eq!(surface::test_releases(), vec![frame]);
+            surface::initialize_diagnostics(false, false);
+        }
+    }
+
+    #[test]
+    fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
+        use crate::application_codec::FromApplicationValue;
+        for detail in [
+            "inconsistent frame revision".to_owned(),
+            "λ".repeat(crate::generated::INTEGRATION_FAILURE_MAX_BYTES),
+        ] {
+            initialize_reporting(false, false);
+            let mut driver = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                "quiet".into(),
+            );
+            let mut model = crate::view_model::test_support::bootstrapped();
+            model.error = Some(crate::view_model::UiError::protocol(detail));
+            drop(driver.advance(
+                &model,
+                &crate::view::settings::SettingsModel::default(),
+                1.0,
+                &crate::view::router::Router::default(),
+                FeatureId::Explore,
+                None,
+            ));
+            assert_eq!(driver.phase, Phase::Failed);
+            assert!(driver.failure.starts_with("Protocol: "));
+            assert!(driver.failure.len() <= crate::generated::INTEGRATION_FAILURE_MAX_BYTES);
+            assert!(driver.failure.is_char_boundary(driver.failure.len()));
+            let (mut connection, _capture) =
+                crate::transport_connection::Connection::test_channel();
+            driver.publish_control(&mut connection);
+            let mut wire = Vec::new();
+            connection
+                .flush(|bytes| {
+                    wire.push(bytes.to_vec());
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(wire.len(), 1);
+            let envelope = crate::protocol::decode_envelope(&wire[0]).unwrap();
+            let control =
+                crate::generated::IntegrationControl::from_application_value(envelope.payload)
+                    .unwrap();
+            assert_eq!(control.receipt.failure, driver.failure);
+            assert_eq!(
+                control.receipt.kind,
+                crate::generated::IntegrationControlKind::Failed
+            );
+            assert!(crate::generated::integration_receipt_valid(
+                &control.receipt
+            ));
+            let mut invalid = control.clone();
+            invalid
+                .receipt
+                .failure
+                .push_str(&"x".repeat(crate::generated::INTEGRATION_FAILURE_MAX_BYTES));
+            assert!(invalid.encode().is_err());
+            invalid = control;
+            invalid.receipt.kind = crate::generated::IntegrationControlKind::Progress;
+            invalid.receipt.failureline = 0;
+            assert!(invalid.encode().is_err());
+            invalid.receipt.kind = crate::generated::IntegrationControlKind::Advance;
+            invalid.receipt.progress = 0;
+            assert!(driver.receive_control(invalid.receipt).is_err());
+            assert!(driver.reporting.state_is_absent());
+        }
+        let mut disabled = Controller::new(
+            false,
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        disabled.fail_detail(|| panic!("disabled driver evaluated failure data"));
+        assert!(disabled.failure.is_empty());
     }
 
     #[test]
@@ -10284,8 +11249,6 @@ mod tests {
                 .map(|image| (snapshot.dataset.identity, image))
         });
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
-        // Even a diagnostic-marked surface cannot activate collection in a quiet driver.
-        surface.integration = true;
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let observer = observer.borrow();
@@ -10309,6 +11272,13 @@ mod tests {
                 frame.content_sequence,
             )
             .is_some()
+        );
+        assert!(
+            displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_none()
+        );
+        assert!(crate::presentation_surface::accept_publication(frame));
+        assert!(
+            displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_some()
         );
         crate::presentation_surface::clear_drawn_detail();
         let stale = crate::view_model::test_support::physical_surface(
@@ -10339,7 +11309,7 @@ mod tests {
                 1.0,
                 &router,
                 FeatureId::Explore,
-                Some(frame),
+                Some(crate::view_model::test_support::physical_surface(frame)),
             ));
             assert_eq!(driver.location_pending, expected_ready);
             assert_eq!(
@@ -10406,8 +11376,7 @@ mod tests {
             observer.identity = (3, 4);
         });
         let (_, frame) = crate::view_model::test_support::explore_presentation();
-        let mut surface = crate::view_model::test_support::physical_surface(frame);
-        surface.integration = true;
+        let surface = crate::view_model::test_support::physical_surface(frame);
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);
         let old_receipt = current_receipt(EXPLORE_GALLERY).unwrap();
@@ -11131,12 +12100,9 @@ mod tests {
             surface: crate::presentation_surface::Surface {
                 high: 1,
                 low: 2,
-                generation: 1,
                 width: 200,
                 height: 200,
-                timeline_ready: 1,
                 frame: None,
-                integration: true,
                 crop: None,
                 viewer_identity: None,
                 fit_revision: 0,

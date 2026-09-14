@@ -14,6 +14,9 @@ use wasm_bindgen::closure::Closure;
 thread_local! {
     static SURFACE_TRACE_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+// Correlates opt-in draw diagnostics only; it never participates in rendering
+// eligibility, graphics ownership, or completion scheduling.
+static NEXT_DRAW_DIAGNOSTIC: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn initialize_diagnostics(surface_trace: bool, pixel_trace: bool) {
     SURFACE_TRACE_ENABLED.with(|flag| flag.set(surface_trace));
@@ -64,16 +67,13 @@ fn frame_trace_fields(frame: Option<FrameReady>) -> String {
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn surface_trace_fields(surface: Surface, requested: Surface) -> String {
     format!(
-        "\"surface\":\"{:016x}{:016x}\",\"requested_surface\":\"{:016x}{:016x}\",\"generation\":{},\"width\":{},\"height\":{},\"allocation_generation\":{},\"timeline_ready\":{}{}",
+        "\"surface\":\"{:016x}{:016x}\",\"requested_surface\":\"{:016x}{:016x}\",\"width\":{},\"height\":{}{}",
         surface.high,
         surface.low,
         requested.high,
         requested.low,
-        surface.generation,
         surface.width,
         surface.height,
-        surface.generation,
-        surface.timeline_ready,
         frame_trace_fields(surface.frame),
     )
 }
@@ -91,6 +91,22 @@ fn trace_surface_request(event: &str, surface: Surface, requested: Surface, cont
         surface_trace_fields(surface, requested),
     );
     emit_surface_trace(&line);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trace_draw_receipt(
+    event: &str,
+    surface: Surface,
+    requested: Surface,
+    control: &str,
+    draw_identity: u64,
+) {
+    if surface_trace_enabled() {
+        emit_surface_trace(&format!(
+            "{{\"event\":\"{event}\",\"control\":\"{control}\",\"draw_identity\":{draw_identity},{}}}",
+            surface_trace_fields(surface, requested),
+        ));
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -132,6 +148,7 @@ fn trace_image(
     requested: Surface,
     snapshot: Option<&crate::generated::ExploreImageMetadata>,
     geometry: Option<(Rectangle, Option<(Rectangle, Rectangle)>)>,
+    draw_identity: u64,
 ) {
     if !surface_trace_enabled() {
         return;
@@ -147,7 +164,7 @@ fn trace_image(
         format!(",\"bounds\":{}{visible}", rect(bounds))
     });
     emit_surface_trace(&format!(
-        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",{}{}{}{geometry}}}",
+        "{{\"event\":\"iced.surface.{event}\",\"control\":\"{control}\",\"draw_identity\":{draw_identity},{}{}{}{geometry}}}",
         surface_trace_fields(surface, requested),
         gallery_trace_fields(snapshot),
         surface
@@ -164,10 +181,18 @@ fn trace_image(
     _requested: Surface,
     _snapshot: Option<&crate::generated::ExploreImageMetadata>,
     _geometry: Option<(Rectangle, Option<(Rectangle, Rectangle)>)>,
+    _draw_identity: u64,
 ) {
 }
 
-fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle, clip: Rectangle) {
+fn trace_draw(
+    event: &str,
+    control: &str,
+    draw: &PreparedDraw,
+    image: Rectangle,
+    clip: Rectangle,
+    draw_identity: u64,
+) {
     if !surface_trace_enabled() {
         return;
     }
@@ -178,6 +203,7 @@ fn trace_draw(event: &str, control: &str, draw: &PreparedDraw, image: Rectangle,
         draw.requested,
         draw.gallery.as_deref(),
         Some((draw.bounds, Some((image, clip)))),
+        draw_identity,
     );
 }
 
@@ -212,6 +238,7 @@ pub(crate) fn trace_atlas_stage(stage: &str, draw: &crate::integration_control::
         draw.surface,
         Some(&draw.snapshot),
         Some((draw.bounds, Some((draw.image, draw.clip)))),
+        0,
     );
 }
 
@@ -829,6 +856,16 @@ fn frame_stream() -> impl iced::futures::Stream<Item = Notification> {
                 return;
             }
             if event.type_() == IMPORT_EVENT {
+                if crate::integration_control::reporting_enabled()
+                    && let Some(identity) = event.detail().as_string()
+                    && let Some(requested) = parse_arena_identity(&identity)
+                {
+                    RENDERER.with(|renderer| {
+                        if let Some(owner) = renderer.borrow_mut().as_mut() {
+                            owner.reconstruct_pending_handoff(requested);
+                        }
+                    });
+                }
                 pending.borrow_mut().drawn = true;
                 notify.wake();
                 return;
@@ -977,14 +1014,11 @@ pub fn subscription() -> iced::Subscription<Notification> {
 pub struct Surface {
     pub high: u64,
     pub low: u64,
-    pub generation: u64,
     pub width: u32,
     pub height: u32,
-    pub timeline_ready: u64,
     // Desired publication geometry/identity, not authority to borrow its slot.
     // Only accept_publication + SampleRead can authorize an external read.
     pub frame: Option<FrameReady>,
-    pub integration: bool,
     pub crop: Option<[u32; 4]>,
     pub viewer_identity: Option<(u64, u32)>,
     pub fit_revision: u64,
@@ -995,12 +1029,9 @@ impl Surface {
         Self {
             high: 0,
             low: 0,
-            generation: 0,
             width: 0,
             height: 0,
-            timeline_ready: 0,
             frame: None,
-            integration: false,
             crop: None,
             viewer_identity: None,
             fit_revision: 0,
@@ -1032,10 +1063,7 @@ impl Surface {
             .map(|(session, image)| (session, image, self.fit_revision))
     }
     pub fn valid(self) -> bool {
-        (self.high != 0 || self.low != 0)
-            && self.generation != 0
-            && self.width != 0
-            && self.height != 0
+        (self.high != 0 || self.low != 0) && self.width != 0 && self.height != 0
     }
 
     fn label(self) -> String {
@@ -1584,13 +1612,6 @@ impl shader::Primitive for Primitive {
             );
             renderer.prepare_draw(device, queue, self.control_id, self.placement, transform);
         });
-        if self.surface.integration {
-            RENDERER.with(|renderer| {
-                if let Some(owner) = renderer.borrow_mut().as_mut() {
-                    owner.reconstruct_pending_handoff(device, self.surface);
-                }
-            });
-        }
     }
 
     fn render(
@@ -1612,6 +1633,7 @@ impl shader::Primitive for Primitive {
                 target,
                 *clip_bounds,
                 self.control_id,
+                self.surface,
                 resources,
                 self.submission.as_ref(),
             );
@@ -1650,6 +1672,14 @@ struct DrawAuthorization {
 
 pub(crate) fn authorize_draw(frame: Option<FrameReady>) {
     DRAW_AUTHORIZATION.with(|authorization| authorization.borrow_mut().draw = frame);
+}
+
+pub(crate) fn reset_reconstruction_probe() {
+    RENDERER.with(|renderer| {
+        if let Some(renderer) = renderer.borrow_mut().as_mut() {
+            renderer.reconstruction_admissions = None;
+        }
+    });
 }
 
 pub(crate) fn retire_samples() {
@@ -1793,7 +1823,7 @@ struct SurfaceRenderer {
     bounds: Rectangle,
     scale_factor: f32,
     requested: Option<Surface>,
-    reconstruction_probe: Option<((u64, u64, u64), (u64, u64, u64))>,
+    reconstruction_admissions: Option<std::collections::VecDeque<(u64, u64)>>,
     draws: std::collections::HashMap<&'static str, PreparedDraw>,
 }
 
@@ -1987,7 +2017,7 @@ impl SurfaceRenderer {
             bounds: Rectangle::default(),
             scale_factor: 1.0,
             requested: None,
-            reconstruction_probe: None,
+            reconstruction_admissions: None,
             draws: std::collections::HashMap::new(),
         }
     }
@@ -2038,34 +2068,52 @@ impl SurfaceRenderer {
         self.format = format;
     }
 
-    fn reconstruct_pending_handoff(&mut self, device: &wgpu::Device, requested: Surface) {
+    fn reconstruct_pending_handoff(&mut self, requested: (u64, u64)) {
+        if !crate::integration_control::reporting_enabled() {
+            return;
+        }
+        let admissions = self
+            .reconstruction_admissions
+            .get_or_insert_with(|| std::collections::VecDeque::with_capacity(4));
+        if admissions.contains(&requested) {
+            return;
+        }
+        // Active, candidate, and the two retiring arenas bound live FD
+        // identities. Repeated readiness/reuse edges are not new handoffs.
+        if admissions.len() == 4 {
+            admissions.pop_front();
+        }
+        admissions.push_back(requested);
         let Some(imported) = self.imported.as_ref() else {
             return;
         };
-        if imported.image.completed.is_none() || same_allocation(imported.image.surface, requested)
-        {
-            return;
-        }
-        let pending_texture = self.pending.as_ref().is_some_and(|pending| {
-            same_allocation(pending.image.surface, requested) && pending.image.completed.is_none()
-        });
-        if !pending_texture {
-            return;
-        }
         let completed = imported.image.surface;
-        let probe = (
-            (completed.high, completed.low, completed.generation),
-            (requested.high, requested.low, requested.generation),
-        );
-        // A pending physical identity is created once and retired when replaced.
-        // Retain its pair guard across all redraws until the next pending import.
-        if self.reconstruction_probe == Some(probe) {
+        let probe = ((completed.high, completed.low), requested);
+        if imported.image.completed.is_none() || probe.0 == probe.1 {
             return;
         }
-        self.replace_pipelines(device, self.format);
-        self.reconstruction_probe = Some(probe);
+        // The trusted FD arena notification precedes any image metadata.
+        // Rebuild only pipeline state; retained samples and already encoded
+        // draws keep their independent physical owners throughout the handoff.
+        let device = self.device.clone();
+        self.replace_pipelines(&device, self.format);
+        let requested = Surface {
+            high: requested.0,
+            low: requested.1,
+            ..Surface::empty()
+        };
         trace_surface_request("renderer_reconstructed", completed, requested, "");
     }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_arena_identity(identity: &str) -> Option<(u64, u64)> {
+    if identity.len() != 32 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let high = u64::from_str_radix(&identity[..16], 16).ok()?;
+    let low = u64::from_str_radix(&identity[16..], 16).ok()?;
+    (high != 0 || low != 0).then_some((high, low))
 }
 
 fn retained_draw_admitted(retained: Surface, requested: Surface, placement: Placement) -> bool {
@@ -2135,6 +2183,10 @@ impl SurfaceRenderer {
         transform: ViewTransform,
     ) {
         let requested = self.requested.expect("prepared surface request");
+        if !requested.valid() {
+            self.draws.remove(control);
+            return;
+        }
         let submitted = Self::submitted_draws(&self.pending, &self.imported, requested).next();
         let Some(imported) = submitted.map(|(imported, _)| imported).or_else(|| {
             self.imported
@@ -2172,6 +2224,7 @@ impl SurfaceRenderer {
                 requested,
                 gallery.map(std::sync::Arc::as_ref),
                 Some((bounds, None)),
+                0,
             );
             self.draws.remove(control);
             return;
@@ -2374,11 +2427,12 @@ impl SurfaceRenderer {
         target: &wgpu::TextureView,
         clip: Rectangle<u32>,
         control_id: &'static str,
+        requested: Surface,
         resources: &mut shader::Resources,
         submission: Option<&std::sync::Arc<dyn Fn() + Send + Sync>>,
     ) {
         let Some(draw) = self.draws.get(control_id) else {
-            if let Some(requested) = self.requested {
+            if requested.valid() {
                 trace_surface_request("sample_draw_missing", requested, requested, control_id);
             }
             return;
@@ -2399,11 +2453,11 @@ impl SurfaceRenderer {
             height: clip.height as f32,
         };
         let Some(visible) = image.intersection(&clip) else {
-            trace_draw("sample_draw_clipped", control_id, draw, image, clip);
+            trace_draw("sample_draw_clipped", control_id, draw, image, clip, 0);
             return;
         };
         if visible.width <= 0.0 || visible.height <= 0.0 {
-            trace_draw("sample_draw_clipped", control_id, draw, image, clip);
+            trace_draw("sample_draw_clipped", control_id, draw, image, clip, 0);
             return;
         }
         let Some(imported) =
@@ -2418,7 +2472,7 @@ impl SurfaceRenderer {
                             .is_some_and(|pending| pending.surface.frame == Some(frame))
                 })
         else {
-            trace_draw("sample_draw_rejected", control_id, draw, image, clip);
+            trace_draw("sample_draw_rejected", control_id, draw, image, clip, 0);
             return;
         };
         let read = if imported.image.completed == Some(frame) {
@@ -2463,17 +2517,38 @@ impl SurfaceRenderer {
         if let Some(observer) = submission {
             resources.observe_submission(observer.clone());
         }
+        let draw_identity = if surface_trace_enabled() {
+            NEXT_DRAW_DIAGNOSTIC.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
         #[cfg(target_arch = "wasm32")]
         if surface_trace_enabled() {
+            let selected = draw.surface;
+            let requested = draw.requested;
+            // A fresh observer belongs to this primitive's exact encoder.
+            // Unlike terminal callbacks, this runs synchronously after submit.
+            resources.observe_submission(std::sync::Arc::new(move || {
+                trace_draw_receipt(
+                    "iced.surface.draw_submitted",
+                    selected,
+                    requested,
+                    control_id,
+                    draw_identity,
+                );
+            }));
             // The closure carries exact immutable publication facts only. The
             // generic batch owns submission/abandonment, not application state.
             resources.observe_settlement(move |outcome| {
-                trace_frame(
+                trace_draw_receipt(
                     match outcome {
-                        shader::Settlement::Submitted => "draw_settled",
-                        shader::Settlement::Abandoned => "draw_abandoned",
+                        shader::Settlement::Submitted => "iced.frame.draw_settled",
+                        shader::Settlement::Abandoned => "iced.frame.draw_abandoned",
                     },
-                    frame,
+                    selected,
+                    requested,
+                    control_id,
+                    draw_identity,
                 )
             });
         }
@@ -2483,13 +2558,16 @@ impl SurfaceRenderer {
             draw.requested,
             control_id,
         );
-        trace_draw("draw_encoded", control_id, draw, image, clip);
+        trace_draw("draw_encoded", control_id, draw, image, clip, draw_identity);
         crate::integration_control::notify_driver_draw(
             control_id,
             frame.content_sequence,
             frame.presentation_revision,
         );
-        if draw.surface.integration {
+        if control_id == crate::view::explore::DETAIL_WORKSPACE_ID {
+            record_drawn_detail(draw.surface, draw.surface.content_region());
+        }
+        if crate::integration_control::reporting_enabled() {
             crate::integration_control::record_probe_draw(
                 control_id,
                 draw.surface,
@@ -2503,13 +2581,11 @@ impl SurfaceRenderer {
                 image,
                 clip,
             );
-        }
-        if draw.surface.integration {
-            if draw.gallery.is_some() {
+            if let Some(gallery) = &draw.gallery {
                 crate::integration_control::report_atlas_draw(
                     crate::integration_control::AtlasDraw {
                         surface: draw.surface,
-                        snapshot: draw.gallery.as_ref().expect("gallery draw").clone(),
+                        snapshot: gallery.clone(),
                         bounds,
                         image,
                         clip,
@@ -2518,24 +2594,19 @@ impl SurfaceRenderer {
                     self.scale_factor,
                 );
             }
-        }
-        if control_id == crate::view::explore::DETAIL_WORKSPACE_ID {
-            record_drawn_detail(draw.surface, draw.surface.content_region());
-        }
-        if draw.surface.integration {
-            let (redraw, draw_count) = imported
-                .diagnostics
-                .as_ref()
-                .filter(|_| crate::integration_control::reporting_enabled())
-                .map_or((false, 0), |diagnostics| {
-                    let previous = diagnostics
-                        .drawn_revision
-                        .swap(frame.presentation_revision, Ordering::Relaxed);
-                    (
-                        previous == frame.presentation_revision,
-                        diagnostics.draw_count.fetch_add(1, Ordering::Relaxed) + 1,
-                    )
-                });
+            let (redraw, draw_count) =
+                imported
+                    .diagnostics
+                    .as_ref()
+                    .map_or((false, 0), |diagnostics| {
+                        let previous = diagnostics
+                            .drawn_revision
+                            .swap(frame.presentation_revision, Ordering::Relaxed);
+                        (
+                            previous == frame.presentation_revision,
+                            diagnostics.draw_count.fetch_add(1, Ordering::Relaxed) + 1,
+                        )
+                    });
             crate::integration_control::report_surface_draw(
                 control_id,
                 frame.presentation_revision,
@@ -2943,6 +3014,7 @@ impl Imported {
                 self.image.surface,
                 None,
                 None,
+                0,
             );
             notify_surface(Notification::SampleRejected(frame));
             return;
@@ -2963,6 +3035,7 @@ impl Imported {
                 self.image.surface,
                 self.image.gallery.as_deref(),
                 None,
+                0,
             );
             return;
         };
@@ -2994,6 +3067,7 @@ impl Imported {
                 self.image.surface,
                 sample.gallery.as_deref(),
                 None,
+                0,
             );
         }
     }
@@ -3002,7 +3076,6 @@ impl Imported {
 pub(crate) fn same_allocation(left: Surface, right: Surface) -> bool {
     left.high == right.high
         && left.low == right.low
-        && left.generation == right.generation
         && left.width == right.width
         && left.height == right.height
 }
@@ -3185,6 +3258,21 @@ fn dispatch_release(frame: FrameReady) {
 }
 
 #[cfg(test)]
+pub(crate) struct TestRendererCleanup;
+
+#[cfg(test)]
+impl Drop for TestRendererCleanup {
+    fn drop(&mut self) {
+        // Construct before the local headless renderer so its stack ownership
+        // drops first, including on assertion unwind. Retire the remaining GPU
+        // owner while wgpu's thread-local state is still accessible.
+        let renderer = RENDERER.with(|owner| owner.borrow_mut().take());
+        // Queue settlement can invoke callbacks that reenter component state.
+        drop(renderer);
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn reset_test_releases() {
     metadata::reset();
     authorize_draw(None);
@@ -3285,6 +3373,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn arena_notifications_validate_the_complete_physical_identity() {
+        assert_eq!(
+            parse_arena_identity("00000000000000010000000000000002"),
+            Some((1, 2))
+        );
+        for invalid in [
+            "",
+            "1",
+            "00000000000000000000000000000000",
+            "0000000000000001000000000000000g",
+            "000000000000000100000000000000020",
+        ] {
+            assert_eq!(parse_arena_identity(invalid), None);
+        }
+    }
+
+    #[test]
     fn workspace_fps_observes_real_iced_gpu_submissions_and_retained_pixels() {
         use iced::advanced::{
             Layout, layout,
@@ -3294,11 +3399,12 @@ mod tests {
         reset_test_releases();
         initialize_diagnostics(false, false);
         crate::integration_control::initialize_reporting(false, false);
-        let (_, frame) = crate::view_model::test_support::explore_presentation();
+        let (model, frame) = crate::view_model::test_support::explore_presentation();
         assert!(accept_publication(frame));
         authorize_draw(Some(frame));
         complete_sample(frame);
         let surface = crate::view_model::test_support::physical_surface(frame);
+        let _renderer_cleanup = TestRendererCleanup;
         let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
             Default::default(),
             Some("wgpu"),
@@ -3357,6 +3463,7 @@ mod tests {
             &[0, 0, 0]
         );
         assert_eq!(sample(&mut tree, 500), 1);
+        reconcile_completed(surface, &model);
         let (device, format) = RENDERER.with(|owner| {
             let owner = owner.borrow();
             let owner = owner.as_ref().unwrap();
@@ -3381,7 +3488,46 @@ mod tests {
         assert_eq!(sample(&mut tree, 1000), 1);
         // Encoding the retained image and then abandoning the exact encoder
         // exercises physical custody without counting a queue submission.
-        drop(renderer.draw(Some(iced::Color::WHITE), &target, &viewport));
+        let unsubmitted = renderer.draw(Some(iced::Color::WHITE), &target, &viewport);
+        for enabled in [false, true] {
+            crate::integration_control::initialize_reporting(enabled, false);
+            // Keep the exact encoded draw alive during pipeline reconstruction
+            // for an FD-admitted arena with no image or page texture.
+            RENDERER.with(|owner| {
+                let mut owner = owner.borrow_mut();
+                let owner = owner.as_mut().unwrap();
+                let imported = owner.imported.as_ref().unwrap();
+                let retained = imported.image.retained_read.clone().unwrap();
+                let completed = imported.image.completed;
+                let requested = (surface.high, surface.low + 1);
+                owner.reconstruct_pending_handoff(requested);
+                owner.reconstruct_pending_handoff(requested);
+                assert_eq!(owner.reconstruction_admissions.is_some(), enabled);
+                if enabled {
+                    assert_eq!(owner.reconstruction_admissions.as_ref().unwrap().len(), 1);
+                }
+                let imported = owner.imported.as_ref().unwrap();
+                assert_eq!(imported.image.completed, completed);
+                assert!(std::sync::Arc::ptr_eq(
+                    imported.image.retained_read.as_ref().unwrap(),
+                    &retained
+                ));
+                assert!(owner.pending.is_none());
+                assert!(test_releases().is_empty());
+            });
+        }
+        crate::integration_control::initialize_reporting(false, false);
+        RENDERER.with(|owner| {
+            assert!(
+                owner
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .reconstruction_admissions
+                    .is_none()
+            )
+        });
+        drop(unsubmitted);
         renderer.reset(bounds);
         let clipped = layout::Node::new(bounds.size()).move_to(Point::new(300.0, 300.0));
         element.as_widget().draw(
@@ -3407,8 +3553,6 @@ mod tests {
         );
         let _ = renderer.screenshot(&viewport, iced::Color::WHITE);
         assert_eq!(sample(&mut tree, 2000), 1);
-        drop(renderer);
-        RENDERER.with(|owner| drop(owner.borrow_mut().take()));
     }
 
     #[test]
@@ -3612,6 +3756,9 @@ mod tests {
             let mut state = crate::view::explore::state::State::default();
             assert!(!state.detail_original(&old));
             state.choose_detail_original(true);
+            state.submit_detail(true);
+            assert!(state.detail_original(&old));
+            state.settle_detail(true);
             logical.detail.showoriginaldimensions = true;
             let paired = DetailContent {
                 explore: std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
@@ -3643,17 +3790,31 @@ mod tests {
             assert!(!upscale.original_dimensions());
             assert!(state.detail_original(&upscale));
             assert!(!captured.detail.showoriginaldimensions);
-            // Re-entering the same cached result must retain the accepted local choice.
-            state.rebase(None, false);
+            // Transport restoration retains the accepted same-image choice.
+            state.rebase(None, true);
+            state.rebase(Some(&logical), true);
             assert!(state.detail_original(&upscale));
             let mut replacement = old.clone();
             std::sync::Arc::make_mut(&mut replacement.explore).selectedimage = Some(99);
             assert!(!state.detail_original(&replacement));
             state.choose_detail_original(true);
-            state.abandon_detail(); // Explicit departure or rejected intent.
-            assert!(!state.detail_original(&replacement));
-            state.choose_detail_original(true);
-            state.rebase(Some(&logical), true);
+            state.submit_detail(true);
+            state.settle_detail(true);
+            state.choose_detail_original(false);
+            state.submit_detail(false);
+            state.settle_detail(false);
+            assert!(state.detail_original(&replacement));
+            state.choose_detail_original(false);
+            state.rebase(None, true);
+            state.rebase(Some(&logical), true); // Another logical image cannot settle this choice.
+            assert!(state.detail_original(&replacement));
+            state.choose_detail_original(false);
+            state.submit_detail(false);
+            let mut restored = logical.clone();
+            restored.selectedimage = Some(99);
+            restored.detail.showoriginaldimensions = false;
+            state.rebase(None, true);
+            state.rebase(Some(&restored), true); // Native commit survived a lost reply.
             assert!(!state.detail_original(&replacement));
             assert!(metadata::pending(frame).is_some());
         }
@@ -4078,7 +4239,12 @@ mod tests {
                     );
                     assert_eq!(test_releases(), if promoted { vec![old] } else { vec![] });
                 }
-                model.explore.snapshot.as_mut().unwrap().overlay.showlabels = false;
+                model
+                    .explore
+                    .snapshot
+                    .get_or_insert_with(|| successor.clone())
+                    .overlay
+                    .showlabels = false;
                 image.reconcile_pending(next, &model);
                 assert!(image.detail.as_ref().unwrap().overlay().showlabels);
                 image.complete(next);
@@ -4130,7 +4296,6 @@ mod tests {
         pending.frame = None;
         pending.viewer_identity = retained.viewer_identity;
         pending.high += 1;
-        pending.generation += 1;
         assert!(retained_draw_admitted(
             retained,
             pending,
@@ -4274,7 +4439,9 @@ mod tests {
             assert!(image.completed.is_none() && image.surface.frame.is_none());
             assert!(image.detail.is_none());
             assert_eq!(image.surface.high, surface.high);
-            assert_eq!(image.surface.generation, surface.generation);
+            assert_eq!(image.surface.low, surface.low);
+            assert_eq!(image.surface.width, surface.width);
+            assert_eq!(image.surface.height, surface.height);
             retire_samples();
             retire_samples();
             DRAW_AUTHORIZATION.with(|authorization| {
@@ -4571,12 +4738,9 @@ mod tests {
         Surface {
             high: 1,
             low: 2,
-            generation: 1,
             width: 640,
             height: 480,
-            timeline_ready: 1,
             frame: Some(frame_ready(content_session, 1, 1, 640, 480)),
-            integration: false,
             crop: None,
             viewer_identity: None,
             fit_revision: 0,
@@ -4649,6 +4813,7 @@ mod tests {
             zoom: 0.5,
             pan_x: 10.0,
             pan_y: -5.0,
+            content_session: surface_for_content_session(1).transform_identity(),
             ..ViewportOwner::default()
         };
         for crop in [None, Some([100, 60, 20, 10]), Some([7, 9, 1, 1])] {
@@ -5219,12 +5384,9 @@ mod tests {
         let scale = content_uv_scale(Surface {
             high: 1,
             low: 2,
-            generation: 3,
             width: 1_280,
             height: 720,
-            timeline_ready: 4,
             frame: Some(frame_ready(1, 2, 3, 640, 360)),
-            integration: false,
             crop: None,
             viewer_identity: None,
             fit_revision: 0,

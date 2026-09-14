@@ -1,6 +1,7 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
 
@@ -276,7 +277,6 @@ class UpscaleSystem::Impl final {
           events_(std::move(events)),
           diagnostics_(diagnostics),
           worker_(std::move(factory), [this](const std::exception_ptr failure) {
-              auto detail = visual_failure_detail(failure, "Upscale GPU worker failed");
               std::optional<UpscaleRequest> request;
               {
                   std::scoped_lock lock(mutex_);
@@ -296,6 +296,8 @@ class UpscaleSystem::Impl final {
                   state_.methods = {};
                   AdvanceRevision();
               }
+              const auto reported = mmltk::frameworks::gpu::combine_image_failures(failure, worker_.FinishDeferredRetirement());
+              auto detail = visual_failure_detail(reported, "Upscale GPU worker failed");
               report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Upscale, settings_.device, detail);
               Publish(event_type{UpscaleFailed{snapshot(), std::move(detail), request, UpscaleFailureKind::Physical}});
           }) {
@@ -749,18 +751,21 @@ class UpscaleSystem::Impl final {
     }
     void Shutdown() noexcept {
         worker_.StopAndWait();
-        std::scoped_lock lock(mutex_);
-        records_ = {};
-        selected_ = {};
-        input_request_.reset();
-        input_document_.reset();
-        input_image_metadata_.reset();
-        document_.reset();
-        state_.ready = false;
-        state_.busy = false;
-        state_.pending.reset();
-        desired_.reset();
-        warm_admitted_ = false;
+        {
+            std::scoped_lock lock(mutex_);
+            records_ = {};
+            selected_ = {};
+            input_request_.reset();
+            input_document_.reset();
+            input_image_metadata_.reset();
+            document_.reset();
+            state_.ready = false;
+            state_.busy = false;
+            state_.pending.reset();
+            desired_.reset();
+            warm_admitted_ = false;
+        }
+        worker_.FinishStoppedRetirement();
     }
     bool stopped() const noexcept { return worker_.stopped(); }
     void Publish(event_type event) noexcept { publish_visual_event_noexcept(events_, std::move(event)); }

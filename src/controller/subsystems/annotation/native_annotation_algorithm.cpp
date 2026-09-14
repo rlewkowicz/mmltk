@@ -15,6 +15,7 @@
 #include <optional>
 
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
+#include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/detail/raster_color.h"
 
@@ -450,28 +451,13 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                                        native_stream,
                                                        clip}) != 0)
                 throw std::runtime_error("Annotation selection rendering failed");
-            if (box.first.x >= box.second.x || box.first.y >= box.second.y) continue;
-            if (raster::raster_box_outline_rgba({
-                    .overlay =
-                        {
-                            reinterpret_cast<std::uint8_t*>(semantic.data),
-                            semantic.descriptor.pitch_bytes,
-                            static_cast<int>(semantic.descriptor.width),
-                            static_cast<int>(semantic.descriptor.height),
-                        },
-                    .box =
-                        {
-                            static_cast<int>(box.first.x),
-                            static_cast<int>(box.first.y),
-                            static_cast<int>(box.second.x),
-                            static_cast<int>(box.second.y),
-                        },
-                    .color = color,
-                    .thickness = 2,
-                    .stream = {reinterpret_cast<void*>(stream_value)},
-                    .clip = clip,
-                }) != 0)
-                throw std::runtime_error("Annotation semantic rendering failed");
+            const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y),
+                                          static_cast<int>(box.second.x), static_cast<int>(box.second.y)};
+            if (outline.x1 >= outline.x2 || outline.y1 >= outline.y2) continue;
+            mmltk::frameworks::gpu::ensure_cuda_ok(
+                static_cast<cudaError_t>(raster::raster_box_outline_rgba(
+                    {.overlay = overlay, .box = outline, .color = color, .thickness = 2, .stream = native_stream, .clip = clip})),
+                "Annotation semantic rendering failed");
         }
         retained.epoch = description.document_epoch;
         retained.identity = clean.allocation.identity;
