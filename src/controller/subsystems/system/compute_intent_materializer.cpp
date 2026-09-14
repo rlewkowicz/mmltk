@@ -23,26 +23,21 @@ namespace {
     return {.detail = mmltk::controller::contracts::bounded_artifact_detail(detail)};
 }
 
-[[nodiscard]] std::string_view artifact_filename(const std::string_view path) noexcept {
-    const auto separator = path.find_last_of('/');
-    return path.substr(separator == std::string_view::npos ? 0U : separator + 1U);
-}
-
 [[nodiscard]] std::expected<const mmltk::controller::contracts::ArtifactSplitFact*, ComputeIntentMaterializer::Refusal>
 current_artifact_split(const mmltk::controller::contracts::ArtifactInspection& inspection, const std::filesystem::path& configured_path,
                        const std::string_view unavailable_detail) noexcept {
     if (!inspection.available()) return std::unexpected(refused("artifact facts are unavailable"));
-    const std::string_view configured_name = artifact_filename(configured_path.native());
+    const auto configured_name = configured_path.lexically_normal();
     if (configured_name.empty()) return std::unexpected(refused(unavailable_detail));
 
     const mmltk::controller::contracts::ArtifactSplitFact* selected = nullptr;
     for (std::size_t index = 0U; index != inspection.splits.size(); ++index) {
         const auto& split = inspection.splits[index];
         if (!split.valid()) return std::unexpected(refused("artifact facts are invalid"));
-        const std::string_view split_name = artifact_filename(split.path);
+        const auto split_name = std::filesystem::path{split.path}.lexically_normal();
         if (split_name.empty()) return std::unexpected(refused("artifact facts are invalid"));
         for (std::size_t previous = 0U; previous != index; ++previous) {
-            if (artifact_filename(inspection.splits[previous].path) == split_name) {
+            if (std::filesystem::path{inspection.splits[previous].path}.lexically_normal() == split_name) {
                 return std::unexpected(refused("artifact split identity is duplicated"));
             }
         }
@@ -183,6 +178,11 @@ ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::
     if (!compiled) return std::unexpected(compiled.error());
     request.compiled_path = (*compiled)->path;
     assign_model_artifact(request, model);
+    request.save_engine_path.clear();
+    request.source_dir.clear();
+    request.recompile = false;
+    request.eval_order = model.key.input == mmltk::controller::contracts::ModelArtifactInputKind::Weights ? "weights"
+                         : model.key.input == mmltk::controller::contracts::ModelArtifactInputKind::Onnx ? "onnx" : "tensorrt";
     request.device_id = -1;
     request.compile_cuda_device_id = -1;
     return request;
@@ -235,16 +235,26 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
     auto request = settings.workflows.predict.request;
     const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Predict, model);
     if (!selected) return std::unexpected(selected.error());
-    const auto compiled = current_artifact_split(artifact,
-                                                 settings.workflows.predict.source.compiled_path.empty()
-                                                     ? settings.workflows.train.request.train_compiled_path
-                                                     : std::filesystem::path{settings.workflows.predict.source.compiled_path},
-                                                 "prediction dataset artifact is unavailable");
-    if (!compiled) return std::unexpected(compiled.error());
-    request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::CompiledDataset;
-    request.compiled_path = (*compiled)->path;
-    assign_model_artifact(request, model);
+    request.compiled_path.clear();
     request.image_inputs.clear();
+    const auto& source = settings.workflows.predict.source;
+    if (source.kind == mmltk::controller::contracts::SourceKind::CompiledDataset) {
+        const auto compiled = current_artifact_split(artifact, source.compiled_path, "prediction dataset artifact is unavailable");
+        if (!compiled) return std::unexpected(compiled.error());
+        request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::CompiledDataset;
+        request.compiled_path = (*compiled)->path;
+    } else if (source.kind == mmltk::controller::contracts::SourceKind::SingleImage) {
+        if (source.single_image_path.empty()) return std::unexpected(refused("prediction image is unavailable"));
+        request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles;
+        request.image_inputs.push_back({.image_path = source.single_image_path,
+                                       .source_name = std::filesystem::path{source.single_image_path}.filename().string(),
+                                       .image_id = 0});
+    } else {
+        return std::unexpected(refused("select a compiled dataset or ordinary images"));
+    }
+    assign_model_artifact(request, model);
+    request.backend = "auto";
+    request.batch_size = 1U;
     request.device_id = -1;
     return request;
 }

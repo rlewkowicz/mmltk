@@ -177,7 +177,7 @@ struct TrainViewState : TrainExecutionPaneState {
 
     mmltk::backend::models::rfdetr::TrainRequest request;
     ModelSelectionSource model_source = ModelSelectionSource::Canonical;
-    ModelArtifactInputKind model_input = ModelArtifactInputKind::None;
+    ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
         [[= mmltk::controller::contracts::reflection::FileDialog<"Select dataset source", "Directories", "*">{
             .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string dataset_source_dir = "./dataset";
@@ -202,13 +202,13 @@ struct ValidateViewState {
 
     mmltk::backend::models::rfdetr::ValidateRequest request;
     ModelSelectionSource model_source = ModelSelectionSource::Canonical;
-    ModelArtifactInputKind model_input = ModelArtifactInputKind::None;
+    ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
 };
 
 struct PredictViewState {
     PredictViewState() {
         request.output_path = "./predictions.json";
-        request.batch_size = 4;
+        request.batch_size = 1;
         request.threshold = 0.25F;
         request.preset_name = kDefaultModelPresetName;
         request.resolution = kDefaultModelResolution;
@@ -217,7 +217,7 @@ struct PredictViewState {
     mmltk::backend::models::rfdetr::PredictRequest request;
     SourceSelectionState source;
     ModelSelectionSource model_source = ModelSelectionSource::Canonical;
-    ModelArtifactInputKind model_input = ModelArtifactInputKind::None;
+    ModelArtifactInputKind model_input = ModelArtifactInputKind::Weights;
     [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int live_split_count = 1;
 };
 

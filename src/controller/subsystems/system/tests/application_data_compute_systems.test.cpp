@@ -149,6 +149,7 @@ class TrainingTerminals final {
     settings.workflows.validate.request.weights_path = root / "weights.pt";
     settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
     settings.workflows.validate.model_input = contracts::ModelArtifactInputKind::Weights;
+    settings.workflows.predict.source.compiled_path = (root / "train.bin").string();
     settings.workflows.predict.request.output_path = root / "prediction.json";
     settings.workflows.predict.request.weights_path = root / "weights.pt";
     settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
@@ -255,6 +256,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     settings.workflows.validate.request.onnx_path = "/tmp/validate.onnx";
     settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
     settings.workflows.validate.model_input = contracts::ModelArtifactInputKind::Onnx;
+    settings.workflows.predict.source.compiled_path = "/tmp/train.bin";
     settings.workflows.predict.request.weights_path = "/tmp/predict.pt";
     settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
     settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
@@ -282,6 +284,7 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     CHECK(validation_request->compiled_path == "/tmp/val.bin");
     CHECK(validation_request->weights_path.empty());
     CHECK(validation_request->onnx_path == "/tmp/validate.onnx");
+    CHECK(validation_request->eval_order == "onnx");
     CHECK(validation_request->tensorrt_path.empty());
 
     const auto predict = selected_model(settings, contracts::FeatureId::Predict);
@@ -296,6 +299,46 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     stale = settings;
     stale.workflows.predict.request.weights_path = "/tmp/replaced-predict.pt";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, predict));
+}
+
+TEST_CASE("compute inputs retain normalized full-path identity and image independence", "[controller][systems][compute]") {
+    auto settings = contracts::default_gui_settings_state();
+    settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
+    settings.workflows.validate.request.weights_path = "/selected/model.pt";
+    settings.workflows.validate.request.compiled_path = "/second/./compiled.mmltk";
+    settings.workflows.validate.request.onnx_path = "/stale/model.onnx";
+    settings.workflows.validate.request.tensorrt_path = "/stale/model.engine";
+    settings.workflows.validate.request.save_engine_path = "/stale/generated.engine";
+    auto selection = selected_model(settings, contracts::FeatureId::Validate);
+    const contracts::ArtifactInspection inspected{.compatible = true,
+        .splits = {split("/first/compiled.mmltk"), split("/second/compiled.mmltk")}, .detail = {}};
+    const auto validation = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, selection);
+    REQUIRE(validation);
+    CHECK(validation->compiled_path == "/second/compiled.mmltk");
+    CHECK(validation->eval_order == "weights");
+    CHECK(validation->onnx_path.empty());
+    CHECK(validation->tensorrt_path.empty());
+    CHECK(validation->save_engine_path.empty());
+    settings.workflows.validate.request.compiled_path = "/third/compiled.mmltk";
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, selection));
+
+    settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
+    settings.workflows.predict.request.weights_path = "/selected/model.pt";
+    settings.workflows.predict.source.kind = contracts::SourceKind::SingleImage;
+    settings.workflows.predict.source.single_image_path = "/images/frame.png";
+    settings.workflows.predict.request.batch_size = 128U;
+    settings.workflows.train.request.train_compiled_path.clear();
+    selection = selected_model(settings, contracts::FeatureId::Predict);
+    const auto image = subsystems::system::ComputeIntentMaterializer::Predict(settings, {}, selection);
+    REQUIRE(image);
+    CHECK(image->source_kind == mmltk::backend::models::rfdetr::PredictSourceKind::ImageFiles);
+    REQUIRE(image->image_inputs.size() == 1U);
+    CHECK(image->image_inputs.front().image_path == "/images/frame.png");
+    CHECK(image->compiled_path.empty());
+    CHECK(image->batch_size == 1U);
+    settings.workflows.predict.source.kind = contracts::SourceKind::CompiledDataset;
+    settings.workflows.predict.source.compiled_path.clear();
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(settings, inspected, selection));
 }
 
 TEST_CASE("model input materialization exhausts the canonical compatibility catalog", "[controller][systems][compute][model]") {
@@ -431,7 +474,7 @@ class FakeDatasetRuntime final : public DatasetRuntime {
     }
 
     contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t) override {
+                                          std::string_view, std::uint32_t, std::stop_token) override {
         contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
         for (const auto& path : paths)
             if (!path.empty()) result.splits.push_back(split(path));
@@ -483,7 +526,6 @@ class ApplicationDataFixture final {
         std::ofstream(root_ / "val.bin").put('\0');
         std::ofstream(root_ / "weights.pt").put('\0');
         std::ofstream(root_ / "model-input.onnx").put('\0');
-        REQUIRE(dataset_.Inspect({root_ / "train.bin", root_ / "val.bin", {}}, "rf-detr-base", 560U).available());
         const auto settings = loaded_.settings.materialization_facts();
         REQUIRE(settings.loaded);
         const auto expected = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings.settings, workflow);
@@ -546,10 +588,10 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     }
 
     contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t) override {
+                                          std::string_view, std::uint32_t, const std::stop_token stop) override {
         Enter();
         observation_->inspect_started.set_value();
-        static_cast<void>(observation_->inspect_gate->Wait({}));
+        static_cast<void>(observation_->inspect_gate->Wait(stop));
         contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
         for (const auto& path : paths)
             if (!path.empty()) result.splits.push_back(split(path));
@@ -1356,6 +1398,34 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK(std::holds_alternative<ComputeChanged>(third_terminal.get_future().get()));
     CHECK(validation.snapshot().terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(constructions == 2U);
+}
+
+TEST_CASE("validation admits asynchronous selected-path inspection and cancels before compute", "[controller][systems][compute][admission]") {
+    const auto root = mmltk::testsupport::make_temp_root("validation-inspection-admission");
+    ApplicationDataFixture fixture{root};
+    fixture.PrepareModel(contracts::FeatureId::Validate);
+    auto [settings, unused_dataset, model] = fixture.systems();
+    auto observation = std::make_shared<DatasetRuntimeObservation>();
+    DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
+    auto gate = std::make_shared<StopGate>();
+    std::atomic_size_t constructions = 0;
+    std::promise<ComputeSystemEvent> settled;
+    ValidationSystem validation{settings, dataset, model, [&] {
+        ++constructions;
+        return std::make_unique<FakeComputeRuntime>(gate, false);
+    }, [&](ComputeSystemEvent event) {
+        if (std::holds_alternative<ComputeChanged>(event)) settled.set_value(std::move(event));
+    }};
+    const auto admitted = validation.Start({});
+    CHECK(admitted.active);
+    observation->inspect_started.get_future().wait();
+    CHECK(constructions == 0U);
+    CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
+    static_cast<void>(validation.Stop());
+    const auto terminal = settled.get_future().get();
+    CHECK(std::get<ComputeChanged>(terminal).snapshot.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(constructions == 0U);
+    CHECK(observation->compile_calls == 0);
 }
 
 TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "[controller][systems][compute]") {

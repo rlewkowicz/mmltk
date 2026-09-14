@@ -124,6 +124,12 @@ pub fn view<'a>(
                 crate::generated::constraint_workflowstraincompileddatasetdir().stable_field_id,
             )))
             .style(crate::fluent_theme::button_primary),
+        model.workflow.dialogs(crate::generated::FeatureId::Train)
+            .filter(|fact| [crate::generated::constraint_workflowstrainrequesttraincompiledpath().stable_field_id,
+                crate::generated::constraint_workflowstrainrequestvalcompiledpath().stable_field_id,
+                crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id].contains(&fact.stable_field_id))
+            .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
+                model.file_dialog_open_available(fact, crate::generated::FeatureId::Train).then_some(Message::Browse(fact.stable_field_id))))),
         crate::view::workflow::fields::toggle(
             "Infer splits",
             train.usecompileddirectorydefaults,

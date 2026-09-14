@@ -871,7 +871,7 @@ void test_fresh_defaults_use_capture_only_annotate() {
     MMLTK_ASSERT(ui.mono_font_size == 12.0F);
     MMLTK_ASSERT(ui.text_input_font_size == 13.0F);
     MMLTK_ASSERT(!ui.show_workspace_performance);
-    MMLTK_ASSERT(train.model_input == ModelArtifactInputKind::None);
+    MMLTK_ASSERT(train.model_input == ModelArtifactInputKind::Weights);
     MMLTK_ASSERT(train.dataset_source_dir == "./dataset");
     MMLTK_ASSERT(train.compiled_dataset_dir == "./compiled");
     MMLTK_ASSERT(train.request.train_compiled_path == "./compiled/train.bin");
@@ -880,16 +880,47 @@ void test_fresh_defaults_use_capture_only_annotate() {
     MMLTK_ASSERT(!train.compile_dimensions);
     MMLTK_ASSERT(train.request.num_queries == 0);
     MMLTK_ASSERT(train.request.eval_max_dets == 0);
-    MMLTK_ASSERT(validate.model_input == ModelArtifactInputKind::None);
+    MMLTK_ASSERT(validate.model_input == ModelArtifactInputKind::Weights);
     MMLTK_ASSERT(validate.request.num_queries == 0);
     MMLTK_ASSERT(validate.request.eval_max_dets == 0);
-    MMLTK_ASSERT(predict.model_input == ModelArtifactInputKind::None);
+    MMLTK_ASSERT(predict.model_input == ModelArtifactInputKind::Weights);
     MMLTK_ASSERT(predict.request.weights_path.empty());
     MMLTK_ASSERT(annotate.model_input == ModelArtifactInputKind::None);
     MMLTK_ASSERT(annotate.weights_path.empty());
     MMLTK_ASSERT(annotate.onnx_path.empty());
     MMLTK_ASSERT(annotate.tensorrt_path.empty());
     MMLTK_ASSERT(export_state.model_input == ModelArtifactInputKind::None);
+}
+
+TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
+    auto state = default_gui_settings_state();
+    const std::array updates{
+        SettingsValueUpdate{.path = "workflows.train.request.train_compiled_path",
+            .value = *mmltk::frameworks::serialization::wire::FlatValue::text("/selected/compiled.mmltk", mmltk::frameworks::reflection::kMaximumPathBytes)},
+    };
+    REQUIRE(apply_gui_settings_values(state, updates));
+    CHECK_FALSE(state.workflows.train.use_compiled_directory_defaults);
+    CHECK(state.workflows.train.request.train_compiled_path == "/selected/compiled.mmltk");
+    CHECK(state.workflows.train.request.test_compiled_path.empty());
+    auto inferred = default_gui_settings_state();
+    const std::array unrelated{SettingsValueUpdate{.path = "ui.dark_mode",
+        .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+    REQUIRE(apply_gui_settings_values(inferred, unrelated));
+    CHECK(inferred.workflows.train.request.test_compiled_path.empty());
+}
+
+TEST_CASE("GUI prediction loads batch one while backend requests retain batching", "[gui][settings]") {
+    auto state = default_gui_settings_state();
+    REQUIRE(state.workflows.predict.request.batch_size == 1U);
+    auto saved = snapshot_gui_settings(state);
+    saved["workflows"]["predict"]["predict"]["batch_size"] = 32U;
+    saved["workflows"]["predict"]["model_artifacts"]["input"] = static_cast<int>(ModelArtifactInputKind::None);
+    apply_gui_settings(saved, state);
+    CHECK(state.workflows.predict.request.batch_size == 1U);
+    CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
+    mmltk::backend::models::rfdetr::PredictRequest cli;
+    cli.batch_size = 32U;
+    CHECK(cli.batch_size == 32U);
 }
 
 void test_model_input_load_normalizes_invalid_values_by_workflow() {
@@ -903,7 +934,7 @@ void test_model_input_load_normalizes_invalid_values_by_workflow() {
 
     apply_gui_settings(saved, snapshot);
 
-    MMLTK_ASSERT(states.workflows.predict.model_input == ModelArtifactInputKind::None);
+    MMLTK_ASSERT(states.workflows.predict.model_input == ModelArtifactInputKind::Weights);
     MMLTK_ASSERT(states.workflows.annotate.model_input == ModelArtifactInputKind::None);
     MMLTK_ASSERT(states.workflows.annotate.weights_path.empty());
 }
@@ -990,7 +1021,7 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
     CHECK(repair_required);
     CHECK(state.workflows.predict.request.preset_name == kDefaultModelPresetName);
     CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
-    CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::None);
+    CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
     CHECK(state.workflows.predict.request.tensorrt_path.empty());
     CHECK_FALSE(state.workflows.train.use_compiled_directory_defaults);
 
@@ -1117,12 +1148,12 @@ void test_catalog_source_transition_normalizes_model_input_at_the_native_boundar
 
     GuiSettingsState defaults = default_gui_settings_state();
     REQUIRE(defaults.workflows.validate.model_source == ModelSelectionSource::Canonical);
-    REQUIRE(defaults.workflows.validate.model_input == ModelArtifactInputKind::None);
+    REQUIRE(defaults.workflows.validate.model_input == ModelArtifactInputKind::Weights);
     const std::array unrelated{
         SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
     };
     REQUIRE(apply_gui_settings_values(defaults, unrelated));
-    CHECK(defaults.workflows.validate.model_input == ModelArtifactInputKind::None);
+    CHECK(defaults.workflows.validate.model_input == ModelArtifactInputKind::Weights);
 
     const GuiSettingsState before_invalid = defaults;
     const std::array invalid_custom_onnx{

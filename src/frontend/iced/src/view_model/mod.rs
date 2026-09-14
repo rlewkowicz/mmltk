@@ -21,7 +21,7 @@ use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,
 };
-pub use workflow::{ModelSelectionReceipt, WorkflowModel};
+pub use workflow::{ModelSelectionReceipt, PendingStart, StartInputs, StartPreparation, WorkflowModel};
 
 use std::collections::BTreeMap;
 

@@ -82,6 +82,7 @@ impl App {
                 self.retire_peer(UiError::protocol(error));
             }
         }
+        self.advance_start();
         self.dispatch_explore_viewport()
     }
 
@@ -134,6 +135,20 @@ impl App {
                 }
             })
         });
+        if let Err(error) = &decoded {
+            if matches!(context, Some(ApplicationIntentEndpoint::SettingsUpdate | ApplicationIntentEndpoint::SettingsReset | ApplicationIntentEndpoint::ModelSelect)) {
+                self.model.workflow.cancel_start(&error.detail);
+            }
+            let feature = match context {
+                Some(ApplicationIntentEndpoint::TrainingStart) => Some(FeatureId::Train),
+                Some(ApplicationIntentEndpoint::ValidationStart) => Some(FeatureId::Validate),
+                Some(ApplicationIntentEndpoint::PredictStart) => Some(FeatureId::Predict),
+                _ => None,
+            };
+            if let Some(feature) = feature { self.model.workflow.start_status = Some((feature, error.detail.clone())); }
+        } else if matches!(context, Some(ApplicationIntentEndpoint::TrainingStart | ApplicationIntentEndpoint::ValidationStart | ApplicationIntentEndpoint::PredictStart)) {
+            self.model.workflow.start_status = None;
+        }
         let settings_mutation_succeeded = context.is_some_and(|endpoint| {
             matches!(
                 endpoint,
@@ -269,7 +284,7 @@ impl App {
         self.submit_registered_intent(ApplicationIntentEndpoint::ModelStop, registered)
     }
 
-    fn submit_registered_intent(
+    pub(super) fn submit_registered_intent(
         &mut self,
         context: ApplicationIntentEndpoint,
         registered: Result<Intent, UiError>,

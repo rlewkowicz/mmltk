@@ -41,7 +41,9 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
         };
     }
     if state.progress.sequence == 0 || state.progress.status.is_empty() {
-        return Presentation::Active;
+        return if state.terminal.detail.is_empty() { Presentation::Active } else {
+            Presentation::OpenEnded { stage: state.terminal.detail.clone(), activity: String::new(), completed: 0 }
+        };
     }
     if state.progress.total == 0 {
         Presentation::OpenEnded {

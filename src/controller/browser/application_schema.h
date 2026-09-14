@@ -23,6 +23,7 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/gui_settings_states.h"
+#include "src/controller/contracts/workflow_path_dialogs.h"
 #include "src/controller/contracts/integration_control.h"
 #include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/contracts/workflows.h"
@@ -325,6 +326,12 @@ constexpr void visit_settings_leaves(Visitor& visitor, std::string prefix,
                               "settings leaf contains a type unsupported by the runtime Rust projection");
                 static_assert(!metadata.file_dialog || std::same_as<Member, std::string> || std::same_as<Member, std::filesystem::path>,
                               "file dialog requires a path-like settings leaf");
+                constexpr auto dialog = [&] {
+                    if constexpr (const auto workflow_dialog = mmltk::controller::contracts::workflow_path_dialog<path>(); workflow_dialog)
+                        return std::optional<ApplicationFileDialogFact>{{workflow_dialog->title, workflow_dialog->filter,
+                            workflow_dialog->pattern, workflow_dialog->mode}};
+                    else return metadata.file_dialog;
+                }();
                 visitor.template operator()<Type, Declaration, Member>(ApplicationSettingsLeafFact{
                     .path = prefix,
                     .stable_id = application_settings_field_stable_id(prefix),
@@ -333,7 +340,7 @@ constexpr void visit_settings_leaves(Visitor& visitor, std::string prefix,
                     .constraint = policy.constraint,
                     .presentation = policy.presentation,
                     .catalog_provider = metadata.catalog_provider,
-                    .file_dialog = metadata.file_dialog,
+                    .file_dialog = dialog,
                     .mutable_leaf = vocabulary::is_mutable_member_v<Declaration, Member>,
                 });
             } else {

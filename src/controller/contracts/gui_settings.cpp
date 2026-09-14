@@ -852,6 +852,7 @@ void to_json(nlohmann::json& j, const PredictViewState& s) {
 
 void from_json(const nlohmann::json& j, PredictViewState& s) {
     predict_flat_fields(s.request, JsonFieldReader{j});
+    s.request.batch_size = 1U;
     get_optional(j, "source", s.source);
     get_optional(j, "live_split_count", s.live_split_count);
     apply_model_selection_json(j, s);
@@ -1007,6 +1008,14 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state) {
     }
     if (normalized.contains("ui")) normalized.at("ui").get_to(candidate.ui);
     apply_workflows(normalized, candidate);
+    candidate.workflows.predict.request.batch_size = 1U;
+    const auto normalize_start_selection = [](auto& workflow) {
+        if (workflow.model_input == ModelArtifactInputKind::None && workflow.model_source == ModelSelectionSource::Canonical)
+            workflow.model_input = ModelArtifactInputKind::Weights;
+    };
+    normalize_start_selection(candidate.workflows.train);
+    normalize_start_selection(candidate.workflows.validate);
+    normalize_start_selection(candidate.workflows.predict);
     if (!gui_settings_valid(candidate) ||
         !mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
         throw std::runtime_error("GUI settings violate typed field or cross-field constraints");

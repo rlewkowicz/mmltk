@@ -26,8 +26,9 @@ services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::
 }
 contracts::ArtifactInspection ArtifactDatasetRuntime::Inspect(
     const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, const std::string_view preset,
-    const std::uint32_t resolution) {
+    const std::uint32_t resolution, const std::stop_token stop) {
     auto cancellation = services::ArtifactCancellationSource::Mint();
+    std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
     return store_.inspect(paths, preset, resolution, cancellation.second);
 }
 
@@ -167,7 +168,17 @@ void DatasetSystem::Shutdown() noexcept {
     run_.StopAndJoin();
 }
 contracts::ArtifactInspection DatasetSystem::Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths,
-                                                     std::string preset, const std::uint32_t resolution) {
+                                                     std::string preset, const std::uint32_t resolution, const std::stop_token stop) {
+    for (std::size_t index = 0; index < paths.size(); ++index) {
+        if (paths[index].empty()) continue;
+        paths[index] = paths[index].lexically_normal();
+        for (std::size_t previous = 0; previous < index; ++previous) {
+            if (paths[index] == paths[previous]) {
+                paths[index].clear();
+                break;
+            }
+        }
+    }
     {
         std::scoped_lock lock(mutex_);
         if (activity_ != DatasetActivity::None) throw contracts::BusyError("dataset operation is active");
@@ -179,9 +190,13 @@ contracts::ArtifactInspection DatasetSystem::Inspect(std::array<std::filesystem:
     };
     contracts::ArtifactInspection result;
     try {
+        if (stop.stop_requested()) {
+            retire();
+            return {};
+        }
         if (!runtime_) runtime_ = factory_();
         if (!runtime_) throw contracts::UnavailableError("dataset runtime is unavailable");
-        result = runtime_->Inspect(paths, preset, resolution);
+        result = runtime_->Inspect(paths, preset, resolution, stop);
     } catch (const contracts::ApplicationError&) {
         runtime_.reset();
         retire();
@@ -194,6 +209,10 @@ contracts::ArtifactInspection DatasetSystem::Inspect(std::array<std::filesystem:
         runtime_.reset();
         retire();
         throw contracts::FailedError("dataset inspection failed");
+    }
+    if (stop.stop_requested()) {
+        retire();
+        return {};
     }
     if (!result.available()) {
         runtime_.reset();

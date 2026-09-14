@@ -1103,6 +1103,18 @@ TEST_CASE("file dialog selected results require an owned bounded nonempty path",
     CHECK_FALSE(oversized.valid_for(target));
 }
 
+TEST_CASE("workflow path dialogs are projected from controller member paths", "[gui][services][dialogs]") {
+    const auto entries = mmltk::controller::services::file_dialog_catalog().entries();
+    for (const auto path : {"workflows.validate.request.compiled_path", "workflows.train.request.output_dir",
+                            "workflows.train.request.resume_path", "workflows.predict.source.compiled_path",
+                            "workflows.predict.source.single_image_path"}) {
+        const auto found = std::ranges::find_if(entries, [path](const auto& entry) { return entry.field_path.view() == path; });
+        REQUIRE(found != entries.end());
+        CHECK_FALSE(found->model_input.has_value());
+        CHECK(mmltk::controller::services::resolve_file_dialog_path(found->stable_id, "/chosen/input").has_value());
+    }
+}
+
 TEST_CASE("model file dialog targets remain typed through native resolution", "[gui][services][model]") {
     using mmltk::backend::models::catalog::ModelArtifactInputKind;
     using mmltk::controller::contracts::FeatureId;

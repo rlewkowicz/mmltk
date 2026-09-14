@@ -11,12 +11,16 @@ pub enum Message {
     Model(crate::view::workflow::model_card::Message),
     OutputPathChanged(String),
     ThresholdChanged(f32),
-    BatchSizeChanged(u64),
+    SourceChanged(crate::generated::SourceKind),
+    CompiledPathChanged(String),
+    ImagePathChanged(String),
+    DialogRequested(u64),
     Workspace(crate::view::workspace::Message),
 }
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    DialogRequested(u64),
     StartRequested,
     // CLEANUP-IGNORE: Predict retains its local domain outcome and workflow-bound child component ownership.
     StopRequested,
@@ -83,14 +87,28 @@ impl Component {
                 "predict.card.inputs",
                 crate::view::shared::card(
                     "Prediction",
-                    "The direct predictor consumes the current compiled training artifact.",
+                    "Select a compiled dataset or an ordinary image.",
                     column![
-                        text(settings.draft.as_ref().map_or(
-                            "Compiled training input unavailable",
-                            |settings| {
-                                settings.workflows.train.request.traincompiledpath.as_str()
-                            },
-                        )),
+                        button("Compiled dataset").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::CompiledDataset))),
+                        button("Single image").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::SingleImage))),
+                        text(draft.map_or("", |value| match value.source.kind {
+                            crate::generated::SourceKind::CompiledDataset => "Source: compiled dataset",
+                            crate::generated::SourceKind::SingleImage => "Source: single image",
+                            _ => "Select a supported prediction source",
+                        })),
+                        crate::view::workflow::fields::text_field(
+                            "Compiled dataset", crate::generated::constraint_workflowspredictsourcecompiledpath().stable_field_id,
+                            draft.map_or("", |value| value.source.compiledpath.as_str()), settings_edit_available, Message::CompiledPathChanged,
+                        ),
+                        crate::view::workflow::fields::text_field(
+                            "Image", crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id,
+                            draft.map_or("", |value| value.source.singleimagepath.as_str()), settings_edit_available, Message::ImagePathChanged,
+                        ),
+                        model.workflow.dialogs(crate::generated::FeatureId::Predict)
+                            .filter(|fact| [crate::generated::constraint_workflowspredictsourcecompiledpath().stable_field_id,
+                                crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id].contains(&fact.stable_field_id))
+                            .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
+                                model.file_dialog_open_available(fact, crate::generated::FeatureId::Predict).then_some(Message::DialogRequested(fact.stable_field_id))))),
                         crate::view::workflow::fields::text_field(
                             "Output JSON",
                             crate::generated::constraint_workflowspredictrequestoutputpath()
@@ -103,6 +121,7 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING),
                 )
             ),
+            text(model.workflow.start_detail(crate::generated::FeatureId::Predict)),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Predict,
                 "Run prediction",
@@ -110,8 +129,7 @@ impl Component {
                     .draft
                     .as_ref()
                     .is_some_and(|draft| {
-                        settings_settled
-                            && model.compute_start_available(
+                        model.compute_start_available(
                                 draft,
                                 crate::generated::FeatureId::Predict,
                             )
@@ -148,13 +166,6 @@ impl Component {
                     crate::generated::constraint_workflowspredictrequestthreshold(),
                     settings_edit_available,
                     Message::ThresholdChanged,
-                ),
-                crate::view::workflow::fields::number_u64(
-                    "Batch size",
-                    draft.map_or(0, |value| value.request.batchsize),
-                    crate::generated::constraint_workflowspredictrequestbatchsize(),
-                    settings_edit_available,
-                    Message::BatchSizeChanged,
                 ),
                 button("Stop").on_press_maybe(
                     model
@@ -214,13 +225,16 @@ impl Component {
                     crate::generated::edit_workflowspredictrequestthreshold(draft, value)
                 })?,
             ),
-            Message::BatchSizeChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                    // CLEANUP-IGNORE: Predict applies its generated batch-size edit before workspace routing.
-                    crate::generated::edit_workflowspredictrequestbatchsize(draft, value)
-                })?,
-                // CLEANUP-IGNORE: Predict closes its local settings outcome before workspace routing.
-            ),
+            Message::SourceChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
+                crate::generated::edit_workflowspredictsourcekind(draft, value)
+            })?),
+            Message::CompiledPathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                crate::generated::edit_workflowspredictsourcecompiledpath(draft, value)
+            })?),
+            Message::ImagePathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                crate::generated::edit_workflowspredictsourcesingleimagepath(draft, value)
+            })?),
+            Message::DialogRequested(id) => Outcome::DialogRequested(id),
             // CLEANUP-IGNORE: Predict alone converts its child workspace result into its local outcome.
             Message::Workspace(message) => {
                 let Some(schedule) = crate::view::workflow::update_workspace(settings, message)?

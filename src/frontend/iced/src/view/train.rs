@@ -178,6 +178,20 @@ impl Component {
                 settings_settled,
             )
             .map(Message::Dataset),
+            crate::view::shared::card(
+                "Training output", "Choose an output directory or a checkpoint for continuation.",
+                column![
+                    text(installed_train.map_or("", |train| train.request.outputdir.as_str())),
+                    text(installed_train.map_or("", |train| train.request.resumepath.as_str())),
+                    model.workflow.dialogs(crate::generated::FeatureId::Train)
+                        .filter(|fact| [crate::generated::constraint_workflowstrainrequestoutputdir().stable_field_id,
+                            crate::generated::constraint_workflowstrainrequestresumepath().stable_field_id].contains(&fact.stable_field_id))
+                        .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
+                            model.file_dialog_open_available(fact, crate::generated::FeatureId::Train)
+                                .then_some(Message::Dataset(dataset::Message::Browse(fact.stable_field_id)))))),
+                ].spacing(crate::view::workflow::FIELD_SPACING),
+            ),
+            text(model.workflow.start_detail(crate::generated::FeatureId::Train)),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Train,
                 "Start training",
@@ -185,9 +199,7 @@ impl Component {
                     .draft
                     .as_ref()
                     .is_some_and(|draft| {
-                        settings_settled
-                            && model
-                                .compute_start_available(draft, crate::generated::FeatureId::Train)
+                        model.compute_start_available(draft, crate::generated::FeatureId::Train)
                     })
                     .then_some(Message::StartRequested),
                 crate::view::workflow::progress::compute(training),

@@ -9,6 +9,56 @@ pub struct WorkflowModel {
     pub validation: Option<ComputeUiState>,
     pub export: Option<ComputeUiState>,
     settings_revision: Option<u64>,
+    pub pending_start: Option<PendingStart>,
+    pub start_status: Option<(FeatureId, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum StartInputs {
+    Train(crate::generated::TrainViewState),
+    Validate(crate::generated::ValidateViewState),
+    Predict(crate::generated::PredictViewState),
+}
+
+impl StartInputs {
+    pub fn capture(settings: &crate::generated::GuiSettingsState, feature: FeatureId) -> Option<Self> {
+        match feature {
+            FeatureId::Train => Some(Self::Train(settings.workflows.train.clone())),
+            FeatureId::Validate => Some(Self::Validate(settings.workflows.validate.clone())),
+            FeatureId::Predict => Some(Self::Predict(settings.workflows.predict.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn matches(&self, settings: &crate::generated::GuiSettingsState) -> bool {
+        match self {
+            Self::Train(value) => value == &settings.workflows.train,
+            Self::Validate(value) => value == &settings.workflows.validate,
+            Self::Predict(value) => value == &settings.workflows.predict,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingStart {
+    pub feature: FeatureId,
+    pub inputs: StartInputs,
+    pub preparation: StartPreparation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartPreparation {
+    Waiting,
+    Selecting { correlation: u64, cancelled: bool },
+    Active { generation: u64, cancelled: bool },
+    Stopping { generation: u64, correlation: u64 },
+}
+
+impl StartPreparation {
+    pub fn cancelled(self) -> bool {
+        matches!(self, Self::Selecting { cancelled: true, .. }
+            | Self::Active { cancelled: true, .. } | Self::Stopping { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,11 +75,61 @@ impl Default for WorkflowModel {
             validation: None,
             export: None,
             settings_revision: None,
+            pending_start: None,
+            start_status: None,
         }
     }
 }
 
 impl WorkflowModel {
+    pub fn cancel_start(&mut self, detail: &str) {
+        let Some(pending) = self.pending_start.as_mut() else { return; };
+        self.start_status = Some((pending.feature, detail.to_owned()));
+        match &mut pending.preparation {
+            StartPreparation::Waiting => self.pending_start = None,
+            StartPreparation::Selecting { cancelled, .. }
+            | StartPreparation::Active { cancelled, .. } => *cancelled = true,
+            StartPreparation::Stopping { .. } => {}
+        }
+    }
+
+    pub fn settle_start_model_reply(
+        &mut self,
+        correlation: u64,
+        reply: &Result<crate::generated::ApplicationReply, crate::protocol::ApplicationError>,
+    ) {
+        let Some(pending) = self.pending_start.as_mut() else { return; };
+        match pending.preparation {
+            StartPreparation::Selecting { correlation: owned, cancelled } if correlation == owned => {
+                match reply {
+                    Ok(crate::generated::ApplicationReply::ModelSelect(snapshot)) => {
+                        pending.preparation = StartPreparation::Active { generation: snapshot.generation, cancelled };
+                    }
+                    Err(error) => {
+                        self.start_status = Some((pending.feature, error.detail.clone()));
+                        self.pending_start = None;
+                    }
+                    _ => {
+                        self.start_status = Some((pending.feature, "Model selection reply did not match its request.".to_owned()));
+                        self.pending_start = None;
+                    }
+                }
+            }
+            StartPreparation::Stopping { correlation: owned, .. } if correlation == owned => {
+                if let Err(error) = reply {
+                    self.start_status = Some((pending.feature, error.detail.clone()));
+                    self.pending_start = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn start_detail(&self, feature: FeatureId) -> &str {
+        self.start_status.as_ref().filter(|(owner, _)| *owner == feature)
+            .map_or("", |(_, detail)| detail.as_str())
+    }
+
     pub fn install_settings(&mut self, snapshot: &SettingsUiState) {
         self.settings_revision = Some(snapshot.revision);
     }

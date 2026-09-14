@@ -100,19 +100,14 @@ impl ApplicationModel {
     }
 
     pub fn compute_start_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
-        if self.connection != ConnectionState::Connected
-            || self.settings_snapshot.is_none()
-            || self.native_settings_unsettled()
-            || self.model_request_pending()
-            || !self.model_selection_matches(settings, page)
-        {
-            return false;
-        }
-        if matches!(
-            page,
-            FeatureId::Train | FeatureId::Validate | FeatureId::Predict
-        ) && (self.workflow.dataset.is_none() || self.dataset_unsettled())
-        {
+        let orchestrated = matches!(page, FeatureId::Train | FeatureId::Validate | FeatureId::Predict);
+        if self.connection != ConnectionState::Connected || self.settings_snapshot.is_none()
+            || self.workflow.pending_start.is_some() || self.dialog_context.is_some()
+            || self.has_pending(ApplicationIntentEndpoint::SettingsReset)
+        { return false; }
+        if orchestrated {
+            if !effective_model_selection(settings, page).is_some_and(|selection| selection.can_prepare()) { return false; }
+        } else if self.native_settings_unsettled() || self.model_request_pending() || !self.model_selection_matches(settings, page) {
             return false;
         }
         match page {
@@ -154,6 +149,7 @@ impl ApplicationModel {
     }
 
     pub fn compute_stop_available(&self, page: FeatureId) -> bool {
+        if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == page) { return true; }
         let (snapshot, start, stop) = match page {
             FeatureId::Validate => (
                 self.workflow.validation.as_ref(),
@@ -184,6 +180,7 @@ impl ApplicationModel {
     }
 
     pub fn training_stop_available(&self) -> bool {
+        if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == FeatureId::Train) { return true; }
         self.connection == ConnectionState::Connected
             && self.workflow.training.as_ref().is_some_and(|snapshot| {
                 snapshot.activity == crate::generated::TrainingActivity::Local

@@ -169,6 +169,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
     }
+    app.advance_start();
     app.reconcile_surface_frame();
     let surface = app.presentation.surface();
     let presentation_task = app

@@ -117,6 +117,7 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
+            text(model.workflow.start_detail(crate::generated::FeatureId::Validate)),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
                 "Run validation",
@@ -124,8 +125,7 @@ impl Component {
                     .draft
                     .as_ref()
                     .is_some_and(|draft| {
-                        settings_settled
-                            && model.compute_start_available(
+                        model.compute_start_available(
                                 draft,
                                 crate::generated::FeatureId::Validate,
                             )

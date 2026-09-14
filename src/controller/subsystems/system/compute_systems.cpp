@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <concepts>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
@@ -125,8 +126,13 @@ class ComputeSystemCore final {
         const auto settings = settings_.materialization_facts();
         if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
         // CLEANUP-IGNORE: ComputeSystemCore materializes its own typed operation before LocalRun admission.
-        auto operation = materialize_(settings.settings, dataset_.snapshot().inspection, model_.selection());
-        if (!operation) throw contracts::InvalidIntentError(operation.error().detail);
+        const auto selection = model_.selection();
+        std::optional<Request> prepared;
+        if constexpr (!std::same_as<Request, mmltk::backend::models::rfdetr::ValidateRequest>) {
+            auto operation = materialize_(settings.settings, {}, selection);
+            if (!operation) throw contracts::InvalidIntentError(operation.error().detail);
+            prepared = std::move(*operation);
+        }
         run_.Start({
             .policy = execution_ ? std::optional<mmltk::common::system::ExecutionPolicyRequest>{{execution_->placement.cpus,
                                                                                                  {},
@@ -145,15 +151,31 @@ class ComputeSystemCore final {
                     state_.progress = {};
                     state_.terminal =
                         contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.generation_frontier);
+                    if constexpr (std::same_as<Request, mmltk::backend::models::rfdetr::ValidateRequest>)
+                        state_.terminal.detail = "Inspecting selected inputs";
                 },
-            .work = [this, operation = std::move(*operation)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+            .work = [this, settings = settings.settings, selection, prepared = std::move(prepared)](
+                        const std::stop_token stop) mutable -> direct::LocalRun::Notification {
                 contracts::ComputeTerminal terminal;
                 bool failed = false;
                 std::atomic_bool malformed_progress = false;
                 try {
+                    if (stop.stop_requested())
+                        return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
+                    if constexpr (std::same_as<Request, mmltk::backend::models::rfdetr::ValidateRequest>) {
+                        const auto inspection = dataset_.Inspect({settings.workflows.validate.request.compiled_path, {}, {}},
+                                                                                           selection.key.preset, selection.key.resolution, stop);
+                        if (stop.stop_requested())
+                            return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
+                        auto operation = materialize_(settings, inspection, selection);
+                        if (!operation) throw contracts::InvalidIntentError(operation.error().detail);
+                        prepared = std::move(*operation);
+                    }
+                    if (stop.stop_requested())
+                        return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
                     if (!runtime_) runtime_ = factory_();
                     if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-                    terminal = runtime_->Run(std::move(operation), stop, [this, &malformed_progress](const contracts::ComputeProgress& p) {
+                    terminal = runtime_->Run(std::move(*prepared), stop, [this, &malformed_progress](const contracts::ComputeProgress& p) {
                         if (!p.valid()) {
                             malformed_progress.store(true, std::memory_order_relaxed);
                             return;
@@ -214,6 +236,7 @@ class ComputeSystemCore final {
             std::scoped_lock lock(mutex_);
             if (!state_.active || !contracts::compute_progress_follows(progress, state_.progress.sequence)) return;
             state_.progress = progress;
+            if (state_.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.terminal.detail.clear();
             snapshot = state_;
         }
         direct::PublishLazyNoexcept(events_, [&] { return ComputeSystemEvent{ComputeProgressEvent{std::move(snapshot)}}; });
@@ -482,9 +505,7 @@ class PredictSystem::Impl final {
         const auto settings = settings_.materialization_facts();
         if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
         // CLEANUP-IGNORE: Predict materialization additionally owns private visual admission and publication.
-        auto operation =
-            subsystems::system::ComputeIntentMaterializer::Predict(settings.settings, dataset_.snapshot().inspection, model_.selection());
-        if (!operation) throw contracts::InvalidIntentError(operation.error().detail);
+        const auto selection = model_.selection();
         PredictSnapshot admitted;
         {
             std::scoped_lock lock(mutex_);
@@ -496,14 +517,26 @@ class PredictSystem::Impl final {
             state_.operation.generation_frontier = *generation;
             state_.operation.active = true;
             state_.operation.progress = {};
-            state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, *generation);
+            state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, *generation,
+                                                                         0U, {}, "Preparing selected prediction inputs");
             state_.frame = {};
             if (!worker_.SubmitDiscrete(
-                    [this, request = std::move(*operation), generation = *generation](
+                    [this, settings = settings.settings, selection, generation = *generation](
                         mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                         const std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
+                        contracts::ArtifactInspection inspection;
+                        if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
+                            inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}},
+                                                          selection.key.preset, selection.key.resolution, stop);
+                        if (stop.stop_requested()) {
+                            return [this, generation] {
+                                Settled(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, generation), {});
+                            };
+                        }
+                        auto request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, selection);
+                        if (!request) throw contracts::InvalidIntentError(request.error().detail);
                         auto product = predict_model(runtime).Run(
-                            std::move(request), stop, [this](const contracts::ComputeProgress& progress) { Progress(progress); });
+                            std::move(*request), stop, [this](const contracts::ComputeProgress& progress) { Progress(progress); });
                         if (!product.terminal.valid_worker_terminal())
                             throw std::runtime_error("prediction runtime returned an invalid terminal");
                         product.terminal.generation = generation;
@@ -585,6 +618,7 @@ class PredictSystem::Impl final {
             if (!revision) return;
             state_.revision = *revision;
             state_.operation.progress = progress;
+            if (state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.operation.terminal.detail.clear();
             changed = state_;
         }
         Publish(PredictProgress{std::move(changed)});

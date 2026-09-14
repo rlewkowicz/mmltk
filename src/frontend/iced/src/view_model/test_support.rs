@@ -204,7 +204,7 @@ pub(super) fn accepted_train_model(model: &ApplicationModel) -> ModelUiState {
     snapshot
 }
 
-pub(super) fn accepted_model_for(
+pub(crate) fn accepted_model_for(
     model: &ApplicationModel,
     settings: &GuiSettingsState,
     workflow: FeatureId,

@@ -147,9 +147,7 @@ class TrainingSystem::Impl final {
     [[nodiscard]] TrainingSnapshot Start() {
         const auto facts = settings_.materialization_facts();
         if (!facts.loaded) throw contracts::UnavailableError("settings are unavailable");
-        auto request =
-            subsystems::system::ComputeIntentMaterializer::LocalTrain(facts.settings, dataset_.snapshot().inspection, model_.selection());
-        if (!request) throw contracts::InvalidIntentError(request.error().detail);
+        const auto selection = model_.selection();
         run_.Start({
             .prepare =
                 [this] {
@@ -162,34 +160,50 @@ class TrainingSystem::Impl final {
                     state_.local.progress = {};
                     state_.local.terminal =
                         contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
+                    state_.local.terminal.detail = "Inspecting selected training inputs";
                     AdvanceObservation();
                 },
-            .work = [this, request = std::move(*request)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+            .work = [this, settings = facts.settings, selection](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
                 contracts::ComputeTerminal terminal;
                 bool failed = false;
                 std::atomic_bool malformed_progress = false;
                 try {
-                    terminal =
-                        runtime().Train(std::move(request), stop, [this, &malformed_progress](const contracts::ComputeProgress& progress) {
-                            if (!progress.valid()) {
-                                malformed_progress.store(true, std::memory_order_relaxed);
-                                return;
-                            }
-                            TrainingProgress observation;
-                            {
-                                std::scoped_lock lock(mutex_);
-                                if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence))
+                    const auto& selected = settings.workflows.train.request;
+                    contracts::ArtifactInspection inspection;
+                    if (!stop.stop_requested()) {
+                        inspection = dataset_.Inspect(
+                            {selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path},
+                            selection.key.preset, selection.key.resolution, stop);
+                    }
+                    if (stop.stop_requested()) {
+                        terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                    } else {
+                        auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
+                        if (!request) throw contracts::InvalidIntentError(request.error().detail);
+                        terminal =
+                            runtime().Train(std::move(*request), stop, [this, &malformed_progress](const contracts::ComputeProgress& progress) {
+                                if (!progress.valid()) {
+                                    malformed_progress.store(true, std::memory_order_relaxed);
                                     return;
-                                state_.local.progress = progress;
-                                AdvanceObservation();
-                                observation = {
-                                    .revision = state_.revision,
-                                    .activity = state_.activity,
-                                    .local = state_.local,
-                                };
-                            }
-                            direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
-                        });
+                                }
+                                TrainingProgress observation;
+                                {
+                                    std::scoped_lock lock(mutex_);
+                                    if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence))
+                                        return;
+                                    state_.local.progress = progress;
+                                    if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running)
+                                        state_.local.terminal.detail.clear();
+                                    AdvanceObservation();
+                                    observation = {
+                                        .revision = state_.revision,
+                                        .activity = state_.activity,
+                                        .local = state_.local,
+                                    };
+                                }
+                                direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
+                            });
+                    }
                     if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal())
                         throw std::runtime_error("local training runtime returned an invalid result");
                     failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;

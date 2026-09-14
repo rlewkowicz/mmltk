@@ -77,6 +77,7 @@ impl ApplicationModel {
             self.error = Some(UiError::protocol("unknown or duplicate IntentReply"));
             return None;
         };
+        self.workflow.settle_start_model_reply(correlation, &result);
         let failed_presentation =
             context == ApplicationIntentEndpoint::PresentationSelect && result.is_err();
         match result {

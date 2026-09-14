@@ -1,4 +1,5 @@
 use super::*;
+use crate::view_model::StartPreparation;
 
 impl App {
     pub(super) fn on_workspace(&mut self, message: crate::view::router::Message) -> Task<Message> {
@@ -37,6 +38,112 @@ impl App {
         }
     }
 
+    fn request_start(&mut self, feature: FeatureId) {
+        if !self.settings.draft().is_some_and(|draft| self.model.compute_start_available(draft, feature)) { return; }
+        let Some(inputs) = self.settings.draft().and_then(|draft| crate::view_model::StartInputs::capture(draft, feature)) else {
+            return;
+        };
+        self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
+            feature, inputs, preparation: StartPreparation::Waiting,
+        });
+        self.model.workflow.start_status = Some((feature, "Saving current settings…".to_owned()));
+        self.flush_settings_edits();
+        self.advance_start();
+    }
+
+    pub(super) fn advance_start(&mut self) {
+        let Some(pending) = self.model.workflow.pending_start.as_ref() else { return; };
+        let feature = pending.feature;
+        if pending.preparation.cancelled() {
+            self.advance_start_cancellation();
+            return;
+        }
+        if self.workspace.active() != feature {
+            self.model.workflow.cancel_start("Start cancelled after leaving the workflow.");
+            self.advance_start_cancellation();
+            return;
+        }
+        let Some(draft) = self.settings.draft() else { return; };
+        if !pending.inputs.matches(draft) {
+            self.model.workflow.cancel_start("Start cancelled because its inputs changed.");
+            self.advance_start_cancellation();
+            return;
+        }
+        if self.settings_unsettled() { return; }
+        if self.model.model_request_pending() { return; }
+        if !self.model.model_selection_matches(self.settings.draft().unwrap(), feature) {
+            let Some(snapshot) = self.model.model_snapshot.as_ref() else { return; };
+            if snapshot.active {
+                self.model.workflow.start_status = Some((feature, "Waiting for model preparation…".to_owned()));
+                return;
+            }
+            if matches!(self.model.workflow.pending_start.as_ref().unwrap().preparation, StartPreparation::Active { .. }) {
+                let detail = if snapshot.terminal.detail.is_empty() { "Model preparation did not produce the selected model.".to_owned() }
+                    else { snapshot.terminal.detail.clone() };
+                self.model.workflow.start_status = Some((feature, detail));
+                self.model.workflow.pending_start = None;
+                return;
+            }
+            let Some(receipt) = self.model.workflow.model_selection_receipt(feature) else { return; };
+            let registered = self.model.register_model_select_intent(receipt, move |correlation| {
+                crate::generated::encode_model_Select(correlation, crate::generated::ModelSelectionRequest { workflow: feature })
+            });
+            if let Ok(intent) = &registered {
+                self.model.workflow.pending_start.as_mut().unwrap().preparation = StartPreparation::Selecting {
+                    correlation: intent.correlation, cancelled: false,
+                };
+            }
+            self.model.workflow.start_status = Some((feature, "Preparing the selected model…".to_owned()));
+            if !self.submit_registered_intent(ApplicationIntentEndpoint::ModelSelect, registered) {
+                self.model.workflow.start_status = Some((feature, "Model preparation could not be submitted.".to_owned()));
+                self.model.workflow.pending_start = None;
+            }
+            return;
+        }
+        self.model.workflow.pending_start = None;
+        self.model.workflow.start_status = Some((feature, "Inspecting selected inputs and starting…".to_owned()));
+        let submitted = match feature {
+            FeatureId::Train => self.submit_intent(ApplicationIntentEndpoint::TrainingStart, |correlation|
+                crate::generated::encode_training_Start(correlation, Train {})),
+            FeatureId::Validate => self.submit_intent(ApplicationIntentEndpoint::ValidationStart, |correlation|
+                crate::generated::encode_validation_Start(correlation, crate::generated::ValidateWorkflowIntent {})),
+            FeatureId::Predict => self.submit_intent(ApplicationIntentEndpoint::PredictStart, |correlation|
+                crate::generated::encode_predict_Start(correlation, crate::generated::PredictWorkflowIntent {})),
+            _ => false,
+        };
+        if !submitted { self.model.workflow.start_status = Some((feature, "Start could not be submitted.".to_owned())); }
+    }
+
+    fn advance_start_cancellation(&mut self) {
+        let Some(pending) = self.model.workflow.pending_start.as_ref() else { return; };
+        let feature = pending.feature;
+        let (generation, stop_submitted) = match pending.preparation {
+            StartPreparation::Active { generation, cancelled: true } => (generation, false),
+            StartPreparation::Stopping { generation, .. } => (generation, true),
+            _ => return,
+        };
+        // Select and Stop share one native-system admission slot. A terminal
+        // event may arrive first, but its registered reply must still settle.
+        if self.model.model_request_pending() { return; }
+        let Some(snapshot) = self.model.model_snapshot.as_ref() else { return; };
+        if snapshot.generation != generation || !snapshot.active {
+            self.model.workflow.pending_start = None;
+            return;
+        }
+        if stop_submitted { return; }
+        if snapshot.terminal.outcome == crate::generated::ModelSelectionOutcome::CancellationRequested { return; }
+        let registered = self.model.register_model_stop_intent(feature, crate::generated::encode_model_Stop);
+        if let Ok(intent) = &registered {
+            self.model.workflow.pending_start.as_mut().unwrap().preparation = StartPreparation::Stopping {
+                generation, correlation: intent.correlation,
+            };
+        }
+        if !self.submit_registered_intent(ApplicationIntentEndpoint::ModelStop, registered) {
+            self.model.workflow.start_status = Some((feature, "Model preparation cancellation could not be submitted.".to_owned()));
+            self.model.workflow.pending_start = None;
+        }
+    }
+
     pub(super) fn guard_compute_start(&mut self, page: FeatureId) -> bool {
         let available = !self.settings.has_local_edits()
             && self
@@ -66,6 +173,11 @@ impl App {
     }
 
     pub(super) fn guard_compute_stop(&mut self, page: FeatureId) -> bool {
+        if self.model.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == page) {
+            self.model.workflow.cancel_start("Start cancelled.");
+            self.advance_start_cancellation();
+            return false;
+        }
         let available = match page {
             FeatureId::Train => self.model.training_stop_available(),
             FeatureId::Validate | FeatureId::Predict | FeatureId::Export => {
@@ -108,6 +220,13 @@ impl App {
     }
 
     pub(super) fn stop_model(&mut self, page: FeatureId) {
+        if self.model.workflow.pending_start.as_ref().is_some_and(|pending| {
+            pending.feature == page && pending.preparation != StartPreparation::Waiting
+        }) {
+            self.model.workflow.cancel_start("Start cancelled.");
+            self.advance_start_cancellation();
+            return;
+        }
         if self.model.model_stop_available() {
             self.submit_model_stop_intent(page, crate::generated::encode_model_Stop);
         }
@@ -154,11 +273,7 @@ impl App {
                 return self.on_model(FeatureId::Train, outcome);
             }
             crate::view::train::Outcome::StartRequested => {
-                if self.guard_compute_start(FeatureId::Train) {
-                    self.submit_intent(ApplicationIntentEndpoint::TrainingStart, |correlation| {
-                        crate::generated::encode_training_Start(correlation, Train {})
-                    });
-                }
+                self.request_start(FeatureId::Train);
             }
             crate::view::train::Outcome::DatasetStopRequested => {
                 if self.model.dataset_stop_available() {
@@ -275,14 +390,7 @@ impl App {
     pub(super) fn on_validate(&mut self, outcome: crate::view::validate::Outcome) -> Task<Message> {
         match outcome {
             crate::view::validate::Outcome::StartRequested => {
-                if self.guard_compute_start(FeatureId::Validate) {
-                    self.submit_intent(ApplicationIntentEndpoint::ValidationStart, |correlation| {
-                        crate::generated::encode_validation_Start(
-                            correlation,
-                            crate::generated::ValidateWorkflowIntent {},
-                        )
-                    });
-                }
+                self.request_start(FeatureId::Validate);
             }
             crate::view::validate::Outcome::StopRequested => {
                 if self.guard_compute_stop(FeatureId::Validate) {
@@ -305,15 +413,9 @@ impl App {
 
     pub(super) fn on_predict(&mut self, outcome: crate::view::predict::Outcome) -> Task<Message> {
         match outcome {
+            crate::view::predict::Outcome::DialogRequested(id) => self.open_dialog(id),
             crate::view::predict::Outcome::StartRequested => {
-                if self.guard_compute_start(FeatureId::Predict) {
-                    self.submit_intent(ApplicationIntentEndpoint::PredictStart, |correlation| {
-                        crate::generated::encode_predict_Start(
-                            correlation,
-                            crate::generated::PredictWorkflowIntent {},
-                        )
-                    });
-                }
+                self.request_start(FeatureId::Predict);
             }
             crate::view::predict::Outcome::StopRequested => {
                 if self.guard_compute_stop(FeatureId::Predict) {
@@ -416,5 +518,233 @@ impl App {
             }
         }
         Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport_connection::{Capture, CapturedRecord};
+    use crate::view_model::test_support::{accepted_model_for, bootstrapped};
+
+    fn start_app() -> (App, Capture) {
+        let (mut app, task) = crate::app::boot();
+        drop(task);
+        app.model = bootstrapped();
+        app.workspace.select(FeatureId::Train);
+        app.settings.install(app.model.settings_snapshot.as_ref().unwrap());
+        let (connection, capture) = Connection::test_channel();
+        app.connection = Some(connection);
+        (app, capture)
+    }
+
+    fn next_intent(capture: &mut Capture, expected: ApplicationIntentEndpoint) -> Intent {
+        let CapturedRecord::Intent(intent) = capture.try_recv().expect("submitted intent") else { panic!("expected intent"); };
+        assert_eq!(crate::generated::decode_application_intent_endpoint(intent.endpoint_id), Some(expected));
+        intent
+    }
+
+    #[test]
+    fn start_prepares_once_and_waits_for_event_before_reply_to_settle() {
+        let (mut app, mut capture) = start_app();
+        app.request_start(FeatureId::Train);
+        let prepare = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        app.request_start(FeatureId::Train);
+        assert!(capture.try_recv().is_err());
+        let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
+        app.model.reduce_event(crate::generated::ApplicationEvent::ModelModelChanged(crate::generated::ModelChanged { snapshot: accepted.clone() }));
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        app.model.reduce_reply(prepare.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(accepted)));
+        app.advance_start();
+        next_intent(&mut capture, ApplicationIntentEndpoint::TrainingStart);
+        app.advance_start();
+        app.request_start(FeatureId::Train);
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn start_flushes_drafts_and_waits_for_settings_reply_after_its_event() {
+        let (mut app, mut capture) = start_app();
+        app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
+            crate::generated::edit_workflowstrainrequesttraincompiledpath(draft, "/selected/train.bin".into())
+        }).unwrap();
+        let mut saved = app.model.settings_snapshot.clone().unwrap();
+        saved.revision += 1;
+        saved.settingsstate = app.settings.draft().unwrap().clone();
+        app.request_start(FeatureId::Train);
+        let settings = next_intent(&mut capture, ApplicationIntentEndpoint::SettingsUpdate);
+        app.model.settings_snapshot = Some(saved.clone());
+        app.model.workflow.install_settings(&saved);
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+        app.model.reduce_reply(settings.correlation, Ok(crate::generated::ApplicationReply::SettingsUpdate(saved)));
+        app.settle_settings_reply(Some(ApplicationIntentEndpoint::SettingsUpdate), true, false);
+        app.advance_start();
+        next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        assert!(capture.try_recv().is_err());
+    }
+
+    fn active_preparation(app: &App, feature: FeatureId) -> crate::generated::ModelUiState {
+        let mut active = accepted_model_for(&app.model, app.settings.draft().unwrap(), feature);
+        active.active = true;
+        active.terminal.outcome = crate::generated::ModelSelectionOutcome::Idle;
+        active
+    }
+
+    fn model_event(app: &mut App, snapshot: crate::generated::ModelUiState) {
+        app.model.reduce_event(crate::generated::ApplicationEvent::ModelModelChanged(
+            crate::generated::ModelChanged { snapshot },
+        ));
+        app.advance_start();
+    }
+
+    #[test]
+    fn owned_preparation_receives_one_stop_before_or_after_select_admission() {
+        for feature in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict] {
+            for stop_before_reply in [true, false] {
+                let (mut app, mut capture) = start_app();
+                app.workspace.select(feature);
+                app.request_start(feature);
+                let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+                let active = active_preparation(&app, feature);
+                if stop_before_reply {
+                    assert!(!app.guard_compute_stop(feature));
+                    assert!(!app.guard_compute_stop(feature));
+                    app.advance_start();
+                    assert!(capture.try_recv().is_err());
+                }
+                app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active.clone())));
+                app.advance_start();
+                if !stop_before_reply {
+                    assert!(capture.try_recv().is_err());
+                    assert!(!app.guard_compute_stop(feature));
+                }
+                let stop = next_intent(&mut capture, ApplicationIntentEndpoint::ModelStop);
+                assert!(!app.guard_compute_stop(feature));
+                app.advance_start();
+                app.request_start(feature);
+                assert!(capture.try_recv().is_err());
+                let mut stopping = active.clone();
+                stopping.terminal.outcome = crate::generated::ModelSelectionOutcome::CancellationRequested;
+                let mut terminal = active;
+                terminal.active = false;
+                terminal.terminal.outcome = crate::generated::ModelSelectionOutcome::Cancelled;
+                if stop_before_reply {
+                    model_event(&mut app, terminal.clone());
+                    assert!(!app.guard_compute_stop(feature));
+                    assert!(app.model.workflow.pending_start.is_some());
+                    assert!(capture.try_recv().is_err());
+                }
+                app.model.reduce_reply(stop.correlation, Ok(crate::generated::ApplicationReply::ModelStop(stopping)));
+                app.advance_start();
+                assert!(!app.guard_compute_stop(feature));
+                assert!(capture.try_recv().is_err());
+                if !stop_before_reply { model_event(&mut app, terminal); }
+                assert!(app.model.workflow.pending_start.is_none());
+                assert!(capture.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_event_before_select_reply_retires_cancellation_without_stop_or_launch() {
+        for outcome in [crate::generated::ModelSelectionOutcome::Accepted,
+            crate::generated::ModelSelectionOutcome::Rejected,
+            crate::generated::ModelSelectionOutcome::Cancelled] {
+            let (mut app, mut capture) = start_app();
+            app.request_start(FeatureId::Train);
+            let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+            let active = active_preparation(&app, FeatureId::Train);
+            assert!(!app.guard_compute_stop(FeatureId::Train));
+            let mut terminal = active.clone();
+            terminal.active = false;
+            terminal.terminal.outcome = outcome;
+            model_event(&mut app, terminal);
+            assert!(!app.guard_compute_stop(FeatureId::Train));
+            assert!(capture.try_recv().is_err());
+            app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active)));
+            app.advance_start();
+            assert!(app.model.workflow.pending_start.is_none());
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn stop_does_not_cancel_a_preexisting_independent_model_select() {
+        let (mut app, mut capture) = start_app();
+        app.request_model(FeatureId::Train);
+        let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        app.request_start(FeatureId::Train);
+        assert_eq!(app.model.workflow.pending_start.as_ref().unwrap().preparation, StartPreparation::Waiting);
+        assert!(!app.guard_compute_stop(FeatureId::Train));
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(capture.try_recv().is_err());
+        let accepted = accepted_model_for(&app.model, app.settings.draft().unwrap(), FeatureId::Train);
+        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(accepted)));
+        app.advance_start();
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancellation_never_stops_a_newer_model_generation() {
+        let (mut app, mut capture) = start_app();
+        app.request_start(FeatureId::Train);
+        let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        let owned = active_preparation(&app, FeatureId::Train);
+        assert!(!app.guard_compute_stop(FeatureId::Train));
+        let mut unrelated = owned.clone();
+        unrelated.generation += 1;
+        model_event(&mut app, unrelated);
+        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(owned)));
+        app.advance_start();
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn rejected_owned_select_retires_cancellation_without_stopping_other_work() {
+        let (mut app, mut capture) = start_app();
+        app.request_start(FeatureId::Train);
+        let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        assert!(!app.guard_compute_stop(FeatureId::Train));
+        app.model.reduce_reply(select.correlation, Err(crate::protocol::ApplicationError {
+            category: crate::generated::ApplicationErrorCategory::Busy,
+            detail: "A separate model operation was admitted first.".to_owned(),
+        }));
+        app.advance_start();
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn input_edits_keep_owned_cancellation_until_select_settles() {
+        let (mut app, mut capture) = start_app();
+        app.request_start(FeatureId::Train);
+        let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        let active = active_preparation(&app, FeatureId::Train);
+        let schedule = app.settings.state_mut().edit(EditCadence::Debounced, |draft| {
+            crate::generated::edit_workflowstrainrequesttraincompiledpath(draft, "/other/train.bin".into())
+        }).unwrap();
+        drop(app.handle_settings_schedule(schedule));
+        assert!(app.model.workflow.pending_start.as_ref().unwrap().preparation.cancelled());
+        assert!(capture.try_recv().is_err());
+        app.model.reduce_reply(select.correlation, Ok(crate::generated::ApplicationReply::ModelSelect(active)));
+        app.advance_start();
+        next_intent(&mut capture, ApplicationIntentEndpoint::ModelStop);
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn route_and_connection_replacement_retire_unlaunched_work() {
+        let (mut app, mut capture) = start_app();
+        app.request_start(FeatureId::Train);
+        next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+        app.workspace.select(FeatureId::Predict);
+        app.advance_start();
+        assert!(app.model.workflow.pending_start.as_ref().unwrap().preparation.cancelled());
+        assert!(capture.try_recv().is_err());
+        app.model.peer_connected();
+        assert!(app.model.workflow.pending_start.is_none());
     }
 }
