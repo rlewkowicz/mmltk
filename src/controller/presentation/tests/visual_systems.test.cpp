@@ -4126,7 +4126,7 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
     LoadedSettings settings;
     ExploreScenario scenario{settings, backend, [extents] {
                                  return std::make_unique<DocumentExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               nullptr, nullptr, nullptr, nullptr, extents);
+                                                                                   nullptr, nullptr, nullptr, nullptr, extents);
                              }};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
@@ -5032,9 +5032,9 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
     LoadedSettings settings;
     // The old borrowed atlas, current atlas and detail remain independently
     // retained while the fake algorithm initializes the closing-gallery output.
-    ExploreScenario scenario{settings, 2U,
-                             RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                            ExploreScenario::TrackWork(work), 4U)};
+    ExploreScenario scenario{
+        settings, 2U,
+        RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(work), 4U)};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 96U}, .row_count = 2U, .columns = 2U});
     explore.SetInputPeer(1U);
@@ -10434,8 +10434,8 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     auto explore_work = std::make_shared<ExploreWorkProbe>();
     LoadedSettings settings;
     ExploreScenario opened(settings, 2U,
-                           RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic,
-                                          ExploreScenario::TrackWork(explore_work), 3U, fixture::FakeWorkspaceFinalizer(backend)));
+                           RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work),
+                                          3U, fixture::FakeWorkspaceFinalizer(backend)));
     opened.OpenAndWait({.extent = {32U, 32U}, .columns = 1U});
     auto& explore = opened.system();
 
@@ -10451,12 +10451,11 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     mmltk::testsupport::open_annotation(annotation, annotation_events, explore.snapshot().frame);
 
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
-    LiveSystem live{
-        kDevice,
-        RuntimeFactory(
-            0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U,
-            fixture::FakeWorkspaceFinalizer(backend)),
-        [&](LiveSystem::event_type) { live_events.Advance(); }};
+    LiveSystem live{kDevice,
+                    RuntimeFactory(
+                        0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); },
+                        1U, fixture::FakeWorkspaceFinalizer(backend)),
+                    [&](LiveSystem::event_type) { live_events.Advance(); }};
     static_cast<void>(live.Start({.extent = {32U, 32U}, .frames_per_second = 120U}));
     REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames != 0U; }));
     static_cast<void>(live.Stop());

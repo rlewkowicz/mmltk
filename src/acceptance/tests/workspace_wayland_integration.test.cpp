@@ -352,19 +352,19 @@ class BrowserHostProcess final {
         do {
             consumed = ::recv(control_write_.get(), control_buffer_.data(), control_buffer_.size(), MSG_TRUNC);
         } while (consumed < 0 && errno == EINTR);
-        if (consumed >= static_cast<ssize_t>(sizeof(event))
-            && consumed <= static_cast<ssize_t>(control_buffer_.size())) {
+        if (consumed >= static_cast<ssize_t>(sizeof(event)) && consumed <= static_cast<ssize_t>(control_buffer_.size())) {
             std::memcpy(&event, control_buffer_.data(), sizeof(event));
             const auto bytes = static_cast<std::size_t>(consumed) - sizeof(event);
-            const bool failed = event.event == ExploreAcceptanceGate::ControlEvent::Frontend
-                && event.slot == static_cast<std::uint64_t>(mmltk::controller::contracts::IntegrationControlKind::Failed);
+            const bool failed = event.event == ExploreAcceptanceGate::ControlEvent::Frontend &&
+                                event.slot == static_cast<std::uint64_t>(mmltk::controller::contracts::IntegrationControlKind::Failed);
             if ((bytes == 0U || failed) && (!failed || event.staging_bytes != 0U)) {
                 frontend_failure_ = {control_buffer_.data() + sizeof(event), bytes};
                 return event;
             }
         }
-        if (consumed == 1 && static_cast<unsigned char>(control_buffer_[0]) ==
-            static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait)) return event;
+        if (consumed == 1 &&
+            static_cast<unsigned char>(control_buffer_[0]) == static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait))
+            return event;
         explore_control_closed_ = consumed == 0;
         control_write_.reset();
         return std::nullopt;
@@ -451,8 +451,8 @@ class BrowserHostProcess final {
     pid_t peer_group_ = -1;
     ScopedFd peer_pidfd_;
     ScopedFd control_write_;
-    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) +
-        mmltk::controller::contracts::kIntegrationFailureMaxBytes> control_buffer_;
+    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) + mmltk::controller::contracts::kIntegrationFailureMaxBytes>
+        control_buffer_;
     std::string_view frontend_failure_;
     bool explore_control_closed_ = false;
     int status_ = -1;
@@ -1053,8 +1053,7 @@ struct SurfaceAudit final {
         else if (event == "firefox.workspace.ready")
             advance(4U);
         else if (event == "firefox.workspace.withdrawal" || event == "firefox.workspace.drop_received") {
-            if (state.firefox_stage == 0U || state.firefox_retired)
-                reject("Firefox withdrawal lacks a live admitted arena");
+            if (state.firefox_stage == 0U || state.firefox_retired) reject("Firefox withdrawal lacks a live admitted arena");
             if (state.firefox_withdrawn == 0U) state.firefox_withdrawn = browser_ordinal;
         } else if (event == "firefox.workspace.retired") {
             if (!state.firefox_withdrawn || state.firefox_retired) reject("Firefox retirement lacks its unique withdrawal");
@@ -1153,9 +1152,8 @@ struct SurfaceAudit final {
                     reject("Iced encoding lacks selection of its acquired image");
                 else {
                     const auto identity = scalar(record, "draw_identity");
-                    if (draws.empty() || draws.back().selected != id ||
-                        draws.back().requested != record.value("requested_surface", "") || draws.back().publication != publication ||
-                        draws.back().encoded != 0U || identity == 0U ||
+                    if (draws.empty() || draws.back().selected != id || draws.back().requested != record.value("requested_surface", "") ||
+                        draws.back().publication != publication || draws.back().encoded != 0U || identity == 0U ||
                         !state.draw_indices.emplace(identity, draws.size() - 1U).second)
                         reject("Iced encoding lacks its exact selected draw");
                     else {
@@ -1190,8 +1188,7 @@ struct SurfaceAudit final {
             }
         }
         if (!event.starts_with("iced.surface.")) return;
-        if (!record.contains("width") || !record.contains("height"))
-            reject("Iced surface provenance is missing or inconsistent");
+        if (!record.contains("width") || !record.contains("height")) reject("Iced surface provenance is missing or inconsistent");
         if (event == "iced.surface.draw_submitted") {
             const auto publication = scalar(record, "presentation_revision");
             const std::string requested = record.value("requested_surface", "");
@@ -1281,8 +1278,7 @@ struct SurfaceAudit final {
                 auto& pending = surfaces[requested];
                 const auto preparation = pending.admitted;
                 if (pending.reconstruction || preparation == 0U || retained->second.acquired_at >= browser_ordinal ||
-                    pending.acquired != 0U ||
-                    pending.discarded != 0U || pending.retired != 0U)
+                    pending.acquired != 0U || pending.discarded != 0U || pending.retired != 0U)
                     reject("renderer reconstruction is duplicate or outside its exact pending ownership window");
                 else
                     pending.reconstruction = Reconstruction{id, requested, scalar(record, "presentation_revision"), browser_ordinal};
@@ -1368,7 +1364,8 @@ struct SurfaceAudit final {
             // JavaScript callbacks. It does not establish a successful draw.
             // A released sample or explicitly destroyed texture still needs
             // every ordinary receipt; bridge closure alone is insufficient.
-            if (custody.encoded != custody.settled + custody.abandoned && !live_draw && !(browser_exited && state.retired == 0U)) return false;
+            if (custody.encoded != custody.settled + custody.abandoned && !live_draw && !(browser_exited && state.retired == 0U))
+                return false;
             if (state.retired != 0U && custody.acquired && !custody.released) return false;
         }
         for (const auto& [publication, frame] : state.samples) {
@@ -1406,21 +1403,19 @@ struct SurfaceAudit final {
                 return "unsampled arena " + id + " lacks matching native and Firefox admission";
             if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || !state.withdrawn)
                 return "unsampled arena " + id + " lacks withdrawal and physical retirement";
-            const bool released_without_sampling =
-                !state.publications.empty() && state.publications.size() == state.receipts.size() &&
-                std::ranges::all_of(state.receipts, [](const auto& receipt) {
-                    return receipt.second.release_only && receipt.second.stage == 3U;
-                });
-            if ((!released_without_sampling && (!state.publications.empty() || !state.reads.empty() || !state.transfers.empty() ||
-                                                 !state.receipts.empty())) ||
+            const bool released_without_sampling = !state.publications.empty() && state.publications.size() == state.receipts.size() &&
+                                                   std::ranges::all_of(state.receipts, [](const auto& receipt) {
+                                                       return receipt.second.release_only && receipt.second.stage == 3U;
+                                                   });
+            if ((!released_without_sampling &&
+                 (!state.publications.empty() || !state.reads.empty() || !state.transfers.empty() || !state.receipts.empty())) ||
                 !state.custody.empty() || !state.source_textures.empty())
                 return "unsampled arena " + id + " has image custody without a receiver texture";
             return {};
         }
         if (state.firefox_import_failed) {
             const bool native_rejection = state.native_stage == 4U && state.import_failed;
-            if (!native_rejection || state.width != state.browser_width ||
-                state.height != state.browser_height || !state.native_retired)
+            if (!native_rejection || state.width != state.browser_width || state.height != state.browser_height || !state.native_retired)
                 return "rejected import " + id + " lacks matching native admission and retirement";
             if (state.firefox_stage != 2U || state.created == 0U || state.acquired != 0U || state.discarded <= state.created ||
                 state.retired <= state.discarded || !state.samples.empty() || state.firefox_withdrawn || state.firefox_retired)
@@ -1435,8 +1430,8 @@ struct SurfaceAudit final {
                                              return transfer.second.terminal == TerminalRead::Retained;
                                          });
                                      });
-        if (state.native_stage != 4U || state.width != state.browser_width ||
-            state.height != state.browser_height || (!state.native_retired && !writer_retained))
+        if (state.native_stage != 4U || state.width != state.browser_width || state.height != state.browser_height ||
+            (!state.native_retired && !writer_retained))
             return "surface " + id + " lacks matching native/browser import and retirement";
         if (!state.withdrawn && !state.firefox_withdrawn && !state.import_failed && !native_shutdown)
             return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
@@ -1511,8 +1506,7 @@ struct SurfaceAudit final {
         for (auto& [_, state] : surfaces)
             state.draw_indices.clear();
         for (std::size_t index = 0U; index != draws.size(); ++index)
-            if (draws[index].identity != 0U)
-                surfaces.at(draws[index].selected).draw_indices.emplace(draws[index].identity, index);
+            if (draws[index].identity != 0U) surfaces.at(draws[index].selected).draw_indices.emplace(draws[index].identity, index);
     }
 
     [[nodiscard]] const SampleCustody* settled_draw(const Draw& draw) const {
@@ -1540,9 +1534,8 @@ struct SurfaceAudit final {
                 if (custody.acquired_at < pending.reconstruction->ordinal)
                     latest_prior_acquisition = std::max(latest_prior_acquisition, custody.acquired_at);
         const auto retained = active.custody.find(pending.reconstruction->publication);
-        if (active.generation >= pending.generation || retained == active.custody.end() ||
-            retained->second.acquired_at == 0U || retained->second.acquired_at != latest_prior_acquisition ||
-            !receipts_joined(active_identity, active, true))
+        if (active.generation >= pending.generation || retained == active.custody.end() || retained->second.acquired_at == 0U ||
+            retained->second.acquired_at != latest_prior_acquisition || !receipts_joined(active_identity, active, true))
             return nullptr;
         const auto fallback = std::ranges::find_if(draws, [&](const Draw& draw) {
             return draw.selected == active_identity && draw.requested == (pending.created == 0U ? active_identity : candidate) &&
@@ -1560,8 +1553,7 @@ struct SurfaceAudit final {
             const bool retired = pending.created == 0U ? pending.firefox_retired > discarded : pending.retired > discarded;
             if (!pending.candidate_withdrawn || preparation == 0U || pending.acquired != 0U || !pending.publications.empty() ||
                 discarded <= preparation || !retired || !pending.reconstruction || pending.reconstruction->requested != b ||
-                pending.reconstruction->ordinal <= preparation ||
-                (pending.created != 0U && pending.reconstruction->ordinal >= discarded) ||
+                pending.reconstruction->ordinal <= preparation || (pending.created != 0U && pending.reconstruction->ordinal >= discarded) ||
                 !pending.firefox_retired || !pending.native_retired)
                 continue;
             if (!joined_surface_failure(b, pending).empty()) continue;
@@ -1571,9 +1563,9 @@ struct SurfaceAudit final {
                 const auto& latest = surfaces.at(draw.selected);
                 const auto custody = settled_draw(draw);
                 if (latest.generation > pending.generation && latest.created > preparation && latest.acquired > discarded &&
-                    latest.acquired > pending.reconstruction->ordinal &&
-                    draw.ordinal > fallback->ordinal && draw.requested == draw.selected && custody != nullptr &&
-                    custody->acquired_at == latest.acquired && receipts_joined(draw.selected, latest, true))
+                    latest.acquired > pending.reconstruction->ordinal && draw.ordinal > fallback->ordinal &&
+                    draw.requested == draw.selected && custody != nullptr && custody->acquired_at == latest.acquired &&
+                    receipts_joined(draw.selected, latest, true))
                     return true;
             }
         }
@@ -2295,9 +2287,8 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     fill(partial, owned, true);
     CHECK(partial.joined.back() == 0U);
     CHECK_FALSE(partial.retained_logical_content);
-    for (const auto field :
-         {"source_instance", "clean_revision", "source_observation_revision", "content_x", "allocation_generation", "capacity_width",
-          "timeline_ready"}) {
+    for (const auto field : {"source_instance", "clean_revision", "source_observation_revision", "content_x", "allocation_generation",
+                             "capacity_width", "timeline_ready"}) {
         PixelBoundaryAudit audit;
         fill(audit, owned);
         auto edge = native;
@@ -3401,9 +3392,9 @@ struct AtlasDrawAudit final {
         "columns",         "rows",        "first_row",       "matching_count",  "visible_indices", "row_capacity",   "row_origin",
         "card_extent"};
     static constexpr std::initializer_list<const char*> image_fields{
-        "surface",         "width",        "height",          "presentation_revision", "frame_revision", "content_session",
-        "source_kind",     "source_instance", "source_revision", "content_width",       "content_height", "columns",
-        "rows",            "first_row",    "matching_count",  "visible_indices",       "row_capacity",   "row_origin",
+        "surface",     "width",           "height",          "presentation_revision", "frame_revision", "content_session",
+        "source_kind", "source_instance", "source_revision", "content_width",         "content_height", "columns",
+        "rows",        "first_row",       "matching_count",  "visible_indices",       "row_capacity",   "row_origin",
         "card_extent"};
     static constexpr std::array stage_names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
     static constexpr std::array held_names{"held-visible", "held-return", "held-aligned", "held-extra", "held-restored", "held-complete"};
@@ -3786,8 +3777,7 @@ struct AtlasDrawAudit final {
             check(source != sources.end(), "draw_gallery_source_missing", record) &&
             check(capture != acquisitions.end(), "draw_sample_acquisition_missing", record) &&
             check(visible(record), "draw_visible_geometry_invalid", record) &&
-            check(SurfaceAudit::valid_identity(record.value("surface", "")) &&
-                      scalar(record, "presentation_revision") != 0U,
+            check(SurfaceAudit::valid_identity(record.value("surface", "")) && scalar(record, "presentation_revision") != 0U,
                   "draw_sample_identity_invalid", record) &&
             check(width <= scalar(record, "width") && height <= scalar(record, "height"), "draw_content_exceeds_allocation", record) &&
             check(scalar(record, "source_revision") == scalar(record, "frame_revision"), "draw_source_frame_revision_mismatch", record) &&
@@ -5804,11 +5794,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 using Kind = mmltk::controller::contracts::IntegrationControlKind;
                 const auto kind = static_cast<Kind>(entered->slot);
                 if (kind == Kind::Failed)
-                    FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index
-                                                                    << ", frontend source line " << entered->staging_bytes
-                                                                    << "\nfrontend error: " << process.frontend_failure()
-                                                                    << "\nnative runtime output:\n"
-                                                                    << read_tail(runtime_log));
+                    FAIL("quiet integration failed after progress "
+                         << progress << ", failure receipt " << entered->compiled_index << ", frontend source line "
+                         << entered->staging_bytes << "\nfrontend error: " << process.frontend_failure() << "\nnative runtime output:\n"
+                         << read_tail(runtime_log));
                 if (kind == Kind::PressureEntered) {
                     REQUIRE_FALSE(pressure_entered_);
                     pressure_entered_ = true;
@@ -6176,8 +6165,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE(pending_reconstruction);
                 REQUIRE_FALSE(supersession_held.has_value());
                 REQUIRE((event->source_high != 0U || event->source_low != 0U));
-                supersession_held = SurfaceAudit::native_identity(
-                    {{"surface_high", event->source_high}, {"surface_low", event->source_low}});
+                supersession_held =
+                    SurfaceAudit::native_identity({{"surface_high", event->source_high}, {"surface_low", event->source_low}});
                 continue;
             }
             if (event->event == ExploreAcceptanceGate::ControlEvent::VisibleReadHeld) {
@@ -7160,7 +7149,7 @@ void record_receiver_withdrawal(SurfaceAudit& audit) {
 
 TEST_CASE("unsampled arena retirement joins native and Firefox physical ownership", "[workspace][audit]") {
     const std::string fault = GENERATE("complete", "native-admission", "browser-admission", "dimensions", "native-withdrawal",
-                                      "browser-withdrawal", "native-retirement", "browser-retirement", "failed-retirement");
+                                       "browser-withdrawal", "native-retirement", "browser-retirement", "failed-retirement");
     CAPTURE(fault);
     SurfaceAudit audit;
     for (std::size_t stage = 0U; stage < 4U; ++stage)
@@ -7196,8 +7185,8 @@ TEST_CASE("Image metadata stays paired with its acquired pixels through retained
         audit.browser(browser_surface_record(browser_surface_events[stage]));
     REQUIRE(audit.evidence_settled());
     audit.SettleScenario();
-    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted",
-                             "iced.frame.draw_settled"})
+    for (const auto* event :
+         {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled"})
         audit.browser(browser_surface_record(event));
     REQUIRE(audit.evidence_settled());
     const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
@@ -7234,8 +7223,8 @@ TEST_CASE("exact draw submission survives non-FIFO encoder settlement", "[worksp
 }
 
 TEST_CASE("draw submission requires exact encoded identity and live custody", "[workspace][audit]") {
-    const std::string fault = GENERATE("complete", "width", "height", "requested", "publication", "before-encoding",
-                                      "after-settlement", "duplicate", "draw-identity");
+    const std::string fault = GENERATE("complete", "width", "height", "requested", "publication", "before-encoding", "after-settlement",
+                                       "duplicate", "draw-identity");
     CAPTURE(fault);
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -7763,16 +7752,29 @@ TEST_CASE("surface join rejects otherwise complete traces for different physical
 namespace {
 
 enum class MissingHandoffEvidence {
-    PendingDiscard, Reconstruction, CaptureBeforeDraw, DuplicateReconstruction, DifferentCompleted,
-    Fallback, FallbackPublication, FallbackRequest, ReplacementPublication, AcquisitionAfterReconstruction, OlderCompleted,
-    AbandonedFallback, AbandonedReplacement, FallbackSubmission, ReplacementSubmission,
-    DuplicateFallbackSubmission, DuplicateReplacementSubmission
+    PendingDiscard,
+    Reconstruction,
+    CaptureBeforeDraw,
+    DuplicateReconstruction,
+    DifferentCompleted,
+    Fallback,
+    FallbackPublication,
+    FallbackRequest,
+    ReplacementPublication,
+    AcquisitionAfterReconstruction,
+    OlderCompleted,
+    AbandonedFallback,
+    AbandonedReplacement,
+    FallbackSubmission,
+    ReplacementSubmission,
+    DuplicateFallbackSubmission,
+    DuplicateReplacementSubmission
 };
 enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
 
 [[nodiscard]] SurfaceAudit pending_handoff(const std::optional<MissingHandoffEvidence> missing = std::nullopt,
-                                         const bool pending_texture = true, const bool incumbent_after_admission = false,
-                                         const bool retain_latest = false) {
+                                           const bool pending_texture = true, const bool incumbent_after_admission = false,
+                                           const bool retain_latest = false) {
     SurfaceAudit audit;
     const auto native = [&](const char* event, const std::uint64_t surface, const std::uint64_t publication = 1U) {
         auto record = native_surface_record(event, surface);
@@ -7858,19 +7860,17 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
         browser("iced.surface.renderer_reconstructed", missing == MissingHandoffEvidence::DifferentCompleted ? d : a, b,
                 missing == MissingHandoffEvidence::OlderCompleted ? 1U : retained_publication);
     if (missing == MissingHandoffEvidence::DuplicateReconstruction) browser("iced.surface.renderer_reconstructed", a, b);
-    if (missing == MissingHandoffEvidence::AcquisitionAfterReconstruction)
-        browser("iced.surface.sample_acquired", a, 0U, 2U);
+    if (missing == MissingHandoffEvidence::AcquisitionAfterReconstruction) browser("iced.surface.sample_acquired", a, 0U, 2U);
     if (missing != MissingHandoffEvidence::Fallback)
-        browser("iced.surface.sample_draw_selected", a,
-                pending_texture || missing == MissingHandoffEvidence::FallbackRequest ? b : a,
+        browser("iced.surface.sample_draw_selected", a, pending_texture || missing == MissingHandoffEvidence::FallbackRequest ? b : a,
                 missing == MissingHandoffEvidence::FallbackPublication ? 1U : retained_publication,
-                missing == MissingHandoffEvidence::AbandonedFallback ? HandoffSubmission::Abandon :
-                missing == MissingHandoffEvidence::FallbackSubmission ? HandoffSubmission::Omit :
-                missing == MissingHandoffEvidence::DuplicateFallbackSubmission ? HandoffSubmission::Duplicate : HandoffSubmission::Submit);
+                missing == MissingHandoffEvidence::AbandonedFallback             ? HandoffSubmission::Abandon
+                : missing == MissingHandoffEvidence::FallbackSubmission          ? HandoffSubmission::Omit
+                : missing == MissingHandoffEvidence::DuplicateFallbackSubmission ? HandoffSubmission::Duplicate
+                                                                                 : HandoffSubmission::Submit);
     if (missing == MissingHandoffEvidence::AbandonedFallback && pending_texture)
         browser("iced.surface.sample_draw_selected", a, a, retained_publication);
-    if (pending_texture || missing != MissingHandoffEvidence::PendingDiscard)
-        browser("firefox.workspace.drop_received", b);
+    if (pending_texture || missing != MissingHandoffEvidence::PendingDiscard) browser("firefox.workspace.drop_received", b);
     for (std::size_t stage = 0U; stage < 2U; ++stage)
         browser(browser_surface_events[stage], c);
     if (pending_texture) {
@@ -7894,11 +7894,11 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
             for (std::size_t stage = 9U; stage < 13U; ++stage)
                 browser(browser_surface_events[stage], c, 0U, 2U);
         browser("iced.surface.sample_draw_selected", c, 0U, 1U,
-                missing == MissingHandoffEvidence::AbandonedReplacement ? HandoffSubmission::Abandon :
-                missing == MissingHandoffEvidence::ReplacementSubmission ? HandoffSubmission::Omit :
-                missing == MissingHandoffEvidence::DuplicateReplacementSubmission ? HandoffSubmission::Duplicate : HandoffSubmission::Submit);
-        if (missing == MissingHandoffEvidence::AbandonedReplacement)
-            browser("iced.surface.sample_draw_selected", c, a);
+                missing == MissingHandoffEvidence::AbandonedReplacement             ? HandoffSubmission::Abandon
+                : missing == MissingHandoffEvidence::ReplacementSubmission          ? HandoffSubmission::Omit
+                : missing == MissingHandoffEvidence::DuplicateReplacementSubmission ? HandoffSubmission::Duplicate
+                                                                                    : HandoffSubmission::Submit);
+        if (missing == MissingHandoffEvidence::AbandonedReplacement) browser("iced.surface.sample_draw_selected", c, a);
     }
     if (newer_incumbent) browser("iced.frame.sample_released", a, 0U, 2U);
     if (missing == MissingHandoffEvidence::ReplacementPublication) browser("iced.frame.sample_released", c, 0U, 2U);
@@ -7931,19 +7931,19 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
     CHECK(drawing.pending_supersession_completed());
     for (const auto missing :
          {MissingHandoffEvidence::PendingDiscard, MissingHandoffEvidence::Reconstruction, MissingHandoffEvidence::CaptureBeforeDraw,
-          MissingHandoffEvidence::DuplicateReconstruction, MissingHandoffEvidence::DifferentCompleted,
-          MissingHandoffEvidence::Fallback, MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
+          MissingHandoffEvidence::DuplicateReconstruction, MissingHandoffEvidence::DifferentCompleted, MissingHandoffEvidence::Fallback,
+          MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
           MissingHandoffEvidence::ReplacementPublication, MissingHandoffEvidence::AcquisitionAfterReconstruction,
-          MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback,
-          MissingHandoffEvidence::AbandonedReplacement, MissingHandoffEvidence::FallbackSubmission,
-          MissingHandoffEvidence::ReplacementSubmission, MissingHandoffEvidence::DuplicateFallbackSubmission,
-          MissingHandoffEvidence::DuplicateReplacementSubmission}) {
+          MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback, MissingHandoffEvidence::AbandonedReplacement,
+          MissingHandoffEvidence::FallbackSubmission, MissingHandoffEvidence::ReplacementSubmission,
+          MissingHandoffEvidence::DuplicateFallbackSubmission, MissingHandoffEvidence::DuplicateReplacementSubmission}) {
         if (pending_texture && missing == MissingHandoffEvidence::FallbackRequest) continue;
         const auto audit = pending_handoff(missing, pending_texture);
         INFO("surface join: " << audit.joined_failure());
         if (missing != MissingHandoffEvidence::CaptureBeforeDraw && missing != MissingHandoffEvidence::DuplicateReconstruction &&
             missing != MissingHandoffEvidence::AcquisitionAfterReconstruction &&
-            missing != MissingHandoffEvidence::DuplicateFallbackSubmission && missing != MissingHandoffEvidence::DuplicateReplacementSubmission &&
+            missing != MissingHandoffEvidence::DuplicateFallbackSubmission &&
+            missing != MissingHandoffEvidence::DuplicateReplacementSubmission &&
             (pending_texture || missing != MissingHandoffEvidence::PendingDiscard))
             CHECK(audit.joined_failure().empty());
         else

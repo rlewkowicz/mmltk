@@ -244,7 +244,8 @@ class ExploreAcceptanceGate::Impl final {
                                                   .generation = receipt.sequence,
                                                   .slot = static_cast<std::uint64_t>(receipt.kind),
                                                   .compiled_index = receipt.progress,
-                                                  .staging_bytes = receipt.failureline}, &receipt);
+                                                  .staging_bytes = receipt.failureline},
+                                                 &receipt);
         if (!sent || receipt.kind == Kind::Failed) {
             terminal_ = true;
             changed_.notify_all();
@@ -270,8 +271,8 @@ class ExploreAcceptanceGate::Impl final {
     }
 
    private:
-    void TraceFrontendRejection(const contracts::IntegrationControlReceipt& receipt, const std::string_view reason,
-                                const ssize_t sent = 0, const int send_error = 0) const noexcept {
+    void TraceFrontendRejection(const contracts::IntegrationControlReceipt& receipt, const std::string_view reason, const ssize_t sent = 0,
+                                const int send_error = 0) const noexcept {
         if (!diagnostics_.valid()) return;
         try {
             namespace serialization = mmltk::frameworks::serialization;
@@ -287,25 +288,26 @@ class ExploreAcceptanceGate::Impl final {
                     else
                         received.emplace_back(std::string(field.member_name), Value(static_cast<std::uint64_t>(value)));
                 });
-            diagnostics_.write_browser_event("integration.frontend.rejected", Value(Value::Object{
-                {"reason", Value(std::string(reason))},
-                {"receipt", Value(std::move(received))},
-                {"expected_sequence", Value(frontend_sequence_)},
-                {"previous_progress", Value(frontend_progress_)},
-                {"terminal", Value(terminal_)},
-                {"frontend_installed", Value(static_cast<bool>(frontend_command_))},
-                {"settled", Value(frontend_settled_)},
-                {"capacity_requested", Value(capacity_requested_)},
-                {"visible_requested", Value(visible_requested_)},
-                {"visible_held", Value(visible_held_)},
-                {"visible_released", Value(visible_released_)},
-                {"visible_release_requested", Value(visible_release_requested_)},
-                {"expected_read_generation", Value(visible_generation_)},
-                {"expected_compiled_index", Value(static_cast<std::uint64_t>(visible_index_))},
-                {"pressure_entered", Value(frontend_pressure_)},
-                {"send_result", Value(static_cast<std::int64_t>(sent))},
-                {"send_errno", Value(static_cast<std::int64_t>(send_error))},
-            }));
+            diagnostics_.write_browser_event("integration.frontend.rejected",
+                                             Value(Value::Object{
+                                                 {"reason", Value(std::string(reason))},
+                                                 {"receipt", Value(std::move(received))},
+                                                 {"expected_sequence", Value(frontend_sequence_)},
+                                                 {"previous_progress", Value(frontend_progress_)},
+                                                 {"terminal", Value(terminal_)},
+                                                 {"frontend_installed", Value(static_cast<bool>(frontend_command_))},
+                                                 {"settled", Value(frontend_settled_)},
+                                                 {"capacity_requested", Value(capacity_requested_)},
+                                                 {"visible_requested", Value(visible_requested_)},
+                                                 {"visible_held", Value(visible_held_)},
+                                                 {"visible_released", Value(visible_released_)},
+                                                 {"visible_release_requested", Value(visible_release_requested_)},
+                                                 {"expected_read_generation", Value(visible_generation_)},
+                                                 {"expected_compiled_index", Value(static_cast<std::uint64_t>(visible_index_))},
+                                                 {"pressure_entered", Value(frontend_pressure_)},
+                                                 {"send_result", Value(static_cast<std::int64_t>(sent))},
+                                                 {"send_errno", Value(static_cast<std::int64_t>(send_error))},
+                                             }));
         } catch (...) {}
     }
 

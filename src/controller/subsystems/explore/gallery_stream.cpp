@@ -765,13 +765,12 @@ ExploreGalleryPublication GalleryStream::Impl::Begin(const ExploreRenderPlan& pl
             const auto restored = static_cast<std::uint32_t>(State().tile_meanings[slot] != nullptr);
             restored_tiles += restored;
             diagnostics_.Emit([&] {
-                return VisualDiagnosticFact{
-                    .system = contracts::DiagnosticOwner::Explore,
-                    .operation = VisualDiagnosticOperation::AcceptancePlaceholderSlot,
-                    .generation = plan.generation,
-                    .value = slot,
-                    .detail = State().visible_indices[slot],
-                    .context = {.capacity_width = restored}};
+                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Explore,
+                                            .operation = VisualDiagnosticOperation::AcceptancePlaceholderSlot,
+                                            .generation = plan.generation,
+                                            .value = slot,
+                                            .detail = State().visible_indices[slot],
+                                            .context = {.capacity_width = restored}};
             });
         }
         diagnostics_.Emit([&] {
@@ -1799,9 +1798,9 @@ void GalleryStream::Impl::PrepareCacheWrite(const std::uintptr_t stream) {
     if (height > std::numeric_limits<std::uint32_t>::max() || (pitch != 0U && height > std::numeric_limits<std::size_t>::max() / pitch))
         throw std::overflow_error("Explore retained cache planes exceed addressable raster storage");
     const auto bytes = height * pitch;
-    const bool replacement = publication_active_ && !borrowed_cache_ &&
-                             (State().cache.size() != committed_.cache.size() ||
-                              !State().cache.identity().SameSource(committed_.cache.identity()));
+    const bool replacement =
+        publication_active_ && !borrowed_cache_ &&
+        (State().cache.size() != committed_.cache.size() || !State().cache.identity().SameSource(committed_.cache.identity()));
     if (replacement) State().cache_active = 1U - committed_.cache_active;
     for (auto* family : {&storage_.buffers_.cached_clean_, &storage_.buffers_.cached_semantic_})
         EnsureBuffer((*family)[State().cache_active], std::max<std::size_t>(bytes, 1U), "Explore candidate tile cache allocation failed");

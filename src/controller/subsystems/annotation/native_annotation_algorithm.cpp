@@ -451,8 +451,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                                        native_stream,
                                                        clip}) != 0)
                 throw std::runtime_error("Annotation selection rendering failed");
-            const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y),
-                                          static_cast<int>(box.second.x), static_cast<int>(box.second.y)};
+            const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y), static_cast<int>(box.second.x),
+                                          static_cast<int>(box.second.y)};
             if (outline.x1 >= outline.x2 || outline.y1 >= outline.y2) continue;
             mmltk::frameworks::gpu::ensure_cuda_ok(
                 static_cast<cudaError_t>(raster::raster_box_outline_rgba(

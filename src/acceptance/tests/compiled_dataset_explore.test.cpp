@@ -1011,8 +1011,8 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         auto& audit = subject.audit;
         auto& system = subject.system;
         static_cast<void>(system.UpdateAugmentation({.enabled = true}));
-        static_cast<void>(system.Open(
-            {.viewport = {.extent = {64U, 32U}, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
+        static_cast<void>(
+            system.Open({.viewport = {.extent = {64U, 32U}, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
         wait_for_native_gallery(audit, system, 0U, 0U);
         REQUIRE(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
         REQUIRE(audit.Wait([&] { return audit.augmentation_count() != 0U; }));

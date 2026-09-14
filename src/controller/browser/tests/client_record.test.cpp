@@ -213,8 +213,11 @@ TEST_CASE("integration control retains typed direction and sequence validation",
 TEST_CASE("integration failure text has a bounded failed-only canonical payload", "[controller][browser][protocol]") {
     using namespace mmltk::controller::contracts;
     for (const auto size : {0U, 1U, static_cast<unsigned>(kIntegrationFailureMaxBytes)}) {
-        IntegrationControl source{.receipt = {.kind = IntegrationControlKind::Failed, .sequence = 3U,
-            .progress = 7U, .failureline = 123U, .failure = std::string(size, 'x')}};
+        IntegrationControl source{.receipt = {.kind = IntegrationControlKind::Failed,
+                                              .sequence = 3U,
+                                              .progress = 7U,
+                                              .failureline = 123U,
+                                              .failure = std::string(size, 'x')}};
         wire::ByteBuffer encoded;
         REQUIRE(encode_client_record(ClientRecord{source}, encoded));
         const auto decoded = decode_client_record({.first = encoded, .second = {}});
@@ -226,8 +229,10 @@ TEST_CASE("integration failure text has a bounded failed-only canonical payload"
     }
     visit_integration_commands([&]<auto kind, auto policy>(auto) {
         if constexpr (kind != IntegrationControlKind::Failed) {
-            const IntegrationControl source{.receipt = {.kind = kind, .sequence = 3U,
-                .read_generation = policy.read_generation ? 1U : 0U, .failure = "Protocol: invalid frame"}};
+            const IntegrationControl source{.receipt = {.kind = kind,
+                                                        .sequence = 3U,
+                                                        .read_generation = policy.read_generation ? 1U : 0U,
+                                                        .failure = "Protocol: invalid frame"}};
             CHECK_FALSE(integration_receipt_valid(source.receipt));
         }
     });

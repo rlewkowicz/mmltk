@@ -88,7 +88,8 @@ struct IntegrationControlReceipt final {
 [[nodiscard]] constexpr bool integration_receipt_valid(const IntegrationControlReceipt& receipt) noexcept {
     if (receipt.sequence == 0U || (receipt.kind == IntegrationControlKind::Failed) != (receipt.failureline != 0U)) return false;
     if (receipt.failure.size() > kIntegrationFailureMaxBytes ||
-        (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty())) return false;
+        (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty()))
+        return false;
     bool valid = false;
     visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
         if (receipt.kind == Kind)

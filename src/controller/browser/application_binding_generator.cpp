@@ -873,8 +873,8 @@ class BindingEmitter final {
         });
         output_ << "} }\n";
         symbols_.Reserve("module", "INTEGRATION_FAILURE_MAX_BYTES", "canonical failure receipt byte limit");
-        output_ << "pub const INTEGRATION_FAILURE_MAX_BYTES: usize = "
-                << mmltk::controller::contracts::kIntegrationFailureMaxBytes << ";\n";
+        output_ << "pub const INTEGRATION_FAILURE_MAX_BYTES: usize = " << mmltk::controller::contracts::kIntegrationFailureMaxBytes
+                << ";\n";
         symbols_.Reserve("module", "integration_receipt_valid", "canonical integration receipt policy");
         output_ << "pub const fn integration_receipt_valid(receipt: &"
                 << writer.rust_type<mmltk::controller::contracts::IntegrationControlReceipt>()

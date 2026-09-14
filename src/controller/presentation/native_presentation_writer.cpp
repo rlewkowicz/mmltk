@@ -630,8 +630,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
             pending_->submitted.observation.frame.source.kind == PresentationSourceKind::Upscale) {
             pending_supersession_acceptance_ = false;
             arena->extent = active_->extent;
-            if (configuration_.completion_acceptance)
-                configuration_.completion_acceptance->HoldSupersession(arena->id.high, arena->id.low);
+            if (configuration_.completion_acceptance) configuration_.completion_acceptance->HoldSupersession(arena->id.high, arena->id.low);
         }
         DiagnoseArena(VisualDiagnosticOperation::PresentationArenaAdvertised, *arena, 1U);
         if (!channel_.admit_arena(arena->id, arena->generation, arena->extent.width, arena->extent.height,

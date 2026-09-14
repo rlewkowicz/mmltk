@@ -248,10 +248,11 @@ struct ApplicationBrowserHost::Impl final {
                                 using Value = serialization::wire::Value;
                                 auto receipt = serialization::reflected_value(value.receipt);
                                 if (receipt) {
-                                    diagnostics.write_browser_event("browser.integration.rejected", Value(Value::Object{
-                                        {"receipt", std::move(*receipt)},
-                                        {"gate_installed", Value(static_cast<bool>(integration))},
-                                    }));
+                                    diagnostics.write_browser_event("browser.integration.rejected",
+                                                                    Value(Value::Object{
+                                                                        {"receipt", std::move(*receipt)},
+                                                                        {"gate_installed", Value(static_cast<bool>(integration))},
+                                                                    }));
                                 }
                             } catch (...) {}
                         }
@@ -407,9 +408,12 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
             if (const auto target = receiver.lock()) {
                 const auto event = [&] {
                     switch (receipt.boundary) {
-                        case PresentationAcceptanceGate::Boundary::Completion: return ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld;
-                        case PresentationAcceptanceGate::Boundary::Capacity: return ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable;
-                        case PresentationAcceptanceGate::Boundary::Supersession: return ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld;
+                        case PresentationAcceptanceGate::Boundary::Completion:
+                            return ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld;
+                        case PresentationAcceptanceGate::Boundary::Capacity:
+                            return ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable;
+                        case PresentationAcceptanceGate::Boundary::Supersession:
+                            return ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld;
                     }
                     std::unreachable();
                 }();

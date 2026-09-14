@@ -1070,8 +1070,7 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     {
         std::scoped_lock lock(gallery.evidence.mutex);
         const auto restored = std::ranges::find_if(gallery.evidence.facts, [&](const auto& fact) {
-            return fact.operation == VisualDiagnosticOperation::AcceptancePlaceholderComplete &&
-                   fact.generation == gallery.plan.generation;
+            return fact.operation == VisualDiagnosticOperation::AcceptancePlaceholderComplete && fact.generation == gallery.plan.generation;
         });
         REQUIRE(restored != gallery.evidence.facts.end());
         CHECK(restored->context.capacity_width == columns * 2U);
@@ -2323,7 +2322,10 @@ TEST_CASE("acceptance failure forwards exact bounded text in its terminal packet
     auto& gate = fixture.gate();
     gate.SetFrontendCommand([](auto) { return true; });
     contracts::IntegrationControlReceipt receipt{.kind = contracts::IntegrationControlKind::Failed,
-        .sequence = 1U, .progress = 87U, .failureline = 123U, .failure = std::string(size, 'x')};
+                                                 .sequence = 1U,
+                                                 .progress = 87U,
+                                                 .failureline = 123U,
+                                                 .failure = std::string(size, 'x')};
     auto invalid = receipt;
     invalid.sequence = 2U;
     CHECK_FALSE(gate.ObserveFrontend(invalid));

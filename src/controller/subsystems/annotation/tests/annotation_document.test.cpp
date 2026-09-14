@@ -1129,29 +1129,28 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         CHECK(render(82U) == preview);
         CHECK(render(82U) == preview);
         auto mixed = std::make_shared<c::contracts::AnnotationSceneContent>(*scene);
-        mixed->objects = {
-            {.name = c::contracts::AnnotationText::From("point"),
-             .shape = c::contracts::AnnotationShape::Point,
-             .point = {20, 8},
-             .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
-            {.name = c::contracts::AnnotationText::From("spline"),
-             .shape = c::contracts::AnnotationShape::Spline,
-             .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
-             .spline_knots = {{{3, 20}}, {{12, 20}}}},
-            {.name = c::contracts::AnnotationText::From("skeleton"),
-             .shape = c::contracts::AnnotationShape::Skeleton,
-             .mask = {.runs = {{48U, 40U, 52U}}, .present = true},
-             .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
-                                {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
-             .skeleton_edges = {{0U, 1U}}},
-            {.name = c::contracts::AnnotationText::From("masked box"),
-             .shape = c::contracts::AnnotationShape::Box,
-             .box = {{2, 2}, {10, 10}},
-             .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
-            {.name = c::contracts::AnnotationText::From("covering box"),
-             .shape = c::contracts::AnnotationShape::Box,
-             .box = {{42, 41}, {55, 54}},
-             .category = 1U}};
+        mixed->objects = {{.name = c::contracts::AnnotationText::From("point"),
+                           .shape = c::contracts::AnnotationShape::Point,
+                           .point = {20, 8},
+                           .mask = {.runs = {{44U, 40U, 52U}}, .present = true}},
+                          {.name = c::contracts::AnnotationText::From("spline"),
+                           .shape = c::contracts::AnnotationShape::Spline,
+                           .mask = {.runs = {{46U, 40U, 52U}}, .present = true},
+                           .spline_knots = {{{3, 20}}, {{12, 20}}}},
+                          {.name = c::contracts::AnnotationText::From("skeleton"),
+                           .shape = c::contracts::AnnotationShape::Skeleton,
+                           .mask = {.runs = {{48U, 40U, 52U}}, .present = true},
+                           .skeleton_nodes = {{.key = c::contracts::AnnotationText::From("first"), .point = {4, 12}},
+                                              {.key = c::contracts::AnnotationText::From("second"), .point = {12, 12}}},
+                           .skeleton_edges = {{0U, 1U}}},
+                          {.name = c::contracts::AnnotationText::From("masked box"),
+                           .shape = c::contracts::AnnotationShape::Box,
+                           .box = {{2, 2}, {10, 10}},
+                           .mask = {.runs = {{50U, 40U, 52U}}, .present = true}},
+                          {.name = c::contracts::AnnotationText::From("covering box"),
+                           .shape = c::contracts::AnnotationShape::Box,
+                           .box = {{42, 41}, {55, 54}},
+                           .category = 1U}};
         REQUIRE(mixed->valid());
         description.scene = mixed;
         description.editor.selected_object = 3U;
@@ -1190,8 +1189,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         for (const unsigned row : {44U, 46U, 48U, 50U})
             CHECK(pixel(remaining, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
         c::subsystems::annotation::AnnotationDocument editor;
-        REQUIRE(editor.Open(c::test_scene("test://fractional-box-raster")).outcome ==
-                c::subsystems::annotation::DocumentOutcome::Applied);
+        REQUIRE(editor.Open(c::test_scene("test://fractional-box-raster")).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
         REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);
         c::AnnotationPointer pointer{.interaction_id = 1U, .sequence = 1U, .point = {16.25F, 19.25F}};
         REQUIRE(editor.Pointer(pointer).render_changed);
@@ -1199,8 +1197,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         compare_fresh();
         pointer.phase = c::contracts::AnnotationPointerPhase::Update;
         for (const auto point : std::array<c::contracts::AnnotationPoint, 7U>{
-                 {{16.5F, 19.5F}, {17.5F, 19.5F}, {16.5F, 20.5F}, {17.5F, 20.5F},
-                  {32.75F, 38.25F}, {16.5F, 19.5F}, {32.75F, 38.25F}}}) {
+                 {{16.5F, 19.5F}, {17.5F, 19.5F}, {16.5F, 20.5F}, {17.5F, 20.5F}, {32.75F, 38.25F}, {16.5F, 19.5F}, {32.75F, 38.25F}}}) {
             pointer.point = point;
             ++pointer.sequence;
             REQUIRE(editor.Pointer(pointer).render_changed);
