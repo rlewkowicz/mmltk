@@ -151,6 +151,18 @@ struct FixtureApplicationSystems final {
     return intent;
 }
 
+void check_integration_round_trip(const IntegrationControl& source, const bool expected_server, wire::ByteBuffer& encoded) {
+    REQUIRE((expected_server ? encode_server_record(source, encoded) : encode_client_record(source, encoded)));
+    const wire::ByteSegments bytes{.first = encoded, .second = {}};
+    const auto client_record = decode_client_record(bytes);
+    const auto server_record = decode_server_record(bytes);
+    CHECK(client_record.has_value() == !expected_server);
+    CHECK(server_record.has_value() == expected_server);
+    if (client_record) CHECK(std::get<IntegrationControl>(*client_record) == source);
+    if (server_record) CHECK(std::get<IntegrationControl>(*server_record) == source);
+    CHECK_FALSE((expected_server ? encode_client_record(source, encoded) : encode_server_record(source, encoded)));
+}
+
 template <class Exception>
 [[nodiscard]] ApplicationErrorRecord map_exception(Exception exception) {
     try {
@@ -184,21 +196,7 @@ TEST_CASE("integration control retains typed direction and sequence validation",
                                                     .failureline = kind == Kind::Failed ? 123U : 0U,
                                                     .read_generation = policy.read_generation ? 7U : 0U,
                                                     .compiled_index = 0U}};
-        if constexpr (policy.server) {
-            REQUIRE(encode_server_record(ServerRecord{source}, encoded));
-            const auto decoded = decode_server_record({.first = encoded, .second = {}});
-            REQUIRE(decoded);
-            CHECK(std::get<IntegrationControl>(*decoded) == source);
-            CHECK_FALSE(decode_client_record({.first = encoded, .second = {}}));
-            CHECK_FALSE(encode_client_record(ClientRecord{source}, encoded));
-        } else {
-            REQUIRE(encode_client_record(ClientRecord{source}, encoded));
-            const auto decoded = decode_client_record({.first = encoded, .second = {}});
-            REQUIRE(decoded);
-            CHECK(std::get<IntegrationControl>(*decoded) == source);
-            CHECK_FALSE(decode_server_record({.first = encoded, .second = {}}));
-            CHECK_FALSE(encode_server_record(ServerRecord{source}, encoded));
-        }
+        check_integration_round_trip(source, policy.server, encoded);
         auto invalid = source.receipt;
         invalid.read_generation = policy.read_generation ? 0U : 7U;
         CHECK_FALSE(mmltk::controller::contracts::integration_receipt_valid(invalid));
@@ -219,11 +217,7 @@ TEST_CASE("integration failure text has a bounded failed-only canonical payload"
                                               .failureline = 123U,
                                               .failure = std::string(size, 'x')}};
         wire::ByteBuffer encoded;
-        REQUIRE(encode_client_record(ClientRecord{source}, encoded));
-        const auto decoded = decode_client_record({.first = encoded, .second = {}});
-        REQUIRE(decoded);
-        CHECK(std::get<IntegrationControl>(*decoded) == source);
-        CHECK_FALSE(decode_server_record({.first = encoded, .second = {}}));
+        check_integration_round_trip(source, false, encoded);
         source.receipt.failure.assign(kIntegrationFailureMaxBytes + 1U, 'x');
         CHECK_FALSE(encode_client_record(ClientRecord{source}, encoded));
     }

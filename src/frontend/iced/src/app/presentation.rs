@@ -777,31 +777,8 @@ mod tests {
     fn viewer_dispatch_queues_latest_while_native_upscale_is_busy() {
         let (mut app, basic, start_correlation, mut receiver) = dispatch_automatic_basic();
 
-        let mut busy = app.model.upscale_snapshot.clone().unwrap();
-        busy.revision += 1;
-        busy.busy = true;
-        busy.pending = Some(basic.clone());
-        app.reduce_reply(IntentReply {
-            correlation: start_correlation,
-            result: Ok(
-                crate::application_codec::IntoApplicationValue::into_application_transport_value(
-                    busy.clone(),
-                ),
-            ),
-        });
-        let crate::transport_connection::CapturedRecord::Intent(selection) =
-            receiver.try_recv().expect("expected Explore selection")
-        else {
-            panic!("expected presentation intent");
-        };
-        assert_eq!(
-            selection,
-            crate::generated::encode_presentation_Select(
-                selection.correlation,
-                basic.source.source.clone(),
-            )
-            .record
-        );
+        let mut busy = accept_upscale_start(&mut app, start_correlation, basic.clone());
+        assert_presentation_selection(&mut receiver, basic.source.source.clone());
         assert!(receiver.try_recv().is_err());
 
         let shift_lut = crate::generated::UpscaleRequest {
@@ -862,18 +839,7 @@ mod tests {
         assert!(app.model.error.is_none());
         assert!(receiver.try_recv().is_err());
 
-        let mut busy = app.model.upscale_snapshot.clone().unwrap();
-        busy.revision += 1;
-        busy.busy = true;
-        busy.pending = Some(basic.clone());
-        app.reduce_reply(IntentReply {
-            correlation: start_correlation,
-            result: Ok(
-                crate::application_codec::IntoApplicationValue::into_application_transport_value(
-                    busy.clone(),
-                ),
-            ),
-        });
+        accept_upscale_start(&mut app, start_correlation, basic.clone());
         let crate::transport_connection::CapturedRecord::Intent(stop) =
             receiver.try_recv().expect("expected deferred Stop")
         else {
@@ -883,19 +849,7 @@ mod tests {
             stop,
             crate::generated::encode_upscale_Stop(stop.correlation).record
         );
-        let crate::transport_connection::CapturedRecord::Intent(selection) =
-            receiver.try_recv().expect("expected Explore selection")
-        else {
-            panic!("expected presentation intent");
-        };
-        assert_eq!(
-            selection,
-            crate::generated::encode_presentation_Select(
-                selection.correlation,
-                basic.source.source.clone(),
-            )
-            .record
-        );
+        assert_presentation_selection(&mut receiver, basic.source.source.clone());
         assert!(!app.presentation.stop_requested);
         assert!(app.model.error.is_none());
 
@@ -1137,6 +1091,41 @@ mod tests {
             crate::generated::encode_upscale_Start(start.correlation, basic.clone()).record
         );
         (app, basic, start.correlation, receiver)
+    }
+
+    fn accept_upscale_start(
+        app: &mut App,
+        correlation: u64,
+        request: crate::generated::UpscaleRequest,
+    ) -> crate::generated::UpscaleSnapshot {
+        let mut busy = app.model.upscale_snapshot.clone().unwrap();
+        busy.revision += 1;
+        busy.busy = true;
+        busy.pending = Some(request);
+        app.reduce_reply(IntentReply {
+            correlation,
+            result: Ok(
+                crate::application_codec::IntoApplicationValue::into_application_transport_value(
+                    busy.clone(),
+                ),
+            ),
+        });
+        busy
+    }
+
+    fn assert_presentation_selection(
+        receiver: &mut crate::transport_connection::Capture,
+        source: crate::generated::PresentationSourceIdentity,
+    ) {
+        let crate::transport_connection::CapturedRecord::Intent(selection) =
+            receiver.try_recv().expect("expected presentation selection")
+        else {
+            panic!("expected presentation intent");
+        };
+        assert_eq!(
+            selection,
+            crate::generated::encode_presentation_Select(selection.correlation, source).record
+        );
     }
 
     #[test]
@@ -1584,20 +1573,7 @@ mod tests {
             assert_eq!(app.presentation.viewer, viewer);
             assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&basic));
             navigate(&mut app, FeatureId::Explore);
-            let crate::transport_connection::CapturedRecord::Intent(selection) = receiver
-                .try_recv()
-                .expect("expected Explore reentry selection")
-            else {
-                panic!("expected presentation intent");
-            };
-            assert_eq!(
-                selection,
-                crate::generated::encode_presentation_Select(
-                    selection.correlation,
-                    basic.source.source.clone(),
-                )
-                .record
-            );
+            assert_presentation_selection(&mut receiver, basic.source.source.clone());
             let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().unwrap()
             else {

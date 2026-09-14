@@ -11134,6 +11134,19 @@ pub(crate) mod tests {
                 None,
             )
         }
+
+        fn assert_pending_fps(&self, output: &ScenarioOutput) {
+            assert_eq!(self.controller.phase, Phase::AwaitWorkspaceFpsPixels);
+            assert!(same_probe(
+                &self
+                    .controller
+                    .workspace_fps_probe
+                    .as_ref()
+                    .unwrap()
+                    .probe,
+                output.probe.as_ref()
+            ));
+        }
     }
 
     #[test]
@@ -11265,16 +11278,7 @@ pub(crate) mod tests {
             assert!(fixture.controller.workspace_fps_failure.is_none());
             let mut replacement = fixture.request_fps(&model, &settings);
             drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
-            assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsPixels);
-            assert!(same_probe(
-                &fixture
-                    .controller
-                    .workspace_fps_probe
-                    .as_ref()
-                    .unwrap()
-                    .probe,
-                replacement.probe.as_ref()
-            ));
+            fixture.assert_pending_fps(&replacement);
             drop(fixture.complete_fps(
                 &mut replacement,
                 FpsPixelOutcome::Captured(pixels),
@@ -11298,16 +11302,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut replacement = fixture.request_fps(&model, &settings);
         drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
-        assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFpsPixels);
-        assert!(same_probe(
-            &fixture
-                .controller
-                .workspace_fps_probe
-                .as_ref()
-                .unwrap()
-                .probe,
-            replacement.probe.as_ref()
-        ));
+        fixture.assert_pending_fps(&replacement);
         let (pixels, _) = reporting::fps_pixel_fixture(false, 1.0);
         drop(fixture.complete_fps(
             &mut replacement,
@@ -11747,6 +11742,18 @@ pub(crate) mod tests {
         assert!(driver.gallery_completion_held.is_none());
     }
 
+    fn advance_receipt(sequence: u64) -> crate::generated::IntegrationControlReceipt {
+        crate::generated::IntegrationControlReceipt {
+            kind: crate::generated::IntegrationControlKind::Advance,
+            sequence,
+            progress: 0,
+            failureline: 0,
+            failure: String::new(),
+            readgeneration: 0,
+            compiledindex: 0,
+        }
+    }
+
     #[test]
     fn destructive_profile_continues_viewer_completion_into_annotation() {
         initialize_reporting(false, false);
@@ -11782,15 +11789,7 @@ pub(crate) mod tests {
             assert!(driver.running());
             assert!(
                 driver
-                    .receive_control(crate::generated::IntegrationControlReceipt {
-                        kind: crate::generated::IntegrationControlKind::Advance,
-                        sequence: 2,
-                        progress: 0,
-                        failureline: 0,
-                        failure: String::new(),
-                        readgeneration: 0,
-                        compiledindex: 0,
-                    })
+                    .receive_control(advance_receipt(2))
                     .is_err(),
                 "viewer evidence cannot settle a destructive Annotation workflow"
             );
@@ -11859,15 +11858,7 @@ pub(crate) mod tests {
         assert_eq!(driver.resolution, "384");
         assert_eq!(driver.dataset_source, "square-source");
         let generation = driver.generation;
-        let advance = crate::generated::IntegrationControlReceipt {
-            kind: crate::generated::IntegrationControlKind::Advance,
-            sequence: 2,
-            progress: 0,
-            failureline: 0,
-            failure: String::new(),
-            readgeneration: 0,
-            compiledindex: 0,
-        };
+        let advance = advance_receipt(2);
         driver.phase = Phase::Complete;
         driver.control_phase = Some(Phase::Complete);
         driver.receive_control(advance.clone()).unwrap();
@@ -12172,15 +12163,7 @@ pub(crate) mod tests {
         premature.phase = Phase::Complete;
         assert!(
             premature
-                .receive_control(crate::generated::IntegrationControlReceipt {
-                    kind: crate::generated::IntegrationControlKind::Advance,
-                    sequence: 2,
-                    progress: 0,
-                    failureline: 0,
-                    failure: String::new(),
-                    readgeneration: 0,
-                    compiledindex: 0,
-                })
+                .receive_control(advance_receipt(2))
                 .is_err(),
             "local completion is insufficient before the typed receipt was admitted"
         );
