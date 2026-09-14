@@ -1582,6 +1582,49 @@ mod tests {
     }
 
     #[test]
+    fn explore_measured_messages_reconcile_on_gallery_return_without_more_input() {
+        use crate::view::explore::{self, gallery};
+        for sizes in [
+            [(900.5, 320.25), (510.5, 710.25), (470.25, 810.5)],
+            [(470.25, 810.5), (820.5, 440.25), (940.5, 310.25)],
+        ] {
+            let (mut app, task) = boot();
+            drop(task);
+            install_ready_explore(&mut app, 127);
+            let columns = authoritative_explore_columns(&app);
+            app.model.explore.snapshot.as_mut().unwrap().mode =
+                crate::generated::ExploreMode::Detail;
+            for (width, height) in sizes {
+                drop(app.on_workspace(crate::view::router::Message::Explore(
+                    explore::Message::Gallery(gallery::Message::Measured {
+                        size: iced::Size::new(width, height),
+                        maximum_extent: gallery_capacity(2048, 2048),
+                        columns,
+                    }),
+                )));
+                assert_eq!(app.workspace.explore_gallery_size(), Some(iced::Size::new(width, height)));
+                assert_eq!(app.model.pending_count(), 0);
+            }
+            drop(app.on_workspace(crate::view::router::Message::Explore(
+                explore::Message::Gallery(gallery::Message::Scrolled {
+                    first_row: 2,
+                    row_fraction: 0.375,
+                    request: None,
+                }),
+            )));
+            let mut returned = app.model.explore.snapshot.clone().unwrap();
+            returned.mode = crate::generated::ExploreMode::Gallery;
+            returned.revision += 1;
+            reduce_explore_changed(&mut app, returned);
+            let expected = app.workspace.explore_measured_layout_request(
+                app.model.explore.snapshot.as_ref(), columns, 127,
+            ).unwrap();
+            assert_eq!(expected.viewport.firstrow, 2);
+            assert_eq!(app.workspace.explore_dispatchable_viewport(), Some(expected));
+        }
+    }
+
+    #[test]
     fn explore_geometry_survives_unavailable_resize_and_bootstrap_reconnect() {
         let (mut resize, task) = boot();
         drop(task);

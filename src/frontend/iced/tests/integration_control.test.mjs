@@ -14,19 +14,30 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     original.push([name, Object.getOwnPropertyDescriptor(globalThis, name)]);
     Object.defineProperty(globalThis, name, {value, configurable: true, writable: true});
   };
-  const microtasks = [], frames = [], events = [], reports = [], lines = [];
+  const microtasks = [], frames = [], events = [], keys = [], reports = [], lines = [];
   const allocations = {maps: 0, sets: 0, scratch: 0, reads: 0, copies: 0, listeners: 0, clock: 0};
   const css = {x: 0, y: 0, left: 0, top: 0, width: 640, height: 480};
   const canvas = {
     width: 640, height: 480,
+    style: {
+      values: new Map(),
+      getPropertyValue(name) { return this.values.get(name)?.[0] ?? ''; },
+      getPropertyPriority(name) { return this.values.get(name)?.[1] ?? ''; },
+      setProperty(name, value, priority = '') { this.values.set(name, [value, priority]); },
+      removeProperty(name) { this.values.delete(name); },
+    },
     getBoundingClientRect: () => css,
-    dispatchEvent: event => { events.push(event.type); return true; },
+    dispatchEvent: event => {
+      events.push(event.type);
+      if (event.key) keys.push([event.type, event.key, event.ctrlKey]);
+      return true;
+    },
   };
   const sampling = {pixel: () => [64, 64, 64, 255], error: undefined};
   const NativeMap = Map, NativeSet = Set;
   install('Map', class extends NativeMap { constructor(...args) { super(...args); allocations.maps++; } });
   install('Set', class extends NativeSet { constructor(...args) { super(...args); allocations.sets++; } });
-  install('document', {querySelector: () => canvas, activeElement: canvas});
+  install('document', {querySelector: () => canvas, activeElement: canvas, hasFocus: () => true, visibilityState: 'visible'});
   install('window', {
     devicePixelRatio: 1,
     addEventListener: () => { allocations.listeners++; },
@@ -35,6 +46,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
   install('performance', {now: () => { allocations.clock++; return 0; }});
   install('dump', line => { lines.push(line); reports.push(JSON.parse(line)); });
   install('PointerEvent', class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
+  install('KeyboardEvent', class { constructor(type, fields) { this.type = type; Object.assign(this, fields); } });
   install('queueMicrotask', callback => microtasks.push(callback));
   install('requestAnimationFrame', callback => frames.push(callback));
   install('OffscreenCanvas', class {
@@ -74,7 +86,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
       queue.shift()();
     }
   };
-  return {canvas, css, sampling, allocations, events, reports, lines, frames, microtasks,
+  return {canvas, css, sampling, allocations, events, keys, reports, lines, frames, microtasks,
     flushMicrotasks: () => drain(microtasks), flushFrames: () => drain(frames)};
 }
 
@@ -562,4 +574,109 @@ test('FPS capture freezes caller data and later canvas changes invalidate the co
   assert.equal(browser.mmltkIntegrationFpsCurrent(receipt, fpsValues), true);
   f.css.width += 1;
   assert.equal(browser.mmltkIntegrationFpsCurrent(receipt, fpsValues), false);
+});
+
+for (const finish of ['completion', 'reset', 'disable']) {
+  test(`temporary canvas layout restores responsive CSS on ${finish}`, t => {
+    const f = canvasFixture(t);
+    f.canvas.style.setProperty('width', '100%', 'important');
+    f.canvas.style.setProperty('height', '100vh');
+    assert.equal(browser.mmltkIntegrationCanvasSize(1500, 600), true);
+    assert.equal(browser.mmltkIntegrationCanvasSize(1000, 1020), true);
+    assert.equal(f.canvas.style.getPropertyValue('width'), '1000px');
+    assert.equal(browser.mmltkIntegrationCanvasSizeSettled(1000, 1020), false);
+    f.css.width = f.canvas.width = 1000;
+    f.css.height = f.canvas.height = 1020;
+    assert.equal(browser.mmltkIntegrationCanvasSizeSettled(1000, 1020), true);
+    if (finish === 'reset') browser.mmltkIntegrationResetScenario();
+    else if (finish === 'disable') browser.mmltkIntegrationDriver(false);
+    else browser.mmltkIntegrationRestoreCanvasSize();
+    assert.equal(f.canvas.style.getPropertyValue('width'), '100%');
+    assert.equal(f.canvas.style.getPropertyPriority('width'), 'important');
+    assert.equal(f.canvas.style.getPropertyValue('height'), '100vh');
+    assert.equal(f.canvas.style.getPropertyPriority('height'), '');
+  });
+}
+
+test('inactive canvas sizing has no layout or scheduling effects', t => {
+  const f = canvasFixture(t, false, false);
+  assert.equal(browser.mmltkIntegrationCanvasSize(1500, 600), false);
+  assert.equal(browser.mmltkIntegrationCanvasSizeSettled(1500, 600), false);
+  browser.mmltkIntegrationRestoreCanvasSize();
+  assert.equal(f.canvas.style.values.size, 0);
+  assert.deepEqual(f.frames, []);
+  assert.deepEqual(f.events, []);
+  assertQuiet(f);
+});
+
+test('canvas sizing restores stylesheet-owned dimensions and rejects invalid requests', t => {
+  const f = canvasFixture(t);
+  assert.equal(browser.mmltkIntegrationCanvasSize(1500, 600), true);
+  assert.equal(browser.mmltkIntegrationCanvasSize(NaN, 1000), false);
+  assert.equal(f.canvas.style.getPropertyValue('width'), '1500px');
+  browser.mmltkIntegrationRestoreCanvasSize();
+  assert.equal(f.canvas.style.values.size, 0);
+});
+
+test('rendered numeric paste focuses and selects before one ordinary paste shortcut', t => {
+  const f = canvasFixture(t, true), completed = [];
+  assert.equal(browser.mmltkIntegrationPasteNumber(20, 30, result => completed.push(result)), 1);
+  f.flushMicrotasks();
+  f.flushFrames();
+  assert.deepEqual(completed, [true]);
+  assert.deepEqual(f.events.slice(0, 3), ['pointermove', 'pointerdown', 'pointerup']);
+  assert.deepEqual(f.keys, [
+    ['keydown', 'Control', true], ['keydown', 'a', true], ['keyup', 'a', true], ['keyup', 'Control', false],
+    ['keydown', 'Control', true], ['keydown', 'v', true], ['keyup', 'v', true], ['keyup', 'Control', false],
+  ]);
+  assert.deepEqual(f.reports.filter(record => record.event === 'integration.number_paste').map(record => record.detail),
+    ['scheduled', 'focused', 'delivered']);
+  browser.mmltkIntegrationCancelNumberEdit();
+  f.flushFrames();
+  assert.deepEqual(completed, [true]);
+  assert.equal(f.canvas.width, 640);
+  assert.equal(f.canvas.height, 480);
+  assert.equal(f.allocations.reads + f.allocations.copies, 0);
+});
+
+for (const finish of ['cancel', 'reset', 'disable']) {
+  for (const begun of [false, true]) {
+    test(`numeric paste settles once on ${finish} with begun=${begun}`, t => {
+      const f = canvasFixture(t), completed = [];
+      browser.mmltkIntegrationPasteNumber(20, 30, result => completed.push(result));
+      if (begun) { f.flushMicrotasks(); f.frames.shift()(); }
+      if (finish === 'reset') browser.mmltkIntegrationResetScenario();
+      else if (finish === 'disable') browser.mmltkIntegrationDriver(false);
+      else browser.mmltkIntegrationCancelNumberEdit();
+      const count = f.keys.length;
+      f.flushMicrotasks();
+      f.flushFrames();
+      assert.deepEqual(completed, [false]);
+      assert.equal(f.keys.length, count, 'late callbacks dispatch no paste or characters');
+    });
+  }
+}
+
+test('inactive and invalid numeric paste complete without scheduling input', t => {
+  const f = canvasFixture(t, false, false), completed = [];
+  assert.equal(browser.mmltkIntegrationPasteNumber(20, 30, result => completed.push(result)), 0);
+  browser.mmltkIntegrationDriver(true);
+  assert.equal(browser.mmltkIntegrationPasteNumber(NaN, 30, result => completed.push(result)), 0);
+  assert.deepEqual(completed, [false, false]);
+  assert.deepEqual(f.frames, []);
+  assert.deepEqual(f.microtasks, []);
+  assert.deepEqual(f.events, []);
+});
+
+test('superseded numeric delivery settles the old request and dispatch failure settles the current request', t => {
+  const f = canvasFixture(t), old = [], current = [];
+  browser.mmltkIntegrationPasteNumber(20, 30, result => old.push(result));
+  browser.mmltkIntegrationPasteNumber(20, 30, result => current.push(result));
+  assert.deepEqual(old, [false]);
+  f.canvas.dispatchEvent = () => { throw new Error('detached canvas'); };
+  f.flushMicrotasks();
+  f.flushFrames();
+  assert.deepEqual(current, [false]);
+  browser.mmltkIntegrationCancelNumberEdit();
+  assert.deepEqual(current, [false]);
 });

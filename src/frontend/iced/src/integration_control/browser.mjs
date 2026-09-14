@@ -3,6 +3,8 @@ let integrationDriver;
 
 export function mmltkIntegrationDriver(enabled) {
   if (!enabled) {
+    mmltkIntegrationRestoreCanvasSize();
+    mmltkIntegrationCancelNumberEdit();
     integrationDriver = undefined;
     const pending = integrationState?.fpsPending;
     if (integrationState) integrationState.fpsPending = undefined;
@@ -610,6 +612,41 @@ function integrationClick(canvas, rect, x, y) {
     });
 }
 
+// Acceptance owns only this temporary inline override. Winit's ordinary
+// ResizeObserver receives layout changes; backing dimensions are never injected.
+export function mmltkIntegrationCanvasSize(width, height) {
+  if (!integrationDriver || ![width, height].every(Number.isFinite) || width <= 0 || height <= 0) return false;
+  const canvas = document.querySelector('canvas');
+  if (!canvas) return false;
+  if (!integrationDriver.canvasSizing) {
+    integrationDriver.canvasSizing = {canvas, properties: ['width', 'height'].map(name =>
+      [name, canvas.style.getPropertyValue(name), canvas.style.getPropertyPriority(name)])};
+  }
+  if (integrationDriver.canvasSizing.canvas !== canvas) return false;
+  canvas.style.setProperty('width', `${width}px`, 'important');
+  canvas.style.setProperty('height', `${height}px`, 'important');
+  return true;
+}
+
+export function mmltkIntegrationCanvasSizeSettled(width, height) {
+  const canvas = integrationDriver?.canvasSizing?.canvas;
+  if (!canvas || document.querySelector('canvas') !== canvas) return false;
+  const bounds = canvas.getBoundingClientRect();
+  return Math.abs(bounds.width - width) < 1 && Math.abs(bounds.height - height) < 1 &&
+    Math.abs(canvas.width - width * window.devicePixelRatio) <= 1 &&
+    Math.abs(canvas.height - height * window.devicePixelRatio) <= 1;
+}
+
+export function mmltkIntegrationRestoreCanvasSize() {
+  const sizing = integrationDriver?.canvasSizing;
+  if (!sizing) return;
+  integrationDriver.canvasSizing = undefined;
+  for (const [name, value, priority] of sizing.properties) {
+    if (value) sizing.canvas.style.setProperty(name, value, priority);
+    else sizing.canvas.style.removeProperty(name);
+  }
+}
+
 export function mmltkIntegrationFullscreen(enabled) {
   integrationDriver.integrationFullscreenSettled = false;
   const request = enabled ? document.documentElement.requestFullscreen() : document.exitFullscreen();
@@ -798,10 +835,64 @@ function integrationKey(canvas, type, key, code, control, shift) {
   return Number(accepted) + Number(event.defaultPrevented);
 }
 
+export function mmltkIntegrationCancelNumberEdit() {
+  integrationDriver?.numberEdit?.complete(false);
+}
+
 export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
+  if (typeof value !== 'string' || !Number.isInteger(selectionLength) || selectionLength <= 0) return 0;
+  return integrationNumberEdit(x, y, value, selectionLength);
+}
+
+export function mmltkIntegrationPasteNumber(x, y, completed) {
+  return integrationNumberEdit(x, y, undefined, 0, completed);
+}
+
+function integrationNumberEdit(x, y, value, selectionLength, completed) {
+  if (!integrationDriver || !Number.isFinite(x) || !Number.isFinite(y)) {
+    completed?.(false);
+    return 0;
+  }
   const canvas = document.querySelector('canvas');
-  if (!canvas || !Number.isFinite(x) || !Number.isFinite(y) ||
-      typeof value !== 'string' || !Number.isInteger(selectionLength) || selectionLength <= 0) return 0;
+  if (!canvas) {
+    completed?.(false);
+    return 0;
+  }
+  mmltkIntegrationCancelNumberEdit();
+  const owner = integrationDriver;
+  const paste = value === undefined;
+  const event = paste ? 'integration.number_paste' : 'integration.number_replace';
+  let pending = true;
+  const editing = {controlDown: false, complete(success) {
+    if (!pending) return;
+    pending = false;
+    if (owner.numberEdit === editing) owner.numberEdit = undefined;
+    if (editing.controlDown) {
+      editing.controlDown = false;
+      try { integrationKey(canvas, 'keyup', 'Control', 'ControlLeft', false, false); }
+      catch (error) {
+        success = false;
+        if (integrationState) report({event: 'integration.failure', detail: `number modifier release: ${error}`});
+      }
+    }
+    completed?.(success);
+  }};
+  owner.numberEdit = editing;
+  const current = () => integrationDriver === owner && owner.numberEdit === editing;
+  const run = callback => () => {
+    if (!current()) return;
+    try { callback(); }
+    catch (error) {
+      editing.complete(false);
+      if (integrationState) report({event: 'integration.failure', detail: `number input delivery: ${error}`});
+    }
+  };
+  const frame = callback => integrationFrame(run(callback));
+  const key = (type, name, code, control) => {
+    const result = integrationKey(canvas, type, name, code, control, false);
+    if (name === 'Control') editing.controlDown = type === 'keydown';
+    return result;
+  };
   const rect = canvas.getBoundingClientRect();
   const observeKeyStage = (stage, result) => { if (integrationState) report({
     event: 'integration.number_key_stage',
@@ -810,18 +901,18 @@ export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
     a: String(result),
     b: String(document.hasFocus()),
     c: String(document.activeElement === canvas),
-    d: value,
+    d: value ?? 'clipboard',
   }); };
   if (integrationState) report({
-    event: 'integration.number_replace',
+    event,
     control: '',
     detail: 'scheduled',
     a: String(x),
     b: String(y),
-    c: value,
+    c: value ?? 'clipboard',
     d: String(document.activeElement === canvas),
   });
-  integrationMicrotask(() => {
+  integrationMicrotask(run(() => {
     const pointerEvents = [
       integrationPointer(rect, x, y, 'pointermove', 0),
       integrationPointer(rect, x, y, 'pointerdown', 1),
@@ -832,7 +923,7 @@ export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
       0,
     );
     if (integrationState) report({
-      event: 'integration.number_replace',
+      event,
       control: '',
       detail: 'focused',
       a: String(pointerResult),
@@ -841,39 +932,45 @@ export function mmltkIntegrationReplaceNumber(x, y, value, selectionLength) {
       d: '0',
     });
     observeKeyStage('awaiting-control-down', pointerResult);
-    integrationFrame(() => {
-      let keyResult = integrationKey(canvas, 'keydown', 'Control', 'ControlLeft', true, false);
+    frame(() => {
+      let keyResult = key('keydown', 'Control', 'ControlLeft', true);
       observeKeyStage('control-down', keyResult);
-      integrationFrame(() => {
-        keyResult += integrationKey(canvas, 'keydown', 'a', 'KeyA', true, false);
-        keyResult += integrationKey(canvas, 'keyup', 'a', 'KeyA', true, false);
+      frame(() => {
+        keyResult += key('keydown', 'a', 'KeyA', true);
+        keyResult += key('keyup', 'a', 'KeyA', true);
         observeKeyStage('select-all', keyResult);
-        integrationFrame(() => {
-          keyResult += integrationKey(canvas, 'keyup', 'Control', 'ControlLeft', false, false);
+        frame(() => {
+          keyResult += key('keyup', 'Control', 'ControlLeft', false);
           observeKeyStage('control-up', keyResult);
-          integrationFrame(() => {
-            for (const character of value) {
+          frame(() => {
+            if (paste) {
+              keyResult += key('keydown', 'Control', 'ControlLeft', true);
+              keyResult += key('keydown', 'v', 'KeyV', true);
+              keyResult += key('keyup', 'v', 'KeyV', true);
+              keyResult += key('keyup', 'Control', 'ControlLeft', false);
+            } else for (const character of value) {
               const code = character === '.' ? 'Period' :
                 character === '-' ? 'Minus' :
                 character === '+' ? 'Equal' :
                 character === 'e' || character === 'E' ? 'KeyE' : `Digit${character}`;
-              keyResult += integrationKey(canvas, 'keydown', character, code, false, false);
-              keyResult += integrationKey(canvas, 'keyup', character, code, false, false);
+              keyResult += key('keydown', character, code, false);
+              keyResult += key('keyup', character, code, false);
             }
             if (integrationState) report({
-              event: 'integration.number_replace',
+              event,
               control: '',
-              detail: 'keyboard',
+              detail: paste ? 'delivered' : 'keyboard',
               a: String(keyResult),
               b: String(document.activeElement === canvas),
-              c: value,
+              c: value ?? 'clipboard',
               d: String(selectionLength),
             });
+            editing.complete(true);
           });
         });
       });
     });
-  });
+  }));
   return 1;
 }
 

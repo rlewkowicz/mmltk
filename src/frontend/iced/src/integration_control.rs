@@ -322,6 +322,10 @@ pub enum Message {
     },
     Advance,
     NumberWheelDelivered,
+    NumberInvalidDelivered,
+    NumberClipboardPrepared { revision: u64, result: Result<(), iced::clipboard::Error> },
+    NumberPasteDelivered(bool),
+    NumberPasteRead { target: String, result: Result<std::sync::Arc<iced::clipboard::Content>, iced::clipboard::Error> },
     GalleryMouseDelivered,
     UpscalePixels {
         source: u64,
@@ -993,6 +997,12 @@ extern "C" {
     );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFullscreen)]
     fn fullscreen_js(enabled: bool);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCanvasSize)]
+    fn canvas_size_js(width: f64, height: f64) -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCanvasSizeSettled)]
+    fn canvas_size_settled_js(width: f64, height: f64) -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationRestoreCanvasSize)]
+    fn restore_canvas_size_js();
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationFullscreenSettled)]
     fn fullscreen_settled_js(enabled: bool) -> bool;
 
@@ -1026,6 +1036,10 @@ extern "C" {
     fn slider_drag_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReplaceNumber)]
     fn replace_number_js(x: f64, y: f64, value: &str, selection_length: u32) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPasteNumber)]
+    fn paste_number_js(x: f64, y: f64, completed: &wasm_bindgen::JsValue) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationCancelNumberEdit)]
+    fn cancel_number_edit_js();
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationAnnotationPointer)]
     fn annotation_pointer_js(
         x: f64,
@@ -1553,6 +1567,11 @@ impl AtlasDraw {
             .iter()
             .position(|value| *value == compiled_index)
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn atlas_resize_dimensions(step: u8) -> (f64, f64) {
+    [(1200.0, 850.0), (1000.0, 1020.0), (1300.0, 760.0), (1500.0, 600.0)][step as usize]
 }
 
 fn atlas_scroll_window(size: iced::Size, columns: u32) -> (u32, f32) {
@@ -2127,6 +2146,26 @@ fn replace_number_input(bounds: Rectangle, value: &str, selection_length: usize)
     ) == 1
 }
 
+#[cfg(target_arch = "wasm32")]
+fn paste_number_input(bounds: Rectangle) -> bool {
+    let Some(mut output) = SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone()) else {
+        return false;
+    };
+    let completed = wasm_bindgen::closure::Closure::once_into_js(move |delivered: bool| {
+        output.send(Message::NumberPasteDelivered(delivered));
+    });
+    paste_number_js(
+        f64::from(bounds.x + bounds.width * 0.5),
+        f64::from(bounds.y + bounds.height * 0.5),
+        &completed,
+    ) == 1
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn paste_number_input(_bounds: Rectangle) -> bool {
+    false
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn replace_number_input(_bounds: Rectangle, _value: &str, _selection_length: usize) -> bool {
     false
@@ -2277,6 +2316,13 @@ enum Phase {
     },
     ExploreDatasetPane,
     ExploreDetailsPane,
+    ExploreNumericStart(u8),
+    ExploreNumericControl { index: u8, step: u8 },
+    ExploreNumericReveal { index: u8, step: u8 },
+    AwaitExploreNumeric { index: u8, step: u8 },
+    AwaitExploreNumericWheel(u8),
+    AwaitExploreNumericInvalid(u8),
+    AwaitExploreClipboard(u64),
     ExplorePolicyOrderReady,
     ExplorePolicyOrder(u64),
     AwaitExplorePolicyOrder(u64),
@@ -2365,6 +2411,11 @@ enum Phase {
     AwaitAtlasRestored,
     AwaitAtlasWindow(bool),
     AwaitAtlasScroll(u8),
+    AtlasResizeStart,
+    AwaitAtlasResizeGallery(u8),
+    AtlasResizeSelect(u8),
+    AwaitAtlasResizeDetail(u8),
+    AwaitAtlasResizeMeasurement(u8),
     AwaitAtlasReturnReady,
     AtlasReturnSelect,
     AtlasAwaySelect(u8),
@@ -2510,6 +2561,10 @@ impl Phase {
             | Self::AwaitExploreInitialPatch { .. }
             | Self::AwaitExploreExactGrid(_)
             | Self::AwaitExploreExactGridPatch { .. }
+            | Self::AwaitExploreNumeric { .. }
+            | Self::AwaitExploreClipboard(_)
+            | Self::AwaitExploreNumericInvalid(_)
+            | Self::AwaitExploreNumericWheel(_)
             | Self::AwaitExplorePolicyOrder(_)
             | Self::AwaitExplorePolicyRange(_)
             | Self::AwaitExplorePolicyOverlay(_)
@@ -2534,6 +2589,9 @@ impl Phase {
             | Self::AwaitAtlasRestored
             | Self::AwaitAtlasWindow(_)
             | Self::AwaitAtlasScroll(_)
+            | Self::AwaitAtlasResizeGallery(_)
+            | Self::AwaitAtlasResizeDetail(_)
+            | Self::AwaitAtlasResizeMeasurement(_)
             | Self::AwaitAtlasReturnReady
             | Self::AwaitAtlasAwayDetail(_, _)
             | Self::AwaitAtlasAwayFilter(_, _)
@@ -2582,6 +2640,49 @@ impl Phase {
 fn region_id(page: FeatureId, index: usize) -> &'static str {
     let composition = crate::view::workflow::Composition::new(page, 0.0);
     composition.stable_id(composition.audit_regions()[index])
+}
+
+fn explore_integer_id(index: u8) -> String {
+    match index {
+        0 => crate::generated::constraint_workflowsexploremininstances().stable_field_id.to_string(),
+        1 => crate::generated::constraint_workflowsexploremaxinstances().stable_field_id.to_string(),
+        2 => crate::generated::constraint_workflowsexploreshuffleseed().stable_field_id.to_string(),
+        3 => crate::generated::constraint_workflowsexploremincompiledindex().stable_field_id.to_string(),
+        4 => crate::generated::constraint_workflowsexploremaxcompiledindex().stable_field_id.to_string(),
+        _ => unreachable!("five Explore integer fields"),
+    }
+}
+
+fn explore_seed_target(baseline: u64) -> u64 {
+    const PRIMARY: u64 = (1_u64 << 53) + 1;
+    const ALTERNATE: u64 = (1_u64 << 53) + 3;
+    if baseline == PRIMARY { ALTERNATE } else { PRIMARY }
+}
+
+fn explore_integer_value(snapshot: &crate::generated::ExploreSnapshot, index: u8) -> u64 {
+    match index {
+        0 => u64::from(snapshot.filter.minimuminstances),
+        1 => u64::from(snapshot.filter.maximuminstances),
+        2 => snapshot.filter.shuffleseed,
+        3 => snapshot.filter.minimumcompiledindex,
+        4 => snapshot.filter.maximumcompiledindex,
+        _ => unreachable!("five Explore integer fields"),
+    }
+}
+
+fn explore_integer_persisted(model: &ApplicationModel, index: u8, value: u64) -> bool {
+    model.settings_snapshot.as_ref().is_some_and(|snapshot| {
+        let settings = &snapshot.settingsstate.workflows.explore;
+        let persisted = match index {
+            0 => u64::from(settings.mininstances),
+            1 => u64::from(settings.maxinstances),
+            2 => settings.shuffleseed,
+            3 => settings.mincompiledindex,
+            4 => settings.maxcompiledindex,
+            _ => unreachable!("five Explore integer fields"),
+        };
+        persisted == value
+    })
 }
 
 fn settings_numeric_id(index: usize, part: usize) -> String {
@@ -2869,6 +2970,10 @@ pub struct Controller {
     workspace_fps_failure: Option<&'static str>,
     benchmark_baseline: bool,
     settings_revision: u64,
+    explore_paste_read: bool,
+    explore_integer_baseline: u64,
+    explore_integer_target: u64,
+    explore_integer_revision: u64,
     numeric_target: f64,
     numeric_replacement: String,
     numeric_selection_length: usize,
@@ -2876,6 +2981,8 @@ pub struct Controller {
     ui_scale_baseline: f32,
     ui_scale_first: Option<f32>,
     input_scale: f32,
+    resize_original_size: Option<iced::Size>,
+    resize_previous_size: Option<iced::Size>,
     oversized_gallery: Option<(iced::Size, crate::generated::VisualExtent)>,
     selection_grid: Option<(u32, u32, u32, u64, u64)>,
 }
@@ -2897,8 +3004,16 @@ impl Controller {
                     iced::Subscription::none()
                 },
                 iced::event::listen_with(|event, _, _| match event {
+                    iced::Event::Clipboard(iced::advanced::clipboard::Event::Read { target: Some(target), result }) => {
+                        Some(Message::NumberPasteRead { target, result })
+                    }
                     iced::Event::Mouse(iced::mouse::Event::WheelScrolled { .. }) => {
                         Some(Message::NumberWheelDelivered)
+                    }
+                    iced::Event::Keyboard(iced::keyboard::Event::KeyReleased { key, .. })
+                        if key.as_ref() == iced::keyboard::Key::Character("x") =>
+                    {
+                        Some(Message::NumberInvalidDelivered)
                     }
                     iced::Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
                         Some(Message::GalleryMouseDelivered)
@@ -3055,6 +3170,10 @@ impl Controller {
             workspace_fps_failure: None,
             benchmark_baseline: false,
             settings_revision: 0,
+            explore_paste_read: false,
+            explore_integer_baseline: 0,
+            explore_integer_target: 0,
+            explore_integer_revision: 0,
             numeric_target: 0.0,
             numeric_replacement: String::new(),
             numeric_selection_length: 0,
@@ -3062,6 +3181,8 @@ impl Controller {
             ui_scale_baseline: 1.0,
             ui_scale_first: None,
             input_scale: 1.0,
+            resize_original_size: None,
+            resize_previous_size: None,
             oversized_gallery: None,
             selection_grid: None,
         }
@@ -3360,7 +3481,13 @@ impl Controller {
             reporting::emit(|sink| sink.record("integration.failed", "", &self.failure, [0.0; 4]));
         }
         crate::presentation_surface::end_capacity_acceptance();
+        #[cfg(target_arch = "wasm32")]
+        {
+            restore_canvas_size_js();
+            cancel_number_edit_js();
+        }
         self.phase = Phase::Failed;
+        self.explore_paste_read = false;
         self.location_pending = false;
     }
 
@@ -3779,6 +3906,10 @@ impl Controller {
                                 | Message::Advance
                                 | Message::Located { .. }
                                 | Message::NumberWheelDelivered
+                                | Message::NumberInvalidDelivered
+                                | Message::NumberClipboardPrepared { .. }
+                                | Message::NumberPasteDelivered(_)
+                                | Message::NumberPasteRead { .. }
                                 | Message::GalleryMouseDelivered
                         ),
                     }
@@ -3786,6 +3917,7 @@ impl Controller {
             Message::Advance
             | Message::Located { .. }
             | Message::NumberWheelDelivered
+            | Message::NumberInvalidDelivered
             | Message::GalleryMouseDelivered => true,
             _ => false,
         }
@@ -3848,7 +3980,44 @@ impl Controller {
                 }
                 return None;
             }
+            Message::NumberClipboardPrepared { revision, result } => {
+                if self.phase == Phase::AwaitExploreClipboard(revision) {
+                    match result {
+                        Ok(()) => self.phase = Phase::ExploreNumericControl { index: 2, step: 6 },
+                        Err(error) => self.fail_detail(|| format!("Explore clipboard preparation failed: {error:?}").into()),
+                    }
+                }
+                return None;
+            }
+            Message::NumberPasteRead { target, result } => {
+                if self.phase == (Phase::AwaitExploreNumeric { index: 2, step: 6 })
+                    && target == explore_integer_id(2)
+                {
+                    match result {
+                        Ok(content) if matches!(content.as_ref(), iced::clipboard::Content::Text(text)
+                            if text == &self.explore_integer_target.to_string()) => self.explore_paste_read = true,
+                        Ok(_) => self.fail("Explore paste read different clipboard contents"),
+                        Err(error) => self.fail_detail(|| format!("Explore clipboard read failed: {error:?}").into()),
+                    }
+                }
+                return None;
+            }
+            Message::NumberPasteDelivered(delivered) => {
+                if !delivered && self.phase == (Phase::AwaitExploreNumeric { index: 2, step: 6 }) {
+                    self.fail("Explore clipboard paste shortcut delivery failed");
+                }
+                return None;
+            }
+            Message::NumberInvalidDelivered => {
+                if let Phase::AwaitExploreNumericInvalid(index) = self.phase {
+                    self.phase = Phase::AwaitExploreNumeric { index, step: 3 };
+                }
+                return None;
+            }
             Message::NumberWheelDelivered => {
+                if let Phase::AwaitExploreNumericWheel(index) = self.phase {
+                    self.phase = Phase::AwaitExploreNumeric { index, step: 2 };
+                }
                 if let Phase::AwaitAdvancedSpinnerWheel(index) = self.phase {
                     self.phase = Phase::AdvancedSpinnerWheelVerify(index);
                     reporting::emit(|sink| {
@@ -4133,6 +4302,7 @@ impl Controller {
             Phase::ExploreCloseDetail => EXPLORE_DETAIL_CLOSE.to_owned(),
             Phase::ExploreDatasetPane => EXPLORE_DATASET_PANE.to_owned(),
             Phase::ExploreDetailsPane => EXPLORE_DETAILS_PANE.to_owned(),
+            Phase::ExploreNumericControl { index, .. } | Phase::ExploreNumericReveal { index, .. } => explore_integer_id(index),
             Phase::ExplorePolicyOrder(_) => explore::ORDER_SHUFFLED_ID.to_owned(),
             Phase::ExplorePolicyRange(_) | Phase::ExplorePolicyRangeVisible(_) => {
                 explore::RANGE_START_ONE_ID.to_owned()
@@ -4149,7 +4319,7 @@ impl Controller {
             Phase::GalleryImage(_) => EXPLORE_GALLERY.to_owned(),
             Phase::DetailOriginal { .. } => EXPLORE_DETAIL_ORIGINAL.to_owned(),
             Phase::DetailFit => explore::DETAIL_FIT_ID.to_owned(),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => EXPLORE_GALLERY.to_owned(),
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => EXPLORE_GALLERY.to_owned(),
             Phase::AtlasCapacity => explore::GALLERY_CAPACITY_ID.to_owned(),
             Phase::AtlasEmpty => explore::GALLERY_EMPTY_ID.to_owned(),
             Phase::AtlasOverlay(index) => overlay_control(index, false).to_owned(),
@@ -4613,7 +4783,34 @@ impl Controller {
             }
             Phase::ExploreDetailsPane => {
                 self.explore_details_pane = Some(bounds);
-                self.phase = Phase::ExplorePolicyOrderReady;
+                self.phase = Phase::ExploreNumericStart(0);
+                None
+            }
+            Phase::ExploreNumericControl { index, step } | Phase::ExploreNumericReveal { index, step } => {
+                let Some(pane) = self.explore_dataset_pane else {
+                    self.fail("Explore numeric input has no sidebar bounds");
+                    return None;
+                };
+                if let Some(offset) = sidebar_reveal_offset(pane, bounds) {
+                    self.reveal_offset = offset;
+                    self.phase = Phase::ExploreNumericReveal { index, step };
+                    return None;
+                }
+                let delivered = match step {
+                    0 | 1 => click_number_edge(input_bounds, step == 0),
+                    2 => wheel_number_input(input_bounds),
+                    6 => paste_number_input(input_bounds),
+                    _ => replace_number_input(input_bounds, &self.numeric_replacement, 20),
+                };
+                if !delivered {
+                    self.fail("Explore integer input dispatch failed");
+                } else {
+                    self.phase = match step {
+                        2 => Phase::AwaitExploreNumericWheel(index),
+                        3 => Phase::AwaitExploreNumericInvalid(index),
+                        _ => Phase::AwaitExploreNumeric { index, step },
+                    };
+                }
                 None
             }
             Phase::ExplorePolicyOrder(revision) => {
@@ -4747,7 +4944,11 @@ impl Controller {
                 }
                 None
             }
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => {
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => {
+                let resizing = match self.phase {
+                    Phase::AtlasResizeSelect(step) => Some(step),
+                    _ => None,
+                };
                 let returning = matches!(self.phase, Phase::AtlasReturnSelect);
                 let away = match self.phase {
                     Phase::AtlasAwaySelect(step) => Some(step),
@@ -4764,7 +4965,9 @@ impl Controller {
                     width: side,
                     height: side,
                 };
-                self.phase = if returning {
+                self.phase = if let Some(step) = resizing {
+                    Phase::AwaitAtlasResizeDetail(step)
+                } else if returning {
                     Phase::AwaitAtlasReturnDetail
                 } else if let Some(step) = away {
                     Phase::AwaitAtlasAwayDetail(step, 0)
@@ -6857,6 +7060,105 @@ impl Controller {
             }
             Phase::ExploreDatasetPane => self.arm(EXPLORE_DATASET_PANE),
             Phase::ExploreDetailsPane => self.arm(EXPLORE_DETAILS_PANE),
+            Phase::ExploreNumericStart(index) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if !model.explore_mutation_available() || settings.has_local_edits() || model.has_explore_pending() {
+                    return Task::none();
+                }
+                if index == 5 {
+                    self.phase = Phase::ExplorePolicyOrderReady;
+                    return iced::widget::operation::snap_to(explore::DATASET_SCROLL_ID, RelativeOffset::START);
+                }
+                let value = explore_integer_value(snapshot, index);
+                self.explore_integer_baseline = value;
+                self.explore_integer_target = match index {
+                    0 => if value == 0 { 1 } else { 0 },
+                    1 => if value == 10_000 { 9_999 } else { 10_000 },
+                    2 => explore_seed_target(value),
+                    3 => if value == 0 { 1 } else { 0 },
+                    _ => value.min(u64::from(snapshot.dataset.imagecount.saturating_sub(1))).saturating_sub(1),
+                };
+                self.explore_integer_revision = snapshot.revision;
+                self.phase = Phase::ExploreNumericControl { index, step: 0 };
+                self.arm(explore_integer_id(index))
+            }
+            Phase::ExploreNumericControl { index, .. } => self.arm(explore_integer_id(index)),
+            Phase::ExploreNumericReveal { index, .. } => self.arm_revealed(explore::DATASET_SCROLL_ID, explore_integer_id(index)),
+            Phase::AwaitExploreNumeric { index, step } => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy || model.has_explore_pending() { return Task::none(); }
+                let value = explore_integer_value(snapshot, index);
+                if step < 3 {
+                    if value != self.explore_integer_baseline {
+                        self.fail("Explore integer changed from an edge click or wheel");
+                        return Task::none();
+                    }
+                    if step == 2 { self.numeric_replacement = "x".to_owned(); }
+                    self.phase = Phase::ExploreNumericControl { index, step: step + 1 };
+                    return self.arm(explore_integer_id(index));
+                }
+                if step == 3 {
+                    if value != self.explore_integer_baseline {
+                        self.fail("Explore unsigned integer accepted invalid text");
+                        return Task::none();
+                    }
+                    self.numeric_replacement = self.explore_integer_target.to_string();
+                    self.phase = Phase::ExploreNumericControl { index, step: 4 };
+                    return self.arm(explore_integer_id(index));
+                }
+                let expected = if step == 4 || step == 6 { self.explore_integer_target } else { self.explore_integer_baseline };
+                if value != expected || snapshot.revision <= self.explore_integer_revision
+                    || !explore_integer_persisted(model, index, expected)
+                    || (step == 6 && !self.explore_paste_read)
+                { return Task::none(); }
+                if step == 4 {
+                    reporting::emit(|sink| sink.record("integration.explore_integer", &explore_integer_id(index),
+                        &value.to_string(), [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                    self.explore_integer_revision = snapshot.revision;
+                    self.numeric_replacement = self.explore_integer_baseline.to_string();
+                    if index == 4 && self.explore_integer_baseline == u64::MAX {
+                        self.phase = Phase::AwaitExploreNumeric { index, step: 5 };
+                        return explore_message(explore::Message::Dataset(explore::dataset::Message::UnlimitedCompiledIndex));
+                    }
+                    self.phase = Phase::ExploreNumericControl { index, step: 5 };
+                    self.arm(explore_integer_id(index))
+                } else if index == 2 && step == 5 {
+                    // The typed edit has already restored its baseline. Prepare
+                    // clipboard contents separately; only the rendered widget
+                    // may consume them through its ordinary paste shortcut.
+                    self.explore_paste_read = false;
+                    self.explore_integer_revision = snapshot.revision;
+                    reporting::emit(|sink| sink.record("integration.explore_integer_paste_baseline",
+                        &explore_integer_id(index), &value.to_string(),
+                        [snapshot.revision as f64, 0.0, 1.0, 1.0]));
+                    self.phase = Phase::AwaitExploreClipboard(snapshot.revision);
+                    let generation = self.generation;
+                    let revision = snapshot.revision;
+                    iced::clipboard::write(self.explore_integer_target.to_string()).map(move |result| {
+                        RootMessage::Integration(Message::Scoped {
+                            generation,
+                            receipt: None,
+                            message: Box::new(Message::NumberClipboardPrepared { revision, result }),
+                        })
+                    })
+                } else if step == 6 {
+                    reporting::emit(|sink| sink.record("integration.explore_integer_paste",
+                        &explore_integer_id(index), &value.to_string(),
+                        [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                    self.explore_integer_revision = snapshot.revision;
+                    self.numeric_replacement = self.explore_integer_baseline.to_string();
+                    self.phase = Phase::ExploreNumericControl { index, step: 7 };
+                    self.arm(explore_integer_id(index))
+                } else {
+                    if step == 7 {
+                        self.explore_paste_read = false;
+                        reporting::emit(|sink| sink.record("integration.explore_integer_paste_restored",
+                            &explore_integer_id(index), &value.to_string(),
+                            [self.explore_integer_revision as f64, snapshot.revision as f64, 1.0, 1.0]));
+                    }
+                    self.advance_to(Phase::ExploreNumericStart(index + 1))
+                }
+            }
             Phase::ExplorePolicyOrderReady => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -7520,7 +7822,7 @@ impl Controller {
                 self.arm(explore::DETAIL_FIT_ID)
             }
             Phase::DetailFit => self.arm(explore::DETAIL_FIT_ID),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasAwaySelect(_) => {
+            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => {
                 self.arm(EXPLORE_GALLERY)
             }
             Phase::AwaitAtlasCapacity
@@ -8066,6 +8368,104 @@ impl Controller {
                 fullscreen_js(true);
                 Task::none()
             }
+            Phase::AtlasResizeStart => {
+                self.resize_original_size = router.explore_gallery_size();
+                self.resize_previous_size = self.resize_original_size;
+                self.phase = Phase::AwaitAtlasResizeGallery(0);
+                #[cfg(target_arch = "wasm32")]
+                if !canvas_size_js(1500.0, 600.0) {
+                    self.fail("cannot size the acceptance canvas");
+                }
+                Task::none()
+            }
+            Phase::AwaitAtlasResizeGallery(step) => {
+                let (Some(snapshot), Some(size)) =
+                    (model.explore.snapshot.as_ref(), router.explore_gallery_size())
+                else { return Task::none(); };
+                if snapshot.mode != crate::generated::ExploreMode::Gallery
+                    || snapshot.busy || model.has_explore_pending()
+                    || (step == 3 && Some(size) != self.resize_original_size)
+                { return Task::none(); }
+                #[cfg(target_arch = "wasm32")]
+                if step < 3 {
+                    let (width, height) = if step == 1 { (1000.0, 1020.0) } else { (1500.0, 600.0) };
+                    if !canvas_size_settled_js(width, height)
+                        || model.window_width != width as u32 || model.window_height != height as u32
+                    { return Task::none(); }
+                }
+                let Some(expected) = router.explore_measured_layout_request(
+                    Some(snapshot), snapshot.viewport.columns, snapshot.order.matchingcount,
+                ) else { return Task::none(); };
+                if snapshot.viewport != expected.viewport { return Task::none(); }
+                let Some(draw) = self.confirmed_atlas(snapshot)
+                    .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
+                else { return Task::none(); };
+                let required_rows = atlas_scroll_window(size, snapshot.viewport.columns).0;
+                if snapshot.viewport.rowcount < required_rows || snapshot.gallery.slots.iter().any(|ready| !*ready) {
+                    return Task::none();
+                }
+                if step < 3 {
+                    crate::presentation_surface::trace_atlas_stage(
+                        ["resize-landscape", "resize-portrait-return", "resize-landscape-return"][step as usize], draw,
+                    );
+                    reporting::emit(|sink| sink.record("integration.atlas_resize", EXPLORE_GALLERY,
+                        ["landscape", "portrait-return", "landscape-return"][step as usize],
+                        [f64::from(size.width), f64::from(size.height), f64::from(required_rows), f64::from(snapshot.viewport.rowcount)]));
+                }
+                if step == 2 {
+                    self.phase = Phase::AwaitAtlasResizeGallery(3);
+                    #[cfg(target_arch = "wasm32")]
+                    restore_canvas_size_js();
+                    return Task::none();
+                }
+                if step == 3 {
+                    self.resize_original_size = None;
+                    self.resize_previous_size = None;
+                    return self.advance_to(Phase::AwaitAtlasReturnReady);
+                }
+                self.selection_grid = Some((snapshot.viewport.columns, snapshot.viewport.rowcount,
+                    snapshot.viewport.firstrow, snapshot.revision, snapshot.frame.revision));
+                self.resize_previous_size = Some(size);
+                self.phase = Phase::AtlasResizeSelect(step);
+                self.arm(EXPLORE_GALLERY)
+            }
+            Phase::AwaitAtlasResizeDetail(step) => {
+                let Some(snapshot) = model.explore.snapshot.as_ref() else { return Task::none(); };
+                if snapshot.busy || !self.detail_drawn(frame, snapshot) { return Task::none(); }
+                self.phase = Phase::AwaitAtlasResizeMeasurement(step * 2);
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let (width, height) = atlas_resize_dimensions(step * 2);
+                    if !canvas_size_js(width, height) { self.fail("cannot resize canvas beneath Detail"); }
+                }
+                Task::none()
+            }
+            Phase::AwaitAtlasResizeMeasurement(step) => {
+                let Some(size) = router.explore_gallery_size() else { return Task::none(); };
+                if Some(size) == self.resize_previous_size { return Task::none(); }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let (width, height) = atlas_resize_dimensions(step);
+                    if !canvas_size_settled_js(width, height)
+                        || model.window_width != width as u32 || model.window_height != height as u32
+                    { return Task::none(); }
+                }
+                self.resize_previous_size = Some(size);
+                reporting::emit(|sink| sink.record("integration.atlas_resize_measured", EXPLORE_GALLERY,
+                    "detail-layout", [f64::from(step), f64::from(size.width), f64::from(size.height), 1.0]));
+                if step % 2 == 0 {
+                    self.phase = Phase::AwaitAtlasResizeMeasurement(step + 1);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let (width, height) = atlas_resize_dimensions(step + 1);
+                        if !canvas_size_js(width, height) { self.fail("cannot repeat canvas resize beneath Detail"); }
+                    }
+                    Task::none()
+                } else {
+                    self.phase = Phase::AwaitAtlasResizeGallery(step / 2 + 1);
+                    explore_message(explore::Message::Detail(explore::detail::Message::CloseRequested))
+                }
+            }
             Phase::AwaitAtlasReturnReady => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -8294,7 +8694,7 @@ impl Controller {
                 });
                 self.atlas_baseline = Some((snapshot.frame.revision, snapshot.augmentation.seed));
                 if index == 7 {
-                    let continuation = self.advance_to(Phase::AwaitAtlasReturnReady);
+                    let continuation = self.advance_to(Phase::AtlasResizeStart);
                     iced::widget::operation::snap_to(EXPLORE_GALLERY, RelativeOffset::START)
                         .chain(continuation)
                 } else {
@@ -10313,6 +10713,94 @@ pub(crate) mod tests {
         assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFps);
         drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Failed, &model, &settings));
         assert_eq!(fixture.controller.phase, Phase::AwaitWorkspaceFps);
+    }
+
+    #[test]
+    fn numeric_seed_round_trip_reuses_one_distinct_exact_target_for_typing_and_paste() {
+        for baseline in [0, 73, (1_u64 << 53) + 1, (1_u64 << 53) + 3, u64::MAX] {
+            let mut fixture = ProbeFixture::new("square");
+            let (mut model, settings) = fps_settings();
+            model.connection = crate::view_model::ConnectionState::Connected;
+            let snapshot = model.explore.snapshot.as_mut().unwrap();
+            snapshot.ready = true;
+            snapshot.busy = false;
+            snapshot.revision = 17;
+            snapshot.filter.shuffleseed = baseline;
+            model.settings_snapshot.as_mut().unwrap().settingsstate.workflows.explore.shuffleseed = baseline;
+            let driver = &mut fixture.controller;
+            driver.phase = Phase::ExploreNumericStart(2);
+            let router = crate::view::router::Router::default();
+            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            let target = driver.explore_integer_target;
+            assert_ne!(target, baseline);
+            assert!(target > (1_u64 << 53));
+            assert_eq!(target % 2, 1);
+            assert_eq!(target, if baseline == (1_u64 << 53) + 1 { (1_u64 << 53) + 3 } else { (1_u64 << 53) + 1 });
+            assert_eq!(target.to_string().parse::<u64>(), Ok(target));
+            driver.phase = Phase::AwaitExploreNumeric { index: 2, step: 5 };
+            model.explore.snapshot.as_mut().unwrap().revision += 1;
+            drop(driver.advance(&model, &settings, 1.0, &router, FeatureId::Explore, None));
+            assert_eq!(driver.phase, Phase::AwaitExploreClipboard(18));
+            assert_eq!(driver.explore_integer_target, target);
+            assert_eq!(driver.explore_integer_baseline, baseline);
+        }
+    }
+
+    #[test]
+    fn clipboard_preparation_and_reads_belong_to_the_active_numeric_round_trip() {
+        let mut fixture = ProbeFixture::new("square");
+        let driver = &mut fixture.controller;
+        driver.phase = Phase::AwaitExploreClipboard(17);
+        let scoped = |generation, message| Message::Scoped {
+            generation, receipt: None, message: Box::new(message),
+        };
+        driver.update(scoped(driver.generation.wrapping_add(1), Message::NumberClipboardPrepared {
+            revision: 17, result: Ok(()),
+        }));
+        assert_eq!(driver.phase, Phase::AwaitExploreClipboard(17));
+        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
+            revision: 16, result: Ok(()),
+        }));
+        assert_eq!(driver.phase, Phase::AwaitExploreClipboard(17));
+        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
+            revision: 17, result: Ok(()),
+        }));
+        assert_eq!(driver.phase, Phase::ExploreNumericControl { index: 2, step: 6 });
+        driver.phase = Phase::AwaitExploreNumeric { index: 2, step: 6 };
+        driver.explore_integer_target = (1_u64 << 53) + 1;
+        let contents = std::sync::Arc::new(iced::clipboard::Content::Text(driver.explore_integer_target.to_string()));
+        driver.update(scoped(driver.generation, Message::NumberPasteRead {
+            target: explore_integer_id(0), result: Ok(contents.clone()),
+        }));
+        assert!(!driver.explore_paste_read);
+        driver.update(scoped(driver.generation, Message::NumberPasteRead {
+            target: explore_integer_id(2), result: Ok(contents),
+        }));
+        assert!(driver.explore_paste_read);
+        driver.fail("completed test cancellation");
+        driver.update(scoped(driver.generation, Message::NumberClipboardPrepared {
+            revision: 17, result: Ok(()),
+        }));
+        assert_eq!(driver.phase, Phase::Failed);
+        assert!(!driver.explore_paste_read);
+    }
+
+    #[test]
+    fn clipboard_rejection_preserves_the_underlying_error_and_fails_only_its_active_stage() {
+        for writing in [true, false] {
+            let mut fixture = ProbeFixture::new("square");
+            let driver = &mut fixture.controller;
+            driver.phase = if writing { Phase::AwaitExploreClipboard(17) }
+                else { Phase::AwaitExploreNumeric { index: 2, step: 6 } };
+            let error = iced::clipboard::Error::Unknown { description: std::sync::Arc::new("clipboard permission rejected".into()) };
+            let message = if writing { Message::NumberClipboardPrepared { revision: 17, result: Err(error) } }
+                else { Message::NumberPasteRead { target: explore_integer_id(2), result: Err(error) } };
+            driver.update(Message::Scoped {
+                generation: driver.generation, receipt: None, message: Box::new(message),
+            });
+            assert_eq!(driver.phase, Phase::Failed);
+            assert!(driver.failure.contains("clipboard permission rejected"));
+        }
     }
 
     #[test]

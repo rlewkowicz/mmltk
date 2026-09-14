@@ -3414,6 +3414,7 @@ struct AtlasDrawAudit final {
     std::optional<nlohmann::json> return_baseline;
     unsigned return_stage = 0U;
     bool return_round_trip = false;
+    std::vector<nlohmann::json> resize_stages;
     bool away_return = false;
     std::map<SampleKey, std::set<std::uint64_t>> ready_cell_samples;
     struct RetainedReadiness final {
@@ -3569,6 +3570,31 @@ struct AtlasDrawAudit final {
 
     void stage(const nlohmann::json& record) {
         const auto name = record.value("control", "");
+        if (name.starts_with("resize-")) {
+            static constexpr std::array names{"resize-landscape", "resize-portrait-return", "resize-landscape-return"};
+            bool matching = check(resize_stages.size() < names.size() && name == names[resize_stages.size()],
+                                  "resize_stage_out_of_order", record) && source_stage_matches_draw(record);
+            if (matching) {
+                const auto& clip = record.at("clip");
+                const auto& image = record.at("image");
+                matching = check(image[1].get<double>() + image[3].get<double>() >=
+                                     clip[1].get<double>() + clip[3].get<double>() - 1.0,
+                                 "resized_atlas_does_not_cover_lower_rows", record);
+                if (!resize_stages.empty()) {
+                    const auto& previous = resize_stages.back();
+                    const bool portrait = name == "resize-portrait-return";
+                    matching = matching && check(portrait ? scalar(record, "rows") > scalar(previous, "rows")
+                                                 : scalar(record, "rows") < scalar(previous, "rows"),
+                                                 "resize_row_direction_mismatch", record, &previous) &&
+                               check_fields(record, previous, {"dataset_identity", "columns", "first_row"},
+                                            "resize_changed_gallery_identity");
+                }
+            }
+            valid = valid && matching;
+            if (matching) resize_stages.push_back(record);
+            clear_last_draw(record);
+            return;
+        }
         if (name == "away-return") {
             const bool matching = check(!away_return, "away_return_repeated", record) && source_stage_matches_draw(record);
             valid = valid && matching;
@@ -3961,6 +3987,15 @@ struct BrowserAudit final {
     std::uint64_t final_cursor_slot_count = 0U;
     bool benchmark_purple = false;
     bool model_copy = false;
+    std::set<std::string> explore_integer_controls;
+    bool explore_integer_precision = false;
+    std::string explore_seed_control;
+    std::uint64_t explore_seed_target = 0U;
+    std::optional<nlohmann::json> explore_paste_baseline;
+    std::optional<nlohmann::json> explore_paste_value;
+    bool explore_paste_restored = false;
+    std::set<std::uint64_t> detail_resize_measurements;
+    std::set<std::string> measured_resize_returns;
     bool spinnerless_integer = false;
     bool spinnerless_floating = false;
     bool advanced_integer_persisted = false;
@@ -4383,6 +4418,42 @@ struct BrowserAudit final {
         } else if (event == "integration.model_copy") {
             model_copy = record.value("control", "") == TRAIN_MODEL_CARD && record.value("detail", "") == "RF-DETR Weights" &&
                          numeric(record, "a") == 1.0;
+        } else if (event == "integration.explore_integer") {
+            if (scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U) {
+                const auto control = record.value("control", "");
+                explore_integer_controls.insert(control);
+                const auto target = scalar(record, "detail");
+                if (target == (std::uint64_t{1} << 53U) + 1U || target == (std::uint64_t{1} << 53U) + 3U) {
+                    explore_integer_precision = true;
+                    explore_seed_control = control;
+                    explore_seed_target = target;
+                }
+            }
+        } else if (event == "integration.explore_integer_paste_baseline") {
+            if (!explore_seed_control.empty() && record.value("control", "") == explore_seed_control &&
+                scalar(record, "detail") != explore_seed_target &&
+                scalar(record, "a") != 0U && scalar(record, "c") == 1U && scalar(record, "d") == 1U)
+                explore_paste_baseline = record;
+        } else if (event == "integration.explore_integer_paste") {
+            if (explore_paste_baseline && record.value("control", "") == explore_seed_control &&
+                scalar(record, "detail") == explore_seed_target &&
+                scalar(record, "a") == scalar(*explore_paste_baseline, "a") && scalar(record, "b") > scalar(record, "a") &&
+                scalar(record, "c") == 1U && scalar(record, "d") == 1U)
+                explore_paste_value = record;
+        } else if (event == "integration.explore_integer_paste_restored") {
+            explore_paste_restored = explore_paste_baseline && explore_paste_value &&
+                record.value("control", "") == explore_seed_control &&
+                scalar(record, "detail") == scalar(*explore_paste_baseline, "detail") &&
+                scalar(record, "a") == scalar(*explore_paste_value, "b") && scalar(record, "b") > scalar(record, "a") &&
+                scalar(record, "c") == 1U && scalar(record, "d") == 1U;
+        } else if (event == "integration.atlas_resize_measured") {
+            if (record.value("detail", "") == "detail-layout" && numeric(record, "b") > 0.0 &&
+                numeric(record, "c") > 0.0 && scalar(record, "d") == 1U)
+                detail_resize_measurements.insert(scalar(record, "a"));
+        } else if (event == "integration.atlas_resize") {
+            if (numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && scalar(record, "c") > 0U &&
+                scalar(record, "d") >= scalar(record, "c"))
+                measured_resize_returns.insert(record.value("detail", ""));
         } else if (event == "integration.spinnerless") {
             const bool valid = numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0 && numeric(record, "d") == 1.0;
             if (record.value("detail", "") == "integer-upper-lower-edges")
@@ -5072,6 +5143,8 @@ struct BrowserAudit final {
             "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement",
             primary_action_geometry, "primary action geometry", reference_columns, "workflow column geometry", vertical_composition,
             "workflow vertical composition", advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls",
+            explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression",
+            explore_paste_restored, "Explore clipboard paste persistence and restoration",
             spinnerless_integer, "integer spinner suppression", spinnerless_floating, "floating spinner suppression",
             advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence",
             compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
@@ -6408,6 +6481,12 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK_FALSE(browser.atlas_scaled_frames.empty());
             CHECK(browser.atlas_native_capacity);
             CHECK(browser.atlas_draws.return_round_trip);
+            CHECK(browser.atlas_draws.resize_stages.size() == 3U);
+            CHECK((browser.detail_resize_measurements == std::set<std::uint64_t>{0U, 1U, 2U, 3U}));
+            CHECK((browser.measured_resize_returns == std::set<std::string>{"landscape", "portrait-return", "landscape-return"}));
+            CHECK(browser.explore_integer_controls.size() == 5U);
+            CHECK(browser.explore_integer_precision);
+            CHECK(browser.explore_paste_restored);
             if (profile_ == "retained") {
                 REQUIRE(visible_read_held.has_value());
                 REQUIRE(visible_read_released);
@@ -7988,6 +8067,33 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
     };
     record["image"] = record["bounds"];
     return record;
+}
+
+TEST_CASE("Explore clipboard evidence requires an exact seed and authoritative restoration", "[workspace][audit]") {
+    for (const std::string_view defect : {"none", "alternate", "target-mismatch", "baseline-collision", "typed-only", "rounded", "control", "persistence", "baseline", "revision"}) {
+        INFO(defect);
+        BrowserAudit audit;
+        const auto entry = [](const char* event, const char* value, const std::uint64_t before, const std::uint64_t after) {
+            return nlohmann::json{{"event", event}, {"control", "seed-field"}, {"detail", value},
+                                  {"a", before}, {"b", after}, {"c", 1U}, {"d", 1U}};
+        };
+        const auto* target = defect == "alternate" ? "9007199254740995" : "9007199254740993";
+        const auto* baseline = defect == "alternate" || defect == "baseline-collision" ? "9007199254740993" : "73";
+        audit.consume(entry("integration.explore_integer", target, 1U, 2U));
+        audit.consume(entry("integration.explore_integer_paste_baseline", baseline, 3U, 0U));
+        auto pasted = entry("integration.explore_integer_paste", target, 3U, 4U);
+        if (defect == "target-mismatch") pasted["detail"] = "9007199254740995";
+        if (defect == "rounded") pasted["detail"] = "9007199254740992";
+        if (defect == "control") pasted["control"] = "another-field";
+        if (defect == "persistence") pasted["d"] = 0U;
+        if (defect != "typed-only") audit.consume(pasted);
+        auto restored = entry("integration.explore_integer_paste_restored", baseline, 4U, 5U);
+        if (defect == "baseline") restored["detail"] = "74";
+        if (defect == "revision") restored["b"] = 4U;
+        audit.consume(restored);
+        CHECK(audit.explore_integer_precision);
+        CHECK(audit.explore_paste_restored == (defect == "none" || defect == "alternate"));
+    }
 }
 
 TEST_CASE("initial atlas completion requires nonblack canvas pixels for the exact publication", "[workspace][audit]") {

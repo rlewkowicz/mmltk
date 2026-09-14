@@ -104,12 +104,15 @@ pub(super) fn update(
             maximum_extent,
             columns,
         } => {
+            // The retained sensor also measures beneath Detail. Returning to
+            // Gallery reconciles this geometry through the ordinary native event.
+            let changed = state.measure_gallery(size.width, size.height, maximum_extent, columns);
             let Some(snapshot) =
                 snapshot.filter(|value| value.mode == crate::generated::ExploreMode::Gallery)
             else {
                 return Ok(None);
             };
-            if !state.measure_gallery(size.width, size.height, maximum_extent, columns) {
+            if !changed {
                 return Ok(None);
             }
             let Some(request) = state.measured_layout_request(
@@ -771,6 +774,27 @@ mod tests {
             .measured_layout_request(Some(&snapshot), 3, snapshot.order.matchingcount)
             .unwrap();
         assert_eq!(reopened.viewport.firstrow, 0);
+    }
+
+    #[test]
+    fn measurements_retain_capacity_without_native_state_and_deduplicate_when_available() {
+        let mut state = state::State::default();
+        let mut settings = SettingsModel::default();
+        let mut snapshot = explore_snapshot();
+        snapshot.ready = true;
+        snapshot.mode = crate::generated::ExploreMode::Gallery;
+        snapshot.order.matchingcount = 127;
+        let measurement = |height| Message::Measured {
+            size: Size::new(601.5, 420.25),
+            maximum_extent: crate::generated::VisualExtent { width: 1024, height },
+            columns: 4,
+        };
+        assert!(update(&mut state, None, &mut settings, measurement(0)).unwrap().is_none());
+        assert_eq!(state.gallery_size(), Some(Size::new(601.5, 420.25)));
+        assert!(state.measured_layout_request(Some(&snapshot), 4, 127).is_none());
+        assert!(matches!(update(&mut state, Some(&snapshot), &mut settings, measurement(1024)).unwrap(),
+            Some(Outcome::ViewportChanged(_))));
+        assert!(update(&mut state, Some(&snapshot), &mut settings, measurement(1024)).unwrap().is_none());
     }
 
     #[test]

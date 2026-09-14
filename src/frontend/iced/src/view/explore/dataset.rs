@@ -277,7 +277,7 @@ pub(super) fn view<'a>(
             )
             .label("Require masks")
             .on_toggle_maybe(mutation_available.then_some(Message::RequireMasksToggled)),
-            bounded_value(
+            instance_number(
                 "Minimum instances",
                 filter
                     .as_ref()
@@ -308,6 +308,7 @@ pub(super) fn view<'a>(
             .id(super::ORDER_CONTROL_ID),
             labeled_number(
                 "Shuffle seed",
+                crate::generated::constraint_workflowsexploreshuffleseed().stable_field_id,
                 filter
                     .as_ref()
                     .map_or(0, |request| request.filter.shuffleseed),
@@ -319,6 +320,7 @@ pub(super) fn view<'a>(
                 column![
                     labeled_number(
                         "First compiled index",
+                        crate::generated::constraint_workflowsexploremincompiledindex().stable_field_id,
                         filter
                             .as_ref()
                             .map_or(0, |request| request.filter.minimumcompiledindex)
@@ -329,6 +331,7 @@ pub(super) fn view<'a>(
                     ),
                     labeled_number(
                         "Last compiled index",
+                        crate::generated::constraint_workflowsexploremaxcompiledindex().stable_field_id,
                         filter
                             .as_ref()
                             .map_or(last_compiled_index, |request| request
@@ -353,7 +356,7 @@ pub(super) fn view<'a>(
                 .spacing(5)
             )
             .id(super::RANGE_CONTROL_ID),
-            bounded_value(
+            instance_number(
                 "Maximum instances",
                 filter
                     .as_ref()
@@ -451,6 +454,7 @@ pub(super) fn toggle_selection(
 
 fn labeled_number(
     label: &'static str,
+    id: u64,
     value: u64,
     maximum: u64,
     available: bool,
@@ -458,6 +462,8 @@ fn labeled_number(
 ) -> Element<'static, Message> {
     let input: Element<'static, Message> = if available {
         iced_aw::number_input(&value, 0..=maximum, message)
+            .id(id.to_string())
+            .ignore_buttons(true)
             .ignore_scroll(true)
             .width(Fill)
             .into()
@@ -483,7 +489,7 @@ fn order_button(
         .into()
 }
 
-fn bounded_value<'a>(
+fn instance_number<'a>(
     label: &'static str,
     value: u32,
     constraint: crate::generated::SettingsLeafConstraint,
@@ -496,12 +502,17 @@ fn bounded_value<'a>(
         .filter(|value| value.is_finite() && *value >= minimum as f64)
         .map_or(u32::MAX, |value| value as u32);
     let input: Element<'a, Message> = if available {
-        iced::widget::slider(minimum..=maximum, value, on_change).into()
+        iced_aw::number_input(&value, minimum..=maximum, on_change)
+            .id(constraint.stable_field_id.to_string())
+            .ignore_buttons(true)
+            .ignore_scroll(true)
+            .width(Fill)
+            .into()
     } else {
         text("Available after Explore is ready").size(11).into()
     };
     column![
-        row![text(label), space::horizontal(), text(value)].align_y(Center),
+        text(label),
         input,
     ]
     .spacing(3)
@@ -598,6 +609,38 @@ mod tests {
             panic!("range request");
         };
         assert_eq!(range.filter.maximumcompiledindex, 19);
+    }
+
+    #[test]
+    fn integer_filter_edits_preserve_unsigned_precision_and_crossed_bounds() {
+        let mut settings = installed_settings_model();
+        let mut model = ready_explore_model();
+        let state = super::super::state::State::default();
+        for value in [(1_u64 << 53) + 1, u64::MAX - 1, u64::MAX] {
+            for message in [Message::ShuffleSeedChanged(value), Message::MaximumCompiledIndexChanged(value)] {
+                let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, message.clone()).unwrap()
+                else { panic!("typed filter request"); };
+                assert_eq!(match message {
+                    Message::ShuffleSeedChanged(_) => request.filter.shuffleseed,
+                    _ => request.filter.maximumcompiledindex,
+                }, value);
+            }
+        }
+        model.snapshot.as_mut().unwrap().filter.minimuminstances = 4;
+        model.snapshot.as_mut().unwrap().filter.maximuminstances = 8;
+        for (message, minimum, maximum) in [
+            (Message::MinimumInstancesChanged(10_000), 8, 8),
+            (Message::MaximumInstancesChanged(0), 4, 4),
+            (Message::MinimumInstancesChanged(0), 0, 8),
+            (Message::MaximumInstancesChanged(10_000), 4, 10_000),
+        ] {
+            let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, message).unwrap()
+            else { panic!("typed filter request"); };
+            assert_eq!((request.filter.minimuminstances, request.filter.maximuminstances), (minimum, maximum));
+        }
+        let Outcome::FilterEdited(request) = update(&state, &model, &mut settings, Message::UnlimitedCompiledIndex).unwrap()
+        else { panic!("typed filter request"); };
+        assert_eq!(request.filter.maximumcompiledindex, u64::MAX);
     }
 
     #[test]
