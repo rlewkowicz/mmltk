@@ -238,7 +238,7 @@ standalone evidence-audit cases.
 
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
-| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls, cached and held-miss gallery/detail returns, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy, FPS, rapid changes, then SIGINT |
+| `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -268,6 +268,31 @@ after the typed release, including selection/hover on known pending cells.
 Native controlled fixtures separately establish disk/GPU admission priority;
 completion order alone cannot establish that priority.
 
+The Detail-open resize sequence makes repeated canvas layout changes in each
+orientation, observes retained gallery measurements while Detail is still
+open, and closes Detail through the ordinary component action. Acceptance
+requires the reconciled viewport, paired completed atlas draw, visible ready
+cells, and coverage of newly visible lower rows. The driver changes only
+temporary inline canvas dimensions so the normal resize observer runs; it
+restores the original dimensions before subsequent scenarios.
+
+The initial general UI scenario audits Explore's five dataset integer inputs:
+minimum/maximum instances, shuffle seed, and first/last compiled index. It
+checks both former spinner edges, wheel suppression, invalid unsigned text,
+typed updates, native settings persistence, and restoration. Shuffle seed
+typing and clipboard paste use a distinct exact value above `2^53`. Numeric
+key input advances across browser render frames so controlled input values
+can update between digits; later rapid-resize coverage does not repeat this
+numeric audit.
+
+Annotate acceptance checks the [shared page composition](gui-interaction.md#workflow-layout-and-navigation)
+at wide and narrow logical widths, the Timeline's Advanced placement, and
+fully visible controls after page and horizontal scrolling. It adds 32 objects
+and 32 classes through settled native edits, then checks the last entries and
+wrapped labels within the right column. Reveal operations remeasure bounds
+after scrolling and allow for whole-pixel scroll translation; canvas gestures
+continue to use the full image geometry and visible source region.
+
 The physical ledger distinguishes native source allocations from retained
 browser arenas and requires each exact acquisition, transfer, mode-specific
 settlement receipt, encoded/submitted draw, and final sample release. A
@@ -291,6 +316,12 @@ The ledger follows the negotiated mode: direct acquisitions retain the native
 source until actual GPU read settlement; copied samples require physical copy
 completion. Unacquired offers require no read receipt. Per-card and full-frame
 probes check pixels independently of allocation and submission facts.
+Canvas atlas probes sample bounded patches inside the actual clipped visible
+tile interiors from one canvas snapshot, retaining the exact draw receipt and
+physical coordinates. Annotation pixel checks independently verify
+downsampled colored geometry against the fixture's known uniform background.
+The [rendered evidence reference](logging.md#rendered-ui-acceptance-evidence)
+describes these records and their sampling limits.
 Use the [Vulkan log queries](logging.md#vulkan-diagnostics-and-descriptor-provenance)
 for validation-layer output. A controlled window close and an intentional
 process loss have different terminal evidence; process exit alone does not
@@ -300,6 +331,18 @@ See [headless details](headless-wayland.md) for compositor readiness,
 shutdown, and virtual-output limits. The [logging guide](logging.md#delivery-and-acceptance-ownership)
 owns diagnostic delivery and artifact-family layout. Query one captured run
 at a time.
+
+### Synthetic clipboard input
+
+The packaged harness sets `MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION=1`.
+Firefox's existing exact-value gate allows synthetic acceptance input to use
+the DOM clipboard without transient user activation and the parent clipboard
+without confirmation. Both
+[Clipboard.cpp](../third_party/firefox/dom/events/Clipboard.cpp) and
+[nsBaseClipboard.cpp](../third_party/firefox/widget/nsBaseClipboard.cpp)
+apply that gate. The integer paste scenario still uses the rendered widget's
+ordinary paste shortcut and verifies the resulting native value. Normal GUI
+sessions retain ordinary clipboard permissions.
 
 ## GUI behavior and evidence ownership
 
@@ -312,8 +355,8 @@ at a time.
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `browser-app` | Shared immediate mouse input and transport retention, typed state reduction, component/crop identity, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/callback settlement |
-| `workspace-wayland` | Actual packaged interaction, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, rendered pixels, recovery, and shutdown |
+| `browser-app` | Shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
+| `workspace-wayland` | Actual packaged interaction, integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, rendered pixels, recovery, and shutdown |
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable

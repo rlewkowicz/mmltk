@@ -83,6 +83,15 @@ messages live in `app/`, `view/`, and the owning widgets. Use
 [generation commands](build.md#generated-bindings-and-dependency-maintenance)
 after changing the native schema.
 
+The shared [page canvas](../src/frontend/iced/src/view/mod.rs) and
+[workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs) own page
+width, scrolling, and ordinary column composition, including Annotate.
+[navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns visual order.
+[workflow/fields.rs](../src/frontend/iced/src/view/workflow/fields.rs) supplies
+typed numeric widgets; Explore's local controls retain their domain-specific
+filter editing. The [interaction guide](gui-interaction.md#workflow-layout-and-navigation)
+owns the layout and input policies.
+
 The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
 owns the current protocol, compact input representation, native command
 ordering, and state-publication details. The physical transport ring lives in

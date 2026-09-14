@@ -7,6 +7,55 @@ explains how input, native state, GPU images, and Iced views cross those
 boundaries. These paths are event-driven; they make no hard frame-rate or
 input-to-display latency guarantee.
 
+## Workflow layout and navigation
+
+The header order is **Train, Validate, Predict, Export, Live, Annotate,
+Explore**. [navigation.rs](../src/frontend/iced/src/view/navigation.rs) owns
+that visual order; ordinary workflow traversal derives from it, excluding
+Explore.
+
+The [page canvas](../src/frontend/iced/src/view/mod.rs) is at least 1020 logical
+pixels wide and centers a page of at most 1500 logical pixels. A narrower
+window exposes horizontal scrolling. Ordinary workflows use one vertical page
+scroll beneath the header; Explore retains its gallery and sidebar scroll
+owners.
+
+The shared [workflow compositor](../src/frontend/iced/src/view/workflow/mod.rs)
+assigns 19% of page width to setup, 62% to the workspace with Advanced below,
+and 19% to tools/status. Annotate uses those same columns:
+
+| Left: setup | Center: workspace and Advanced | Right: tools and status |
+| --- | --- | --- |
+| Source, output destination, Open, Save annotations | Viewer controls and image; Timeline in Advanced underneath | Tools, objects, classes, editing controls, operation status, Stop |
+
+[Annotate](../src/frontend/iced/src/view/annotation.rs) supplies these regions
+to the compositor. Its [sidebar](../src/frontend/iced/src/view/annotation/sidebar.rs)
+keeps tools, object/class lists, and long labels within the right column.
+Those lists grow with the page's vertical content; Annotate has no separate
+compact layout or nested inspector, object, or class scroll area. Viewer and
+editor widget identities survive ordinary layout and native-state updates.
+
+## Numeric editing
+
+Application integer inputs omit increment/decrement buttons and ignore wheel
+mutation. Keyboard editing, selection, paste, and bounded arrow-key adjustment
+remain available. The shared
+[numeric fields](../src/frontend/iced/src/view/workflow/fields.rs) retain their
+generated signed or unsigned type, field identity, and native constraints;
+integer values do not round through floating-point text conversion.
+
+Explore's [dataset controls](../src/frontend/iced/src/view/explore/dataset.rs)
+show Minimum instances and Maximum instances as labeled, full-width integer
+inputs. Both retain the native 0–10,000 range. Raising the minimum past the
+current maximum stops at that maximum; lowering the maximum past the current
+minimum stops at that minimum. Shuffle seed and compiled-index inputs retain
+their exact `u64` values and existing range/unlimited policy.
+
+These filter inputs remain mounted with stable native field identities when
+mutation is temporarily unavailable. Disabling their input callback preserves
+focus through pending filter admission and settlement. Settings and filters
+still use their owning typed mutation paths.
+
 ## Typed application boundary
 
 The current application package protocol is **17**. Canonical C++ declarations
@@ -276,6 +325,14 @@ cache, priority, and physical atlas rules. The GUI includes every partially
 visible row in demand. Its measured viewport may alternate between N and N+1
 rows while card raster extent remains unchanged.
 
+The retained gallery sensor continues measuring beneath Detail. The component
+records the latest size, native capacity, column count, scroll row, and row
+fraction independently of the current Gallery/Detail mode. Measurements alone
+do not submit gallery viewport changes while Detail is open. Returning to
+Gallery reconciles the retained measurement through the ordinary native-state
+event path, including repeated landscape-to-portrait and portrait-to-landscape
+changes, without requiring another resize or scroll.
+
 Explore retains independent completed gallery and detail handles in its shared
 output pool. An unchanged return selects the real retained gallery product
 revision under a newer domain observation. Changed requirements
@@ -295,6 +352,11 @@ A known placeholder cell already has a compiled-image identity. Hover and
 selection remain available before its thumbnail is ready; readiness controls
 pixels and labels. Blank padding in a partial final row has no selectable
 image. Same-image detail revisions preserve pan/zoom and widget identity.
+
+When the displayed gallery's paired metadata has zero matching samples, an
+opaque workspace-background overlay shows “No samples match the filters” and
+covers the empty atlas tiles. The underlying native empty-gallery publication,
+paired metadata, encoded draw, and resource custody remain intact.
 
 Gallery and Detail Labels use the current local checkbox state over the labels
 and geometry paired with the displayed image. A label-only toggle needs no new

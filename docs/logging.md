@@ -204,6 +204,56 @@ replace these draw and lifetime records. The
 [FPS behavior](gui-interaction.md#browser-redraws-and-fps) and asynchronous
 acceptance canvas probe have separate activation and ownership.
 
+## Rendered UI acceptance evidence
+
+The opt-in [browser driver](../src/frontend/iced/src/integration_control.rs),
+its [JavaScript adapter](../src/frontend/iced/src/integration_control/browser.mjs),
+and the independent [native audit](../src/acceptance/tests/workspace_wayland_integration.test.cpp)
+record UI interaction and pixels separately from physical resource custody:
+
+| Records | Evidence |
+| --- | --- |
+| `integration.atlas_resize_measured`, `integration.atlas_resize` | Gallery measurements retained beneath Detail, then required/actual rows after each completed resized return |
+| `integration.atlas_ready_cell`, `integration.atlas_canvas_sample` | Exact drawn gallery identity, compiled image, selected canvas coordinates, patch counts, and sampled color |
+| `integration.explore_integer`, `integration.explore_integer_paste_baseline`, `integration.explore_integer_paste`, `integration.explore_integer_paste_restored` | Exact decimal integer values, native revision progression, typing/paste persistence, and restoration |
+| `integration.number_replace`, `integration.number_paste`, `integration.number_key_stage` | Synthetic focus, selection, modifier, and key-delivery stages; delivery alone does not prove native persistence |
+| `integration.annotation_layout`, `integration.annotation_reachable`, `integration.annotation_tail` | Shared columns, wide/narrow viewport behavior, fully revealed controls, and long-list final entries |
+| `integration.annotation_pixel` | Native geometry/palette expectation and actual canvas pixel at the current image scale |
+
+```bash
+./mmltk --logs --family latest-wayland-test \
+  -q '@event:integration.explore_integer OR @event:integration.number_' \
+  --format timeline --limit 60
+./mmltk --logs --family latest-wayland-test \
+  -q '@event:integration.atlas_resize OR @event=integration.atlas_ready_cell' \
+  --format jsonl --limit 40
+```
+
+Atlas canvas sampling uses one snapshot of the current canvas. For each ready
+tile, its interior is intersected with the actual draw clip; at most nine
+patches of up to 8×8 pixels are inspected there. The selected patch retains
+physical `canvas_x`/`canvas_y`, `sampled_pixels`, `colored_pixels`, and
+`cell_sample_rgba`. `cell_sample_x` and `cell_sample_y` express its center in
+thousandths of a native card pixel. Offscreen pixels cannot satisfy the check,
+and sparse patches do not establish every pixel of an image. Draw receipt,
+paired metadata, compiled-image identity, and native pixel evidence remain
+separate required facts.
+
+The annotation pixel fixture has uniform RGB `(48, 80, 112)` background.
+For downsampled colored geometry, the browser sampler and native audit each
+accept their color comparison or a bounded blend of the expected color over
+that background, with consistent coverage across all three channels.
+Solid controls and class swatches retain direct RGB comparisons with a
+tolerance of three intensity levels per channel.
+
+The native acceptance audit bounds retained Explore diagnostic snapshots at
+256 to accommodate admission and completion observations during numeric
+entry. This is evidence storage, not application ordering or graphics state.
+Clipboard acceptance and its opt-in permission gate are documented in
+[validation](validation.md#synthetic-clipboard-input). Enabled harness captures
+include Mozilla `Clipboard` and `WidgetClipboard` module logs alongside the
+existing graphics modules.
+
 ## Start with a bounded investigation
 
 ```bash

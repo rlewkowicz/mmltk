@@ -14,8 +14,10 @@
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
   generated boundaries, frontend components, and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
-  formats, shared immediate mouse input, native command settlement, paired image
-  geometry, direct/copy acquisition, retained redraws, FPS, and resource lifetime.
+  formats, workflow layout and navigation, numeric editing, shared immediate
+  mouse input, native command settlement, retained Explore measurements, paired
+  image geometry, direct/copy acquisition, retained redraws, FPS, and resource
+  lifetime.
 
 ## Data and backend systems
 
@@ -29,11 +31,13 @@
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): tidy, cleanup, test selection, standalone
-  CUDA/Vulkan diagnostics, retained browser acceptance, evidence, and debugging.
+  CUDA/Vulkan diagnostics, rendered layout/input and retained browser acceptance,
+  evidence, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): explicit diagnostic activation, pixel probes, artifact
-  ownership, nested-field queries, Vulkan/FD provenance, correlation, and triage.
+  ownership, rendered UI evidence, nested-field queries, Vulkan/FD provenance,
+  correlation, and triage.
 - [Planned work](roadmap.md): future directions rather than current capability.
 
 `CONTRACT.md` owns high-level architecture and component handoffs. This wiki
