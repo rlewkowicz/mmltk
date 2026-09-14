@@ -565,30 +565,6 @@ std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_str
                              context);
 }
 
-int64_t batch_target_instance_count(const mmltk::backend::data::Batch& batch) {
-    int64_t total = 0;
-    for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
-        const uint32_t dataset_index = batch.image_indices[image_pos];
-        total += static_cast<int64_t>(batch.label_index[dataset_index].num_instances);
-    }
-    return total;
-}
-
-double resolve_num_boxes_value(int64_t num_boxes_int, const DetectionConfig& config, bool training_mode,
-                               const DistributedContext& distributed, const torch_api::Device& device) {
-    const int64_t group_detr = training_mode ? config.group_detr : 1;
-    if (!config.sum_group_losses) { num_boxes_int *= group_detr; }
-
-    double num_boxes_value =
-        std::max(static_cast<double>(num_boxes_int) / static_cast<double>(std::max<int64_t>(1, config.world_size)), 1.0);
-    if (!distributed.enabled) { return num_boxes_value; }
-
-    auto num_boxes =
-        torch_api::tensor({static_cast<float>(num_boxes_int)}, torch_api::TensorOptions().dtype(torch_api::kFloat32).device(device));
-    distributed_all_reduce_tensor(distributed, num_boxes);
-    return torch_api::clamp_min(num_boxes.div(std::max<int64_t>(1, config.world_size)), 1.0).item<double>();
-}
-
 void wait_for_lane_result(TrainLaneResult& lane_result, int device_id) {
     if (!lane_result.ready_event) { throw std::runtime_error("parallel RF-DETR train result is missing a completion event"); }
     lane_result.ready_event->wait(reinterpret_cast<std::uintptr_t>(
@@ -1520,11 +1496,11 @@ void average_gradients(const DistributedContext& distributed, const std::vector<
 std::future<TrainLaneResult> enqueue_train_lane(
     mmltk::common::concurrency::WorkerPool& lane_pool, RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader,
     TrainLaneContext& lane, const mmltk::backend::data::Batch& batch, const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
-    mmltk::backend::ml::cuda::CudaEventPool& event_pool, double num_boxes_value, double scaled_loss_factor, size_t parameter_version,
+    mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
     const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height, int image_width,
     std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled, torch_api::ScalarType autocast_dtype,
     TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
-    return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, num_boxes_value, scaled_loss_factor,
+    return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, scaled_loss_factor,
                               parameter_version, &detection_config, &model, device_id, image_height, image_width, seed, epoch, rank,
                               augmentation_sequence, amp_enabled, autocast_dtype, route, wave_normalizer = std::move(wave_normalizer),
                               lane_index]() mutable {
@@ -1550,7 +1526,8 @@ std::future<TrainLaneResult> enqueue_train_lane(
                                   device_id, lane.target_scratch, "train", model.config().num_queries, model.config().training_supervision,
                                   model.config().num_classes - 1, &lane.augmenter->batch_plan());
             }
-            if (wave_normalizer) { wave_normalizer->publish(lane_index, prepared_target_count(prepared)); }
+            const auto target_count = prepared_target_count(prepared);
+            if (wave_normalizer) { wave_normalizer->publish(lane_index, target_count); }
             batch_guard.set_consumer_stream(lane.augmenter->prepare_batch_consumer());
             static_cast<void>(lane.augmenter->finish_batch(batch));
             batch_guard.release();
@@ -1600,10 +1577,10 @@ std::future<TrainLaneResult> enqueue_train_lane(
                         "rfdetr.train.parallel.targets_handoff"};
                     target_consumer.handoff();
                 }
-                if (route_is_active(route)) {
+                if (route_is_active(route) || wave_normalizer) {
                     if (!wave_normalizer) { throw std::runtime_error("active RF-DETR lane is missing its wave target normalizer"); }
                     auto normalizer = wave_normalizer->consume(lane_index, lane.stream.stream());
-                    SupervisionTimingLease criterion_timing(lane_owner, true, SupervisionTimingLease::Kind::Criterion);
+                    SupervisionTimingLease criterion_timing(lane_owner, route_is_active(route), SupervisionTimingLease::Kind::Criterion);
                     // CLEANUP-IGNORE: The parallel lane unpacks into detached gradient work owned by this lane.
                     auto routed = compute_routed_training_loss(*lane.model, route, outputs, prepared, normalizer, detection_config);
                     criterion_timing.finish();
@@ -1613,6 +1590,9 @@ std::future<TrainLaneResult> enqueue_train_lane(
                     loss_dict = std::move(routed.ordinary_terms);
                 } else {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_dict{"rfdetr.train.parallel.loss_dict"};
+                    const double group_divisor = detection_config.sum_group_losses ? 1.0 : detection_config.group_detr;
+                    const double num_boxes_value =
+                        std::max(static_cast<double>(target_count) * group_divisor / std::max<int64_t>(1, detection_config.world_size), 1.0);
                     loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, num_boxes_value);
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_total{"rfdetr.train.parallel.loss_total"};
                     loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
@@ -2070,10 +2050,6 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         }
         const std::size_t stored_queries =
             checked_cast<std::size_t>(resume_checkpoint.metadata.num_queries, "resume checkpoint query count exceeds size_t");
-        if (stored_queries < required_query_limit.as_size) {
-            throw std::runtime_error("resume checkpoint query count " + std::to_string(stored_queries) +
-                                     " does not cover the dataset-derived requirement " + std::to_string(required_query_limit.as_size));
-        }
         if (dataset_limits.requested_override && requested_query_limit.as_size != stored_queries) {
             throw std::runtime_error("resume preserves checkpoint query count " + std::to_string(stored_queries) +
                                      "; requested query override resolves to " + std::to_string(requested_query_limit.as_size));
@@ -2645,7 +2621,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 const double current_scale = grad_scaler.enabled() ? static_cast<double>(grad_scaler.current_scale()) : 1.0;
                 const double scaled_loss_factor =
                     current_scale / static_cast<double>(micro_batches_per_optimizer_step(options, train_lane_count));
-                ParallelTrainingWave<TrainLaneResult> wave(static_cast<std::size_t>(train_lane_count), route_is_active(training_route),
+                ParallelTrainingWave<TrainLaneResult> wave(static_cast<std::size_t>(train_lane_count),
+                                                           route_is_active(training_route) || distributed.enabled,
                                                            options.device_id, distributed);
 
                 for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
@@ -2656,13 +2633,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
 
                     auto& lane = train_lanes[static_cast<size_t>(lane_index)];
 
-                    const double num_boxes_value = route_is_active(training_route)
-                                                       ? 0.0
-                                                       : resolve_num_boxes_value(batch_target_instance_count(*batch), detection_config,
-                                                                                 true, distributed, cuda_device(options.device_id));
                     wave.add(enqueue_train_lane(
                         *train_lane_pool, &train_runtime, train_loader, lane, *batch, params_ready ? &*params_ready : nullptr,
-                        training_events.pool(), num_boxes_value, scaled_loss_factor, parameter_version, detection_config, model,
+                        training_events.pool(), scaled_loss_factor, parameter_version, detection_config, model,
                         options.device_id, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()),
                         static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1, amp_enabled,
                         autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));

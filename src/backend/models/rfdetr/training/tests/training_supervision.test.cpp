@@ -966,6 +966,19 @@ void test_copy_paste_ring_support_and_cache_cycles() {
             if (fixture_contains(ring_runs, p % 8, p / 8)) expected[7] |= 1ULL << p;
         check_copy_paste_targets(targets, expected, preview, points);
         CHECK(targets.packed_masks.has_value() == include_masks);
+        lease.retire();
+
+        // The first source lies in the ring's hole and survives its pasted donor:
+        // augmentation grows one admitted target into two with one ordinary query.
+        const std::array<mmltk::backend::data::LabelIndexEntry, 1> one_source{{{0, 1, 0}}};
+        batch.label_index = one_source.data();
+        auto grown = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 1,
+                                           rfdetr::TrainingSupervisionConfig{}, 8, &plan);
+        rfdetr::TargetConsumerLease grown_lease(scratch, grown, 0);
+        grown_lease.handoff();
+        REQUIRE(grown.counts == std::vector<int64_t>{2});
+        REQUIRE(torch_api::equal(grown.all_labels.cpu(), torch_api::tensor({0, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64))));
+        batch.label_index = entries.data();
     }
 }
 
@@ -1250,6 +1263,26 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     fixture.num_images = 12;
     mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
     {
+        const auto annotated =
+            std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000011.jsonl";
+        std::ifstream input(annotated);
+        std::string annotation;
+        REQUIRE(static_cast<bool>(std::getline(input, annotation)));
+        input.close();
+        std::ofstream output(annotated, std::ios::app);
+        REQUIRE(output.good());
+        for (int additional = 0; additional < 3; ++additional) output << annotation << '\n';
+        // Distinct source identities keep both lane caches populated and permit
+        // deterministic copy-paste between over-capacity images. Images 9, 10,
+        // and 12 remain empty so all routes still exercise mixed batches.
+        for (int image_index = 1; image_index <= 8; ++image_index) {
+            const auto destination = annotated.parent_path() / ("00000" + std::to_string(image_index) + ".jsonl");
+            std::ofstream annotations(destination, std::ios::trunc);
+            REQUIRE(annotations.good());
+            for (int instance = 0; instance < 4; ++instance) annotations << annotation << '\n';
+        }
+    }
+    {
         const auto second_annotated =
             std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000012.jsonl";
         std::ofstream clear_annotations(second_annotated, std::ios::trunc);
@@ -1267,6 +1300,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
     config.resolution = 64;
     config.num_classes = 2;
+    config.num_queries = 2;
+    config.num_select = 2;
     config.segmentation = false;
     rfdetr::NativeRfDetrModel seed_model(config);
     rfdetr::DecodedNativeModelState checkpoint;
@@ -1324,6 +1359,9 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 request.gpu_augmentation.enabled = true;
                 request.gpu_augmentation.copy_paste_probability = 1.0F;
             }
+            if (route_index == 0 && lanes == 2) {
+                request.gpu_augmentation = rfdetr::test_support::isolated_augmentation_config(1.0F);
+            }
             request.training_supervision = routes[route_index];
             const auto result = rfdetr::run_training(request);
             REQUIRE(result.history.size() == 1);
@@ -1351,6 +1389,9 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 REQUIRE(resumed.history.size() == 1);
                 REQUIRE(resumed.last_epoch == 1);
                 REQUIRE(std::isfinite(resumed.history.front().train_loss));
+                REQUIRE(resumed.artifacts.config.num_queries == config.num_queries);
+                resume_request.num_queries = static_cast<std::size_t>(config.num_queries + 1);
+                REQUIRE_THROWS(rfdetr::run_training(resume_request));
             }
         }
     }
@@ -1383,6 +1424,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                     request.progress_bar = false;
                     request.validation_loss = true;
                     request.training_supervision = distributed_route;
+                    if (route_index == 0) { request.gpu_augmentation = rfdetr::test_support::isolated_augmentation_config(1.0F); }
                     request.distributed_worker = true;
                     request.distributed_rank = rank;
                     request.distributed_world_size = 2;

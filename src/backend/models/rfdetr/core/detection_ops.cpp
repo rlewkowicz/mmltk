@@ -770,6 +770,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
     }
     int64_t max_queries = 0;
     int64_t max_targets_per_image = 0;
+    int64_t assignment_extent = 0;
     std::vector<int64_t> layer_query_counts;
     layer_query_counts.reserve(layers.size());
     for (const auto& layer : layers) {
@@ -785,10 +786,12 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
         }
         const int64_t group_queries = layer_queries / group_detr;
         for (const int64_t target_count : targets.counts) {
-            if (target_count > group_queries) {
-                throw std::runtime_error("RF-DETR " + std::string(targets.split) + " target count " + std::to_string(target_count) +
-                                         " exceeds resolved query count " + std::to_string(targets.resolved_query_count));
-            }
+            // Each group solves a rectangular matrix; only its smaller side
+            // has written assignments. Multiplication is bounded by layer_queries.
+            const int64_t active_extent = std::min(group_queries, target_count) * group_detr;
+            if (active_extent > std::numeric_limits<int64_t>::max() - assignment_extent)
+                throw std::overflow_error("matcher assignment extent overflows");
+            assignment_extent += active_extent;
         }
         layer_query_counts.push_back(layer_queries);
         max_queries = std::max(max_queries, layer_queries);
@@ -828,15 +831,15 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
         }
     }
 
-    if (total_targets > std::numeric_limits<int64_t>::max() / group_detr / static_cast<int64_t>(layers.size()))
-        throw std::overflow_error("matcher assignment extent overflows");
-    const auto cpu_indices = workspace.cpu_indices(static_cast<int64_t>(layers.size()) * total_targets * group_detr);
+    const auto cpu_indices = workspace.cpu_indices(assignment_extent);
     std::vector<MatchIndices> all_indices(layers.size());
     int64_t offset = 0;
-    for (auto& layer_indices : all_indices) {
+    for (size_t layer_index = 0; layer_index < all_indices.size(); ++layer_index) {
+        auto& layer_indices = all_indices[layer_index];
+        const auto group_queries = layer_query_counts[layer_index] / group_detr;
         layer_indices.reserve(targets.targets.size());
         for (const auto count : targets.counts) {
-            const auto size = count * group_detr;
+            const auto size = std::min(group_queries, count) * group_detr;
             layer_indices.emplace_back(cpu_indices.select(0, 0).narrow(0, offset, size), cpu_indices.select(0, 1).narrow(0, offset, size));
             offset += size;
         }

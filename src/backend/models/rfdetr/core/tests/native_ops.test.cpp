@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 #include <catch2/generators/catch_generators.hpp>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -356,6 +357,89 @@ void test_matcher_sanitizes_nonfinite_costs() {
     assert_single_image_match_count(indices, 1);
 }
 
+void test_rectangular_matcher_layers_preserve_all_targets() {
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    const int64_t target_count = GENERATE(2, 300, 404);
+    const int64_t groups = GENERATE(1, 2);
+    auto config = make_config();
+    config.group_detr = static_cast<int>(groups);
+    config.dec_layers = 2;
+    rfdetr::populate_default_detection_weight_dict(config);
+    const auto float_options = torch_api::TensorOptions().dtype(torch_api::kFloat32);
+    const auto integer_options = float_options.dtype(torch_api::kInt64);
+    auto targets = make_single_image_targets(torch_api::full({target_count + 1, 4}, 0.2F, float_options),
+                                               torch_api::zeros({target_count + 1}, integer_options),
+                                               torch_api::ones({target_count + 1}, float_options));
+    targets.resolved_query_count = 300;
+    targets.counts = {0, target_count, 1};
+    targets.offsets = {0, 0, target_count};
+    targets.targets.resize(3);
+    for (size_t image = 0; image < targets.targets.size(); ++image) {
+        targets.targets[image].boxes = targets.all_boxes.narrow(0, targets.offsets[image], targets.counts[image]);
+        targets.targets[image].labels = targets.all_labels.narrow(0, targets.offsets[image], targets.counts[image]);
+    }
+    rfdetr::ModelOutputs outputs;
+    outputs.aux_outputs.resize(1);
+    outputs.enc_outputs.emplace();
+    const std::array layers{&outputs.main, &outputs.aux_outputs.front(), &*outputs.enc_outputs};
+    const std::array<int64_t, 3> query_counts{300, 150, 600};
+    std::vector<std::pair<torch_api::Tensor, torch_api::Tensor>> retained;
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        auto& layer = *layers[layer_index];
+        const int64_t queries = query_counts[layer_index];
+        layer.pred_logits = torch_api::zeros({3, queries, config.num_classes}, float_options.requires_grad(true));
+        layer.pred_boxes = torch_api::full({3, queries, 4}, 0.2F, float_options);
+        layer.pred_boxes.index_put_({Slice(), Slice(), 0}, 0.3F);
+        layer.pred_boxes.set_requires_grad(true);
+        rfdetr::ModelOutputs single;
+        single.main = layer;
+        const auto matches = rfdetr::matcher_indices(single, targets, config, true);
+        REQUIRE(matches.size() == 3);
+        for (size_t image = 0; image < matches.size(); ++image) {
+            const int64_t per_group = std::min(queries / groups, targets.counts[image]);
+            REQUIRE(matches[image].first.numel() == per_group * groups);
+            REQUIRE(matches[image].second.numel() == per_group * groups);
+            // SciPy's constant-cost rectangular assignment selects the diagonal
+            // in both orientations, then concatenates groups in query order.
+            const auto diagonal = torch_api::arange(per_group, integer_options);
+            for (int64_t group = 0; group < groups; ++group) {
+                REQUIRE(torch_api::equal(matches[image].first.narrow(0, group * per_group, per_group),
+                                           diagonal + group * (queries / groups)));
+                REQUIRE(torch_api::equal(matches[image].second.narrow(0, group * per_group, per_group), diagonal));
+            }
+        }
+        if (layer_index == 0) retained = matches;
+    }
+    const auto losses = rfdetr::detection_loss_dict(outputs, targets, config, true, false);
+    const std::array<std::string, 3> suffixes{"", "_0", "_enc"};
+    for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+        const auto matched = std::min(query_counts[layer_index] / groups, target_count) + 1;
+        const float expected = 0.1F * static_cast<float>(matched) / static_cast<float>(target_count + 1);
+        REQUIRE(std::fabs(losses.at("loss_bbox" + suffixes[layer_index]).item<float>() - expected) < 1.0e-5F);
+    }
+    const auto weighted = rfdetr::weighted_detection_loss(losses, config, torch_api::Device(torch_api::kCPU));
+    REQUIRE(torch_api::isfinite(weighted).item<bool>());
+    weighted.backward();
+    for (const auto* layer : layers) {
+        REQUIRE(torch_api::isfinite(layer->pred_logits.grad()).all().item<bool>());
+        REQUIRE(torch_api::isfinite(layer->pred_boxes.grad()).all().item<bool>());
+    }
+    const auto retained_count = std::min<int64_t>(300 / groups, target_count);
+    REQUIRE(torch_api::equal(retained[1].second, torch_api::arange(retained_count, integer_options).repeat({groups})));
+    REQUIRE(targets.all_labels.numel() == target_count + 1);
+    REQUIRE(targets.counts[1] == target_count);
+    if (target_count == 404) {
+        auto selected = outputs;
+        selected.main.pred_logits = outputs.main.pred_logits.detach().clone();
+        selected.main.pred_logits.index_put_({1, 0, 1}, 10.0F);
+        targets.all_labels.index_put_({403}, 1);
+        const auto last_target = rfdetr::matcher_indices(selected, targets, config, true);
+        REQUIRE(last_target[1].second.eq(403).any().item<bool>());
+    }
+    config.group_detr = 7;
+    REQUIRE_THROWS(rfdetr::matcher_indices(outputs, targets, config, true));
+}
+
 auto make_mask_loss_config(const int mask_point_sample_ratio = 4) {
     auto config = make_config();
     config.include_masks = true;
@@ -508,6 +592,7 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_and_losses)
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_batched_matcher_transfer_matches_single_layer_losses);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_multi_match_box_losses);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_sanitizes_nonfinite_costs);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_rectangular_matcher_layers_preserve_all_targets);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_cpu_mask_loss_uses_upstream_keys);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_sparse_mask_loss_matches_dense_reference);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_mask_cost_handles_zero_point_sampling_on_cuda);

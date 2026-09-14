@@ -782,10 +782,6 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
 
             offsets[image_pos] = image_offset;
             counts[image_pos] = total_instances - image_offset;
-            if (counts[image_pos] > resolved_query_count) {
-                throw std::runtime_error("RF-DETR " + std::string(split) + " target count " + std::to_string(counts[image_pos]) +
-                                         " exceeds resolved query count " + std::to_string(resolved_query_count));
-            }
             offset_values[static_cast<int64_t>(image_pos)] = image_offset;
             count_values[static_cast<int64_t>(image_pos)] = counts[image_pos];
         }

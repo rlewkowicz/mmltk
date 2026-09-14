@@ -81,6 +81,29 @@ TEST_CASE("Matcher assignment CPU projections share one immutable packed set", "
     REQUIRE(retained.flatten()[3].item<std::int64_t>() == 31);
 }
 
+TEST_CASE("Rectangular assignment packing uses full target offsets and retained active extents", "[rfdetr][matcher][numa]") {
+    const auto topology = mmltk::common::system::NumaTopology::Capture();
+    MatcherWorkspace workspace(topology.permitted_nodes.front(), true);
+    workspace.enable_statistics();
+    const auto rows = at::arange(300, at::TensorOptions().dtype(at::kLong));
+    const auto shorter_rows = rows.narrow(0, 0, 150);
+    const auto none = longs({});
+    const Indices rectangular{
+        {{rows, rows}, {none, none}, {longs({0}), longs({0})}},
+        {{shorter_rows, shorter_rows}, {none, none}, {longs({0}), longs({0})}},
+    };
+    const auto packed = workspace.pack(rectangular, {0, 404, 404}, at::Device(at::kCPU));
+    REQUIRE(packed[0].source.second.numel() == 301);
+    REQUIRE(packed[1].source.second.numel() == 151);
+    REQUIRE(packed[0].global_targets[300].item<int64_t>() == 404);
+    REQUIRE(packed[1].global_targets[150].item<int64_t>() == 404);
+    REQUIRE(workspace.statistics().assignment_bytes == (301 + 151) * 3 * sizeof(int64_t));
+    const auto next = workspace.pack(assignments(), {0, 2}, at::Device(at::kCPU));
+    REQUIRE(next[0].global_targets.numel() == 3);
+    REQUIRE(at::equal(packed[0].source.second.narrow(0, 0, 300), rows));
+    REQUIRE(at::equal(packed[1].global_targets.narrow(0, 0, 150), shorter_rows));
+}
+
 TEST_CASE("Matcher costs copy only compact active shapes after high-water growth", "[rfdetr][matcher][cuda][numa]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; active cost transfer remains unverified");

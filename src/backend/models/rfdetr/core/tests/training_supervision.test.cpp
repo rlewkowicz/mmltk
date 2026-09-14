@@ -352,6 +352,52 @@ void test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d() {
     REQUIRE(torch_api::allclose(result.dense, expected, 1.0e-6, 1.0e-6));
 }
 
+void test_rectangular_supervision_retains_404_targets_with_300_queries() {
+    auto config = match_free_config();
+    config.num_queries = 300;
+    config.num_select = 300;
+    config.training_supervision.denoising.enabled = true;
+    config.training_supervision.denoising.groups = 2;
+    rfdetr::TrainingSupervisionImpl supervision(config);
+    supervision.initialize(404);
+    const auto integers = torch_api::TensorOptions().dtype(torch_api::kInt64);
+    const auto targets = batched_targets({torch_api::full({404, 4}, 0.2F), torch_api::zeros({0, 4})},
+                                         {torch_api::zeros({404}, integers), torch_api::zeros({0}, integers)}, config.num_queries);
+    rfdetr::ModelOutputs outputs;
+    auto& layer = outputs.main;
+    layer.pred_logits = torch_api::zeros({2, 300, config.num_classes}).set_requires_grad(true);
+    layer.pred_boxes = torch_api::full({2, 300, 4}, 0.3F).set_requires_grad(true);
+    layer.query_features = torch_api::ones({2, 1, 300, config.hidden_dim}).set_requires_grad(true);
+    layer.query_layout = rfdetr::SupervisedQueryLayout{1, 300};
+    const auto labels = torch_api::zeros({2, 404}, integers);
+    const auto boxes = torch_api::full({2, 404, 4}, 0.2F);
+    auto valid = torch_api::ones({2, 404}, integers.dtype(torch_api::kBool));
+    valid.index_put_({1}, false);
+    const auto correspondence = supervision.correspondence(labels, boxes, valid, *layer.query_features);
+    REQUIRE(correspondence.dense.sizes().vec() == std::vector<int64_t>{2, 1, 404, 300});
+    REQUIRE(torch_api::allclose(correspondence.dense.index({0}).sum(-1), torch_api::ones({1, 404})));
+    REQUIRE(correspondence.sparse_normalized.index({1}).abs().sum().item<float>() == 0.0F);
+    const auto loss = supervision.loss(outputs, targets, {torch_api::tensor(404.0F)}, true);
+    REQUIRE(torch_api::isfinite(loss.total).item<bool>());
+    loss.total.backward();
+    require_finite_gradients({layer.pred_logits, layer.pred_boxes, *layer.query_features});
+    REQUIRE(layer.pred_logits.grad().index({1}).abs().sum().item<float>() == 0.0F);
+    REQUIRE(layer.pred_boxes.grad().index({1}).abs().sum().item<float>() == 0.0F);
+
+    const auto dn = supervision.prepare_denoising(targets, {404, 0, 0, 0}, torch::Device(torch::kCPU), torch::kFloat32);
+    REQUIRE(dn.has_value());
+    REQUIRE(dn->layout.ordinary.queries_per_group == 300);
+    REQUIRE(dn->layout.denoising_queries_per_group == 404);
+    REQUIRE(dn->content.sizes().vec() == std::vector<int64_t>{2, 808, config.hidden_dim});
+    REQUIRE(dn->valid_slots.index({0}).sum().item<int64_t>() == 808);
+    REQUIRE(dn->valid_slots.index({1}).sum().item<int64_t>() == 0);
+    REQUIRE(torch_api::equal(dn->target_indices.index({0, 1}), torch_api::arange(404, integers)));
+    const auto retained_content = dn->content.clone();
+    const auto smaller = batched_targets({torch_api::full({1, 4}, 0.2F)}, {torch_api::zeros({1}, integers)}, 300);
+    REQUIRE(supervision.prepare_denoising(smaller, {404, 0, 0, 1}, torch::Device(torch::kCPU), torch::kFloat32).has_value());
+    REQUIRE(torch_api::equal(dn->content, retained_content));
+}
+
 void test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live() {
     auto dense = torch_api::tensor({{{{0.60F, 0.40F, 0.0F}, {0.30F, 0.70F, 0.0F}, {0.25F, 0.34F, 0.0F}}}}).set_requires_grad(true);
     const auto valid = torch_api::ones({1, 3}, torch_api::TensorOptions().dtype(torch_api::kBool));
@@ -1379,10 +1425,17 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
     }
 
     const auto over_capacity_targets = batched_targets(
-        {torch_api::zeros({config.num_queries + 1, 4})},
+        {torch_api::full({config.num_queries + 1, 4}, 0.2F)},
         {torch_api::zeros({config.num_queries + 1}, torch_api::TensorOptions().dtype(torch_api::kInt64))}, config.num_queries);
-    REQUIRE_THROWS(
-        owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone()}), over_capacity_targets, {71, 3, 1, 8}));
+    const auto over_capacity =
+        owner.forward_with_denoising(rfdetr::nested_tensor_from_tensor_list({image.clone()}), over_capacity_targets, {71, 3, 1, 8});
+    REQUIRE(over_capacity.main.pred_logits.size(1) == config.num_queries);
+    REQUIRE(over_capacity.denoising.has_value());
+    REQUIRE(over_capacity.denoising->queries_per_group == config.num_queries + 1);
+    const auto over_capacity_loss =
+        owner.supervision_loss(over_capacity, over_capacity_targets, {torch_api::tensor(static_cast<float>(config.num_queries + 1))}, true);
+    REQUIRE(torch_api::isfinite(over_capacity_loss.total).item<bool>());
+    over_capacity_loss.total.backward();
     REQUIRE_FALSE(
         rfdetr::training_supervision_query_layout_valid(config.training_supervision, std::numeric_limits<std::size_t>::max(), 2U, 0U));
     REQUIRE_FALSE(
@@ -1638,6 +1691,7 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_sparse_ma
 // CLEANUP-IGNORE: Registration is an exhaustive inventory of semantically independent mathematical tests.
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_geometry_preserves_consumer_policies_and_batch_isolation);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_rectangular_supervision_retains_404_targets_with_300_queries);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]",
                          test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]",

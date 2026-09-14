@@ -574,9 +574,6 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
     const int64_t maximum_count = *std::max_element(targets.counts.begin(), targets.counts.end());
     if (maximum_count == 0) { return std::nullopt; }
     if (maximum_count < 0) { throw std::runtime_error("DN target counts must be nonnegative"); }
-    if (targets.resolved_query_count > 0 && maximum_count > targets.resolved_query_count) {
-        throw std::runtime_error("DN target count exceeds the resolved ordinary query capacity");
-    }
     const int64_t groups = config_.training_supervision.denoising.groups;
     const auto dn_queries = mmltk::common::math::checked_multiply(
         static_cast<std::uint64_t>(groups), static_cast<std::uint64_t>(maximum_count), "RF-DETR DN query count overflow");
