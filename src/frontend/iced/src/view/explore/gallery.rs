@@ -463,6 +463,7 @@ fn gallery_viewport<'a>(
                         .center(Fill)
                         .width(Fill)
                         .height(Fill)
+                        .style(crate::fluent_theme::container_workspace)
                 ]
                 .into()
             } else {

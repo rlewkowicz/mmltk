@@ -11,7 +11,6 @@ mod timeline;
 pub const WORKSPACE_ID: &str = "annotation.workspace.surface";
 pub const SIDEBAR_ID: &str = "annotation.sidebar";
 pub const TIMELINE_ID: &str = "annotation.timeline";
-pub(crate) const COMPACT_BREAKPOINT: f32 = 900.0;
 
 pub(crate) fn tool_id(tool: crate::generated::AnnotationTool) -> String {
     sidebar::tool_id(tool)
@@ -194,13 +193,10 @@ impl Component {
             surface.fit_revision = surface.fit_revision.wrapping_add(self.fit_revision);
             surface
         });
-        let compact = width < COMPACT_BREAKPOINT;
-        let canvas_width = if compact {
-            width.max(1.0)
-        } else {
-            width - 332.0
-        };
-        let inspector_width = if compact { width.max(1.0) } else { 320.0 };
+        let composition = crate::view::workflow::Composition::new(
+            crate::generated::FeatureId::Annotate,
+            width,
+        );
         let settings_edit_available = settings.draft.is_some() && model.settings_edit_available();
         let settings_settled = !settings.has_local_edits();
         let draft = settings
@@ -295,7 +291,7 @@ impl Component {
             surface,
             aspect,
             settings_edit_available,
-            canvas_width,
+            composition.center_width(),
             self.canvas.binding(
                 model,
                 settings.draft.as_ref().map_or_else(
@@ -321,34 +317,24 @@ impl Component {
                 model.annotation_stop_available(),
             )
             .map(Message::Sidebar);
-        let setup = container(setup)
-            .id("workflow.setup")
-            .padding(10)
-            .width(iced::Fill);
-        let diagnostics =
-            container(container(diagnostics).id("annotation.status")).id("workflow.diagnostics");
-        let advanced = container(advanced).id("workflow.advanced");
-        let inspector = iced::widget::scrollable(column![diagnostics, setup, advanced].spacing(14))
-            .id("annotation.inspector.scroll")
-            .width(iced::Length::Fixed(inspector_width))
-            .height(iced::Length::Fixed(640.0));
         let image = column![
             iced::widget::row![button("Fit image (F)").on_press(Message::FitRequested),
-                button("Cancel gesture (Esc)").on_press(Message::CancelRequested)].spacing(8),
+                button("Cancel gesture (Esc)").on_press(Message::CancelRequested)]
+                .spacing(8)
+                .width(iced::Fill)
+                .wrap()
+                .vertical_spacing(8),
             text("V select · B rectangle · P paint · E erase · G point · S spline · K skeleton · Ctrl+Z undo · Ctrl+Shift+Z redo · Ctrl+S save · Wheel zoom / middle-drag pan").size(12),
-            container(workspace).id("workflow.workspace")
+            workspace
         ].spacing(8);
-        iced::widget::row![
-            container(image)
-                .id("workflow.workspace_and_advanced")
-                .width(iced::Length::Fixed(canvas_width)),
-            inspector
-        ]
-        .spacing(12)
-        .width(iced::Fill)
-        .wrap()
-        .vertical_spacing(12)
-        .into()
+        crate::view::workflow::Regions::new(
+            crate::generated::FeatureId::Annotate,
+            setup,
+            image.into(),
+            column![text("Advanced"), advanced].spacing(8).into(),
+            diagnostics,
+        )
+        .render(width)
     }
 }
 

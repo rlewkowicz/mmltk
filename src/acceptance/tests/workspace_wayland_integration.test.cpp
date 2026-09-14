@@ -4054,6 +4054,8 @@ struct BrowserAudit final {
     std::set<std::pair<std::uint64_t, std::uint64_t>> annotation_pixel_frames;
     std::map<std::string, std::size_t> annotation_product_operations;
     std::set<std::string> annotation_layouts;
+    std::map<std::string, std::set<std::string>> annotation_reachable;
+    std::map<std::string, std::map<std::string, std::uint64_t>> annotation_tails;
     std::set<std::string> annotation_capabilities;
     std::size_t annotation_swatches = 0U;
     std::size_t annotation_previews = 0U;
@@ -4570,11 +4572,22 @@ struct BrowserAudit final {
                 ++annotation_swatches;
             else
                 annotation_capabilities.insert(record.value("detail", ""));
+        } else if (event == "integration.annotation_tail") {
+            if (scalar(record, "a") >= 32U && numeric(record, "b") > 0.0 &&
+                numeric(record, "c") >= -0.01 && numeric(record, "d") >= -0.01)
+                annotation_tails[record.value("detail", "")].emplace(record.value("control", ""), scalar(record, "a"));
+        } else if (event == "integration.annotation_reachable") {
+            if (numeric(record, "a") >= -1.0 && numeric(record, "b") >= -1.0 &&
+                numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0)
+                annotation_reachable[record.value("detail", "")].insert(record.value("control", ""));
         } else if (event == "integration.annotation_layout") {
             annotation_layouts.insert(record.value("detail", ""));
             annotation_layout_valid = annotation_layout_valid && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 &&
-                                      numeric(record, "a") <= numeric(record, "c") && numeric(record, "b") <= numeric(record, "c") &&
-                                      std::abs(numeric(record, "d") - 12.0) <= 1.0;
+                                      std::abs(numeric(record, "a") / numeric(record, "c") - 0.62) < 0.002 &&
+                                      std::abs(numeric(record, "b") / numeric(record, "c") - 0.19) < 0.002 &&
+                                      numeric(record, "c") >= 1020.0 && numeric(record, "c") <= 1500.0 &&
+                                      (record.value("detail", "") == "narrow" ? numeric(record, "d") < 1020.0
+                                                                                 : numeric(record, "d") >= 1020.0);
         } else if (event == "integration.annotation_product") {
             ++annotation_product_operations[record.value("detail", "")];
             annotation_pixels_valid =
@@ -4943,7 +4956,7 @@ struct BrowserAudit final {
             SETTINGS_RESET,
             SETTINGS_CLOSE,
         };
-        static const std::array pages{"Train", "Validate", "Predict", "Live", "Annotate", "Export"};
+        static const std::array pages{"Train", "Validate", "Predict", "Export", "Live", "Annotate"};
         static const std::array regions{"workflow.setup", "workflow.workspace_and_advanced", "workflow.workspace", "workflow.advanced",
                                         "workflow.diagnostics"};
         const auto page_bound = [this](const std::string_view page, const std::string_view control) -> const Bounds* {
@@ -5013,17 +5026,28 @@ struct BrowserAudit final {
                                          std::abs(explore_dataset.width - 280.0) < 1.0 && std::abs(explore_details.width - 300.0) < 1.0;
         const Bounds* const annotation_workspace = page_bound("Annotate", "workflow.workspace");
         const Bounds* const annotation_diagnostics = page_bound("Annotate", "workflow.diagnostics");
+        const Bounds* const annotation_setup = page_bound("Annotate", "workflow.setup");
+        const Bounds* const annotation_center = page_bound("Annotate", "workflow.workspace_and_advanced");
+        const Bounds* const annotation_advanced = page_bound("Annotate", "workflow.advanced");
+        const Bounds* const annotation_save = page_bound("Annotate", "annotation.save");
         const bool annotation_composition =
-            annotation_workspace != nullptr && annotation_diagnostics != nullptr && annotation_sidebar.valid() &&
-            annotation_timeline.valid() && annotation_operation.valid() && annotation_stop.valid() && annotation_brush.valid() &&
-            annotation_tool_control.valid() && annotation_diagnostics->contains_horizontally(annotation_sidebar) &&
-            annotation_operation.x >= annotation_sidebar.x - 1.0 && annotation_stop.x >= annotation_sidebar.x - 1.0 &&
-            annotation_brush.x >= annotation_sidebar.x - 1.0 && annotation_tool_control.x >= annotation_sidebar.x - 1.0 &&
-            annotation_diagnostics->contains_horizontally(annotation_timeline) &&
-            (annotation_diagnostics->x >= annotation_workspace->x + annotation_workspace->width - 1.0 ||
-             (annotation_diagnostics->y >= annotation_workspace->y + annotation_workspace->height - 1.0 &&
-              annotation_diagnostics->x >= annotation_workspace->x - 1.0 &&
-              annotation_diagnostics->x + annotation_diagnostics->width <= annotation_workspace->x + annotation_workspace->width + 1.0));
+            annotation_workspace != nullptr && annotation_diagnostics != nullptr && annotation_setup != nullptr &&
+            annotation_center != nullptr && annotation_advanced != nullptr && annotation_save != nullptr &&
+            annotation_sidebar.valid() && annotation_timeline.valid() && annotation_operation.valid() &&
+            annotation_stop.valid() && annotation_brush.valid() && annotation_tool_control.valid() &&
+            annotation_diagnostics->contains_horizontally(annotation_sidebar) &&
+            annotation_diagnostics->contains_horizontally(annotation_operation) &&
+            annotation_diagnostics->contains_horizontally(annotation_stop) &&
+            annotation_diagnostics->contains_horizontally(annotation_brush) &&
+            annotation_diagnostics->contains_horizontally(annotation_tool_control) &&
+            annotation_center->contains_horizontally(annotation_timeline) &&
+            annotation_setup->contains(*annotation_save) &&
+            annotation_advanced->y >= annotation_workspace->y + annotation_workspace->height - 1.0 &&
+            std::abs(annotation_setup->width / page_width - 0.19) < 0.002 &&
+            std::abs(annotation_center->width / page_width - 0.62) < 0.002 &&
+            std::abs(annotation_diagnostics->width / page_width - 0.19) < 0.002 &&
+            std::abs(annotation_center->x - annotation_setup->x - annotation_setup->width) < 1.0 &&
+            std::abs(annotation_diagnostics->x - annotation_center->x - annotation_center->width) < 1.0;
         const bool settings_composition =
             settings_modal.valid() && std::abs(settings_modal.width - 520.0) < 0.01 && settings_footer.valid() &&
             settings_appearance.valid() && settings_typography.valid() && settings_show_fps.valid() && settings_environment.valid() &&
@@ -6626,7 +6650,30 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK((browser.annotation_shapes == std::set<std::string>{"Point", "Spline", "Skeleton"}));
             CHECK(browser.annotation_pixels_valid);
             CHECK(browser.annotation_layout_valid);
-            CHECK((browser.annotation_layouts == std::set<std::string>{"compact", "wide"}));
+            CHECK((browser.annotation_layouts == std::set<std::string>{"narrow", "wide"}));
+            for (const auto layout : {"wide", "narrow"}) {
+                const auto found = browser.annotation_reachable.find(layout);
+                REQUIRE(found != browser.annotation_reachable.end());
+                const auto& controls = found->second;
+                for (const auto control : {"annotation.save", "annotation.timeline", "annotation.stop"})
+                    CHECK(controls.contains(control));
+                // The source imports one object and six classes. Setup creates
+                // three shapes and 32 disabled duplicates/classes. Each full
+                // product pass adds four further objects.
+                const std::uint64_t objects = std::string_view{layout} == "wide" ? 36U : 40U;
+                const std::uint64_t classes = 38U;
+                const auto tails = browser.annotation_tails.find(layout);
+                REQUIRE(tails != browser.annotation_tails.end());
+                const std::map<std::string, std::uint64_t> expected{
+                    {"annotation.object." + std::to_string(objects - 1U), objects},
+                    {"annotation.class." + std::to_string(classes - 1U), classes},
+                };
+                CHECK(tails->second == expected);
+                for (const auto& [control, count] : expected) {
+                    static_cast<void>(count);
+                    CHECK(controls.contains(control));
+                }
+            }
             CHECK((browser.annotation_capabilities == std::set<std::string>{"enabled", "disabled"}));
             CHECK(browser.annotation_swatches == 2U);
             CHECK(browser.annotation_previews == 2U);
@@ -6655,6 +6702,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                  .max_items = mmltk::controller::contracts::kAnnotationUiStateByteBudget});
             REQUIRE(saved.has_value());
             CHECK(saved->valid());
+            CHECK(saved->scene.objects.size() == 44U);
+            CHECK(saved->scene.categories.size() == 38U);
+            CHECK(std::ranges::count_if(saved->scene.objects, [](const auto& object) { return !object.enabled; }) == 32);
             CHECK(saved->scene.palette == mmltk::controller::contracts::annotation_class_palette(saved->scene.categories.size()));
             for (const auto shape : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationShape>())
                 CHECK(std::ranges::any_of(saved->scene.objects,

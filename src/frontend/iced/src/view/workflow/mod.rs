@@ -38,14 +38,10 @@ const AUDIT_REGIONS: [Region; 8] = [
     Region::PrimaryAction,
     Region::Status,
 ];
-pub const ORDINARY_PAGES: [crate::generated::FeatureId; 6] = [
-    crate::generated::FeatureId::Train,
-    crate::generated::FeatureId::Validate,
-    crate::generated::FeatureId::Predict,
-    crate::generated::FeatureId::Live,
-    crate::generated::FeatureId::Annotate,
-    crate::generated::FeatureId::Export,
-];
+pub fn ordinary_pages() -> impl Iterator<Item = crate::generated::FeatureId> {
+    crate::view::navigation::ORDER.into_iter()
+        .filter(|page| *page != crate::generated::FeatureId::Explore)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Layout {
@@ -130,11 +126,9 @@ impl Composition {
     }
 
     pub fn next_ordinary_page(self) -> Option<crate::generated::FeatureId> {
-        ORDINARY_PAGES
-            .iter()
-            .position(|page| *page == self.page)
-            .and_then(|index| ORDINARY_PAGES.get(index + 1))
-            .copied()
+        let mut pages = ordinary_pages();
+        pages.find(|page| *page == self.page)?;
+        pages.next()
     }
 }
 
@@ -334,16 +328,13 @@ mod tests {
 
     #[test]
     fn ordinary_pages_use_the_reference_column_order_and_widths() {
-        for width in [1200.0, 1500.0] {
+        for width in [1020.0, 1200.0, 1500.0] {
             let composition = Composition::new(crate::generated::FeatureId::Train, width);
             let layout = composition.layout();
             assert_eq!(layout.setup_width, width * 0.19);
             assert_eq!(layout.workspace_width, width * 0.62);
             assert_eq!(layout.diagnostics_width, width * 0.19);
-            assert_eq!(
-                layout.setup_width + layout.workspace_width + layout.diagnostics_width,
-                width
-            );
+            assert!((layout.setup_width + layout.workspace_width + layout.diagnostics_width - width).abs() < 0.001);
         }
         let composition = Composition::new(crate::generated::FeatureId::Train, 1200.0);
         assert_eq!(
@@ -371,15 +362,13 @@ mod tests {
 
     #[test]
     fn all_six_ordinary_pages_have_the_complete_region_inventory() {
-        assert_eq!(ORDINARY_PAGES.len(), 6);
-        assert_eq!(
-            crate::view::navigation::ORDER
-                .into_iter()
-                .filter(|page| *page != crate::generated::FeatureId::Explore)
-                .collect::<Vec<_>>(),
-            ORDINARY_PAGES.to_vec()
-        );
-        for page in ORDINARY_PAGES {
+        assert_eq!(ordinary_pages().count(), 6);
+        let pages = ordinary_pages().collect::<Vec<_>>();
+        for (index, page) in pages.iter().enumerate() {
+            assert_eq!(Composition::new(*page, 1020.0).next_ordinary_page(), pages.get(index + 1).copied());
+        }
+        assert_eq!(Composition::new(crate::generated::FeatureId::Explore, 1020.0).next_ordinary_page(), None);
+        for page in ordinary_pages() {
             assert_ne!(page, crate::generated::FeatureId::Explore);
             let composition = Composition::new(page, 1200.0);
             assert_eq!(composition.audit_regions().len(), 8);
@@ -388,7 +377,7 @@ mod tests {
             assert!(!composition.stable_id(Region::Status).is_empty());
         }
         assert_eq!(
-            Composition::new(crate::generated::FeatureId::Export, 0.0).next_ordinary_page(),
+            Composition::new(crate::generated::FeatureId::Annotate, 0.0).next_ordinary_page(),
             None
         );
     }

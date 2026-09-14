@@ -783,11 +783,20 @@ pub(crate) fn record_probe_draw(
     });
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ControlBounds {
+    target: Rectangle,
+    page: Rectangle,
+    horizontal: Rectangle,
+}
+
 struct FindControl {
     target: Id,
     translation: Vector,
     pending_translation: Vector,
     bounds: Option<Rectangle>,
+    page: Rectangle,
+    horizontal: Rectangle,
 }
 
 impl FindControl {
@@ -802,8 +811,8 @@ impl FindControl {
     }
 }
 
-impl Operation<Rectangle> for FindControl {
-    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Rectangle>)) {
+impl Operation<ControlBounds> for FindControl {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<ControlBounds>)) {
         let parent_translation = self.translation;
         self.translation += self.pending_translation;
         self.pending_translation = Vector::ZERO;
@@ -824,6 +833,16 @@ impl Operation<Rectangle> for FindControl {
         _state: &mut dyn iced::advanced::widget::operation::Scrollable,
     ) {
         self.capture(id, bounds);
+        let visible = Rectangle {
+            x: bounds.x - self.translation.x,
+            y: bounds.y - self.translation.y,
+            ..bounds
+        };
+        if id == Some(&Id::from(crate::view::PAGE_SCROLL_ID)) {
+            self.page = visible;
+        } else if id == Some(&Id::from(crate::view::HORIZONTAL_SCROLL_ID)) {
+            self.horizontal = visible;
+        }
         self.pending_translation += translation;
     }
 
@@ -836,28 +855,136 @@ impl Operation<Rectangle> for FindControl {
         self.capture(id, bounds);
     }
 
-    fn finish(&self) -> Outcome<Rectangle> {
-        Outcome::Some(self.bounds.unwrap_or_default())
+    fn finish(&self) -> Outcome<ControlBounds> {
+        Outcome::Some(ControlBounds {
+            target: self.bounds.unwrap_or_default(),
+            page: self.page,
+            horizontal: self.horizontal,
+        })
     }
 }
 
-fn locate(control: String, generation: u64) -> Task<RootMessage> {
-    let target = control.clone();
+fn measure_control(control: String) -> Task<ControlBounds> {
     widget::operate(FindControl {
         target: Id::from(control),
         translation: Vector::ZERO,
         pending_translation: Vector::ZERO,
         bounds: None,
+        page: Rectangle::default(),
+        horizontal: Rectangle::default(),
     })
-    .map(move |bounds| {
+}
+
+fn locate(control: String, generation: u64) -> Task<RootMessage> {
+    measure_control(control.clone()).map(move |bounds| {
         RootMessage::Integration(Message::Scoped {
             generation,
             receipt: None,
             message: Box::new(Message::Located {
-                control: target.clone(),
-                bounds,
+                control: control.clone(),
+                bounds: bounds.target,
             }),
         })
+    })
+}
+
+fn reveal_axis(start: f32, size: f32, viewport_start: f32, viewport_size: f32) -> f32 {
+    if viewport_size <= 0.0 || size <= 0.0 {
+        return 0.0;
+    }
+    if start < viewport_start || size > viewport_size {
+        start - viewport_start
+    } else {
+        (start + size - viewport_start - viewport_size).max(0.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AnnotationReveal {
+    Control,
+    Tail { count: usize, narrow: bool },
+    Geometry,
+    Source { extent: [f32; 2], region: Rectangle, margin: f32 },
+}
+
+fn contains_rectangle(outer: Rectangle, inner: Rectangle) -> bool {
+    outer.width > 0.0 && outer.height > 0.0 && inner.width > 0.0 && inner.height > 0.0
+        && inner.x >= outer.x - 0.01 && inner.y >= outer.y - 0.01
+        && inner.x + inner.width <= outer.x + outer.width + 0.01
+        && inner.y + inner.height <= outer.y + outer.height + 0.01
+}
+
+impl ControlBounds {
+    fn visible(self) -> Option<Rectangle> {
+        self.target.intersection(&self.page)?.intersection(&self.horizontal)
+            .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
+    }
+
+    fn requested(self, reveal: AnnotationReveal) -> Option<Rectangle> {
+        if self.page.width <= 0.0 || self.page.height <= 0.0
+            || self.horizontal.width <= 0.0 || self.horizontal.height <= 0.0
+            || self.target.width <= 0.0 || self.target.height <= 0.0 {
+            return None;
+        }
+        Some(match reveal {
+            AnnotationReveal::Control | AnnotationReveal::Tail { .. } => self.target,
+            // Metadata-only inspection has no click or pixel sample.
+            AnnotationReveal::Geometry => Rectangle { width: 1.0, height: 1.0, ..self.target },
+            AnnotationReveal::Source { extent, region, margin } => {
+                if extent[0] <= 0.0 || extent[1] <= 0.0 { return None; }
+                let scale = (self.target.width / extent[0]).min(self.target.height / extent[1]);
+                Rectangle {
+                    x: self.target.x + (self.target.width - extent[0] * scale) * 0.5 + region.x * scale - margin,
+                    y: self.target.y + (self.target.height - extent[1] * scale) * 0.5 + region.y * scale - margin,
+                    width: region.width * scale + 2.0 * margin,
+                    height: region.height * scale + 2.0 * margin,
+                }
+            }
+        })
+    }
+}
+
+fn scroll_control_into_view(control: String, reveal: AnnotationReveal) -> Task<RootMessage> {
+    measure_control(control).then(move |bounds| {
+        let Some(target) = bounds.requested(reveal) else { return Task::none(); };
+        let x = reveal_axis(target.x, target.width, bounds.horizontal.x, bounds.horizontal.width);
+        let y = reveal_axis(target.y, target.height, bounds.page.y, bounds.page.height);
+        iced::widget::operation::scroll_by(crate::view::PAGE_SCROLL_ID,
+            AbsoluteOffset { x: 0.0, y })
+            .chain(iced::widget::operation::scroll_by(crate::view::HORIZONTAL_SCROLL_ID,
+                AbsoluteOffset { x, y: 0.0 }))
+    })
+}
+
+fn reveal_control(control: String, generation: u64, reveal: AnnotationReveal) -> Task<RootMessage> {
+    measure_control(control.clone()).then(move |before| {
+        let control = control.clone();
+        scroll_control_into_view(control.clone(), reveal).chain(measure_control(control.clone()).map(move |bounds| {
+            let viewport = bounds.page.intersection(&bounds.horizontal);
+            let verified = bounds.visible().is_some() && viewport.zip(bounds.requested(reveal))
+                .is_some_and(|(viewport, requested)| contains_rectangle(viewport, requested));
+            let tail_verified = if let AnnotationReveal::Tail { count, narrow } = reveal {
+                let before_viewport = before.page.intersection(&before.horizontal);
+                let offscreen_gap = before_viewport.map_or(-1.0, |viewport| before.target.y - viewport.y - viewport.height);
+                let valid = count >= 32 && offscreen_gap > 0.0 && verified;
+                if let Some(viewport) = viewport.filter(|_| valid) {
+                    reporting::emit(|sink| sink.record("integration.annotation_tail", &control,
+                        if narrow { "narrow" } else { "wide" },
+                        [count as f64, f64::from(offscreen_gap), f64::from(bounds.target.y - viewport.y),
+                            f64::from(viewport.y + viewport.height - bounds.target.y - bounds.target.height)]));
+                }
+                valid
+            } else { true };
+            RootMessage::Integration(Message::Scoped {
+                generation,
+                receipt: None,
+                message: Box::new(Message::Located {
+                    control: control.clone(),
+                    // Source conversion always retains full surface geometry.
+                    bounds: if verified && tail_verified { bounds.target } else { Rectangle::default() },
+                }),
+            })
+        }))
     })
 }
 
@@ -2191,6 +2318,9 @@ fn click_after_surface_draw(
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyScaleStage { Wide, Narrow, Restore }
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
     AwaitWorkspaceFps,
@@ -2470,10 +2600,11 @@ enum Phase {
         index: u16,
     },
     CopyLayout(u8),
+    CopyListSetup { stage: u8, revision: u64 },
     CopySwatchWait,
     CopyCapability,
     CopyCapabilityWait,
-    CopyAwaitScale(bool),
+    CopyAwaitScale(CopyScaleStage),
     CopyProductStart,
     CopyProductWait,
     CopyAwaitOutput,
@@ -2624,6 +2755,7 @@ impl Phase {
             | Self::AwaitAnnotation
             | Self::AwaitAnnotationFrame(_)
             | Self::AwaitPointer(_)
+            | Self::CopyListSetup { .. }
             | Self::CopyCapabilityWait
             | Self::CopyProductWait
             | Self::CopyAwaitOutput
@@ -2805,12 +2937,12 @@ fn same_numeric_value(left: f64, right: f64) -> bool {
     (left - right).abs() <= f64::EPSILON * left.abs().max(right.abs()).max(1.0) * 8.0
 }
 
-fn annotation_compact_scale(current_scale: f32, logical_width: f32) -> Result<f32, &'static str> {
+fn annotation_layout_scale(current_scale: f32, logical_width: f32, narrow: bool) -> Result<f32, &'static str> {
     let constraint = crate::generated::constraint_uiuiscale();
     let (minimum, maximum) = constraint
         .minimum
         .zip(constraint.maximum)
-        .ok_or("Annotation compact scale requires native bounds")?;
+        .ok_or("Annotation narrow scale requires native bounds")?;
     let (minimum, maximum) = (minimum as f32, maximum as f32);
     if !constraint.finite
         || !minimum.is_finite()
@@ -2822,13 +2954,13 @@ fn annotation_compact_scale(current_scale: f32, logical_width: f32) -> Result<f3
         || !logical_width.is_finite()
         || logical_width <= 0.0
     {
-        return Err("Annotation compact scale has invalid bounds or viewport dimensions");
+        return Err("Annotation narrow scale has invalid bounds or viewport dimensions");
     }
     let unscaled_width = current_scale * logical_width;
-    // Leave a small margin inside the component's single layout breakpoint.
-    let scale = (unscaled_width / (annotation::COMPACT_BREAKPOINT * 0.98)).clamp(minimum, maximum);
-    if !unscaled_width.is_finite() || unscaled_width / scale >= annotation::COMPACT_BREAKPOINT {
-        return Err("Native UI-scale bounds cannot reach the compact Annotation layout");
+    let target_width = crate::view::PAGE_MIN_WIDTH * if narrow { 0.98 } else { 1.1 };
+    let scale = (unscaled_width / target_width).clamp(minimum, maximum);
+    if !unscaled_width.is_finite() || (unscaled_width / scale < crate::view::PAGE_MIN_WIDTH) != narrow {
+        return Err("Native UI-scale bounds cannot reach the requested Annotation layout");
     }
     Ok(scale)
 }
@@ -2894,6 +3026,7 @@ pub struct Controller {
     bounded_object_count: usize,
     annotation_probe: Option<AnnotationProbe>,
     annotation_pixels_receipt: Option<ProbeReceipt>,
+    annotation_pixel_progress: ((u64, u64), usize, usize),
     annotation_pixels_pending: Option<ProbeReceipt>,
     annotation_pixels_owner: Option<std::sync::Arc<()>>,
     control_probe_receipt: Option<ProbeReceipt>,
@@ -2907,12 +3040,16 @@ pub struct Controller {
     copy_product_frame: u64,
     copy_product_ui_revision: u64,
     copy_product_settlement: annotation_product::Settlement,
-    copy_compact: bool,
+    copy_narrow: bool,
     copy_original_scale: f32,
+    copy_list_revision: u64,
+    copy_list_object_target: usize,
+    copy_list_class_target: usize,
+    copy_layout_objects: usize,
+    copy_layout_classes: usize,
     copy_requested_scale: f32,
     copy_layout_bounds: Rectangle,
     copy_viewport_width: f32,
-    copy_inspector_offset: f32,
     copy_swatch_color: [f64; 3],
     copy_swatch_ready: bool,
     copy_capability_ready: bool,
@@ -3094,6 +3231,7 @@ impl Controller {
             bounded_object_count: 0,
             annotation_probe: None,
             annotation_pixels_receipt: None,
+            annotation_pixel_progress: ((0, 0), 0, 0),
             annotation_pixels_pending: None,
             annotation_pixels_owner: None,
             control_probe_receipt: None,
@@ -3107,12 +3245,16 @@ impl Controller {
             copy_product_frame: 0,
             copy_product_ui_revision: 0,
             copy_product_settlement: annotation_product::Settlement::RenderedFrame,
-            copy_compact: false,
+            copy_narrow: false,
             copy_original_scale: 1.0,
+            copy_list_revision: 0,
+            copy_list_object_target: 0,
+            copy_list_class_target: 0,
+            copy_layout_objects: 0,
+            copy_layout_classes: 0,
             copy_requested_scale: 1.0,
             copy_layout_bounds: Rectangle::default(),
             copy_viewport_width: 0.0,
-            copy_inspector_offset: 0.0,
             copy_swatch_color: [0.0; 3],
             copy_swatch_ready: false,
             copy_capability_ready: false,
@@ -3558,12 +3700,132 @@ impl Controller {
         self.arm(EXPLORE_UPSCALE_ACTIONS[0])
     }
 
+    fn annotation_points(&self, width: f64, height: f64) -> [f64; 4] {
+        self.copy_product_gesture.unwrap_or_else(|| {
+                        if let Some(object) = self
+                            .copy_before
+                            .as_ref()
+                            .filter(|_| self.viewer_scenario == "copy")
+                        {
+                            let b = &object.box_;
+                            let mut start = [
+                                f64::from((b.first.x + b.second.x) / 2.0),
+                                f64::from((b.first.y + b.second.y) / 2.0),
+                            ];
+                            if self.copy_step == 0 || self.copy_step == 3 {
+                                if let Some(run) = object.mask.runs.first() {
+                                    start = [
+                                        (f64::from(run.first) + f64::from(run.last)) / 2.0,
+                                        f64::from(run.row) + 0.5,
+                                    ];
+                                }
+                            }
+                            if self.copy_step == 2 {
+                                start = [
+                                    (f64::from(b.second.x) + 3.0).min(width - 1.0),
+                                    f64::from((b.first.y + b.second.y) / 2.0),
+                                ];
+                            }
+                            if self.copy_step == 1 {
+                                start = [f64::from(b.second.x), f64::from(b.second.y)];
+                            }
+                            [
+                                start[0],
+                                start[1],
+                                (start[0] + 8.0).min(width - 1.0),
+                                (start[1] + 8.0).min(height - 1.0),
+                            ]
+                        } else {
+                            let top = match self.copy_step {
+                                5 => 0.15,
+                                6 => 0.35,
+                                7 => 0.7,
+                                _ => 0.3,
+                            };
+                            let [x, y, ex, ey] = match self.copy_shape_points {
+                                0 => [0.25, top, 0.3, top + 0.05],
+                                1 => [0.6, top, 0.65, top + 0.05],
+                                _ => [0.45, 0.65, 0.5, 0.7],
+                            };
+                            [x * width, y * height, ex * width, ey * height]
+                        }
+        })
+    }
+
+    fn annotation_reveal(&self, control: &str) -> AnnotationReveal {
+        if matches!(self.phase, Phase::CopyLayout(2 | 3)) {
+            return AnnotationReveal::Tail { count: if matches!(self.phase, Phase::CopyLayout(2)) {
+                self.copy_layout_objects
+            } else { self.copy_layout_classes }, narrow: self.copy_narrow };
+        }
+        if control != ANNOTATION_SURFACE {
+            return if control == ANNOTATION_SIDEBAR { AnnotationReveal::Geometry } else { AnnotationReveal::Control };
+        }
+        if let Some(probe) = &self.annotation_probe {
+            if let Some(pixel) = probe.pixels.chunks_exact(7).next() {
+                let radius = pixel[6] as f32;
+                return AnnotationReveal::Source {
+                    extent: probe.extent.map(|value| value as f32),
+                    region: Rectangle { x: pixel[0] as f32 - radius, y: pixel[1] as f32 - radius,
+                        width: radius * 2.0, height: radius * 2.0 },
+                    margin: 2.0 / self.input_scale,
+                };
+            }
+        }
+        if matches!(self.phase, Phase::AnnotationPointer(_)) {
+            if let Some(frame) = self.annotation_frame_ready {
+                let extent = [frame.content_width as f32, frame.content_height as f32];
+                let [x, y, ex, ey] = self.annotation_points(f64::from(extent[0]), f64::from(extent[1])).map(|value| value as f32);
+                return AnnotationReveal::Source { extent,
+                    region: Rectangle { x: x.min(ex), y: y.min(ey), width: (ex-x).abs(), height: (ey-y).abs() },
+                    margin: 1.0 / self.input_scale,
+                };
+            }
+        }
+        AnnotationReveal::Geometry
+    }
+
+    fn copy_scale_transition(&mut self, model: &ApplicationModel, applied_scale: f32, stage: CopyScaleStage) -> Task<RootMessage> {
+        let scale = if stage == CopyScaleStage::Restore { self.copy_original_scale } else {
+            match annotation_layout_scale(applied_scale, model.window_width as f32, stage == CopyScaleStage::Narrow) {
+                Ok(value) => value,
+                Err(detail) => { self.fail(detail); return Task::none(); }
+            }
+        };
+        let unchanged = same_numeric_value(f64::from(scale), f64::from(applied_scale));
+        let revision = model.settings_snapshot.as_ref().map_or(0, |snapshot| snapshot.revision);
+        self.settings_revision = if unchanged { revision.saturating_sub(1) } else { revision };
+        self.copy_requested_scale = scale;
+        self.phase = Phase::CopyAwaitScale(stage);
+        if unchanged { return self.advance_to(self.phase.clone()); }
+        Task::done(RootMessage::Settings(crate::view::settings::Message::UiScaleChanged(scale)))
+            .chain(Task::done(RootMessage::Settings(crate::view::settings::Message::UiScaleReleased)))
+    }
+
+    fn copy_layout_control(&self, step: u8) -> String {
+        match step {
+            0 => "workflow.workspace_and_advanced".into(),
+            1 => "workflow.diagnostics".into(),
+            2 => format!("annotation.object.{}", self.copy_layout_objects.saturating_sub(1)),
+            3 => format!("annotation.class.{}", self.copy_layout_classes.saturating_sub(1)),
+            4 => VIEWER_SAVE.into(),
+            5 => ANNOTATION_TIMELINE.into(),
+            6 => ANNOTATION_STOP.into(),
+            _ => "annotation.class.active.swatch".into(),
+        }
+    }
+
     fn arm(&mut self, control: impl Into<String>) -> Task<RootMessage> {
         if self.location_pending {
             return Task::none();
         }
         self.location_pending = true;
-        locate(control.into(), self.generation)
+        let control = control.into();
+        if control.starts_with("annotation.") {
+            reveal_control(control.clone(), self.generation, self.annotation_reveal(&control))
+        } else {
+            locate(control, self.generation)
+        }
     }
 
     fn arm_scrolled(
@@ -3576,33 +3838,18 @@ impl Controller {
         }
         self.location_pending = true;
         let control = control.into();
-        let inspector = control.starts_with("annotation.") && control != ANNOTATION_SURFACE;
-        let offset = if inspector
-            && (control == "annotation.undo"
-                || control == "annotation.redo"
-                || control.starts_with("annotation.tool."))
-        {
-            RelativeOffset::START
-        } else {
-            offset
-        };
-        let scroll = if inspector {
-            iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, RelativeOffset::START)
-                .chain(iced::widget::operation::scroll_by(
-                    crate::view::PAGE_SCROLL_ID,
-                    AbsoluteOffset {
-                        x: 0.0,
-                        y: self.copy_inspector_offset,
-                    },
-                ))
-                .chain(iced::widget::operation::snap_to(
-                    "annotation.inspector.scroll",
-                    offset,
-                ))
+        if control.starts_with("annotation.") {
+            let reveal = self.annotation_reveal(&control);
+            let task = reveal_control(control.clone(), self.generation, reveal);
+            if matches!(reveal, AnnotationReveal::Tail { .. }) {
+                iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, RelativeOffset::START)
+                    .chain(iced::widget::operation::snap_to(crate::view::HORIZONTAL_SCROLL_ID, RelativeOffset::START))
+                    .chain(task)
+            } else { task }
         } else {
             iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
-        };
-        scroll.chain(locate(control, self.generation))
+                .chain(locate(control, self.generation))
+        }
     }
 
     fn arm_revealed(
@@ -4100,7 +4347,10 @@ impl Controller {
                             self.control_probe_receipt = request_receipt;
                             self.copy_swatch_ready = true;
                         } else {
-                            self.annotation_pixels_receipt = request_receipt;
+                            self.annotation_pixel_progress.1 += 1;
+                            if self.annotation_pixel_progress.1 >= self.annotation_pixel_progress.2 {
+                                self.annotation_pixels_receipt = request_receipt;
+                            }
                         }
                     }
                     _ => self
@@ -4330,8 +4580,8 @@ impl Controller {
             Phase::CopySave => VIEWER_SAVE.to_owned(),
             Phase::CopyCapability=>annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
             Phase::CopyLayout(0)=>"workflow.workspace_and_advanced".into(),
-            Phase::CopyLayout(1)=>"annotation.inspector.scroll".into(),
-            Phase::CopyLayout(_)=>"annotation.class.active.swatch".into(),
+            Phase::CopyLayout(1)=>"workflow.diagnostics".into(),
+            Phase::CopyLayout(step) => self.copy_layout_control(step),
             Phase::StartUpscale { kernel, .. } => EXPLORE_UPSCALE_ACTIONS[kernel].to_owned(),
             Phase::DetailNext(_) => EXPLORE_NEXT.to_owned(),
             Phase::DetailPrevious(_) => EXPLORE_PREVIOUS.to_owned(),
@@ -4375,63 +4625,35 @@ impl Controller {
             }
             Phase::CopyLayout(1) => {
                 let image = self.copy_layout_bounds;
-                let stacked = bounds.y >= image.y + image.height;
-                let bounded = image.width > 0.0
-                    && bounds.width > 0.0
-                    && image.x >= 0.0
-                    && bounds.x >= 0.0
-                    && image.x + image.width <= self.copy_viewport_width + 1.0
-                    && bounds.x + bounds.width <= self.copy_viewport_width + 1.0;
-                let placed = if stacked {
-                    (image.x - bounds.x).abs() <= 1.0 && (image.width - bounds.width).abs() <= 1.0
-                } else {
-                    bounds.x >= image.x + image.width && (bounds.y - image.y).abs() <= 1.0
-                };
-                reporting::emit(|sink| {
-                    sink.record(
-                        "integration.annotation_layout_viewport",
-                        "annotation.inspector.scroll",
-                        if self.copy_compact { "compact" } else { "wide" },
-                        [
-                            f64::from(self.copy_viewport_width),
-                            f64::from(self.input_scale),
-                            f64::from(self.copy_requested_scale),
-                            if !bounded {
-                                1.0
-                            } else if !placed {
-                                2.0
-                            } else if stacked != self.copy_compact {
-                                3.0
-                            } else {
-                                0.0
-                            },
-                        ],
-                    )
-                });
-                if !bounded || !placed || stacked != self.copy_compact {
-                    self.fail("Annotation canvas and inspector do not fit the actual viewport");
+                let page = crate::view::canvas_layout(self.copy_viewport_width);
+                let valid = (image.width / page.page_width - 0.62).abs() < 0.002
+                    && (bounds.width / page.page_width - 0.19).abs() < 0.002
+                    && (bounds.x - image.x - image.width).abs() <= 1.0
+                    && (bounds.y - image.y).abs() <= 1.0
+                    && page.horizontal_overflow == self.copy_narrow;
+                if !valid {
+                    self.fail("Annotation must retain shared columns with narrow horizontal overflow");
                     return None;
                 }
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.annotation_layout",
-                        "annotation.inspector.scroll",
-                        if stacked { "compact" } else { "wide" },
-                        [
-                            f64::from(image.width),
-                            f64::from(bounds.width),
-                            f64::from(self.copy_viewport_width),
-                            f64::from(if stacked {
-                                bounds.y - image.y - image.height
-                            } else {
-                                bounds.x - image.x - image.width
-                            }),
-                        ],
+                        "workflow.diagnostics",
+                        if self.copy_narrow { "narrow" } else { "wide" },
+                        [f64::from(image.width), f64::from(bounds.width),
+                            f64::from(page.page_width), f64::from(self.copy_viewport_width)],
                     )
                 });
-                self.copy_inspector_offset =
-                    (bounds.y - crate::view::NAVIGATION_HEIGHT - 10.0).max(0.0);
                 self.phase = Phase::CopyLayout(2);
+                None
+            }
+            Phase::CopyLayout(step @ 2..=6) => {
+                reporting::emit(|sink| sink.record(
+                    "integration.annotation_reachable", &control,
+                    if self.copy_narrow { "narrow" } else { "wide" },
+                    [f64::from(bounds.x), f64::from(bounds.y), f64::from(bounds.width), f64::from(bounds.height)],
+                ));
+                self.phase = Phase::CopyLayout(step + 1);
                 None
             }
             Phase::CopyLayout(_) => {
@@ -5151,55 +5373,7 @@ impl Controller {
                         f64::from(frame.content_width),
                         f64::from(frame.content_height),
                     );
-                    let points = self.copy_product_gesture.unwrap_or_else(|| {
-                        if let Some(object) = self
-                            .copy_before
-                            .as_ref()
-                            .filter(|_| self.viewer_scenario == "copy")
-                        {
-                            let b = &object.box_;
-                            let mut start = [
-                                f64::from((b.first.x + b.second.x) / 2.0),
-                                f64::from((b.first.y + b.second.y) / 2.0),
-                            ];
-                            if self.copy_step == 0 || self.copy_step == 3 {
-                                if let Some(run) = object.mask.runs.first() {
-                                    start = [
-                                        (f64::from(run.first) + f64::from(run.last)) / 2.0,
-                                        f64::from(run.row) + 0.5,
-                                    ];
-                                }
-                            }
-                            if self.copy_step == 2 {
-                                start = [
-                                    (f64::from(b.second.x) + 3.0).min(width - 1.0),
-                                    f64::from((b.first.y + b.second.y) / 2.0),
-                                ];
-                            }
-                            if self.copy_step == 1 {
-                                start = [f64::from(b.second.x), f64::from(b.second.y)];
-                            }
-                            [
-                                start[0],
-                                start[1],
-                                (start[0] + 8.0).min(width - 1.0),
-                                (start[1] + 8.0).min(height - 1.0),
-                            ]
-                        } else {
-                            let top = match self.copy_step {
-                                5 => 0.15,
-                                6 => 0.35,
-                                7 => 0.7,
-                                _ => 0.3,
-                            };
-                            let [x, y, ex, ey] = match self.copy_shape_points {
-                                0 => [0.25, top, 0.3, top + 0.05],
-                                1 => [0.6, top, 0.65, top + 0.05],
-                                _ => [0.45, 0.65, 0.5, 0.7],
-                            };
-                            [x * width, y * height, ex * width, ey * height]
-                        }
-                    });
+                    let points = self.annotation_points(width, height);
                     annotation_checks::place_gesture(input_bounds, (width, height), points)
                 };
                 #[cfg(target_arch = "wasm32")]
@@ -5367,10 +5541,8 @@ impl Controller {
             message: Box::new(Message::Advance),
         }));
         if reveal_annotation {
-            // The compact inspector scrolls the canvas offscreen. A pixel
-            // assertion must reveal it before waiting for a completed draw.
-            iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, RelativeOffset::START)
-                .chain(continuation)
+            // Restore both axes before waiting for a completed canvas draw.
+            scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry).chain(continuation)
         } else {
             continuation
         }
@@ -9598,7 +9770,55 @@ impl Controller {
                 self.phase = Phase::CopyUndo { index, mask: true };
                 self.arm_scrolled("annotation.undo", RelativeOffset::START)
             }
+            Phase::CopyListSetup { stage, .. } => {
+                let Some(snapshot) = model.annotation.snapshot.as_ref() else { return Task::none(); };
+                if !model.annotation_edit_available() || snapshot.uirevision <= self.copy_list_revision {
+                    return Task::none();
+                }
+                let ui = &snapshot.ui;
+                let Some(selected) = ui.editor.selectedobject.and_then(|index| ui.scene.objects.get(index as usize)) else {
+                    self.fail("Annotation long-list setup requires a selected object"); return Task::none();
+                };
+                self.copy_list_revision = snapshot.uirevision;
+                self.phase = Phase::CopyListSetup { stage, revision: snapshot.uirevision };
+                use annotation::sidebar::Message as Sidebar;
+                let command = match stage {
+                    0 => {
+                        self.phase = Phase::CopyListSetup { stage: 1, revision: snapshot.uirevision };
+                        Sidebar::Sidebar(crate::generated::AnnotationSidebarCommand::Duplicate)
+                    }
+                    1 if selected.enabled => {
+                        self.phase = Phase::CopyListSetup { stage: 1, revision: snapshot.uirevision };
+                        return annotation_message(annotation::Message::Sidebar(Sidebar::SelectedObjectEnabled(false)))
+                            .chain(annotation_message(annotation::Message::Sidebar(Sidebar::SelectedObjectApplied(selected.category))));
+                    }
+                    1 if ui.scene.objects.len() < self.copy_list_object_target => {
+                        Sidebar::Sidebar(crate::generated::AnnotationSidebarCommand::Duplicate)
+                    }
+                    1 | 2 if ui.scene.categories.len() < self.copy_list_class_target => {
+                        self.phase = Phase::CopyListSetup { stage: 2, revision: snapshot.uirevision };
+                        return annotation_message(annotation::Message::Sidebar(Sidebar::CategoryDraftChanged(
+                            format!("Acceptance long category {} with a label that wraps inside its assigned column", ui.scene.categories.len()))))
+                            .chain(annotation_message(annotation::Message::Sidebar(Sidebar::CategoryApplied)));
+                    }
+                    1 | 2 => {
+                        self.phase = Phase::CopyListSetup { stage: 3, revision: snapshot.uirevision };
+                        Sidebar::ObjectSelected((self.copy_objects + 2) as u16)
+                    }
+                    _ => {
+                        if ui.scene.objects.len() != self.copy_list_object_target || ui.scene.categories.len() != self.copy_list_class_target {
+                            self.fail("Annotation long-list setup did not preserve its exact bounded inventory"); return Task::none();
+                        }
+                        return self.copy_scale_transition(model, applied_scale, CopyScaleStage::Wide);
+                    }
+                };
+                annotation_message(annotation::Message::Sidebar(command))
+            }
             Phase::CopyLayout(step) => {
+                if let Some(snapshot) = &model.annotation.snapshot {
+                    self.copy_layout_objects = snapshot.ui.scene.objects.len();
+                    self.copy_layout_classes = snapshot.ui.scene.categories.len();
+                }
                 self.copy_viewport_width = model.window_width as f32;
                 if let Some(ui) = model
                     .annotation
@@ -9623,7 +9843,9 @@ impl Controller {
                 if step == 0 {
                     self.arm_scrolled("workflow.workspace_and_advanced", RelativeOffset::START)
                 } else if step == 1 {
-                    self.arm("annotation.inspector.scroll")
+                    self.arm("workflow.diagnostics")
+                } else if step < 7 {
+                    self.arm_scrolled(self.copy_layout_control(step), RelativeOffset::START)
                 } else {
                     if self.location_pending {
                         return Task::none();
@@ -9631,33 +9853,14 @@ impl Controller {
                     if !self.prepare_control_probe() {
                         return Task::none();
                     }
-                    self.location_pending = true;
                     self.copy_swatch_ready = false;
-                    iced::widget::operation::snap_to(
-                        crate::view::PAGE_SCROLL_ID,
-                        RelativeOffset::START,
-                    )
-                    .chain(iced::widget::operation::scroll_by(
-                        crate::view::PAGE_SCROLL_ID,
-                        AbsoluteOffset {
-                            x: 0.0,
-                            y: self.copy_inspector_offset,
-                        },
-                    ))
-                    .chain(iced::widget::operation::snap_to(
-                        "annotation.inspector.scroll",
-                        RelativeOffset::START,
-                    ))
-                    .chain(locate(
-                        "annotation.class.active.swatch".into(),
-                        self.generation,
-                    ))
+                    self.arm_scrolled("annotation.class.active.swatch", RelativeOffset::START)
                 }
             }
             Phase::CopySwatchWait => {
                 if self.control_probe_receipt != current_receipt("workflow.visual.workspace") {
                     self.copy_swatch_ready = false;
-                    return self.advance_to(Phase::CopyLayout(2));
+                    return self.advance_to(Phase::CopyLayout(7));
                 }
                 if self.copy_swatch_ready {
                     self.advance_to(Phase::CopyProductStart)
@@ -9720,7 +9923,7 @@ impl Controller {
                     Task::none()
                 }
             }
-            Phase::CopyAwaitScale(compact) => {
+            Phase::CopyAwaitScale(stage) => {
                 let scale = self.copy_requested_scale;
                 let Some(settled) =
                     settled_settings_snapshot(model, settings, self.settings_revision)
@@ -9736,13 +9939,14 @@ impl Controller {
                     return Task::none();
                 }
                 let width = model.window_width as f32;
-                if compact && (!width.is_finite() || width >= annotation::COMPACT_BREAKPOINT) {
-                    self.fail(
-                        "Settled native UI scale did not reach the compact Annotation layout",
-                    );
-                    return Task::none();
+                if !width.is_finite() || width <= 0.0 {
+                    self.fail("Annotation settled viewport is invalid"); return Task::none();
                 }
-                if compact {
+                self.copy_narrow = width < crate::view::PAGE_MIN_WIDTH;
+                if stage != CopyScaleStage::Restore && self.copy_narrow != (stage == CopyScaleStage::Narrow) {
+                    self.fail("Annotation scale did not establish the requested layout"); return Task::none();
+                }
+                if stage != CopyScaleStage::Restore {
                     let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                         return Task::none();
                     };
@@ -9772,31 +9976,8 @@ impl Controller {
                         return Task::none();
                     }
                     self.copy_product_gesture = None;
-                    let compact = !self.copy_compact;
-                    let scale = if compact {
-                        match annotation_compact_scale(applied_scale, model.window_width as f32) {
-                            Ok(scale) => scale,
-                            Err(detail) => {
-                                self.fail(detail);
-                                return Task::none();
-                            }
-                        }
-                    } else {
-                        self.copy_original_scale
-                    };
-                    self.settings_revision = model
-                        .settings_snapshot
-                        .as_ref()
-                        .map_or(0, |snapshot| snapshot.revision);
-                    self.copy_compact = true;
-                    self.copy_requested_scale = scale;
-                    self.phase = Phase::CopyAwaitScale(compact);
-                    return Task::done(RootMessage::Settings(
-                        crate::view::settings::Message::UiScaleChanged(scale),
-                    ))
-                    .chain(Task::done(RootMessage::Settings(
-                        crate::view::settings::Message::UiScaleReleased,
-                    )));
+                    return self.copy_scale_transition(model, applied_scale,
+                        if self.copy_narrow { CopyScaleStage::Restore } else { CopyScaleStage::Narrow });
                 };
                 self.copy_product_frame = snapshot.frame.revision;
                 // Commands and completed reads can leave pixels unchanged.
@@ -10197,12 +10378,18 @@ impl Controller {
                     if self.location_pending || self.annotation_pixels_pending == receipt {
                         return Task::none();
                     }
-                    if !self.prepare_annotation_probe(
-                        snapshot.frame.revision,
-                        presentation_revision,
-                        [snapshot.frame.extent.width, snapshot.frame.extent.height],
-                        annotation_checks::probes(&snapshot.ui),
-                    ) {
+                    let samples = annotation_checks::probes(&snapshot.ui);
+                    let key = (snapshot.frame.revision, presentation_revision);
+                    if self.annotation_pixel_progress.0 != key || self.annotation_pixel_progress.1 >= samples.len() / 7 {
+                        self.annotation_pixel_progress = (key, 0, samples.len() / 7);
+                    }
+                    let index = self.annotation_pixel_progress.1;
+                    let Some(pixel) = samples.chunks_exact(7).nth(index) else {
+                        self.fail("Annotation pixel inventory lost its next expected sample");
+                        return Task::none();
+                    };
+                    if !self.prepare_annotation_probe(snapshot.frame.revision, presentation_revision,
+                        [snapshot.frame.extent.width, snapshot.frame.extent.height], pixel.to_vec()) {
                         return Task::none();
                     }
                     return self.arm(ANNOTATION_SURFACE);
@@ -10305,7 +10492,11 @@ impl Controller {
                             .draft
                             .as_ref()
                             .map_or(1.0, |draft| draft.ui.uiscale);
-                        return self.advance_to(Phase::CopyLayout(0));
+                        self.copy_narrow = (model.window_width as f32) < crate::view::PAGE_MIN_WIDTH;
+                        self.copy_list_object_target = snapshot.ui.scene.objects.len() + 32;
+                        self.copy_list_class_target = snapshot.ui.scene.categories.len() + 32;
+                        self.copy_list_revision = snapshot.uirevision.saturating_sub(1);
+                        return self.advance_to(Phase::CopyListSetup { stage: 0, revision: snapshot.uirevision });
                     }
                     self.copy_step += 1;
                     self.copy_shape_points = 0;
@@ -12554,28 +12745,98 @@ pub(crate) mod tests {
             "work"
         );
         assert_eq!(Phase::AwaitPointer(1).deadline_class(), "work");
+        for stage in 0..=3 {
+            let first = Phase::CopyListSetup { stage, revision: 10 };
+            let settled = Phase::CopyListSetup { stage, revision: 11 };
+            assert_eq!(first.deadline_class(), "work");
+            assert_eq!(settled.deadline_class(), "work");
+            assert_ne!(first, settled);
+            assert_eq!(settled, Phase::CopyListSetup { stage, revision: 11 });
+        }
         assert_eq!(Phase::Complete.deadline_class(), "work");
         assert_eq!(Phase::AwaitSettings.deadline_class(), "interaction");
     }
 
     #[test]
-    fn annotation_compact_scale_obeys_native_bounds_at_packaged_dpi_widths() {
+    fn measured_reveal_handles_both_edges_visible_and_oversized_controls() {
+        assert_eq!(reveal_axis(120.0, 40.0, 100.0, 200.0), 0.0);
+        assert_eq!(reveal_axis(80.0, 40.0, 100.0, 200.0), -20.0);
+        assert_eq!(reveal_axis(280.0, 40.0, 100.0, 200.0), 20.0);
+        assert_eq!(reveal_axis(120.0, 400.0, 100.0, 200.0), 20.0);
+        assert_eq!(reveal_axis(100.0, 200.0, 100.0, 200.0), 0.0);
+        assert_eq!(reveal_axis(500.0, 0.0, 100.0, 200.0), 0.0);
+        assert_eq!(reveal_axis(500.0, 40.0, 100.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn annotation_reveal_proves_subregions_without_rescaling_full_geometry() {
+        let full = Rectangle { x: -100.0, y: -200.0, width: 1000.0, height: 1600.0 };
+        let viewport = Rectangle { x: 0.0, y: 50.0, width: 700.0, height: 500.0 };
+        let measured = ControlBounds { target: full, page: viewport, horizontal: viewport };
+        let visible = measured.visible().unwrap();
+        assert_eq!(visible, viewport);
+        assert!(!contains_rectangle(visible, measured.requested(AnnotationReveal::Control).unwrap()));
+        let request = AnnotationReveal::Source {
+            extent: [1000.0, 1600.0],
+            region: Rectangle { x: 250.0, y: 300.0, width: 10.0, height: 20.0 }, margin: 2.0,
+        };
+        let requested = measured.requested(request).unwrap();
+        assert_eq!(requested, Rectangle { x: 148.0, y: 98.0, width: 14.0, height: 24.0 });
+        assert!(contains_rectangle(visible, requested));
+        assert_eq!(measured.target, full);
+        let trailing = ControlBounds { target: Rectangle { y: 400.0, ..full }, ..measured };
+        assert!(!contains_rectangle(viewport, trailing.requested(request).unwrap()));
+        let clamped = ControlBounds { target: Rectangle { x: 650.0, width: 100.0, ..full }, ..measured };
+        assert!(!contains_rectangle(clamped.visible().unwrap(), clamped.target));
+        let missing = ControlBounds { page: Rectangle::default(), ..measured };
+        assert!(missing.visible().is_none());
+        assert!(missing.requested(request).is_none());
+        let absent = ControlBounds { target: Rectangle::default(), ..measured };
+        assert!(absent.visible().is_none());
+        assert!(absent.requested(request).is_none());
+    }
+
+    #[test]
+    fn annotation_layout_sequence_supports_initially_wide_and_narrow_scales() {
+        let constraint = crate::generated::constraint_uiuiscale();
+        let minimum = constraint.minimum.unwrap() as f32;
+        let maximum = constraint.maximum.unwrap() as f32;
+        assert_eq!(maximum, 1.75);
+        for (original, initially_narrow) in [(1.0, false), (maximum, true)] {
+            assert!((minimum..=maximum).contains(&original));
+            let physical_width = 1500.0;
+            let original_width = physical_width / original;
+            assert_eq!(original_width < crate::view::PAGE_MIN_WIDTH, initially_narrow);
+            let wide = annotation_layout_scale(original, original_width, false).unwrap();
+            assert!(physical_width / wide >= crate::view::PAGE_MIN_WIDTH);
+            let narrow = annotation_layout_scale(wide, physical_width / wide, true).unwrap();
+            assert!(physical_width / narrow < crate::view::PAGE_MIN_WIDTH);
+            let mut controller = Controller::new(false, false, String::new(), String::new(), "512".into(), "copy".into());
+            controller.copy_original_scale = original;
+            let model = ApplicationModel::default();
+            drop(controller.copy_scale_transition(&model, narrow, CopyScaleStage::Restore));
+            assert_eq!(controller.copy_requested_scale, original);
+            assert_eq!(controller.phase, Phase::CopyAwaitScale(CopyScaleStage::Restore));
+        }
+    }
+
+    #[test]
+    fn annotation_narrow_scale_obeys_native_bounds_at_packaged_dpi_widths() {
         let constraint = crate::generated::constraint_uiuiscale();
         for (unscaled_width, current_scale) in
-            [(1500.0, 1.0), (1000.0, 1.0), (1500.0, 1.5), (1000.0, 1.25)]
+            [(1500.0, 1.0), (1280.0, 1.5), (1500.0, 1.75), (1000.0, 1.25)]
         {
             let logical_width = unscaled_width / current_scale;
-            let scale = annotation_compact_scale(current_scale, logical_width)
-                .expect("packaged width reaches compact layout");
+            let scale = annotation_layout_scale(current_scale, logical_width, true)
+                .expect("packaged width reaches narrow layout");
             assert!(f64::from(scale) >= constraint.minimum.unwrap());
             assert!(f64::from(scale) <= constraint.maximum.unwrap());
-            assert!(unscaled_width / scale < annotation::COMPACT_BREAKPOINT);
+            assert!(unscaled_width / scale < crate::view::PAGE_MIN_WIDTH);
         }
         let maximum = constraint.maximum.unwrap() as f32;
-        assert!(
-            annotation_compact_scale(1.0, annotation::COMPACT_BREAKPOINT * maximum * 2.0).is_err()
-        );
-        assert!(annotation_compact_scale(1.0, f32::NAN).is_err());
+        assert!(annotation_layout_scale(maximum, 1920.0 / maximum, true).is_err());
+        assert!(annotation_layout_scale(1.0, 1920.0, true).is_err());
+        assert!(annotation_layout_scale(1.0, f32::NAN, true).is_err());
     }
 
     #[test]

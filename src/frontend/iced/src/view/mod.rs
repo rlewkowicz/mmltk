@@ -23,6 +23,7 @@ use iced::widget::scrollable::{Direction, Scrollbar};
 use iced::widget::{container, opaque, responsive, scrollable, space, stack};
 use iced::{Color, Fill, Length, Padding};
 
+pub const HORIZONTAL_SCROLL_ID: &str = "application.horizontal.scroll";
 pub const PAGE_SCROLL_ID: &str = "application.page.scroll";
 pub const PAGE_MIN_WIDTH: f32 = 1020.0;
 pub const PAGE_MAX_WIDTH: f32 = 1500.0;
@@ -48,20 +49,6 @@ pub fn canvas_layout(viewport_width: f32) -> CanvasLayout {
     }
 }
 
-fn page_canvas_layout(viewport_width: f32, feature: crate::generated::FeatureId) -> CanvasLayout {
-    if feature != crate::generated::FeatureId::Annotate {
-        return canvas_layout(viewport_width);
-    }
-    let canvas_width = viewport_width.max(1.0);
-    let page_width = canvas_width.min(PAGE_MAX_WIDTH);
-    CanvasLayout {
-        canvas_width,
-        page_width,
-        page_offset: (canvas_width - page_width) * 0.5,
-        horizontal_overflow: false,
-    }
-}
-
 fn compact_scrollbar() -> Scrollbar {
     Scrollbar::new()
         .width(SCROLLBAR_WIDTH)
@@ -80,7 +67,7 @@ pub fn view<'a>(
     settings_component: &'a settings::Component,
 ) -> Element<'a, Message> {
     let base = responsive(move |size| {
-        let layout = page_canvas_layout(size.width, router.active());
+        let layout = canvas_layout(size.width);
         let canvas_width = layout.canvas_width;
         let page_width = layout.page_width;
         let page_offset = layout.page_offset;
@@ -140,6 +127,7 @@ pub fn view<'a>(
             .style(crate::fluent_theme::container_shell)
             .into();
         scrollable(shell)
+            .id(HORIZONTAL_SCROLL_ID)
             .direction(Direction::Horizontal(compact_scrollbar()))
             .style(crate::fluent_theme::scrollable_default)
             .width(Fill)
@@ -218,6 +206,7 @@ mod tests {
             drop(router.view(&model, &settings, None, 1200.0));
         }
 
+        assert_eq!(super::HORIZONTAL_SCROLL_ID, "application.horizontal.scroll");
         assert_eq!(super::PAGE_SCROLL_ID, "application.page.scroll");
         assert_eq!(super::workspace::STABLE_ID, "workflow.visual.workspace");
     }
@@ -238,15 +227,5 @@ mod tests {
         assert_eq!(super::canvas_layout(1800.0).page_width, 1500.0);
         assert_eq!(super::canvas_layout(1800.0).page_offset, 150.0);
         assert!(!super::canvas_layout(1500.0).horizontal_overflow);
-    }
-    #[test]
-    fn annotation_canvas_uses_the_available_compact_width() {
-        let layout = super::page_canvas_layout(700.0, crate::generated::FeatureId::Annotate);
-        assert_eq!(layout.page_width, 700.0);
-        assert!(!layout.horizontal_overflow);
-        assert_eq!(
-            super::page_canvas_layout(700.0, crate::generated::FeatureId::Train),
-            super::canvas_layout(700.0)
-        );
     }
 }

@@ -684,8 +684,7 @@ impl Component {
                 let selected_spline = self.selected_shape(model, AnnotationShape::Spline);
                 let selected_mask = self.selected_shape(model, AnnotationShape::Mask);
                 let selected_skeleton = self.selected_shape(model, AnnotationShape::Skeleton);
-                let objects = iced::widget::scrollable(
-                    state.scene.objects.iter().enumerate().fold(
+                let objects = state.scene.objects.iter().enumerate().fold(
                         column![text(format!("Objects ({})", state.scene.objects.len()))]
                             .spacing(4),
                         |list, (index, object)| {
@@ -716,7 +715,7 @@ impl Component {
                                                 name,
                                                 shape_label(object.shape),
                                                 if object.enabled { "" } else { " (hidden)" }
-                                            ))
+                                            )).width(Fill)
                                         ]
                                         .spacing(6),
                                     )
@@ -728,11 +727,9 @@ impl Component {
                                 .id(format!("annotation.object.{index}")),
                             )
                         },
-                    ),
-                )
-                .height(iced::Length::Fixed(180.0));
+                    );
                 let categories =
-                    iced::widget::scrollable(state.scene.categories.iter().enumerate().fold(
+                    state.scene.categories.iter().enumerate().fold(
                         column![text("Class for new objects")].spacing(4),
                         |list, (index, name)| {
                             let swatch = state
@@ -756,7 +753,7 @@ impl Component {
                                                     ""
                                                 },
                                                 name.value
-                                            ))
+                                            )).width(Fill)
                                         ]
                                         .spacing(6),
                                     )
@@ -768,8 +765,7 @@ impl Component {
                                 .id(format!("annotation.class.{index}")),
                             )
                         },
-                    ))
-                    .height(iced::Length::Fixed(150.0));
+                    );
                 let reclassify = button("Apply current class to selected object")
                     .width(Fill)
                     .on_press_maybe(
@@ -936,7 +932,10 @@ impl Component {
                         available.then_some(Message::HoldChanged(!state.editor.holdsave))
                     })),
                 ]
-                .spacing(6),
+                .spacing(6)
+                .width(Fill)
+                .wrap()
+                .vertical_spacing(6),
                 sidebar,
                 brush_control,
                 text(ui.map_or_else(
