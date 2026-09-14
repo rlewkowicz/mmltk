@@ -898,6 +898,11 @@ fn reveal_axis(start: f32, size: f32, viewport_start: f32, viewport_size: f32) -
     if viewport_size <= 0.0 || size <= 0.0 {
         return 0.0;
     }
+    // Scrollable rounds its translation to whole logical pixels. Leave room
+    // for that rounding while still requiring the entire target to be visible.
+    let inset = ((viewport_size - size) * 0.5).clamp(0.0, 1.0);
+    let viewport_start = viewport_start + inset;
+    let viewport_size = viewport_size - inset * 2.0;
     if start < viewport_start || size > viewport_size {
         start - viewport_start
     } else {
@@ -1045,6 +1050,30 @@ fn reveal_control(control: String, generation: u64, reveal: AnnotationReveal) ->
                 } else {
                     true
                 };
+                if !verified || !tail_verified {
+                    reporting::emit(|sink| {
+                        for (detail, rectangle) in [
+                            ("before-target", before.target),
+                            ("before-page", before.page),
+                            ("before-horizontal", before.horizontal),
+                            ("after-target", bounds.target),
+                            ("after-page", bounds.page),
+                            ("after-horizontal", bounds.horizontal),
+                        ] {
+                            sink.record(
+                                "integration.reveal_bounds",
+                                &control,
+                                detail,
+                                [
+                                    f64::from(rectangle.x),
+                                    f64::from(rectangle.y),
+                                    f64::from(rectangle.width),
+                                    f64::from(rectangle.height),
+                                ],
+                            );
+                        }
+                    });
+                }
                 RootMessage::Integration(Message::Scoped {
                     generation,
                     receipt: None,
@@ -3882,7 +3911,9 @@ impl Controller {
             };
         }
         if control != ANNOTATION_SURFACE {
-            return if control == ANNOTATION_SIDEBAR {
+            return if control == ANNOTATION_SIDEBAR
+                || matches!(self.phase, Phase::PageRegion { .. })
+            {
                 AnnotationReveal::Geometry
             } else {
                 AnnotationReveal::Control
@@ -8874,6 +8905,19 @@ impl Controller {
                         || model.window_width != width as u32
                         || model.window_height != height as u32
                     {
+                        reporting::emit(|sink| {
+                            sink.record(
+                                "integration.atlas_resize_wait",
+                                EXPLORE_GALLERY,
+                                "window",
+                                [
+                                    model.window_width as f64,
+                                    model.window_height as f64,
+                                    width,
+                                    height,
+                                ],
+                            )
+                        });
                         return Task::none();
                     }
                 }
@@ -8885,12 +8929,44 @@ impl Controller {
                     return Task::none();
                 };
                 if snapshot.viewport != expected.viewport {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.atlas_resize_wait",
+                            EXPLORE_GALLERY,
+                            "viewport",
+                            [
+                                snapshot.viewport.extent.width as f64,
+                                snapshot.viewport.extent.height as f64,
+                                expected.viewport.extent.width as f64,
+                                expected.viewport.extent.height as f64,
+                            ],
+                        )
+                    });
                     return Task::none();
                 }
                 let Some(draw) = self
                     .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.atlas_resize_wait",
+                            EXPLORE_GALLERY,
+                            "pixels",
+                            [
+                                snapshot.frame.revision as f64,
+                                self.atlas_receipt
+                                    .as_ref()
+                                    .map_or(0, |draw| draw.snapshot.frame.revision)
+                                    as f64,
+                                self.atlas_pixels
+                                    .as_ref()
+                                    .map_or(0, |draw| draw.snapshot.frame.revision)
+                                    as f64,
+                                snapshot.viewport.rowcount as f64,
+                            ],
+                        )
+                    });
                     return Task::none();
                 };
                 let required_rows = atlas_scroll_window(size, snapshot.viewport.columns).0;
@@ -10146,6 +10222,9 @@ impl Controller {
                     return Task::none();
                 };
                 if !model.annotation_edit_available()
+                    || model
+                        .has_pending(crate::generated::ApplicationIntentEndpoint::AnnotationEdit)
+                    || snapshot.busy
                     || snapshot.uirevision <= self.copy_list_revision
                 {
                     return Task::none();
@@ -11138,12 +11217,7 @@ pub(crate) mod tests {
         fn assert_pending_fps(&self, output: &ScenarioOutput) {
             assert_eq!(self.controller.phase, Phase::AwaitWorkspaceFpsPixels);
             assert!(same_probe(
-                &self
-                    .controller
-                    .workspace_fps_probe
-                    .as_ref()
-                    .unwrap()
-                    .probe,
+                &self.controller.workspace_fps_probe.as_ref().unwrap().probe,
                 output.probe.as_ref()
             ));
         }
@@ -11788,9 +11862,7 @@ pub(crate) mod tests {
             assert!(matches!(driver.phase, Phase::OpenAnnotation));
             assert!(driver.running());
             assert!(
-                driver
-                    .receive_control(advance_receipt(2))
-                    .is_err(),
+                driver.receive_control(advance_receipt(2)).is_err(),
                 "viewer evidence cannot settle a destructive Annotation workflow"
             );
             let (mut model, _) = crate::view_model::test_support::explore_presentation();
@@ -12162,9 +12234,7 @@ pub(crate) mod tests {
         premature.configure_session("dpi", String::new(), String::new());
         premature.phase = Phase::Complete;
         assert!(
-            premature
-                .receive_control(advance_receipt(2))
-                .is_err(),
+            premature.receive_control(advance_receipt(2)).is_err(),
             "local completion is insufficient before the typed receipt was admitted"
         );
     }
@@ -13261,12 +13331,17 @@ pub(crate) mod tests {
     #[test]
     fn measured_reveal_handles_both_edges_visible_and_oversized_controls() {
         assert_eq!(reveal_axis(120.0, 40.0, 100.0, 200.0), 0.0);
-        assert_eq!(reveal_axis(80.0, 40.0, 100.0, 200.0), -20.0);
-        assert_eq!(reveal_axis(280.0, 40.0, 100.0, 200.0), 20.0);
+        assert_eq!(reveal_axis(80.0, 40.0, 100.0, 200.0), -21.0);
+        assert_eq!(reveal_axis(280.0, 40.0, 100.0, 200.0), 21.0);
         assert_eq!(reveal_axis(120.0, 400.0, 100.0, 200.0), 20.0);
         assert_eq!(reveal_axis(100.0, 200.0, 100.0, 200.0), 0.0);
         assert_eq!(reveal_axis(500.0, 0.0, 100.0, 200.0), 0.0);
         assert_eq!(reveal_axis(500.0, 40.0, 100.0, 0.0), 0.0);
+        for start in [30.2, 2598.2] {
+            let offset = reveal_axis(start, 46.4, 52.0, 771.3).round();
+            assert!(start - offset >= 52.0);
+            assert!(start - offset + 46.4 <= 823.3);
+        }
     }
 
     #[test]

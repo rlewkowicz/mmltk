@@ -462,16 +462,12 @@ fn labeled_number(
     available: bool,
     message: fn(u64) -> Message,
 ) -> Element<'static, Message> {
-    let input: Element<'static, Message> = if available {
-        iced_aw::number_input(&value, 0..=maximum, message)
-            .id(id.to_string())
-            .ignore_buttons(true)
-            .ignore_scroll(true)
-            .width(Fill)
-            .into()
-    } else {
-        text(value).into()
-    };
+    let input = iced_aw::number_input(&value, 0..=maximum, message)
+        .id(id.to_string())
+        .on_input_maybe(available.then_some(message))
+        .ignore_buttons(true)
+        .ignore_scroll(true)
+        .width(Fill);
     column![text(label), input,].spacing(3).into()
 }
 
@@ -503,16 +499,12 @@ fn instance_number<'a>(
         .maximum
         .filter(|value| value.is_finite() && *value >= minimum as f64)
         .map_or(u32::MAX, |value| value as u32);
-    let input: Element<'a, Message> = if available {
-        iced_aw::number_input(&value, minimum..=maximum, on_change)
-            .id(constraint.stable_field_id.to_string())
-            .ignore_buttons(true)
-            .ignore_scroll(true)
-            .width(Fill)
-            .into()
-    } else {
-        text("Available after Explore is ready").size(11).into()
-    };
+    let input = iced_aw::number_input(&value, minimum..=maximum, on_change)
+        .id(constraint.stable_field_id.to_string())
+        .on_input_maybe(available.then_some(on_change))
+        .ignore_buttons(true)
+        .ignore_scroll(true)
+        .width(Fill);
     column![text(label), input,].spacing(3).into()
 }
 

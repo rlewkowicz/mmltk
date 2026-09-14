@@ -404,6 +404,27 @@ test('pre-location canvas requests retain their original geometry across another
   assert.equal(results.length, 4);
 });
 
+test('downsampled annotation outlines retain class hue at the shared viewer width', t => {
+  const f = canvasFixture(t, true), results = [];
+  browser.mmltkIntegrationReceipt(workspace, 'outline', 7, 11);
+  const yellow = [255, 255, 0], orange = [255, 80.52631258964539, 0];
+  const mask = [183.60000729560852, 82.62000024318695, 98.56424868106842];
+  for (const [expected, pixel] of [
+    [yellow, [156, 171, 53]], [yellow, [48, 80, 112]],
+    [yellow, [156, 53, 171]], [yellow, yellow],
+    [orange, [131, 80, 67]], [orange, [90, 80, 89]], [orange, [131, 67, 80]],
+    [mask, [110, 81, 106]], [mask, [48, 80, 112]], [[48, 80, 112], [48, 80, 112]],
+  ]) {
+    f.sampling.pixel = () => [...pixel, 255];
+    browser.mmltkIntegrationAnnotationPixels(browser.mmltkIntegrationProbe(workspace),
+      [0, 0, 80, 40], [180, 90], [90, 45, ...expected, 24, 2], 7, 11,
+      (...values) => results.push(values));
+  }
+  assert.deepEqual(results.map(result => result[2]), [1, 0, 0, 1, 1, 0, 0, 1, 0, 1]);
+  assert.equal(f.allocations.copies, 10);
+  assert.deepEqual(f.events, []);
+});
+
 test('held placeholder hover uses the exact draw without selecting it', t => {
   const f = canvasFixture(t);
   assert.equal(browser.mmltkIntegrationHoverAfterSurfaceDraw(10, 20, gallery, 7), 1);
@@ -434,6 +455,37 @@ test('partial atlas sampling reports each exact ready card and reuses canvas sto
   assert.ok(cellLines.every(line => line.includes('"dataset_identity":10848950138688527399')));
   assert.equal(f.allocations.scratch, 1);
   assert.equal(f.allocations.reads, 2);
+  assert.deepEqual(f.events, []);
+});
+
+test('atlas sampling finds visible image content beyond padding and rejects black tiles', t => {
+  const f = canvasFixture(t, true);
+  const reads = [];
+  f.sampling.pixel = (x, y) => {
+    reads.push([x, y]);
+    assert.ok(x >= 11 && x + 8 <= 70 && y >= 21 && y + 8 <= 80);
+    return y > 60 ? [48, 80, 112, 255] : [0, 0, 0, 255];
+  };
+  const results = [];
+  const sample = () => browser.mmltkIntegrationAtlasPixels(browser.mmltkIntegrationProbe(gallery),
+    [10.25, 20.25, 60, 60], [4], '{"image":[0,0,100,100],"columns":1,"card_extent":100}', 7, 11,
+    (...values) => results.push(values));
+  browser.mmltkIntegrationReceipt(gallery, 'clipped-padding', 7, 11);
+  sample();
+  f.flushFrames();
+  assert.deepEqual(results, [['observed', 1, 1]]);
+  const cell = f.reports.find(record => record.event === 'integration.atlas_ready_cell');
+  assert.equal(cell.canvas_y, reads.at(-1)[1]);
+  assert.equal(cell.cell_sample_y, (cell.canvas_y + 4.5) * 1000);
+  assert.equal(cell.cell_sample_rgba, 0xff705030);
+  assert.equal(f.allocations.copies, 1);
+  assert.ok(reads.length > 1 && reads.length <= 9);
+  f.sampling.pixel = () => [0, 0, 0, 255];
+  const before = f.allocations.reads;
+  sample();
+  f.flushFrames();
+  assert.deepEqual(results.at(-1), ['observed', 1, 0]);
+  assert.equal(f.allocations.reads - before, 9);
   assert.deepEqual(f.events, []);
 });
 
@@ -637,6 +689,27 @@ test('rendered numeric paste focuses and selects before one ordinary paste short
   assert.equal(f.canvas.width, 640);
   assert.equal(f.canvas.height, 480);
   assert.equal(f.allocations.reads + f.allocations.copies, 0);
+});
+
+test('numeric keyboard entry allows a render frame between characters and stops on cancellation', t => {
+  const f = canvasFixture(t, true);
+  browser.mmltkIntegrationReplaceNumber(20, 30, '9999', 20);
+  f.flushMicrotasks();
+  for (let i = 0; i < 3; i++) f.frames.shift()();
+  const characters = () => f.keys.filter(([type, key]) => type === 'keydown' && key === '9');
+  for (let count = 1; count <= 2; count++) {
+    f.frames.shift()();
+    assert.equal(characters().length, count);
+  }
+  browser.mmltkIntegrationCancelNumberEdit();
+  f.flushFrames();
+  assert.equal(characters().length, 2);
+  assert.equal(f.reports.some(record => record.detail === 'keyboard'), false);
+  browser.mmltkIntegrationReplaceNumber(20, 30, '9999', 20);
+  f.flushMicrotasks();
+  f.flushFrames();
+  assert.equal(characters().length, 6);
+  assert.equal(f.reports.filter(record => record.detail === 'keyboard').length, 1);
 });
 
 for (const finish of ['cancel', 'reset', 'disable']) {

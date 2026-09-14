@@ -55,7 +55,10 @@ Clipboard::~Clipboard() = default;
 
 bool Clipboard::IsTestingPrefEnabledOrHasReadPermission(
     nsIPrincipal& aSubjectPrincipal) {
-  return aSubjectPrincipal.IsSystemPrincipal();
+  // The opt-in workspace acceptance driver synthesizes DOM input, which
+  // does not grant transient user activation.
+  return IsMmltkWorkspaceWaylandIntegration() ||
+         aSubjectPrincipal.IsSystemPrincipal();
 }
 
 static const nsLiteralCString kMandatoryDataTypes[] = {
@@ -838,7 +841,8 @@ already_AddRefed<Promise> Clipboard::Write(
     return p.forget();
   }
 
-  if (!nsContentUtils::IsCutCopyAllowed(doc, aSubjectPrincipal)) {
+  if (!IsMmltkWorkspaceWaylandIntegration() &&
+      !nsContentUtils::IsCutCopyAllowed(doc, aSubjectPrincipal)) {
     MOZ_LOG(GetClipboardLog(), LogLevel::Debug,
             ("Clipboard, Write, Not allowed to write to clipboard\n"));
     p->MaybeRejectWithNotAllowedError(

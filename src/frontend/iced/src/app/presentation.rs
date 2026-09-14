@@ -1117,8 +1117,9 @@ mod tests {
         receiver: &mut crate::transport_connection::Capture,
         source: crate::generated::PresentationSourceIdentity,
     ) {
-        let crate::transport_connection::CapturedRecord::Intent(selection) =
-            receiver.try_recv().expect("expected presentation selection")
+        let crate::transport_connection::CapturedRecord::Intent(selection) = receiver
+            .try_recv()
+            .expect("expected presentation selection")
         else {
             panic!("expected presentation intent");
         };

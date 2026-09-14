@@ -596,7 +596,10 @@ NS_IMETHODIMP nsBaseClipboard::GetDataSnapshot(
     return NS_ERROR_FAILURE;
   }
 
-  if (aRequestingPrincipal->IsSystemPrincipal()) {
+  // Keep the parent permission boundary consistent with the DOM clipboard
+  // gate for the opt-in synthetic-input workspace acceptance session.
+  if (mozilla::dom::IsMmltkWorkspaceWaylandIntegration() ||
+      aRequestingPrincipal->IsSystemPrincipal()) {
     GetDataSnapshotInternal(aFlavorList, aWhichClipboard,
                             aRequestingWindowContext, aCallback);
     return NS_OK;

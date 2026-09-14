@@ -232,16 +232,30 @@ export function mmltkIntegrationAtlasPixels(receipt, rectangles, cards, fields, 
       if (cards.length * 4 !== rectangles.length) throw new Error('ready-cell identity count');
       let nonblack = 0;
       for (let i = 0; i < rectangles.length; i += 4) {
-        const width = Math.min(8, Math.floor(rectangles[i + 2]));
-        const height = Math.min(8, Math.floor(rectangles[i + 3]));
-        const x = Math.floor(rectangles[i] + (rectangles[i + 2] - width) / 2);
-        const y = Math.floor(rectangles[i + 1] + (rectangles[i + 3] - height) / 2);
-        const pixels = context.getImageData(x, y, width, height).data;
+        const left = Math.ceil(rectangles[i]), top = Math.ceil(rectangles[i + 1]);
+        const spanX = Math.floor(rectangles[i] + rectangles[i + 2]) - left;
+        const spanY = Math.floor(rectangles[i + 1] + rectangles[i + 3]) - top;
+        const width = Math.min(8, spanX), height = Math.min(8, spanY);
+        if (width < 1 || height < 1) throw new Error('empty visible ready-cell interior');
+        let x, y, pixels;
         let colored = 0;
-        for (let p = 0; p < pixels.length; p += 4) {
-          if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8) {
-            colored++;
+        // A clipped or augmented image can have black padding at its center.
+        // Search a bounded set of patches inside the actual visible interior,
+        // retaining the selected physical coordinates for native pixel audit.
+        for (const vertical of [.5, .9, .1]) {
+          for (const horizontal of [.5, .9, .1]) {
+            x = left + Math.round((spanX - width) * horizontal);
+            y = top + Math.round((spanY - height) * vertical);
+            pixels = context.getImageData(x, y, width, height).data;
+            colored = 0;
+            for (let p = 0; p < pixels.length; p += 4) {
+              if (pixels[p + 3] > 0 && Math.max(pixels[p], pixels[p + 1], pixels[p + 2]) > 8) {
+                colored++;
+              }
+            }
+            if (colored * 2 >= width * height) break;
           }
+          if (colored * 2 >= width * height) break;
         }
         const matched = colored * 2 >= width * height;
         nonblack += Number(matched);
@@ -481,20 +495,43 @@ export function mmltkIntegrationAnnotationPixels(receipt, cssBounds, extent, pro
     const context=canvasSnapshot(canvas);
     const scale=Math.min(bounds[2]/extent[0],bounds[3]/extent[1]);
     const ox=bounds[0]+(bounds[2]-extent[0]*scale)/2,oy=bounds[1]+(bounds[3]-extent[1]*scale)/2;
+    const background = [48, 80, 112];
     const colorError = (pixels, offset, expected, filteredPalette) => {
       let gain = 1;
       let minimum = 0;
       const peak = Math.max(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
       const low = Math.min(pixels[offset], pixels[offset + 1], pixels[offset + 2]);
-      // Filtered thin outlines mix with the background. Preserve class hue
-      // and require at least half native chroma; solid controls stay exact.
+      // Filtered thin outlines mix with the background. Strong chroma can
+      // establish class hue directly; solid controls stay exact.
       if (filteredPalette && peak - low >= 127.5) {
         minimum = low;
         gain = 255 / (peak - low);
       }
-      return Math.max(Math.abs(expected[0] - (pixels[offset] - minimum) * gain),
+      let error = Math.max(Math.abs(expected[0] - (pixels[offset] - minimum) * gain),
         Math.abs(expected[1] - (pixels[offset + 1] - minimum) * gain),
         Math.abs(expected[2] - (pixels[offset + 2] - minimum) * gain));
+      if (scale < 1 && Math.max(...expected) !== Math.min(...expected)) {
+        // The pixel-evidence PNG fixture is uniformly RGB(48,80,112). At
+        // small scales an outline may only partially cover its strongest
+        // screen pixel. Require a real contribution of the expected color
+        // and the same coverage in every channel, within byte rounding.
+        let dot = 0, norm = 0;
+        for (let channel = 0; channel < 3; channel++) {
+          const delta = expected[channel] - background[channel];
+          dot += (pixels[offset + channel] - background[channel]) * delta;
+          norm += delta * delta;
+        }
+        const coverage = norm > 0 ? dot / norm : 0;
+        if (coverage >= scale / 2 && coverage <= 1) {
+          let residual = 0;
+          for (let channel = 0; channel < 3; channel++) {
+            residual = Math.max(residual, Math.abs(pixels[offset + channel] -
+              (background[channel] + coverage * (expected[channel] - background[channel]))));
+          }
+          if (residual <= 3) error = Math.min(error, residual / coverage);
+        }
+      }
+      return error;
     };
     let matched=0;
     for(let i=0;i<probes.length;i+=7){
@@ -942,19 +979,26 @@ function integrationNumberEdit(x, y, value, selectionLength, completed) {
         frame(() => {
           keyResult += key('keyup', 'Control', 'ControlLeft', false);
           observeKeyStage('control-up', keyResult);
-          frame(() => {
+          let characterIndex = 0;
+          const enter = () => {
             if (paste) {
               keyResult += key('keydown', 'Control', 'ControlLeft', true);
               keyResult += key('keydown', 'v', 'KeyV', true);
               keyResult += key('keyup', 'v', 'KeyV', true);
               keyResult += key('keyup', 'Control', 'ControlLeft', false);
-            } else for (const character of value) {
+            } else if (characterIndex < value.length) {
+              const character = value[characterIndex++];
               const code = character === '.' ? 'Period' :
                 character === '-' ? 'Minus' :
                 character === '+' ? 'Equal' :
                 character === 'e' || character === 'E' ? 'KeyE' : `Digit${character}`;
               keyResult += key('keydown', character, code, false);
               keyResult += key('keyup', character, code, false);
+              // Iced rebuilds controlled input values between render frames.
+              if (characterIndex < value.length) {
+                frame(enter);
+                return;
+              }
             }
             if (integrationState) report({
               event,
@@ -966,7 +1010,8 @@ function integrationNumberEdit(x, y, value, selectionLength, completed) {
               d: String(selectionLength),
             });
             editing.complete(true);
-          });
+          };
+          frame(enter);
         });
       });
     });
