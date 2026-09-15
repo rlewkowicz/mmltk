@@ -205,6 +205,8 @@ int main(const int argument_count, char* const* const arguments) {
     metric_page.rows[0].precision_curve[9][100] = 0.125;
     metric_page.rows[0].average_recall[2][9] = 0.375;
     metric_page.rows[1].category = 5U;
+    metric_page.rows[1].category_name.emplace();
+    for (std::size_t index = 0U; index < 128U; ++index) metric_page.rows[1].category_name->value += "é";
     metric_page.rows[1].kind = rfdetr::EvaluationMetricKind::Mask;
     ValidationImageMetadata sample_image;
     sample_image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, {768U, 512U}, 77U);
@@ -224,6 +226,43 @@ int main(const int argument_count, char* const* const arguments) {
         return true;
     };
     if (!append_validation(metric_page) || !append_validation(sample_image)) return EXIT_FAILURE;
+    if (!append_validation(rfdetr::kEvaluationAxes.iou) || !append_validation(rfdetr::kEvaluationAxes.recall) ||
+        !append_validation(rfdetr::kEvaluationAxes.confidence)) return EXIT_FAILURE;
+    // Malformed pages cross the real native record encoder and Rust decoders.
+    // Mutating wire values deliberately bypasses native output admission.
+    const auto named_member = [](wire::Value& value, std::string_view name) -> wire::Value& {
+        auto& fields = std::get<wire::Value::Object>(value.storage);
+        return std::ranges::find_if(fields, [&](const auto& field) { return field.first == name; })->second;
+    };
+    for (const bool oversized_name : {false, true}) {
+        auto named = *mmltk::frameworks::serialization::reflected_value(metric_page);
+        auto positional = *mmltk::frameworks::serialization::reflected_transport_value(metric_page);
+        auto& named_rows = std::get<wire::Value::Array>(named_member(named, "rows").storage);
+        auto& positional_rows = std::get<wire::Value::Array>(std::get<wire::Value::Array>(positional.storage).back().storage);
+        if (oversized_name) {
+            named_member(named_member(named_rows[1], "category_name"), "value").storage = std::string(257U, 'x');
+            // Field index is derived from the actual native named projection.
+            const auto& named_fields = std::get<wire::Value::Object>(named_rows[1].storage);
+            const auto index = static_cast<std::size_t>(std::ranges::find_if(named_fields,
+                [](const auto& field) { return field.first == "category_name"; }) - named_fields.begin());
+            auto& name = std::get<wire::Value::Array>(positional_rows[1].storage)[index];
+            std::get<wire::Value::Array>(name.storage).front().storage = std::string(257U, 'x');
+        } else {
+            named_rows.resize(rfdetr::kEvaluationDetailPageSize + 1U, named_rows.front());
+            positional_rows.resize(rfdetr::kEvaluationDetailPageSize + 1U, positional_rows.front());
+        }
+        rfdetr::EvaluationDetailPage rejected;
+        if (mmltk::frameworks::serialization::decode_into(rejected, named)) return EXIT_FAILURE;
+        records.emplace_back(IntentReply{.correlation = validation_correlation++, .result = std::move(named)});
+        records.emplace_back(IntentReply{.correlation = validation_correlation++, .result = std::move(positional)});
+    }
+    for (const std::uint32_t count : {0U, 5U}) {
+        auto invalid_query = *mmltk::frameworks::serialization::reflected_value(rfdetr::EvaluationDetailQuery{});
+        named_member(invalid_query, "count").storage = static_cast<std::uint64_t>(count);
+        rfdetr::EvaluationDetailQuery rejected;
+        if (mmltk::frameworks::serialization::decode_into(rejected, invalid_query)) return EXIT_FAILURE;
+    }
+
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

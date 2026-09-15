@@ -25,6 +25,7 @@ struct ValidationBackendResult {
     ModelInfo model_info;
     EvalSummary summary;
     std::vector<EvaluationMetricDetail> details;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
     PhaseTiming timing;
 };
 

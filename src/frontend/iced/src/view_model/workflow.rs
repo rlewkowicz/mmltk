@@ -536,6 +536,13 @@ mod validation_tests {
             generation: 2, total: 0, offset: 0, rows: vec![],
         }));
         assert!(model.workflow.validation_details.is_some());
+        let retained = model.workflow.validation_details.clone();
+        let mut settings = crate::generated::application_snapshot_defaults().unwrap().into_iter()
+            .find_map(|fact| match fact.value { crate::generated::ApplicationSnapshot::Settings(value) => Some(value), _ => None }).unwrap();
+        settings.revision += 1;
+        settings.settingsstate.workflows.validate.request.compiledpath = "/later/input.bin".into();
+        model.install_settings(&settings);
+        assert_eq!(model.workflow.validation_details, retained);
     }
     #[test]
     fn validation_equal_physical_revisions_require_identical_product_facts() {

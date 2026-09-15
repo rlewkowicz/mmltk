@@ -1,4 +1,4 @@
-module;
+#pragma once
 #include <array>
 #include <span>
 #include <cstddef>
@@ -7,15 +7,14 @@ module;
 #include <optional>
 #include <vector>
 
-#include "src/backend/data/dataset_loader.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
-#include "src/common/concurrency/event_cancellation.h"
-#include "src/common/concurrency/parallel_range.h"
-#include "src/common/concurrency/worker_pool.h"
 
-export module mmltk.backend.models.rfdetr.core.evaluator;
+namespace mmltk::backend::data { class DatasetLoader; }
+namespace mmltk::common::concurrency { class WorkerPool; }
 
-export namespace mmltk::backend::models::rfdetr {
+namespace mmltk::backend::models::rfdetr {
+
+enum class EvaluationDetailRetention : std::uint8_t { CompactOnly, Detailed };
 
 class EvaluationDatasetOwner final {
    public:
@@ -35,8 +34,8 @@ class EvaluationDatasetOwner final {
         std::uint32_t prediction_ordinal = 0U;
         std::uint16_t category_index = 0U;
         std::uint32_t category_rank = 0U;
-        std::array<std::uint16_t, 4> area_matched_bits{};
-        std::array<std::uint16_t, 4> area_ignored_bits{};
+        std::array<std::uint16_t, kEvaluationAreaCount> area_matched_bits{};
+        std::array<std::uint16_t, kEvaluationAreaCount> area_ignored_bits{};
     };
     struct ImageMatches final {
         std::vector<MatchRecord> bbox;
@@ -56,8 +55,8 @@ class EvaluationDatasetOwner final {
                                                  std::optional<PackedMaskPredictionView> masks, std::size_t max_dets_per_image,
                                                  std::span<const Prediction> encoded_masks = {}) const;
     void merge_matches(ImageMatches matches);
-    [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image) const;
-    [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& worker_pool) const;
+    [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, EvaluationDetailRetention retention) const;
+    [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& worker_pool, EvaluationDetailRetention retention) const;
     [[nodiscard]] std::vector<EvaluationMetricDetail> take_details();
     [[nodiscard]] std::vector<int> image_ids() const;
     [[nodiscard]] std::size_t image_count() const noexcept;

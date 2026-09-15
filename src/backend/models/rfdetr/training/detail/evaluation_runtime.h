@@ -1,29 +1,36 @@
-namespace mmltk::backend::models::rfdetr::evaluator_detail {
-using CudaGuard = ::c10::cuda::CUDAGuard;
-using CudaStreamGuard = ::c10::cuda::CUDAStreamGuard;
-using DeviceIndex = ::c10::DeviceIndex;
-using ::cudaError_t;
-using ::cudaEvent_t;
-using ::cudaEventCreate;
-using ::cudaEventCreateWithFlags;
-using ::cudaEventDestroy;
-using ::cudaEventElapsedTime;
-using ::cudaEventRecord;
-using ::cudaEventSynchronize;
-using ::cudaGetDevice;
-using ::cudaSetDevice;
-using ::cudaStream_t;
-using ::cudaStreamSynchronize;
-using ::cudaSuccess;
-using ::c10::cuda::getStreamFromExternal;
-using ::mmltk::backend::ml::cuda::checked_device_index;
-inline constexpr unsigned int kCudaEventDisableTiming = cudaEventDisableTiming;
-}  // namespace mmltk::backend::models::rfdetr::evaluator_detail
-
+#pragma once
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <functional>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+#include <cuda_runtime.h>
+#include <torch/types.h>
+#include "src/backend/ml/cuda/detail/torch_cuda_utils.h"
+#include "src/backend/models/rfdetr/core/detail/postprocess.h"
+#include "src/backend/models/rfdetr/core/evaluator.h"
+#include "src/common/concurrency/worker_pool.h"
+namespace mmltk::backend::data { struct Batch; }
 namespace mmltk::backend::models::rfdetr {
 
-#if defined(MMLTK_TRAINING_EVALUATION_RUNTIME)
-class EvaluationRunTechnicalOwner;
+struct PredictionBatchMetadata {
+    std::int64_t dataset_index = 0;
+    std::int64_t image_id = 0;
+    std::string source_name;
+};
+std::vector<PredictionBatchMetadata> make_prediction_batch_metadata(const mmltk::backend::data::Batch& batch,
+                                                                  const std::vector<int>& image_ids);
 
 struct EvaluationRunConfig final {
     EvaluationMetricSet metric_set = EvaluationMetricSet::BBox;
@@ -51,28 +58,6 @@ struct EvaluationRunTerminal final {
     std::size_t image_count = 0U;
     std::size_t category_count = 0U;
     bool cancelled = false;
-};
-
-class TrainingEvaluationRunOwner final {
-   public:
-    explicit TrainingEvaluationRunOwner(EvaluationRunConfig config);
-    ~TrainingEvaluationRunOwner();
-    TrainingEvaluationRunOwner(TrainingEvaluationRunOwner&&) noexcept;
-    TrainingEvaluationRunOwner& operator=(TrainingEvaluationRunOwner&&) noexcept;
-    TrainingEvaluationRunOwner(const TrainingEvaluationRunOwner&) = delete;
-    TrainingEvaluationRunOwner& operator=(const TrainingEvaluationRunOwner&) = delete;
-
-    void begin();
-    void cancel() noexcept;
-    [[nodiscard]] EvaluationRunProgress progress() const noexcept;
-    [[nodiscard]] std::optional<EvaluationRunTerminal> terminal() const;
-    [[nodiscard]] std::vector<int> image_ids() const;
-    [[nodiscard]] EvaluationRunTechnicalOwner& operations() noexcept;
-    [[nodiscard]] const EvaluationRunTechnicalOwner& operations() const noexcept;
-
-   private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
 };
 
 struct EvaluationProfileSetup {
@@ -175,12 +160,10 @@ class EvaluationCudaTimingPool final {
     std::vector<std::unique_ptr<EvaluationCudaBatchTiming>> slots_;
     std::vector<size_t> free_slots_;
 };
-#endif
 
 using CompactImageMatchRecord = EvaluationDatasetOwner::MatchRecord;
 using ImageEvaluationMatches = EvaluationDatasetOwner::ImageMatches;
 
-#if defined(MMLTK_TRAINING_EVALUATION_RUNTIME)
 struct PinnedBBoxPredictionBuffers {
     torch::Tensor scores_cpu;
     torch::Tensor labels_cpu;
@@ -290,11 +273,7 @@ struct EvaluationPredictionLane {
 };
 
 using EvaluationLaneWork = std::move_only_function<StagedPredictionBatch(EvaluationPredictionLane&)>;
-#endif
 
-#if defined(MMLTK_TRAINING_EVALUATION_RUNTIME)
-std::vector<Prediction> result_to_predictions(int image_id, const TensorMap& result, size_t category_count, size_t max_dets_per_image,
-                                              EvaluationProfileRecord* profile = nullptr);
 StagedPredictionBatch stage_prediction_batch(std::vector<PredictionBatchMetadata> images, PostprocessedBatch batch, size_t category_count,
                                              size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle);
 PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::concurrency::WorkerPool& cpu_pool,
@@ -302,31 +281,43 @@ PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::
                                                                  const EvaluationDatasetOwner* evaluation_dataset = nullptr);
 std::vector<PredictionBatchItem> collect_prediction_batch_encoding(PendingPredictionBatchEncoding&& pending);
 
-AlignmentStats compare_top1(const TensorMap& lhs, const TensorMap& rhs, size_t category_count);
-
-class EvaluationRunTechnicalOwner {
+class TrainingEvaluationRunOwner final {
    public:
-    virtual ~EvaluationRunTechnicalOwner() = default;
-    virtual void load_dataset(mmltk::backend::data::DatasetLoader& loader) = 0;
-    [[nodiscard]] virtual EvaluationDatasetOwner& dataset() noexcept = 0;
-    [[nodiscard]] virtual const EvaluationDatasetOwner& dataset() const noexcept = 0;
-    [[nodiscard]] virtual std::size_t pending_lane_count() const noexcept = 0;
-    [[nodiscard]] virtual std::size_t pending_encoding_count() const noexcept = 0;
-    [[nodiscard]] virtual bool profiling() const noexcept = 0;
-    virtual void configure_profile(EvaluationProfileSetup setup) = 0;
-    virtual void record_loader_wait(double seconds) noexcept = 0;
-    virtual void record_timing_start(EvaluationCudaTimingLease lease, EvaluationCudaBatchTiming::Phase phase, void* stream) = 0;
-    virtual void record_timing_stop(EvaluationCudaTimingLease lease, EvaluationCudaBatchTiming::Phase phase, void* stream) = 0;
-    virtual void record_model_output(std::string precision, std::string box_precision, std::size_t query_count,
-                                     std::size_t class_count) = 0;
-    virtual void record_prediction_transfer(const PostprocessedBatch& processed, std::size_t image_count) = 0;
-    [[nodiscard]] virtual EvaluationCudaTimingLease acquire_timing() = 0;
-    virtual void submit(mmltk::common::concurrency::WorkerPool& lane_pool, EvaluationLaneWork work, EvaluationCudaTimingLease timing) = 0;
-    virtual void drain_lane(mmltk::common::concurrency::WorkerPool& cpu_pool) = 0;
-    [[nodiscard]] virtual std::size_t drain_encoding() = 0;
-    [[nodiscard]] virtual EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& cpu_pool) = 0;
-    virtual void settle(EvalSummary summary) = 0;
+    explicit TrainingEvaluationRunOwner(EvaluationRunConfig config);
+    ~TrainingEvaluationRunOwner();
+    TrainingEvaluationRunOwner(TrainingEvaluationRunOwner&&) noexcept;
+    TrainingEvaluationRunOwner& operator=(TrainingEvaluationRunOwner&&) noexcept;
+    TrainingEvaluationRunOwner(const TrainingEvaluationRunOwner&) = delete;
+    TrainingEvaluationRunOwner& operator=(const TrainingEvaluationRunOwner&) = delete;
+
+    void begin();
+    void cancel() noexcept;
+    [[nodiscard]] EvaluationRunProgress progress() const noexcept;
+    [[nodiscard]] std::optional<EvaluationRunTerminal> terminal() const;
+    [[nodiscard]] std::vector<int> image_ids() const;
+    void load_dataset(mmltk::backend::data::DatasetLoader& loader);
+    [[nodiscard]] EvaluationDatasetOwner& dataset() noexcept;
+    [[nodiscard]] const EvaluationDatasetOwner& dataset() const noexcept;
+    [[nodiscard]] std::size_t pending_lane_count() const noexcept;
+    [[nodiscard]] std::size_t pending_encoding_count() const noexcept;
+    [[nodiscard]] bool profiling() const noexcept;
+    void configure_profile(EvaluationProfileSetup setup);
+    void record_loader_wait(double seconds) noexcept;
+    void record_timing_start(EvaluationCudaTimingLease lease, EvaluationCudaBatchTiming::Phase phase, void* stream);
+    void record_timing_stop(EvaluationCudaTimingLease lease, EvaluationCudaBatchTiming::Phase phase, void* stream);
+    void record_model_output(std::string precision, std::string box_precision, std::size_t query_count,
+                                     std::size_t class_count);
+    void record_prediction_transfer(const PostprocessedBatch& processed, std::size_t image_count);
+    [[nodiscard]] EvaluationCudaTimingLease acquire_timing();
+    void submit(mmltk::common::concurrency::WorkerPool& lane_pool, EvaluationLaneWork work, EvaluationCudaTimingLease timing);
+    void drain_lane(mmltk::common::concurrency::WorkerPool& cpu_pool);
+    [[nodiscard]] std::size_t drain_encoding();
+    [[nodiscard]] EvalSummary evaluate(std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& cpu_pool);
+    void settle(EvalSummary summary);
+
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
-#endif
 
 }  // namespace mmltk::backend::models::rfdetr

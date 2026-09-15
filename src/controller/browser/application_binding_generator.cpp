@@ -245,6 +245,16 @@ class BindingOuterRoutingWriter final {
     ProjectedSymbolRegistry& symbols_;
 };
 
+void emit_rust_float_literal(std::ostream& output, const long double value) {
+    const double projected = static_cast<double>(value);
+    if (!std::isfinite(projected)) throw std::logic_error("generated Rust floating constraint must be finite");
+    const std::ios_base::fmtflags prior_flags = output.flags();
+    const std::streamsize prior_precision = output.precision();
+    output << std::setprecision(std::numeric_limits<double>::max_digits10) << std::showpoint << projected << std::noshowpoint;
+    output.flags(prior_flags);
+    output.precision(prior_precision);
+}
+
 template <class Value>
 void emit_catalog_value(std::ostream& output, const Value& value) {
     using Type = std::remove_cvref_t<Value>;
@@ -256,7 +266,7 @@ void emit_catalog_value(std::ostream& output, const Value& value) {
     } else if constexpr (std::same_as<Type, std::string_view>) {
         output << "Cow::Borrowed(" << std::quoted(value) << ')';
     } else if constexpr (std::is_floating_point_v<Type>) {
-        output << std::showpoint << value << std::noshowpoint;
+        emit_rust_float_literal(output, value);
         if constexpr (std::same_as<Type, float>) output << "f32";
     } else if constexpr (std::is_integral_v<Type>) {
         if constexpr (std::is_signed_v<Type>)
@@ -628,15 +638,6 @@ class BindingEmitter final {
             symbols_.Reserve("struct " + std::string(name), field, std::string(source) + "." + std::string(field));
     }
 
-    static void EmitRustFloatLiteral(std::ostream& output, const long double value) {
-        const double projected = static_cast<double>(value);
-        if (!std::isfinite(projected)) throw std::logic_error("generated Rust floating constraint must be finite");
-        const std::ios_base::fmtflags prior_flags = output.flags();
-        const std::streamsize prior_precision = output.precision();
-        output << std::setprecision(std::numeric_limits<double>::max_digits10) << std::showpoint << projected << std::noshowpoint;
-        output.flags(prior_flags);
-        output.precision(prior_precision);
-    }
 
     static void EmitOptionalFloat(std::ostream& output, const bool present, const long double value) {
         if (!present) {
@@ -644,7 +645,7 @@ class BindingEmitter final {
             return;
         }
         output << "Some(";
-        EmitRustFloatLiteral(output, value);
+        emit_rust_float_literal(output, value);
         output << ')';
     }
 
@@ -680,12 +681,12 @@ class BindingEmitter final {
                 output_ << "if !" << member << ".is_finite() { return Err(\"non-finite field " << member << "\".into()) }\n";
             if (constraint.has_minimum) {
                 output_ << "if " << member << " < ";
-                EmitRustFloatLiteral(output_, constraint.minimum);
+                emit_rust_float_literal(output_, constraint.minimum);
                 output_ << " as _ { return Err(\"field below minimum\".into()) }\n";
             }
             if (constraint.has_maximum) {
                 output_ << "if " << member << " > ";
-                EmitRustFloatLiteral(output_, constraint.maximum);
+                emit_rust_float_literal(output_, constraint.maximum);
                 output_ << " as _ { return Err(\"field above maximum\".into()) }\n";
             }
             if constexpr (std::same_as<Type, mmltk::frameworks::serialization::wire::FlatValue> ||

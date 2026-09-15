@@ -1,6 +1,6 @@
 ---
 BasedOnStyle: Google
-ColumnLimit: 140
+ColumnLimit: 160
 IndentWidth: 4
 ContinuationIndentWidth: 4
 TabWidth: 4
@@ -10,7 +10,7 @@ PointerAlignment: Left
 SortIncludes: false
 IncludeIsMainSourceRegex: '.*\.cu$'
 SortUsingDeclarations: true
-MaxEmptyLinesToKeep: 1
+MaxEmptyLinesToKeep: 0
 KeepEmptyLinesAtTheStartOfBlocks: false
 AllowShortBlocksOnASingleLine: true
 AllowShortCaseLabelsOnASingleLine: true

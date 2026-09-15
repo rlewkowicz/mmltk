@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
@@ -83,10 +84,8 @@
 import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.backend.models.rfdetr.core.artifact_resolution;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution; // CLEANUP-IGNORE: Training directly imports its dataset policy owner.
-import mmltk.backend.models.rfdetr.core.dataset_utils;            // CLEANUP-IGNORE: Training directly imports its dataset utility owner.
 import mmltk.backend.models.rfdetr.core.runtime;
 import mmltk.backend.models.rfdetr.core.tool_launch_utils;
-import mmltk.backend.models.rfdetr.core.evaluator;
 import mmltk.backend.models.rfdetr.core.model;
 
 import mmltk.common.logging.mmltk_logging;
@@ -101,9 +100,7 @@ import mmltk.backend.ml.cuda.shared_cuda_event;
 #include "model_access.h"
 #include "model_state_access.h"
 
-#define MMLTK_TRAINING_EVALUATION_RUNTIME
-#include "detail/evaluation_runtime_private.inc"
-#undef MMLTK_TRAINING_EVALUATION_RUNTIME
+#include "detail/evaluation_runtime.h"
 
 namespace mmltk::backend::models::rfdetr {
 
@@ -279,7 +276,7 @@ class TrainingValidationRuntime {
             options.device_id,
             options.validation_profile,
         });
-        evaluation_run_->operations().load_dataset(*loader_);
+        evaluation_run_->load_dataset(*loader_);
         image_ids_ = evaluation_run_->image_ids();
     }
 
@@ -1595,7 +1592,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     torch_api::InferenceMode inference_mode;
     detail::native_model_owner(model).module().eval();
     validation.begin_pass();
-    EvaluationRunTechnicalOwner& evaluation_run = validation.evaluation_run().operations();
+    TrainingEvaluationRunOwner& evaluation_run = validation.evaluation_run();
     auto cancel_unsettled_run = std::unique_ptr<TrainingEvaluationRunOwner, void (*)(TrainingEvaluationRunOwner*)>{
         &validation.evaluation_run(), [](TrainingEvaluationRunOwner* owner) { owner->cancel(); }};
 
@@ -1860,6 +1857,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_metric{"rfdetr.train.eval.metric"};
         result.summary = evaluation_run.evaluate(validation.detection_limit().as_size, cpu_pool);
+        result.summary.model_detection_budget = checked_cast<std::uint32_t>(model.config().num_select, "training model detection budget exceeds uint32_t");
     }
     evaluation_run.settle(result.summary);
     static_cast<void>(cancel_unsettled_run.release());

@@ -29,10 +29,8 @@ mmltk_configure_component(
     mmltk_backend_models_rfdetr_core PUBLIC_DECLARATIONS)
 
 foreach(_mmltk_rfdetr_core_module IN ITEMS
-        evaluator.cppm
         model.cppm
         artifact_resolution.cppm
-        dataset_utils.cppm
         dataset_limit_resolution.cppm
         runtime.cppm
         tool_launch_utils.cppm)
@@ -47,6 +45,7 @@ mmltk_register_public_headers(
         class_artifact.h
         class_layout.h
         evaluation.h
+        evaluator.h
         model_info.h
         model_state.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
@@ -54,8 +53,6 @@ mmltk_register_header_isolation(mmltk_backend_models_rfdetr_core)
 mmltk_register_retained_module_implementation_units(
     mmltk_backend_models_rfdetr_core
     artifact_resolution.cpp
-    evaluator.cpp
-    evaluation_dataset_owner.cpp
     model.cpp
     runtime.cpp
 )
@@ -69,6 +66,7 @@ mmltk_register_ordinary_sources(
     model_state.cpp)
 mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_core
+    evaluator.cpp
     detection_ops.cpp
     matcher_workspace.cpp
     draw.cpp
@@ -97,8 +95,6 @@ mmltk_register_private_headers(
     detail/detection_types.h
     detail/archive_utils.h
     detail/draw.h
-    detail/evaluator_dataset_private.h
-    detail/evaluator_implementation.inc
     detail/execution_precision.h
     detail/mask_pack_cuda.h
     detail/model_access.h
@@ -228,6 +224,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
         mmltk_acceptance_support
+        mmltk::frameworks::serialization
         mmltk_backend_data_test_support
         nlohmann_json
         mmltk::backend::models::rfdetr::contract

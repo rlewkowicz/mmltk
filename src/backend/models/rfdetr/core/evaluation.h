@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -80,6 +81,22 @@ void encode_mask_values_into(const uint32_t height, const uint32_t width, Encode
         }
     }
     if (in_run) { append_run(run_start, run_length); }
+}
+
+void encode_mask_from_packed_data_into(const std::uint8_t* data, std::uint32_t height, std::uint32_t width, EncodedMask& mask);
+EncodedMask encode_mask_from_packed_data(const std::uint8_t* data, std::uint32_t height, std::uint32_t width);
+
+inline std::array<float, 4> xyxy_clamped(const float* box_values) {
+    const float x1 = box_values[0];
+    const float y1 = box_values[1];
+    const float x2 = box_values[2];
+    const float y2 = box_values[3];
+    return {
+        std::min(x1, x2),
+        std::min(y1, y2),
+        std::max(x1, x2),
+        std::max(y1, y2),
+    };
 }
 
 struct Prediction {

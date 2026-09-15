@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 
@@ -35,10 +36,8 @@
 import mmltk.backend.ml.cuda.torch_scope;
 import mmltk.backend.models.rfdetr.core.artifact_resolution;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
-import mmltk.backend.models.rfdetr.core.dataset_utils;
 import mmltk.backend.models.rfdetr.core.runtime;
 import mmltk.backend.models.rfdetr.core.tool_launch_utils;
-import mmltk.backend.models.rfdetr.core.evaluator;
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.loader;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
@@ -168,9 +167,10 @@ struct AlignmentSample final {
         return result;
     }
     if (predictions.cancelled) dataset->limit_images(predictions.processed_images);
-    result.summary = dataset->evaluate(evaluation_cap);
+    result.summary = dataset->evaluate(evaluation_cap, EvaluationDetailRetention::Detailed);
     result.summary.model_detection_budget = static_cast<std::uint32_t>(predict.max_dets_per_image);
     result.details = dataset->take_details();
+    result.class_catalog = dataset->class_catalog();
     result.timing = predictions.timing;
     return result;
 }

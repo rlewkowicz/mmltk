@@ -520,6 +520,33 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     let transported_page = generated::EvaluationDetailPage::from_application_transport_value(model_reference(601)?).map_err(io::Error::other)?;
     require(metric_page == transported_page && metric_page.rows.len() == 2 && metric_page.rows[0].precisioncurve[9][100] == 0.125,
         "native validation detail grid did not survive both codecs")?;
+    require(metric_page.rows[0].category.is_none() && metric_page.rows[0].categoryname.is_none()
+        && metric_page.rows[1].category == Some(5)
+        && metric_page.rows[1].categoryname.as_ref().is_some_and(|name| name.value == "é".repeat(128)),
+        "bounded evaluated names or aggregate identity were lost")?;
+    let axes = &generated::EVALUATION_AXIS_CATALOG[0];
+    require(axes.iou == <[f64; 10]>::from_application_value(model_reference(604)?).map_err(io::Error::other)?
+        && axes.iou == <[f64; 10]>::from_application_transport_value(model_reference(605)?).map_err(io::Error::other)?
+        && axes.recall == <[f64; 101]>::from_application_value(model_reference(606)?).map_err(io::Error::other)?
+        && axes.recall == <[f64; 101]>::from_application_transport_value(model_reference(607)?).map_err(io::Error::other)?
+        && axes.confidence == <[f64; 101]>::from_application_value(model_reference(608)?).map_err(io::Error::other)?
+        && axes.confidence == <[f64; 101]>::from_application_transport_value(model_reference(609)?).map_err(io::Error::other)?
+        && axes.iou.len() == metric_page.rows[0].precisioncurve.len()
+        && axes.recall.len() == metric_page.rows[0].precisioncurve[0].len(),
+        "static metric axes differ from native values or actual curve extents")?;
+    for correlation in [610, 612] {
+        require(generated::EvaluationDetailPage::from_application_value(model_reference(correlation)?).is_err()
+            && generated::EvaluationDetailPage::from_application_transport_value(model_reference(correlation + 1)?).is_err(),
+            "metric page codec accepted oversized rows or category names")?;
+    }
+    let query = generated::encode_validation_Details(1, generated::EvaluationDetailQuery { generation: 7, offset: 0, count: 4 });
+    require(query.record.endpoint_id == 8227943998713357562
+        && query.record.fields.iter().map(|field| field.field_id).collect::<Vec<_>>() ==
+            [14315253701558637748, 17534743922720314413, 12467602364773788561],
+        "validation detail endpoint or stable request field identities changed")?;
+    require(generated::REFLECTED_FIELD_FACTS.iter().any(|field| field.owner == "EvaluationMetricDetail"
+        && field.name == "precision_curve" && field.catalog_provider == Some("EvaluationAxisCatalog")),
+        "curve declaration lost its canonical axis provider")?;
     let sample_image = generated::ValidationImageMetadata::from_application_value(model_reference(602)?).map_err(io::Error::other)?;
     let transported_image = generated::ValidationImageMetadata::from_application_transport_value(model_reference(603)?).map_err(io::Error::other)?;
     require(sample_image == transported_image && sample_image.samples[0].identity.datasetindex == 3 && sample_image.samples[0].labels[0].groundtruth

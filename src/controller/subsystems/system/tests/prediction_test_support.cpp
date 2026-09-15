@@ -210,6 +210,9 @@ ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest
         result.evaluation.emplace();
         result.evaluation->summary.bbox.available = true;
         result.evaluation->summary.bbox.ap = 0.75;
+        result.evaluation->class_catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(
+            std::vector<std::string>{"last in model", "absent", "middle", "first in model",
+                std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z')});
         result.evaluation->details.resize(5U);
         for (std::uint32_t index = 0U; index < 5U; ++index) result.evaluation->details[index].category = index;
     }

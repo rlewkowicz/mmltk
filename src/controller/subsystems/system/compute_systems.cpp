@@ -313,6 +313,13 @@ mmltk::backend::models::rfdetr::EvaluationDetailPage ValidationSystem::Details(m
     rfdetr::EvaluationDetailPage result{query.generation, static_cast<std::uint32_t>(rows.size()), query.offset, {}};
     const auto count = std::min<std::size_t>(query.count, rows.size() - query.offset);
     result.rows.assign(rows.begin() + query.offset, rows.begin() + query.offset + count);
+    for (auto& row : result.rows) {
+        if (row.category) {
+            const auto& catalog = impl_->evaluation_->class_catalog;
+            if (!catalog || *row.category >= catalog->size()) throw std::logic_error("validation detail catalog is unavailable");
+            row.category_name = mmltk::backend::data::catalog::ClassName{catalog->names()[*row.category]};
+        }
+    }
     return result;
 }
 void ValidationSystem::Shutdown() noexcept { impl_->Shutdown(); }

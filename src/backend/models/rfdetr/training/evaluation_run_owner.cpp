@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/evaluator.h"
 #include <ATen/Context.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -38,16 +39,12 @@
 #include "torch_cuda_utils.h"
 
 import mmltk.backend.ml.cuda.gpu_quiescence;
-import mmltk.backend.models.rfdetr.core.dataset_utils;
-import mmltk.backend.models.rfdetr.core.evaluator;
 
-#define MMLTK_TRAINING_EVALUATION_RUNTIME
-#include "detail/evaluation_runtime_private.inc"
-#undef MMLTK_TRAINING_EVALUATION_RUNTIME
+#include "detail/evaluation_runtime.h"
 
 namespace mmltk::backend::models::rfdetr {
 
-struct TrainingEvaluationRunOwner::Impl final : EvaluationRunTechnicalOwner {
+struct TrainingEvaluationRunOwner::Impl final {
     explicit Impl(EvaluationRunConfig value) : config(std::move(value)) {
         if (config.batch_capacity == 0U || config.prediction_capacity == 0U || config.lane_count == 0U || config.slots_per_lane == 0U ||
             config.encoding_capacity == 0U || config.device_id < 0) {
@@ -75,115 +72,7 @@ struct TrainingEvaluationRunOwner::Impl final : EvaluationRunTechnicalOwner {
         }
     }
 
-    ~Impl() override { cancel_and_drain(); }
-
-    void load_dataset(mmltk::backend::data::DatasetLoader& loader) override {
-        if (!lane_futures_.empty() || !encoding_queue_.empty()) {
-            throw std::logic_error("evaluation dataset cannot change while work is in flight");
-        }
-        dataset_ = std::make_unique<EvaluationDatasetOwner>(loader, config.metric_set);
-    }
-
-    EvaluationDatasetOwner& dataset() noexcept override { return *dataset_; }
-    const EvaluationDatasetOwner& dataset() const noexcept override { return *dataset_; }
-    std::size_t pending_lane_count() const noexcept override { return lane_futures_.size(); }
-    std::size_t pending_encoding_count() const noexcept override { return encoding_queue_.size(); }
-    bool profiling() const noexcept override { return profile_ != nullptr; }
-    void configure_profile(EvaluationProfileSetup setup) override {
-        if (!profile_) throw std::logic_error("evaluation profiling is disabled");
-        static_cast<EvaluationProfileSetup&>(*profile_) = std::move(setup);
-        profile_->precision = "unknown";
-        profile_->box_precision = "unknown";
-        capture_sdp_backend_flags(*profile_);
-        profile_->resolved_query_count = profile_->query_count;
-        profile_->backend_query_count = profile_->query_count;
-    }
-    void record_loader_wait(const double seconds) noexcept override {
-        if (profile_) profile_->loader_wait_seconds += seconds;
-    }
-    void record_timing_start(const EvaluationCudaTimingLease lease, const EvaluationCudaBatchTiming::Phase phase, void* stream) override {
-        if (lease) lease.timing->record_start(phase, static_cast<cudaStream_t>(stream));
-    }
-    void record_timing_stop(const EvaluationCudaTimingLease lease, const EvaluationCudaBatchTiming::Phase phase, void* stream) override {
-        if (lease) lease.timing->record_stop(phase, static_cast<cudaStream_t>(stream));
-    }
-    void record_model_output(std::string precision, std::string box_precision, const std::size_t query_count,
-                             const std::size_t class_count) override {
-        if (!profile_) return;
-        profile_->precision = std::move(precision);
-        profile_->box_precision = std::move(box_precision);
-        profile_->query_count = query_count;
-        profile_->backend_query_count = query_count;
-        profile_->class_count = class_count;
-    }
-    void record_prediction_transfer(const PostprocessedBatch& processed, const std::size_t image_count) override {
-        if (profile_) accumulate_prediction_transfer_bytes(*profile_, processed, image_count);
-    }
-    EvaluationCudaTimingLease acquire_timing() override {
-        if (!timing_pool_) return {};
-        EvaluationCudaTimingLease lease = timing_pool_->acquire();
-        unsubmitted_timing_.push_back(lease);
-        return lease;
-    }
-    void submit(mmltk::common::concurrency::WorkerPool& lane_pool, EvaluationLaneWork work, EvaluationCudaTimingLease timing) override {
-        const std::size_t lane_index = progress_.submitted_batches % lanes_.size();
-        EvaluationPredictionLane& lane = lanes_[lane_index];
-        lane_futures_.push_back(lane_pool.enqueue([&lane, work = std::move(work)]() mutable { return work(lane); }));
-        if (timing) {
-            if (unsubmitted_timing_.empty() || unsubmitted_timing_.front().slot_index != timing.slot_index)
-                throw std::logic_error("evaluation timing custody was not acquired by this run");
-            unsubmitted_timing_.pop_front();
-            lane_timing_.push_back(timing);
-        }
-        ++progress_.submitted_batches;
-        ++progress_.in_flight_batches;
-        update_profile_peaks();
-    }
-    void drain_lane(mmltk::common::concurrency::WorkerPool& cpu_pool) override {
-        StagedPredictionBatch staged = lane_futures_.front().get();
-        lane_futures_.pop_front();
-        if (profile_) {
-            encoding_timing_.push_back(lane_timing_.front());
-            lane_timing_.pop_front();
-        }
-        encoding_queue_.push_back(enqueue_prediction_batch_encoding(cpu_pool, std::move(staged), profile_.get(), &dataset()));
-        update_profile_peaks();
-    }
-    std::size_t drain_encoding() override {
-        std::vector<PredictionBatchItem> completed = collect_prediction_batch_encoding(std::move(encoding_queue_.front()));
-        encoding_queue_.pop_front();
-        if (profile_) {
-            EvaluationCudaTimingLease& timing = encoding_timing_.front();
-            timing.timing->accumulate(*profile_);
-            timing_pool_->release(timing);
-            encoding_timing_.pop_front();
-        }
-        for (auto& image : completed) {
-            if (!image.evaluation_matches) throw std::logic_error("validation image task omitted compact evaluation matches");
-            dataset().merge_matches(std::move(*image.evaluation_matches));
-        }
-        progress_.completed_images += completed.size();
-        if (progress_.in_flight_batches != 0U) --progress_.in_flight_batches;
-        return completed.size();
-    }
-    EvalSummary evaluate(const std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& cpu_pool) override {
-        const auto started = std::chrono::steady_clock::now();
-        EvalSummary summary = dataset().evaluate(max_dets_per_image, cpu_pool);
-        if (profile_) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
-            profile_->final_sort_ap_nanoseconds.fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
-            write_profile();
-        }
-        return summary;
-    }
-    void settle(EvalSummary summary) override {
-        if (!lane_futures_.empty() || !encoding_queue_.empty() || !unsubmitted_timing_.empty() || !lane_timing_.empty() ||
-            !encoding_timing_.empty())
-            throw std::logic_error("evaluation run cannot settle with outstanding work");
-        if (terminal_) throw std::logic_error("evaluation run already reached a terminal outcome");
-        terminal_ = EvaluationRunTerminal{std::move(summary), progress_.completed_images, dataset_->category_count(), progress_.cancelled};
-        progress_.terminal = true;
-    }
+    ~Impl() { cancel_and_drain(); }
 
     void begin() {
         if (!lane_futures_.empty() || !encoding_queue_.empty() || !unsubmitted_timing_.empty() || !lane_timing_.empty() ||
@@ -341,7 +230,148 @@ std::optional<EvaluationRunTerminal> TrainingEvaluationRunOwner::terminal() cons
 std::vector<int> TrainingEvaluationRunOwner::image_ids() const {
     return impl_->dataset_ ? impl_->dataset_->image_ids() : std::vector<int>{};
 }
-EvaluationRunTechnicalOwner& TrainingEvaluationRunOwner::operations() noexcept { return *impl_; }
-const EvaluationRunTechnicalOwner& TrainingEvaluationRunOwner::operations() const noexcept { return *impl_; }
+void TrainingEvaluationRunOwner::load_dataset(mmltk::backend::data::DatasetLoader& loader) {
+    if (!impl_->lane_futures_.empty() || !impl_->encoding_queue_.empty()) {
+        throw std::logic_error("evaluation dataset cannot change while work is in flight");
+    }
+    impl_->dataset_ = std::make_unique<EvaluationDatasetOwner>(loader, impl_->config.metric_set);
+}
+
+EvaluationDatasetOwner& TrainingEvaluationRunOwner::dataset() noexcept { return *impl_->dataset_; }
+const EvaluationDatasetOwner& TrainingEvaluationRunOwner::dataset() const noexcept { return *impl_->dataset_; }
+std::size_t TrainingEvaluationRunOwner::pending_lane_count() const noexcept { return impl_->lane_futures_.size(); }
+std::size_t TrainingEvaluationRunOwner::pending_encoding_count() const noexcept { return impl_->encoding_queue_.size(); }
+bool TrainingEvaluationRunOwner::profiling() const noexcept { return impl_->profile_ != nullptr; }
+void TrainingEvaluationRunOwner::configure_profile(EvaluationProfileSetup setup) {
+    if (!impl_->profile_) throw std::logic_error("evaluation profiling is disabled");
+    static_cast<EvaluationProfileSetup&>(*impl_->profile_) = std::move(setup);
+    impl_->profile_->precision = "unknown";
+    impl_->profile_->box_precision = "unknown";
+    capture_sdp_backend_flags(*impl_->profile_);
+    impl_->profile_->resolved_query_count = impl_->profile_->query_count;
+    impl_->profile_->backend_query_count = impl_->profile_->query_count;
+}
+void TrainingEvaluationRunOwner::record_loader_wait(const double seconds) noexcept {
+    if (impl_->profile_) impl_->profile_->loader_wait_seconds += seconds;
+}
+void TrainingEvaluationRunOwner::record_timing_start(const EvaluationCudaTimingLease lease, const EvaluationCudaBatchTiming::Phase phase, void* stream) {
+    if (lease) lease.timing->record_start(phase, static_cast<cudaStream_t>(stream));
+}
+void TrainingEvaluationRunOwner::record_timing_stop(const EvaluationCudaTimingLease lease, const EvaluationCudaBatchTiming::Phase phase, void* stream) {
+    if (lease) lease.timing->record_stop(phase, static_cast<cudaStream_t>(stream));
+}
+void TrainingEvaluationRunOwner::record_model_output(std::string precision, std::string box_precision, const std::size_t query_count,
+                         const std::size_t class_count) {
+    if (!impl_->profile_) return;
+    impl_->profile_->precision = std::move(precision);
+    impl_->profile_->box_precision = std::move(box_precision);
+    impl_->profile_->query_count = query_count;
+    impl_->profile_->backend_query_count = query_count;
+    impl_->profile_->class_count = class_count;
+}
+void TrainingEvaluationRunOwner::record_prediction_transfer(const PostprocessedBatch& processed, const std::size_t image_count) {
+    if (impl_->profile_) accumulate_prediction_transfer_bytes(*impl_->profile_, processed, image_count);
+}
+EvaluationCudaTimingLease TrainingEvaluationRunOwner::acquire_timing() {
+    if (!impl_->timing_pool_) return {};
+    EvaluationCudaTimingLease lease = impl_->timing_pool_->acquire();
+    try {
+        impl_->unsubmitted_timing_.push_back(lease);
+    } catch (...) {
+        impl_->timing_pool_->release(lease);
+        throw;
+    }
+    return lease;
+}
+void TrainingEvaluationRunOwner::submit(mmltk::common::concurrency::WorkerPool& lane_pool, EvaluationLaneWork work, EvaluationCudaTimingLease timing) {
+    const std::size_t lane_index = impl_->progress_.submitted_batches % impl_->lanes_.size();
+    EvaluationPredictionLane& lane = impl_->lanes_[lane_index];
+    if (static_cast<bool>(timing) != profiling() ||
+        (timing && (impl_->unsubmitted_timing_.empty() || impl_->unsubmitted_timing_.front().slot_index != timing.slot_index ||
+                    impl_->unsubmitted_timing_.front().timing != timing.timing))) {
+        throw std::logic_error("evaluation timing custody was not acquired by this run");
+    }
+    // Reserve both owning records before admitting a task. Assignment of its
+    // future is noexcept, so no submitted work can escape queue custody.
+    impl_->lane_futures_.emplace_back();
+    try {
+        if (timing) impl_->lane_timing_.push_back(timing);
+    } catch (...) {
+        impl_->lane_futures_.pop_back();
+        throw;
+    }
+    try {
+        impl_->lane_futures_.back() = lane_pool.enqueue([&lane, work = std::move(work)]() mutable {
+            auto owned_work = std::move(work);
+            return owned_work(lane);
+        });
+    } catch (...) {
+        if (timing) impl_->lane_timing_.pop_back();
+        impl_->lane_futures_.pop_back();
+        throw;
+    }
+    if (timing) impl_->unsubmitted_timing_.pop_front();
+    ++impl_->progress_.submitted_batches;
+    ++impl_->progress_.in_flight_batches;
+    impl_->update_profile_peaks();
+}
+void TrainingEvaluationRunOwner::drain_lane(mmltk::common::concurrency::WorkerPool& cpu_pool) {
+    impl_->encoding_queue_.emplace_back();
+    try {
+        if (impl_->profile_) impl_->encoding_timing_.push_back(impl_->lane_timing_.front());
+    } catch (...) {
+        impl_->encoding_queue_.pop_back();
+        throw;
+    }
+    try {
+        StagedPredictionBatch staged = impl_->lane_futures_.front().get();
+        impl_->encoding_queue_.back() = enqueue_prediction_batch_encoding(cpu_pool, std::move(staged), impl_->profile_.get(), &dataset());
+    } catch (...) {
+        // Admission settles any partial image batch before it throws. The lane
+        // timing remains with the original lane receipt for cancellation.
+        if (impl_->profile_) impl_->encoding_timing_.pop_back();
+        impl_->encoding_queue_.pop_back();
+        throw;
+    }
+    impl_->lane_futures_.pop_front();
+    if (impl_->profile_) impl_->lane_timing_.pop_front();
+    impl_->update_profile_peaks();
+}
+std::size_t TrainingEvaluationRunOwner::drain_encoding() {
+    std::vector<PredictionBatchItem> completed = collect_prediction_batch_encoding(std::move(impl_->encoding_queue_.front()));
+    if (impl_->profile_) {
+        EvaluationCudaTimingLease& timing = impl_->encoding_timing_.front();
+        timing.timing->accumulate(*impl_->profile_);
+        impl_->timing_pool_->release(timing);
+        impl_->encoding_timing_.pop_front();
+    }
+    impl_->encoding_queue_.pop_front();
+    for (auto& image : completed) {
+        if (!image.evaluation_matches) throw std::logic_error("validation image task omitted compact evaluation matches");
+        dataset().merge_matches(std::move(*image.evaluation_matches));
+    }
+    impl_->progress_.completed_images += completed.size();
+    if (impl_->progress_.in_flight_batches != 0U) --impl_->progress_.in_flight_batches;
+    return completed.size();
+}
+EvalSummary TrainingEvaluationRunOwner::evaluate(const std::size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool& cpu_pool) {
+    const auto started = impl_->profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    EvalSummary summary = dataset().evaluate(max_dets_per_image, cpu_pool, EvaluationDetailRetention::CompactOnly);
+    if (impl_->profile_) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+        impl_->profile_->final_sort_ap_nanoseconds.fetch_add(static_cast<std::uint64_t>(elapsed.count()), std::memory_order_relaxed);
+        impl_->write_profile();
+    }
+    return summary;
+}
+void TrainingEvaluationRunOwner::settle(EvalSummary summary) {
+    if (!impl_->lane_futures_.empty() || !impl_->encoding_queue_.empty() || !impl_->unsubmitted_timing_.empty() || !impl_->lane_timing_.empty() ||
+        !impl_->encoding_timing_.empty())
+        throw std::logic_error("evaluation run cannot settle with outstanding work");
+    if (impl_->terminal_) throw std::logic_error("evaluation run already reached a terminal outcome");
+    impl_->terminal_ = EvaluationRunTerminal{std::move(summary), impl_->progress_.completed_images, impl_->dataset_->category_count(), impl_->progress_.cancelled};
+    impl_->progress_.terminal = true;
+}
+
 
 }  // namespace mmltk::backend::models::rfdetr

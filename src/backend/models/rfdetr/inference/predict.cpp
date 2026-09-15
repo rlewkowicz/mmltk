@@ -1,4 +1,5 @@
 module;
+#include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
@@ -61,10 +62,8 @@ module mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.ml.cuda.torch_scope;
 import mmltk.backend.models.rfdetr.core.artifact_resolution; // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
-import mmltk.backend.models.rfdetr.core.dataset_utils;
 import mmltk.backend.models.rfdetr.core.runtime;
 import mmltk.backend.models.rfdetr.core.tool_launch_utils;
-import mmltk.backend.models.rfdetr.core.evaluator;
 import mmltk.backend.models.rfdetr.core.model;
 
 import mmltk.backend.models.rfdetr.inference.loader;

@@ -900,19 +900,7 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     REQUIRE(dialog.snapshot().selection->selected());
     CHECK(std::get<services::FileDialogSelected>(dialog.snapshot().selection->result).path == "/tmp/input");
     CHECK(constructions == 2U);
-    const auto measured = validation.snapshot();
-    REQUIRE(measured.metrics);
-    CHECK(measured.metrics->bbox.ap == 0.75);
-    CHECK(measured.detail_rows == 5U);
-    CHECK_FALSE(measured.metrics->mask);
-    CHECK(validation.Details({measured.operation.generation_frontier, 0U, 4U}).rows.size() == 4U);
-    const auto last = validation.Details({measured.operation.generation_frontier, 4U, 4U});
-    REQUIRE(last.rows.size() == 1U);
-    CHECK(last.rows.front().category == 4U);
-    CHECK(validation.Details({measured.operation.generation_frontier, 5U, 1U}).rows.empty());
-    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 6U, 1U}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 5U}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier - 1U, 0U, 1U}), contracts::InvalidIntentError);
+
 }
 
 TEST_CASE("production direct adapters reject unavailable physical dependencies", "[controller][systems][production-adapters]") {
@@ -1435,6 +1423,31 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK(std::holds_alternative<ValidationChanged>(third_terminal.get_future().get()));
     CHECK(validation.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(constructions == 2U);
+    const auto measured = validation.snapshot();
+    REQUIRE(measured.metrics);
+    CHECK(measured.metrics->bbox.ap == 0.75);
+    CHECK(measured.detail_rows == 5U);
+    CHECK_FALSE(measured.metrics->mask);
+    CHECK(validation.Details({measured.operation.generation_frontier, 0U, 4U}).rows.size() == 4U);
+    const auto last = validation.Details({measured.operation.generation_frontier, 4U, 4U});
+    REQUIRE(last.rows.size() == 1U);
+    CHECK(last.rows.front().category == 4U);
+    CHECK(validation.Details({measured.operation.generation_frontier, 5U, 1U}).rows.empty());
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 6U, 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 5U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier - 1U, 0U, 1U}), contracts::InvalidIntentError);
+    REQUIRE(last.rows.front().category_name);
+    CHECK(last.rows.front().category_name->value == std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z'));
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 0U}), contracts::InvalidIntentError);
+    contracts::SettingsUpdateRequest edit;
+    edit.updates = {{.path = "workflows.validate.request.compiled_path", .value = (root / "later.bin").string()},
+                    {.path = "workflows.validate.request.weights_path", .value = (root / "later.pt").string()}};
+    static_cast<void>(settings.Update(std::move(edit)));
+    const auto retained = validation.Details({measured.operation.generation_frontier, 0U, 4U});
+    REQUIRE(retained.rows.front().category_name);
+    CHECK(retained.rows.front().category_name->value == "last in model");
+    CHECK(retained.rows.back().category_name->value == "first in model");
+    CHECK_FALSE(retained.rows[1].available); // No-GT category still has its evaluated name.
 }
 
 TEST_CASE("validation admits asynchronous selected-path inspection and cancels before compute", "[controller][systems][compute][admission]") {

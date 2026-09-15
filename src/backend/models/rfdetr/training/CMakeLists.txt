@@ -24,6 +24,8 @@ mmltk_register_public_headers(
         distributed_train_launcher.h
         train.h
         train_recipe.h)
+mmltk_register_private_headers(mmltk_backend_models_rfdetr_training detail/evaluation_runtime.h)
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
 foreach(_mmltk_training_partition IN ITEMS
         checkpoint.cppm)
     mmltk_register_retained_module_providers(
@@ -48,7 +50,6 @@ mmltk_register_ordinary_sources(
     training_ops.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
-    detail/evaluation_runtime_private.inc
     detail/target_builder_private.h
     detail/gpu_augment_private.h
     detail/native_optimizer_private.h
@@ -102,6 +103,9 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_training_tests ${sources})
+    mmltk_register_ordinary_sources(
+        mmltk_backend_models_rfdetr_training_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp)
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}

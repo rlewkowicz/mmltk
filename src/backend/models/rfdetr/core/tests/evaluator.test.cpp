@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/evaluator.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 #include <array>
@@ -18,7 +19,7 @@
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
-import mmltk.backend.models.rfdetr.core.evaluator;
+#include "src/frameworks/serialization/reflected_cbor.h"
 namespace {
 namespace data = mmltk::backend::data;
 namespace r = mmltk::backend::models::rfdetr;
@@ -86,7 +87,7 @@ TEST_CASE("evaluation distinguishes unavailable categories, measured zero, masks
     EvaluationFixture fixture({{box(0, {0, 0, 32, 32})}, {}});
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
     owner.merge_matches(match(owner, 0, {}, 10, true));
-    auto summary = owner.evaluate(10);
+    auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
     CHECK(summary.bbox.available); CHECK(summary.bbox.ap == 0.0);
     REQUIRE(summary.mask); CHECK(summary.mask->available); CHECK(summary.mask->ap == 0.0);
     auto details = owner.take_details();
@@ -96,22 +97,22 @@ TEST_CASE("evaluation distinguishes unavailable categories, measured zero, masks
     CHECK_FALSE(row(details, r::EvaluationArea::Large, 0U).available);
     owner.clear_predictions();
     owner.merge_matches(match(owner, 0, {box(0, {0, 0, 32, 32})}, 10, true));
-    summary = owner.evaluate(10); CHECK(summary.bbox.ap == Approx(1.0)); CHECK(summary.mask->ap == Approx(1.0));
+    summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed); CHECK(summary.bbox.ap == Approx(1.0)); CHECK(summary.mask->ap == Approx(1.0));
     owner.limit_images(0);
-    summary = owner.evaluate(10); CHECK_FALSE(summary.bbox.available); CHECK(summary.bbox.confidence.f1 == 0.0);
+    summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed); CHECK_FALSE(summary.bbox.available); CHECK(summary.bbox.confidence.f1 == 0.0);
     CHECK_FALSE(summary.bbox.average_recall[0]);
 }
 TEST_CASE("evaluation uses the 101-point envelope and all ten inclusive IoU thresholds", "[rfdetr][evaluation][gpu]") {
     EvaluationFixture fixture({{box(0, {0, 0, 32, 32}), box(0, {64, 64, 96, 96})}});
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
     owner.merge_matches(match(owner, 0, {box(0, {0, 0, 32, 32})}, 100));
-    CHECK(owner.evaluate(100).bbox.ap == Approx(51.0 / 101.0));
+    CHECK(owner.evaluate(100, r::EvaluationDetailRetention::Detailed).bbox.ap == Approx(51.0 / 101.0));
     owner.clear_predictions();
     owner.merge_matches(match(owner, 0, {box(0, {96, 96, 128, 128}, 1.0F), box(0, {0, 0, 32, 32}, 0.9F)}, 100));
-    CHECK(owner.evaluate(100).bbox.ap == Approx(51.0 / 202.0));
+    CHECK(owner.evaluate(100, r::EvaluationDetailRetention::Detailed).bbox.ap == Approx(51.0 / 202.0));
     owner.clear_predictions();
     owner.merge_matches(match(owner, 0, {box(0, {0, 0, 16, 32})}, 100));
-    CHECK(owner.evaluate(100).bbox.ap == Approx(51.0 / 1010.0));
+    CHECK(owner.evaluate(100, r::EvaluationDetailRetention::Detailed).bbox.ap == Approx(51.0 / 1010.0));
     auto details = owner.take_details();
     const auto& curve = row(details, r::EvaluationArea::All, 0U);
     CHECK(curve.average_precision[0] == Approx(51.0 / 101.0)); CHECK(curve.average_precision[1] == 0.0);
@@ -127,7 +128,7 @@ TEST_CASE("evaluation shares candidates but keeps independent area ignores and s
     CHECK((matches.bbox[0].area_ignored_bits[1] & 7U) == 0U);
     CHECK((matches.bbox[0].area_ignored_bits[1] & 8U) != 0U);
     owner.merge_matches(std::move(matches));
-    const auto summary = owner.evaluate(1);
+    const auto summary = owner.evaluate(1, r::EvaluationDetailRetention::Detailed);
     REQUIRE(summary.bbox.average_recall[0]); CHECK(*summary.bbox.average_recall[0] == Approx(.75));
     auto details = owner.take_details(); CHECK(row(details, r::EvaluationArea::All, 5U).average_precision[0] == Approx(1.0));
 }
@@ -135,12 +136,12 @@ TEST_CASE("evaluation preserves COCO GT ties and upstream float64 confidence bou
     EvaluationFixture fixture({{box(0, {0, 0, 20, 20}), box(0, {10, 0, 30, 20})}});
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
     owner.merge_matches(match(owner, 0, {box(0, {5, 0, 25, 20}, .9F), box(0, {0, 0, 20, 20}, .8F)}, 10));
-    auto summary = owner.evaluate(10); CHECK(summary.bbox.confidence.recall == Approx(1.0));
+    auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed); CHECK(summary.bbox.confidence.recall == Approx(1.0));
     for (const auto [score, threshold] : std::array<std::pair<float, double>, 4>{{{.60F, .61}, {.58F, .58}, {.5F, .51}, {0.0F, .01}}}) {
         owner.clear_predictions();
         owner.merge_matches(match(owner, 0, {box(0, {0, 0, 20, 20}, 1.0F), box(0, {10, 0, 30, 20}, 1.0F), box(0, {0, 0, 20, 20}, score),
             box(0, {0, 0, 20, 20}, std::numeric_limits<float>::quiet_NaN())}, 10));
-        summary = owner.evaluate(10);
+        summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
         CHECK(summary.bbox.confidence_threshold == Approx(threshold));
         CHECK(summary.bbox.confidence.f1 == Approx(1.0));
     }
@@ -149,7 +150,7 @@ TEST_CASE("evaluation macro F1 averages per-class F1 rather than pooled counts",
     EvaluationFixture fixture({{box(0, {0, 0, 20, 20}), box(5, {32, 0, 52, 20}), box(5, {64, 0, 84, 20}), box(5, {96, 0, 116, 20})}});
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
     owner.merge_matches(match(owner, 0, {box(0, {0, 0, 20, 20}), box(5, {32, 0, 52, 20}), box(5, {32, 0, 52, 20})}, 10));
-    const auto summary = owner.evaluate(10);
+    const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
     CHECK(summary.bbox.confidence_threshold == 0.0);
     CHECK(summary.bbox.confidence.precision == Approx(.75));
     CHECK(summary.bbox.confidence.recall == Approx(2.0 / 3.0));
@@ -160,14 +161,14 @@ TEST_CASE("evaluation areas use original geometry and preserve the inclusive 96 
     EvaluationFixture fixture({{box(0, {0, 0, 96, 96})}}, 64);
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
     owner.merge_matches(match(owner, 0, {box(0, {0, 0, 48, 48})}, 10));
-    const auto summary = owner.evaluate(10);
+    const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
     CHECK(summary.bbox.ap == Approx(1.0));
     CHECK_FALSE(summary.bbox.area_ap[0]);
     REQUIRE(summary.bbox.area_ap[1]); CHECK(*summary.bbox.area_ap[1] == Approx(1.0));
     REQUIRE(summary.bbox.area_ap[2]); CHECK(*summary.bbox.area_ap[2] == Approx(1.0));
     CHECK_THROWS_AS(fixture.loader->letterbox(1U), std::out_of_range);
     CHECK_THROWS_AS(match(owner, 1, {}, 10), std::out_of_range);
-    CHECK_THROWS_AS(owner.evaluate(0U), std::invalid_argument);
+    CHECK_THROWS_AS(owner.evaluate(0U, r::EvaluationDetailRetention::Detailed), std::invalid_argument);
 }
 TEST_CASE("evaluation recall caps share the largest per-image ordered matching", "[rfdetr][evaluation][gpu]") {
     std::vector<r::Prediction> predictions;
@@ -179,10 +180,74 @@ TEST_CASE("evaluation recall caps share the largest per-image ordered matching",
     EvaluationFixture fixture({predictions});
     r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
     owner.merge_matches(match(owner, 0, predictions, 12));
-    const auto summary = owner.evaluate(12);
+    const auto summary = owner.evaluate(12, r::EvaluationDetailRetention::Detailed);
     CHECK(summary.bbox.ap == Approx(1.0));
     CHECK(summary.bbox.detection_limits == std::array<std::uint32_t, 3>{1U, 10U, 12U});
     REQUIRE(summary.bbox.average_recall[0]); CHECK(*summary.bbox.average_recall[0] == Approx(1.0 / 12.0));
     REQUIRE(summary.bbox.average_recall[1]); CHECK(*summary.bbox.average_recall[1] == Approx(10.0 / 12.0));
     REQUIRE(summary.bbox.average_recall[2]); CHECK(*summary.bbox.average_recall[2] == Approx(1.0));
+}
+
+TEST_CASE("compact and detailed evaluation share all summary values and retain one ordered catalog", "[rfdetr][evaluation][gpu]") {
+    EvaluationFixture fixture({{box(0, {0, 0, 32, 32}), box(5, {32, 32, 96, 96})}, {}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+    const auto catalog = owner.class_catalog();
+    auto names = std::vector<std::string>(catalog->names().rbegin(), catalog->names().rend());
+    auto selected = std::make_shared<const data::catalog::ClassCatalog>(names);
+    const auto permutation = selected->permutation_to(*catalog);
+    CHECK(permutation.front() == catalog->size() - 1U);
+    CHECK(permutation.back() == 0U);
+    auto predictions = std::vector{box(static_cast<int>(permutation.back()), {0, 0, 32, 32}, .9F),
+        box(static_cast<int>(permutation.front()), {32, 32, 96, 96}, .7F), box(0, {0, 0, 32, 32}, .7F)};
+    owner.merge_matches(match(owner, 0, predictions, 10U, true));
+    // Input replacement and loader destruction do not relabel the evaluated run.
+    selected = std::make_shared<const data::catalog::ClassCatalog>(std::vector<std::string>{"later input"});
+    fixture.loader.reset();
+    CHECK(owner.class_catalog() == catalog);
+    CHECK(owner.class_catalog()->names().front() == names.back());
+    r::EvaluationDatasetOwner copied(owner);
+    CHECK(copied.class_catalog() == catalog);
+    for (const auto limit : {2U, 1U, 0U}) {
+        owner.limit_images(limit);
+        const auto compact = owner.evaluate(10U, r::EvaluationDetailRetention::CompactOnly);
+        CHECK(owner.take_details().empty());
+        const auto detailed = owner.evaluate(10U, r::EvaluationDetailRetention::Detailed);
+        const auto compact_wire = mmltk::frameworks::serialization::reflected_value(compact);
+        const auto detailed_wire = mmltk::frameworks::serialization::reflected_value(detailed);
+        REQUIRE(compact_wire); REQUIRE(detailed_wire);
+        CHECK(*compact_wire == *detailed_wire);
+        const auto rows = owner.take_details();
+        REQUIRE(rows.size() == (catalog->size() + 1U) * r::kEvaluationAreaCount * 2U);
+        const auto& aggregate = row(rows, r::EvaluationArea::All, std::nullopt);
+        CHECK_FALSE(aggregate.category_name);
+        CHECK(aggregate.available == (limit != 0U));
+        for (const auto& detail : rows) CHECK_FALSE(detail.category_name); // Names are projected only on page copies.
+    }
+    CHECK(copied.image_ids() == std::vector<int>{1, 2});
+    CHECK(copied.evaluate(10U, r::EvaluationDetailRetention::CompactOnly).bbox.available);
+}
+
+TEST_CASE("evaluation axes exactly preserve thresholds and curve extents", "[rfdetr][evaluation]") {
+    constexpr std::array<double, 10> expected_iou{0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95};
+    STATIC_REQUIRE(r::EvaluationAxisCatalog::valid());
+    CHECK(r::kEvaluationAxes.iou == expected_iou);
+    const r::EvaluationMetricDetail detail;
+    CHECK(detail.average_precision.size() == r::kEvaluationAxes.iou.size());
+    CHECK(detail.average_recall[0].size() == r::kEvaluationAxes.iou.size());
+    CHECK(detail.precision_curve.size() == r::kEvaluationAxes.iou.size());
+    CHECK(detail.precision_curve[0].size() == r::kEvaluationAxes.recall.size());
+    for (std::size_t index = 0U; index < r::kEvaluationAxes.recall.size(); ++index) {
+        CHECK(r::kEvaluationAxes.recall[index] == static_cast<double>(index) * 0.01);
+        CHECK(r::kEvaluationAxes.confidence[index] == static_cast<double>(index) * 0.01);
+    }
+}
+
+TEST_CASE("each native double IoU threshold is inclusive at its exact rational boundary", "[rfdetr][evaluation][gpu]") {
+    EvaluationFixture fixture({{box(0, {0, 0, 20, 20})}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
+    for (std::size_t index = 0U; index < r::kEvaluationIouCount; ++index) {
+        const auto matches = match(owner, 0, {box(0, {0, 0, static_cast<float>(10U + index), 20})}, 1U);
+        REQUIRE(matches.bbox.size() == 1U);
+        CHECK(matches.bbox.front().area_matched_bits[0] == static_cast<std::uint16_t>((1U << (index + 1U)) - 1U));
+    }
 }

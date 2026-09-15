@@ -39,7 +39,6 @@ target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
     ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
-    ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
 target_link_libraries(mmltk_backend_models_rfdetr_inference
     PUBLIC
